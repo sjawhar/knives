@@ -2216,7 +2216,8 @@ fn only_a_rerunnable_watch_on_a_token_knives_minted_is_restarted() {
 /// A gh that answers a GraphQL call the way GitHub and gh do, after it records
 /// its token: `FAKE_GH_ANSWER=missing` is a node id the token cannot see (the
 /// `NOT_FOUND` body on stdout, gh's own line on stderr, exit 1), `found` the
-/// node, and `other` an unrelated failure.
+/// node, `other` an unrelated failure, and `prompt` a stderr prompt with no
+/// newline that waits for a line on stdin (a pager's `Press RETURN`).
 fn fake_graphql_gh() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("fake gh dir");
     let log = dir.path().join("gh.log");
@@ -2227,6 +2228,7 @@ fn fake_graphql_gh() -> (tempfile::TempDir, PathBuf) {
          case \"$FAKE_GH_ANSWER\" in\n\
          found) printf '{\"data\":{\"node\":{\"id\":\"PR_x\"}}}'; exit 0 ;;\n\
          other) echo 'gh: Something went wrong while executing your query.' >&2; exit 1 ;;\n\
+         prompt) printf 'Press RETURN' >&2; read -r reply; exit 0 ;;\n\
          esac\n\
          printf '{\"data\":{\"node\":null},\"errors\":[{\"type\":\"NOT_FOUND\"}]}'\n\
          echo \"gh: Could not resolve to a node with the global id of 'PR_x'.\" >&2\n\
@@ -2243,6 +2245,18 @@ fn run_graphql(
     arguments: &[&str],
     answer: &str,
     env: &[(&str, &str)],
+) -> (std::process::Output, String) {
+    run_graphql_with(arguments, answer, env, |command| {
+        command.output().expect("run knives gh")
+    })
+}
+
+/// [`run_graphql`], with `run` running the command.
+fn run_graphql_with(
+    arguments: &[&str],
+    answer: &str,
+    env: &[(&str, &str)],
+    run: impl FnOnce(&mut Command) -> std::process::Output,
 ) -> (std::process::Output, String) {
     let host = concat!("github", ".com");
     let scratch = tempfile::tempdir().expect("scratch");
@@ -2269,7 +2283,7 @@ fn run_graphql(
     for (name, value) in env {
         command.env(name, value);
     }
-    let output = command.output().expect("run knives gh");
+    let output = run(&mut command);
     let recorded = fs::read_to_string(&log).expect("fake gh ran");
     (output, recorded)
 }
@@ -2308,6 +2322,61 @@ fn an_ownerless_graphql_node_miss_names_the_checkouts_owner_and_gh_repo() {
             "{query}: {stderr}"
         );
     }
+}
+
+#[test]
+fn a_stderr_prompt_without_a_newline_shows_before_gh_reads_the_answer() {
+    use std::io::{Read as _, Write as _};
+    // When: gh, on a call knives copies stderr for, writes a prompt with no
+    // newline and waits for an answer on stdin.
+    let (output, _) = run_graphql_with(
+        &["api", "graphql", "-f", NODE_QUERY],
+        "prompt",
+        &[],
+        |command| {
+            let mut child = command
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("run knives gh");
+            let mut stderr = child.stderr.take().expect("stderr pipe");
+            let (shown, seen) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let mut text = Vec::new();
+                let mut buffer = [0_u8; 256];
+                while let Ok(read) = stderr.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    text.extend_from_slice(&buffer[..read]);
+                    if text.ends_with(b"Press RETURN") {
+                        let _ = shown.send(());
+                    }
+                }
+                text
+            });
+            let prompt_shown = seen.recv_timeout(std::time::Duration::from_secs(30));
+            // Answer either way, so that gh ends.
+            child
+                .stdin
+                .take()
+                .expect("stdin pipe")
+                .write_all(b"\n")
+                .expect("answer the prompt");
+            let output = child.wait_with_output().expect("wait for knives gh");
+            let text = reader.join().expect("stderr reader");
+
+            // Then: the prompt reached the caller while gh was still waiting.
+            assert!(
+                prompt_shown.is_ok(),
+                "the prompt was held back: {}",
+                String::from_utf8_lossy(&text)
+            );
+            output
+        },
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
 }
 
 #[test]

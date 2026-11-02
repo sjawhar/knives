@@ -230,34 +230,82 @@ fn routed_token(args: &[String], cwd: &Path) -> Option<Routed> {
     }
 }
 
-/// Whether this is a `gh api graphql` call that names no owner and no
-/// repository (no owner in the query or its fields, no `GH_REPO`), so only the
-/// checkout can route it. A mutation that takes a node id
+/// Whether this is a `gh api graphql` call in which knives finds no owner and
+/// no repository (none in the query or its fields, no `GH_REPO`), so only the
+/// checkout routes it. A mutation that takes a node id
 /// (`enqueuePullRequest`, `archivePullRequest`, …) is such a call. The node
 /// id's repository cannot be known without a request: a GitHub node id holds
 /// at most the repository's database id, never its owner.
 fn is_ownerless_graphql(args: &[String]) -> bool {
-    args.first().is_some_and(|word| word == "api")
-        && before_terminator(args).iter().any(|word| word == "graphql")
+    api_endpoint(args) == Some("graphql")
         && owner_from_api_args(args).is_none()
         && named_repository(args).is_none()
 }
 
-/// What gh writes when GitHub finds no node for a GraphQL node id, as
-/// `gh: Could not resolve to a node with the global id of '<id>'.`
-fn is_unresolved_node(line: &[u8]) -> bool {
-    let line = String::from_utf8_lossy(line);
-    line.contains("Could not resolve to ") && line.contains("with the global id")
+/// The flags of `gh api` that take their value as the next argument when
+/// written without `=` (gh 2.98 `gh api --help`).
+const API_VALUE_FLAGS: &[&str] = &[
+    "-F",
+    "--field",
+    "-f",
+    "--raw-field",
+    "-H",
+    "--header",
+    "-X",
+    "--method",
+    "-q",
+    "--jq",
+    "-t",
+    "--template",
+    "-p",
+    "--preview",
+    "--input",
+    "--cache",
+    "--hostname",
+];
+
+/// The endpoint of a `gh api` call: its one positional, which follows `--`
+/// when the call has one.
+fn api_endpoint(args: &[String]) -> Option<&str> {
+    let (first, rest) = args.split_first()?;
+    if first != "api" {
+        return None;
+    }
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        if word == "--" {
+            return words.next().map(String::as_str);
+        }
+        if !word.starts_with('-') {
+            return Some(word);
+        }
+        if API_VALUE_FLAGS.contains(&word.as_str()) {
+            words.next();
+        }
+    }
+    None
 }
 
+/// What gh writes when GitHub finds no node for a GraphQL node id, as
+/// `gh: Could not resolve to a node with the global id of '<id>'.`
+fn is_unresolved_node(text: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(text);
+    text.contains("Could not resolve to ") && text.contains("with the global id")
+}
+
+/// The most of one stderr line kept to find [`is_unresolved_node`]'s text in:
+/// gh's line is short, and a longer line is not that answer.
+const STDERR_LINE_KEPT: usize = 4096;
+
 /// Runs gh for a call whose target only the checkout chose
-/// ([`Routed::checkout_guess`]), copying its stderr through unchanged. When
-/// gh fails because GitHub found no node, one more stderr line names the
-/// owner knives routed to, where that owner came from, and how to name the
-/// node's repository: GitHub's answer for a node of another owner is the
-/// same as for a node that does not exist.
+/// ([`Routed::checkout_guess`]), copying each piece of its stderr through as
+/// it arrives, so a prompt without a newline shows at once. When gh fails
+/// because GitHub found no node, one more stderr line names the owner knives
+/// routed to, where that owner came from, and how to name the node's
+/// repository: GitHub's answer for a node of another owner is the same as
+/// for a node that does not exist.
 fn gh_exit_code_naming_a_guessed_route(gh: &mut Command, target: &str, cwd: &Path) -> i32 {
-    use std::io::{BufRead as _, Write as _};
+    use std::io::Write as _;
     gh.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped());
@@ -265,18 +313,29 @@ fn gh_exit_code_naming_a_guessed_route(gh: &mut Command, target: &str, cwd: &Pat
         return gh_not_found();
     };
     let mut unresolved = false;
-    if let Some(stderr) = child.stderr.take() {
-        let mut reader = std::io::BufReader::new(stderr);
+    if let Some(mut stderr) = child.stderr.take() {
+        let mut buffer = [0_u8; 8192];
         let mut line = Vec::new();
         // Read to the end even when our own stderr is gone, so gh never
         // blocks on a full pipe.
-        while reader
-            .read_until(b'\n', &mut line)
-            .is_ok_and(|read| read > 0)
-        {
-            let _ = std::io::stderr().write_all(&line);
-            unresolved = unresolved || is_unresolved_node(&line);
-            line.clear();
+        loop {
+            let read = match stderr.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            let chunk = buffer.get(..read).unwrap_or_default();
+            let _ = std::io::stderr().write_all(chunk);
+            if unresolved {
+                continue;
+            }
+            line.extend_from_slice(chunk);
+            unresolved = is_unresolved_node(&line);
+            if let Some(end) = line.iter().rposition(|byte| *byte == b'\n') {
+                line.drain(..=end);
+            }
+            line.drain(..line.len().saturating_sub(STDERR_LINE_KEPT));
         }
     }
     let code = child.wait().map_or_else(|_| gh_not_found(), exit_code);
@@ -284,8 +343,9 @@ fn gh_exit_code_naming_a_guessed_route(gh: &mut Command, target: &str, cwd: &Pat
         let owner = credential_path(target)
             .and_then(|path| path.split('/').next())
             .unwrap_or(target);
-        eprintln!(
-            "knives gh: GitHub found no node for this call. The query names no owner and no repository, so knives ran it as the GitHub App of owner {owner}, which the checkout in {} chose ({target}). GitHub gives the same answer for a node in a repository of another owner. Run the call again with GH_REPO=<owner>/<repo> of the node's repository set (gh api takes no -R), or from a checkout of that repository.",
+        let _ = writeln!(
+            std::io::stderr(),
+            "knives gh: GitHub found no node for this call. knives found no owner or repository in the call, so it ran it as the GitHub App of owner {owner}, which the checkout in {} chose ({target}). GitHub gives the same answer for a node in a repository of another owner. Run the call again with GH_REPO=<owner>/<repo> of the node's repository set (gh api takes no -R), or from a checkout of that repository.",
             cwd.display()
         );
     }
@@ -2665,7 +2725,11 @@ mod tests {
             assert!(is_ownerless_graphql(&args(&[
                 "api", "graphql", "-f", enqueue
             ])));
+            // The endpoint is the one positional, past flag values and `--`.
             assert!(is_ownerless_graphql(&args(&["api", "-f", node, "graphql"])));
+            assert!(is_ownerless_graphql(&args(&[
+                "api", "-f", node, "--", "graphql"
+            ])));
             // The query or a field names the owner.
             assert!(!is_ownerless_graphql(&args(&[
                 "api", "graphql", "-f", owner
@@ -2673,16 +2737,16 @@ mod tests {
             assert!(!is_ownerless_graphql(&args(&[
                 "api", "graphql", "-f", variable, "-f", "o=acme"
             ])));
-            // Not GraphQL: a REST path or another command.
+            // Not GraphQL: a REST path, `graphql` as a flag's value, or another
+            // command.
             assert!(!is_ownerless_graphql(&args(&["api", "rate_limit"])));
-            assert!(!is_ownerless_graphql(&args(&["pr", "list"])));
-            // `graphql` only after the terminator is a positional, not the endpoint.
             assert!(!is_ownerless_graphql(&args(&[
                 "api",
                 "rate_limit",
-                "--",
+                "--template",
                 "graphql"
             ])));
+            assert!(!is_ownerless_graphql(&args(&["pr", "list"])));
         });
         // GH_REPO names the repository.
         with_env(&[("GH_REPO", "acme/work")], || {
