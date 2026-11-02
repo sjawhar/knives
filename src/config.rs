@@ -813,13 +813,18 @@ struct LocalEntry {
 /// absent overlay changes nothing.
 fn apply_local_overlay(registry: &mut Registry, path: &Path) -> Result<(), ConfigError> {
     let local = path.with_file_name(LOCAL_OVERLAY);
-    if !local.exists() {
-        return Ok(());
-    }
-    let text = std::fs::read_to_string(&local).map_err(|source| ConfigError::Read {
-        path: local.clone(),
-        source,
-    })?;
+    // Only a missing file is absent: an unreadable one would silently drop
+    // private forbidden terms, so it is refused like any other read failure.
+    let text = match std::fs::read_to_string(&local) {
+        Ok(text) => text,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(ConfigError::Read {
+                path: local,
+                source,
+            });
+        }
+    };
     let overlay: LocalOverlay = toml::from_str(&text).map_err(|source| ConfigError::Parse {
         path: local.clone(),
         source: Box::new(source),
@@ -1756,6 +1761,32 @@ release = "https://example.invalid/releases.git"
         .to_string();
         assert!(error.contains(LOCAL_OVERLAY), "was: {error}");
         assert!(error.contains("forge slugs"), "was: {error}");
+    }
+
+    #[test]
+    fn an_unreadable_local_overlay_is_refused_not_skipped() {
+        // Skipping it would drop its forbidden terms without a word.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), OVERLAY_BASE);
+        std::fs::create_dir(dir.path().join(LOCAL_OVERLAY)).unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(error.contains("reading"), "was: {error}");
+        assert!(error.contains(LOCAL_OVERLAY), "was: {error}");
+    }
+
+    #[test]
+    fn a_local_overlay_without_a_registry_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(LOCAL_OVERLAY),
+            "[repos.demo]\nforbidden = [\"acme-corp\"]\n",
+        )
+        .unwrap();
+        let error = load(&dir.path().join("repos.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("[repos.demo]"), "was: {error}");
+        assert!(error.contains(LOCAL_OVERLAY), "was: {error}");
     }
 
     #[test]
