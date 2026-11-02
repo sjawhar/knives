@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::{State, Store, StoreError};
+use super::{State, Store, StoreError, Writes};
 use crate::config::FormerNames;
 use crate::lock::FileLock;
 use crate::statement::{Statement, StatementKind};
@@ -99,14 +99,15 @@ impl Store {
     ///
     /// A real migration passes the lock it took on the state file, held until
     /// the store drops, so no other writer saves over it between the read and
-    /// the save. A dry run passes none and saves nothing: a look that writes
-    /// nothing, not even the lock file. A save is atomic, so what it reads is
-    /// one whole state file.
+    /// the save, and the save writes the whole state the migration changed.
+    /// A dry run passes none and saves nothing: a look that writes nothing,
+    /// not even the lock file. A save is atomic, so what it reads is one whole
+    /// state file.
     pub(crate) fn open_to_migrate(
         path: PathBuf,
         lock: Option<FileLock>,
     ) -> Result<Self, StoreError> {
-        Self::read(path, &[], lock)
+        Self::read(path, &[], Writes::Whole(lock), Vec::new())
     }
 
     /// Every branch statement an older knives kept in the state file, in map

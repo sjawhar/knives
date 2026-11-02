@@ -395,9 +395,10 @@ pub(crate) fn run_track(
     if forget && !pulled_before_replacing(fork, bound, "the forget") {
         return Ok(Exit::Incomplete);
     }
-    // Opened for update to hold the lock while the statement is read and the next
-    // one appended: a concurrent `track` then reads this one's statement rather
-    // than the one before it. Nothing here writes the state file.
+    // Opened for update to hold the fork's lock while the statement is read and
+    // the next one appended: a concurrent `track` then reads this one's
+    // statement rather than the one before it. Nothing here writes the state
+    // file.
     let store = Store::open_for_update(
         default_state_path(),
         &bound.registry.former_names(),
@@ -510,10 +511,10 @@ pub(crate) fn run_depends(
     if !pulled_before_replacing(fork, bound, "the dependency") {
         return Ok(Exit::Incomplete);
     }
-    // Held while the list is read and the next statement appended, so two
-    // concurrent `depends` on this machine each add to the other's list
-    // rather than racing; the pull above brought in what other machines
-    // stated. Nothing here writes the state file.
+    // The fork's lock is held while the list is read and the next statement
+    // appended, so two concurrent `depends` on this machine each add to the
+    // other's list rather than racing; the pull above brought in what other
+    // machines stated. Nothing here writes the state file.
     let store = Store::open_for_update(
         default_state_path(),
         &registry.former_names(),
