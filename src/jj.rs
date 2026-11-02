@@ -3659,31 +3659,20 @@ pub fn forget_workspace(repo: &Path, name: &str) -> Result<(), JjError> {
     Ok(())
 }
 
-/// Where jj recorded workspace `name` of `repo`, or `None` when that is
-/// `destination` itself.
+/// Where jj recorded workspace `name` of `repo`, or `None` when it recorded
+/// no path for the name (a workspace made before jj recorded them).
 ///
-/// Paths compare through symbolic links above them. Errs when jj recorded no
-/// path for the name (a workspace made before jj recorded them).
-///
-/// A workspace name is the repository's, not a path's: a same-named workspace
-/// can live elsewhere (an old `workspaces` root, one added by hand), and
-/// forgetting the name for a vanished directory at `destination` would take
-/// that live one over. Read from the repository's workspace store in process:
-/// jj stores the path relative to `.jj/repo`, and the `jj workspace root` of
-/// the pinned jj refuses to answer once that directory is gone.
-pub fn workspace_recorded_elsewhere(
-    repo: &Path,
-    name: &str,
-    destination: &Path,
-) -> Result<Option<PathBuf>, JjError> {
+/// The record is the repository's answer to where a workspace lives: the
+/// registry's `workspaces` root only says where new ones go, and a workspace
+/// made under an earlier root stays where it was made. Read from the
+/// repository's workspace store in process: jj stores the path relative to
+/// `.jj/repo`, and the `jj workspace root` of the pinned jj refuses to answer
+/// once that directory is gone.
+fn recorded_workspace_path(repo: &Path, name: &str) -> Result<Option<PathBuf>, JjError> {
     let repo_dir = repo.join(".jj/repo");
-    let no_record = || JjError::Open {
-        path: repo_dir.display().to_string(),
-        detail: format!("Workspace has no recorded path: {name}"),
-    };
     // Loading a store that does not exist creates an empty one; this only reads.
     if !repo_dir.join("workspace_store").join("index").is_file() {
-        return Err(no_record());
+        return Ok(None);
     }
     let store_error = |error: WorkspaceStoreError| JjError::Open {
         path: repo_dir.display().to_string(),
@@ -3692,9 +3681,46 @@ pub fn workspace_recorded_elsewhere(
     let recorded = SimpleWorkspaceStore::load(&repo_dir)
         .map_err(store_error)?
         .get_workspace_path(jj_lib::ref_name::WorkspaceName::new(name))
-        .map_err(store_error)?
-        .ok_or_else(no_record)?;
-    let recorded = lexically_normal(&repo_dir.join(recorded));
+        .map_err(store_error)?;
+    Ok(recorded.map(|recorded| lexically_normal(&repo_dir.join(recorded))))
+}
+
+/// Where workspace `name` of `repo` lives: the path jj recorded for it, while
+/// the repository still has a workspace of that name. `None` when it has none,
+/// or recorded no path for it.
+///
+/// The store is not enough alone: `jj workspace forget` leaves the forgotten
+/// name's path in it, so a finished branch would otherwise be "found" at its
+/// old directory and restarted there.
+pub fn registered_workspace_path(repo: &Path, name: &str) -> Result<Option<PathBuf>, JjError> {
+    let registered = Repo::open(repo)?
+        .workspaces()?
+        .iter()
+        .any(|(workspace, _)| workspace.as_str() == name);
+    if !registered {
+        return Ok(None);
+    }
+    recorded_workspace_path(repo, name)
+}
+
+/// Where jj recorded workspace `name` of `repo`, or `None` when that is
+/// `destination` itself.
+///
+/// Paths compare through symbolic links above them. Errs when jj recorded no
+/// path for the name (a workspace made before jj recorded them).
+///
+/// A workspace name is the repository's, not a path's: a same-named workspace
+/// can live elsewhere (one added by hand), and forgetting the name for a
+/// vanished directory at `destination` would take that live one over.
+pub fn workspace_recorded_elsewhere(
+    repo: &Path,
+    name: &str,
+    destination: &Path,
+) -> Result<Option<PathBuf>, JjError> {
+    let recorded = recorded_workspace_path(repo, name)?.ok_or_else(|| JjError::Open {
+        path: repo.join(".jj/repo").display().to_string(),
+        detail: format!("Workspace has no recorded path: {name}"),
+    })?;
     Ok((comparable_path(&recorded) != comparable_path(destination)).then_some(recorded))
 }
 

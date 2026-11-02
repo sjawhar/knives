@@ -228,10 +228,12 @@ upstream` or the `repos.toml` edit, rather than reading the fork as absent.
 
 `knives start` opens a branch's workspace beside the checkout, named for the branch: the
 `<name>/default` layout, where the workspaces are `default`'s siblings. A checkout at `~/<name>`
-has no room for siblings, so its entry sets `workspaces` to the directory they go in instead;
-`finish` removes them from the same place. `~` expands and a relative value is taken from the
-config directory, so write it as `~/…`. A `workspaces` inside the checkout is refused by `knives
-start` and `finish`, the two verbs that use it.
+has no room for siblings, so its entry sets `workspaces` to the directory they go in instead.
+`~` expands and a relative value is taken from the config directory, so write it as `~/…`. A
+`workspaces` inside the checkout is refused by `knives start` and `finish` whenever they would use
+it. The setting places new workspaces only: an existing one is found at the path jj recorded for
+it, so changing `workspaces` leaves the live ones where they are, and `start`, `finish` and the
+possession check still find them there.
 
 `consumers` records forge slugs, not checkout paths. Knives reads supported pin files from each
 consumer repository's trunk and caches that scan by the trunk commit. If the forge is unavailable,

@@ -17,30 +17,66 @@ use crate::detect::BookmarkTips;
 use crate::ids::{BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, WorkspaceName};
 use crate::jj::{
     Repo, StaleRegistration, WorkspaceIdentity, add_workspace, fetch_all, forget_workspace,
-    is_workspace_named, path_occupant, remove_finished_worktree, remove_prunable_worktree,
-    repo_immutable_heads, set_repo_immutable_heads, user_immutable_heads, workspace_identity,
-    workspace_recorded_elsewhere,
+    is_workspace_named, path_occupant, registered_workspace_path, remove_finished_worktree,
+    remove_prunable_worktree, repo_immutable_heads, set_repo_immutable_heads, user_immutable_heads,
+    workspace_identity, workspace_recorded_elsewhere,
 };
 use crate::ledger::{Ledger, Scribe};
 use crate::release_model::newest_release;
 use crate::seen;
 use crate::store::{Store, default_state_path};
 
-/// Where a branch's workspace goes: under the entry's workspace root, named for
-/// the branch with slashes flattened.
+/// Where `start` creates a new workspace for a branch: under the entry's
+/// workspace root, named for the branch with slashes flattened.
 ///
 /// Workspaces are cheap to create, well under a second, because tracked content
 /// is small even in a large checkout. The real cost is rebuilding language
 /// environments, not the checkout.
-pub fn workspace_path(fork: &Fork<'_>, branch: &BranchName) -> PathBuf {
+pub fn new_workspace_path(fork: &Fork<'_>, branch: &BranchName) -> PathBuf {
     fork.workspace_root().join(workspace_for(branch.as_str()))
+}
+
+/// Where a branch's workspace is: the path the repository recorded for its
+/// registered workspace, else where `start` would create it.
+///
+/// The configured root says where new workspaces go, not where existing ones
+/// are: changing `workspaces` moves only workspaces created afterwards, and
+/// every verb that finds an existing workspace (`start` resuming or rebuilding
+/// it, `finish`, the possession check) keeps finding one made under an earlier
+/// root, its directory vanished or not. A record that cannot be read is no
+/// answer, so the configured path stands in.
+pub fn workspace_path(fork: &Fork<'_>, branch: &BranchName) -> PathBuf {
+    locate_workspace(
+        &fork.checkout.path,
+        &workspace_for(branch.as_str()),
+        new_workspace_path(fork, branch),
+    )
+}
+
+/// The recorded path of `checkout`'s registered workspace `workspace`, else
+/// `fallback`. One exception: with nothing at the recorded path and this very
+/// workspace at `fallback`, it was moved there by hand, and `fallback` is where
+/// it is. A symbolic link at the recorded path counts as something there: what
+/// it is gets judged there.
+fn locate_workspace(checkout: &Path, workspace: &str, fallback: PathBuf) -> PathBuf {
+    let Some(recorded) = registered_workspace_path(checkout, workspace)
+        .ok()
+        .flatten()
+    else {
+        return fallback;
+    };
+    let vanished = std::fs::symlink_metadata(&recorded).is_err();
+    if vanished && is_workspace_named(&fallback, checkout, &WorkspaceName::new(workspace)) {
+        return fallback;
+    }
+    recorded
 }
 
 /// Whether the current directory is inside this branch's workspace.
 ///
 /// Possession is the one claim check that needs no identity: standing in the
 /// workspace is being the one working there. `cwd` is a physical path, so the
-/// configured directory is canonicalised before the comparison — a `workspaces`
+/// workspace's directory is canonicalised before the comparison — a path
 /// spelled through a symlink (a directory on another disk) never matched
 /// otherwise. And the directory must be this checkout's workspace of this name:
 /// with `workspaces` free to point anywhere, standing in a directory at the path
@@ -71,10 +107,11 @@ pub fn possesses(cwd: &Path, fork: &Fork<'_>, branch: &BranchName) -> bool {
 /// reached `jj workspace add --name default` and died on jj's raw "already
 /// exists".
 ///
-/// A `workspaces` directory inside the checkout is refused first: it puts every
-/// branch workspace in the working copy it belongs to, which is never what
-/// anyone meant. The registry cannot check it — the checkout is found, not
-/// stated — so the two verbs that would use the directory do. The directory is
+/// A `workspaces` directory inside the checkout is refused when the branch's
+/// workspace would be placed there: it puts every branch workspace in the
+/// working copy it belongs to, which is never what anyone meant. The registry
+/// cannot check it — the checkout is found, not stated — so the two verbs that
+/// would use the directory do. The directory is
 /// canonicalised when it exists, as the checkout already is, so a spelling
 /// through a symlink is judged by where it lands; one that does not exist yet
 /// has only its spelling.
@@ -84,7 +121,13 @@ pub fn collides_with_checkout(fork: &Fork<'_>, branch: &BranchName) -> Option<St
     let root = spelled
         .canonicalize()
         .unwrap_or_else(|_| spelled.to_owned());
-    if root.starts_with(checkout) {
+    let workspace = workspace_for(branch.as_str());
+    let configured = root.join(&workspace);
+    // An existing workspace is judged where it is; a new one where it would go.
+    // The root is judged only when it is used: a root set for future
+    // workspaces does not lock out one made under an earlier root.
+    let directory = locate_workspace(checkout, &workspace, configured.clone());
+    if directory == configured && root.starts_with(checkout) {
         return Some(format!(
             "[repos.{}] workspaces {} is inside the checkout {}; branch workspaces cannot \
              live in the working copy they belong to",
@@ -93,8 +136,6 @@ pub fn collides_with_checkout(fork: &Fork<'_>, branch: &BranchName) -> Option<St
             checkout.display()
         ));
     }
-    let workspace = workspace_for(branch.as_str());
-    let directory = root.join(&workspace);
     (workspace == "default" || checkout.starts_with(&directory)).then(|| {
         format!(
             "branch {branch} maps to workspace {workspace} at {}, which is the registered \
@@ -830,7 +871,7 @@ mod tests {
     #[test]
     fn a_workspace_is_a_sibling_named_for_the_branch() {
         let sibling = entry(None);
-        let path = workspace_path(
+        let path = new_workspace_path(
             &Fork::at("work", &sibling, Path::new("/home/u/forks/work/default")),
             &BranchName::new("feat/alpha"),
         );
@@ -842,7 +883,7 @@ mod tests {
         // A checkout at `~/<name>` has no `default` leaf to sit beside; without
         // this, every branch of every such repository would land in `~`.
         let configured = entry(Some("/home/u/.worktrees/work"));
-        let path = workspace_path(
+        let path = new_workspace_path(
             &Fork::at("work", &configured, Path::new("/home/u/work")),
             &BranchName::new("feat/alpha"),
         );
@@ -854,7 +895,7 @@ mod tests {
         // `feat/a/b` must not become three directories deep, or the workspace
         // lands somewhere nobody looks.
         let sibling = entry(None);
-        let path = workspace_path(
+        let path = new_workspace_path(
             &Fork::at("x", &sibling, Path::new("/repos/x/default")),
             &BranchName::new("feat/a/b"),
         );

@@ -547,17 +547,19 @@ fn start_refuses_a_branch_named_for_the_primary_workspace_under_a_configured_dir
 
 #[test]
 fn finish_leaves_a_symbolic_link_at_the_workspace_path_alone() {
-    // Given: a real workspace of this branch elsewhere, and a symbolic link to it
-    // at the derived path. `remove_dir_all` unlinks a symlink rather than
-    // following it; reporting that as "removed" would hide a live directory
-    // whose registration is gone.
+    // Given: a real workspace of this branch, moved away from the path jj
+    // recorded, and a symbolic link to it at that path. `remove_dir_all`
+    // unlinks a symlink rather than following it; reporting that as "removed"
+    // would hide a live directory whose registration is gone.
     let lab = Lab::new();
-    let (home, workspaces) = home_with_workspaces(&lab);
-    let elsewhere = home.path().join("elsewhere").join("feat-gamma");
-    knives::jj::add_workspace(&lab.work, "feat-gamma", &elsewhere, "main@upstream")
-        .expect("open the real workspace elsewhere");
-    std::fs::create_dir_all(&workspaces).expect("create workspaces directory");
-    std::os::unix::fs::symlink(&elsewhere, workspaces.join("feat-gamma")).expect("link");
+    let (home, _workspaces) = home_with_workspaces(&lab);
+    let recorded = home.path().join("elsewhere").join("feat-gamma");
+    let moved = home.path().join("moved").join("feat-gamma");
+    knives::jj::add_workspace(&lab.work, "feat-gamma", &recorded, "main@upstream")
+        .expect("open the real workspace");
+    std::fs::create_dir_all(moved.parent().expect("parent")).expect("create moved parent");
+    std::fs::rename(&recorded, &moved).expect("move the workspace");
+    std::os::unix::fs::symlink(&moved, &recorded).expect("link");
 
     // When: the branch is finished
     let finished = knives(
@@ -569,14 +571,14 @@ fn finish_leaves_a_symbolic_link_at_the_workspace_path_alone() {
     // Then: the link and its target survive, and the output says what it found
     assert!(finished.status.success(), "{finished:?}");
     assert!(
-        std::fs::symlink_metadata(workspaces.join("feat-gamma"))
+        std::fs::symlink_metadata(&recorded)
             .expect("link metadata")
             .file_type()
             .is_symlink(),
         "finish removed the link"
     );
     assert!(
-        elsewhere.join(".jj").is_dir(),
+        moved.join(".jj").is_dir(),
         "finish removed the link's target"
     );
     let stdout = String::from_utf8_lossy(&finished.stdout);
@@ -584,4 +586,266 @@ fn finish_leaves_a_symbolic_link_at_the_workspace_path_alone() {
         stdout.contains("symbolic link") && !stdout.contains("removed"),
         "finish misdescribed a symbolic link: {stdout}"
     );
+}
+
+/// Point the registry's `workspaces` at a second directory, as moving the root
+/// to another disk does, and return it.
+fn move_workspaces_root(lab: &Lab, home: &tempfile::TempDir) -> PathBuf {
+    let moved = home.path().join("elsewhere").join("demo");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\nupstream = \"{}\"\n\
+             origin = \"https://forge.invalid/acme/work.git\"\nworkspaces = \"{}\"\n",
+            lab.upstream.display(),
+            moved.display(),
+        ),
+    )
+    .expect("rewrite registry");
+    moved
+}
+
+#[test]
+fn a_workspace_made_under_an_earlier_root_is_still_found_where_it_is() {
+    // Given: feat/gamma started under root A, then the registry moved to root B
+    let lab = Lab::new();
+    let (home, old_root) = home_with_workspaces(&lab);
+    let started = start_gamma(&lab, &home);
+    assert!(started.status.success(), "{started:?}");
+    let workspace = old_root.join("feat-gamma");
+    assert!(workspace.is_dir(), "fixture: workspace not created");
+    let new_root = move_workspaces_root(&lab, &home);
+
+    // When: another identity starts the branch from inside the old workspace
+    let resumed = lab::knives_command(
+        &workspace,
+        home.path(),
+        lab.temp_path(),
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "take over",
+        ],
+    )
+    .env("KNIVES_OWNER", "ses_aaa111")
+    .output()
+    .expect("run knives");
+
+    // Then: standing in the workspace is possession, and nothing opened under B
+    assert!(
+        resumed.status.success(),
+        "start from inside the old workspace was refused: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(
+        !new_root.join("feat-gamma").exists(),
+        "start opened a second workspace under the new root"
+    );
+
+    // When: status runs
+    let status = knives(&lab, &home, &["--text", "status", "demo"]);
+
+    // Then: the workspace counts as the branch's, not an unnamed one
+    let shown = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        shown.contains("feat/gamma")
+            && !shown
+                .lines()
+                .any(|line| line.contains("not named for a branch") && line.contains("feat-gamma")),
+        "status lost the workspace: {shown}\n{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    // When: the branch is finished
+    let finished = knives(
+        &lab,
+        &home,
+        &[
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            "done",
+        ],
+    );
+
+    // Then: the workspace under A is removed and forgotten
+    assert!(
+        finished.status.success(),
+        "finish failed: {}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(
+        !workspace.exists(),
+        "finish left {}: {}",
+        workspace.display(),
+        String::from_utf8_lossy(&finished.stdout)
+    );
+    assert_eq!(workspaces_of(&lab.work), vec!["default".to_owned()]);
+
+    // When: the branch is started again
+    let restarted = start_gamma(&lab, &home);
+
+    // Then: the new workspace lands under B
+    assert!(restarted.status.success(), "{restarted:?}");
+    assert!(
+        is_workspace_named(&new_root.join("feat-gamma"), &lab.work, "feat-gamma"),
+        "the new workspace did not land under the new root"
+    );
+}
+
+#[test]
+fn a_vanished_workspace_under_an_earlier_root_is_rebuilt_and_finished_there() {
+    // Given: feat/gamma started under root A, its directory removed, and the
+    // registry moved to root B
+    let lab = Lab::new();
+    let (home, old_root) = home_with_workspaces(&lab);
+    let started = start_gamma(&lab, &home);
+    assert!(started.status.success(), "{started:?}");
+    let workspace = old_root.join("feat-gamma");
+    std::fs::remove_dir_all(&workspace).expect("remove the workspace directory");
+    let new_root = move_workspaces_root(&lab, &home);
+
+    // When: the printed rebuild runs
+    let rebuilt = knives(
+        &lab,
+        &home,
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            "rebuild",
+        ],
+    );
+
+    // Then: the workspace is rebuilt where jj recorded it, not under B
+    assert!(rebuilt.status.success(), "{rebuilt:?}");
+    assert!(
+        is_workspace_named(&workspace, &lab.work, "feat-gamma"),
+        "the rebuild did not restore {}",
+        workspace.display()
+    );
+    assert!(!new_root.join("feat-gamma").exists());
+
+    // When: its directory vanishes again and the branch is finished
+    std::fs::remove_dir_all(&workspace).expect("remove the workspace directory");
+    let finished = knives(
+        &lab,
+        &home,
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    // Then: the registration is forgotten
+    assert!(finished.status.success(), "{finished:?}");
+    let stdout = String::from_utf8_lossy(&finished.stdout);
+    assert!(
+        stdout.contains("workspace feat-gamma forgotten"),
+        "{stdout}"
+    );
+    assert_eq!(workspaces_of(&lab.work), vec!["default".to_owned()]);
+}
+
+#[test]
+fn a_forgotten_workspace_left_on_disk_is_not_found_by_its_stale_record() {
+    // Given: feat/gamma started under root A, forgotten with its directory
+    // kept (jj keeps the path in its store), and the registry moved to root B
+    let lab = Lab::new();
+    let (home, old_root) = home_with_workspaces(&lab);
+    let started = start_gamma(&lab, &home);
+    assert!(started.status.success(), "{started:?}");
+    let finished = knives(
+        &lab,
+        &home,
+        &[
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--no-cleanup",
+        ],
+    );
+    assert!(finished.status.success(), "{finished:?}");
+    let old = old_root.join("feat-gamma");
+    assert!(old.is_dir(), "fixture: directory not kept");
+    let new_root = move_workspaces_root(&lab, &home);
+
+    // When: the branch is started again
+    let restarted = start_gamma(&lab, &home);
+
+    // Then: the new workspace lands under B and the old directory is untouched
+    assert!(restarted.status.success(), "{restarted:?}");
+    assert!(is_workspace_named(
+        &new_root.join("feat-gamma"),
+        &lab.work,
+        "feat-gamma"
+    ));
+    assert!(old.is_dir(), "the old directory was touched");
+}
+
+#[test]
+fn a_root_inside_the_checkout_refuses_new_workspaces_only() {
+    // Given: feat/gamma started under root A, then the registry's root moved
+    // inside the checkout
+    let lab = Lab::new();
+    let (home, old_root) = home_with_workspaces(&lab);
+    let started = start_gamma(&lab, &home);
+    assert!(started.status.success(), "{started:?}");
+    let workspace = old_root.join("feat-gamma");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\nupstream = \"{}\"\n\
+             origin = \"https://forge.invalid/acme/work.git\"\nworkspaces = \"{}\"\n",
+            lab.upstream.display(),
+            lab.work.join("future-workspaces").display(),
+        ),
+    )
+    .expect("rewrite registry");
+
+    // When: the existing branch is resumed, and a new branch is started
+    let resumed = start_gamma(&lab, &home);
+    let fresh = knives(
+        &lab,
+        &home,
+        &[
+            "--text",
+            "start",
+            "feat/delta",
+            "--repo",
+            "demo",
+            "--why",
+            "new",
+        ],
+    );
+
+    // Then: the existing one opens where it is; the new one is refused
+    assert!(resumed.status.success(), "{resumed:?}");
+    assert!(!fresh.status.success(), "{fresh:?}");
+    assert!(
+        String::from_utf8_lossy(&fresh.stderr).contains("is inside the checkout"),
+        "{fresh:?}"
+    );
+
+    // When: the existing branch is finished
+    let finished = knives(
+        &lab,
+        &home,
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    // Then: it is removed from where it is
+    assert!(finished.status.success(), "{finished:?}");
+    assert!(!workspace.exists(), "finish left {}", workspace.display());
 }
