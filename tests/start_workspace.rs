@@ -741,9 +741,9 @@ fn recorded_workspace_root(lab: &Lab, name: &str) -> String {
 }
 
 #[test]
-fn the_printed_rebuild_refuses_a_same_named_workspace_registered_elsewhere() {
-    // Given: the branch's directory is gone, and its workspace name now lives at
-    // another path Q (an old `workspaces` root, or one added by hand)
+fn the_printed_rebuild_opens_the_workspace_where_jj_recorded_it() {
+    // Given: nothing at the branch's derived path, and its workspace registered
+    // at another path Q (made under an earlier `workspaces` root)
     let lab = Lab::new();
     let (home, _consumer) = release_test_home(&lab);
     let started = knives_start(&lab, &home, "feat/alpha");
@@ -762,16 +762,11 @@ fn the_printed_rebuild_refuses_a_same_named_workspace_registered_elsewhere() {
         .output()
         .expect("run the rebuild");
 
-    // Then: it refuses, names both paths, and the workspace at Q is untouched
-    let stderr = String::from_utf8_lossy(&rebuilt.stderr);
-    assert!(!rebuilt.status.success(), "{stderr}");
-    assert!(
-        stderr.contains(&format!(
-            "workspace feat-alpha is registered at {recorded}, not {}; finish or forget it there",
-            workspace.display()
-        )),
-        "{stderr}"
-    );
+    // Then: it opens the workspace at Q, which stays registered there, and
+    // creates nothing at the derived path
+    let stdout = String::from_utf8_lossy(&rebuilt.stdout);
+    assert!(rebuilt.status.success(), "{rebuilt:?}");
+    assert!(stdout.contains(&recorded), "{stdout}");
     assert_eq!(recorded_workspace_root(&lab, "feat-alpha"), recorded);
     assert!(
         git_worktrees(&lab.work).contains(&format!("worktree {recorded}")),
@@ -781,7 +776,7 @@ fn the_printed_rebuild_refuses_a_same_named_workspace_registered_elsewhere() {
     assert!(elsewhere.join(".jj").is_dir());
     assert!(
         !workspace.exists(),
-        "the rebuild created the workspace anyway"
+        "the rebuild created a second workspace at the derived path"
     );
 }
 
