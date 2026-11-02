@@ -37,27 +37,39 @@ pub fn new_workspace_path(fork: &Fork<'_>, branch: &BranchName) -> PathBuf {
 }
 
 /// Where a branch's workspace is: the path the repository recorded for its
-/// registered workspace while something is there, else where `start` would
-/// create it.
+/// registered workspace, else where `start` would create it.
 ///
 /// The configured root says where new workspaces go, not where existing ones
 /// are: changing `workspaces` moves only workspaces created afterwards, and
-/// every verb that finds an existing workspace (`start` resuming it, `finish`,
-/// the possession check) keeps finding one made under an earlier root. A
-/// record that cannot be read, or names a path with nothing at it (a
-/// workspace moved by hand), is no answer, so the configured path stands in.
+/// every verb that finds an existing workspace (`start` resuming or rebuilding
+/// it, `finish`, the possession check) keeps finding one made under an earlier
+/// root, its directory vanished or not. A record that cannot be read is no
+/// answer, so the configured path stands in.
 pub fn workspace_path(fork: &Fork<'_>, branch: &BranchName) -> PathBuf {
-    existing_workspace_path(&fork.checkout.path, &workspace_for(branch.as_str()))
-        .unwrap_or_else(|| new_workspace_path(fork, branch))
+    locate_workspace(
+        &fork.checkout.path,
+        &workspace_for(branch.as_str()),
+        new_workspace_path(fork, branch),
+    )
 }
 
-/// The recorded path of `checkout`'s registered workspace `workspace`, when
-/// something is at it. A symbolic link counts: what it is gets judged there.
-fn existing_workspace_path(checkout: &Path, workspace: &str) -> Option<PathBuf> {
-    registered_workspace_path(checkout, workspace)
+/// The recorded path of `checkout`'s registered workspace `workspace`, else
+/// `fallback`. One exception: with nothing at the recorded path and this very
+/// workspace at `fallback`, it was moved there by hand, and `fallback` is where
+/// it is. A symbolic link at the recorded path counts as something there: what
+/// it is gets judged there.
+fn locate_workspace(checkout: &Path, workspace: &str, fallback: PathBuf) -> PathBuf {
+    let Some(recorded) = registered_workspace_path(checkout, workspace)
         .ok()
         .flatten()
-        .filter(|path| std::fs::symlink_metadata(path).is_ok())
+    else {
+        return fallback;
+    };
+    let vanished = std::fs::symlink_metadata(&recorded).is_err();
+    if vanished && is_workspace_named(&fallback, checkout, &WorkspaceName::new(workspace)) {
+        return fallback;
+    }
+    recorded
 }
 
 /// Whether the current directory is inside this branch's workspace.
@@ -119,8 +131,7 @@ pub fn collides_with_checkout(fork: &Fork<'_>, branch: &BranchName) -> Option<St
     }
     let workspace = workspace_for(branch.as_str());
     // An existing workspace is judged where it is; a new one where it would go.
-    let directory =
-        existing_workspace_path(checkout, &workspace).unwrap_or_else(|| root.join(&workspace));
+    let directory = locate_workspace(checkout, &workspace, root.join(&workspace));
     (workspace == "default" || checkout.starts_with(&directory)).then(|| {
         format!(
             "branch {branch} maps to workspace {workspace} at {}, which is the registered \

@@ -696,3 +696,96 @@ fn a_workspace_made_under_an_earlier_root_is_still_found_where_it_is() {
         "the new workspace did not land under the new root"
     );
 }
+
+#[test]
+fn a_vanished_workspace_under_an_earlier_root_is_rebuilt_and_finished_there() {
+    // Given: feat/gamma started under root A, its directory removed, and the
+    // registry moved to root B
+    let lab = Lab::new();
+    let (home, old_root) = home_with_workspaces(&lab);
+    let started = start_gamma(&lab, &home);
+    assert!(started.status.success(), "{started:?}");
+    let workspace = old_root.join("feat-gamma");
+    std::fs::remove_dir_all(&workspace).expect("remove the workspace directory");
+    let new_root = move_workspaces_root(&lab, &home);
+
+    // When: the printed rebuild runs
+    let rebuilt = knives(
+        &lab,
+        &home,
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            "rebuild",
+        ],
+    );
+
+    // Then: the workspace is rebuilt where jj recorded it, not under B
+    assert!(rebuilt.status.success(), "{rebuilt:?}");
+    assert!(
+        is_workspace_named(&workspace, &lab.work, "feat-gamma"),
+        "the rebuild did not restore {}",
+        workspace.display()
+    );
+    assert!(!new_root.join("feat-gamma").exists());
+
+    // When: its directory vanishes again and the branch is finished
+    std::fs::remove_dir_all(&workspace).expect("remove the workspace directory");
+    let finished = knives(
+        &lab,
+        &home,
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    // Then: the registration is forgotten
+    assert!(finished.status.success(), "{finished:?}");
+    let stdout = String::from_utf8_lossy(&finished.stdout);
+    assert!(
+        stdout.contains("workspace feat-gamma forgotten"),
+        "{stdout}"
+    );
+    assert_eq!(workspaces_of(&lab.work), vec!["default".to_owned()]);
+}
+
+#[test]
+fn a_forgotten_workspace_left_on_disk_is_not_found_by_its_stale_record() {
+    // Given: feat/gamma started under root A, forgotten with its directory
+    // kept (jj keeps the path in its store), and the registry moved to root B
+    let lab = Lab::new();
+    let (home, old_root) = home_with_workspaces(&lab);
+    let started = start_gamma(&lab, &home);
+    assert!(started.status.success(), "{started:?}");
+    let finished = knives(
+        &lab,
+        &home,
+        &[
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--no-cleanup",
+        ],
+    );
+    assert!(finished.status.success(), "{finished:?}");
+    let old = old_root.join("feat-gamma");
+    assert!(old.is_dir(), "fixture: directory not kept");
+    let new_root = move_workspaces_root(&lab, &home);
+
+    // When: the branch is started again
+    let restarted = start_gamma(&lab, &home);
+
+    // Then: the new workspace lands under B and the old directory is untouched
+    assert!(restarted.status.success(), "{restarted:?}");
+    assert!(is_workspace_named(
+        &new_root.join("feat-gamma"),
+        &lab.work,
+        "feat-gamma"
+    ));
+    assert!(old.is_dir(), "the old directory was touched");
+}
