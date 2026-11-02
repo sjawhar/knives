@@ -849,16 +849,19 @@ pub fn body_human_text(text: &str) -> String {
 ///
 /// A problem often quotes jj or git, which print more than one line (jj's
 /// "Concurrent modification detected" before its error, git's "Another git
-/// process" sentence). Each non-blank line is trimmed and the lines are joined
-/// with `; `, then escaped as [`inline_human_text`] escapes them, so a line
-/// break reads as a separator instead of U+FFFD.
+/// process" sentence). Each non-blank line is trimmed. A line that starts
+/// lower-case continues the sentence git wrapped, so it joins with a space;
+/// every other line joins with `; `. The result is escaped as
+/// [`inline_human_text`] escapes it, so a line break never reads as U+FFFD.
 pub fn problem_human_text(text: &str) -> String {
-    let joined = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("; ");
+    let mut joined = String::with_capacity(text.len());
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if !joined.is_empty() {
+            let continues = line.starts_with(char::is_lowercase);
+            joined.push_str(if continues { " " } else { "; " });
+        }
+        joined.push_str(line);
+    }
     inline_human_text(&joined)
 }
 

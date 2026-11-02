@@ -915,6 +915,45 @@ mod tests {
              Hint: run \u{fffd}[31mit\u{fffd}[0m again"
         );
     }
+
+    #[test]
+    fn a_wrapped_sentence_in_a_problem_stays_one_sentence() {
+        // git wraps its advice at about 60 columns; a line that continues a
+        // sentence starts lower-case and joins with a space, not "; ".
+        let report = Report {
+            repo: "demo".to_owned(),
+            problems: vec![
+                "could not fetch foreign #7: command `git` failed (exit status: 1): \
+                 error: cannot lock ref 'refs/heads/pull/7': Unable to create \
+                 '/r/.git/refs/heads/pull/7.lock': File exists.\n\n\
+                 Another git process seems to be running in this repository, e.g.\n\
+                 an editor opened by 'git commit'. Please make sure all processes\n\
+                 are terminated then try again. If it still fails, a git process\n\
+                 may have crashed in this repository earlier:\n\
+                 remove the file manually to continue.\n\
+                 From /r/upstream\n \
+                 ! c242436..08646eb  refs/pull/7/head -> pull/7  (unable to update local ref)"
+                    .to_owned(),
+            ],
+            ..Report::default()
+        };
+
+        let text = render(&report);
+        let problem = text.lines().next().unwrap_or_default();
+        assert_eq!(
+            problem,
+            "? could not fetch foreign #7: command `git` failed (exit status: 1): \
+             error: cannot lock ref 'refs/heads/pull/7': Unable to create \
+             '/r/.git/refs/heads/pull/7.lock': File exists.; \
+             Another git process seems to be running in this repository, e.g. \
+             an editor opened by 'git commit'. Please make sure all processes \
+             are terminated then try again. If it still fails, a git process \
+             may have crashed in this repository earlier: \
+             remove the file manually to continue.; \
+             From /r/upstream; \
+             ! c242436..08646eb  refs/pull/7/head -> pull/7  (unable to update local ref)"
+        );
+    }
     #[test]
     fn cache_write_failure_is_a_note_and_does_not_make_sync_incomplete() {
         // A cache write happens after the live batch; losing it must not change
