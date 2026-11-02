@@ -37,7 +37,8 @@ use knives::forge::Forge;
 use knives::forge::github::CliForge;
 use knives::ids::{BranchName, UpstreamName};
 use knives::ledger::{Ledger, Scribe};
-use knives::store::{Store, default_state_path};
+use knives::lock::LockError;
+use knives::store::{Store, StoreError, default_state_path};
 use release_carries::{run_release_census, run_release_members, run_revision_carries};
 use release_cut::{ReleaseInvocation, run_reap, run_release};
 use release_edit::{ReleaseEdit, run_release_edit};
@@ -541,18 +542,20 @@ fn open_store_for(
     })
 }
 
-/// [`open_store_for`] for a report that writes the state file.
+/// [`open_store_for`] for a report that writes the state file, opened for
+/// update of `fork` alone ([`Store::open_for_update`]), as one row of a
+/// report of `many` rows or of one.
 fn open_store_for_update(
     registry: &Registry,
-    chosen: &[Selected<'_>],
-    forks: &[&UpstreamName],
-) -> anyhow::Result<Store> {
+    many: bool,
+    fork: &UpstreamName,
+) -> Result<Store, StoreError> {
     let former = registry.former_names();
-    Ok(if chosen.len() > 1 {
-        Store::open_each_for_update(default_state_path(), &former, forks)?
+    if many {
+        Store::open_each_for_update(default_state_path(), &former, &[fork])
     } else {
-        Store::open_for_update(default_state_path(), &former, forks)?
-    })
+        Store::open_for_update(default_state_path(), &former, &[fork])
+    }
 }
 
 /// The problem a fork's row carries when its ledger could not be read.
@@ -775,7 +778,10 @@ fn run_status(ground: Ground<'_>, view: StatusView<'_>) -> anyhow::Result<Exit> 
 
 fn run_preflight(registry: &Registry, fork: &Fork<'_>) -> anyhow::Result<Exit> {
     // Convention digests and claims only: no branch statement is asked about.
-    let mut store = Store::open_for_update(default_state_path(), &registry.former_names(), &[])?;
+    // A digest records what this run read, whatever another run decided, so
+    // no fork's lock is held across the forge calls below; the save replays
+    // the digests onto the file as it is then.
+    let mut store = Store::open(default_state_path(), &registry.former_names(), &[])?;
     let forge = CliForge;
     let cache_root = knives::forge_cache::cache_root();
     let report = preflight::gather(preflight::GatherInput {
@@ -806,8 +812,8 @@ fn run_sync(
         upstream: upstream.as_ref(),
     };
     let forks = placed(&chosen);
+    let many = chosen.len() > 1;
     let pulled = knives::ledger_sweep::pull(registry, &forks);
-    let mut store = open_store_for_update(registry, &chosen, &forks)?;
     let cli_forge = CliForge;
     let forge = use_forge.then_some(&cli_forge as &dyn Forge);
     let cache_root = knives::forge_cache::cache_root();
@@ -818,39 +824,73 @@ fn run_sync(
         // A repository that cannot be synced is still a row in the document,
         // carrying the error as a problem; the repositories before it already
         // fetched and wrote their events, and their rows are not lost to it.
-        let mut report = match chosen {
-            Selected::Bound(fork) if store.unreadable(&fork.upstream).is_some() => sync::Report {
-                repo: fork.name.to_string(),
-                problems: unreadable_problem(&store, &fork.upstream)
-                    .into_iter()
-                    .collect(),
-                ..sync::Report::default()
-            },
-            Selected::Bound(fork) => scribe_for(fork, bound)
-                .and_then(|scribe| {
-                    sync::sync_repo(sync::SyncInput {
-                        fork,
-                        store: &mut store,
-                        forge,
-                        scribe: &scribe,
-                        cache: cache_root.as_deref(),
-                    })
-                })
-                .unwrap_or_else(|error| sync::Report {
-                    repo: fork.name.to_string(),
-                    problems: vec![format!("could not sync: {error:#}")],
+        // Each fork is synced under its own lock, opened for that fork alone,
+        // so a sync of every fork keeps no fork waiting past its own row.
+        let (mut report, store) = match chosen {
+            Selected::Bound(fork) => {
+                match open_store_for_update(registry, many, &fork.upstream) {
+                    Ok(mut store) => {
+                        let report = if store.unreadable(&fork.upstream).is_some() {
+                            sync::Report {
+                                repo: fork.name.to_string(),
+                                problems: unreadable_problem(&store, &fork.upstream)
+                                    .into_iter()
+                                    .collect(),
+                                ..sync::Report::default()
+                            }
+                        } else {
+                            scribe_for(fork, bound)
+                                .and_then(|scribe| {
+                                    sync::sync_repo(sync::SyncInput {
+                                        fork,
+                                        store: &mut store,
+                                        forge,
+                                        scribe: &scribe,
+                                        cache: cache_root.as_deref(),
+                                    })
+                                })
+                                .unwrap_or_else(|error| sync::Report {
+                                    repo: fork.name.to_string(),
+                                    problems: vec![format!("could not sync: {error:#}")],
+                                    ..sync::Report::default()
+                                })
+                        };
+                        (report, Some(store))
+                    }
+                    // A fork whose store could not be opened is that fork's
+                    // row when there are others: the forks before it already
+                    // synced and wrote, and their rows are not lost to it.
+                    // Another writer keeping the fork past the wait is such a
+                    // row even alone; the next run may sync it.
+                    Err(error)
+                        if many || matches!(error, StoreError::Lock(LockError::Held { .. })) =>
+                    {
+                        (
+                            sync::Report {
+                                repo: fork.name.to_string(),
+                                problems: vec![format!("could not sync: {error}")],
+                                ..sync::Report::default()
+                            },
+                            None,
+                        )
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Selected::Unplaced { name, problem, .. } => (
+                sync::Report {
+                    repo: name.to_string(),
+                    problems: vec![problem.clone()],
                     ..sync::Report::default()
-                }),
-            Selected::Unplaced { name, problem, .. } => sync::Report {
-                repo: name.to_string(),
-                problems: vec![problem.clone()],
-                ..sync::Report::default()
-            },
+                },
+                None,
+            ),
         };
         let upstream = chosen.upstream();
-        report
-            .problems
-            .extend(pulled.problems_with_store(&store, &upstream));
+        report.problems.extend(store.as_ref().map_or_else(
+            || pulled.problems_for(&upstream),
+            |store| pulled.problems_with_store(store, &upstream),
+        ));
         worst = worst.worst(sync::exit_for(&report));
         reports.push(report);
     }

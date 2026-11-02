@@ -137,6 +137,10 @@ pub fn run(
         eprintln!("{repo_name}: {line}");
         return Ok(Exit::Usage);
     }
+    // Holds this fork's lock, and only this fork's, until the command ends:
+    // another `start` on the fork waits and then decides from this
+    // one's claim, while a `start` on any other fork runs alongside. The state
+    // file's lock is taken only by the save that records the claim.
     let mut store = Store::open_for_update(
         default_state_path(),
         &bound.registry.former_names(),

@@ -57,7 +57,19 @@ impl Lab {
     }
 
     pub(crate) fn with_trunk(trunk: &str) -> Self {
-        let temp = TempDir::new().expect("create lab directory");
+        Self::build(TempDir::new().expect("create lab directory"), trunk)
+    }
+
+    /// [`Self::new`] in a directory under `parent`, so that one scan root
+    /// (`HOME`) holds the checkouts of several labs, each its own fork.
+    pub(crate) fn new_in(parent: &Path) -> Self {
+        Self::build(
+            TempDir::new_in(parent).expect("create lab directory"),
+            "main",
+        )
+    }
+
+    fn build(temp: TempDir, trunk: &str) -> Self {
         let upstream = temp.path().join("upstream.git");
         let origin = temp.path().join("origin.git");
         let seed = temp.path().join("seed");

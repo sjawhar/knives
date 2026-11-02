@@ -45,8 +45,11 @@ Claims the branch and opens a jj workspace.
 
 - The holder identity is `KNIVES_OWNER` (from the OpenCode plugin), `CLAUDE_CODE_SESSION_ID` or `OMP_SESSION_ID`. Two agents under one OS user are separate claimants. The second `start` refuses with the holder's name.
 - With no harness identity, the claim is anonymous (`<user>/os-user`) and resumes only inside its own workspace. Status shows `<id>/<kind>`.
-- `start`, `finish`, `track` and `depends` wait up to one minute for one claim-store lock. Pauses start at 20 ms and double to 2 s, with jitter. A paused `start` can be in a queue.
-- The OS advisory lock on `state.lock` ends with its process, also on SIGKILL, Ctrl-C or panic. **Never remove the file.** A held lock belongs to a running process.
+- `start`, `finish`, `track`, `depends` and `sync` hold the lock of the fork they act on (`fork-locks/<upstream>.lock` beside `state.json`) while they work. Another of these commands on the same fork waits up to one minute for it. Pauses start at 20 ms and double to 2 s, with jitter. A paused `start` can be in a queue. A command on another fork does not wait.
+- The write to `state.json` takes `state.lock` only for that write. It also waits up to one minute.
+- The OS advisory lock on a lock file ends with its process, also on SIGKILL, Ctrl-C or panic. **Never remove a lock file.** A held lock belongs to a running process.
+- If a claim changed while a command ran (an older knives, or a hand edit), the save writes nothing to `state.json` and the command exits `3`. The workspace and the ledger event that the command made before the save stay. Run `knives status` before you run the command again.
+- A knives older than the fork locks takes only `state.lock`. Do not run it at the same time as this one.
 - When the one-minute wait runs out, the command exits `3` and names the holder:
 
 ```text

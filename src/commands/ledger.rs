@@ -21,8 +21,8 @@ use crate::ledger::{Draft, Ledger, Scribe, Stated, inline_human_text, unmigrated
 use crate::ledger_sweep::{self, Contended, Swept, Tally, Waited};
 use crate::lock::FileLock;
 use crate::statement::{Statement, StatementKind, Statements};
-use crate::store::Store;
 use crate::store::migration::{LegacyStatement, Renamed, renamed};
+use crate::store::{Store, lock_forks};
 
 /// What became of a sweep run by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -300,6 +300,24 @@ pub fn migrate(
     owner: &str,
     dry_run: bool,
 ) -> anyhow::Result<Migrated> {
+    // Every registered fork's lock first, in the order writers take theirs: a
+    // writer holds its fork's lock from before it reads the fork's ledger
+    // until it is done, so none reads a ledger directory this run is moving.
+    let upstreams: Vec<UpstreamName> = registry.as_ref().map_or_else(
+        |_| Vec::new(),
+        |registry| {
+            registry
+                .repos
+                .iter()
+                .map(|(key, entry)| entry.upstream_name(key))
+                .collect()
+        },
+    );
+    let _forks = if dry_run {
+        Vec::new()
+    } else {
+        lock_forks(state_path, &upstreams.iter().collect::<Vec<_>>())?
+    };
     let lock = (!dry_run)
         .then(|| FileLock::acquire(state_path, crate::lock::LockWait::CLAIM))
         .transpose()?;

@@ -131,6 +131,17 @@ pub enum StoreError {
         path.display()
     )]
     FormerNames { path: PathBuf, held: String },
+    #[error(
+        "the claim on {key} changed while this command ran ({now}); nothing was written to {}, \
+         but what the command did before (a workspace, a ledger event) stays. Read `knives \
+         status`, then run the command again to decide from the claim as it is now",
+        path.display()
+    )]
+    ClaimMoved {
+        path: PathBuf,
+        key: String,
+        now: String,
+    },
     #[error(transparent)]
     Lock(#[from] LockError),
     #[error(transparent)]
@@ -142,6 +153,33 @@ pub enum StoreError {
     },
 }
 
+/// One change a writer made to the state, replayed onto the file as it is when
+/// the store saves ([`Store::save`]).
+type Change = Box<dyn Fn(&mut State, &Path) -> Result<(), StoreError> + Send + Sync>;
+
+/// How a store's save reaches the file.
+enum Writes {
+    /// Each change since the last save, replayed in order onto the file as
+    /// it is at the save, under the state file's lock taken for that one
+    /// write. Another fork's writer, or a report recording what it saw, may
+    /// have saved since this store read the file; a whole-file write from what
+    /// this store read would erase what they wrote.
+    Replayed(Vec<Change>),
+    /// `knives ledger migrate`'s rewrite of the whole file: its renames are
+    /// not changes to replay. The state file's lock, held since the open
+    /// (none for a dry run, which never saves), keeps every other save out.
+    Whole(Option<FileLock>),
+}
+
+impl std::fmt::Debug for Writes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Replayed(changes) => write!(formatter, "Replayed({} changes)", changes.len()),
+            Self::Whole(lock) => formatter.debug_tuple("Whole").field(lock).finish(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Store {
     path: PathBuf,
@@ -151,9 +189,11 @@ pub struct Store {
     /// store opened for a report of many forks keeps one it could not read
     /// ([`Store::open_each`]); every other open fails on it.
     ledgers: BTreeMap<UpstreamName, Result<ForkLedger, LedgerError>>,
-    /// Present only for a store opened to be written. Held, not read: its whole
-    /// job is to exist until this value is dropped.
-    _lock: Option<FileLock>,
+    writes: Writes,
+    /// The lock on each fork a store opened for update was opened for
+    /// ([`Store::open_for_update`]). Held, not read: its whole job is to exist
+    /// until this value is dropped.
+    _forks: Vec<FileLock>,
 }
 
 /// What one read of a fork's ledger gave the store ([`Ledger::read`]).
@@ -169,7 +209,11 @@ struct ForkLedger {
 }
 
 impl Store {
-    /// Read-only. Cannot block another agent.
+    /// Takes no lock to open, so it cannot block another agent. A change
+    /// made on it is replayed at [`Store::save`] onto the file as it is then,
+    /// so it loses no other writer's change; a writer whose change follows
+    /// from what it read must not race another such writer, and opens
+    /// [`Store::open_for_update`] instead.
     ///
     /// `former` is what the caller's registry says each fork was once kept
     /// under ([`crate::config::Registry::former_names`]), for the refusal of
@@ -185,19 +229,28 @@ impl Store {
         former: &FormerNames,
         repos: &[&UpstreamName],
     ) -> Result<Self, StoreError> {
-        Self::read(path, repos, None)?.migrated(former)?.all_read()
+        Self::read(path, repos, Writes::Replayed(Vec::new()), Vec::new())?
+            .migrated(former)?
+            .all_read()
     }
 
-    /// For a read-modify-write. Holds the lock until dropped, and waits the
-    /// full claim-writer budget ([`LockWait::CLAIM`]) for another writer.
-    /// `former` and `repos` as for [`Store::open`].
+    /// For a decision about `repos` and the write that records it: a claim
+    /// taken or released, a statement replacing the one before it, an event
+    /// for a pull request state that changed since the last one. Takes the
+    /// lock of each fork in `repos` before reading anything and holds it until
+    /// dropped, so another writer about the same fork waits for this one and
+    /// then reads what it wrote; it waits the full claim-writer budget
+    /// ([`LockWait::CLAIM`]) for one. A fork's lock keeps out no writer about
+    /// any other fork: the state file's own lock is taken only by
+    /// [`Store::save`], for the one write. `former` and `repos` as for
+    /// [`Store::open`].
     pub fn open_for_update(
         path: PathBuf,
         former: &FormerNames,
         repos: &[&UpstreamName],
     ) -> Result<Self, StoreError> {
-        let lock = FileLock::acquire(&path, LockWait::CLAIM)?;
-        Self::read(path, repos, Some(lock))?
+        let forks = lock_forks(&path, repos)?;
+        Self::read(path, repos, Writes::Replayed(Vec::new()), forks)?
             .migrated(former)?
             .all_read()
     }
@@ -212,7 +265,7 @@ impl Store {
         former: &FormerNames,
         repos: &[&UpstreamName],
     ) -> Result<Self, StoreError> {
-        Self::read(path, repos, None)?.migrated(former)
+        Self::read(path, repos, Writes::Replayed(Vec::new()), Vec::new())?.migrated(former)
     }
 
     /// [`Store::open_for_update`] as [`Store::open_each`] opens a store.
@@ -221,8 +274,8 @@ impl Store {
         former: &FormerNames,
         repos: &[&UpstreamName],
     ) -> Result<Self, StoreError> {
-        let lock = FileLock::acquire(&path, LockWait::CLAIM)?;
-        Self::read(path, repos, Some(lock))?.migrated(former)
+        let forks = lock_forks(&path, repos)?;
+        Self::read(path, repos, Writes::Replayed(Vec::new()), forks)?.migrated(former)
     }
 
     /// Refuse a store that could not read one of the ledgers it was opened
@@ -292,54 +345,55 @@ impl Store {
     fn read(
         path: PathBuf,
         repos: &[&UpstreamName],
-        lock: Option<FileLock>,
+        writes: Writes,
+        forks: Vec<FileLock>,
     ) -> Result<Self, StoreError> {
-        let state = if path.exists() {
-            let text = std::fs::read_to_string(&path).map_err(|source| StoreError::Read {
-                path: path.clone(),
-                source,
-            })?;
-            serde_json::from_str(&text).map_err(|source| StoreError::Parse {
-                path: path.clone(),
-                source,
-            })?
-        } else {
-            State::default()
-        };
+        let state = read_state(&path)?;
         let ledgers = read_ledgers(&path.with_file_name("ledger"), repos);
         Ok(Self {
             path,
             state,
             ledgers,
-            _lock: lock,
+            writes,
+            _forks: forks,
         })
     }
 
-    /// Write atomically, so a crash mid-write cannot truncate the file and a
-    /// concurrent reader never sees a half-written document.
-    pub fn save(&self) -> Result<(), StoreError> {
-        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent).map_err(|source| StoreError::Write {
-            path: parent.to_owned(),
-            source,
-        })?;
-        let mut temp =
-            tempfile::NamedTempFile::new_in(parent).map_err(|source| StoreError::Write {
-                path: parent.to_owned(),
-                source,
-            })?;
-        let text = serde_json::to_string_pretty(&self.state)?;
-        temp.write_all(text.as_bytes())
-            .and_then(|()| temp.write_all(b"\n"))
-            .map_err(|source| StoreError::Write {
-                path: self.path.clone(),
-                source,
-            })?;
-        temp.persist(&self.path)
-            .map_err(|error| StoreError::Write {
-                path: self.path.clone(),
-                source: error.error,
-            })?;
+    /// Record `change`: apply it to what this store answers from now, and
+    /// keep it for the save to replay.
+    fn change(&mut self, change: Change) {
+        // Applied to what this store itself read and changed, a change finds
+        // what it expects: only a save, onto the file as it is by then, can
+        // find the file moved.
+        let _ = change(&mut self.state, &self.path);
+        if let Writes::Replayed(changes) = &mut self.writes {
+            changes.push(change);
+        }
+    }
+
+    /// Write what this store changed. Each change is replayed onto the
+    /// state file as it is now, under the state file's lock held only for
+    /// this read and write, so a change another writer saved since this
+    /// store opened survives; a store that changed nothing writes nothing.
+    /// A claim another writer moved since this store read it fails the
+    /// whole save ([`StoreError::ClaimMoved`]), and nothing is written.
+    ///
+    /// The write is atomic, so a crash mid-write cannot truncate the file and
+    /// a concurrent reader never sees a half-written document.
+    pub fn save(&mut self) -> Result<(), StoreError> {
+        let changes = match &mut self.writes {
+            Writes::Whole(_) => return write_state(&self.path, &self.state),
+            Writes::Replayed(changes) if changes.is_empty() => return Ok(()),
+            Writes::Replayed(changes) => changes,
+        };
+        let _lock = FileLock::acquire(&self.path, LockWait::CLAIM)?;
+        let mut state = read_state(&self.path)?;
+        for change in changes.iter() {
+            change(&mut state, &self.path)?;
+        }
+        write_state(&self.path, &state)?;
+        changes.clear();
+        self.state = state;
         Ok(())
     }
 
@@ -353,12 +407,47 @@ impl Store {
             started: jiff::Timestamp::now().to_string(),
             files: Vec::new(),
         };
-        let _ = self.state.claims.insert(record.key(), record.clone());
+        self.set_claim(record.key(), Some(record.clone()));
         record
     }
 
     pub fn release_claim(&mut self, target: &BranchTarget) -> bool {
-        self.state.claims.remove(&target.key()).is_some()
+        let key = target.key();
+        let had = self.state.claims.contains_key(&key);
+        if had {
+            self.set_claim(key, None);
+        }
+        had
+    }
+
+    /// Put `next` in place of the claim at `key` that this store holds now.
+    /// The decision to take or release a claim was made from that one, so
+    /// the save refuses when the file holds another: a writer that bypassed
+    /// the fork's lock (an older knives, a hand edit) moved it meanwhile.
+    fn set_claim(&mut self, key: String, next: Option<Claim>) {
+        let read = self.state.claims.get(&key).cloned();
+        self.change(Box::new(move |state, path| {
+            let now = state.claims.get(&key);
+            if now != read.as_ref() {
+                return Err(StoreError::ClaimMoved {
+                    path: path.to_owned(),
+                    key: key.clone(),
+                    now: now.map_or_else(
+                        || "now unheld".to_owned(),
+                        |claim| format!("now held by {}", claim.owner),
+                    ),
+                });
+            }
+            match &next {
+                Some(claim) => {
+                    let _ = state.claims.insert(key.clone(), claim.clone());
+                }
+                None => {
+                    let _ = state.claims.remove(&key);
+                }
+            }
+            Ok(())
+        }));
     }
 
     pub fn claims(&self, repo: Option<&UpstreamName>) -> Vec<&Claim> {
@@ -390,10 +479,11 @@ impl Store {
     }
 
     pub fn record_foreign_parent(&mut self, repo: &UpstreamName, number: u64, why: &str) {
-        let _ = self
-            .state
-            .foreign_parents
-            .insert(format!("{repo}/{number}"), why.to_owned());
+        let (key, why) = (format!("{repo}/{number}"), why.to_owned());
+        self.change(Box::new(move |state, _| {
+            let _ = state.foreign_parents.insert(key.clone(), why.clone());
+            Ok(())
+        }));
     }
 
     /// Pull request numbers we carry as release parents but did not author.
@@ -443,8 +533,9 @@ impl Store {
 
     /// The stamp of the live statement of `kind` about `target`, which a
     /// statement replacing it is stamped after ([`crate::ledger::Stated::replaces`]).
-    /// Read from a store opened for update, it is the newest this machine
-    /// has while it holds the lock its writers take.
+    /// Read from a store opened for update of `target`'s fork, it is the
+    /// newest this machine has while it holds the fork's lock its writers
+    /// take ([`Store::open_for_update`]).
     pub fn statement_stamp(
         &self,
         target: &BranchTarget,
@@ -514,10 +605,11 @@ impl Store {
     }
 
     pub fn record_convention_digest(&mut self, repo: &UpstreamName, file: &str, digest: &str) {
-        let _ = self
-            .state
-            .conventions
-            .insert(format!("{repo}/{file}"), digest.to_owned());
+        let (key, digest) = (format!("{repo}/{file}"), digest.to_owned());
+        self.change(Box::new(move |state, _| {
+            let _ = state.conventions.insert(key.clone(), digest.clone());
+            Ok(())
+        }));
     }
 
     pub fn pull_heads(&self, repo: &UpstreamName) -> BTreeMap<String, String> {
@@ -529,27 +621,35 @@ impl Store {
     }
 
     pub fn record_pull_head(&mut self, repo: &UpstreamName, number: u64, sha: &str) {
-        let _ = self
-            .state
-            .pull_heads
-            .entry(repo.to_string())
-            .or_default()
-            .insert(number.to_string(), sha.to_owned());
+        let (repo, number, sha) = (repo.to_string(), number.to_string(), sha.to_owned());
+        self.change(Box::new(move |state, _| {
+            let _ = state
+                .pull_heads
+                .entry(repo.clone())
+                .or_default()
+                .insert(number.clone(), sha.clone());
+            Ok(())
+        }));
     }
 
     /// Record where the forge said a pull request stands. The parameter type is
     /// the invariant: a record is a forge state, never the transition sync
     /// classified from it.
     pub fn record_pull_state(&mut self, repo: &UpstreamName, number: u64, state: ForgeState) {
-        let _ = self
-            .state
-            .pull_states
-            .insert(format!("{repo}#{number}"), state.as_recorded().to_owned());
+        let (key, recorded) = (format!("{repo}#{number}"), state.as_recorded().to_owned());
+        self.change(Box::new(move |state, _| {
+            let _ = state.pull_states.insert(key.clone(), recorded.clone());
+            Ok(())
+        }));
     }
 
     /// Drop a record this version cannot read, so its problem is reported once.
     pub fn forget_pull_state(&mut self, repo: &UpstreamName, number: u64) {
-        let _ = self.state.pull_states.remove(&format!("{repo}#{number}"));
+        let key = format!("{repo}#{number}");
+        self.change(Box::new(move |state, _| {
+            let _ = state.pull_states.remove(&key);
+            Ok(())
+        }));
     }
 
     /// The recorded state as the file spells it: `record_pull_state` writes a
@@ -563,10 +663,11 @@ impl Store {
     }
 
     pub fn record_comment_mark(&mut self, repo: &UpstreamName, number: u64, at: &str) {
-        let _ = self
-            .state
-            .comment_marks
-            .insert(format!("{repo}#{number}"), at.to_owned());
+        let (key, at) = (format!("{repo}#{number}"), at.to_owned());
+        self.change(Box::new(move |state, _| {
+            let _ = state.comment_marks.insert(key.clone(), at.clone());
+            Ok(())
+        }));
     }
 
     pub fn comment_mark(&self, repo: &UpstreamName, number: u64) -> Option<&str> {
@@ -575,6 +676,67 @@ impl Store {
             .get(&format!("{repo}#{number}"))
             .map(String::as_str)
     }
+}
+
+/// The lock of each fork in `repos`, taken in name order so that two writers
+/// about the same forks cannot each hold one the other waits for. A fork's
+/// lock is `fork-locks/<upstream>.lock` beside the state file: it guards the
+/// fork's records in the state file and its ledger statements, and nothing
+/// else.
+pub(crate) fn lock_forks(path: &Path, repos: &[&UpstreamName]) -> Result<Vec<FileLock>, LockError> {
+    let ordered: BTreeSet<&UpstreamName> = repos.iter().copied().collect();
+    ordered
+        .into_iter()
+        .map(|repo| {
+            // Named `<upstream>.fork` for `FileLock` to put `.lock` in place
+            // of: an upstream name's own dots are not an extension.
+            let target = path
+                .with_file_name("fork-locks")
+                .join(format!("{}.fork", repo.as_str()));
+            FileLock::acquire(&target, LockWait::CLAIM)
+        })
+        .collect()
+}
+
+/// The state file at `path`, or the empty state when there is none yet.
+fn read_state(path: &Path) -> Result<State, StoreError> {
+    if !path.exists() {
+        return Ok(State::default());
+    }
+    let text = std::fs::read_to_string(path).map_err(|source| StoreError::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    serde_json::from_str(&text).map_err(|source| StoreError::Parse {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+/// Write `state` to `path` atomically: a crash mid-write cannot truncate the
+/// file, and a concurrent reader never sees a half-written document.
+fn write_state(path: &Path, state: &State) -> Result<(), StoreError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|source| StoreError::Write {
+        path: parent.to_owned(),
+        source,
+    })?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|source| StoreError::Write {
+        path: parent.to_owned(),
+        source,
+    })?;
+    let text = serde_json::to_string_pretty(state)?;
+    temp.write_all(text.as_bytes())
+        .and_then(|()| temp.write_all(b"\n"))
+        .map_err(|source| StoreError::Write {
+            path: path.to_owned(),
+            source,
+        })?;
+    temp.persist(path).map_err(|error| StoreError::Write {
+        path: path.to_owned(),
+        source: error.error,
+    })?;
+    Ok(())
 }
 
 /// Each of `repos`' ledgers beside the state file, as one read found it
@@ -999,7 +1161,7 @@ mod tests {
         let mut subject = store(dir.path());
         let _ = subject.claim(&target(), &os_user("x"), "w");
         subject.save().unwrap();
-        let names: Vec<String> = std::fs::read_dir(dir.path())
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|entry| {
                 entry
@@ -1007,7 +1169,9 @@ mod tests {
                     .map(|e| e.file_name().to_string_lossy().into_owned())
             })
             .collect();
-        assert_eq!(names, ["state.json"]);
+        names.sort();
+        // The save's lock file stays: it is the inode every writer locks.
+        assert_eq!(names, ["state.json", "state.lock"]);
     }
 
     #[test]
@@ -1080,18 +1244,150 @@ mod tests {
 
     #[test]
     fn a_reader_is_never_blocked_by_a_writer() {
-        // Reading cannot lose a write, so a held writer lock keeps out writers only.
+        // Reading cannot lose a write, so a held fork lock keeps out writers only.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        let writer =
-            Store::open_for_update(path.clone(), &crate::config::FormerNames::new(), &[]).unwrap();
+        let writer = Store::open_for_update(path.clone(), &FormerNames::new(), &[&repo()]).unwrap();
 
-        assert!(Store::open(path.clone(), &FormerNames::new(), &[]).is_ok());
+        assert!(Store::open(path.clone(), &FormerNames::new(), &[&repo()]).is_ok());
 
         drop(writer);
         assert!(
-            Store::open_for_update(path, &FormerNames::new(), &[]).is_ok(),
+            Store::open_for_update(path, &FormerNames::new(), &[&repo()]).is_ok(),
             "the lock outlived its holder"
         );
+    }
+
+    #[test]
+    fn a_writer_about_another_fork_does_not_wait() {
+        // Given: a writer holding a-repo for as long as it likes.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let _held = Store::open_for_update(path.clone(), &FormerNames::new(), &[&repo()]).unwrap();
+
+        // When: a writer about another fork opens, and saves.
+        let started = std::time::Instant::now();
+        let other = UpstreamName::new("acme/other.repo");
+        let mut subject = Store::open_for_update(path, &FormerNames::new(), &[&other])
+            .expect("another fork's writer opens");
+        subject.record_pull_state(&other, 7, ForgeState::Open);
+        subject.save().unwrap();
+
+        // Then: neither waited on a-repo's holder, and the lock file is named
+        // for the whole upstream name.
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(dir.path().join("fork-locks/acme/other.repo.lock").is_file());
+    }
+
+    #[test]
+    fn a_writer_about_the_same_fork_waits_for_the_holder() {
+        // Given: a writer about a-repo that lets go after a pause.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut first =
+            Store::open_for_update(path.clone(), &FormerNames::new(), &[&repo()]).unwrap();
+        let started = std::time::Instant::now();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let _ = first.claim(&target(), &os_user("first"), "w");
+            first.save().unwrap();
+        });
+
+        // When: a second writer about a-repo opens.
+        let second = Store::open_for_update(path, &FormerNames::new(), &[&repo()]).unwrap();
+        holder.join().unwrap();
+
+        // Then: it opened only once the first was done, and reads its claim.
+        assert!(started.elapsed() >= std::time::Duration::from_millis(150));
+        assert_eq!(second.claims(None)[0].owner, "first");
+    }
+
+    #[test]
+    fn interleaved_writers_about_two_forks_lose_neither_change() {
+        // Given: two writers about two forks, both open before either saves.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let other = UpstreamName::new("other-repo");
+        let mut first =
+            Store::open_for_update(path.clone(), &FormerNames::new(), &[&repo()]).unwrap();
+        let mut second =
+            Store::open_for_update(path.clone(), &FormerNames::new(), &[&other]).unwrap();
+        let _ = first.claim(&target(), &os_user("first"), "w");
+        second.record_pull_state(&other, 7, ForgeState::Merged);
+        second.record_comment_mark(&other, 7, "2026-11-02T10:00:00Z");
+
+        // When: both save, the one that read first saving first.
+        first.save().unwrap();
+        second.save().unwrap();
+
+        // Then: the file has both, and the later saver now answers for both.
+        let reread = Store::open(path, &FormerNames::new(), &[]).unwrap();
+        assert_eq!(reread.claims(None).len(), 1);
+        assert_eq!(reread.pull_state(&other, 7), Some("MERGED"));
+        assert_eq!(second.claims(None).len(), 1);
+    }
+
+    #[test]
+    fn a_claim_moved_since_it_was_read_fails_the_save_and_writes_nothing() {
+        // Given: two writers that bypassed the fork's lock, as an older knives
+        // would, each deciding a-repo/feat/alpha is free.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut first = Store::open(path.clone(), &FormerNames::new(), &[]).unwrap();
+        let mut second = Store::open(path.clone(), &FormerNames::new(), &[]).unwrap();
+        let _ = first.claim(&target(), &os_user("first"), "w");
+        let _ = second.claim(&target(), &os_user("second"), "w");
+        second.record_comment_mark(&repo(), 7, "2026-11-02T10:00:00Z");
+        first.save().unwrap();
+
+        // When: the second saves.
+        let error = second.save().unwrap_err();
+
+        // Then: refused, naming the holder, and nothing of it written.
+        assert!(
+            matches!(&error, StoreError::ClaimMoved { now, .. } if now == "now held by first"),
+            "was: {error}"
+        );
+        let reread = Store::open(path, &FormerNames::new(), &[]).unwrap();
+        assert_eq!(reread.claims(None)[0].owner, "first");
+        assert_eq!(reread.comment_mark(&repo(), 7), None);
+    }
+
+    #[test]
+    fn a_release_of_a_claim_moved_since_it_was_read_is_refused() {
+        // Given: a claim, read by a writer that will release it, then seized
+        // by a writer that bypassed the fork's lock.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut first = Store::open(path.clone(), &FormerNames::new(), &[]).unwrap();
+        let _ = first.claim(&target(), &os_user("first"), "w");
+        first.save().unwrap();
+        let mut releasing = Store::open(path.clone(), &FormerNames::new(), &[]).unwrap();
+        let mut seizing = Store::open(path.clone(), &FormerNames::new(), &[]).unwrap();
+        let _ = seizing.claim(&target(), &os_user("seizer"), "w");
+        seizing.save().unwrap();
+
+        // When: the release saves.
+        assert!(releasing.release_claim(&target()));
+        let error = releasing.save().unwrap_err();
+
+        // Then: the seizer's claim stands.
+        assert!(
+            matches!(error, StoreError::ClaimMoved { .. }),
+            "was: {error}"
+        );
+        let reread = Store::open(path, &FormerNames::new(), &[]).unwrap();
+        assert_eq!(reread.claims(None)[0].owner, "seizer");
+    }
+
+    #[test]
+    fn a_save_with_nothing_changed_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut subject =
+            Store::open_for_update(path.clone(), &FormerNames::new(), &[&repo()]).unwrap();
+        subject.save().unwrap();
+        assert!(!path.exists());
+        assert!(!dir.path().join("state.lock").exists());
     }
 }
