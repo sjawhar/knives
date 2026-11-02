@@ -647,13 +647,17 @@ fn a_workspace_made_under_an_earlier_root_is_still_found_where_it_is() {
     );
 
     // When: status runs
-    let status = knives(&lab, &home, &["--text", "status", "--repo", "demo"]);
+    let status = knives(&lab, &home, &["--text", "status", "demo"]);
 
     // Then: the workspace counts as the branch's, not an unnamed one
     let shown = String::from_utf8_lossy(&status.stdout);
     assert!(
-        !shown.contains("not named for a branch above"),
-        "status lost the workspace: {shown}"
+        shown.contains("feat/gamma")
+            && !shown
+                .lines()
+                .any(|line| line.contains("not named for a branch") && line.contains("feat-gamma")),
+        "status lost the workspace: {shown}\n{}",
+        String::from_utf8_lossy(&status.stderr)
     );
 
     // When: the branch is finished
