@@ -82,7 +82,9 @@ command never edits consumer checkouts.
 `consumers`, `workspaces`, `forbidden` (identifiers an upstream-bound diff must not add; `audit`
 scans for them), and `ledger` (the repository the fork's ledger is shared through); there is no
 path field, and a file that still has one is refused
-on load with the entry named.
+on load with the entry named. `config::load` then appends an optional `repos.local.toml` beside
+the file: `forbidden` and `consumers` only, for entries the registry already has, checked with
+the registry's own lists, so private terms and consumer slugs stay out of a shared registry.
 A checkout is the entry whose `upstream` its own `upstream` remote matches, so an entry
 follows the repository to wherever it is cloned and a machine's layout is not configuration.
 Two entries cannot share an `upstream`; the file is refused with both names. `origin` and
