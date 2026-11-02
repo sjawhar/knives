@@ -107,10 +107,11 @@ pub fn possesses(cwd: &Path, fork: &Fork<'_>, branch: &BranchName) -> bool {
 /// reached `jj workspace add --name default` and died on jj's raw "already
 /// exists".
 ///
-/// A `workspaces` directory inside the checkout is refused first: it puts every
-/// branch workspace in the working copy it belongs to, which is never what
-/// anyone meant. The registry cannot check it — the checkout is found, not
-/// stated — so the two verbs that would use the directory do. The directory is
+/// A `workspaces` directory inside the checkout is refused when the branch's
+/// workspace would be placed there: it puts every branch workspace in the
+/// working copy it belongs to, which is never what anyone meant. The registry
+/// cannot check it — the checkout is found, not stated — so the two verbs that
+/// would use the directory do. The directory is
 /// canonicalised when it exists, as the checkout already is, so a spelling
 /// through a symlink is judged by where it lands; one that does not exist yet
 /// has only its spelling.
@@ -120,7 +121,13 @@ pub fn collides_with_checkout(fork: &Fork<'_>, branch: &BranchName) -> Option<St
     let root = spelled
         .canonicalize()
         .unwrap_or_else(|_| spelled.to_owned());
-    if root.starts_with(checkout) {
+    let workspace = workspace_for(branch.as_str());
+    let configured = root.join(&workspace);
+    // An existing workspace is judged where it is; a new one where it would go.
+    // The root is judged only when it is used: a root set for future
+    // workspaces does not lock out one made under an earlier root.
+    let directory = locate_workspace(checkout, &workspace, configured.clone());
+    if directory == configured && root.starts_with(checkout) {
         return Some(format!(
             "[repos.{}] workspaces {} is inside the checkout {}; branch workspaces cannot \
              live in the working copy they belong to",
@@ -129,9 +136,6 @@ pub fn collides_with_checkout(fork: &Fork<'_>, branch: &BranchName) -> Option<St
             checkout.display()
         ));
     }
-    let workspace = workspace_for(branch.as_str());
-    // An existing workspace is judged where it is; a new one where it would go.
-    let directory = locate_workspace(checkout, &workspace, root.join(&workspace));
     (workspace == "default" || checkout.starts_with(&directory)).then(|| {
         format!(
             "branch {branch} maps to workspace {workspace} at {}, which is the registered \

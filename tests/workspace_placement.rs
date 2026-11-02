@@ -789,3 +789,59 @@ fn a_forgotten_workspace_left_on_disk_is_not_found_by_its_stale_record() {
     ));
     assert!(old.is_dir(), "the old directory was touched");
 }
+
+#[test]
+fn a_root_inside_the_checkout_refuses_new_workspaces_only() {
+    // Given: feat/gamma started under root A, then the registry's root moved
+    // inside the checkout
+    let lab = Lab::new();
+    let (home, old_root) = home_with_workspaces(&lab);
+    let started = start_gamma(&lab, &home);
+    assert!(started.status.success(), "{started:?}");
+    let workspace = old_root.join("feat-gamma");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\nupstream = \"{}\"\n\
+             origin = \"https://forge.invalid/acme/work.git\"\nworkspaces = \"{}\"\n",
+            lab.upstream.display(),
+            lab.work.join("future-workspaces").display(),
+        ),
+    )
+    .expect("rewrite registry");
+
+    // When: the existing branch is resumed, and a new branch is started
+    let resumed = start_gamma(&lab, &home);
+    let fresh = knives(
+        &lab,
+        &home,
+        &[
+            "--text",
+            "start",
+            "feat/delta",
+            "--repo",
+            "demo",
+            "--why",
+            "new",
+        ],
+    );
+
+    // Then: the existing one opens where it is; the new one is refused
+    assert!(resumed.status.success(), "{resumed:?}");
+    assert!(!fresh.status.success(), "{fresh:?}");
+    assert!(
+        String::from_utf8_lossy(&fresh.stderr).contains("is inside the checkout"),
+        "{fresh:?}"
+    );
+
+    // When: the existing branch is finished
+    let finished = knives(
+        &lab,
+        &home,
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    // Then: it is removed from where it is
+    assert!(finished.status.success(), "{finished:?}");
+    assert!(!workspace.exists(), "finish left {}", workspace.display());
+}
