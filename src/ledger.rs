@@ -845,6 +845,23 @@ pub fn body_human_text(text: &str) -> String {
     escape_human_text(text, true)
 }
 
+/// Render a problem for a one-line human report.
+///
+/// A problem often quotes jj or git, which print more than one line (jj's
+/// "Concurrent modification detected" before its error, git's "Another git
+/// process" sentence). Each non-blank line is trimmed and the lines are joined
+/// with `; `, then escaped as [`inline_human_text`] escapes them, so a line
+/// break reads as a separator instead of U+FFFD.
+pub fn problem_human_text(text: &str) -> String {
+    let joined = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    inline_human_text(&joined)
+}
+
 fn escape_human_text(text: &str, preserve_line_feeds: bool) -> String {
     text.chars()
         .map(|character| {

@@ -113,7 +113,7 @@ pub fn render(report: &Report) -> String {
             lines.extend(
                 problems
                     .iter()
-                    .map(|problem| format!("!! {}", inline_human_text(problem))),
+                    .map(|problem| format!("!! {}", crate::ledger::problem_human_text(problem))),
             );
             lines.join("\n")
         }
@@ -127,7 +127,7 @@ pub fn render(report: &Report) -> String {
             // A problem names a file from disk or another machine's ref.
             let flagged = problems
                 .iter()
-                .map(|problem| format!("!! {}", inline_human_text(problem)));
+                .map(|problem| format!("!! {}", crate::ledger::problem_human_text(problem)));
             if entries.is_empty() && events.is_none() {
                 return std::iter::once(format!("{repo}  no notches yet"))
                     .chain(flagged)

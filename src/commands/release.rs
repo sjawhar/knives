@@ -1407,7 +1407,7 @@ pub fn render_members(report: &MembersReport) -> String {
         report
             .problems
             .iter()
-            .map(|problem| format!("!! {}", crate::ledger::inline_human_text(problem))),
+            .map(|problem| format!("!! {}", crate::ledger::problem_human_text(problem))),
     );
     lines.join("\n")
 }
@@ -1416,7 +1416,7 @@ pub fn render(plan: &Plan) -> String {
     let mut lines: Vec<String> = plan
         .problems
         .iter()
-        .map(|problem| format!("!! {}", crate::ledger::inline_human_text(problem)))
+        .map(|problem| format!("!! {}", crate::ledger::problem_human_text(problem)))
         .chain(plan.notes.iter().map(|note| format!("! {note}")))
         .collect();
     let Some(release) = &plan.release else {

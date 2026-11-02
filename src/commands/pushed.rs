@@ -248,7 +248,7 @@ pub fn render(report: &Report) -> String {
             &format!(
                 "{}: PROBLEM: {}",
                 report.repo,
-                crate::ledger::inline_human_text(problem)
+                crate::ledger::problem_human_text(problem)
             ),
         );
     }

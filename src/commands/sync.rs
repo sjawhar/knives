@@ -614,7 +614,7 @@ pub fn render(report: &Report) -> String {
         report
             .problems
             .iter()
-            .map(|problem| format!("? {}", crate::ledger::inline_human_text(problem))),
+            .map(|problem| format!("? {}", crate::ledger::problem_human_text(problem))),
     );
     if report.rows.is_empty() {
         lines.push(format!("{}: no tracked pull requests", report.repo));
@@ -887,6 +887,33 @@ mod tests {
             ..Report::default()
         };
         assert_eq!(exit_for(&blocked), Exit::Incomplete);
+    }
+
+    #[test]
+    fn a_multi_line_problem_renders_on_one_readable_line() {
+        // jj and git print more than one line ("Concurrent modification
+        // detected" before the error; git's second "Another git process" line).
+        let report = Report {
+            repo: "demo".to_owned(),
+            problems: vec![
+                "could not sync: command `jj` failed (exit status: 1): \
+                 Concurrent modification detected, resolving automatically.\n\
+                 Error: Failed to update refs: refs/remotes/origin/main\r\n\n\
+                 Hint: run \u{1b}[31mit\u{1b}[0m again"
+                    .to_owned(),
+            ],
+            ..Report::default()
+        };
+
+        let text = render(&report);
+        let problem = text.lines().next().unwrap_or_default();
+        assert_eq!(
+            problem,
+            "? could not sync: command `jj` failed (exit status: 1): \
+             Concurrent modification detected, resolving automatically.; \
+             Error: Failed to update refs: refs/remotes/origin/main; \
+             Hint: run \u{fffd}[31mit\u{fffd}[0m again"
+        );
     }
     #[test]
     fn cache_write_failure_is_a_note_and_does_not_make_sync_incomplete() {
