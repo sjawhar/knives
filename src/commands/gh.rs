@@ -279,7 +279,7 @@ fn api_endpoint(args: &[String]) -> Option<&str> {
         if !word.starts_with('-') {
             return Some(word);
         }
-        if API_VALUE_FLAGS.contains(&word.as_str()) {
+        if leaves_value_to_next(API_VALUE_FLAGS, word) {
             words.next();
         }
     }
@@ -2729,6 +2729,10 @@ mod tests {
             assert!(is_ownerless_graphql(&args(&["api", "-f", node, "graphql"])));
             assert!(is_ownerless_graphql(&args(&[
                 "api", "-f", node, "--", "graphql"
+            ])));
+            // `-if` is `-i -f`: its value is the next word.
+            assert!(is_ownerless_graphql(&args(&[
+                "api", "-if", node, "graphql"
             ])));
             // The query or a field names the owner.
             assert!(!is_ownerless_graphql(&args(&[
