@@ -2212,3 +2212,222 @@ fn only_a_rerunnable_watch_on_a_token_knives_minted_is_restarted() {
         );
     }
 }
+
+/// A gh that answers a GraphQL call the way GitHub and gh do, after it records
+/// its token: `FAKE_GH_ANSWER=missing` is a node id the token cannot see (the
+/// `NOT_FOUND` body on stdout, gh's own line on stderr, exit 1), `found` the
+/// node, `other` an unrelated failure, and `prompt` a stderr prompt with no
+/// newline that waits for a line on stdin (a pager's `Press RETURN`).
+fn fake_graphql_gh() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("fake gh dir");
+    let log = dir.path().join("gh.log");
+    let gh = dir.path().join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\nprintf 'GH_TOKEN=%s\\n' \"$GH_TOKEN\" > \"$FAKE_GH_LOG\"\n\
+         case \"$FAKE_GH_ANSWER\" in\n\
+         found) printf '{\"data\":{\"node\":{\"id\":\"PR_x\"}}}'; exit 0 ;;\n\
+         other) echo 'gh: Something went wrong while executing your query.' >&2; exit 1 ;;\n\
+         prompt) printf 'Press RETURN' >&2; read -r reply; exit 0 ;;\n\
+         esac\n\
+         printf '{\"data\":{\"node\":null},\"errors\":[{\"type\":\"NOT_FOUND\"}]}'\n\
+         echo \"gh: Could not resolve to a node with the global id of 'PR_x'.\" >&2\n\
+         exit 1\n",
+    )
+    .expect("write fake gh");
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).expect("chmod fake gh");
+    (dir, log)
+}
+
+/// `knives gh -- <arguments>` from a git checkout whose only remote is
+/// acme/work, with `env` set and `FAKE_GH_ANSWER=answer`.
+fn run_graphql(
+    arguments: &[&str],
+    answer: &str,
+    env: &[(&str, &str)],
+) -> (std::process::Output, String) {
+    run_graphql_with(arguments, answer, env, |command| {
+        command.output().expect("run knives gh")
+    })
+}
+
+/// [`run_graphql`], with `run` running the command.
+fn run_graphql_with(
+    arguments: &[&str],
+    answer: &str,
+    env: &[(&str, &str)],
+    run: impl FnOnce(&mut Command) -> std::process::Output,
+) -> (std::process::Output, String) {
+    let host = concat!("github", ".com");
+    let scratch = tempfile::tempdir().expect("scratch");
+    let work = scratch.path().join("work");
+    lab::git_repository(
+        &work,
+        &[("origin", &format!("https://{host}/acme/work.git"))],
+    );
+    let (dir, log) = fake_graphql_gh();
+    let helper_dir = fake_app_token();
+    let gitconfig = token_config(helper_dir.path(), "fallback");
+    let mut command = knives_cmd(helper_dir.path());
+    command
+        .arg("gh")
+        .arg("--")
+        .args(arguments)
+        .current_dir(&work)
+        .env_remove("GH_REPO")
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .env("FAKE_GH_ANSWER", answer)
+        .env("PATH", helper_path(helper_dir.path()))
+        .env("GIT_CONFIG_GLOBAL", &gitconfig);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let output = run(&mut command);
+    let recorded = fs::read_to_string(&log).expect("fake gh ran");
+    (output, recorded)
+}
+
+const NODE_QUERY: &str = r#"query=query{node(id:"PR_x"){id}}"#;
+const ENQUEUE: &str =
+    r#"query=mutation{enqueuePullRequest(input:{pullRequestId:"PR_x"}){clientMutationId}}"#;
+
+#[test]
+fn an_ownerless_graphql_node_miss_names_the_checkouts_owner_and_gh_repo() {
+    for query in [NODE_QUERY, ENQUEUE] {
+        // When: a GraphQL call that names only a node id runs from acme/work's
+        // checkout, and GitHub finds no such node for acme's App.
+        let (output, recorded) = run_graphql(&["api", "graphql", "-f", query], "missing", &[]);
+
+        // Then: gh's answer and status are kept, and knives says after gh's line
+        // which owner the checkout chose and how to name the node's repository.
+        assert!(
+            recorded.contains("GH_TOKEN=tok-acme"),
+            "{query}: {recorded}"
+        );
+        assert_eq!(output.status.code(), Some(1), "{query}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("NOT_FOUND"), "{query}: {stdout}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let gh_line = stderr
+            .find("gh: Could not resolve to a node with the global id of 'PR_x'.")
+            .unwrap_or_else(|| panic!("{query}: gh's line is kept: {stderr}"));
+        let hint = stderr
+            .find("knives gh: GitHub found no node")
+            .unwrap_or_else(|| panic!("{query}: a routing hint: {stderr}"));
+        assert!(gh_line < hint, "{query}: {stderr}");
+        assert!(stderr.contains("owner acme"), "{query}: {stderr}");
+        assert!(
+            stderr.contains("GH_REPO=<owner>/<repo>"),
+            "{query}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_stderr_prompt_without_a_newline_shows_before_gh_reads_the_answer() {
+    use std::io::{Read as _, Write as _};
+    // When: gh, on a call knives copies stderr for, writes a prompt with no
+    // newline and waits for an answer on stdin.
+    let (output, _) = run_graphql_with(
+        &["api", "graphql", "-f", NODE_QUERY],
+        "prompt",
+        &[],
+        |command| {
+            let mut child = command
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("run knives gh");
+            let mut stderr = child.stderr.take().expect("stderr pipe");
+            let (shown, seen) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let mut text = Vec::new();
+                let mut buffer = [0_u8; 256];
+                while let Ok(read) = stderr.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    text.extend_from_slice(&buffer[..read]);
+                    if text.ends_with(b"Press RETURN") {
+                        let _ = shown.send(());
+                    }
+                }
+                text
+            });
+            let prompt_shown = seen.recv_timeout(std::time::Duration::from_secs(30));
+            // Answer either way, so that gh ends.
+            child
+                .stdin
+                .take()
+                .expect("stdin pipe")
+                .write_all(b"\n")
+                .expect("answer the prompt");
+            let output = child.wait_with_output().expect("wait for knives gh");
+            let text = reader.join().expect("stderr reader");
+
+            // Then: the prompt reached the caller while gh was still waiting.
+            assert!(
+                prompt_shown.is_ok(),
+                "the prompt was held back: {}",
+                String::from_utf8_lossy(&text)
+            );
+            output
+        },
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+}
+
+#[test]
+fn a_graphql_call_whose_target_is_named_or_that_finds_its_node_gets_no_routing_hint() {
+    const OWNER_QUERY: &str =
+        r#"query=query{repository(owner:"acme",name:"work"){pullRequest(number:1){id}}}"#;
+    const VARIABLE_QUERY: &str =
+        r#"query=query($owner:String!){repository(owner:$owner,name:"work"){id}}"#;
+    /// The arguments, gh's answer, the environment, and the exit status.
+    type Case = (
+        &'static [&'static str],
+        &'static str,
+        &'static [(&'static str, &'static str)],
+        i32,
+    );
+    let cases: [Case; 5] = [
+        // GH_REPO names the repository: a miss is the node's own.
+        (
+            &["api", "graphql", "-f", NODE_QUERY],
+            "missing",
+            &[("GH_REPO", "acme/work")],
+            1,
+        ),
+        // The query names its owner, inline or through a field.
+        (&["api", "graphql", "-f", OWNER_QUERY], "missing", &[], 1),
+        (
+            &["api", "graphql", "-f", VARIABLE_QUERY, "-f", "owner=acme"],
+            "missing",
+            &[],
+            1,
+        ),
+        // The checkout's owner was the right one.
+        (&["api", "graphql", "-f", NODE_QUERY], "found", &[], 0),
+        // Another failure says nothing about the route.
+        (&["api", "graphql", "-f", ENQUEUE], "other", &[], 1),
+    ];
+    for (arguments, answer, env, code) in cases {
+        // When: the call runs from acme/work's checkout.
+        let (output, recorded) = run_graphql(arguments, answer, env);
+
+        // Then: it ran as acme's App with gh's status, and knives added nothing.
+        assert!(
+            recorded.contains("GH_TOKEN=tok-acme"),
+            "{arguments:?}: {recorded}"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{arguments:?}: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("knives gh:"), "{arguments:?}: {stderr}");
+    }
+}
