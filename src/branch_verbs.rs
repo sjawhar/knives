@@ -92,17 +92,22 @@ pub(crate) fn run_finish(
     }
     let workspace = knives::commands::wip::workspace_for(branch.as_str());
     let directory = workspace_path(fork, branch);
+    // The fork's lock is taken first and held to the end: between the snapshot
+    // and the removal, a `start` of this branch would otherwise take the lock,
+    // adopt the workspace, and write in it, and this removal would take that
+    // work with it. A claim writer on this fork waits for the removal, which a
+    // workspace with a build tree in it can make seconds long.
+    let mut store = Store::open_for_update(
+        default_state_path(),
+        &bound.registry.former_names(),
+        &[&fork.upstream],
+    )?;
     // Read-only checks before the claim is touched: a refusal leaves everything
     // as it was.
     let cleared = match clear_workspace(fork, branch, &directory, options) {
         Ok(cleared) => cleared,
         Err(exit) => return Ok(exit),
     };
-    let mut store = Store::open_for_update(
-        default_state_path(),
-        &bound.registry.former_names(),
-        &[&fork.upstream],
-    )?;
     let forced_release = match finish_claim_gate(fork, target, &store, options, bound)? {
         FinishClaimGate::Continue(event) => event,
         FinishClaimGate::Refuse => return Ok(Exit::Usage),
@@ -137,10 +142,6 @@ pub(crate) fn run_finish(
         })?;
     }
     store.save()?;
-    // The claim is recorded; nothing below touches the store, and removing a
-    // workspace with a build tree in it can take seconds another writer would
-    // otherwise spend waiting for the lock.
-    drop(store);
 
     let claim = if had { "released" } else { "was not held" };
     let registration = release_registration(checkout_path, &workspace, &directory, cleared.present);
@@ -243,10 +244,15 @@ fn clear_workspace(
         knives::ids::WorkspaceName::new(knives::commands::wip::workspace_for(branch.as_str()));
     // Read what is at the path before writing anything to the repository: a jj
     // that refused to load a forgotten workspace's state would otherwise leave
-    // the directory forgotten and unremovable.
-    let identity = directory
-        .exists()
-        .then(|| knives::jj::workspace_identity(directory, checkout));
+    // the directory forgotten and unremovable. A path this code cannot even
+    // look at is not an empty one: something may be there with work in it.
+    let identity = match std::fs::metadata(directory) {
+        Ok(_) => Some(knives::jj::workspace_identity(directory, checkout)),
+        // Nothing there, or a link to nothing: neither holds work, and the
+        // link is reported where the registration it leaves behind is.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => Some(WorkspaceIdentity::Unreadable(error.to_string())),
+    };
     // When the workspace at the path is this branch's own, the directory is the
     // evidence: jj's record of where it lives can be missing (made before jj
     // recorded paths) or stale (moved by hand).

@@ -417,6 +417,71 @@ fn finish_does_not_forget_a_workspace_whose_repository_pointer_cannot_be_read() 
 }
 
 #[test]
+fn finish_does_not_forget_a_workspace_it_cannot_look_into() {
+    use std::os::unix::fs::PermissionsExt as _;
+    // Given: the workspace's `.jj` cannot be read, so what is under it cannot
+    // be told from a workspace with work in it
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    let state = workspace.join(".jj");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    // When: the branch is finished
+    let refused = finish(&lab, &home, &[]);
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    // Then: it refuses; the workspace stays registered and the claim held
+    assert_eq!(refused.status.code(), Some(3), "{}", shown(&refused));
+    let names = jj(&lab.work, &["workspace", "list", "-T", r#"name ++ "\n""#]);
+    assert!(names.contains("feat-gamma"), "{names}");
+    assert!(claim_held(&home));
+    assert!(workspace.is_dir());
+}
+
+#[test]
+fn finish_touches_nothing_before_it_holds_the_forks_lock() {
+    // Given: another writer on this fork holds its lock
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    let held = knives::store::Store::open_for_update(
+        home.path().join("state.json"),
+        &knives::config::FormerNames::new(),
+        &[&knives::ids::UpstreamName::new("demo")],
+    )
+    .expect("hold the fork's lock");
+
+    // When: a finish runs while that writer holds it
+    let finishing = lab::knives_command(
+        &lab.work,
+        home.path(),
+        lab.temp_path(),
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    )
+    .env("KNIVES_OWNER", OWNER)
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .expect("spawn finish");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Then: it has taken nothing: no snapshot, no forget, no removal
+    assert!(workspace.is_dir(), "the workspace went before the lock");
+    assert!(claim_held(&home), "the claim went before the lock");
+    let names = jj(&lab.work, &["workspace", "list", "-T", r#"name ++ "\n""#]);
+    assert!(names.contains("feat-gamma"), "{names}");
+
+    // When: the lock is free
+    drop(held);
+    let finished = finishing.wait_with_output().expect("wait for finish");
+
+    // Then: the finish goes through
+    assert!(finished.status.success(), "{}", shown(&finished));
+    assert!(!workspace.exists());
+}
+
+#[test]
 fn finish_changes_nothing_when_a_file_name_is_not_utf8() {
     use std::os::unix::ffi::OsStrExt as _;
     // Given: a file whose name jj cannot snapshot

@@ -1514,11 +1514,15 @@ pub fn workspace_identity(directory: &Path, checkout: &Path) -> WorkspaceIdentit
         return WorkspaceIdentity::SymbolicLink(target);
     }
     let pointer = directory.join(".jj").join("repo");
-    if pointer.is_dir() {
-        return WorkspaceIdentity::Repository;
-    }
-    if !pointer.is_file() {
-        return WorkspaceIdentity::NotAWorkspace;
+    // A pointer this code cannot even look at is not a missing one: `.jj` may
+    // be there, unreadable, with work under it.
+    match std::fs::metadata(&pointer) {
+        Ok(found) if found.is_dir() => return WorkspaceIdentity::Repository,
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return WorkspaceIdentity::NotAWorkspace;
+        }
+        Err(error) => return WorkspaceIdentity::Unreadable(error.to_string()),
     }
     // A `.jj/repo` that cannot be resolved is a workspace this code cannot
     // read, not a directory that is no workspace: something here claims to be
