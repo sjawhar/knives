@@ -169,8 +169,8 @@ Or with [mise](https://mise.jdx.dev), using the `v` resolved in the first line a
 mise use -g "github:sjawhar/knives@$v"
 ```
 
-A bare `github:sjawhar/knives` can resolve to an older release when your mise config sets
-`minimum_release_age`; add `minimum_release_age_excludes = ["github:sjawhar/knives"]` under
+A bare `github:sjawhar/knives` can resolve to an older release, because mise skips releases younger
+than `minimum_release_age` (24 hours by default, longer when configured); add `minimum_release_age_excludes = ["github:sjawhar/knives"]` under
 `[settings]` to take the newest.
 
 ### Plugins
