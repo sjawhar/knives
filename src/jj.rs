@@ -1951,9 +1951,10 @@ const FETCH_RETRY_STEP_MILLIS: u64 = 100;
 /// Run a fetch, retrying only when another writer holds or won its ref update.
 ///
 /// A fetch is idempotent: the next attempt updates whatever refs the winning
-/// writer left behind. A lock file a crashed git left behind reads the same
-/// and costs the retries before its error returns. Every other error returns
-/// unchanged on its first attempt.
+/// writer left behind. git reports every ref-lock failure as `cannot lock ref`,
+/// so one that is no race (a lock file a crashed git left behind, a ref
+/// directory it may not write) reads the same and costs the retries before
+/// its error returns. Every other error returns unchanged on its first attempt.
 fn fetch_command(program: &str, args: &[&str]) -> Result<String, JjError> {
     for retry in 1..FETCH_ATTEMPTS {
         match command_args(program, args) {
@@ -3950,13 +3951,18 @@ esac
         })
     }
 
-    const RACES: [&str; 3] = [
+    /// The three race spellings, and git's real message for a ref directory it
+    /// may not write: no race, but `cannot lock ref`, so it is retried too.
+    const RACES: [&str; 4] = [
         "Error: Failed to update refs: refs/remotes/upstream/main",
         "fatal: cannot lock ref 'refs/remotes/upstream/main': is at abc but expected def",
         "fatal: Unable to create '/repo/refs/remotes/upstream/main.lock': File exists",
+        "error: cannot lock ref 'refs/remotes/origin/main': Unable to create \
+         '/repo/refs/remotes/origin/main.lock': Permission denied",
     ];
 
-    /// An unrelated failure, and a lock-file failure that is not contention.
+    /// An unrelated failure, and an `Unable to create` lock message without
+    /// `File exists` or `cannot lock ref`, which the matcher must not count.
     const NON_RACES: [&str; 2] = [
         "fatal: authentication failed",
         "fatal: Unable to create '/repo/refs/remotes/upstream/main.lock': Permission denied",

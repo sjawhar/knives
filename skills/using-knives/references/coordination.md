@@ -4,7 +4,7 @@ Read before `sync`, `preflight`, `start`, `finish`, `track` or `depends`. These 
 
 ## `knives sync [REPO|--all]`
 
-Fetches every remote and tracked PR head. When another fetch of the same clone wins a ref update, each fetch is retried up to four more times after short jittered waits (under 1.5 s in all). A ref lock file that a crashed git left behind looks the same and costs those retries before its error returns. Then it classifies the change of each tracked PR **since the last sync**:
+Fetches every remote and tracked PR head. When another fetch of the same clone wins a ref update, each fetch is retried up to four more times after short jittered waits (under 1.5 s in all). git reports every ref-lock failure the same way, so one that is no race (a lock file a crashed git left behind, a ref directory it may not write) also costs those retries before its error returns. Then it classifies the change of each tracked PR **since the last sync**:
 
 | Transition | Meaning |
 |---|---|
