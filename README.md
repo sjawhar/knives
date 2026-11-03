@@ -170,7 +170,7 @@ mise use -g "github:sjawhar/knives@$v"
 ```
 
 A bare `github:sjawhar/knives` can resolve to an older release, because mise skips releases younger
-than `minimum_release_age` (24 hours by default, longer when configured); add `minimum_release_age_excludes = ["github:sjawhar/knives"]` under
+than `minimum_release_age` (24 hours by default, or the value you configure); add `minimum_release_age_excludes = ["github:sjawhar/knives"]` under
 `[settings]` to take the newest.
 
 ### Plugins
