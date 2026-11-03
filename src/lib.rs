@@ -20,6 +20,8 @@
 //!   the advisory file lock every writer of such a file holds.
 //! - [`hook`] owns harness-facing session state and behavior.
 //! - [`bind`] decides which registry entry a directory is, from its remotes.
+//! - [`liveness`] says whether a process on this machine still works in a
+//!   directory, and which machine and PID namespace a claim was taken in.
 
 pub mod bind;
 pub mod carriage;
@@ -37,6 +39,7 @@ pub mod jj;
 pub mod ledger;
 pub mod ledger_git;
 pub mod ledger_sweep;
+pub mod liveness;
 pub mod lock;
 pub mod pins;
 pub mod release_model;

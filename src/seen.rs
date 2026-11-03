@@ -373,6 +373,7 @@ mod tests {
             why: "work".to_owned(),
             started: started.to_owned(),
             files: Vec::new(),
+            place: None,
         }
     }
 

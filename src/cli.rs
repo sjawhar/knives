@@ -296,10 +296,17 @@ pub enum Command {
     /// Only the claim is released: the branch, its bookmark, and any open pull request
     /// all survive, so hand a branch back as soon as your active work on it stops.
     ///
-    /// Removing the directory loses no work: jj snapshots a working copy into a commit,
-    /// so every change made in that workspace is already in the repository and reachable
-    /// by change id. What does not survive is anything jj never tracked — build output,
-    /// an untracked `.env` — so `--no-cleanup` leaves the directory alone.
+    /// Removing the directory loses no work: `finish` first snapshots the working copy
+    /// into its commit and names it, so every change made in that workspace is in the
+    /// repository and reachable by change id; when jj cannot snapshot all of it (a stale
+    /// working copy, a file over `snapshot.max-new-file-size`) the claim and the workspace
+    /// stay as they were, and what jj could snapshot stays in its commit. What
+    /// does not survive is anything jj never tracks — build output, an ignored `.env` —
+    /// so `--no-cleanup` leaves the directory alone.
+    ///
+    /// `finish` also refuses while another process on this machine has its working
+    /// directory or an open file in the workspace, and when the claim was taken on
+    /// another host or agent box, whose processes it cannot see.
     Finish {
         branch: String,
         /// Registry name. Defaults to the repo you are standing in.
@@ -308,10 +315,12 @@ pub enum Command {
         /// Forget the workspace but leave its directory on disk.
         #[arg(long)]
         no_cleanup: bool,
-        /// Release a claim held by another identity. Requires a durable reason.
+        /// Release a claim held by another identity, finish a workspace another
+        /// process still uses, or finish a claim taken on another host or agent
+        /// box. Requires a durable reason.
         #[arg(long, requires = "why")]
         force: bool,
-        /// Why this forced release is safe.
+        /// Why this forced finish is safe.
         #[arg(long)]
         why: Option<String>,
         /// Record that this branch was superseded by another.

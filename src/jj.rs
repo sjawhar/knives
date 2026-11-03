@@ -1509,7 +1509,7 @@ pub enum WorkspaceIdentity {
     Repository,
     /// A symbolic link, with its target.
     SymbolicLink(PathBuf),
-    /// Not a jj workspace at all.
+    /// No jj workspace at all: nothing claims to be one here.
     NotAWorkspace,
 }
 
@@ -1518,17 +1518,29 @@ pub fn workspace_identity(directory: &Path, checkout: &Path) -> WorkspaceIdentit
         return WorkspaceIdentity::SymbolicLink(target);
     }
     let pointer = directory.join(".jj").join("repo");
-    if pointer.is_dir() {
-        return WorkspaceIdentity::Repository;
+    // A pointer this code cannot even look at is not a missing one: `.jj` may
+    // be there, unreadable, with work under it.
+    match std::fs::metadata(&pointer) {
+        Ok(found) if found.is_dir() => return WorkspaceIdentity::Repository,
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return WorkspaceIdentity::NotAWorkspace;
+        }
+        Err(error) => return WorkspaceIdentity::Unreadable(error.to_string()),
     }
-    if !pointer.is_file() {
-        return WorkspaceIdentity::NotAWorkspace;
-    }
-    let (Ok(store), Ok(expected)) = (
-        Repo::repository_store_path(directory),
-        Repo::repository_store_path(checkout),
-    ) else {
-        return WorkspaceIdentity::NotAWorkspace;
+    // A `.jj/repo` that cannot be resolved is a workspace this code cannot
+    // read, not a directory that is no workspace: something here claims to be
+    // one, and what claims that must not be forgotten or removed as if it had
+    // nothing in it.
+    let store = match Repo::repository_store_path(directory) {
+        Ok(store) => store,
+        Err(error) => return WorkspaceIdentity::Unreadable(error.to_string()),
+    };
+    let Ok(expected) = Repo::repository_store_path(checkout) else {
+        return WorkspaceIdentity::Unreadable(format!(
+            "the repository of {} could not be read",
+            checkout.display()
+        ));
     };
     if store != expected {
         return WorkspaceIdentity::Foreign(store);
@@ -3718,6 +3730,65 @@ pub fn forget_workspace(repo: &Path, name: &str) -> Result<(), JjError> {
         ],
     )?;
     Ok(())
+}
+
+/// The working-copy commit a workspace's snapshot left, by change and commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkingCopySnapshot {
+    pub change: String,
+    pub commit: String,
+}
+
+impl std::fmt::Display for WorkingCopySnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "change {} (commit {})", self.change, self.commit)
+    }
+}
+
+/// Snapshots the working copy at `directory` into its working-copy commit and
+/// names that commit, so a workspace about to be forgotten or removed keeps
+/// every edit made there.
+///
+/// Errs when jj cannot snapshot (a stale working copy, a lock it cannot take),
+/// and when it says anything is wrong while succeeding: jj reports a snapshot
+/// that left something out (a new file over `snapshot.max-new-file-size`, a
+/// name that is not UTF-8) as a warning and still exits 0, and removing the
+/// directory would then lose what it left out. Any warning counts, not one
+/// spelling: a warning this code does not know is no proof the snapshot is
+/// whole. What jj did snapshot stays in its commit either way.
+pub fn snapshot_workspace(directory: &Path) -> Result<WorkingCopySnapshot, JjError> {
+    let shown = path(directory);
+    let (_, warnings) = command_output("jj", &["--repository", &shown, "util", "snapshot"])?;
+    if warnings
+        .lines()
+        .any(|line| line.trim_start().starts_with("Warning:"))
+    {
+        return Err(JjError::Process {
+            program: format!("jj --repository {shown} util snapshot"),
+            detail: warnings.trim().to_owned(),
+        });
+    }
+    let ids = command(
+        "jj",
+        [
+            "--repository",
+            &shown,
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            "@",
+            "-T",
+            r#"change_id.short(12) ++ " " ++ commit_id.short(12)"#,
+        ],
+    )?;
+    let (change, commit) = ids.trim().split_once(' ').ok_or_else(|| JjError::Parse {
+        detail: format!("working-copy ids of {shown}: {ids:?}"),
+    })?;
+    Ok(WorkingCopySnapshot {
+        change: change.to_owned(),
+        commit: commit.to_owned(),
+    })
 }
 
 /// Where jj recorded workspace `name` of `repo`, or `None` when it recorded

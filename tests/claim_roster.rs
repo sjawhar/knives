@@ -205,7 +205,10 @@ fn track_depends_and_finish_name_the_fork_by_its_registry_key() {
         "demo/feat/gamma now requires maintainer/demo#3"
     );
     assert!(
-        finished.starts_with("demo/feat/gamma: claim released; "),
+        finished
+            .lines()
+            .all(|line| line.starts_with("demo/feat/gamma: "))
+            && finished.contains("demo/feat/gamma: claim released; "),
         "{finished}"
     );
 }
