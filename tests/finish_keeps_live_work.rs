@@ -248,6 +248,109 @@ fn the_finishing_sessions_own_processes_do_not_count() {
 }
 
 #[test]
+fn a_duplicate_harness_of_the_same_session_counts() {
+    // Given: a process carrying the finishing session that the finishing
+    // harness did not start: orphaned away from this test's process tree, as a
+    // second harness of the session would be
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    let spawned = Command::new("sh")
+        .args([
+            "-c",
+            "cd \"$1\" && nohup sleep 120 >/dev/null 2>&1 & echo $!",
+            "sh",
+        ])
+        .arg(&workspace)
+        .env("KNIVES_OWNER", OWNER)
+        .output()
+        .expect("spawn the duplicate");
+    let pid = String::from_utf8_lossy(&spawned.stdout).trim().to_owned();
+    assert!(!pid.is_empty(), "{spawned:?}");
+
+    // When: the branch is finished
+    let refused = finish(&lab, &home, &[]);
+    let _ = Command::new("kill").arg(&pid).status();
+
+    // Then: the duplicate is named and nothing changed
+    assert_eq!(refused.status.code(), Some(2), "{}", shown(&refused));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains(&format!("pid {pid} ")),
+        "{}",
+        shown(&refused)
+    );
+    assert!(workspace.is_dir());
+    assert!(claim_held(&home));
+}
+
+#[test]
+fn finish_changes_nothing_when_a_file_name_is_not_utf8() {
+    use std::os::unix::ffi::OsStrExt as _;
+    // Given: a file whose name jj cannot snapshot
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    let name = std::ffi::OsStr::from_bytes(b"draft-\xff.txt");
+    std::fs::write(workspace.join(name), "draft\n").expect("write");
+
+    // When: the branch is finished
+    let refused = finish(&lab, &home, &[]);
+
+    // Then: it refuses; the file, the workspace and the claim stay
+    assert_eq!(refused.status.code(), Some(3), "{}", shown(&refused));
+    assert!(workspace.join(name).is_file());
+    assert!(claim_held(&home));
+}
+
+#[test]
+fn finish_does_not_forget_a_workspace_whose_state_cannot_be_read() {
+    // Given: the workspace's working-copy state is corrupt
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    std::fs::write(
+        workspace.join(".jj/working_copy/checkout"),
+        b"\xff\xfe garbage",
+    )
+    .expect("corrupt the working-copy state");
+
+    // When: the branch is finished
+    let refused = finish(&lab, &home, &[]);
+
+    // Then: it refuses; the workspace stays registered and the claim held
+    assert_eq!(refused.status.code(), Some(3), "{}", shown(&refused));
+    let names = jj(&lab.work, &["workspace", "list", "-T", r#"name ++ "\n""#]);
+    assert!(names.contains("feat-gamma"), "{names}");
+    assert!(claim_held(&home));
+}
+
+#[test]
+fn the_kept_commit_is_named_even_when_removal_fails() {
+    use std::os::unix::fs::PermissionsExt as _;
+    // Given: an edit, and a directory removal cannot get through
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    std::fs::write(workspace.join("notes.txt"), "draft\n").expect("write the edit");
+    let stuck = workspace.join("stuck");
+    std::fs::create_dir(&stuck).expect("create");
+    std::fs::write(stuck.join("inside.txt"), "x\n").expect("write");
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+
+    // When: the branch is finished
+    let finished = finish(&lab, &home, &[]);
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    // Then: whatever the removal did, the output names the commit that keeps
+    // the edit
+    assert!(
+        String::from_utf8_lossy(&finished.stdout).contains("its working copy is kept as change "),
+        "{}",
+        shown(&finished)
+    );
+}
+
+#[test]
 fn finish_refuses_a_claim_taken_in_another_place() {
     // Given: the claim was taken in another agent box (its place recorded)
     let lab = Lab::new();
@@ -264,17 +367,22 @@ fn finish_refuses_a_claim_taken_in_another_place() {
     state["claims"]["demo/feat/gamma"]["place"] = Value::String("other-box pid:[1]".to_owned());
     std::fs::write(&path, state.to_string()).expect("write state");
 
-    // When: the same session finishes from here, then forces
+    // When: the same session finishes from here
     let refused = finish(&lab, &home, &[]);
-    let forced = finish(&lab, &home, &["--force", "--why", "the box is gone"]);
 
-    // Then: the plain finish refuses and names the other place
+    // Then: it refuses, names the other place, and keeps the claim and the
+    // workspace
     assert_eq!(refused.status.code(), Some(2), "{}", shown(&refused));
     assert!(
         String::from_utf8_lossy(&refused.stderr).contains("other-box pid:[1]"),
         "{}",
         shown(&refused)
     );
+    assert!(claim_held(&home));
+    assert!(workspace.is_dir());
+
+    // When: it forces, then the finish goes through
+    let forced = finish(&lab, &home, &["--force", "--why", "the box is gone"]);
     assert!(forced.status.success(), "{}", shown(&forced));
     assert!(!workspace.exists());
 }

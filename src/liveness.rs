@@ -38,15 +38,38 @@ impl std::fmt::Display for LiveUser {
 /// process sees them.
 pub type Session<'a> = (&'a str, &'a str);
 
+/// Programs that run a command on someone's behalf without being a harness:
+/// shells and wrappers between a harness and the `knives` it runs.
+const PASS_THROUGH: [&str; 17] = [
+    "sh",
+    "bash",
+    "dash",
+    "zsh",
+    "fish",
+    "ksh",
+    "brush",
+    "env",
+    "timeout",
+    "nice",
+    "nohup",
+    "stdbuf",
+    "xargs",
+    "setsid",
+    "sudo",
+    "script",
+    "systemd-run",
+];
+
 /// The processes using `directory`, except the caller's own.
 ///
 /// The caller's own are this process and its ancestors, and, when a harness
-/// names the session (`session`), every process under that harness carrying
+/// names the session (`session`), the processes its harness started that carry
 /// the same session: its language servers and background jobs. The harness is
-/// the nearest ancestor that does not carry the session itself (a harness sets
-/// the variable for what it starts, not in its own environment). A duplicate
-/// harness of the same session is not in this process's ancestry, so it and
-/// what it started are counted.
+/// the nearest ancestor that is not a shell or a wrapper (`PASS_THROUGH`);
+/// harnesses differ in whether their own environment carries the session, so
+/// the environment cannot mark the boundary. A duplicate harness of the same
+/// session is outside that harness's process tree, so it and what it started
+/// are counted, even where both inherited the session from one launcher.
 ///
 /// Empty where `/proc` cannot be read (not Linux).
 pub fn live_users(directory: &Path, session: Option<Session<'_>>) -> Vec<LiveUser> {
@@ -74,8 +97,8 @@ pub fn live_users(directory: &Path, session: Option<Session<'_>>) -> Vec<LiveUse
     let harness = session.and_then(|session| {
         own.iter()
             .skip(1)
-            .find(|&&pid| !carries(pid, session))
-            .map(|&root| (root, session))
+            .find(|&&pid| !PASS_THROUGH.contains(&comm_of(pid).as_str()))
+            .map(|&harness| (harness, session))
     });
     users
         .into_iter()
@@ -86,6 +109,13 @@ pub fn live_users(directory: &Path, session: Option<Session<'_>>) -> Vec<LiveUse
                 })
         })
         .collect()
+}
+
+/// The program name of `pid`, as `/proc/<pid>/comm` gives it.
+fn comm_of(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|comm| comm.trim().to_owned())
+        .unwrap_or_default()
 }
 
 /// This process's place: the host name and the PID namespace it runs in. Two
@@ -141,12 +171,7 @@ fn command_of(pid: u32) -> String {
                 .join(" ")
         })
         .unwrap_or_default();
-    let line = if line.is_empty() {
-        std::fs::read_to_string(format!("/proc/{pid}/comm"))
-            .map_or_else(|_| "?".to_owned(), |comm| comm.trim().to_owned())
-    } else {
-        line
-    };
+    let line = if line.is_empty() { comm_of(pid) } else { line };
     match line.char_indices().nth(120) {
         Some((cut, _)) => format!("{}…", &line[..cut]),
         None => line,

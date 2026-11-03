@@ -3677,13 +3677,19 @@ impl std::fmt::Display for WorkingCopySnapshot {
 /// every edit made there.
 ///
 /// Errs when jj cannot snapshot (a stale working copy, a lock it cannot take),
-/// and when it snapshotted only part of the working copy: jj refuses new files
-/// over `snapshot.max-new-file-size` with a warning and still exits 0, and
-/// removing the directory would then lose them.
+/// and when it says anything is wrong while succeeding: jj reports a snapshot
+/// that left something out (a new file over `snapshot.max-new-file-size`, a
+/// name that is not UTF-8) as a warning and still exits 0, and removing the
+/// directory would then lose what it left out. Any warning counts, not one
+/// spelling: a warning this code does not know is no proof the snapshot is
+/// whole. What jj did snapshot stays in its commit either way.
 pub fn snapshot_workspace(directory: &Path) -> Result<WorkingCopySnapshot, JjError> {
     let shown = path(directory);
     let (_, warnings) = command_output("jj", &["--repository", &shown, "util", "snapshot"])?;
-    if warnings.contains("Refused to snapshot") {
+    if warnings
+        .lines()
+        .any(|line| line.trim_start().starts_with("Warning:"))
+    {
         return Err(JjError::Process {
             program: format!("jj --repository {shown} util snapshot"),
             detail: warnings.trim().to_owned(),

@@ -92,7 +92,8 @@ pub(crate) fn run_finish(
     }
     let workspace = knives::commands::wip::workspace_for(branch.as_str());
     let directory = workspace_path(fork, branch);
-    // Before the claim is touched: a refusal leaves everything as it was.
+    // Read-only checks before the claim is touched: a refusal leaves everything
+    // as it was.
     let cleared = match clear_workspace(fork, branch, &directory, options) {
         Ok(cleared) => cleared,
         Err(exit) => return Ok(exit),
@@ -106,6 +107,9 @@ pub(crate) fn run_finish(
         FinishClaimGate::Continue(event) => event,
         FinishClaimGate::Refuse => return Ok(Exit::Usage),
     };
+    if let Err(exit) = keep_working_copy(fork, branch, cleared.working_copy.as_deref()) {
+        return Ok(exit);
+    }
     let forced = joined(forced_release, cleared.over_live_users);
     let had = store.release_claim(target);
     let pr = store.tracked_pull(target);
@@ -194,11 +198,8 @@ pub(crate) fn run_finish(
             format!("{shown} is not a workspace of {checkout}, left alone")
         }
     };
-    let kept = cleared.kept.map_or_else(String::new, |kept| {
-        format!("; its working copy is kept as {kept}")
-    });
     println!(
-        "{}/{branch}: claim {claim}; workspace {workspace} {registration}{kept}; {removal}",
+        "{}/{branch}: claim {claim}; workspace {workspace} {registration}; {removal}",
         fork.name
     );
     Ok(Exit::Ok)
@@ -212,67 +213,105 @@ fn joined(first: Option<String>, second: Option<String>) -> Option<String> {
     }
 }
 
-/// What is at the branch's workspace path, and what the checks before the
-/// claim is touched allow `finish` to go on with.
+/// What is at the branch's workspace path, and what the read-only checks
+/// before the claim is touched allow `finish` to go on with.
 struct Cleared {
     /// What sits at the path, when anything does.
     identity: Option<WorkspaceIdentity>,
     /// Whether that is this branch's own workspace.
     present: bool,
+    /// Where this branch's working copy is, when `finish` will forget it: the
+    /// path itself, or the directory a symbolic link there points at.
+    working_copy: Option<PathBuf>,
     /// The forced finish's provenance, when `--force` went over a live process.
     over_live_users: Option<String>,
-    /// The snapshot that keeps the working copy of a workspace about to go.
-    kept: Option<knives::jj::WorkingCopySnapshot>,
 }
 
-/// Reads what is at `directory` and, when it is this branch's own workspace,
-/// checks it before anything changes: no other process may still work there,
-/// and its working copy must be snapshotted whole into jj. `Err` carries the
-/// exit after the refusal is printed.
+/// Reads what is at `directory` and finds this branch's working copy there,
+/// then checks that no other process still works in it. A workspace of this
+/// repository whose state cannot be read is refused: it cannot be snapshotted,
+/// so it must not be forgotten. `Err` carries the exit after the refusal is
+/// printed.
 fn clear_workspace(
     fork: &Fork<'_>,
     branch: &BranchName,
     directory: &Path,
     options: &FinishOptions<'_>,
 ) -> Result<Cleared, Exit> {
-    let workspace = knives::commands::wip::workspace_for(branch.as_str());
+    let checkout = &fork.checkout.path;
+    let workspace =
+        knives::ids::WorkspaceName::new(knives::commands::wip::workspace_for(branch.as_str()));
     // Read what is at the path before writing anything to the repository: a jj
     // that refused to load a forgotten workspace's state would otherwise leave
     // the directory forgotten and unremovable.
     let identity = directory
         .exists()
-        .then(|| knives::jj::workspace_identity(directory, &fork.checkout.path));
+        .then(|| knives::jj::workspace_identity(directory, checkout));
     // When the workspace at the path is this branch's own, the directory is the
     // evidence: jj's record of where it lives can be missing (made before jj
     // recorded paths) or stale (moved by hand).
-    let present = matches!(
-        &identity,
-        Some(WorkspaceIdentity::Ours(name)) if name.as_str() == workspace
-    );
-    if !present {
-        return Ok(Cleared {
-            identity,
-            present,
-            over_live_users: None,
-            kept: None,
-        });
-    }
-    let over_live_users = live_users_gate(fork, branch, directory, options)?;
-    let kept = knives::jj::snapshot_workspace(directory).map_err(|error| {
-        eprintln!(
-            "{}/{branch}: could not snapshot the working copy at {} into jj, so forgetting or \
-             removing it could lose its edits; nothing was changed\n{error}",
-            fork.name,
-            directory.display()
-        );
-        Exit::Incomplete
-    })?;
+    let present = identity.as_ref() == Some(&WorkspaceIdentity::Ours(workspace.clone()));
+    let working_copy = match &identity {
+        _ if present => Some(directory.to_owned()),
+        Some(WorkspaceIdentity::SymbolicLink(target)) => {
+            let target = directory
+                .parent()
+                .map_or_else(|| target.clone(), |at| at.join(target));
+            knives::jj::is_workspace_named(&target, checkout, &workspace).then_some(target)
+        }
+        Some(WorkspaceIdentity::Unreadable(detail)) => {
+            eprintln!(
+                "{}/{branch}: {} is a workspace of {} whose working-copy state could not be read \
+                 ({detail}); it cannot be snapshotted, so it is not forgotten; nothing was changed",
+                fork.name,
+                directory.display(),
+                checkout.display()
+            );
+            return Err(Exit::Incomplete);
+        }
+        _ => None,
+    };
+    let over_live_users = match &working_copy {
+        Some(working_copy) => live_users_gate(fork, branch, working_copy, options)?,
+        None => None,
+    };
     Ok(Cleared {
         identity,
         present,
+        working_copy,
         over_live_users,
-        kept: Some(kept),
     })
+}
+
+/// Snapshots this branch's working copy into jj before it is forgotten, and
+/// names the commit that keeps it at once, before anything can fail on the
+/// way to removing it. A snapshot that fails or leaves something out refuses
+/// the finish with the claim and the workspace as they were; what jj did
+/// snapshot stays in its commit.
+fn keep_working_copy(
+    fork: &Fork<'_>,
+    branch: &BranchName,
+    working_copy: Option<&Path>,
+) -> Result<(), Exit> {
+    let Some(working_copy) = working_copy else {
+        return Ok(());
+    };
+    match knives::jj::snapshot_workspace(working_copy) {
+        Ok(kept) => {
+            println!("{}/{branch}: its working copy is kept as {kept}", fork.name);
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!(
+                "{}/{branch}: could not snapshot all of the working copy at {} into jj, so \
+                 forgetting or removing it could lose edits; the claim and the workspace are \
+                 left as they were\n{error}",
+                fork.name,
+                working_copy.display()
+            );
+            Err(Exit::Incomplete)
+        }
+    }
 }
 
 /// Whether anything else on this machine still works in `directory`: a
