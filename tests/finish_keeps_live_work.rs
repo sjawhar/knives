@@ -397,6 +397,26 @@ fn finish_does_not_forget_an_unreadable_workspace_behind_a_link() {
 }
 
 #[test]
+fn finish_does_not_forget_a_workspace_whose_repository_pointer_cannot_be_read() {
+    // Given: the workspace's `.jj/repo` pointer leads nowhere, so what is at
+    // the path cannot be told apart from a workspace with work in it
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    std::fs::write(workspace.join(".jj/repo"), "../nowhere/repo").expect("break the pointer");
+
+    // When: the branch is finished
+    let refused = finish(&lab, &home, &[]);
+
+    // Then: it refuses; the workspace stays registered and the claim held
+    assert_eq!(refused.status.code(), Some(3), "{}", shown(&refused));
+    let names = jj(&lab.work, &["workspace", "list", "-T", r#"name ++ "\n""#]);
+    assert!(names.contains("feat-gamma"), "{names}");
+    assert!(claim_held(&home));
+    assert!(workspace.is_dir());
+}
+
+#[test]
 fn finish_changes_nothing_when_a_file_name_is_not_utf8() {
     use std::os::unix::ffi::OsStrExt as _;
     // Given: a file whose name jj cannot snapshot

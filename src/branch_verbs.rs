@@ -256,10 +256,16 @@ fn clear_workspace(
     // forgotten, and one whose state cannot be read is refused as if it sat at
     // the path.
     let landed = match &identity {
-        Some(WorkspaceIdentity::SymbolicLink(_)) => directory
-            .canonicalize()
-            .ok()
-            .map(|target| (knives::jj::workspace_identity(&target, checkout), target)),
+        Some(WorkspaceIdentity::SymbolicLink(_)) => match directory.canonicalize() {
+            Ok(target) => Some((knives::jj::workspace_identity(&target, checkout), target)),
+            // A link to nothing has nothing to snapshot. A link this code
+            // cannot follow for any other reason may lead to work.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some((
+                WorkspaceIdentity::Unreadable(error.to_string()),
+                directory.to_owned(),
+            )),
+        },
         _ => None,
     };
     let (resolved, at) = match &landed {

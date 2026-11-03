@@ -1505,7 +1505,7 @@ pub enum WorkspaceIdentity {
     Repository,
     /// A symbolic link, with its target.
     SymbolicLink(PathBuf),
-    /// Not a jj workspace at all.
+    /// No jj workspace at all: nothing claims to be one here.
     NotAWorkspace,
 }
 
@@ -1520,11 +1520,19 @@ pub fn workspace_identity(directory: &Path, checkout: &Path) -> WorkspaceIdentit
     if !pointer.is_file() {
         return WorkspaceIdentity::NotAWorkspace;
     }
-    let (Ok(store), Ok(expected)) = (
-        Repo::repository_store_path(directory),
-        Repo::repository_store_path(checkout),
-    ) else {
-        return WorkspaceIdentity::NotAWorkspace;
+    // A `.jj/repo` that cannot be resolved is a workspace this code cannot
+    // read, not a directory that is no workspace: something here claims to be
+    // one, and what claims that must not be forgotten or removed as if it had
+    // nothing in it.
+    let store = match Repo::repository_store_path(directory) {
+        Ok(store) => store,
+        Err(error) => return WorkspaceIdentity::Unreadable(error.to_string()),
+    };
+    let Ok(expected) = Repo::repository_store_path(checkout) else {
+        return WorkspaceIdentity::Unreadable(format!(
+            "the repository of {} could not be read",
+            checkout.display()
+        ));
     };
     if store != expected {
         return WorkspaceIdentity::Foreign(store);
