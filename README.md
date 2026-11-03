@@ -163,10 +163,15 @@ install -Dm755 ~/.local/opt/knives-$v-linux-x86_64/bin/knives ~/.local/bin/knive
 Make sure `~/.local/bin` is on your `PATH` (for bash: `echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc`,
 then open a new shell), and check with `knives --version`.
 
-Or with [mise](https://mise.jdx.dev): `mise use -g github:sjawhar/knives@<tag>` with the
-[latest tag](https://github.com/sjawhar/knives/releases/latest). A bare `github:sjawhar/knives`
-can resolve to an older release when your mise config sets `minimum_release_age`; add
-`minimum_release_age_excludes = ["github:sjawhar/knives"]` under `[settings]` to take the newest.
+Or with [mise](https://mise.jdx.dev), using the `v` resolved in the first line above:
+
+```
+mise use -g "github:sjawhar/knives@$v"
+```
+
+A bare `github:sjawhar/knives` can resolve to an older release when your mise config sets
+`minimum_release_age`; add `minimum_release_age_excludes = ["github:sjawhar/knives"]` under
+`[settings]` to take the newest.
 
 ### Plugins
 
