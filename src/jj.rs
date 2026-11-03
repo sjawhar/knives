@@ -3659,6 +3659,59 @@ pub fn forget_workspace(repo: &Path, name: &str) -> Result<(), JjError> {
     Ok(())
 }
 
+/// The working-copy commit a workspace's snapshot left, by change and commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkingCopySnapshot {
+    pub change: String,
+    pub commit: String,
+}
+
+impl std::fmt::Display for WorkingCopySnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "change {} (commit {})", self.change, self.commit)
+    }
+}
+
+/// Snapshots the working copy at `directory` into its working-copy commit and
+/// names that commit, so a workspace about to be forgotten or removed keeps
+/// every edit made there.
+///
+/// Errs when jj cannot snapshot (a stale working copy, a lock it cannot take),
+/// and when it snapshotted only part of the working copy: jj refuses new files
+/// over `snapshot.max-new-file-size` with a warning and still exits 0, and
+/// removing the directory would then lose them.
+pub fn snapshot_workspace(directory: &Path) -> Result<WorkingCopySnapshot, JjError> {
+    let shown = path(directory);
+    let (_, warnings) = command_output("jj", &["--repository", &shown, "util", "snapshot"])?;
+    if warnings.contains("Refused to snapshot") {
+        return Err(JjError::Process {
+            program: format!("jj --repository {shown} util snapshot"),
+            detail: warnings.trim().to_owned(),
+        });
+    }
+    let ids = command(
+        "jj",
+        [
+            "--repository",
+            &shown,
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            "@",
+            "-T",
+            r#"change_id.short(12) ++ " " ++ commit_id.short(12)"#,
+        ],
+    )?;
+    let (change, commit) = ids.trim().split_once(' ').ok_or_else(|| JjError::Parse {
+        detail: format!("working-copy ids of {shown}: {ids:?}"),
+    })?;
+    Ok(WorkingCopySnapshot {
+        change: change.to_owned(),
+        commit: commit.to_owned(),
+    })
+}
+
 /// Where jj recorded workspace `name` of `repo`, or `None` when it recorded
 /// no path for the name (a workspace made before jj recorded them).
 ///

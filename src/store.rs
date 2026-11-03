@@ -57,6 +57,12 @@ pub struct Claim {
     pub started: String,
     #[serde(default)]
     pub files: Vec<String>,
+    /// Where the claim was taken: host name and PID namespace
+    /// ([`crate::liveness::this_place`]). A process in another place cannot see
+    /// this one's processes, so `finish` from there cannot tell whether the
+    /// workspace is still in use. Absent on claims taken before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place: Option<String>,
 }
 
 impl Claim {
@@ -406,6 +412,7 @@ impl Store {
             why: why.to_owned(),
             started: jiff::Timestamp::now().to_string(),
             files: Vec::new(),
+            place: Some(crate::liveness::this_place()),
         };
         self.set_claim(record.key(), Some(record.clone()));
         record

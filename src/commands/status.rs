@@ -1195,6 +1195,7 @@ mod tests {
             why: "status model".to_owned(),
             started: "2026-08-01T00:00:00Z".to_owned(),
             files: Vec::new(),
+            place: None,
         };
 
         assert_eq!(

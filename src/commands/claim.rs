@@ -183,17 +183,20 @@ pub fn identity_outside_a_fork() -> Identity {
 
 /// The session a harness names (`HARNESS_SESSION_VARIABLES`), if one does.
 fn harness_identity() -> Option<Identity> {
-    HARNESS_SESSION_VARIABLES
-        .iter()
-        .find_map(|name| {
-            std::env::var(name)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .map(|owner| Identity {
-            owner,
-            kind: OwnerKind::HarnessSession,
-        })
+    harness_session().map(|(_, owner)| Identity {
+        owner,
+        kind: OwnerKind::HarnessSession,
+    })
+}
+
+/// The variable a harness names this session by, and its value.
+pub fn harness_session() -> Option<(&'static str, String)> {
+    HARNESS_SESSION_VARIABLES.iter().find_map(|&name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| (name, value))
+    })
 }
 
 fn os_user() -> Identity {
@@ -224,6 +227,7 @@ mod tests {
             why: "w".into(),
             started: "2026-01-01T00:00:00Z".into(),
             files: Vec::new(),
+            place: None,
         }
     }
 

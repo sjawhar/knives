@@ -460,6 +460,7 @@ mod tests {
                 why: "porting".to_owned(),
                 started: "2026-01-01T00:00:00Z".to_owned(),
                 files: Vec::new(),
+                place: None,
             },
             Claim {
                 repo: "r".to_owned(),
@@ -469,6 +470,7 @@ mod tests {
                 why: "waiting".to_owned(),
                 started: "2026-01-01T00:00:00Z".to_owned(),
                 files: Vec::new(),
+                place: None,
             },
         ];
         let seen = Seen {
@@ -505,6 +507,7 @@ mod tests {
             why: "porting".to_owned(),
             started: "2026-01-01T00:00:00Z".to_owned(),
             files: Vec::new(),
+            place: None,
         }];
         let seen = Seen::default();
         let early = claim_lines(
@@ -533,6 +536,7 @@ mod tests {
             why: "reviewing".to_owned(),
             started: "2026-01-02T00:00:00Z".to_owned(),
             files: Vec::new(),
+            place: None,
         });
         let expected = "03b4a0b08163a78c";
         assert_eq!(notice_digest(&beta, root, &grown), expected);
