@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 use crate::cli::{Exit, Output};
 use crate::config::{ConfigError, FormerNames, Registry};
 use crate::ids::{Requirement, UpstreamName};
-use crate::ledger::{Draft, Ledger, Scribe, Stated, inline_human_text, unmigrated};
+use crate::ledger::{
+    Draft, Ledger, Scribe, Stated, inline_human_text, problem_human_text, unmigrated,
+};
 use crate::ledger_sweep::{self, Contended, Swept, Tally, Waited};
 use crate::lock::FileLock;
 use crate::statement::{Statement, StatementKind, Statements};
@@ -182,7 +184,7 @@ pub fn render(report: &Report) -> String {
         report
             .problems
             .iter()
-            .map(|problem| format!("!! {}", inline_human_text(problem))),
+            .map(|problem| format!("!! {}", problem_human_text(problem))),
     );
     lines.extend(
         report
@@ -887,7 +889,7 @@ pub fn render_migrated(migrated: &Migrated) -> String {
         migrated
             .problems
             .iter()
-            .map(|problem| format!("!! {}", inline_human_text(problem))),
+            .map(|problem| format!("!! {}", problem_human_text(problem))),
     );
     lines.join("\n")
 }

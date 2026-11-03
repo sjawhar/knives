@@ -773,7 +773,7 @@ pub fn render(report: &Report) -> String {
         let _ = write!(
             lines,
             "\n  PROBLEM: {}",
-            crate::ledger::inline_human_text(problem)
+            crate::ledger::problem_human_text(problem)
         );
     }
     if !report.branches.is_empty() {

@@ -614,7 +614,7 @@ pub fn render(report: &Report) -> String {
         report
             .problems
             .iter()
-            .map(|problem| format!("? {}", crate::ledger::inline_human_text(problem))),
+            .map(|problem| format!("? {}", crate::ledger::problem_human_text(problem))),
     );
     if report.rows.is_empty() {
         lines.push(format!("{}: no tracked pull requests", report.repo));
@@ -887,6 +887,101 @@ mod tests {
             ..Report::default()
         };
         assert_eq!(exit_for(&blocked), Exit::Incomplete);
+    }
+
+    #[test]
+    fn a_multi_line_problem_renders_on_one_readable_line() {
+        // jj and git print more than one line ("Concurrent modification
+        // detected" before the error; git's second "Another git process" line).
+        let report = Report {
+            repo: "demo".to_owned(),
+            problems: vec![
+                "could not sync: command `jj` failed (exit status: 1): \
+                 Concurrent modification detected, resolving automatically.\n\
+                 Error: Failed to update refs: refs/remotes/origin/main\r\n\n\
+                 Hint: run \u{1b}[31mit\u{1b}[0m again"
+                    .to_owned(),
+            ],
+            ..Report::default()
+        };
+
+        let text = render(&report);
+        let problem = text.lines().next().unwrap_or_default();
+        assert_eq!(
+            problem,
+            "? could not sync: command `jj` failed (exit status: 1): \
+             Concurrent modification detected, resolving automatically.; \
+             Error: Failed to update refs: refs/remotes/origin/main; \
+             Hint: run \u{fffd}[31mit\u{fffd}[0m again"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_sentence_in_a_problem_stays_one_sentence() {
+        // git wraps its advice at about 60 columns; a line that continues a
+        // sentence starts lower-case and joins with a space, not "; ".
+        let report = Report {
+            repo: "demo".to_owned(),
+            problems: vec![
+                "could not fetch foreign #7: command `git` failed (exit status: 1): \
+                 error: cannot lock ref 'refs/heads/pull/7': Unable to create \
+                 '/r/.git/refs/heads/pull/7.lock': File exists.\n\n\
+                 Another git process seems to be running in this repository, e.g.\n\
+                 an editor opened by 'git commit'. Please make sure all processes\n\
+                 are terminated then try again. If it still fails, a git process\n\
+                 may have crashed in this repository earlier:\n\
+                 remove the file manually to continue.\n\
+                 From /r/upstream\n \
+                 ! c242436..08646eb  refs/pull/7/head -> pull/7  (unable to update local ref)"
+                    .to_owned(),
+            ],
+            ..Report::default()
+        };
+
+        let text = render(&report);
+        let problem = text.lines().next().unwrap_or_default();
+        assert_eq!(
+            problem,
+            "? could not fetch foreign #7: command `git` failed (exit status: 1): \
+             error: cannot lock ref 'refs/heads/pull/7': Unable to create \
+             '/r/.git/refs/heads/pull/7.lock': File exists.; \
+             Another git process seems to be running in this repository, e.g. \
+             an editor opened by 'git commit'. Please make sure all processes \
+             are terminated then try again. If it still fails, a git process \
+             may have crashed in this repository earlier: \
+             remove the file manually to continue.; \
+             From /r/upstream; \
+             ! c242436..08646eb  refs/pull/7/head -> pull/7  (unable to update local ref)"
+        );
+    }
+
+    #[test]
+    fn a_lower_case_message_prefix_starts_a_new_message() {
+        // git prints each `fatal:`/`error:` line as its own message; only its
+        // wrapped advice ("and the repository exists.") continues a sentence.
+        let report = Report {
+            repo: "demo".to_owned(),
+            problems: vec![
+                "could not fetch foreign #7: command `git` failed (exit status: 128): \
+                 fatal: '/r/upstream.git' does not appear to be a git repository\n\
+                 fatal: Could not read from remote repository.\n\n\
+                 Please make sure you have the correct access rights\n\
+                 and the repository exists."
+                    .to_owned(),
+            ],
+            ..Report::default()
+        };
+
+        let text = render(&report);
+        let problem = text.lines().next().unwrap_or_default();
+        assert_eq!(
+            problem,
+            "? could not fetch foreign #7: command `git` failed (exit status: 128): \
+             fatal: '/r/upstream.git' does not appear to be a git repository; \
+             fatal: Could not read from remote repository.; \
+             Please make sure you have the correct access rights \
+             and the repository exists."
+        );
     }
     #[test]
     fn cache_write_failure_is_a_note_and_does_not_make_sync_incomplete() {

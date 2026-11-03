@@ -57,7 +57,11 @@ somebody else's branch, and cross-fork dependencies that have not merged yet.
 
 `knives sync` fetches every remote, discovers tracked pull requests from the forge snapshot,
 then classifies each as new, unchanged, advanced, merged, or closed and reports comment activity
-since the last run.
+since the last run. When another fetch of the same clone wins a ref update, the remote fetch and
+each carried foreign pull-request fetch are retried up to four more times after short jittered waits
+(under 1.5 s in all). git reports every ref-lock failure the same way, so one that is no race (a lock
+file a crashed git left behind, a ref directory it may not write) also costs those retries before its
+error returns.
 
 ## What it remembers
 

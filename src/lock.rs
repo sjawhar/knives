@@ -100,7 +100,7 @@ fn pause(attempt: u32, wait: LockWait, random: u64) -> Duration {
 
 /// Jitter source. The standard library's per-process randomised hasher is
 /// enough to break lockstep between waiters, and costs no dependency.
-fn random_u64() -> u64 {
+pub(crate) fn random_u64() -> u64 {
     use std::hash::{BuildHasher as _, Hasher as _};
     std::collections::hash_map::RandomState::new()
         .build_hasher()

@@ -478,6 +478,11 @@ pub fn pending(repository: &Repository, machine: &str) -> Result<Pending, GitErr
 /// `--quiet`: what git prints on its way to failing is the one place it names
 /// the ref it refused. `--prune` drops the copy of a ref the remote no longer
 /// has, so the report is the remote's refs now.
+///
+/// Ref-lock failures are not retried here. Every production caller holds the
+/// git directory's `knives-transport.lock`, so another knives ledger fetch
+/// cannot race this one. A retry would also keep that lock for another
+/// 60-second transport deadline, past what a waiting command is promised.
 pub fn fetch(repository: &Repository, remote: &str) -> Result<Vec<MachineRef>, GitError> {
     let remote = ref_component("remote", remote)?;
     transport(repository.git().args([
