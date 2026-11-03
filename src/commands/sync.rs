@@ -954,6 +954,35 @@ mod tests {
              ! c242436..08646eb  refs/pull/7/head -> pull/7  (unable to update local ref)"
         );
     }
+
+    #[test]
+    fn a_lower_case_message_prefix_starts_a_new_message() {
+        // git prints each `fatal:`/`error:` line as its own message; only its
+        // wrapped advice ("and the repository exists.") continues a sentence.
+        let report = Report {
+            repo: "demo".to_owned(),
+            problems: vec![
+                "could not fetch foreign #7: command `git` failed (exit status: 128): \
+                 fatal: '/r/upstream.git' does not appear to be a git repository\n\
+                 fatal: Could not read from remote repository.\n\n\
+                 Please make sure you have the correct access rights\n\
+                 and the repository exists."
+                    .to_owned(),
+            ],
+            ..Report::default()
+        };
+
+        let text = render(&report);
+        let problem = text.lines().next().unwrap_or_default();
+        assert_eq!(
+            problem,
+            "? could not fetch foreign #7: command `git` failed (exit status: 128): \
+             fatal: '/r/upstream.git' does not appear to be a git repository; \
+             fatal: Could not read from remote repository.; \
+             Please make sure you have the correct access rights \
+             and the repository exists."
+        );
+    }
     #[test]
     fn cache_write_failure_is_a_note_and_does_not_make_sync_incomplete() {
         // A cache write happens after the live batch; losing it must not change

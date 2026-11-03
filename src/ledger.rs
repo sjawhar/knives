@@ -849,20 +849,30 @@ pub fn body_human_text(text: &str) -> String {
 ///
 /// A problem often quotes jj or git, which print more than one line (jj's
 /// "Concurrent modification detected" before its error, git's "Another git
-/// process" sentence). Each non-blank line is trimmed. A line that starts
-/// lower-case continues the sentence git wrapped, so it joins with a space;
-/// every other line joins with `; `. The result is escaped as
-/// [`inline_human_text`] escapes it, so a line break never reads as U+FFFD.
+/// process" sentence). Each non-blank line is trimmed. A line that continues
+/// a sentence git wrapped joins with a space; every other line joins with
+/// `; `. The result is escaped as [`inline_human_text`] escapes it, so a line
+/// break never reads as U+FFFD.
 pub fn problem_human_text(text: &str) -> String {
     let mut joined = String::with_capacity(text.len());
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         if !joined.is_empty() {
-            let continues = line.starts_with(char::is_lowercase);
-            joined.push_str(if continues { " " } else { "; " });
+            joined.push_str(if continues_sentence(line) { " " } else { "; " });
         }
         joined.push_str(line);
     }
     inline_human_text(&joined)
+}
+
+/// Whether a line continues the sentence before it: it starts lower-case
+/// and is not a new message under a prefix such as git's `fatal:`, `error:`,
+/// `warning:` or `hint:` (a first word that ends in a colon).
+fn continues_sentence(line: &str) -> bool {
+    let prefixed = line
+        .split_whitespace()
+        .next()
+        .is_some_and(|word| word.len() > 1 && word.ends_with(':'));
+    line.starts_with(char::is_lowercase) && !prefixed
 }
 
 fn escape_human_text(text: &str, preserve_line_feeds: bool) -> String {
