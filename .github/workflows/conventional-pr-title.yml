@@ -7,6 +7,12 @@ on:
 permissions:
   pull-requests: read
 
+# A newer event on a pull request cancels its older check, waiting or running: the newest run reads
+# the title as it is then, and every sjawhar repository shares one limit of 40 GitHub-hosted jobs.
+concurrency:
+  group: conventional-pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   conventional-pr-title:
     name: Conventional PR Title
