@@ -123,18 +123,49 @@ masks, so the question "what is this weird branch" is usually answered before yo
 
 ## Install
 
+### Prerequisites
+
+- `git`, `curl`, `tar`.
+- `gh`, the GitHub CLI, logged in (`gh auth login`). Every command that reads the forge goes
+  through it. Install: <https://github.com/cli/cli#installation>.
+- `jj` 0.45.1. knives embeds `jj-lib` 0.45.1 (pinned in `Cargo.toml`), and the installed `jj`
+  must agree with it about the on-disk repository format, so use that release:
+
+  ```
+  curl -fsSL https://github.com/jj-vcs/jj/releases/download/v0.45.1/jj-v0.45.1-x86_64-unknown-linux-musl.tar.gz \
+    | tar xzf - ./jj
+  install -Dm755 jj ~/.local/bin/jj
+  ```
+
+  (On macOS or ARM, take the matching asset from the
+  [v0.45.1 release](https://github.com/jj-vcs/jj/releases/tag/v0.45.1).)
+
 knives reads a checkout's identity through git, so a jj workspace must carry a `.git` file beside
-its `.jj`. `jj workspace add` writes one when it creates a Git worktree for the workspace, which
-it does by default when the workspace it runs from is colocated and `git.colocate` is `true`
-(jj-vcs/jj#9941, after 0.45.0; `--colocate` forces it, `--no-colocate` opts out). Install a jj
-build at least that new, whose on-disk repo format matches the `jj-lib` this knives build
-embeds (see `Cargo.toml`). Then download the knives
-release archive for your platform and put `bin/` on your `PATH`:
+its `.jj`: work in a colocated jj repository (`jj git init --colocate`, or `jj git clone --colocate`).
+`jj workspace add` then writes the `.git` file for each new workspace, because `git.colocate` is
+`true` by default (jj-vcs/jj#9941; `--colocate` forces it, `--no-colocate` opts out).
+
+### The binary
+
+With [mise](https://mise.jdx.dev), which tracks the latest release:
 
 ```
-tar xzf knives-v0.1.2-linux-x86_64.tar.gz
-install -m755 knives-*/bin/knives ~/.local/bin/
+mise use -g github:sjawhar/knives
 ```
+
+Or download the latest release archive by hand (Linux x86_64):
+
+```
+v=$(curl -fsSL https://api.github.com/repos/sjawhar/knives/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
+curl -fsSLO "https://github.com/sjawhar/knives/releases/download/$v/knives-$v-linux-x86_64.tar.gz"
+tar xzf "knives-$v-linux-x86_64.tar.gz"
+install -Dm755 knives-*/bin/knives ~/.local/bin/knives
+```
+
+Make sure `~/.local/bin` is on your `PATH` (for bash: `echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc`,
+then open a new shell), and check with `knives --version`.
+
+### Plugins
 
 Install the Claude Code plugin separately:
 
