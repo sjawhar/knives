@@ -127,18 +127,57 @@ masks, so the question "what is this weird branch" is usually answered before yo
 
 ## Install
 
+### Prerequisites
+
+- `git`, `curl`, `tar`.
+- `gh`, the GitHub CLI, logged in (`gh auth login`). Every command that reads the forge goes
+  through it. Install: <https://github.com/cli/cli#installation>.
+- `jj` 0.45.1 with jj-vcs/jj#9941. knives embeds `jj-lib` 0.45.1 (pinned in `Cargo.toml`), and
+  the installed `jj` must agree with it about the on-disk repository format. Upstream 0.45.1 lacks
+  #9941 (upstream ships it from 0.46.0), so install the 0.45.1 build that carries it:
+
+  ```
+  t=v0.45.1-sami.20260910-043938
+  curl -fsSL "https://github.com/sjawhar/jj/releases/download/$t/jj-$t-x86_64-unknown-linux-musl.tar.gz" \
+    | tar xzf - ./jj
+  install -Dm755 jj ~/.local/bin/jj
+  ```
+
+  (On macOS or ARM Linux, take the matching asset from the
+  [same release](https://github.com/sjawhar/jj/releases/tag/v0.45.1-sami.20260910-043938).)
+
 knives reads a checkout's identity through git, so a jj workspace must carry a `.git` file beside
-its `.jj`. `jj workspace add` writes one when it creates a Git worktree for the workspace, which
-it does by default when the workspace it runs from is colocated and `git.colocate` is `true`
-(jj-vcs/jj#9941, after 0.45.0; `--colocate` forces it, `--no-colocate` opts out). Install a jj
-build at least that new, whose on-disk repo format matches the `jj-lib` this knives build
-embeds (see `Cargo.toml`). Then download the knives
-release archive for your platform and put `bin/` on your `PATH`:
+its `.jj`: work in a colocated jj repository (`jj git init --colocate`, or `jj git clone --colocate`).
+`jj workspace add` then writes the `.git` file for each new workspace, because `git.colocate` is
+`true` by default (jj-vcs/jj#9941; `--colocate` forces it, `--no-colocate` opts out).
+
+### The binary
+
+Release archives are built for Linux x86_64 only; elsewhere, build from source (below).
+
+Download the latest release archive and unpack it under `~/.local/opt`:
 
 ```
-tar xzf knives-v0.1.2-linux-x86_64.tar.gz
-install -m755 knives-*/bin/knives ~/.local/bin/
+v=$(curl -fsSL https://api.github.com/repos/sjawhar/knives/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
+curl -fsSLO "https://github.com/sjawhar/knives/releases/download/$v/knives-$v-linux-x86_64.tar.gz"
+mkdir -p ~/.local/opt && tar xzf "knives-$v-linux-x86_64.tar.gz" -C ~/.local/opt
+install -Dm755 ~/.local/opt/knives-$v-linux-x86_64/bin/knives ~/.local/bin/knives
 ```
+
+Make sure `~/.local/bin` is on your `PATH` (for bash: `echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc`,
+then open a new shell), and check with `knives --version`.
+
+Or with [mise](https://mise.jdx.dev), using the `v` resolved in the first line above:
+
+```
+mise use -g "github:sjawhar/knives@$v"
+```
+
+A bare `github:sjawhar/knives` can resolve to an older release, because mise skips releases younger
+than `minimum_release_age` (24 hours by default, or the value you configure); add `minimum_release_age_excludes = ["github:sjawhar/knives"]` under
+`[settings]` to take the newest.
+
+### Plugins
 
 Install the Claude Code plugin separately:
 
@@ -158,6 +197,10 @@ Install the OpenCode plugin from the release archive by adding its path to `open
   "file:///<prefix>/share/knives/opencode/plugins/knives.ts"
 ]
 ```
+
+`<prefix>` is the unpacked archive: `$HOME/.local/opt/knives-<tag>-linux-x86_64` for the download
+above (write the absolute path), or `$(mise where github:sjawhar/knives)` with mise. It changes with
+each release, so update `opencode.json` when you upgrade.
 
 The plugin finds `<prefix>/bin/knives` automatically. It registers the skills included in the
 archive without another configuration step.
