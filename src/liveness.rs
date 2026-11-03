@@ -40,7 +40,9 @@ pub type Session<'a> = (&'a str, &'a str);
 
 /// Programs that run a command on someone's behalf without being a harness:
 /// shells and wrappers between a harness and the `knives` it runs.
-const PASS_THROUGH: [&str; 17] = [
+const PASS_THROUGH: [&str; 19] = [
+    "direnv",
+    "tmux",
     "sh",
     "bash",
     "dash",
@@ -172,6 +174,11 @@ fn command_of(pid: u32) -> String {
         })
         .unwrap_or_default();
     let line = if line.is_empty() { comm_of(pid) } else { line };
+    let line = if line.is_empty() {
+        "?".to_owned()
+    } else {
+        line
+    };
     match line.char_indices().nth(120) {
         Some((cut, _)) => format!("{}…", &line[..cut]),
         None => line,
