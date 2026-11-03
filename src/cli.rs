@@ -299,7 +299,8 @@ pub enum Command {
     /// Removing the directory loses no work: `finish` first snapshots the working copy
     /// into its commit and names it, so every change made in that workspace is in the
     /// repository and reachable by change id; when jj cannot snapshot all of it (a stale
-    /// working copy, a file over `snapshot.max-new-file-size`) nothing is changed. What
+    /// working copy, a file over `snapshot.max-new-file-size`) the claim and the workspace
+    /// stay as they were, and what jj could snapshot stays in its commit. What
     /// does not survive is anything jj never tracks — build output, an ignored `.env` —
     /// so `--no-cleanup` leaves the directory alone.
     ///

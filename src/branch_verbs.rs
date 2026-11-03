@@ -251,20 +251,29 @@ fn clear_workspace(
     // evidence: jj's record of where it lives can be missing (made before jj
     // recorded paths) or stale (moved by hand).
     let present = identity.as_ref() == Some(&WorkspaceIdentity::Ours(workspace.clone()));
-    let working_copy = match &identity {
-        _ if present => Some(directory.to_owned()),
-        Some(WorkspaceIdentity::SymbolicLink(target)) => {
-            let target = directory
-                .parent()
-                .map_or_else(|| target.clone(), |at| at.join(target));
-            knives::jj::is_workspace_named(&target, checkout, &workspace).then_some(target)
-        }
+    // A symbolic link is judged by where the whole chain of links lands: this
+    // branch's workspace there is snapshotted there before its name is
+    // forgotten, and one whose state cannot be read is refused as if it sat at
+    // the path.
+    let landed = match &identity {
+        Some(WorkspaceIdentity::SymbolicLink(_)) => directory
+            .canonicalize()
+            .ok()
+            .map(|target| (knives::jj::workspace_identity(&target, checkout), target)),
+        _ => None,
+    };
+    let (resolved, at) = match &landed {
+        Some((resolved, target)) => (Some(resolved), target.as_path()),
+        None => (identity.as_ref(), directory),
+    };
+    let working_copy = match resolved {
+        Some(WorkspaceIdentity::Ours(name)) if *name == workspace => Some(at.to_owned()),
         Some(WorkspaceIdentity::Unreadable(detail)) => {
             eprintln!(
                 "{}/{branch}: {} is a workspace of {} whose working-copy state could not be read \
                  ({detail}); it cannot be snapshotted, so it is not forgotten; nothing was changed",
                 fork.name,
-                directory.display(),
+                at.display(),
                 checkout.display()
             );
             return Err(Exit::Incomplete);

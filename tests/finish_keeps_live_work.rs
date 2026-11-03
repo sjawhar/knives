@@ -284,6 +284,119 @@ fn a_duplicate_harness_of_the_same_session_counts() {
 }
 
 #[test]
+fn a_duplicate_under_the_same_launcher_counts() {
+    // Given: one launcher that carries the session starts a duplicate working
+    // in the workspace and, beside it, the harness (`python3`) whose shell runs
+    // `knives finish`: knives ← bash ← python3 ← sh, duplicate ← sh
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    let script = r#"
+        ws=$1; shift
+        (cd "$ws" && exec sleep 120) &
+        duplicate=$!
+        echo "duplicate $duplicate" >&2
+        python3 -c 'import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:]))' \
+            bash -c '"$@"; exit $?' bash "$@"
+        status=$?
+        kill "$duplicate"
+        exit "$status"
+    "#;
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", script, "sh"])
+        .arg(&workspace)
+        .arg(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "finish", "feat/gamma", "--repo", "demo"])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("KNIVES_OWNER", OWNER);
+    for name in knives::commands::claim::HARNESS_SESSION_VARIABLES {
+        if name != "KNIVES_OWNER" {
+            command.env_remove(name);
+        }
+    }
+    let refused = command.output().expect("run the launcher");
+
+    // Then: the duplicate is named and nothing changed
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let duplicate = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("duplicate "))
+        .unwrap_or_else(|| panic!("no duplicate started: {}", shown(&refused)))
+        .to_owned();
+    assert_eq!(refused.status.code(), Some(2), "{}", shown(&refused));
+    assert!(
+        stderr.contains(&format!("pid {duplicate} ")),
+        "{}",
+        shown(&refused)
+    );
+    assert!(workspace.is_dir());
+    assert!(claim_held(&home));
+}
+
+/// Moves the workspace at `workspace` to a sibling and leaves `workspace` a
+/// chain of two symbolic links to it; returns where it now is.
+fn behind_two_links(workspace: &Path) -> PathBuf {
+    let real = workspace.with_file_name("feat-gamma-real");
+    let middle = workspace.with_file_name("feat-gamma-middle");
+    std::fs::rename(workspace, &real).expect("move the workspace");
+    std::os::unix::fs::symlink(&real, &middle).expect("link the middle");
+    std::os::unix::fs::symlink(&middle, workspace).expect("link the path");
+    real
+}
+
+#[test]
+fn finish_keeps_the_edit_of_a_workspace_behind_a_chain_of_links() {
+    // Given: the workspace, with an edit, reached through two symbolic links
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    std::fs::write(workspace.join("notes.txt"), "draft\n").expect("write the edit");
+    let real = behind_two_links(&workspace);
+
+    // When: the branch is finished
+    let finished = finish(&lab, &home, &[]);
+
+    // Then: the edit is in a commit, and the links and the directory stay
+    assert!(finished.status.success(), "{}", shown(&finished));
+    let carrying = jj(
+        &lab.work,
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            r#"files("notes.txt")"#,
+            "-T",
+            r#"commit_id.short(12) ++ "\n""#,
+        ],
+    );
+    assert!(!carrying.trim().is_empty(), "{}", shown(&finished));
+    assert!(real.join("notes.txt").is_file());
+}
+
+#[test]
+fn finish_does_not_forget_an_unreadable_workspace_behind_a_link() {
+    // Given: the workspace reached through a symbolic link, its state corrupt
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    let real = behind_two_links(&workspace);
+    std::fs::write(real.join(".jj/working_copy/checkout"), b"\xff\xfe garbage")
+        .expect("corrupt the working-copy state");
+
+    // When: the branch is finished
+    let refused = finish(&lab, &home, &[]);
+
+    // Then: it refuses; the workspace stays registered and the claim held
+    assert_eq!(refused.status.code(), Some(3), "{}", shown(&refused));
+    let names = jj(&lab.work, &["workspace", "list", "-T", r#"name ++ "\n""#]);
+    assert!(names.contains("feat-gamma"), "{names}");
+    assert!(claim_held(&home));
+}
+
+#[test]
 fn finish_changes_nothing_when_a_file_name_is_not_utf8() {
     use std::os::unix::ffi::OsStrExt as _;
     // Given: a file whose name jj cannot snapshot
