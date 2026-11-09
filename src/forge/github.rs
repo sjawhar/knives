@@ -14,21 +14,28 @@ use std::sync::{Condvar, Mutex};
 use serde::{Deserialize, Deserializer};
 
 use super::{
-    CheckRun, ChecksSummary, CommitOids, ConsumerHead, DiffTotals, Forge, ForgeError, PullDetails,
-    PullFacts, PullRequest, PullSummary, RepoIdentity, SweepEntry, SweepPage, TimelineEvent,
-    TimelineEventKind,
+    Account, CheckRun, ChecksSummary, CommitOids, ConsumerHead, DiffTotals, Forge, ForgeError,
+    PullDetails, PullFacts, PullRequest, PullSummary, RepoIdentity, SweepEntry, SweepPage,
+    TimelineEvent, TimelineEventKind,
 };
 use crate::consumer_pins::ConsumerPinSource;
 const PR_STATE: &str = "all";
-// headRepositoryOwner is what makes a pull request ours or someone else's. Without
+/// How deep every wide pull-request list reaches.
+const PR_LIST_LIMIT: usize = 300;
+/// One page of the REST pull-request list, the forge's maximum.
+const REST_PAGE_SIZE: usize = 100;
+/// Pages of the REST list that cover a wide list's window.
+const REST_PAGES: usize = PR_LIST_LIMIT.div_ceil(REST_PAGE_SIZE);
+// The head owner is what makes a pull request ours or someone else's. Without
 // it, ownership was inferred from the head branch name, so an outside contributor
-// whose branch is called `main` was tracked as our work.
+// whose branch is called `main` was tracked as our work. It is not asked of
+// GraphQL: see `head_owner_page_path`.
 
 // The wide lists never ask for mergeable/mergeStateStatus: GitHub computes them
 // lazily per pull request, which made the 300-row list cost 16s on one fork and
 // deterministically 502 on another. Merge-state is live-batch-only (I2).
 const PR_SUMMARY_FIELDS: &str = "number,state,reviewDecision,headRefName,headRefOid,updatedAt,\
-     isDraft,url,headRepositoryOwner,baseRefName,mergeCommit";
+     isDraft,url,baseRefName,mergeCommit";
 const SUMMARY_LIST_ARGS: [&str; 8] = [
     "pr",
     "list",
@@ -294,12 +301,164 @@ fn names_errors(reply: &str) -> bool {
     serde_json::from_str::<ReplyErrors>(reply).is_ok_and(|reply| !reply.errors.is_empty())
 }
 
+/// The `status` of a REST failure body and nothing else.
+#[derive(Deserialize)]
+struct RestFailure {
+    #[serde(default)]
+    status: String,
+}
+
+/// Whether `reply` is the forge saying it has no such pull request. gh exits 1
+/// after printing that body, and a number the forge does not know is an
+/// absence the fact batch already tolerates, not a failed call.
+fn names_no_such_pull_request(reply: &str) -> bool {
+    serde_json::from_str::<RestFailure>(reply).is_ok_and(|failure| failure.status == "404")
+}
+
 fn joined_forge_call<T>(
     result: std::thread::Result<Result<T, ForgeError>>,
 ) -> Result<T, ForgeError> {
     result.map_err(|_| ForgeError::Query {
         detail: "a forge worker panicked".to_owned(),
     })?
+}
+
+/// One pull request's head owner, as the forge answered it.
+#[derive(Debug)]
+enum HeadOwner {
+    /// The forge knows no pull request of that number.
+    NoSuchPullRequest,
+    /// Its head owner, `None` where the head repository is deleted.
+    Answered(Option<Account>),
+}
+
+/// Head owners, read over REST.
+///
+/// GraphQL's `headRepositoryOwner` resolves inside the *head* repository, so a
+/// head that lives in an organisation closed to classic personal access tokens
+/// is refused: the forge nulls the field and names it in `errors`, and the
+/// whole wide list fails. That credential is not an accident — a fork's
+/// upstream is by definition a repository we do not own, so no App
+/// installation exists there and a personal token is what reaches it. REST
+/// reads the same fact out of the base repository's own pull-request payload
+/// (`head.repo.owner.login`), which that token may read.
+///
+/// A number present with `None` is an answered absence — the head repository
+/// was deleted — and is never asked again.
+impl CliForge {
+    /// Head owners for one page of the repository's pull requests.
+    fn head_owner_page(
+        repo: &Path,
+        slug: &str,
+        page: usize,
+    ) -> Result<BTreeMap<u64, Option<Account>>, ForgeError> {
+        let path = head_owner_page_path(slug, page);
+        let payload = Self::run(repo, &["api", &path])?;
+        parse_head_owners(&payload)
+    }
+
+    /// Head owners for the same window a wide list reaches, pages in parallel.
+    fn head_owner_window(
+        repo: &Path,
+        slug: &str,
+    ) -> Result<BTreeMap<u64, Option<Account>>, ForgeError> {
+        std::thread::scope(|scope| {
+            let pages = (1..=REST_PAGES)
+                .map(|page| scope.spawn(move || Self::head_owner_page(repo, slug, page)))
+                .collect::<Vec<_>>();
+            let mut owners = BTreeMap::new();
+            for page in pages {
+                owners.extend(joined_forge_call(page.join())?);
+            }
+            Ok(owners)
+        })
+    }
+
+    /// What the forge answered about one pull request's head owner.
+    ///
+    /// `NoSuchPullRequest` is the forge saying it has no such number: the fact
+    /// batch tolerates an unknown asked number the same way, so asking for its
+    /// owner must not fail the call either.
+    fn head_owner_one(repo: &Path, slug: &str, number: u64) -> Result<HeadOwner, ForgeError> {
+        let path = head_owner_path(slug, number);
+        let args = ["api", path.as_str()];
+        let output = Self::output(repo, &args)?;
+        let reply = String::from_utf8_lossy(&output.stdout);
+        if output.status.success() {
+            return parse_head_owner(&reply).map(HeadOwner::Answered);
+        }
+        if names_no_such_pull_request(&reply) {
+            return Ok(HeadOwner::NoSuchPullRequest);
+        }
+        Err(Self::failure(repo, &args, &output, None))
+    }
+
+    /// The head owner of each number, one call apiece.
+    ///
+    /// Asked in chunks, as the fact batch is: only `MAX_CONCURRENT_GH_PROCESSES`
+    /// of these can hold a permit anyway, and a whole wide list's worth of
+    /// threads at once is a thread per waiting number, across every repository
+    /// `status --all` gathers.
+    fn head_owners_each(
+        repo: &Path,
+        slug: &str,
+        numbers: &[u64],
+    ) -> Result<BTreeMap<u64, Option<Account>>, ForgeError> {
+        let mut owners = BTreeMap::new();
+        for chunk in numbers.chunks(MAX_CONCURRENT_GH_PROCESSES) {
+            std::thread::scope(|scope| {
+                let asked = chunk
+                    .iter()
+                    .map(|&number| {
+                        scope.spawn(move || {
+                            Ok::<_, ForgeError>((number, Self::head_owner_one(repo, slug, number)?))
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                for one in asked {
+                    let (number, answer) = joined_forge_call(one.join())?;
+                    if let HeadOwner::Answered(owner) = answer {
+                        owners.insert(number, owner);
+                    }
+                }
+                Ok::<_, ForgeError>(())
+            })?;
+        }
+        Ok(owners)
+    }
+
+    /// The head owner of each number, asked the cheaper way: one call apiece
+    /// while they are fewer than the window's pages, else the window and one
+    /// call for each number it did not answer.
+    fn head_owners(
+        repo: &Path,
+        slug: &str,
+        numbers: &[u64],
+    ) -> Result<BTreeMap<u64, Option<Account>>, ForgeError> {
+        if numbers.len() <= REST_PAGES {
+            return Self::head_owners_each(repo, slug, numbers);
+        }
+        let mut owners = Self::head_owner_window(repo, slug)?;
+        owners.extend(Self::head_owners_each(
+            repo,
+            slug,
+            &missing_owners(&owners, numbers.iter().copied()),
+        )?);
+        Ok(owners)
+    }
+}
+
+/// The asked numbers `owners` holds no answer for, each once.
+fn missing_owners(
+    owners: &BTreeMap<u64, Option<Account>>,
+    numbers: impl Iterator<Item = u64>,
+) -> Vec<u64> {
+    let mut missing: Vec<u64> = numbers
+        .filter(|number| !owners.contains_key(number))
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    missing
 }
 
 impl Forge for CliForge {
@@ -311,9 +470,19 @@ impl Forge for CliForge {
     fn list_pull_requests(
         &self,
         repo: &Path,
+        target: &RepoIdentity,
         authors: &[String],
     ) -> Result<Vec<PullSummary>, ForgeError> {
-        std::thread::scope(|scope| {
+        // The repository the lists are of, named rather than left to gh's
+        // `{owner}/{repo}`: that placeholder takes the first of the checkout's
+        // remotes, while `gh pr list` honours `gh repo set-default`, so on a
+        // checkout whose default is not the first remote the two would read
+        // different repositories.
+        let slug = target.name_with_owner.clone();
+        let (mut pull_requests, mut owners) = std::thread::scope(|scope| {
+            // The head owner is read beside the lists, not in them: see
+            // `head_owner_page_path`.
+            let owners = scope.spawn(|| Self::head_owner_window(repo, &slug));
             let base = scope.spawn(|| {
                 let payload = Self::run(repo, &SUMMARY_LIST_ARGS)?;
                 parse_summaries(&payload)
@@ -346,8 +515,22 @@ impl Forge for CliForge {
                 pull_requests.extend(joined_forge_call(author_list.join())?);
             }
             dedupe_by_number(&mut pull_requests);
-            Ok(pull_requests)
-        })
+            let owners = joined_forge_call(owners.join())?;
+            Ok::<_, ForgeError>((pull_requests, owners))
+        })?;
+        // An author-scoped search reaches past the window the pages cover.
+        let missing = missing_owners(
+            &owners,
+            pull_requests.iter().map(|pull_request| pull_request.number),
+        );
+        owners.extend(Self::head_owners_each(repo, &slug, &missing)?);
+        for pull_request in &mut pull_requests {
+            pull_request.head_repository_owner = owners
+                .get(&pull_request.number)
+                .cloned()
+                .unwrap_or_default();
+        }
+        Ok(pull_requests)
     }
 
     fn sweep(&self, repo: &Path, target: &RepoIdentity) -> Result<SweepPage, ForgeError> {
@@ -372,10 +555,14 @@ impl Forge for CliForge {
             return Ok(BTreeMap::new());
         }
         let (owner, name) = target.split()?;
+        let slug = format!("{owner}/{name}");
         let owner = format!("owner={owner}");
         let name = format!("name={name}");
 
         std::thread::scope(|scope| {
+            // The head owner is read beside the batch, not in it: see the
+            // `CliForge` head-owner impl.
+            let owners = scope.spawn(|| Self::head_owners(repo, &slug, numbers));
             let chunks = numbers
                 .chunks(FACTS_BATCH_CHUNK_SIZE)
                 .map(|chunk| {
@@ -392,9 +579,13 @@ impl Forge for CliForge {
                 })
                 .collect::<Vec<_>>();
 
-            let mut facts = BTreeMap::new();
+            let mut facts: BTreeMap<u64, PullFacts> = BTreeMap::new();
             for chunk in chunks {
                 facts.extend(joined_forge_call(chunk.join())?);
+            }
+            let owners = joined_forge_call(owners.join())?;
+            for (number, fact) in &mut facts {
+                fact.pull.head_repository_owner = owners.get(number).cloned().unwrap_or_default();
             }
             Ok(facts)
         })
@@ -507,7 +698,8 @@ pub const fn sweep_query() -> &'static str {
 
 /// Full I2 fact row per aliased number.
 ///
-/// It has every summary field plus merge state, review timeline, check rollup,
+/// It has every summary field except the head owner (read over REST, see the
+/// `CliForge` head-owner impl), plus merge state, review timeline, check rollup,
 /// check suites, and the newest comment (`sync`). Each number is asked under
 /// its alias, `p<number>`: the parser keys rows on the repeated `number`, and
 /// matches the forge's errors, which name the alias, against the asked ones.
@@ -530,7 +722,7 @@ pub fn pull_facts_query(numbers: &[u64]) -> String {
         "query($owner: String!, $name: String!) {{ \
          repository(owner: $owner, name: $name) {{ {fields} }} }} \
          fragment facts on PullRequest {{ number state reviewDecision headRefName headRefOid \
-         updatedAt isDraft url headRepositoryOwner {{ login }} baseRefName mergeable \
+         updatedAt isDraft url baseRefName mergeable \
          mergeStateStatus mergeCommit {{ oid }} additions deletions changedFiles headRef {{ name }} \
          body reviewThreads(first: 100) {{ pageInfo {{ hasNextPage }} nodes {{ isResolved }} }} \
          reviews(last: 100) {{ nodes {{ submittedAt }} }} \
@@ -1054,6 +1246,58 @@ pub fn parse_sweep(payload: &str) -> Result<SweepPage, ForgeError> {
 
 pub fn parse_summaries(payload: &str) -> Result<Vec<PullSummary>, ForgeError> {
     Ok(serde_json::from_str(payload)?)
+}
+
+/// One page of the REST pull-request list, newest-created first, every state —
+/// the window `summary_list_args` lists, read for its head owners.
+pub fn head_owner_page_path(slug: &str, page: usize) -> String {
+    format!("repos/{slug}/pulls?state={PR_STATE}&per_page={REST_PAGE_SIZE}&page={page}")
+}
+
+/// One pull request over REST, for a head owner the pages did not answer.
+pub fn head_owner_path(slug: &str, number: u64) -> String {
+    format!("repos/{slug}/pulls/{number}")
+}
+
+/// A REST pull request, read for its head owner alone.
+#[derive(Deserialize)]
+struct RestPull {
+    number: u64,
+    head: RestHead,
+}
+
+#[derive(Deserialize)]
+struct RestHead {
+    /// Null once the head repository is deleted, as GraphQL nulls the owner.
+    #[serde(default)]
+    repo: Option<RestRepo>,
+}
+
+#[derive(Deserialize)]
+struct RestRepo {
+    #[serde(default)]
+    owner: Option<Account>,
+}
+
+impl RestPull {
+    fn head_owner(self) -> Option<Account> {
+        self.head.repo.and_then(|repo| repo.owner)
+    }
+}
+
+/// The head owner of every pull request on one REST page.
+pub fn parse_head_owners(payload: &str) -> Result<BTreeMap<u64, Option<Account>>, ForgeError> {
+    let pulls: Vec<RestPull> = serde_json::from_str(payload)?;
+    Ok(pulls
+        .into_iter()
+        .map(|pull| (pull.number, pull.head_owner()))
+        .collect())
+}
+
+/// The head owner of one REST pull request.
+pub fn parse_head_owner(payload: &str) -> Result<Option<Account>, ForgeError> {
+    let pull: RestPull = serde_json::from_str(payload)?;
+    Ok(pull.head_owner())
 }
 
 fn is_tolerable_not_found(failure: &QueryFailure, asked: &[u64]) -> bool {
@@ -1676,12 +1920,12 @@ printf '{}'
 
     #[test]
     fn facts_carry_the_full_row_the_details_and_the_newest_comment() {
-        // One alias carrying every summary field plus mergeable CONFLICTING,
-        // headRepositoryOwner{login}, a review newer than the newest comment.
+        // One alias carrying every summary field the fragment asks for plus
+        // mergeable CONFLICTING, and a review newer than the newest comment.
         let payload = facts_payload(
             r#""p7":{"number":7,"state":"OPEN","reviewDecision":"APPROVED","headRefName":"feat/a",
         "headRefOid":"aa","updatedAt":"2026-08-01T00:00:00Z","isDraft":false,"url":"u",
-        "headRepositoryOwner":{"login":"our-org"},"baseRefName":"main","mergeable":"CONFLICTING",
+        "baseRefName":"main","mergeable":"CONFLICTING",
         "mergeStateStatus":"DIRTY","mergeCommit":null,
         "reviews":{"nodes":[{"submittedAt":"2026-08-02T00:00:00Z"}]},
         "commits":{"nodes":[{"commit":{"committedDate":"2026-08-01T12:00:00Z"}}]},
@@ -1691,11 +1935,8 @@ printf '{}'
         let fact = &facts[&7];
         assert_eq!(fact.pull.mergeable.as_deref(), Some("CONFLICTING"));
         assert_eq!(
-            fact.pull
-                .head_repository_owner
-                .as_ref()
-                .map(|owner| owner.login.as_str()),
-            Some("our-org")
+            fact.pull.head_repository_owner, None,
+            "the batch does not answer the head owner; the REST read does"
         );
         assert_eq!(
             fact.details.review_predates_head,
@@ -2208,6 +2449,10 @@ printf '{}'
 
     /// A `gh` first on `PATH` that prints `reply` on stdout and `complaint` on
     /// stderr, then exits 1: what `gh api` does when it fails.
+    ///
+    /// A REST head-owner call (`gh api repos/<slug>/pulls/<number>`) is
+    /// answered on its own: with the pull request `rest_pull` wrote, else with
+    /// the forge's 404 body, as gh prints it.
     fn replying_gh(
         environment: &EnvironmentGuard,
         reply: &str,
@@ -2216,18 +2461,51 @@ printf '{}'
         let directory = tempfile::tempdir().expect("temporary fake gh directory");
         let reply_path = directory.path().join("reply");
         let complaint_path = directory.path().join("complaint");
+        let rest = directory.path().join("rest");
         fs::write(&reply_path, reply).expect("write fake gh reply");
         fs::write(&complaint_path, complaint).expect("write fake gh complaint");
+        fs::create_dir_all(&rest).expect("fake gh REST directory");
         install_fake_gh(
             environment,
             directory.path(),
             &format!(
-                "#!/bin/sh\ncat '{}'\ncat '{}' >&2\nexit 1\n",
-                reply_path.display(),
-                complaint_path.display()
+                r#"#!/bin/sh
+for argument in "$@"; do
+    case "$argument" in
+        repos/*/pulls/*)
+            number=${{argument##*/}}
+            if [ -f '{rest}/'"$number" ]; then
+                cat '{rest}/'"$number"
+                exit 0
+            fi
+            printf '%s' '{{"message":"Not Found","status":"404"}}'
+            echo 'gh: Not Found (HTTP 404)' >&2
+            exit 1
+            ;;
+    esac
+done
+cat '{reply}'
+cat '{complaint}' >&2
+exit 1
+"#,
+                rest = rest.display(),
+                reply = reply_path.display(),
+                complaint = complaint_path.display(),
             ),
         );
         directory
+    }
+
+    /// Gives `replying_gh`'s fake a REST answer for one pull request.
+    fn rest_pull(gh: &tempfile::TempDir, number: u64, login: &str) {
+        fs::write(
+            gh.path().join("rest").join(number.to_string()),
+            format!(
+                r#"{{"number":{number},"head":{{"ref":"feat/a",
+                "repo":{{"owner":{{"login":"{login}"}}}}}}}}"#
+            ),
+        )
+        .expect("write fake gh REST reply");
     }
 
     fn upstream() -> RepoIdentity {
@@ -2272,6 +2550,8 @@ printf '{}'
             SAML_REFUSED_HEAD_REF,
             "gh: Resource protected by organization SAML enforcement.",
         );
+        rest_pull(&gh, 7, "our-org");
+        rest_pull(&gh, 8, "someone");
 
         let facts = CliForge
             .pull_facts(gh.path(), &upstream(), &[7, 8])
@@ -2279,12 +2559,22 @@ printf '{}'
 
         assert_eq!(facts[&7].details.head_ref_deleted, None);
         assert_eq!(facts[&8].details.head_ref_deleted, Some(false));
+        // The head owner the batch no longer asks for, read beside it.
+        assert_eq!(
+            facts[&7]
+                .pull
+                .head_repository_owner
+                .as_ref()
+                .map(|account| account.login.as_str()),
+            Some("our-org")
+        );
     }
 
     #[test]
     fn cli_forge_reads_the_facts_gh_prints_beside_an_unknown_number() {
         // The same exit for a number the forge does not know: the asked alias
-        // is absent and every other row stands.
+        // is absent, the REST head-owner call for it is a 404, and every other
+        // row stands.
         let _environment = environment_lock();
         let environment = EnvironmentGuard::capture(&["PATH"]);
         let gh = replying_gh(
@@ -2295,6 +2585,7 @@ printf '{}'
             "message":"Could not resolve to a PullRequest with the number of 300."}]}"#,
             "gh: Could not resolve to a PullRequest with the number of 300.",
         );
+        rest_pull(&gh, 7, "our-org");
 
         let facts = CliForge
             .pull_facts(gh.path(), &upstream(), &[7, 300])
@@ -2576,11 +2867,107 @@ printf '{}'
                 "300",
                 "--json",
                 "number,state,reviewDecision,headRefName,headRefOid,updatedAt,isDraft,url,\
-     headRepositoryOwner,baseRefName,mergeCommit"
+     baseRefName,mergeCommit"
             ]
         );
         assert!(!summary_fields().contains("mergeable"));
         assert!(!summary_fields().contains("mergeStateStatus"));
+        assert!(!summary_fields().contains("headRepositoryOwner"));
+    }
+
+    #[test]
+    fn the_head_owner_pages_cover_the_window_the_wide_list_reaches() {
+        // The two must agree: a row the list returns whose owner no page
+        // answers costs a call of its own.
+        // The literal limit of the list arguments is the one the pages cover:
+        // `REST_PAGES` is derived from `PR_LIST_LIMIT`, so only this pair can
+        // drift.
+        assert_eq!(summary_list_args().get(5), Some(&"300"));
+        assert_eq!(PR_LIST_LIMIT, 300);
+        assert_eq!(
+            head_owner_page_path("our-org/work", 2),
+            "repos/our-org/work/pulls?state=all&per_page=100&page=2"
+        );
+        assert_eq!(
+            head_owner_path("our-org/work", 7),
+            "repos/our-org/work/pulls/7"
+        );
+    }
+
+    #[test]
+    fn a_head_owner_page_answers_every_row_including_a_deleted_head_repository() {
+        let page = r#"[
+        {"number":7,"head":{"ref":"feat/a","repo":{"owner":{"login":"our-org"}}}},
+        {"number":8,"head":{"ref":"main","repo":{"owner":{"login":"someone"}}}},
+        {"number":9,"head":{"ref":"feat/gone","repo":null}}]"#;
+
+        let owners = parse_head_owners(page).expect("a REST page parses");
+
+        assert_eq!(owner_login(&owners, 7), Some("our-org"));
+        assert_eq!(owner_login(&owners, 8), Some("someone"));
+        // An answered absence: the head repository is gone, so #9 is ours
+        // neither way, and the number is never asked again.
+        assert_eq!(owners.get(&9), Some(&None));
+        assert_eq!(owners.get(&10), None);
+    }
+
+    #[test]
+    fn one_pull_request_answers_its_own_head_owner() {
+        let pull = r#"{"number":7,"head":{"ref":"feat/a",
+        "repo":{"owner":{"login":"our-org"}}}}"#;
+
+        assert_eq!(
+            parse_head_owner(pull).expect("a REST pull request parses"),
+            Some(Account {
+                login: "our-org".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn only_a_number_no_page_answered_is_asked_for_on_its_own() {
+        let owners = BTreeMap::from([
+            (
+                7,
+                Some(Account {
+                    login: "our-org".to_owned(),
+                }),
+            ),
+            (9, None),
+        ]);
+
+        // #9 is answered, #11 is not, and asking twice is still one call.
+        assert_eq!(missing_owners(&owners, [7, 9, 11, 11].into_iter()), [11]);
+    }
+
+    #[test]
+    fn only_the_forges_404_means_no_such_pull_request() {
+        // Everything else is the call's own failure: tolerating a 401 would
+        // read "this token cannot see the repository" as "no such number",
+        // and every row would silently stop being ours.
+        assert!(names_no_such_pull_request(
+            r#"{"message":"Not Found","status":"404"}"#
+        ));
+        for reply in [
+            r#"{"message":"Bad credentials","status":"401"}"#,
+            r#"{"message":"Forbidden","status":"403"}"#,
+            r#"{"message":"Server Error","status":"500"}"#,
+            r#"{"message":"Not Found"}"#,
+            "<html>gateway timeout</html>",
+            "",
+        ] {
+            assert!(
+                !names_no_such_pull_request(reply),
+                "tolerated a reply that is no answer: {reply}"
+            );
+        }
+    }
+
+    fn owner_login(owners: &BTreeMap<u64, Option<Account>>, number: u64) -> Option<&str> {
+        owners
+            .get(&number)?
+            .as_ref()
+            .map(|account| account.login.as_str())
     }
     #[test]
     fn facts_batches_30_numbers_into_four_bounded_queries() {

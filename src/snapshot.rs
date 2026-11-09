@@ -112,10 +112,10 @@ impl Opened<'_> {
         }
 
         let authors = crate::forge::search_authors(&self.config.remotes);
-        let mut rows = self
-            .config
-            .forge
-            .list_pull_requests(self.config.path, &authors)?;
+        let mut rows =
+            self.config
+                .forge
+                .list_pull_requests(self.config.path, &self.identity, &authors)?;
         rows.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
         let sweep_max = rows
             .iter()

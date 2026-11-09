@@ -908,6 +908,7 @@ mod tests {
         fn list_pull_requests(
             &self,
             _repo: &Path,
+            _target: &RepoIdentity,
             _authors: &[String],
         ) -> Result<Vec<PullSummary>, ForgeError> {
             Ok(vec![PullSummary::of(&self.discovery)])

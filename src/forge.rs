@@ -530,6 +530,7 @@ pub trait Forge: Send + Sync {
     fn list_pull_requests(
         &self,
         repo: &Path,
+        target: &RepoIdentity,
         authors: &[String],
     ) -> Result<Vec<PullSummary>, ForgeError>;
 

@@ -217,6 +217,7 @@ impl Forge for CountingForge {
     fn list_pull_requests(
         &self,
         _repo: &std::path::Path,
+        _target: &RepoIdentity,
         _authors: &[String],
     ) -> Result<Vec<PullSummary>, ForgeError> {
         Ok(self.pull_requests.values().map(PullSummary::of).collect())
