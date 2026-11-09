@@ -8,8 +8,8 @@
 use std::collections::BTreeSet;
 
 use knives::forge::github::{
-    parse_pull_facts, parse_pull_timeline, parse_summaries, parse_sweep, pull_facts_query,
-    pull_timeline_query, summary_fields, summary_list_args,
+    parse_head_owner, parse_head_owners, parse_pull_facts, parse_pull_timeline, parse_summaries,
+    parse_sweep, pull_facts_query, pull_timeline_query, summary_fields, summary_list_args,
 };
 use knives::forge::{ChecksSummary, PullRequest, PullSummary, TimelineEventKind};
 use serde_json::Value;
@@ -18,7 +18,12 @@ const RECORDED_SUMMARIES: &str = include_str!("fixtures/gh_pr_list.json");
 const RECORDED_FACTS: &str = include_str!("fixtures/gh_pull_facts.json");
 const RECORDED_SWEEP: &str = include_str!("fixtures/gh_sweep.json");
 const RECORDED_TIMELINE: &str = include_str!("fixtures/gh_pull_timeline.json");
+const RECORDED_REST_PULLS: &str = include_str!("fixtures/gh_rest_pulls.json");
 const SCRUBBED_REPOSITORY: &str = "https://forge.invalid/our-org/recorded-repo";
+/// The field no GraphQL query asks for: `headRepositoryOwner` resolves inside
+/// the head repository, which an organisation may close to the only credential
+/// a fork's upstream accepts. It is read over REST instead.
+const REST_ONLY_FIELDS: [&str; 1] = ["headRepositoryOwner"];
 const REAL_FORGE_HOST: &str = concat!("github", ".com");
 
 fn recorded_repository(recorded: &Value) -> Result<&serde_json::Map<String, Value>, &'static str> {
@@ -78,10 +83,8 @@ fn every_field_we_request_survives_a_real_payload() {
         "baseRefName"
     );
     assert!(parsed.iter().any(|pr| pr.is_draft), "isDraft");
-    assert!(
-        parsed.iter().any(|pr| pr.head_repository_owner.is_some()),
-        "headRepositoryOwner"
-    );
+    // No headRepositoryOwner assertion: the list no longer asks for it (see
+    // REST_ONLY_FIELDS), though this recording predates that and still carries it.
     assert!(
         parsed.iter().any(|pr| pr
             .merge_commit
@@ -115,7 +118,11 @@ fn every_summary_field_is_requested() {
         .keys()
         .map(String::as_str)
         .collect();
-    let requested: BTreeSet<&str> = summary_fields().split(',').map(str::trim).collect();
+    let requested: BTreeSet<&str> = summary_fields()
+        .split(',')
+        .map(str::trim)
+        .chain(REST_ONLY_FIELDS)
+        .collect();
 
     assert!(
         held.is_subset(&requested),
@@ -147,6 +154,7 @@ fn every_fact_field_is_in_the_batch_fragment() {
     let query = pull_facts_query(&[1]);
     let requested: BTreeSet<&str> = query
         .split(|character: char| !character.is_ascii_alphanumeric())
+        .chain(REST_ONLY_FIELDS)
         .collect();
 
     for field in fields
@@ -259,7 +267,6 @@ fn a_recorded_batch_payload_decodes_every_field_the_query_asks_for() {
         "updatedAt",
         "isDraft",
         "url",
-        "headRepositoryOwner",
         "baseRefName",
         "mergeable",
         "mergeStateStatus",
@@ -377,6 +384,133 @@ fn the_pull_request_list_argument_array_requests_every_state() {
     let arguments = summary_list_args();
     assert_eq!(arguments.get(2), Some(&"--state"));
     assert_eq!(arguments.get(3), Some(&"all"));
+}
+
+#[test]
+fn a_recorded_rest_page_answers_the_head_owner_of_every_row() {
+    // Recorded from a real upstream whose organisation refuses
+    // `headRepositoryOwner` to a classic token: an organisation-owned head, an
+    // outside contributor's fork, and a pull request whose head repository is
+    // gone.
+    let owners = parse_head_owners(RECORDED_REST_PULLS).expect("a recorded REST page decodes");
+    let recorded: Vec<Value> =
+        serde_json::from_str(RECORDED_REST_PULLS).expect("recorded JSON is valid");
+
+    assert_eq!(owners.len(), recorded.len(), "every row is answered");
+    for pull_request in &recorded {
+        let number = pull_request
+            .get("number")
+            .and_then(Value::as_u64)
+            .expect("a recorded pull request has a number");
+        let recorded_owner = pull_request
+            .pointer("/head/repo/owner/login")
+            .and_then(Value::as_str);
+        assert_eq!(
+            owners
+                .get(&number)
+                .expect("the page answers every number it carries")
+                .as_ref()
+                .map(|account| account.login.as_str()),
+            recorded_owner,
+            "pull request #{number}"
+        );
+    }
+    assert!(
+        owners.values().filter(|owner| owner.is_some()).count() >= 2,
+        "the recording must carry owners: {owners:?}"
+    );
+    assert!(
+        owners.values().any(Option::is_none),
+        "the recording must carry a deleted head repository: {owners:?}"
+    );
+}
+
+#[test]
+fn a_recorded_rest_pull_request_answers_its_own_head_owner() {
+    let recorded: Vec<Value> =
+        serde_json::from_str(RECORDED_REST_PULLS).expect("recorded JSON is valid");
+    let one = recorded
+        .iter()
+        .find(|pull_request| pull_request.pointer("/head/repo/owner/login").is_some())
+        .expect("a recorded pull request has a head owner");
+
+    let owner = parse_head_owner(&one.to_string()).expect("a recorded pull request decodes");
+
+    assert_eq!(
+        owner.as_ref().map(|account| account.login.as_str()),
+        one.pointer("/head/repo/owner/login")
+            .and_then(Value::as_str)
+    );
+}
+
+/// Every login the scrubbed REST recording may name.
+const SCRUBBED_LOGINS: [&str; 5] = [
+    "our-org",
+    "someone",
+    "outside-person",
+    "upstream-org",
+    "person-1",
+];
+
+#[test]
+fn the_recorded_rest_payload_is_scrubbed() {
+    // A REST pull request carries the forge's own account, repository and
+    // commit identifiers beside the login, and this repository is public: an
+    // id or an avatar URL names the account a replaced login does not.
+    let lower = RECORDED_REST_PULLS.to_ascii_lowercase();
+    for identity in [
+        concat!("me", "tr"),
+        concat!("ha", "wk"),
+        concat!("middle", "man"),
+        concat!("sjaw", "har"),
+        "githubusercontent",
+        REAL_FORGE_HOST,
+    ] {
+        assert!(
+            !lower.contains(identity),
+            "REST fixture leaks internal identifier `{identity}`"
+        );
+    }
+
+    let recorded: Value =
+        serde_json::from_str(RECORDED_REST_PULLS).expect("recorded JSON is valid");
+    walk_scrubbed_rest(&recorded);
+}
+
+/// Every identifier in the recording is a replacement: a login from
+/// `SCRUBBED_LOGINS`, a four-digit id, a `NODE-` node id, an avatar that names
+/// nobody, and a commit nobody can look up on the real upstream.
+fn walk_scrubbed_rest(value: &Value) {
+    match value {
+        Value::Object(fields) => {
+            for (key, field) in fields {
+                match (key.as_str(), field) {
+                    ("login", Value::String(login)) => assert!(
+                        SCRUBBED_LOGINS.contains(&login.as_str()),
+                        "REST fixture leaks the login `{login}`"
+                    ),
+                    ("id", Value::Number(id)) => assert!(
+                        id.as_u64().is_some_and(|id| id < 10_000),
+                        "REST fixture leaks the forge id `{id}`"
+                    ),
+                    ("node_id", Value::String(node)) => assert!(
+                        node.starts_with("NODE-"),
+                        "REST fixture leaks the node id `{node}`"
+                    ),
+                    ("avatar_url", Value::String(avatar)) => {
+                        assert_eq!(avatar, "https://forge.invalid/avatar");
+                    }
+                    ("sha", Value::String(sha)) => assert!(
+                        sha.starts_with("000000000000000000000000000000000000"),
+                        "REST fixture leaks the commit `{sha}`"
+                    ),
+                    _ => walk_scrubbed_rest(field),
+                }
+            }
+        }
+        Value::Array(items) => items.iter().for_each(walk_scrubbed_rest),
+        _ => (),
+    }
 }
 
 #[test]

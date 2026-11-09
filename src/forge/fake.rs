@@ -92,6 +92,7 @@ impl Forge for FakeForge {
     fn list_pull_requests(
         &self,
         _repo: &Path,
+        _target: &RepoIdentity,
         _authors: &[String],
     ) -> Result<Vec<PullSummary>, ForgeError> {
         if self.fail_list {

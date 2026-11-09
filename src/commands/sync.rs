@@ -1175,6 +1175,7 @@ mod comment_activity_tests {
         fn list_pull_requests(
             &self,
             _repo: &Path,
+            _target: &RepoIdentity,
             _authors: &[String],
         ) -> Result<Vec<PullSummary>, ForgeError> {
             Ok(self.pull_requests.iter().map(PullSummary::of).collect())
@@ -1261,6 +1262,7 @@ mod comment_activity_tests {
         fn list_pull_requests(
             &self,
             _repo: &Path,
+            _target: &RepoIdentity,
             _authors: &[String],
         ) -> Result<Vec<PullSummary>, ForgeError> {
             Err(ForgeError::Command {
