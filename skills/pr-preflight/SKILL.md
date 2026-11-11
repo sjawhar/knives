@@ -1,6 +1,6 @@
 ---
 name: pr-preflight
-description: Use when opening or preparing a PR against an upstream repository or a fork, contributing upstream, or before you run gh pr create.
+description: Use when opening or preparing a PR against an upstream repository or a fork, contributing upstream, before you run gh pr create, or before you write an issue, a comment or a review reply its maintainers read.
 ---
 
 # Upstream PR Preflight Gate
@@ -71,7 +71,15 @@ knives notch <branch> -m "promised the maintainer we would split the config chan
 - Before you answer a review, run `knives notch <branch>` to see what you owe.
 - Unanswered threads come from the forge, not from notches.
 
-## Step 4: Execution
+## Step 4: Write the Text the Maintainer Reads
+
+Every text this project's maintainers read takes the three steps below: a PR title and body, an issue, a comment, a reply on a review thread. The three steps are a floor. The project's own policy and the user's configured outbound-prose rules add to them, and both win where they disagree with a step here.
+
+1. **Read before you write.** Check 3 gives you the convention files. Also read how the maintainers write: their last ten issues and pull requests, how they answer each other, and the words they use for the part you change. Search the project for your subject. A question they answered last month, asked again, costs you the reader. Write down what you find: their template, their terms and their level of detail.
+2. **Write in their conventions, in plain words.** Use their template and their headings. Say what happens: each sentence names who acts and what they do. Delete a phrase that names no action. Define each term where you first use it. Keep to one instruction per sentence, the active voice, no noun cluster longer than three words, and one meaning for each word. These are the rules of ASD-STE100, the Simplified Technical English standard. Use no capitals for emphasis.
+3. **A fresh reader cuts it.** Give the draft and your step 1 notes to a reader that had no part in the writing. Tell it to delete everything the maintainer does not need. By preference that reader runs on a model from another vendor than the writer's. Where the user's rules do not permit another vendor, a reader of the same model that did not write the text satisfies this step. The reader returns the cut text and a list of what it removed. The cut text is what goes out. An edit after the cut takes this step again.
+
+## Step 5: Execution
 
 When all seven checks pass, open the PR:
 
