@@ -243,12 +243,19 @@ fn ordinary_disposal(
 /// the session that forces a release is not the one to delete it. Its own
 /// `knives finish` disposes of both the directory and the registration, which
 /// is why the registration has to survive this release too.
+///
+/// The owner name is the displaced session's own text, copied from the claim
+/// it wrote into the state file every session of this machine reads, so this
+/// line prints it escaped ([`inline_human_text`]): raw, the session this
+/// release displaces would choose what the forcing caller's terminal
+/// receives.
 fn left_to_its_owner(place: &Place<'_>, owner: &str) -> String {
     format!(
-        "{} and its `{}` registration are left as they are: the directory is {owner}'s, and \
+        "{} and its `{}` registration are left as they are: the directory is {}'s, and \
          what jj never tracked in it is not this session's to delete",
         place.directory.display(),
         place.workspace,
+        inline_human_text(owner),
     )
 }
 
@@ -746,12 +753,16 @@ fn refuse_held(refusal: &Refusal<'_>) -> FinishClaimGate {
 /// so each word here is the one its own change carries and a later search
 /// cannot make this print a verb the entry never recorded.
 ///
-/// The owner name and the reason are another machine's text, which the
-/// ledger pull brought here, so they go to the terminal escaped
-/// ([`inline_human_text`]): an entry naming this caller as the owner it
+/// Both owner names and the reason are text this process did not write, so
+/// all three go to the terminal escaped ([`inline_human_text`]). `lost.owner`
+/// and the reason come off a ledger entry, which the ledger pull may have
+/// brought from another machine: an entry naming this caller as the owner it
 /// displaced would otherwise send terminal control sequences to the caller's
-/// own terminal. The timestamp needs no escaping: a ledger read rejects an
-/// entry whose `ts` no timestamp can be parsed from.
+/// own terminal. `owner` is this run's identity, and with no harness variable
+/// set that name is read back from a claim in the state file
+/// (`crate::commands::hook::owner_for`), which another session wrote. The
+/// timestamp needs no escaping: a ledger read rejects an entry whose `ts` no
+/// timestamp can be parsed from.
 fn displacement(target: &BranchTarget, owner: &str, change: ClaimChange, lost: &Entry) -> String {
     let verb = match change {
         ClaimChange::Taken => "took",
@@ -764,8 +775,9 @@ fn displacement(target: &BranchTarget, owner: &str, change: ClaimChange, lost: &
         .as_deref()
         .map_or_else(String::new, |why| format!(": {}", inline_human_text(why)));
     format!(
-        "{} {verb} {owner}'s claim on {} at {}{why}",
+        "{} {verb} {}'s claim on {} at {}{why}",
         inline_human_text(&lost.owner),
+        inline_human_text(owner),
         target.key(),
         lost.ts,
     )

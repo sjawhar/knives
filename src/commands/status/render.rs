@@ -1,3 +1,20 @@
+//! The text status report: the one `status` surface a terminal reads.
+//!
+//! Every cell carrying text this process did not write goes through
+//! [`inline_human_text`], which maps each control character — the C1 range
+//! among them — to U+FFFD: a branch name and a workspace name come from the
+//! repository, a claim's owner name from whichever session took the claim, a
+//! review decision and a pull request's state from the forge, a finding's
+//! subject and detail from any of those, a notch's text and anchor from a
+//! ledger entry another machine may have written. What this process wrote
+//! itself stays raw: the branch state, the push relation, the landed verdict,
+//! the owner kind and the seen window are this module's own words, the repo
+//! key is a registry key the registry already refuses to load with a control
+//! character in it ([`crate::ledger::is_ledger_component`]), a tip is the hex
+//! jj printed, and an age, a number and a count are computed here. `--json`
+//! and the default encoding keep every field raw, because they are records
+//! their reader escapes when it prints them.
+
 use std::fmt::Write as _;
 
 use crate::ids::short_id;
@@ -42,7 +59,7 @@ fn pull_cell(row: &BranchRow) -> String {
     };
     let mut details = vec![format!("#{}", pull.number)];
     if pull.state != "open" && pull.state != "unknown" {
-        details.push(pull.state.clone());
+        details.push(inline_human_text(&pull.state));
     }
     if pull.draft {
         details.push("draft".to_owned());
@@ -58,16 +75,22 @@ fn pull_cell(row: &BranchRow) -> String {
     {
         details.push(format!("(activity {age})"));
     }
-    details.extend(
-        pull.prior
-            .iter()
-            .map(|prior| format!("prior #{} {}", prior.number, prior.state)),
-    );
+    details.extend(pull.prior.iter().map(|prior| {
+        format!(
+            "prior #{} {}",
+            prior.number,
+            inline_human_text(&prior.state)
+        )
+    }));
     details.join(" ")
 }
 
+/// The review and the checks columns. The review decision is the forge's own
+/// word lowercased, so it reaches the terminal escaped; the checks label is
+/// this module's own word, and escaping it costs no more than the clone it
+/// replaces.
 fn option_cell(value: Option<&String>) -> String {
-    value.cloned().unwrap_or_else(|| "-".to_owned())
+    value.map_or_else(|| "-".to_owned(), |value| inline_human_text(value))
 }
 
 fn landed_cell(row: &BranchRow) -> String {
@@ -75,10 +98,23 @@ fn landed_cell(row: &BranchRow) -> String {
         .map_or_else(|| "-".to_owned(), |verdict| verdict.to_string())
 }
 
+/// The claim column: the owner name shortened to twelve characters, and the
+/// kind that name was derived from.
+///
+/// The owner is text this process did not write — whichever session took the
+/// claim chose it, through `KNIVES_OWNER`, `CLAUDE_CODE_SESSION_ID` or
+/// `OMP_SESSION_ID` — so the terminal reads it escaped, as every other
+/// printer of a claim owner does (`claim_evidence`, `src/commands/claim.rs`).
+/// Escaped before it is shortened, because the escape maps each control
+/// character to one U+FFFD and the column stays twelve characters long. The
+/// state file, the ledger and the machine surfaces keep the raw name.
 fn claim_cell(row: &BranchRow) -> String {
     row.claim.as_ref().map_or_else(
         || "-".to_owned(),
-        |claim| format!("{}/{}", short_id(&claim.id), owner_kind_name(claim.kind)),
+        |claim| {
+            let owner = inline_human_text(&claim.id);
+            format!("{}/{}", short_id(&owner), owner_kind_name(claim.kind))
+        },
     )
 }
 
@@ -92,6 +128,9 @@ const fn owner_kind_name(kind: crate::store::OwnerKind) -> &'static str {
 
 fn seen_cell(row: &BranchRow) -> String {
     if let Some(last_seen) = &row.last_seen {
+        // Raw: `last_seen` is a `jiff::Timestamp` this run formatted
+        // (`fold_claims`, `claims.rs`), not the timestamp text off the state
+        // file, so the fallback can hold no control character.
         return crate::ledger::age(last_seen, jiff::Timestamp::now())
             .unwrap_or_else(|| last_seen.clone());
     }
@@ -118,10 +157,9 @@ fn notch_summary(notch: &LastNotch) -> String {
     if escaped.chars().count() > NOTCH_TEXT {
         shown.push('…');
     }
-    let anchor = notch
-        .anchor
-        .as_deref()
-        .map_or_else(String::new, |anchor| format!(" @{anchor}"));
+    let anchor = notch.anchor.as_deref().map_or_else(String::new, |anchor| {
+        format!(" @{}", crate::ledger::inline_human_text(anchor))
+    });
     let summary = crate::ledger::age(&notch.ts, jiff::Timestamp::now()).map_or_else(
         || format!("\"{shown}\"{anchor}"),
         |age| format!("\"{shown}\" ({age}{anchor})"),
@@ -204,10 +242,15 @@ fn finding_lines(groups: &[FindingGroup], verbose: bool) -> Vec<String> {
             .iter()
             .flat_map(|group| {
                 group.items.iter().map(|item| {
+                    let subject = inline_human_text(&item.subject);
                     if item.detail.is_empty() {
-                        format!("    {}  {}", group.kind, item.subject)
+                        format!("    {}  {subject}", group.kind)
                     } else {
-                        format!("    {}  {}: {}", group.kind, item.subject, item.detail)
+                        format!(
+                            "    {}  {subject}: {}",
+                            group.kind,
+                            inline_human_text(&item.detail)
+                        )
                     }
                 })
             })
@@ -221,7 +264,11 @@ fn finding_lines(groups: &[FindingGroup], verbose: bool) -> Vec<String> {
     groups
         .iter()
         .map(|group| {
-            let shown: Vec<&str> = group.subjects().take(SUBJECTS_PER_LINE).collect();
+            let shown: Vec<String> = group
+                .subjects()
+                .take(SUBJECTS_PER_LINE)
+                .map(inline_human_text)
+                .collect();
             let mut subjects = shown.join(", ");
             let hidden = group.items.len().saturating_sub(shown.len());
             if hidden > 0 {
@@ -244,9 +291,15 @@ pub fn render(report: &Report, verbose: bool) -> String {
     } else {
         "not consulted"
     };
+    // The trunk is a branch name and the release a ref name, both read off a
+    // repository other machines push to; the repo key is the registry's, and
+    // a registry holding a control character in a key does not load.
     let mut lines = vec![format!(
-        "{}  trunk {}  release {release}  forge {consulted} ({}ms)",
-        report.repo, report.trunk, report.forge.elapsed_ms
+        "{}  trunk {}  release {}  forge {consulted} ({}ms)",
+        report.repo,
+        inline_human_text(&report.trunk),
+        inline_human_text(release),
+        report.forge.elapsed_ms
     )];
     // Problems and notes name paths from disk and from other machines' refs.
     if !report.problems.is_empty() {
@@ -269,12 +322,18 @@ pub fn render(report: &Report, verbose: bool) -> String {
     }
     // Workspaces named for a branch row sit in that row's `workspace` cell;
     // this line is only what is left, which is why it never matches the length
-    // of `jj workspace list`.
+    // of `jj workspace list`. A name is whatever `jj workspace add --name`
+    // was given, so the line escapes each one.
     if !report.other_workspaces.is_empty() {
+        let names: Vec<String> = report
+            .other_workspaces
+            .iter()
+            .map(|workspace| inline_human_text(workspace))
+            .collect();
         lines.push(format!(
             "  workspaces  {} not named for a branch above: {}",
-            report.other_workspaces.len(),
-            report.other_workspaces.join(", ")
+            names.len(),
+            names.join(", ")
         ));
     }
     if !report.notes.is_empty() {
@@ -392,6 +451,29 @@ mod tests {
             "was: {rendered}"
         );
         assert!(rendered.contains("now"), "was: {rendered}");
+    }
+
+    #[test]
+    fn the_claim_column_escapes_the_owner_name_the_claiming_session_chose() {
+        // The owner is whatever the session that took the claim put in
+        // `KNIVES_OWNER`: a C0 escape and the C1 introducer a terminal
+        // reading UTF-8 as ISO 2022 obeys all the same.
+        let mut row = new_row("feat/alpha");
+        row.claim = Some(ClaimCell {
+            id: "a\u{1b}b\u{9b}c".to_owned(),
+            kind: OwnerKind::HarnessSession,
+            since: "2026-08-01T00:00:00Z".to_owned(),
+            why: "status model".to_owned(),
+        });
+
+        let rendered = render(&report_with(row), false);
+
+        assert!(
+            rendered.contains("a\u{fffd}b\u{fffd}c/harness-session"),
+            "was: {rendered:?}"
+        );
+        assert!(!rendered.contains('\u{1b}'), "was: {rendered:?}");
+        assert!(!rendered.contains('\u{9b}'), "was: {rendered:?}");
     }
 
     #[test]

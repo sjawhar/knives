@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{FormerNames, default_config_path};
 use crate::ids::{BranchTarget, Requirement, UpstreamName};
-use crate::ledger::{Entry, Ledger, LedgerError, unmigrated};
+use crate::ledger::{Entry, Ledger, LedgerError, inline_human_text, unmigrated};
 use crate::lock::{FileLock, LockError, LockWait};
 use crate::statement::{StatementKind, Statements};
 
@@ -447,6 +447,10 @@ impl Store {
     /// The decision to take or release a claim was made from that one, so
     /// the save refuses when the file holds another: a writer that bypassed
     /// the fork's lock (an older knives, a hand edit) moved it meanwhile.
+    ///
+    /// The owner that moved it is that writer's own text, and the refusal is
+    /// printed to a terminal, so it goes out escaped
+    /// ([`inline_human_text`]) while the state file keeps the raw name.
     fn set_claim(&mut self, key: String, next: Option<Claim>) {
         let read = self.state.claims.get(&key).cloned();
         self.change(Box::new(move |state, path| {
@@ -457,7 +461,7 @@ impl Store {
                     key: key.clone(),
                     now: now.map_or_else(
                         || "now unheld".to_owned(),
-                        |claim| format!("now held by {}", claim.owner),
+                        |claim| format!("now held by {}", inline_human_text(&claim.owner)),
                     ),
                 });
             }
@@ -1404,6 +1408,45 @@ mod tests {
         let reread = Store::open(path, &FormerNames::new(), &[]).unwrap();
         assert_eq!(reread.claims(None)[0].owner, "first");
         assert_eq!(reread.comment_mark(&repo(), 7), None);
+    }
+
+    #[test]
+    fn the_owner_that_moved_a_claim_is_named_escaped_and_kept_raw_in_the_file() {
+        // Given: the writer that moved the claim put control characters in
+        // its own owner name. The refusal is printed to a terminal, so raw
+        // that writer would choose what the losing caller's terminal
+        // receives; the state file stays the raw record. C1 controls count:
+        // U+009B is CSI and U+009D is OSC.
+        let hostile = "first-\u{1b}]0;x\u{7}\u{9b}31m\u{9d}2;y";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut first = Store::open(path.clone(), &FormerNames::new(), &[]).unwrap();
+        let mut second = Store::open(path.clone(), &FormerNames::new(), &[]).unwrap();
+        let _ = first.claim(&target(), &os_user(hostile), "w");
+        let _ = second.claim(&target(), &os_user("second"), "w");
+        first.save().unwrap();
+
+        // When: the second saves over the claim it read as free.
+        let error = second.save().unwrap_err();
+
+        // Then: the message names that owner with every control character of
+        // it as U+FFFD, and the file holds the name as it was written.
+        assert!(
+            matches!(
+                &error,
+                StoreError::ClaimMoved { now, .. }
+                    if now == "now held by first-\u{fffd}]0;x\u{fffd}\u{fffd}31m\u{fffd}2;y"
+            ),
+            "was: {error}"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains(['\u{1b}', '\u{7}', '\u{9b}', '\u{9d}']),
+            "a control character reached the terminal: {error}"
+        );
+        let reread = Store::open(path, &FormerNames::new(), &[]).unwrap();
+        assert_eq!(reread.claims(None)[0].owner, hostile);
     }
 
     #[test]

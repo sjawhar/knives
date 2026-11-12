@@ -699,6 +699,72 @@ fn start_refusing_a_claim_names_the_processes_working_in_its_workspace() {
     }
 }
 
+/// Fail when `text` still holds a control character these tests plant: the
+/// escape that opens an OSC sequence, the bell that ends it, or either C1
+/// introducer a terminal reading UTF-8 as ISO 2022 acts on (U+009B is CSI,
+/// U+009D is OSC).
+fn free_of_control_characters(text: &str) {
+    for (control, name) in [
+        ('\u{1b}', "an escape character"),
+        ('\u{7}', "a bell character"),
+        ('\u{9b}', "a CSI character"),
+        ('\u{9d}', "an OSC character"),
+    ] {
+        assert!(
+            !text.contains(control),
+            "{name} reached the terminal: {text:?}"
+        );
+    }
+}
+
+#[test]
+fn start_refusing_a_claim_escapes_the_control_characters_of_a_live_process() {
+    // The command line of a process in the workspace is the text of whoever
+    // started it, and this refusal prints every such process
+    // (`claim_evidence`, src/commands/start.rs). The finish refusal's escape
+    // of the same list is pinned in tests/finish_keeps_live_work.rs; this is
+    // the start refusal's, and it drives a C1 introducer beside the C0 ones.
+    use std::os::unix::process::CommandExt as _;
+
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = claimed_by_agent_one(&lab, home.path());
+    // knives never counts the processes of the session calling it, so this
+    // stand-in for the holder's shell carries none of this test's variables.
+    let mut working = Command::new("sleep");
+    working
+        .arg0("sleep\u{1b}]0;held\u{7}\u{9b}31m")
+        .arg("3600")
+        .current_dir(&workspace);
+    for name in knives::commands::claim::HARNESS_SESSION_VARIABLES {
+        working.env_remove(name);
+    }
+    let mut holder = working.spawn().expect("spawn a process in the workspace");
+
+    // When: another identity tries to start the claimed branch
+    let refused = tried(
+        &lab,
+        home.path(),
+        "agent-two",
+        &["--text", "start", "feat/gamma", "--repo", "demo"],
+    );
+    let _ = holder.kill();
+    let _ = holder.wait();
+
+    // Then: the process is named with every control character of its command
+    // line as U+FFFD
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(&format!(
+            "pid {} (sleep\u{fffd}]0;held\u{fffd}\u{fffd}31m 3600) at ",
+            holder.id()
+        )),
+        "stderr: {stderr:?}"
+    );
+    free_of_control_characters(&stderr);
+}
+
 #[test]
 fn start_refusing_a_claim_taken_in_another_place_says_the_scan_proves_nothing() {
     // The processes of another host or agent box are invisible from here, so
@@ -2064,6 +2130,110 @@ fn the_takeover_notice_escapes_the_control_characters_of_the_ledger() {
         !stderr.contains('\u{1b}'),
         "an escape character reached the terminal: {stderr:?}"
     );
+}
+
+/// An owner name holding the control characters of an OSC sequence.
+///
+/// `KNIVES_OWNER` refuses only a blank name, so a claimant can hold this
+/// one; a session with no harness variable set reads its own name back out
+/// of a claim in the state file, so an owner name is another party's text
+/// wherever this tool prints one.
+const HOSTILE_OWNER: &str = "agent-\u{1b}]0;x\u{7}\u{9b}31m\u{9d}2;y-one";
+
+/// [`HOSTILE_OWNER`] as every terminal must read it. Its C1 controls are
+/// control characters a terminal reading UTF-8 as ISO 2022 acts on — U+009B
+/// is CSI and U+009D is OSC — so they escape as the C0 ones do.
+const ESCAPED_OWNER: &str = "agent-\u{fffd}]0;x\u{fffd}\u{fffd}31m\u{fffd}2;y-one";
+
+#[test]
+fn an_owner_name_holding_control_characters_reaches_every_terminal_escaped() {
+    // Given: that name holds the claim on the branch
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let claimed = ran(
+        &lab,
+        home.path(),
+        HOSTILE_OWNER,
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    assert_eq!(
+        claim_of(home.path(), "feat/gamma")["owner"].as_str(),
+        Some(HOSTILE_OWNER),
+        "the state file is the raw record: only the terminal rendering escapes"
+    );
+    let stdout = String::from_utf8_lossy(&claimed.stdout);
+    assert!(
+        stdout.contains(&format!("claimed demo/feat/gamma for {ESCAPED_OWNER}")),
+        "stdout: {stdout:?}"
+    );
+    free_of_control_characters(&stdout);
+
+    // When: another owner is refused the branch
+    let refused = tried(
+        &lab,
+        home.path(),
+        "agent-two",
+        &["--text", "start", "feat/gamma", "--repo", "demo"],
+    );
+
+    // Then: the refusal names the holder with each control as U+FFFD
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "stderr: {stderr:?}");
+    assert!(stderr.contains(ESCAPED_OWNER), "stderr: {stderr:?}");
+    free_of_control_characters(&stderr);
+
+    // When: that owner forces the release of the claim
+    let forced = ran(
+        &lab,
+        home.path(),
+        "agent-two",
+        &[
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            "owner session died",
+        ],
+    );
+
+    // Then: the line that leaves the displaced owner's workspace alone names
+    // that owner escaped
+    let stdout = String::from_utf8_lossy(&forced.stdout);
+    assert!(
+        stdout.contains(&format!("the directory is {ESCAPED_OWNER}'s")),
+        "stdout: {stdout:?}"
+    );
+    free_of_control_characters(&stdout);
+
+    // When: the displaced owner finishes the branch it believed it held
+    let told = tried(
+        &lab,
+        home.path(),
+        HOSTILE_OWNER,
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    // Then: the notice it gets names it escaped too
+    let stderr = String::from_utf8_lossy(&told.stderr);
+    assert_eq!(told.status.code(), Some(1), "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(&format!(
+            "released {ESCAPED_OWNER}'s claim on demo/feat/gamma"
+        )),
+        "stderr: {stderr:?}"
+    );
+    free_of_control_characters(&stderr);
 }
 
 #[test]

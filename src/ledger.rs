@@ -994,16 +994,17 @@ pub fn age(ts: &str, now: jiff::Timestamp) -> Option<String> {
 
 /// Render ledger text for an inline human terminal field.
 ///
-/// C0 controls and DEL become U+FFFD so compact fields cannot emit terminal
-/// control sequences while JSON remains the raw structured representation.
+/// Every control character becomes U+FFFD so compact fields cannot emit
+/// terminal control sequences while JSON remains the raw structured
+/// representation.
 pub fn inline_human_text(text: &str) -> String {
     escape_human_text(text, false)
 }
 
 /// Render ledger body prose for a human terminal.
 ///
-/// Line feeds remain available for the caller to indent; every other C0
-/// control and DEL becomes U+FFFD.
+/// Line feeds remain available for the caller to indent; every other control
+/// character becomes U+FFFD.
 pub fn body_human_text(text: &str) -> String {
     escape_human_text(text, true)
 }
@@ -1038,10 +1039,16 @@ fn continues_sentence(line: &str) -> bool {
     line.starts_with(char::is_lowercase) && !prefixed
 }
 
+/// Every [`char::is_control`] character becomes U+FFFD: the C0 controls and
+/// DEL, and the C1 controls U+0080 to U+009F too, two of which a terminal
+/// reading UTF-8 as ISO 2022 takes for introducers (U+009B is CSI, U+009D is
+/// OSC). [`is_ledger_component`] already judges a name by the same question,
+/// and an escaper that asked a narrower one let half the controls through
+/// every field it renders.
 fn escape_human_text(text: &str, preserve_line_feeds: bool) -> String {
     text.chars()
         .map(|character| {
-            if character.is_ascii_control() && !(preserve_line_feeds && character == '\n') {
+            if character.is_control() && !(preserve_line_feeds && character == '\n') {
                 '\u{fffd}'
             } else {
                 character
@@ -2268,6 +2275,30 @@ mod tests {
         assert_eq!(age("2026-08-15T12:00:30Z", now).as_deref(), Some("now"));
         // Only reachable for an entry assembled by hand: `entries` rejects these.
         assert_eq!(age("last tuesday", now), None);
+    }
+
+    #[test]
+    fn every_control_character_is_escaped_and_only_a_body_keeps_its_line_feeds() {
+        // A C1 control is a control character a terminal reading UTF-8 as
+        // ISO 2022 acts on: U+009B is CSI and U+009D is OSC, so an escaper
+        // that asked only `is_ascii_control` let an introducer through.
+        assert_eq!(
+            inline_human_text("a\u{1b}[2Jb\u{7f}c\u{9b}31md\u{9d}0;xe\u{85}f"),
+            "a\u{fffd}[2Jb\u{fffd}c\u{fffd}31md\u{fffd}0;xe\u{fffd}f"
+        );
+        // The line feed a caller indents by survives in a body and nowhere
+        // else; every other control, C1 included, goes either way.
+        assert_eq!(inline_human_text("one\ntwo"), "one\u{fffd}two");
+        assert_eq!(body_human_text("one\ntwo\u{9b}0m"), "one\ntwo\u{fffd}0m");
+        assert_eq!(body_human_text("one\rtwo"), "one\u{fffd}two");
+        // A problem joins its lines, so a line feed never reads as U+FFFD,
+        // and what it joins is escaped the same way.
+        assert_eq!(
+            problem_human_text("fatal: a\u{9b}31m\nhint: b"),
+            "fatal: a\u{fffd}31m; hint: b"
+        );
+        // Text with no control character is handed back as it is.
+        assert_eq!(inline_human_text("plain — text"), "plain — text");
     }
 
     #[test]

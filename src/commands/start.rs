@@ -523,12 +523,18 @@ fn take_claim(context: &mut StartContext<'_>) -> anyhow::Result<Exit> {
             format!("claimed: {reason} (adopted existing workspace)"),
             None,
         )?;
+        // Every owner name printed here goes out escaped, this run's own
+        // included: with no harness variable set the identity is read back
+        // from a claim in the state file that another session wrote
+        // (`crate::commands::hook::owner_for`), and a printer that escaped
+        // only that case would be a rule no reader of this code, and no
+        // reader of the output, could tell apart from the other.
         println!(
             "adopted existing workspace {} at {change}; left as-is\nclaimed {}/{} for {}",
             context.destination.display(),
             context.fork.name,
             context.branch,
-            context.identity.owner,
+            crate::ledger::inline_human_text(&context.identity.owner),
         );
         return Ok(Exit::Ok);
     }
@@ -551,7 +557,7 @@ fn take_claim(context: &mut StartContext<'_>) -> anyhow::Result<Exit> {
         context.destination.display(),
         context.fork.name,
         context.branch,
-        context.identity.owner,
+        crate::ledger::inline_human_text(&context.identity.owner),
     );
     Ok(Exit::Ok)
 }
