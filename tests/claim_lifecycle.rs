@@ -260,6 +260,7 @@ fn start_refuses_two_anonymous_owners_with_the_same_name() {
         String::from_utf8_lossy(&second.stderr)
     );
     let stderr = String::from_utf8_lossy(&second.stderr);
+    let workspace = lab.work.parent().expect("parent").join("feat-gamma");
     assert!(
         stderr.contains("both sides are anonymous identities"),
         "stderr: {stderr}"
@@ -267,6 +268,12 @@ fn start_refuses_two_anonymous_owners_with_the_same_name() {
     assert!(stderr.contains("can never match"), "stderr: {stderr}");
     assert!(stderr.contains("port it"), "stderr: {stderr}");
     assert!(stderr.contains("--force"), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!("its workspace is {}", workspace.display())),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("taken in this place"), "stderr: {stderr}");
+    assert!(stderr.contains("harness session"), "stderr: {stderr}");
 }
 
 #[test]
@@ -316,11 +323,184 @@ fn start_refuses_another_harness_session_and_names_the_holder() {
         String::from_utf8_lossy(&second.stderr)
     );
     let stderr = String::from_utf8_lossy(&second.stderr);
+    let workspace = lab.work.parent().expect("parent").join("feat-gamma");
     assert!(stderr.contains("agent-one"), "stderr: {stderr}");
     assert!(stderr.contains("harness-session"), "stderr: {stderr}");
     assert!(stderr.contains("claimed"), "stderr: {stderr}");
     assert!(stderr.contains("last seen"), "stderr: {stderr}");
     assert!(stderr.contains("--force"), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!("its workspace is {}", workspace.display())),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no process of this machine"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("taken in this place"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("is evidence of nothing"),
+        "a silent scan of this very place proves something: {stderr}"
+    );
+    assert!(stderr.contains("harness session"), "stderr: {stderr}");
+}
+
+/// `agent-one` claims `feat/gamma` with the reason every refusal test reads
+/// back, and the workspace the claim opened.
+fn claimed_by_agent_one(lab: &Lab, home: &Path) -> std::path::PathBuf {
+    ran(
+        lab,
+        home,
+        "agent-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    lab.work.parent().expect("parent").join("feat-gamma")
+}
+
+#[test]
+fn start_refusing_a_claim_whose_workspace_is_gone_says_nothing_is_there() {
+    // An empty process list reads as an idle workspace. With the directory
+    // itself gone there is nothing to be idle in, and only the refusal can
+    // tell the reader which of the two it found.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = claimed_by_agent_one(&lab, home.path());
+    std::fs::remove_dir_all(&workspace).expect("remove workspace directory");
+
+    let refused = tried(
+        &lab,
+        home.path(),
+        "agent-two",
+        &["--text", "start", "feat/gamma", "--repo", "demo"],
+    );
+
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "its workspace is {}, and nothing is at that path",
+            workspace.display()
+        )),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("pid "),
+        "a process in a directory that is not there: {stderr}"
+    );
+}
+
+#[test]
+fn start_refusing_a_claim_names_the_processes_working_in_its_workspace() {
+    // The fact that decides whether to seize a branch is whether anything is
+    // still working in its workspace, and `knives finish` goes on saying
+    // nothing of it: its refusal is about the claim alone.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = claimed_by_agent_one(&lab, home.path());
+    // knives never counts the processes of the session calling it, so this
+    // stand-in for the holder's shell carries none of this test's variables.
+    let mut working = Command::new("sleep");
+    working.arg("3600").current_dir(&workspace);
+    for name in knives::commands::claim::HARNESS_SESSION_VARIABLES {
+        working.env_remove(name);
+    }
+    let mut holder = working.spawn().expect("spawn a process in the workspace");
+
+    let refused = tried(
+        &lab,
+        home.path(),
+        "agent-two",
+        &["--text", "start", "feat/gamma", "--repo", "demo"],
+    );
+    let finished = tried(
+        &lab,
+        home.path(),
+        "agent-two",
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+    let _ = holder.kill();
+    let _ = holder.wait();
+
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!("pid {} (sleep 3600) at ", holder.id())),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("is evidence that the work"),
+        "stderr: {stderr}"
+    );
+
+    let refused_finish = String::from_utf8_lossy(&finished.stderr);
+    assert_eq!(finished.status.code(), Some(2), "stderr: {refused_finish}");
+    assert!(
+        refused_finish.contains("is claimed by agent-one"),
+        "stderr: {refused_finish}"
+    );
+    for silent in [
+        format!("pid {}", holder.id()),
+        "its workspace is ".to_owned(),
+        "taken in this place".to_owned(),
+        "taken in another place".to_owned(),
+        "records no place".to_owned(),
+    ] {
+        assert!(
+            !refused_finish.contains(&silent),
+            "the finish refusal gained {silent:?}: {refused_finish}"
+        );
+    }
+}
+
+#[test]
+fn start_refusing_a_claim_taken_in_another_place_says_the_scan_proves_nothing() {
+    // The processes of another host or agent box are invisible from here, so
+    // an empty list says nothing about a claim taken in one of them; a reader
+    // who took it for an idle workspace would seize live work.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    claimed_by_agent_one(&lab, home.path());
+    let state_path = home.path().join("state.json");
+    let mut state: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).expect("state"))
+            .expect("parse state");
+    state["claims"]["demo/feat/gamma"]["place"] =
+        Value::String("agent-box-7 pid:[4026532999]".to_owned());
+    std::fs::write(
+        &state_path,
+        serde_json::to_string(&state).expect("serialise state"),
+    )
+    .expect("rewrite state");
+
+    let refused = tried(
+        &lab,
+        home.path(),
+        "agent-two",
+        &["--text", "start", "feat/gamma", "--repo", "demo"],
+    );
+
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("taken in another place, agent-box-7 pid:[4026532999]"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no process of this machine"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("is evidence of nothing"),
+        "stderr: {stderr}"
+    );
 }
 
 /// Set the mode of the checkout's jj operation objects: how a test takes its

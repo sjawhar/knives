@@ -243,8 +243,8 @@ pub fn run(
             .ok_or_else(|| anyhow::anyhow!("claim decision lacked held claim context"))?;
         let last_seen = seen::last_seen_in(claim, checkout, &seen::load());
         return Ok(refuse_claim(
-            branch,
             claim,
+            &destination,
             last_seen,
             decision == ClaimDecision::RefuseAnonymous,
         ));
@@ -295,8 +295,8 @@ fn claim_context(
 }
 
 fn refuse_claim(
-    branch: &BranchName,
     claim: &crate::store::Claim,
+    workspace: &Path,
     last_seen: crate::seen::LastSeen,
     anonymous: bool,
 ) -> Exit {
@@ -306,10 +306,79 @@ fn refuse_claim(
         ""
     };
     eprintln!(
-        "{anonymous_note}{}\nuse `knives start {branch} --force --why \"…\"` to seize the claim",
+        "{anonymous_note}{}\n{}\nuse `knives start {} --force --why \"…\"` to seize the claim",
         render_claim_context(claim, last_seen, jiff::Timestamp::now()),
+        claim_evidence(claim, workspace),
+        claim.branch,
     );
     Exit::Usage
+}
+
+/// What the refused caller needs to judge the claim: where its workspace is,
+/// what runs in it, where it was taken, and what those facts are worth.
+///
+/// A holder's name sorts nothing when one machine holds forty claims of one
+/// session. The question a refused agent has is whether the work is still
+/// live, and the only evidence of that on this machine is a process inside
+/// the workspace. [`crate::liveness::live_users`] sees what this process can
+/// see, so its silence proves nothing about a claim taken in another PID
+/// namespace, and the lines say which case this is rather than leaving the
+/// reader to compare two places by eye.
+fn claim_evidence(claim: &crate::store::Claim, workspace: &Path) -> String {
+    let session = crate::commands::claim::harness_session();
+    let users = crate::liveness::live_users(
+        workspace,
+        session
+            .as_ref()
+            .map(|(name, value)| (*name, value.as_str())),
+    );
+    // A directory that vanished leaves the same empty list as a workspace
+    // nobody is in, so the path is judged on its own. A dangling symbolic
+    // link is something at the path, as it is everywhere else in this file.
+    let nothing_there = std::fs::symlink_metadata(workspace).is_err();
+    let mut lines = vec![format!(
+        "its workspace is {}{}",
+        workspace.display(),
+        if nothing_there {
+            ", and nothing is at that path"
+        } else {
+            ""
+        },
+    )];
+    if users.is_empty() {
+        lines.push("no process of this machine is in it".to_owned());
+    } else {
+        lines.extend(users.iter().map(|user| format!("  {user}")));
+    }
+    let here = crate::liveness::this_place();
+    let taken_here = claim.place.as_deref() == Some(here.as_str());
+    lines.push(match claim.place.as_deref() {
+        Some(_) if taken_here => "the claim was taken in this place".to_owned(),
+        Some(place) => format!("the claim was taken in another place, {place}"),
+        None => "the claim records no place".to_owned(),
+    });
+    lines.push(
+        match (users.is_empty(), taken_here) {
+            (false, _) => {
+                "a process named above is evidence that the work in the workspace is live"
+            }
+            (true, true) => {
+                "the list was read in the place the claim was taken, so nothing this machine can \
+                 see is working in the workspace"
+            }
+            (true, false) => {
+                "an empty list is evidence of nothing here, because this machine cannot see the \
+                 processes of another host or agent box"
+            }
+        }
+        .to_owned(),
+    );
+    lines.push(
+        "the list leaves out this run's own processes, the processes of its harness session, and \
+         any process this user cannot inspect"
+            .to_owned(),
+    );
+    lines.join("\n")
 }
 
 fn force_claim(
