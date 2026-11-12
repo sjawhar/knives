@@ -89,6 +89,16 @@ pub fn possession_permits_release(claim: &Claim, identity: &Identity) -> bool {
 
 /// Renders the complete claim context shared by refusals and other claim
 /// lifecycle notices.
+///
+/// The owner name and the reason are the text of whatever session took the
+/// claim — another agent of this machine, through `knives start --why` — and
+/// every session of the machine reads that state file, so both reach the
+/// terminal escaped ([`crate::ledger::inline_human_text`]): a reason holding
+/// a terminal control sequence would otherwise drive the terminal of every
+/// caller this context is printed to, which is the refused `start`, the
+/// refused `finish`, the notice after a seizure and the notice after a
+/// resume. The age and the sighting are this process's own words about
+/// timestamps, and need no escaping.
 pub fn render_claim_context(
     claim: &Claim,
     last_seen: crate::seen::LastSeen,
@@ -99,14 +109,18 @@ pub fn render_claim_context(
     format!(
         "{} is claimed by {} ({}), claimed {claimed_age} ago, {}: {}",
         claim.key(),
-        claim.owner,
+        crate::ledger::inline_human_text(&claim.owner),
         owner_kind_label(claim.kind),
         render_last_seen(last_seen, now),
-        claim.why,
+        crate::ledger::inline_human_text(&claim.why),
     )
 }
 
 /// Renders a compact claim row for an advisory surface.
+///
+/// The owner name and the reason are another session's text, escaped for the
+/// same reason [`render_claim_context`] escapes them: these rows are printed
+/// by the session hook, into the terminal of a caller that wrote none of it.
 pub fn render_claim_line(
     subject: &str,
     claim: &Claim,
@@ -117,10 +131,10 @@ pub fn render_claim_line(
         crate::ledger::age(&claim.started, now).unwrap_or_else(|| "unknown".to_owned());
     format!(
         "{subject} ({}, {}, claimed {claimed_age} ago, {}): {}",
-        claim.owner,
+        crate::ledger::inline_human_text(&claim.owner),
         owner_kind_label(claim.kind),
         render_last_seen(last_seen, now),
-        claim.why,
+        crate::ledger::inline_human_text(&claim.why),
     )
 }
 

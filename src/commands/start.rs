@@ -330,6 +330,16 @@ fn refuse_claim(
 /// see, so its silence proves nothing about a claim taken in another PID
 /// namespace, and the lines say which case this is rather than leaving the
 /// reader to compare two places by eye.
+///
+/// A process line is another party's text: the command comes from
+/// `/proc/<pid>/comm` of a process this caller did not start, and the path is
+/// a path on disk, so both go to the terminal escaped
+/// ([`crate::ledger::inline_human_text`]) — whoever started that process
+/// would otherwise choose what the refused caller's terminal receives. The
+/// place is the same: whatever session took the claim wrote it into the state
+/// file, so it goes out escaped too. The pid is a number this process read as
+/// one, and the workspace path and the branch are this caller's own
+/// arguments.
 fn claim_evidence(claim: &crate::store::Claim, workspace: &Path) -> String {
     let users = crate::liveness::others_using(workspace);
     // A directory that vanished leaves the same empty list as a workspace
@@ -352,13 +362,20 @@ fn claim_evidence(claim: &crate::store::Claim, workspace: &Path) -> String {
     if users.is_empty() {
         lines.push("no process of this machine is in it".to_owned());
     } else {
-        lines.extend(users.iter().map(|user| format!("  {user}")));
+        lines.extend(
+            users
+                .iter()
+                .map(|user| format!("  {}", crate::ledger::inline_human_text(&user.to_string()))),
+        );
     }
     let here = crate::liveness::this_place();
     let taken_here = claim.place.as_deref() == Some(here.as_str());
     lines.push(match claim.place.as_deref() {
         Some(_) if taken_here => "the claim was taken in this place".to_owned(),
-        Some(place) => format!("the claim was taken in another place, {place}"),
+        Some(place) => format!(
+            "the claim was taken in another place, {}",
+            crate::ledger::inline_human_text(place)
+        ),
         None => "the claim records no place".to_owned(),
     });
     lines.push(

@@ -19,7 +19,7 @@ use knives::ids::{BranchName, BranchTarget, Requirement};
 use knives::jj::{
     Repo, StaleRegistration, WorkspaceIdentity, path_occupant, remove_finished_worktree,
 };
-use knives::ledger::{ClaimChange, Displaced, Draft, Entry, Stated};
+use knives::ledger::{ClaimChange, Displaced, Draft, Entry, Stated, inline_human_text};
 use knives::statement::{Statement, StatementKind};
 use knives::store::{Store, default_state_path};
 
@@ -65,8 +65,10 @@ enum FinishClaimGate {
     Continue(Released),
     /// Another owner took or released the caller's own claim and nobody
     /// holds the branch now. The caller has been told so; its own workspace
-    /// is still disposed of, and the finish reports a finding whatever that
-    /// disposal gives.
+    /// is still disposed of, and the finish exits with the worse of a
+    /// finding and what that disposal gives: `2` where a live process
+    /// refuses the removal, `3` where jj cannot read the workspace state or
+    /// snapshot the working copy.
     Lost,
     /// The gate has said everything there is to say; exit with this.
     Refuse(Exit),
@@ -733,6 +735,13 @@ fn refuse_held(refusal: &Refusal<'_>) -> FinishClaimGate {
 /// `change` is the change the entry recorded, as [`claim_ended`] matched it,
 /// so each word here is the one its own change carries and a later search
 /// cannot make this print a verb the entry never recorded.
+///
+/// The owner name and the reason are another machine's text, which the
+/// ledger pull brought here, so they go to the terminal escaped
+/// ([`inline_human_text`]): an entry naming this caller as the owner it
+/// displaced would otherwise send terminal control sequences to the caller's
+/// own terminal. The timestamp needs no escaping: a ledger read rejects an
+/// entry whose `ts` no timestamp can be parsed from.
 fn displacement(target: &BranchTarget, owner: &str, change: ClaimChange, lost: &Entry) -> String {
     let verb = match change {
         ClaimChange::Taken => "took",
@@ -743,10 +752,10 @@ fn displacement(target: &BranchTarget, owner: &str, change: ClaimChange, lost: &
     let why = lost
         .claim_change_why
         .as_deref()
-        .map_or_else(String::new, |why| format!(": {why}"));
+        .map_or_else(String::new, |why| format!(": {}", inline_human_text(why)));
     format!(
         "{} {verb} {owner}'s claim on {} at {}{why}",
-        lost.owner,
+        inline_human_text(&lost.owner),
         target.key(),
         lost.ts,
     )
@@ -792,6 +801,11 @@ fn claim_ended<'a>(
 /// use there cannot be checked. A duplicate harness of the same session in
 /// another box is the case: the identity matches and the claim cannot tell
 /// them apart. Refused without `--force`; a forced finish records the reason.
+///
+/// The owner and the place are the text of whatever session took the claim,
+/// held in a state file every session of this machine reads, so the refusal
+/// prints both escaped ([`inline_human_text`]): raw, that session would
+/// choose what this caller's terminal receives.
 fn place_gate(
     claim: &knives::store::Claim,
     target: &BranchTarget,
@@ -811,11 +825,12 @@ fn place_gate(
         });
     }
     eprintln!(
-        "{} was claimed by {} in {taken}; this finish runs in {here}, which cannot see whether a \
+        "{} was claimed by {} in {}; this finish runs in {here}, which cannot see whether a \
          process there still works in the workspace\nuse `knives finish {} --force --why \"…\"` \
          once nothing there uses it",
         claim.key(),
-        claim.owner,
+        inline_human_text(&claim.owner),
+        inline_human_text(taken),
         target.branch,
     );
     FinishClaimGate::Refuse(Exit::Usage)

@@ -1229,6 +1229,7 @@ fn a_forced_release_leaves_the_displaced_owners_workspace_as_it_is() {
     let workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
     let untracked = workspace.join("scratch.txt");
     std::fs::write(&untracked, "jj never saw this\n").expect("write untracked work");
+    let operations_before = lab::operation_ids(&lab.work);
 
     let forced = force_finish_gamma_as(&lab, &home, "agent-two", "owner session died");
 
@@ -1244,6 +1245,18 @@ fn a_forced_release_leaves_the_displaced_owners_workspace_as_it_is() {
     assert!(
         stdout.contains("are left as they are") && stdout.contains("the directory is agent-one's"),
         "stdout: {stdout}"
+    );
+    // The working copy is the displaced owner's to snapshot: a snapshot of it
+    // writes an operation into the repository the two workspaces share, and
+    // it would commit the untracked file this release must leave alone.
+    assert!(
+        !stdout.contains("its working copy is kept as"),
+        "the displaced owner's working copy was snapshotted: {stdout}"
+    );
+    assert_eq!(
+        lab::operation_ids(&lab.work),
+        operations_before,
+        "the release wrote an operation into the displaced owner's repository"
     );
     assert_eq!(
         std::fs::read_to_string(&untracked).expect("read the untracked work"),

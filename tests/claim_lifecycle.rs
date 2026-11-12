@@ -703,7 +703,9 @@ fn start_refusing_a_claim_names_the_processes_working_in_its_workspace() {
 fn start_refusing_a_claim_taken_in_another_place_says_the_scan_proves_nothing() {
     // The processes of another host or agent box are invisible from here, so
     // an empty list says nothing about a claim taken in one of them; a reader
-    // who took it for an idle workspace would seize live work.
+    // who took it for an idle workspace would seize live work. The place is
+    // the text of whatever session took the claim, so it reaches this
+    // terminal escaped.
     let lab = Lab::new();
     let (home, _consumer) = release_test_home(&lab);
     claimed_by_agent_one(&lab, home.path());
@@ -712,7 +714,7 @@ fn start_refusing_a_claim_taken_in_another_place_says_the_scan_proves_nothing() 
         serde_json::from_str(&std::fs::read_to_string(&state_path).expect("state"))
             .expect("parse state");
     state["claims"]["demo/feat/gamma"]["place"] =
-        Value::String("agent-box-7 pid:[4026532999]".to_owned());
+        Value::String("agent-box-7 \u{1b}]0;held\u{7} pid:[4026532999]".to_owned());
     std::fs::write(
         &state_path,
         serde_json::to_string(&state).expect("serialise state"),
@@ -729,8 +731,14 @@ fn start_refusing_a_claim_taken_in_another_place_says_the_scan_proves_nothing() 
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert_eq!(refused.status.code(), Some(2), "stderr: {stderr}");
     assert!(
-        stderr.contains("taken in another place, agent-box-7 pid:[4026532999]"),
-        "stderr: {stderr}"
+        stderr.contains(
+            "taken in another place, agent-box-7 \u{fffd}]0;held\u{fffd} pid:[4026532999]"
+        ),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "an escape character reached the terminal: {stderr:?}"
     );
     assert!(
         stderr.contains("no process of this machine"),
@@ -739,6 +747,55 @@ fn start_refusing_a_claim_taken_in_another_place_says_the_scan_proves_nothing() 
     assert!(
         stderr.contains("is evidence of nothing"),
         "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn the_start_refusal_escapes_the_control_characters_of_the_claims_reason() {
+    // The reason is the text of whatever session took the claim, and every
+    // session of this machine reads the state file it sits in: unescaped,
+    // the holder chooses what the refused caller's terminal receives.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    ran(
+        &lab,
+        home.path(),
+        "agent-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port \u{1b}]0;held\u{7}it",
+        ],
+    );
+    assert_eq!(
+        claim_of(home.path(), "feat/gamma")["why"].as_str(),
+        Some("port \u{1b}]0;held\u{7}it"),
+        "the state file is the raw record: only the terminal rendering escapes"
+    );
+
+    // When: another identity tries to start the claimed branch
+    let refused = tried(
+        &lab,
+        home.path(),
+        "agent-two",
+        &["--text", "start", "feat/gamma", "--repo", "demo"],
+    );
+
+    // Then: every control character of the reason reached the terminal as
+    // U+FFFD, and no escape character survived
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("port \u{fffd}]0;held\u{fffd}it"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "an escape character reached the terminal: {stderr:?}"
     );
 }
 
@@ -1931,6 +1988,81 @@ fn a_displaced_owners_finish_names_the_takeover_and_offers_no_release() {
         ledger_of(home.path()).len(),
         entries,
         "a finish that changed nothing wrote to the ledger"
+    );
+}
+
+#[test]
+fn the_takeover_notice_escapes_the_control_characters_of_the_ledger() {
+    // A ledger entry can come from another machine through the ledger pull,
+    // and the entry that ends a claim names the owner it displaced: without
+    // escaping, whoever wrote it chooses what the displaced owner's terminal
+    // receives the next time that owner runs `knives finish`.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    ran(
+        &lab,
+        home.path(),
+        "agent-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    ran(
+        &lab,
+        home.path(),
+        "agent-two",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            "rescue \u{1b}]0;seized\u{7}stalled work",
+        ],
+    );
+    assert_eq!(
+        claim_change(home.path(), "taken")
+            .claim_change_why
+            .as_deref(),
+        Some("rescue \u{1b}]0;seized\u{7}stalled work"),
+        "the ledger is the raw record: only the terminal rendering escapes"
+    );
+    // The taker hands the branch back, so nobody holds it and the notice the
+    // displaced owner gets is read from the ledger alone.
+    ran(
+        &lab,
+        home.path(),
+        "agent-two",
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    // When: the owner that lost the claim finishes the branch
+    let told = tried(
+        &lab,
+        home.path(),
+        "agent-one",
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    // Then: every control character of the reason reached the terminal as
+    // U+FFFD, and no escape sequence survived
+    let stderr = String::from_utf8_lossy(&told.stderr);
+    assert_eq!(told.status.code(), Some(1), "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("rescue \u{fffd}]0;seized\u{fffd}stalled work"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "an escape character reached the terminal: {stderr:?}"
     );
 }
 

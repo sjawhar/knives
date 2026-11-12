@@ -703,7 +703,9 @@ fn the_kept_commit_is_named_even_when_removal_fails() {
 
 #[test]
 fn finish_refuses_a_claim_taken_in_another_place() {
-    // Given: the claim was taken in another agent box (its place recorded)
+    // Given: the claim was taken in another agent box (its place recorded).
+    // The place is the text of whatever session took the claim, so the
+    // refusal must print it escaped.
     let lab = Lab::new();
     let (home, _consumer) = release_test_home(&lab);
     let workspace = start(&lab, &home);
@@ -715,19 +717,25 @@ fn finish_refuses_a_claim_taken_in_another_place() {
         state["claims"]["demo/feat/gamma"]["place"].is_string(),
         "start recorded no place: {state}"
     );
-    state["claims"]["demo/feat/gamma"]["place"] = Value::String("other-box pid:[1]".to_owned());
+    state["claims"]["demo/feat/gamma"]["place"] =
+        Value::String("other-box \u{1b}]0;held\u{7} pid:[1]".to_owned());
     std::fs::write(&path, state.to_string()).expect("write state");
 
     // When: the same session finishes from here
     let refused = finish(&lab, &home, &[]);
 
-    // Then: it refuses, names the other place, and keeps the claim and the
-    // workspace
+    // Then: it refuses, names the other place with every control character
+    // of it as U+FFFD, and keeps the claim and the workspace
+    let stderr = String::from_utf8_lossy(&refused.stderr);
     assert_eq!(refused.status.code(), Some(2), "{}", shown(&refused));
     assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("other-box pid:[1]"),
+        stderr.contains("other-box \u{fffd}]0;held\u{fffd} pid:[1]"),
         "{}",
         shown(&refused)
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "an escape character reached the terminal: {stderr:?}"
     );
     assert!(claim_held(&home));
     assert!(workspace.is_dir());
