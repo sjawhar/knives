@@ -12,7 +12,7 @@ use knives::bind::Fork;
 use knives::cli::Exit;
 use knives::commands::claim::{
     Bound, ClaimContext, ClaimDecision, current_identity, decide, last_seen_provenance,
-    render_claim_context,
+    possession_permits_release, render_claim_context,
 };
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
 use knives::ids::{BranchName, BranchTarget, Requirement};
@@ -87,10 +87,11 @@ struct Released {
 /// Hand a branch back and remove its workspace. The inverse of `start`.
 ///
 /// Removing the directory loses no work: the working copy is snapshotted into its commit
-/// first, and a snapshot that fails or leaves a file out refuses the finish. What does
-/// not survive is anything jj never tracks, which is what `--no-cleanup` is for. Another
-/// process still using the workspace, or a claim taken in a place whose processes this
-/// one cannot see, refuses it too unless `--force`.
+/// first, and a snapshot that fails or leaves a file out keeps the directory exactly as
+/// it is, for the next `start` of this branch to adopt, while the claim still comes back.
+/// What does not survive a removal is anything jj never tracks, which is what
+/// `--no-cleanup` is for. Another process still using the workspace, or a claim taken in
+/// a place whose processes this one cannot see, refuses it unless `--force`.
 /// `bound` is the registry and the fork the current directory is inside, by
 /// the name its claims are kept under, which names a terminal user acting
 /// from a fork's workspace.
@@ -101,7 +102,6 @@ pub(crate) fn run_finish(
     bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
-    let checkout_path = &fork.checkout.path;
     // Without this, `finish` would forget the primary workspace and delete the
     // checkout itself.
     if let Some(line) = collides_with_checkout(fork, branch) {
@@ -110,6 +110,11 @@ pub(crate) fn run_finish(
     }
     let workspace = knives::commands::wip::workspace_for(branch.as_str());
     let directory = workspace_path(fork, branch);
+    let place = Place {
+        checkout: &fork.checkout.path,
+        workspace: &workspace,
+        directory: &directory,
+    };
     // The fork's lock is taken first and held to the end: between the snapshot
     // and the removal, a `start` of this branch would otherwise take the lock,
     // adopt the workspace, and write in it, and this removal would take that
@@ -120,19 +125,21 @@ pub(crate) fn run_finish(
         &bound.registry.former_names(),
         &[&fork.upstream],
     )?;
+    // Who may hand the claim back is settled before anything is read from the
+    // workspace: a caller the gate refuses reads no directory and scans no
+    // process table, and a workspace whose state jj cannot read no longer
+    // hides the claim question from a caller that does not hold the claim.
+    let released = match finish_claim_gate(fork, target, &store, options, bound)? {
+        FinishClaimGate::Continue(released) => released,
+        FinishClaimGate::Refuse => return Ok(Exit::Usage),
+    };
     // Read-only checks before the claim is touched: a refusal leaves everything
     // as it was.
     let cleared = match clear_workspace(fork, branch, &directory, options) {
         Ok(cleared) => cleared,
         Err(exit) => return Ok(exit),
     };
-    let released = match finish_claim_gate(fork, target, &store, options, bound)? {
-        FinishClaimGate::Continue(released) => released,
-        FinishClaimGate::Refuse => return Ok(Exit::Usage),
-    };
-    if let Err(exit) = keep_working_copy(fork, branch, cleared.working_copy.as_deref()) {
-        return Ok(exit);
-    }
+    let kept = keep_working_copy(fork, branch, cleared.working_copy.as_deref());
     let forced = joined(released.text, cleared.over_live_users);
     let had = store.release_claim(target);
     let pr = store.tracked_pull(target);
@@ -161,19 +168,68 @@ pub(crate) fn run_finish(
     store.save()?;
 
     let claim = if had { "released" } else { "was not held" };
-    let registration = release_registration(checkout_path, &workspace, &directory, cleared.present);
-    let shown = directory.display();
-    let checkout = checkout_path.display();
-    let removal = match cleared.identity {
+    // The release does not wait on the working copy. A snapshot jj refuses
+    // would otherwise keep the claim, and the branch with it, with a session
+    // that has already walked away; the directory is instead left exactly as
+    // it is, and the next `start` of this branch adopts it untouched.
+    if let Err(refused) = kept {
+        eprintln!(
+            "{}/{branch}: claim {claim}; jj could not snapshot all of the working copy at {}, \
+             so the workspace is kept exactly as it is and the next `knives start {branch}` \
+             adopts that directory without touching what is in it\n{}",
+            fork.name,
+            refused.at.display(),
+            refused.refused,
+        );
+        return Ok(Exit::Incomplete);
+    }
+    let registration = release_registration(
+        place.checkout,
+        place.workspace,
+        place.directory,
+        cleared.present,
+    );
+    let removal = removal_note(
+        &place,
+        cleared.identity.as_ref(),
+        &registration,
+        options.cleanup,
+    )?;
+    println!(
+        "{}/{branch}: claim {claim}; workspace {workspace} {registration}; {removal}",
+        fork.name
+    );
+    Ok(Exit::Ok)
+}
+
+/// Where this branch's workspace lives, by the three names the disposal needs.
+struct Place<'a> {
+    checkout: &'a Path,
+    workspace: &'a str,
+    directory: &'a Path,
+}
+
+/// Removes the directory, when this branch's own workspace is what sits there
+/// and its registration was cleared, and says what became of it either way.
+fn removal_note(
+    place: &Place<'_>,
+    identity: Option<&WorkspaceIdentity>,
+    registration: &Registration,
+    cleanup: bool,
+) -> anyhow::Result<String> {
+    let shown = place.directory.display();
+    let checkout = place.checkout.display();
+    let workspace = place.workspace;
+    Ok(match identity {
         None => format!(
             "no directory at {shown}{}",
-            stale_worktree_note(checkout_path, &directory)
+            stale_worktree_note(place.checkout, place.directory)
         ),
         Some(WorkspaceIdentity::Ours(name)) if name.as_str() == workspace => {
             // A registration that could not be forgotten keeps its directory: with
             // the directory gone, every later `start` dies on jj's "already exists",
             // `--force` included, where a retried `finish` would have cleaned up.
-            let removable = options.cleanup
+            let removable = cleanup
                 && !matches!(
                     registration,
                     Registration::Failed(_) | Registration::Elsewhere(_)
@@ -182,10 +238,10 @@ pub(crate) fn run_finish(
                 // Safe because jj already snapshotted the working copy into a commit:
                 // the work is in the repository and reachable by change id. Untracked
                 // files are the exception, which is what --no-cleanup is for.
-                std::fs::remove_dir_all(&directory)?;
+                std::fs::remove_dir_all(place.directory)?;
                 format!(
                     "{shown} removed; its commits remain in the repository{}",
-                    stale_worktree_note(checkout_path, &directory)
+                    stale_worktree_note(place.checkout, place.directory)
                 )
             } else {
                 format!("{shown} left on disk")
@@ -215,12 +271,7 @@ pub(crate) fn run_finish(
         Some(WorkspaceIdentity::NotAWorkspace) => {
             format!("{shown} is not a workspace of {checkout}, left alone")
         }
-    };
-    println!(
-        "{}/{branch}: claim {claim}; workspace {workspace} {registration}; {removal}",
-        fork.name
-    );
-    Ok(Exit::Ok)
+    })
 }
 
 /// Two optional provenance texts as one.
@@ -337,16 +388,22 @@ fn clear_workspace(
     })
 }
 
+/// A working copy jj would not snapshot whole, and where it sits.
+struct NotSnapshotted {
+    at: PathBuf,
+    refused: knives::jj::JjError,
+}
+
 /// Snapshots this branch's working copy into jj before it is forgotten, and
 /// names the commit that keeps it at once, before anything can fail on the
-/// way to removing it. A snapshot that fails or leaves something out refuses
-/// the finish with the claim and the workspace as they were; what jj did
-/// snapshot stays in its commit.
+/// way to removing it. A snapshot that fails or leaves something out leaves
+/// the workspace as it is and the disposal undone; what jj did snapshot stays
+/// in its commit, and the claim is handed back either way.
 fn keep_working_copy(
     fork: &Fork<'_>,
     branch: &BranchName,
     working_copy: Option<&Path>,
-) -> Result<(), Exit> {
+) -> Result<(), NotSnapshotted> {
     let Some(working_copy) = working_copy else {
         return Ok(());
     };
@@ -355,16 +412,10 @@ fn keep_working_copy(
             println!("{}/{branch}: its working copy is kept as {kept}", fork.name);
             Ok(())
         }
-        Err(error) => {
-            eprintln!(
-                "{}/{branch}: could not snapshot all of the working copy at {} into jj, so \
-                 forgetting or removing it could lose edits; the claim and the workspace are \
-                 left as they were\n{error}",
-                fork.name,
-                working_copy.display()
-            );
-            Err(Exit::Incomplete)
-        }
+        Err(refused) => Err(NotSnapshotted {
+            at: working_copy.to_owned(),
+            refused,
+        }),
     }
 }
 
@@ -510,11 +561,23 @@ fn finish_claim_gate(
     };
     let cwd = std::env::current_dir()?;
     let identity = current_identity(bound)?;
-    let decision = decide(&ClaimContext {
+    let decision = match decide(&ClaimContext {
         held: Some(&claim),
         identity: &identity,
         in_claimed_workspace: possesses(&cwd, fork, &target.branch),
-    });
+    }) {
+        // Standing in the directory is evidence enough to take work up again,
+        // never to hand back a claim taken under another name: after a takeover
+        // the directory belongs to the new holder, and the finish an agent runs
+        // from inside it would otherwise release that holder's claim and remove
+        // the directory under it.
+        ClaimDecision::Resume { possession: true }
+            if !possession_permits_release(&claim, &identity) =>
+        {
+            ClaimDecision::RefuseHeld
+        }
+        decision => decision,
+    };
     match decision {
         ClaimDecision::Resume { .. } | ClaimDecision::Take => {
             Ok(place_gate(&claim, target, options))

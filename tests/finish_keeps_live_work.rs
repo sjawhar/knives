@@ -70,6 +70,23 @@ fn claim_held(home: &tempfile::TempDir) -> bool {
     state["claims"]["demo/feat/gamma"]["owner"] == Value::String(OWNER.to_owned())
 }
 
+/// Whether `state.json` records any claim on the branch, whoever holds it.
+fn claim_recorded(home: &tempfile::TempDir) -> bool {
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    !state["claims"]["demo/feat/gamma"].is_null()
+}
+
+/// The fork's ledger entries, oldest first.
+fn ledger_entries(home: &tempfile::TempDir) -> Vec<knives::ledger::Entry> {
+    knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .read()
+        .expect("read ledger")
+        .entries
+}
+
 fn jj(checkout: &Path, args: &[&str]) -> String {
     let output = Command::new("jj")
         .arg("--ignore-working-copy")
@@ -148,7 +165,7 @@ fn finish_keeps_an_edit_no_jj_command_has_seen_and_names_its_commit() {
 }
 
 #[test]
-fn finish_changes_nothing_when_jj_cannot_snapshot_every_file() {
+fn finish_releases_the_claim_and_keeps_the_workspace_when_jj_cannot_snapshot_every_file() {
     // Given: a new file over jj's default snapshot.max-new-file-size (1 MiB)
     let lab = Lab::new();
     let (home, _consumer) = release_test_home(&lab);
@@ -158,12 +175,30 @@ fn finish_changes_nothing_when_jj_cannot_snapshot_every_file() {
     // When: the branch is finished
     let refused = finish(&lab, &home, &[]);
 
-    // Then: it refuses, the workspace and the file are there, the claim is held
+    // Then: it exits incomplete, naming what jj refused, and the claim is gone:
+    // the branch is not locked to a session that has already walked away
     assert_eq!(refused.status.code(), Some(3), "{}", shown(&refused));
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(stderr.contains("big.bin"), "{}", shown(&refused));
+    assert!(stderr.contains("claim released"), "{}", shown(&refused));
+    assert!(!claim_recorded(&home), "{}", shown(&refused));
+    let entries = ledger_entries(&home);
+    assert_eq!(
+        entries.last().map(|entry| entry.text.as_str()),
+        Some("claim released"),
+        "was: {entries:?}"
+    );
+    assert_eq!(
+        entries
+            .last()
+            .and_then(|entry| entry.claim_change.as_deref()),
+        Some("released"),
+        "was: {entries:?}"
+    );
+
+    // And: the directory and the workspace are exactly as they were, so the
+    // next `start` of this branch adopts them with the edit still in place
     assert!(workspace.join("big.bin").is_file());
-    assert!(claim_held(&home), "{}", shown(&refused));
     let names = jj(&lab.work, &["workspace", "list", "-T", r#"name ++ "\n""#]);
     assert!(names.contains("feat-gamma"), "{names}");
 }
@@ -482,7 +517,7 @@ fn finish_touches_nothing_before_it_holds_the_forks_lock() {
 }
 
 #[test]
-fn finish_changes_nothing_when_a_file_name_is_not_utf8() {
+fn finish_releases_the_claim_and_keeps_the_workspace_when_a_file_name_is_not_utf8() {
     use std::os::unix::ffi::OsStrExt as _;
     // Given: a file whose name jj cannot snapshot
     let lab = Lab::new();
@@ -494,10 +529,26 @@ fn finish_changes_nothing_when_a_file_name_is_not_utf8() {
     // When: the branch is finished
     let refused = finish(&lab, &home, &[]);
 
-    // Then: it refuses; the file, the workspace and the claim stay
+    // Then: it exits incomplete and the claim comes back; the file and the
+    // workspace are left exactly as they were
     assert_eq!(refused.status.code(), Some(3), "{}", shown(&refused));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("claim released"),
+        "{}",
+        shown(&refused)
+    );
+    assert!(!claim_recorded(&home), "{}", shown(&refused));
+    let entries = ledger_entries(&home);
+    assert_eq!(
+        entries
+            .last()
+            .and_then(|entry| entry.claim_change.as_deref()),
+        Some("released"),
+        "was: {entries:?}"
+    );
     assert!(workspace.join(name).is_file());
-    assert!(claim_held(&home));
+    let names = jj(&lab.work, &["workspace", "list", "-T", r#"name ++ "\n""#]);
+    assert!(names.contains("feat-gamma"), "{names}");
 }
 
 #[test]
@@ -520,6 +571,49 @@ fn finish_does_not_forget_a_workspace_whose_state_cannot_be_read() {
     let names = jj(&lab.work, &["workspace", "list", "-T", r#"name ++ "\n""#]);
     assert!(names.contains("feat-gamma"), "{names}");
     assert!(claim_held(&home));
+}
+
+#[test]
+fn a_stranger_gets_the_claim_refusal_when_the_workspace_state_cannot_be_read() {
+    // Given: a claim held by one session, and a workspace whose working-copy
+    // state is corrupt. The workspace refusal used to come first, which hid the
+    // claim question: a stranger learnt the directory was unreadable and never
+    // that the branch was not theirs to hand back.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    std::fs::write(
+        workspace.join(".jj/working_copy/checkout"),
+        b"\xff\xfe garbage",
+    )
+    .expect("corrupt the working-copy state");
+
+    // When: another session finishes the branch
+    let refused = lab::knives_command(
+        &lab.work,
+        home.path(),
+        lab.temp_path(),
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    )
+    .env("KNIVES_OWNER", "someone-else")
+    .output()
+    .expect("finish as another session");
+
+    // Then: the refusal is the claim's, not the workspace's
+    assert_eq!(refused.status.code(), Some(2), "{}", shown(&refused));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(&format!("is claimed by {OWNER}")),
+        "{}",
+        shown(&refused)
+    );
+    assert!(
+        !stderr.contains("working-copy state could not be read"),
+        "{}",
+        shown(&refused)
+    );
+    assert!(claim_held(&home), "{}", shown(&refused));
+    assert!(workspace.is_dir());
 }
 
 #[test]

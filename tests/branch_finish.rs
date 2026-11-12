@@ -448,8 +448,10 @@ fn finish_force_requires_why() {
 
 #[test]
 fn finish_by_possession_still_releases() {
-    // Physical presence in the claim's workspace is an intentional possession
-    // proof even when no harness identity survives into the finishing process.
+    // Physical presence in the claim's workspace releases it when the caller
+    // resolves to the name the claim carries: with one claimant on the fork
+    // and no harness variable in the environment, the derived owner is that
+    // claimant.
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
     let workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
@@ -472,6 +474,55 @@ fn finish_by_possession_still_releases() {
         String::from_utf8_lossy(&finished.stdout),
         String::from_utf8_lossy(&finished.stderr)
     );
+}
+
+#[test]
+fn finish_by_possession_is_refused_when_the_fork_has_a_second_claimant() {
+    // Two claimants and no harness variable: no owner can be derived from
+    // state, so the caller is the OS user, a name the claim does not carry.
+    // Standing in the directory is then no permission to hand the claim back —
+    // after a takeover the directory belongs to whoever took it.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
+    hold_claim(&home, "feat/delta");
+
+    let refused = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "finish", "feat/gamma", "--repo", "demo"])
+        .current_dir(&workspace)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env_remove("KNIVES_OWNER")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("OMP_SESSION_ID")
+        .env("USER", "terminal-user")
+        .output()
+        .expect("finish held workspace from inside");
+
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert!(
+        stderr.contains("is claimed by agent-one"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("knives finish feat/gamma --force --why"),
+        "stderr: {stderr}"
+    );
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert_eq!(
+        state["claims"]["demo/feat/gamma"]["owner"],
+        Value::String("agent-one".to_owned())
+    );
+    assert!(workspace.is_dir(), "the claimed workspace was removed");
 }
 
 #[test]

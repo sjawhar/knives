@@ -71,6 +71,22 @@ pub fn decide(context: &ClaimContext<'_>) -> ClaimDecision {
     }
 }
 
+/// Whether standing in the claimed workspace lets this caller release the
+/// claim.
+///
+/// [`decide`] resumes on possession alone, which is right for taking work up:
+/// the directory is the evidence that the claim's own session left it there.
+/// Handing the claim back is the opposite question. A takeover gives the
+/// directory to its new holder, and an agent runs `knives finish` from inside
+/// it, so possession alone would let any later session standing there hand
+/// back a claim it never took, and the directory would go with it. Equal owner
+/// names release, whatever kind of identity each side is; two anonymous
+/// callers under one OS user name go on releasing each other's claims from
+/// inside the directory, as they always have.
+pub fn possession_permits_release(claim: &Claim, identity: &Identity) -> bool {
+    claim.owner == identity.owner
+}
+
 /// Renders the complete claim context shared by refusals and other claim
 /// lifecycle notices.
 pub fn render_claim_context(
@@ -608,5 +624,36 @@ mod tests {
         };
 
         assert_eq!(decide(&context), ClaimDecision::RefuseHeld);
+    }
+
+    #[test]
+    fn possession_releases_only_the_claim_of_the_same_owner_name() {
+        let claim = held("agent-one", OwnerKind::HarnessSession);
+
+        assert!(possession_permits_release(
+            &claim,
+            &identity("agent-one", OwnerKind::HarnessSession)
+        ));
+        assert!(!possession_permits_release(
+            &claim,
+            &identity("agent-two", OwnerKind::HarnessSession)
+        ));
+    }
+
+    #[test]
+    fn possession_releases_across_identity_kinds_that_name_the_same_owner() {
+        // The name is the owner; how each side came by it is not the question a
+        // release asks. Two anonymous callers under one OS user name keep
+        // releasing each other's claims from inside the directory.
+        let claim = held("terminal-user", OwnerKind::OsUser);
+
+        assert!(possession_permits_release(
+            &claim,
+            &identity("terminal-user", OwnerKind::OsUser)
+        ));
+        assert!(possession_permits_release(
+            &held("agent-one", OwnerKind::HarnessSession),
+            &identity("agent-one", OwnerKind::WorkspaceDerived)
+        ));
     }
 }
