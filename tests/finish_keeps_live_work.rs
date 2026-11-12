@@ -240,6 +240,42 @@ fn finish_refuses_while_a_process_works_in_the_workspace() {
 }
 
 #[test]
+fn finish_refusing_a_live_process_escapes_the_control_characters_of_its_command() {
+    // Given: a process in the workspace whose command line carries terminal
+    // control characters, which the session that started it chose. The start
+    // refusal escapes this same list (src/commands/start.rs, claim_evidence);
+    // the finish refusal prints it, so it is text a terminal reads too.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    let sleeper = Sleeper::spawn(|command| {
+        use std::os::unix::process::CommandExt;
+        command.current_dir(&workspace).arg0("sleep\u{1b}]0;held\u{7}");
+    });
+
+    // When: the holder finishes the branch
+    let refused = finish(&lab, &home, &[]);
+
+    // Then: it refuses and names the process, and no control character of that
+    // command line survived into the terminal
+    assert_eq!(refused.status.code(), Some(2), "{}", shown(&refused));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(&format!("pid {}", sleeper.pid())),
+        "{}",
+        shown(&refused)
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "an escape character reached the terminal: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains('\u{7}'),
+        "a bell character reached the terminal: {stderr:?}"
+    );
+}
+
+#[test]
 fn finish_refuses_while_a_process_holds_a_file_in_the_workspace_open() {
     // Given: a process elsewhere with a file of the workspace open
     let lab = Lab::new();
