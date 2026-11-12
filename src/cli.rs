@@ -2,8 +2,10 @@
 //!
 //! Argument shapes are enforced by the parser rather than checked at runtime,
 //! so a command cannot start work and then discover it lacks something it
-//! needed. `--why` on a claim is required here for exactly that reason: the
-//! description is what makes another agent's claim legible.
+//! needed. `--force` on a claim requires `--why` here for exactly that reason:
+//! a claim taken from another agent, or released under one, is legible to the
+//! next reader only with the reason that explains it. A plain `start` takes
+//! `--why` too, and falls back to a default reason.
 
 use std::path::PathBuf;
 
@@ -272,6 +274,11 @@ pub enum Command {
     /// Claiming a branch and opening a workspace for it were two commands for no
     /// reason: starting work on a branch is one act. `finish` is its inverse.
     ///
+    /// A `--why` from the claim's own holder replaces the reason on the claim,
+    /// from inside the workspace or outside it. The claim keeps the time and the
+    /// place it was taken, and a `start` with no `--why` keeps the reason it
+    /// already carries.
+    ///
     /// Also states the fork's `immutable_heads()` — jj's trunk, the trunk by name
     /// on every knives remote, and every tag fetched from upstream — in the
     /// repository's jj config when that config states none, and says so on
@@ -285,6 +292,8 @@ pub enum Command {
         #[arg(long)]
         repo: Option<String>,
         /// What you are doing and why. A claim nobody can read is noise.
+        /// Defaults to `started work`, and replaces the reason on a claim you
+        /// hold.
         #[arg(long)]
         why: Option<String>,
         /// Replace an existing claim. Requires a new reason for the ledger.
@@ -298,15 +307,20 @@ pub enum Command {
     ///
     /// Removing the directory loses no work: `finish` first snapshots the working copy
     /// into its commit and names it, so every change made in that workspace is in the
-    /// repository and reachable by change id; when jj cannot snapshot all of it (a stale
-    /// working copy, a file over `snapshot.max-new-file-size`) the claim and the workspace
-    /// stay as they were, and what jj could snapshot stays in its commit. What
+    /// repository and reachable by change id. When jj cannot snapshot all of it (a stale
+    /// working copy, a file over `snapshot.max-new-file-size`), the claim comes back all
+    /// the same, the workspace is kept exactly as it is, and the next `start` of this
+    /// branch adopts that directory; what jj could snapshot stays in its commit. What
     /// does not survive is anything jj never tracks — build output, an ignored `.env` —
     /// so `--no-cleanup` leaves the directory alone.
     ///
     /// `finish` also refuses while another process on this machine has its working
-    /// directory or an open file in the workspace, and when the claim was taken on
-    /// another host or agent box, whose processes it cannot see.
+    /// directory or an open file in the workspace, when the claim was taken on
+    /// another host or agent box, whose processes it cannot see, and when another
+    /// identity holds the claim. A caller whose own claim another owner took or
+    /// released is told who did it and sent to `start`, never to `finish --force`,
+    /// which would release the live claim of whoever holds the branch now. A forced
+    /// release over another owner's claim leaves that workspace as it is.
     Finish {
         branch: String,
         /// Registry name. Defaults to the repo you are standing in.

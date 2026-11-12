@@ -45,6 +45,13 @@ knives notch -m 'this fork needs a cut before the pin moves'
 | `anchor` | Automatic subject tip at write time. Absent when it did not resolve. |
 | `pr` | Explicit stamp, else the subject's tracked PR. |
 | `statement` | What `track`, `depends`, `finish --superseded-by` and `ledger migrate` stated: `{kind, value}`. Kind is `pull`, `fork-only`, `superseded` or `depends` (the comma-joined list that the writer knew). |
+| `claim_change` | What the entry did to the claim on its subject: `claimed`, `taken`, `released` or `resumed`. Absent on an entry that changed no claim, and on every entry an older knives wrote. |
+| `claim_change_why` | The reason that goes with the change: the reason the claim holds after it for `claimed`, `taken` and `resumed`, and the `--why` of a forced release for `released`. Absent when the change has none. |
+| `previous_owner` | The owner whose claim the entry took or released. Absent where it displaced nobody. |
+| `previous_kind` | How that owner's name was resolved: `harness-session`, `workspace-derived` or `os-user`. |
+| `previous_started` | When that owner's claim was taken. |
+| `previous_last_seen` | The durable token of that owner's last sighting: a timestamp, `none-since-claim`, `none-within-window` or `unreadable-operation-log`. |
+| `previous_why` | That owner's own reason for the claim. |
 
 Statement rules:
 
@@ -67,8 +74,8 @@ A command records an event that it sees. A failed ledger write fails the command
 
 | Command | Entry |
 |---|---|
-| `start` | `claimed: <why>`. On a held claim, `resumed` or `resumed via workspace possession`. |
-| `finish` | `claim released`, with the supersession if given, also when unheld. |
+| `start` | `claimed: <why>`, carrying `claim_change` `claimed`. A forced start writes `seized from <owner> (…): <why>`, carrying `taken` where another owner name held the claim and `claimed` where the caller held it itself. On a held claim, `resumed` or `resumed via workspace possession`, carrying `resumed`. |
+| `finish` | `claim released`, with the supersession if given, also when unheld. It carries `claim_change` `released` where a claim was released, and no claim change where none was held. |
 | `track --pr/--fork-only/--forget` | The changed statement. |
 | `depends --on` | `requires <owner>/<name>#<number>`, by upstream name, however `--on` spelled it. |
 | `release cut` | The full parent set, the cut change id beside the commit id, and the carried-parent delta from the prior cut. |
