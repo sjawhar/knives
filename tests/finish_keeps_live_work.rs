@@ -373,6 +373,63 @@ fn a_duplicate_under_the_same_launcher_counts() {
     assert!(claim_held(&home));
 }
 
+#[test]
+fn a_forced_release_over_another_owners_claim_records_the_live_process() {
+    // The release leaves the displaced owner's workspace as it is, and it
+    // still reads it: the live-process gate is what `--force` passes here,
+    // and the one entry carries both the forced release and what was working
+    // in the directory.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    let sleeper = Sleeper::spawn(|command| {
+        command.current_dir(&workspace);
+    });
+
+    // When: another session releases the claim by force
+    let forced = lab::knives_command(
+        &lab.work,
+        home.path(),
+        lab.temp_path(),
+        &[
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            "the owner session died",
+        ],
+    )
+    .env("KNIVES_OWNER", "agent-two")
+    .output()
+    .expect("force finish another owner's claim");
+
+    // Then: the release goes through, the entry names the process it went
+    // over beside the claim it ended, and the directory is untouched
+    assert!(forced.status.success(), "{}", shown(&forced));
+    let entries = ledger_entries(&home);
+    let released = entries.last().expect("an entry for the release");
+    assert!(
+        released
+            .text
+            .contains(&format!("released {OWNER}'s claim by force")),
+        "was: {released:?}"
+    );
+    assert!(
+        released.text.contains(&format!(
+            "finished by force while in use by pid {} (sleep 120)",
+            sleeper.pid()
+        )) && released.text.ends_with(": the owner session died"),
+        "was: {released:?}"
+    );
+    assert_eq!(released.claim_change.as_deref(), Some("released"));
+    assert_eq!(released.previous_owner.as_deref(), Some(OWNER));
+    assert!(!claim_recorded(&home), "{}", shown(&forced));
+    assert!(workspace.is_dir(), "{}", shown(&forced));
+}
+
 /// Moves the workspace at `workspace` to a sibling and leaves `workspace` a
 /// chain of two symbolic links to it; returns where it now is.
 fn behind_two_links(workspace: &Path) -> PathBuf {

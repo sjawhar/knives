@@ -77,6 +77,7 @@ Do this before you read code too: a conclusion from the wrong copy is wrong, and
 - `knives start <branch> --why "what you are doing"` claims the branch and makes a jj workspace. An existing branch: on its tip, with `@` an empty child. A new branch: on the release's shared base (the upstream trunk when no release exists), so it composes without a rebase.
 - A `start` that pauses waits for another agent's claim lock. Let it. A refusal names the holder. `using-knives` has the messages.
 - As soon as your active work stops, also to wait for something external such as PR review, run `knives finish <branch>`. It returns the claim and removes the workspace. A forced finish over a claim another owner name holds returns that claim and leaves the workspace and its registration as they are: that directory is the other owner's. Nothing is lost either way: jj keeps the work as a commit by change id, and the branch, bookmark and open PR stay.
+- An unforced `knives finish` after another agent took or released your claim exits `1` and names who ended it. Where another owner holds the branch, nothing was changed, and `knives start <branch> --force --why "…"` takes it back; where nobody holds it, your own workspace was disposed of, and `knives start <branch>` claims the branch again.
 
 ## 6. Never improvise
 

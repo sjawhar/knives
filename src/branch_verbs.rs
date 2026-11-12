@@ -144,17 +144,22 @@ pub(crate) fn run_finish(
         FinishClaimGate::Refuse(exit) => return Ok(exit),
     };
     // Read-only checks before the claim is touched: a refusal leaves everything
-    // as it was. A release over another owner's claim reads nothing from their
-    // workspace at all, because it will neither snapshot nor dispose of it.
-    let cleared = if released.displaced.is_some() {
-        Cleared::default()
-    } else {
-        match clear_workspace(fork, branch, &directory, options) {
-            Ok(cleared) => cleared,
-            Err(exit) => return Ok(exit),
-        }
+    // as it was. A release over another owner's claim reads their workspace
+    // too: `knives start` refuses to adopt a workspace whose state jj cannot
+    // read, so releasing the claim over one would leave the branch closed to
+    // everybody.
+    let cleared = match clear_workspace(fork, branch, &directory, options) {
+        Ok(cleared) => cleared,
+        Err(exit) => return Ok(exit),
     };
-    let kept = keep_working_copy(fork, branch, cleared.working_copy.as_deref());
+    // What that release does not do is write in the directory: the displaced
+    // owner's working copy is theirs to snapshot, as the disposal below is
+    // theirs to run.
+    let kept = if released.displaced.is_some() {
+        Ok(())
+    } else {
+        keep_working_copy(fork, branch, cleared.working_copy.as_deref())
+    };
     let forced = joined(released.text, cleared.over_live_users);
     let had = store.release_claim(target);
     let pr = store.tracked_pull(target);
@@ -343,10 +348,6 @@ fn finish_provenance(
 
 /// What is at the branch's workspace path, and what the read-only checks
 /// before the claim is touched allow `finish` to go on with.
-///
-/// The default is what a `finish` that will not look at the workspace reads
-/// of it: nothing there, nothing to snapshot, nothing forced.
-#[derive(Default)]
 struct Cleared {
     /// What sits at the path, when anything does.
     identity: Option<WorkspaceIdentity>,
@@ -663,12 +664,12 @@ fn unheld_gate(
     }
     let identity = current_identity(bound)?;
     let entries = store.ledger_entries(&target.repo);
-    let Some(lost) = claim_ended(entries, &target.branch, &identity.owner) else {
+    let Some((change, lost)) = claim_ended(entries, &target.branch, &identity.owner) else {
         return Ok(FinishClaimGate::Continue(Released::default()));
     };
     eprintln!(
         "{}\nnobody holds {} now\nuse `knives start {}` to claim it again",
-        displacement(target, &identity.owner, lost),
+        displacement(target, &identity.owner, change, lost),
         target.key(),
         target.branch,
     );
@@ -700,11 +701,17 @@ struct Refusal<'a> {
 fn refuse_held(refusal: &Refusal<'_>) -> FinishClaimGate {
     let context = render_claim_context(refusal.claim, refusal.last_seen, jiff::Timestamp::now());
     let branch = &refusal.target.branch;
-    if let Some(lost) = claim_ended(refusal.entries, branch, &refusal.identity.owner) {
+    // The notice belongs to a caller another owner name displaced. A caller
+    // whose own name holds the claim lost it to nobody: it is refused because
+    // two identities of that name cannot be told apart, and telling it that
+    // its claim was taken would name the branch it holds as somebody else's.
+    if refusal.claim.owner != refusal.identity.owner
+        && let Some((change, lost)) = claim_ended(refusal.entries, branch, &refusal.identity.owner)
+    {
         eprintln!(
             "{}\n{context}\nnothing was changed here: the workspace and its registration are \
              the holder's\nuse `knives start {branch} --force --why \"…\"` to take the branch back",
-            displacement(refusal.target, &refusal.identity.owner, lost),
+            displacement(refusal.target, &refusal.identity.owner, change, lost),
         );
         return FinishClaimGate::Refuse(Exit::Findings);
     }
@@ -721,12 +728,17 @@ fn refuse_held(refusal: &Refusal<'_>) -> FinishClaimGate {
 }
 
 /// What this fork's ledger says became of `owner`'s claim: who ended it,
-/// when, and the reason that owner gave for ending it.
-fn displacement(target: &BranchTarget, owner: &str, lost: &Entry) -> String {
-    // `claim_ended` answers with a taken or a released entry and nothing else.
-    let verb = match lost.claim_change() {
-        Some(ClaimChange::Taken) => "took",
-        _ => "released",
+/// how, when, and the reason that owner gave for ending it.
+///
+/// `change` is the change the entry recorded, as [`claim_ended`] matched it,
+/// so each word here is the one its own change carries and a later search
+/// cannot make this print a verb the entry never recorded.
+fn displacement(target: &BranchTarget, owner: &str, change: ClaimChange, lost: &Entry) -> String {
+    let verb = match change {
+        ClaimChange::Taken => "took",
+        ClaimChange::Released => "released",
+        ClaimChange::Claimed => "claimed",
+        ClaimChange::Resumed => "resumed",
     };
     let why = lost
         .claim_change_why
@@ -740,8 +752,9 @@ fn displacement(target: &BranchTarget, owner: &str, lost: &Entry) -> String {
     )
 }
 
-/// The entry that ended `owner`'s claim on `branch`, read newest first, or
-/// nothing where this fork's ledger records no such end.
+/// The entry that ended `owner`'s claim on `branch`, read newest first, with
+/// the change it recorded, or nothing where this fork's ledger records no
+/// such end.
 ///
 /// The search stops at the newest claim or release `owner` itself wrote,
 /// which closed the chapter before it: an owner that claimed the branch
@@ -750,7 +763,11 @@ fn displacement(target: &BranchTarget, owner: &str, lost: &Entry) -> String {
 /// older knives wrote — neither stops the search nor answers it, and neither
 /// does a resume, so an owner that took its work up again in the directory it
 /// had lost is still told who took the branch.
-fn claim_ended<'a>(entries: &'a [Entry], branch: &BranchName, owner: &str) -> Option<&'a Entry> {
+fn claim_ended<'a>(
+    entries: &'a [Entry],
+    branch: &BranchName,
+    owner: &str,
+) -> Option<(ClaimChange, &'a Entry)> {
     for entry in entries.iter().rev() {
         if entry.subject.as_deref() != Some(branch.as_str()) {
             continue;
@@ -759,10 +776,10 @@ fn claim_ended<'a>(entries: &'a [Entry], branch: &BranchName, owner: &str) -> Op
             Some(ClaimChange::Claimed | ClaimChange::Released) if entry.owner == owner => {
                 return None;
             }
-            Some(ClaimChange::Taken | ClaimChange::Released)
+            Some(change @ (ClaimChange::Taken | ClaimChange::Released))
                 if entry.previous_owner.as_deref() == Some(owner) =>
             {
-                return Some(entry);
+                return Some((change, entry));
             }
             _ => {}
         }

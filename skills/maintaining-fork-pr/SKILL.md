@@ -183,7 +183,7 @@ knives preflight
   - who owns any `knives release advance` or release-wide action
   - citations of the head, PR and release commit
 - Never claim that the released parent advanced because the PR bookmark moved. Give release or consumer proof, or its owner, only if the dispatch asked. Otherwise make no release-ready claim.
-- Run `knives finish <branch>` from the workspace. From outside it, make sure the claim is gone. A forced finish over a claim another owner name holds returns that claim and leaves that workspace and its registration as they are, so only your own workspace goes. Return the notch chain and final observations to the orchestrator. A stopped worker's handback is not a successful repair or a verified release.
+- Run `knives finish <branch>` from the workspace. From outside it, make sure the claim is gone. A forced finish over a claim another owner name holds returns that claim and leaves that workspace and its registration as they are, so only your own workspace goes. An unforced one after another agent took or released your claim exits `1` and names who ended it: where another owner holds the branch, nothing was changed, and `knives start <branch> --force --why "…"` takes it back; where nobody holds it, your own workspace was disposed of, and `knives start <branch>` claims the branch again. Return the notch chain and final observations to the orchestrator. A stopped worker's handback is not a successful repair or a verified release.
 
 ## Cross-scope questions and interruptions
 

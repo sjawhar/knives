@@ -2210,6 +2210,107 @@ fn a_caller_that_never_held_the_branch_keeps_the_refusal_it_always_got() {
 }
 
 #[test]
+fn an_owner_that_took_its_own_branch_back_is_told_of_no_takeover() {
+    // The ledger holds a takeover of this caller's claim, and the caller took
+    // the branch back after it: it holds the claim now, and the refusal is
+    // the one two identities of a single OS-user name always get. Measured
+    // before the fix: `agent-z took sami's claim` at exit 1, told to the
+    // owner of the live claim.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let outside = tempfile::tempdir().expect("create unmanaged terminal");
+    let as_sami = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_knives"))
+            .args(args)
+            .current_dir(outside.path())
+            .env("KNIVES_CONFIG_HOME", home.path())
+            .env("HOME", lab.temp_path())
+            .env_remove("KNIVES_OWNER")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("OMP_SESSION_ID")
+            .env("USER", "sami")
+            .output()
+            .expect("run knives as the OS user sami")
+    };
+    let claimed = as_sami(&[
+        "--text",
+        "start",
+        "feat/gamma",
+        "--repo",
+        "demo",
+        "--why",
+        "port it",
+    ]);
+    assert!(
+        claimed.status.success(),
+        "sami's claim failed: {}",
+        String::from_utf8_lossy(&claimed.stderr)
+    );
+    ran(
+        &lab,
+        home.path(),
+        "agent-z",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            "rescue stalled work",
+        ],
+    );
+    let back = as_sami(&[
+        "--text",
+        "start",
+        "feat/gamma",
+        "--repo",
+        "demo",
+        "--force",
+        "--why",
+        "the port is mine to finish",
+    ]);
+    assert!(
+        back.status.success(),
+        "taking the branch back failed: {}",
+        String::from_utf8_lossy(&back.stderr)
+    );
+    assert_eq!(
+        holder_of(home.path(), "feat/gamma").as_deref(),
+        Some("sami")
+    );
+
+    // When: that owner finishes the branch from outside its workspace, with
+    // no harness variable to tell the two identities of `sami` apart
+    let refused = as_sami(&["--text", "finish", "feat/gamma", "--repo", "demo"]);
+
+    // Then: the refusal two anonymous identities always get, and no takeover
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("both sides are anonymous identities"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("use `knives finish feat/gamma --force --why"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("sami's claim on"),
+        "the holder was told its own claim was taken: {stderr}"
+    );
+    assert!(
+        !stderr.contains("agent-z"),
+        "a takeover the caller already answered was reported: {stderr}"
+    );
+    assert_eq!(
+        holder_of(home.path(), "feat/gamma").as_deref(),
+        Some("sami")
+    );
+}
+
+#[test]
 fn a_ledger_without_claim_fields_keeps_the_refusal_it_always_gave() {
     // Every entry an older knives wrote carries no claim change, and prose
     // is never read for one: such a ledger answers nothing, and the caller
