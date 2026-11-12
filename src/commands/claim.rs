@@ -120,6 +120,9 @@ pub fn render_last_seen(last_seen: crate::seen::LastSeen, now: jiff::Timestamp) 
         crate::seen::LastSeen::NoneWithinWindow => {
             "not seen within the observation window".to_owned()
         }
+        crate::seen::LastSeen::Unreadable => {
+            "the jj operation log could not be read, so no sighting is reported".to_owned()
+        }
     }
 }
 
@@ -129,6 +132,7 @@ pub fn last_seen_provenance(last_seen: crate::seen::LastSeen) -> String {
         crate::seen::LastSeen::At(timestamp) => timestamp.to_string(),
         crate::seen::LastSeen::NoneSinceClaim => "none-since-claim".to_owned(),
         crate::seen::LastSeen::NoneWithinWindow => "none-within-window".to_owned(),
+        crate::seen::LastSeen::Unreadable => "unreadable-operation-log".to_owned(),
     }
 }
 

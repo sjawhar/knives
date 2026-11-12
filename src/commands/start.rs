@@ -190,16 +190,22 @@ pub fn run(
     let cwd = std::env::current_dir()?;
     let destination = workspace_path(fork, branch);
     let in_claimed_workspace = possesses(&cwd, fork, branch);
-    let mut context = StartContext {
-        store: &mut store,
-        fork,
-        branch,
-        identity: current_identity(bound)?,
-        upstream_trunk: entry.trunk_ref(),
-        workspace: WorkspaceName::new(workspace_for(branch.as_str())),
-        opened: Repo::open(checkout)?,
-        destination,
-    };
+    let identity = current_identity(bound)?;
+    let held = store
+        .claims(Some(&fork.upstream))
+        .into_iter()
+        .find(|claim| claim.branch == branch.as_str())
+        .cloned();
+    // Who holds the branch is in the state file alone, so the decision is made
+    // before the repository is opened: a checkout whose operation log cannot be
+    // read must still say who holds the claim it is refusing, rather than die
+    // on a read only the refusal's sighting ever wanted.
+    let decision = decide(&ClaimContext {
+        held: held.as_ref(),
+        identity: &identity,
+        in_claimed_workspace,
+    });
+    let forced = force && held.is_some();
     // A rule a human stated is their decision: `status` reports one that
     // differs, and nothing overwrites it. knives' own earlier write (marked by
     // its `doc`) is refreshed when the entry's rule has moved on. A user-level
@@ -226,12 +232,34 @@ pub fn run(
         });
         println!("jj immutable_heads() {verb} {repo_name}'s repository config: {rule}{shadow}");
     }
-    let held = context
-        .store
-        .claims(Some(&fork.upstream))
-        .into_iter()
-        .find(|claim| claim.branch == branch.as_str())
-        .cloned();
+    if !forced
+        && matches!(
+            decision,
+            ClaimDecision::RefuseAnonymous | ClaimDecision::RefuseHeld
+        )
+    {
+        let claim = held
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("claim decision lacked held claim context"))?;
+        let last_seen = seen::last_seen_in(claim, checkout, &seen::load());
+        return Ok(refuse_claim(
+            branch,
+            claim,
+            last_seen,
+            decision == ClaimDecision::RefuseAnonymous,
+        ));
+    }
+    // Everything below acts on the repository, so this is where it is opened.
+    let mut context = StartContext {
+        store: &mut store,
+        fork,
+        branch,
+        identity,
+        upstream_trunk: entry.trunk_ref(),
+        workspace: WorkspaceName::new(workspace_for(branch.as_str())),
+        opened: Repo::open(checkout)?,
+        destination,
+    };
     let activity = context
         .opened
         .workspace_activity(&BTreeSet::from([context.workspace.clone()]), 200)?;
@@ -239,31 +267,22 @@ pub fn run(
     let claim_seen = held
         .as_ref()
         .map(|claim| seen::last_seen(claim, &activity, &observations));
-    let decision = decide(&ClaimContext {
-        held: held.as_ref(),
-        identity: &context.identity,
-        in_claimed_workspace,
-    });
 
-    if force && held.is_some() {
+    if forced {
         let (previous, last_seen) = claim_context(held.as_ref(), claim_seen)?;
         let reason = why.ok_or_else(|| anyhow::anyhow!("--force requires --why"))?;
         return force_claim(&mut context, previous, last_seen, reason);
     }
 
     match decision {
-        ClaimDecision::RefuseAnonymous => {
-            let (claim, last_seen) = claim_context(held.as_ref(), claim_seen)?;
-            Ok(refuse_claim(branch, claim, last_seen, true))
-        }
-        ClaimDecision::RefuseHeld => {
-            let (claim, last_seen) = claim_context(held.as_ref(), claim_seen)?;
-            Ok(refuse_claim(branch, claim, last_seen, false))
-        }
         ClaimDecision::Resume { possession } => {
             resume_claim(&context, held.as_ref(), claim_seen, possession)
         }
         ClaimDecision::Take => take_claim(&mut context, why.unwrap_or("started work")),
+        // Both returned above, before the repository was opened.
+        ClaimDecision::RefuseAnonymous | ClaimDecision::RefuseHeld => Err(anyhow::anyhow!(
+            "a refused claim reached the paths that open the repository"
+        )),
     }
 }
 

@@ -31,14 +31,23 @@ use tempfile::TempDir;
 /// knives agreeing on where a repository's config (identity,
 /// `immutable_heads()`) lives; a test that wants a user config still sets
 /// `JJ_CONFIG` on its own command.
+///
+/// `JJ_USER` and `JJ_EMAIL` are removed for the same reason, and they need
+/// their own removal because jj-lib reads them from the environment and lets
+/// them outrank the repository config the lab writes: a test that asserts the
+/// identity on what it commits must get the identity it stated, whoever runs
+/// it — a developer, CI, or an agent session whose harness exports its bot
+/// account.
 #[ctor::ctor(unsafe)]
 fn isolate_jj_config() {
     let xdg = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("xdg");
     // SAFETY: a constructor runs before `main`, hence before libtest spawns its
-    // first thread; nothing can read the environment concurrently.
+    // first thread; nothing can read or write the environment concurrently.
     unsafe {
         std::env::set_var("XDG_CONFIG_HOME", xdg);
         std::env::set_var("JJ_CONFIG", "/dev/null");
+        std::env::remove_var("JJ_USER");
+        std::env::remove_var("JJ_EMAIL");
     }
 }
 

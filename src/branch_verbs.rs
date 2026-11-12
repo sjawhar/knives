@@ -508,7 +508,6 @@ fn finish_claim_gate(
     else {
         return Ok(FinishClaimGate::Continue(Released::default()));
     };
-    let workspace = knives::commands::wip::workspace_for(target.branch.as_str());
     let cwd = std::env::current_dir()?;
     let identity = current_identity(bound)?;
     let decision = decide(&ClaimContext {
@@ -521,11 +520,8 @@ fn finish_claim_gate(
             Ok(place_gate(&claim, target, options))
         }
         ClaimDecision::RefuseAnonymous | ClaimDecision::RefuseHeld => {
-            let activity = Repo::open(&fork.checkout.path)?.workspace_activity(
-                &std::collections::BTreeSet::from([knives::ids::WorkspaceName::new(workspace)]),
-                knives::jj::MAX_ACTIVITY_OPS,
-            )?;
-            let last_seen = knives::seen::last_seen(&claim, &activity, &knives::seen::load());
+            let last_seen =
+                knives::seen::last_seen_in(&claim, &fork.checkout.path, &knives::seen::load());
             if !options.force {
                 let anonymous_note = if decision == ClaimDecision::RefuseAnonymous {
                     "both sides are anonymous identities, so they can never match; "

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::commands::claim::Identity;
 use crate::commands::wip::workspace_for;
 use crate::ids::{UpstreamName, WorkspaceName};
-use crate::jj::WorkspaceActivity;
+use crate::jj::{MAX_ACTIVITY_OPS, Repo, WorkspaceActivity};
 use crate::lock::{FileLock, LockWait};
 use crate::store::{Claim, OwnerKind, default_state_path};
 
@@ -33,12 +33,16 @@ pub struct Seen {
     pub workspaces: BTreeMap<String, String>,
 }
 
-/// What the three observation streams can honestly report for one claim.
+/// What the three observation streams can honestly report for one claim, and
+/// the fourth answer a checkout that cannot be read leaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LastSeen {
     At(jiff::Timestamp),
     NoneSinceClaim,
     NoneWithinWindow,
+    /// The operation log could not be read, so no window was ever looked at:
+    /// a sighting that is missing, never one that was searched for in vain.
+    Unreadable,
 }
 
 /// Records an invocation observation without ever making that invocation fail.
@@ -282,6 +286,27 @@ pub fn last_seen(claim: &Claim, activity: &WorkspaceActivity, seen: &Seen) -> La
     } else {
         LastSeen::NoneWithinWindow
     }
+}
+
+/// The claim's last sighting in `checkout`, where an operation log that cannot
+/// be read costs the caller its sighting and nothing else.
+///
+/// Who holds a claim is in the state file, so a command that must explain a
+/// claim it will not touch has everything it needs without the repository.
+/// Ending it on the operation walk would refuse to say who holds the branch
+/// precisely where the caller cannot find out any other way, so a walk that
+/// fails reports [`LastSeen::Unreadable`] instead.
+pub fn last_seen_in(claim: &Claim, checkout: &Path, seen: &Seen) -> LastSeen {
+    let workspace = WorkspaceName::new(workspace_for(&claim.branch));
+    let walked = Repo::open(checkout).and_then(|repo| {
+        repo.workspace_activity(
+            &std::collections::BTreeSet::from([workspace]),
+            MAX_ACTIVITY_OPS,
+        )
+    });
+    walked.map_or(LastSeen::Unreadable, |activity| {
+        last_seen(claim, &activity, seen)
+    })
 }
 
 fn seen_path() -> PathBuf {

@@ -255,6 +255,158 @@ fn start_refuses_another_harness_session_and_names_the_holder() {
     assert!(stderr.contains("--force"), "stderr: {stderr}");
 }
 
+/// Set the mode of the checkout's jj operation objects: how a test takes its
+/// operation log away and gives it back.
+fn operations_mode(checkout: &Path, mode: u32) {
+    let operations = checkout
+        .join(".jj")
+        .join("repo")
+        .join("op_store")
+        .join("operations");
+    std::fs::set_permissions(&operations, std::fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+/// Make the checkout's jj operation log unreadable, so opening the repository
+/// fails where the claim decision never needed it; `false` when this user
+/// reads it anyway (root ignores modes), and the caller has nothing to test.
+fn unreadable_operation_log(checkout: &Path) -> bool {
+    operations_mode(checkout, 0o000);
+    if Repo::open(checkout).is_ok() {
+        operations_mode(checkout, 0o755);
+        return false;
+    }
+    true
+}
+
+/// Every sentence a refusal must not say when it read no window at all.
+fn asserts_a_window(stderr: &str) -> bool {
+    stderr.contains("last seen")
+        || stderr.contains("observation window")
+        || stderr.contains("no activity observed")
+}
+
+#[test]
+fn start_refuses_a_held_claim_whose_operation_log_cannot_be_read() {
+    // Who holds the branch is in the state file, so a checkout whose operation
+    // log cannot be read must still be refused and told who holds it; the
+    // sighting is the only thing the unreadable log costs.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let run = |owner: &str, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_knives"))
+            .args(args)
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", home.path())
+            .env("HOME", lab.temp_path())
+            .env("KNIVES_OWNER", owner)
+            .output()
+            .expect("run knives")
+    };
+    let first = run(
+        "agent-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    assert!(
+        first.status.success(),
+        "first start failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    if !unreadable_operation_log(&lab.work) {
+        return;
+    }
+
+    // When: another session starts the branch the unreadable checkout holds.
+    let refused = run(
+        "agent-two",
+        &["--text", "start", "feat/gamma", "--repo", "demo"],
+    );
+    operations_mode(&lab.work, 0o755);
+
+    // Then: the claim refusal, with no sighting and no window it never read.
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("agent-one"), "stderr: {stderr}");
+    assert!(stderr.contains("port it"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("operation log could not be read"),
+        "stderr: {stderr}"
+    );
+    assert!(!asserts_a_window(&stderr), "stderr: {stderr}");
+}
+
+#[test]
+fn finish_refuses_a_held_claim_whose_operation_log_cannot_be_read() {
+    // The same for the other verb: the holder is named, the refusal stands,
+    // and nothing about the unreadable log reaches the exit code.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let run = |owner: &str, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_knives"))
+            .args(args)
+            .current_dir(&lab.work)
+            .env("KNIVES_CONFIG_HOME", home.path())
+            .env("HOME", lab.temp_path())
+            .env("KNIVES_OWNER", owner)
+            .output()
+            .expect("run knives")
+    };
+    let started = run(
+        "agent-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    assert!(
+        started.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    if !unreadable_operation_log(&lab.work) {
+        return;
+    }
+
+    // When: another session finishes the branch agent-one holds.
+    let refused = run(
+        "agent-two",
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+    operations_mode(&lab.work, 0o755);
+
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("agent-one"), "stderr: {stderr}");
+    assert!(stderr.contains("port it"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("operation log could not be read"),
+        "stderr: {stderr}"
+    );
+    assert!(!asserts_a_window(&stderr), "stderr: {stderr}");
+}
+
 #[test]
 fn start_from_inside_the_claimed_workspace_resumes_by_possession() {
     // Possession is intentionally weaker than a harness identity and must leave
