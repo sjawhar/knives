@@ -18,6 +18,7 @@ use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeE
 use crate::hook::resolve::{Match, argument_paths, match_checkout};
 use crate::hook::state::{Envelope, SessionState};
 use crate::ids::UpstreamName;
+use crate::ledger::problem_human_text;
 use crate::lock::LockError;
 use crate::store::{OwnerKind, Store, StoreError, default_state_path};
 
@@ -101,25 +102,41 @@ pub fn run(harness: HookHarness, loaded: Result<Registry, ConfigError>) -> Exit 
     match result {
         Ok(Some(output)) => {
             if let Err(error) = write_output(&output) {
-                eprintln!("knives hook: {error:#}");
+                report(&error);
             }
         }
         Ok(None) => {}
-        Err(error) => eprintln!("knives hook: {error:#}"),
+        Err(error) => report(&error),
     }
     Exit::Ok
+}
+
+/// Say on stderr why an event could not be answered.
+///
+/// Every one of these errors carries text this process did not write — jj's
+/// and git's stderr through `JjError`, the state file through `StoreError`,
+/// the `toml` parser's quotation of `repos.toml` through `ConfigError`, a
+/// peer's ledger path through `LedgerError` — and a harness keeps this
+/// stream in the session it spawned the hook from. jj, git and the `toml`
+/// parser print more than one line, so the escape is
+/// [`problem_human_text`]: it folds the lines into one and maps every
+/// control character to U+FFFD, exactly as `error_line` (src/main.rs) closes
+/// the same channel for every other command. `{error:#}` stays the
+/// rendering, so the alternate form of an anyhow chain is unchanged.
+fn report(error: &dyn std::fmt::Display) {
+    eprintln!("knives hook: {}", problem_human_text(&format!("{error:#}")));
 }
 
 fn run_opencode(loaded: Result<Registry, ConfigError>) -> anyhow::Result<Option<String>> {
     let mut input = String::new();
     if let Err(error) = std::io::stdin().read_to_string(&mut input) {
-        eprintln!("knives hook: {error:#}");
+        report(&error);
         return opencode::empty_response().map(Some).map_err(Into::into);
     }
     let event = match OpenCodeEvent::parse(&input) {
         Ok(event) => event,
         Err(error) => {
-            eprintln!("knives hook: {error:#}");
+            report(&error);
             return opencode::empty_response().map(Some).map_err(Into::into);
         }
     };
@@ -135,7 +152,7 @@ fn run_opencode(loaded: Result<Registry, ConfigError>) -> anyhow::Result<Option<
     match response {
         Ok(response) => Ok(Some(response)),
         Err(error) => {
-            eprintln!("knives hook: {error:#}");
+            report(&error);
             empty_opencode_response(kind).map(Some)
         }
     }
@@ -232,7 +249,7 @@ fn opencode_tool_after(
         Err(error) => {
             // The state file is a saving: a read-only config home gets its
             // additions on every event rather than never.
-            eprintln!("knives hook: {error:#}");
+            report(&error);
             outstanding
         }
     };
@@ -611,7 +628,7 @@ fn post_tool_use(
 /// gets its guidance on every event rather than never.
 fn remember(home: &Path, harness: &str, session_id: &str, apply: impl FnOnce(&mut SessionState)) {
     if let Err(error) = SessionState::update(home, harness, session_id, apply) {
-        eprintln!("knives hook: {error:#}");
+        report(&error);
     }
 }
 
@@ -756,6 +773,16 @@ fn notice_if_requested(
 
 /// `text` in place of the claims notice ([`format_refusal`]), unless the
 /// session already holds it: its digest is `<kind>:` and the text's own.
+///
+/// `text` is the one thing here nobody in this process wrote: a
+/// [`crate::bind::Disagreement`] quoting the `upstream` URL off a git clone
+/// someone else configured, or a [`StoreError`] quoting the state file every
+/// session of this machine writes. It goes into the model's context, which
+/// the harness also shows in its transcript, so it is folded and escaped
+/// ([`problem_human_text`]) exactly as a refusal printed to a terminal is.
+/// The digest keeps the raw text: it is a record in the session state file,
+/// never read by a terminal, and a session that already holds this refusal
+/// must keep recognising it.
 fn refusal_notice(
     repo: &GuidanceRoot,
     kind: &str,
@@ -767,7 +794,7 @@ fn refusal_notice(
         return None;
     }
     Some(PreparedNotice {
-        text: format_refusal(&repo.name, text),
+        text: format_refusal(&repo.name, &problem_human_text(text)),
         update: NoticeStateUpdate { digest },
     })
 }

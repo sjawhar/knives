@@ -699,20 +699,18 @@ fn start_refusing_a_claim_names_the_processes_working_in_its_workspace() {
     }
 }
 
-/// Fail when `text` still holds a control character these tests plant: the
-/// escape that opens an OSC sequence, the bell that ends it, or either C1
-/// introducer a terminal reading UTF-8 as ISO 2022 acts on (U+009B is CSI,
-/// U+009D is OSC).
+/// Fail when `text` still holds a control character.
+///
+/// Asked of every character through [`char::is_control`], which is what the
+/// escape itself asks (`inline_human_text`, src/ledger.rs), rather than of a
+/// fixed list of the characters these tests plant: a list passes on every
+/// control character nobody wrote down, the C1 range included. The line feed
+/// is the one exception, because knives writes it itself to end a line.
 fn free_of_control_characters(text: &str) {
-    for (control, name) in [
-        ('\u{1b}', "an escape character"),
-        ('\u{7}', "a bell character"),
-        ('\u{9b}', "a CSI character"),
-        ('\u{9d}', "an OSC character"),
-    ] {
+    for (index, character) in text.char_indices() {
         assert!(
-            !text.contains(control),
-            "{name} reached the terminal: {text:?}"
+            !character.is_control() || character == '\n',
+            "{character:?} reached the terminal at byte {index}: {text:?}"
         );
     }
 }
@@ -2234,6 +2232,171 @@ fn an_owner_name_holding_control_characters_reaches_every_terminal_escaped() {
         "stderr: {stderr:?}"
     );
     free_of_control_characters(&stderr);
+
+    // When: the branch is started again with a workspace directory already at
+    // the destination — the finish above disposed of the one this flow left,
+    // so the directory is made here as a workspace made outside knives is
+    let workspace = lab.work.parent().expect("parent").join("feat-gamma");
+    knives::jj::add_workspace(&lab.work, "feat-gamma", &workspace, "main@upstream")
+        .expect("create existing workspace");
+    let adopted = ran(
+        &lab,
+        home.path(),
+        HOSTILE_OWNER,
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "take it back",
+        ],
+    );
+
+    // Then: the adoption path's `claimed … for` line names it escaped, as the
+    // fresh workspace's line did at the top of this test: both lines print
+    // the one escaped owner `take_claim` binds.
+    let stdout = String::from_utf8_lossy(&adopted.stdout);
+    assert!(
+        stdout.contains("adopted existing workspace"),
+        "stdout: {stdout:?}"
+    );
+    assert!(
+        stdout.contains(&format!("claimed demo/feat/gamma for {ESCAPED_OWNER}")),
+        "stdout: {stdout:?}"
+    );
+    free_of_control_characters(&stdout);
+}
+
+#[test]
+fn a_takeover_by_an_owner_holding_control_characters_names_that_owner_escaped() {
+    // The notice a displaced owner gets names two owners: this run's own
+    // identity, which the test above drives hostile, and the owner the ledger
+    // entry records as the taker (`lost.owner`, `displacement` in
+    // src/branch_verbs.rs). The ledger pull brings entries from other
+    // machines, so that name is another party's text wherever it is read, and
+    // only a hostile taker drives it.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    ran(
+        &lab,
+        home.path(),
+        "agent-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    ran(
+        &lab,
+        home.path(),
+        HOSTILE_OWNER,
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            "rescue stalled work",
+        ],
+    );
+    assert_eq!(
+        claim_change(home.path(), "taken").owner,
+        HOSTILE_OWNER,
+        "the ledger is the raw record: only the terminal rendering escapes"
+    );
+    // The taker hands the branch back, so nobody holds it and the notice the
+    // displaced owner gets is read from the ledger alone.
+    ran(
+        &lab,
+        home.path(),
+        HOSTILE_OWNER,
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    // When: the owner that lost the claim finishes the branch
+    let told = tried(
+        &lab,
+        home.path(),
+        "agent-one",
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    // Then: the taker the entry names reaches this terminal escaped
+    let stderr = String::from_utf8_lossy(&told.stderr);
+    assert_eq!(told.status.code(), Some(1), "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(&format!(
+            "{ESCAPED_OWNER} took agent-one's claim on demo/feat/gamma at "
+        )),
+        "stderr: {stderr:?}"
+    );
+    free_of_control_characters(&stderr);
+}
+
+#[test]
+fn a_finish_from_another_place_names_the_holding_owner_escaped() {
+    // A claim taken in another host or agent box refuses this finish and names
+    // the owner that holds it (`place_gate`, src/branch_verbs.rs). That owner
+    // is the text of whatever session took the claim, in a state file every
+    // session of this machine reads; the place's own escape is pinned in
+    // tests/finish_keeps_live_work.rs, and this pins the owner's.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    ran(
+        &lab,
+        home.path(),
+        HOSTILE_OWNER,
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    let path = home.path().join("state.json");
+    let mut state: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read state"))
+            .expect("parse state");
+    assert!(
+        state["claims"]["demo/feat/gamma"]["place"].is_string(),
+        "start recorded no place: {state}"
+    );
+    state["claims"]["demo/feat/gamma"]["place"] = Value::String("agent-box-7".to_owned());
+    std::fs::write(&path, state.to_string()).expect("write state");
+
+    // When: the owner that holds it finishes from this place
+    let refused = tried(
+        &lab,
+        home.path(),
+        HOSTILE_OWNER,
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    // Then: the refusal names the holder with every control character as
+    // U+FFFD, and the claim stands
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(&format!("was claimed by {ESCAPED_OWNER} in agent-box-7;")),
+        "stderr: {stderr:?}"
+    );
+    free_of_control_characters(&stderr);
+    assert_eq!(
+        holder_of(home.path(), "feat/gamma").as_deref(),
+        Some(HOSTILE_OWNER)
+    );
 }
 
 #[test]

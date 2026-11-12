@@ -14,6 +14,7 @@ use crate::cli::Exit;
 use crate::config::{Registry, RepoEntry, default_config_path};
 use crate::hook::resolve::guidance_name;
 use crate::ids::RepoName;
+use crate::ledger::{inline_human_text, problem_human_text};
 use crate::remote_url::{remote_host, repository_name, url_owner};
 
 /// What `register` decided about a directory, so the caller renders rather
@@ -153,6 +154,25 @@ pub fn snippet(name: &str, entry: &RepoEntry) -> Result<String, toml::ser::Error
 /// Prints a registry snippet, or the name a registered checkout already has,
 /// without changing the registry.
 ///
+/// Two of the three things printed here were written by someone else. A
+/// warning quotes the remote names and URLs of the checkout's git config
+/// ([`miswiring_warnings`]), and a refusal names the directory, its remotes
+/// and, when git could not be read, git's own wrapped answer: the warnings
+/// go out through [`inline_human_text`], which keeps each warning the one
+/// line it is built as, and the refusal through [`problem_human_text`],
+/// which folds git's lines into one. The name of an already registered
+/// checkout is the registry's key, which the registry refuses to load with a
+/// control character in it ([`crate::ledger::is_ledger_component`]), so it
+/// goes out as it is.
+///
+/// The snippet stays raw: it is TOML for a person to paste into
+/// `repos.toml`, so it must arrive as the file needs it, and TOML is the
+/// reader that escapes it — `toml` writes a control character in a string as
+/// `\u001B`, never as a byte a terminal acts on. The path the line under it
+/// names ([`default_config_path`]) is built from the environment this
+/// process was started in, not from its own words, so it is escaped like
+/// every other path printed here.
+///
 /// # Errors
 ///
 /// Returns errors from reading the checkout's remotes or serializing the entry.
@@ -172,17 +192,17 @@ pub fn run(target: Option<PathBuf>, registry: &Registry) -> anyhow::Result<Exit>
             warnings,
         } => {
             for warning in &warnings {
-                eprintln!("  warning: {warning}");
+                eprintln!("  warning: {}", inline_human_text(warning));
             }
             print!("{}", snippet(&name, &entry)?);
             eprintln!(
                 "paste this into {} to register; hooks reload the registry on every event, so it takes effect on the next tool call\n  convention: origin = your fork (push target, PR heads); upstream = the maintainer's repo (fetch only)",
-                default_config_path().display()
+                inline_human_text(&default_config_path().display().to_string())
             );
             Ok(Exit::Ok)
         }
         Outcome::Refused(line) => {
-            eprintln!("{line}");
+            eprintln!("{}", problem_human_text(&line));
             Ok(Exit::Usage)
         }
     }

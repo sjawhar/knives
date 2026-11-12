@@ -34,6 +34,11 @@ fn tip_cell(row: &BranchRow) -> String {
     })
 }
 
+/// The origin half of a push cell. `origin` is a commit id's short prefix
+/// (`push_for`, `rows.rs`), the same hex `tip_cell` prints, so it stays raw
+/// for the reason the header gives for a tip; the relation is this module's
+/// own word. Neither is a bookmark or a remote name: no name reaches this
+/// cell.
 fn origin_relation_cell(origin: &str, relation: &str) -> String {
     format!("origin={origin} ({relation})")
 }
@@ -194,7 +199,7 @@ fn branch_table(rows: &[BranchRow]) -> Vec<String> {
         .iter()
         .map(|row| {
             [
-                row.name.to_string(),
+                inline_human_text(row.name.as_str()),
                 row.state.to_string(),
                 tip_cell(row),
                 push_cell(row),

@@ -16,6 +16,22 @@ pub(crate) fn scan_home() -> Option<std::path::PathBuf> {
     home
 }
 
+/// One refusal, as a terminal must read it.
+///
+/// A bind refusal is built from what this machine and its tools said: the
+/// scan root and every checkout path found under it, the `upstream` URL a
+/// clone declares ([`knives::bind::Disagreement`]), and git's own stderr
+/// through [`knives::bind::BindError`], which wraps its advice over several
+/// lines. So the escape is the one `main` gives every error it prints
+/// (`error_line`, src/main.rs): [`knives::ledger::problem_human_text`] folds
+/// the lines into one and maps every control character to U+FFFD. The
+/// registry's own names, which `message` appends as `known: a, b`, pass
+/// through it unchanged: the registry refuses to load a key with a control
+/// character in it.
+fn refusal_line(message: &str) -> String {
+    knives::ledger::problem_human_text(message)
+}
+
 /// The fork verbs' shared step, taken once per invocation by a verb that acts
 /// on a fork: the current directory bound against the registry, and the
 /// sighting recorded from that bind — one remotes read for both and the verb.
@@ -80,7 +96,7 @@ impl<'a> Ground<'a> {
         match knives::bind::resolve(registry, &name, &self.here, &home) {
             Ok(fork) => Some(fork),
             Err(why) => {
-                eprintln!("{}", why.message(&name, registry));
+                eprintln!("{}", refusal_line(&why.message(&name, registry)));
                 None
             }
         }
@@ -100,7 +116,7 @@ impl<'a> Ground<'a> {
             Ok(fork) => Ok(Some(fork.clone())),
             Err(Unbound::Unreadable(error)) => Err(error.clone().into()),
             Err(unbound) => {
-                eprintln!("{}", unbound.message(self.registry));
+                eprintln!("{}", refusal_line(&unbound.message(self.registry)));
                 Ok(None)
             }
         }
@@ -126,7 +142,7 @@ impl<'a> Ground<'a> {
         if registry.is_empty() {
             eprintln!(
                 "no repos configured; add entries to {}",
-                default_config_path().display()
+                knives::ledger::inline_human_text(&default_config_path().display().to_string())
             );
             return Ok(Err(Exit::Usage));
         }
@@ -144,8 +160,13 @@ impl<'a> Ground<'a> {
             return Ok(Err(Exit::Usage));
         };
         let (selected, problems) = sweep(registry, &home);
+        // Each is what the scan could not read, in git's and the filesystem's
+        // own words, which wrap over several lines.
         for problem in &problems {
-            eprintln!("could not read: {problem}");
+            eprintln!(
+                "could not read: {}",
+                knives::ledger::problem_human_text(problem)
+            );
         }
         Ok(Ok(selected))
     }
@@ -184,7 +205,7 @@ fn standing_row<'a>(
             Some(Ok(Ok(vec![Selected::disagreeing(disagreement)])))
         }
         Err(unbound @ (Unbound::GitOnly { .. } | Unbound::NotColocated { .. })) => {
-            eprintln!("{}", unbound.message(registry));
+            eprintln!("{}", refusal_line(&unbound.message(registry)));
             Some(Ok(Err(Exit::Usage)))
         }
         Err(_) => None,
@@ -246,6 +267,12 @@ pub(crate) fn placed<'s>(chosen: &'s [Selected<'_>]) -> Vec<&'s UpstreamName> {
 /// different subsets. It is noted once on stderr and left out. Unless the
 /// scan failed to read something — then the missing checkout may be the one
 /// it could not read, and the entry stays a row carrying that refusal.
+///
+/// The one line printed here names the entry by its registry key, which the
+/// registry refuses to load with a control character in it
+/// ([`knives::ledger::is_ledger_component`]), so it goes out as it is. A
+/// row's `problem` is a value, not a line: it is handed to whichever report
+/// renders it, which escapes it for a terminal and leaves it raw for JSON.
 fn sweep<'a>(registry: &'a Registry, home: &std::path::Path) -> (Vec<Selected<'a>>, Vec<String>) {
     let mut scan = knives::bind::scan(registry, home);
     let selected = registry

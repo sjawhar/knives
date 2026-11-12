@@ -17,6 +17,7 @@ use crate::consumer_pins::{ConsumerHeadMemo, ConsumerPinSource, scan_consumer_sl
 use crate::ids::RepoName;
 use crate::ids::{BookmarkRef, BranchName, ReleaseScheme, RemoteName, is_our_release};
 use crate::jj::Repo;
+use crate::ledger::{inline_human_text, problem_human_text};
 use crate::release_model::repo_slug;
 
 /// Cached release lookup for one repo, computed once and shared across every
@@ -432,11 +433,24 @@ pub fn gather(input: &GatherInput<'_>) -> Report {
     }
 }
 
+/// One line per repository, with what could not be answered below it.
+///
+/// A repository's name is a registry key and its release remote a registry
+/// value, and the newest release is a git ref no control character reaches;
+/// the checkout path comes off disk, the lag line quotes what a consumer
+/// repository pins, and a note or a problem quotes git, jj or the forge, so
+/// those reach the terminal escaped.
 pub fn render(report: &Report) -> String {
     let mut lines = Vec::new();
+    let note_line = |note: &String| inline_human_text(note);
     if report.repos.is_empty() {
-        lines.extend(report.notes.first().cloned());
-        lines.extend(report.problems.iter().map(|problem| format!("? {problem}")));
+        lines.extend(report.notes.first().map(note_line));
+        lines.extend(
+            report
+                .problems
+                .iter()
+                .map(|problem| format!("? {}", problem_human_text(problem))),
+        );
         return lines.join("\n");
     }
 
@@ -448,7 +462,7 @@ pub fn render(report: &Report) -> String {
         .unwrap_or(0);
     for repo in &report.repos {
         let location = match (&repo.path, repo.ambiguous) {
-            (Some(path), _) => path.clone(),
+            (Some(path), _) => inline_human_text(path),
             (None, 0) if repo.disagrees => "upstream disagrees with repos.toml".to_owned(),
             (None, 0) => "not on this machine".to_owned(),
             (None, count) => format!("ambiguous: {count} checkouts"),
@@ -464,14 +478,27 @@ pub fn render(report: &Report) -> String {
             None => line.push_str("  newest=none"),
         }
         if let Some(behind) = &repo.behind {
-            let _ = write!(line, "  BEHIND: {behind}");
+            let _ = write!(line, "  BEHIND: {}", inline_human_text(behind));
         }
         lines.push(line);
-        lines.extend(repo.notes.iter().map(|note| format!("  ! {note}")));
-        lines.extend(repo.problems.iter().map(|problem| format!("  ? {problem}")));
+        lines.extend(
+            repo.notes
+                .iter()
+                .map(|note| format!("  ! {}", inline_human_text(note))),
+        );
+        lines.extend(
+            repo.problems
+                .iter()
+                .map(|problem| format!("  ? {}", problem_human_text(problem))),
+        );
     }
-    lines.extend(report.problems.iter().map(|problem| format!("? {problem}")));
-    lines.extend(report.notes.iter().cloned());
+    lines.extend(
+        report
+            .problems
+            .iter()
+            .map(|problem| format!("? {}", problem_human_text(problem))),
+    );
+    lines.extend(report.notes.iter().map(note_line));
     lines.join("\n")
 }
 
@@ -1198,6 +1225,50 @@ mod tests {
                 .as_str()
                 .is_some_and(|behind| behind.contains("acme/behind pins release/2026-07-20")),
             "was: {json:#?}"
+        );
+    }
+
+    #[test]
+    fn render_escapes_the_checkout_path_the_lag_and_every_note_and_problem() {
+        // The path comes off disk, the lag line quotes what a consumer
+        // repository pins, and the notes and problems quote git and the
+        // forge; the registry key, its release remote and the release ref
+        // are what the registry and git hold.
+        let report = Report {
+            repos: vec![RepoRow {
+                name: "tool".to_owned(),
+                upstream_name: "acme/tool".to_owned(),
+                ledger: None,
+                path: Some("/home/me/\u{1b}[2Jtool".to_owned()),
+                ambiguous: 0,
+                disagrees: false,
+                release_remote: Some("release".to_owned()),
+                newest_release: Some("release/2026-08-05@origin".to_owned()),
+                behind: Some("acme/behind pins release/\u{7}2026-07-20".to_owned()),
+                notes: vec!["could not compare: \u{1b}]0;pwned\u{7}".to_owned()],
+                problems: vec!["gh said\nfatal: \u{1b}[31mno".to_owned()],
+            }],
+            notes: vec!["note \u{1b}[0m".to_owned()],
+            problems: vec!["scan: \u{9b}2J".to_owned()],
+            config_path: "/tmp/repos.toml".to_owned(),
+        };
+
+        let text = render(&report);
+
+        assert!(!text.contains('\u{1b}'), "was: {text:?}");
+        assert!(!text.contains('\u{7}'), "was: {text:?}");
+        assert!(!text.contains('\u{9b}'), "was: {text:?}");
+        assert!(
+            text.contains(
+                "tool  /home/me/\u{fffd}[2Jtool  release-remote=release  \
+                 newest=release/2026-08-05@origin  BEHIND: acme/behind pins \
+                 release/\u{fffd}2026-07-20"
+            ),
+            "was: {text:?}"
+        );
+        assert!(
+            text.contains("  ? gh said; fatal: \u{fffd}[31mno"),
+            "was: {text:?}"
         );
     }
 }

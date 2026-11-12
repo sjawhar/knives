@@ -786,18 +786,27 @@ pub fn render(report: &Report) -> String {
     for finding in &report.findings {
         groups.entry(finding.kind).or_default().push(finding);
     }
+    // A finding's subject is a branch, a bookmark or a file path, and its
+    // detail quotes jj and the forge; a note quotes them too. `status`
+    // escapes the same findings at its printer
+    // (`crate::commands::status::render`), and this is that printer for the
+    // audit.
     for (kind, findings) in groups {
         for finding in findings {
             let _ = write!(
                 lines,
                 "\n  {kind}: {} — {}",
-                finding.subject.short(),
-                finding.detail
+                crate::ledger::inline_human_text(&finding.subject.short()),
+                crate::ledger::inline_human_text(&finding.detail)
             );
         }
     }
     for note in &report.notes {
-        let _ = write!(lines, "\n  note: {note}");
+        let _ = write!(
+            lines,
+            "\n  note: {}",
+            crate::ledger::inline_human_text(note)
+        );
     }
     lines.push_str("\n  timeline archaeology: knives pr <n> --timeline");
     lines
@@ -808,7 +817,7 @@ mod tests {
     use super::{
         AuditInput, LocalFacts, MetadataRewrite, ReleaseDriftScan, Report,
         add_misplaced_origin_release_refs, add_open_pull_head_checks, add_release_drifts, exit_for,
-        pull_head_findings, pull_position_findings, same_commit,
+        pull_head_findings, pull_position_findings, render, same_commit,
     };
     use crate::bind::Fork;
     use crate::cli::Exit;
@@ -1667,5 +1676,34 @@ mod tests {
         );
         assert!(report.problems.is_empty(), "was: {:?}", report.problems);
         assert_eq!(exit_for(&report), Exit::Ok);
+    }
+
+    #[test]
+    fn render_escapes_every_finding_subject_detail_and_note() {
+        // A subject is a branch, a bookmark or a file jj named; a detail and
+        // a note quote jj and the forge.
+        let mut report = Report::new("demo");
+        report.findings.push(crate::detect::Finding::new(
+            FindingKind::RemoteDrift,
+            Subject::File("infra/\u{1b}[2Japp.py".to_owned()),
+            "the forge said \u{1b}]0;pwned\u{7}CLOSED",
+        ));
+        report.notes.push("gh said \u{9b}2J".to_owned());
+        report
+            .problems
+            .push("jj said\nError: \u{1b}[31mno".to_owned());
+
+        let text = render(&report);
+
+        assert!(!text.contains('\u{1b}'), "was: {text:?}");
+        assert!(!text.contains('\u{7}'), "was: {text:?}");
+        assert!(!text.contains('\u{9b}'), "was: {text:?}");
+        assert!(
+            text.contains(
+                "infra/\u{fffd}[2Japp.py — the forge said \u{fffd}]0;pwned\u{fffd}CLOSED"
+            ),
+            "was: {text:?}"
+        );
+        assert!(text.contains("note: gh said \u{fffd}2J"), "was: {text:?}");
     }
 }

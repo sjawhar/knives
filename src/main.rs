@@ -48,7 +48,7 @@ fn main() -> ExitCode {
     let exit = match dispatch() {
         Ok(exit) => ExitCode::from(exit.code()),
         Err(error) => {
-            eprintln!("knives: {error:#}");
+            eprintln!("{}", error_line(&error));
             ExitCode::from(Exit::Incomplete.code())
         }
     };
@@ -58,6 +58,24 @@ fn main() -> ExitCode {
         knives::ledger_sweep::hand_off();
     }
     exit
+}
+
+/// The one line a failed command writes to the terminal.
+///
+/// Every error the dispatch returns passes here, and each carries text this
+/// process did not write: jj's and git's stderr through `JjError`, a peer's
+/// ledger path through `LedgerError`, a forge's answer, the state file
+/// through `StoreError`, the `toml` parser's quotation of `repos.toml`
+/// through `ConfigError`, a scanned remote through `BindError`. jj and git
+/// print more than one line, so the escape is
+/// [`knives::ledger::problem_human_text`]: it folds the lines into one and
+/// maps every control character to U+FFFD, which closes the whole channel in
+/// this single call.
+fn error_line(error: &anyhow::Error) -> String {
+    format!(
+        "knives: {}",
+        knives::ledger::problem_human_text(&format!("{error:#}"))
+    )
 }
 
 #[allow(
@@ -276,6 +294,9 @@ fn dispatch() -> anyhow::Result<Exit> {
             let Some(fork) = ground.one_fork(repo.as_deref())? else {
                 return Ok(Exit::Usage);
             };
+            // The refusal names the series the caller asked for, as `{:?}`
+            // writes it, and the labels the registry holds: an argument of
+            // this run and registry values, so neither is escaped here.
             let selected = match series.as_deref().map(|name| fork.entry.for_series(name)) {
                 None => None,
                 Some(Ok(entry)) => Some(entry),
@@ -294,6 +315,8 @@ fn dispatch() -> anyhow::Result<Exit> {
                 &knives::jj::Repo::open(&fork.checkout.path)?,
                 fork.entry,
             );
+            // A base is the `trunk_ref` the registry states for each series:
+            // a registry value, like every other, and not escaped here.
             if !unresolved.is_empty() {
                 println!(
                     "{}: release series base {} does not resolve; fetch it, or set the series' \
@@ -911,5 +934,23 @@ mod tests {
         assert_eq!(repo_workers, MAX_REPO_WORKERS);
         assert!(repo_workers <= MAX_REPO_WORKERS);
         assert!(probe_workers >= 1);
+    }
+
+    #[test]
+    fn an_error_reaches_the_terminal_with_every_control_character_escaped() {
+        // What jj hands back: two lines, and a bookmark name that carried an
+        // escape sequence into the message.
+        let error = anyhow::anyhow!(
+            "command `jj` failed: Concurrent modification detected\nError: no bookmark \
+             \u{1b}[2Jmain\u{7} here"
+        );
+
+        let line = error_line(&error);
+
+        assert_eq!(
+            line,
+            "knives: command `jj` failed: Concurrent modification detected; Error: no bookmark \
+             \u{fffd}[2Jmain\u{fffd} here"
+        );
     }
 }

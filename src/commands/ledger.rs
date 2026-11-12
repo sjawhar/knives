@@ -152,6 +152,12 @@ pub fn render(report: &Report) -> String {
                     Some(1) => ", 1 entry not yet sent".to_owned(),
                     Some(count) => format!(", {count} entries not yet sent"),
                 };
+                // The remote is this crate's own `ledger_sweep::REMOTE`, and
+                // each fork name is an `<owner>/<name>`
+                // `ledger_git::Repository::new` refuses unless
+                // `is_ledger_component` holds of both halves, which no
+                // control character passes; the git directory is a path off
+                // disk, so it goes out escaped.
                 format!(
                     "ledger: {} ({}): {} commit(s), {} push(es), {} entr{} pulled{discarded}\
                      {skipped}{unsent}; carries {}",
@@ -845,28 +851,35 @@ pub fn render_migrated(migrated: &Migrated) -> String {
     } else {
         ("moved", "renamed", "wrote")
     };
+    // A moved path comes off disk, a renamed key out of the state file and a
+    // sighting's workspace name out of `seen.json`: all three are text
+    // another session wrote, so a terminal reads them escaped. The map's name
+    // is this module's own word.
     let mut lines: Vec<String> = migrated
         .moved
         .iter()
         .map(|each| {
             format!(
                 "ledger: {moved} {} to {}",
-                each.from.display(),
-                each.to.display()
+                inline_human_text(&each.from.display().to_string()),
+                inline_human_text(&each.to.display().to_string())
             )
         })
-        .chain(
-            migrated
-                .renamed
-                .iter()
-                .map(|each| format!("state: {renamed} {} {} to {}", each.map, each.from, each.to)),
-        )
-        .chain(
-            migrated
-                .sightings
-                .iter()
-                .map(|each| format!("seen: {renamed} workspace {} to {}", each.from, each.to)),
-        )
+        .chain(migrated.renamed.iter().map(|each| {
+            format!(
+                "state: {renamed} {} {} to {}",
+                each.map,
+                inline_human_text(&each.from),
+                inline_human_text(&each.to)
+            )
+        }))
+        .chain(migrated.sightings.iter().map(|each| {
+            format!(
+                "seen: {renamed} workspace {} to {}",
+                inline_human_text(&each.from),
+                inline_human_text(&each.to)
+            )
+        }))
         .collect();
     lines.push(format!(
         "ledger: {wrote} {} statement(s); {} already on the ledger",
@@ -913,5 +926,33 @@ mod tests {
         assert!(!text.contains('\u{7}'), "was: {text:?}");
         assert!(text.contains("!! "), "was: {text:?}");
         assert!(text.contains("note: "), "was: {text:?}");
+    }
+
+    #[test]
+    fn a_migrations_paths_keys_and_workspace_names_render_escaped() {
+        // The ledger directory is a path off disk; the renamed key and the
+        // workspace name come out of files another session wrote.
+        let migrated = Migrated {
+            moved: vec![Moved {
+                from: PathBuf::from("/ledger/acme\u{1b}[2J/tool"),
+                to: PathBuf::from("/ledger/acme/tool"),
+            }],
+            renamed: vec![Renamed {
+                map: crate::store::migration::StateMap::Claims,
+                from: "acme-tool/feat\u{7}/x".to_owned(),
+                to: "acme/tool/feat".to_owned(),
+            }],
+            sightings: vec![crate::seen::RenamedSighting {
+                from: "acme-tool-\u{1b}]0;pwned".to_owned(),
+                to: "acme-tool-feat".to_owned(),
+            }],
+            ..Migrated::default()
+        };
+
+        let text = render_migrated(&migrated);
+
+        assert!(!text.contains('\u{1b}'), "was: {text:?}");
+        assert!(!text.contains('\u{7}'), "was: {text:?}");
+        assert_eq!(text.matches('\u{fffd}').count(), 3, "was: {text:?}");
     }
 }

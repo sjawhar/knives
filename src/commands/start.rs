@@ -492,8 +492,20 @@ fn resume_claim(
     Ok(Exit::Ok)
 }
 
+/// Claim the branch and say so, adopting the directory that is already there
+/// or making a new workspace.
+///
+/// Every owner name printed here goes out escaped
+/// ([`crate::ledger::inline_human_text`]), this run's own included: with no
+/// harness variable set the identity is read back from a claim in the state
+/// file that another session wrote
+/// (`crate::commands::hook::owner_for`), and a printer that escaped only
+/// that case would be a rule no reader of this code, and no reader of the
+/// output, could tell apart from the other. Bound once, so both `claimed …
+/// for` lines say the same thing and one test covers both.
 fn take_claim(context: &mut StartContext<'_>) -> anyhow::Result<Exit> {
     let reason = context.why.unwrap_or("started work");
+    let owner = crate::ledger::inline_human_text(&context.identity.owner);
     if context.destination.exists() {
         if let Some(line) = adoption_refusal(
             &context.destination,
@@ -523,18 +535,11 @@ fn take_claim(context: &mut StartContext<'_>) -> anyhow::Result<Exit> {
             format!("claimed: {reason} (adopted existing workspace)"),
             None,
         )?;
-        // Every owner name printed here goes out escaped, this run's own
-        // included: with no harness variable set the identity is read back
-        // from a claim in the state file that another session wrote
-        // (`crate::commands::hook::owner_for`), and a printer that escaped
-        // only that case would be a rule no reader of this code, and no
-        // reader of the output, could tell apart from the other.
         println!(
-            "adopted existing workspace {} at {change}; left as-is\nclaimed {}/{} for {}",
+            "adopted existing workspace {} at {change}; left as-is\nclaimed {}/{} for {owner}",
             context.destination.display(),
             context.fork.name,
             context.branch,
-            crate::ledger::inline_human_text(&context.identity.owner),
         );
         return Ok(Exit::Ok);
     }
@@ -553,11 +558,11 @@ fn take_claim(context: &mut StartContext<'_>) -> anyhow::Result<Exit> {
     )?;
     record_claim(context, reason, format!("claimed: {reason}"), None)?;
     println!(
-        "workspace {} at {change} based on {base_revision} ({base_label})\nclaimed {}/{} for {}",
+        "workspace {} at {change} based on {base_revision} ({base_label})\nclaimed {}/{} for \
+         {owner}",
         context.destination.display(),
         context.fork.name,
         context.branch,
-        crate::ledger::inline_human_text(&context.identity.owner),
     );
     Ok(Exit::Ok)
 }

@@ -549,11 +549,15 @@ pub fn target_name(target: &Target, fallback: &str) -> String {
 }
 
 /// Render the human-readable branch-and-commit census.
+///
+/// A branch, an orphan and a check target are names jj holds in a ref, and
+/// the repository is a registry key; a note and a problem quote jj and the
+/// forge, so those reach the terminal escaped.
 pub fn render_census(report: &CensusReport) -> String {
     let mut lines = vec![format!("{}: census", report.repo)];
     let mut notes = report.notes.iter();
     if let Some(primary) = notes.next() {
-        lines.push(primary.clone());
+        lines.push(crate::ledger::inline_human_text(primary));
     }
     for row in &report.rows {
         lines.push(String::new());
@@ -574,12 +578,12 @@ pub fn render_census(report: &CensusReport) -> String {
     } else {
         lines.extend(report.orphans.iter().map(|orphan| format!("  {orphan}")));
     }
-    lines.extend(notes.map(|note| format!("note: {note}")));
+    lines.extend(notes.map(|note| format!("note: {}", crate::ledger::inline_human_text(note))));
     lines.extend(
         report
             .problems
             .iter()
-            .map(|problem| format!("unanswered: {problem}")),
+            .map(|problem| format!("unanswered: {}", crate::ledger::problem_human_text(problem))),
     );
     lines.join("\n")
 }
@@ -596,16 +600,25 @@ fn render_census_row(lines: &mut Vec<String>, row: &BranchCarriage) {
 }
 
 /// Render the human-readable form of a multi-target carriage report.
+///
+/// The revision is the caller's own argument and a check target is a name jj
+/// holds in a ref; a note and a problem quote jj and the forge, so those
+/// reach the terminal escaped.
 pub fn render_carries(report: &CarriesReport) -> String {
     let mut lines = vec![format!("{}: {}", report.repo, report.revision)];
     lines.extend(report.checks.iter().map(|check| render_check(check, "  ")));
-    lines.extend(report.notes.iter().map(|note| format!("  note: {note}")));
     lines.extend(
         report
-            .problems
+            .notes
             .iter()
-            .map(|problem| format!("  unanswered: {problem}")),
+            .map(|note| format!("  note: {}", crate::ledger::inline_human_text(note))),
     );
+    lines.extend(report.problems.iter().map(|problem| {
+        format!(
+            "  unanswered: {}",
+            crate::ledger::problem_human_text(problem)
+        )
+    }));
     lines.join("\n")
 }
 
@@ -787,8 +800,8 @@ mod tests {
     use crate::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName};
 
     use super::{
-        CarryCheck, CarryVerdict, CensusInput, CensusTargets, Target, TargetRole, census_member,
-        orphan_status, targets,
+        CarriesReport, CarryCheck, CarryVerdict, CensusInput, CensusReport, CensusTargets, Target,
+        TargetRole, census_member, orphan_status, render_carries, render_census, targets,
     };
 
     fn local(name: &str) -> BookmarkRef {
@@ -1049,5 +1062,49 @@ mod tests {
         assert_eq!(member.carriage.checks.len(), 1);
         assert_eq!(member.carriage.orphan, None);
         assert_eq!(problems.len(), 1);
+    }
+
+    #[test]
+    fn a_census_and_a_carries_report_escape_their_notes_and_problems() {
+        // Both quote jj and the forge: "pull request state unavailable:"
+        // carries whatever the forge said.
+        let census = CensusReport {
+            repo: "demo".to_owned(),
+            rows: Vec::new(),
+            orphans: Vec::new(),
+            notes: vec![
+                "pull request state unavailable: \u{1b}[2J".to_owned(),
+                "and \u{7}then".to_owned(),
+            ],
+            problems: vec!["jj said\nError: \u{1b}[31mno".to_owned()],
+        };
+        let carries = CarriesReport {
+            repo: "demo".to_owned(),
+            revision: "@".to_owned(),
+            checks: Vec::new(),
+            notes: vec!["gh said \u{9b}2J".to_owned()],
+            problems: vec!["could not read \u{1b}]0;pwned\u{7}".to_owned()],
+        };
+
+        let census = render_census(&census);
+        let carries = render_carries(&carries);
+
+        for text in [&census, &carries] {
+            assert!(!text.contains('\u{1b}'), "was: {text:?}");
+            assert!(!text.contains('\u{7}'), "was: {text:?}");
+            assert!(!text.contains('\u{9b}'), "was: {text:?}");
+        }
+        assert!(
+            census.contains("pull request state unavailable: \u{fffd}[2J"),
+            "was: {census:?}"
+        );
+        assert!(
+            census.contains("unanswered: jj said; Error: \u{fffd}[31mno"),
+            "was: {census:?}"
+        );
+        assert!(
+            carries.contains("  note: gh said \u{fffd}2J"),
+            "was: {carries:?}"
+        );
     }
 }
