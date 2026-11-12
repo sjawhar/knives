@@ -473,6 +473,15 @@ fn keep_working_copy(
 /// process (not this one, its ancestors, or its own harness's) with its working
 /// directory or an open file there. `Ok` to go on, carrying the forced finish's
 /// provenance when `--force` went over one.
+///
+/// The same list of processes goes two ways, and only one of them is escaped:
+/// a command line comes from `/proc/<pid>/cmdline` of a process this caller
+/// did not start, so the refusal a terminal reads escapes it
+/// ([`inline_human_text`]), as `knives start`'s refusal escapes these same
+/// lines (`claim_evidence`, `src/commands/start.rs`), while the forced
+/// finish's provenance keeps it raw as [`forced_release_event`] keeps the raw
+/// owner, because the entry is the durable record and its reader escapes it
+/// when it prints it.
 fn live_users_gate(
     fork: &Fork<'_>,
     branch: &BranchName,
@@ -493,8 +502,9 @@ fn live_users_gate(
             "finished by force while in use by {list}: {why}"
         )));
     }
+    let shown = inline_human_text(&list);
     eprintln!(
-        "{}/{branch}: {} is in use by {list}; finishing would take the directory from under \
+        "{}/{branch}: {} is in use by {shown}; finishing would take the directory from under \
          it\nuse `knives finish {branch} --force --why \"…\"` once it is done",
         fork.name,
         directory.display()

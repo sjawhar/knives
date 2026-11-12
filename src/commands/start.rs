@@ -331,9 +331,10 @@ fn refuse_claim(
 /// namespace, and the lines say which case this is rather than leaving the
 /// reader to compare two places by eye.
 ///
-/// A process line is another party's text: the command comes from
-/// `/proc/<pid>/comm` of a process this caller did not start, and the path is
-/// a path on disk, so both go to the terminal escaped
+/// A process line is another party's text: the command comes from the
+/// `/proc/<pid>/cmdline` of a process this caller did not start, or its
+/// `/proc/<pid>/comm` when that is empty, and the path is a path on disk, so
+/// both go to the terminal escaped
 /// ([`crate::ledger::inline_human_text`]) — whoever started that process
 /// would otherwise choose what the refused caller's terminal receives. The
 /// place is the same: whatever session took the claim wrote it into the state

@@ -250,7 +250,9 @@ fn finish_refusing_a_live_process_escapes_the_control_characters_of_its_command(
     let workspace = start(&lab, &home);
     let sleeper = Sleeper::spawn(|command| {
         use std::os::unix::process::CommandExt;
-        command.current_dir(&workspace).arg0("sleep\u{1b}]0;held\u{7}");
+        command
+            .current_dir(&workspace)
+            .arg0("sleep\u{1b}]0;held\u{7}");
     });
 
     // When: the holder finishes the branch
