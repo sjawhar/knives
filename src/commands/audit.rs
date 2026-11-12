@@ -1002,6 +1002,13 @@ mod tests {
                 anchor: None,
                 pr: None,
                 parents: Vec::new(),
+                claim_change: None,
+                claim_change_why: None,
+                previous_owner: None,
+                previous_kind: None,
+                previous_started: None,
+                previous_last_seen: None,
+                previous_why: None,
             },
             Entry {
                 ts: "2026-08-16T00:00:00Z".to_owned(),
@@ -1016,6 +1023,13 @@ mod tests {
                 anchor: None,
                 pr: None,
                 parents: Vec::new(),
+                claim_change: None,
+                claim_change_why: None,
+                previous_owner: None,
+                previous_kind: None,
+                previous_started: None,
+                previous_last_seen: None,
+                previous_why: None,
             },
         ];
 
@@ -1043,6 +1057,13 @@ mod tests {
             anchor: None,
             pr: None,
             parents: Vec::new(),
+            claim_change: None,
+            claim_change_why: None,
+            previous_owner: None,
+            previous_kind: None,
+            previous_started: None,
+            previous_last_seen: None,
+            previous_why: None,
         };
         let entries = vec![
             event(
@@ -1122,6 +1143,13 @@ mod tests {
             anchor: None,
             pr: None,
             parents: Vec::new(),
+            claim_change: None,
+            claim_change_why: None,
+            previous_owner: None,
+            previous_kind: None,
+            previous_started: None,
+            previous_last_seen: None,
+            previous_why: None,
         };
         let entries = vec![
             event(
@@ -1189,6 +1217,13 @@ mod tests {
             anchor: None,
             pr: None,
             parents: Vec::new(),
+            claim_change: None,
+            claim_change_why: None,
+            previous_owner: None,
+            previous_kind: None,
+            previous_started: None,
+            previous_last_seen: None,
+            previous_why: None,
         }];
         let local = BTreeMap::from([(
             BranchName::new("release/2026-08-15"),
@@ -1254,6 +1289,13 @@ mod tests {
                 anchor: None,
                 pr: None,
                 parents: Vec::new(),
+                claim_change: None,
+                claim_change_why: None,
+                previous_owner: None,
+                previous_kind: None,
+                previous_started: None,
+                previous_last_seen: None,
+                previous_why: None,
             })
             .expect("record cut");
         let entries = ledger.read().expect("read the cut back").entries;

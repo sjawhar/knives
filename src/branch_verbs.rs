@@ -19,7 +19,7 @@ use knives::ids::{BranchName, BranchTarget, Requirement};
 use knives::jj::{
     Repo, StaleRegistration, WorkspaceIdentity, path_occupant, remove_finished_worktree,
 };
-use knives::ledger::{Draft, Stated};
+use knives::ledger::{ClaimChange, Displaced, Draft, Stated};
 use knives::statement::{Statement, StatementKind};
 use knives::store::{Store, default_state_path};
 
@@ -62,8 +62,26 @@ pub(crate) struct FinishOptions<'a> {
 }
 
 enum FinishClaimGate {
-    Continue(Option<String>),
+    Continue(Released),
     Refuse,
+}
+
+/// What the claim gate leaves for the entry `finish` writes.
+///
+/// The gate is the one place that reads the claim before `release_claim`
+/// removes it, and the one place that looks up its last sighting, so what
+/// the entry records about the displaced holder travels from here rather
+/// than being read a second time.
+#[derive(Default)]
+struct Released {
+    /// The prose a forced release carries; absent when nothing forced it.
+    text: Option<String>,
+    /// The `--why` that forced the release, which the entry records as the
+    /// reason the claim changed hands.
+    why: Option<String>,
+    /// The holder this release displaced, where another owner name held the
+    /// claim.
+    displaced: Option<Displaced>,
 }
 
 /// Hand a branch back and remove its workspace. The inverse of `start`.
@@ -108,25 +126,20 @@ pub(crate) fn run_finish(
         Ok(cleared) => cleared,
         Err(exit) => return Ok(exit),
     };
-    let forced_release = match finish_claim_gate(fork, target, &store, options, bound)? {
-        FinishClaimGate::Continue(event) => event,
+    let released = match finish_claim_gate(fork, target, &store, options, bound)? {
+        FinishClaimGate::Continue(released) => released,
         FinishClaimGate::Refuse => return Ok(Exit::Usage),
     };
     if let Err(exit) = keep_working_copy(fork, branch, cleared.working_copy.as_deref()) {
         return Ok(exit);
     }
-    let forced = joined(forced_release, cleared.over_live_users);
+    let forced = joined(released.text, cleared.over_live_users);
     let had = store.release_claim(target);
     let pr = store.tracked_pull(target);
     // Persist the immutable explanation before the mutable claim state. A failed
     // append then leaves the old claim in place instead of silently releasing or
     // seizing work without the provenance that explains why.
-    let provenance = forced
-        .map(|text| match options.superseded_by {
-            Some(replacement) => format!("{text}; superseded by {replacement}"),
-            None => text,
-        })
-        .or_else(|| release_event(had, options.superseded_by));
+    let provenance = finish_provenance(forced, had, options.superseded_by);
     if let Some(text) = provenance {
         // `--superseded-by` always leaves provenance to carry it: the replacement
         // rides on the one entry that already names it.
@@ -138,7 +151,11 @@ pub(crate) fn run_finish(
                 },
                 replaces: store.statement_stamp(target, StatementKind::Superseded),
             }),
-            ..Draft::event(Some(branch.as_str()), text, pr)
+            ..Draft::event(Some(branch.as_str()), text, pr).about_claim(
+                had.then_some(ClaimChange::Released),
+                released.why.as_deref(),
+                released.displaced.as_ref(),
+            )
         })?;
     }
     store.save()?;
@@ -212,6 +229,22 @@ fn joined(first: Option<String>, second: Option<String>) -> Option<String> {
         (Some(first), Some(second)) => Some(format!("{first}; {second}")),
         (first, second) => first.or(second),
     }
+}
+
+/// The prose the one entry a `finish` writes carries, or nothing when it has
+/// nothing to record: what forced the finish, what the branch was superseded
+/// by, and whether a claim was released at all.
+fn finish_provenance(
+    forced: Option<String>,
+    had: bool,
+    superseded_by: Option<&str>,
+) -> Option<String> {
+    forced
+        .map(|text| match superseded_by {
+            Some(replacement) => format!("{text}; superseded by {replacement}"),
+            None => text,
+        })
+        .or_else(|| release_event(had, superseded_by))
 }
 
 /// What is at the branch's workspace path, and what the read-only checks
@@ -473,7 +506,7 @@ fn finish_claim_gate(
         .find(|claim| claim.branch == target.branch.as_str())
         .cloned()
     else {
-        return Ok(FinishClaimGate::Continue(None));
+        return Ok(FinishClaimGate::Continue(Released::default()));
     };
     let workspace = knives::commands::wip::workspace_for(target.branch.as_str());
     let cwd = std::env::current_dir()?;
@@ -509,9 +542,12 @@ fn finish_claim_gate(
             let why = options
                 .why
                 .ok_or_else(|| anyhow::anyhow!("--force requires --why"))?;
-            Ok(FinishClaimGate::Continue(Some(forced_release_event(
-                &claim, last_seen, why,
-            ))))
+            Ok(FinishClaimGate::Continue(Released {
+                text: Some(forced_release_event(&claim, last_seen, why)),
+                why: Some(why.to_owned()),
+                displaced: (claim.owner != identity.owner)
+                    .then(|| Displaced::of(&claim, last_seen)),
+            }))
         }
     }
 }
@@ -528,12 +564,16 @@ fn place_gate(
 ) -> FinishClaimGate {
     let here = knives::liveness::this_place();
     let Some(taken) = claim.place.as_deref().filter(|taken| *taken != here) else {
-        return FinishClaimGate::Continue(None);
+        return FinishClaimGate::Continue(Released::default());
     };
     if let Some(why) = options.why.filter(|_| options.force) {
-        return FinishClaimGate::Continue(Some(format!(
-            "finished by force from {here}, not {taken} where the claim was taken: {why}"
-        )));
+        return FinishClaimGate::Continue(Released {
+            text: Some(format!(
+                "finished by force from {here}, not {taken} where the claim was taken: {why}"
+            )),
+            why: Some(why.to_owned()),
+            displaced: None,
+        });
     }
     eprintln!(
         "{} was claimed by {} in {taken}; this finish runs in {here}, which cannot see whether a \

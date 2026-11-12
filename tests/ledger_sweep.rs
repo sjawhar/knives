@@ -118,6 +118,13 @@ fn append(root: &Path, fork: &str, count: usize) {
                 anchor: None,
                 pr: None,
                 parents: Vec::new(),
+                claim_change: None,
+                claim_change_why: None,
+                previous_owner: None,
+                previous_kind: None,
+                previous_started: None,
+                previous_last_seen: None,
+                previous_why: None,
             })
             .expect("append an entry");
     }
@@ -1264,6 +1271,13 @@ fn a_track_from_a_machine_whose_clock_runs_behind_wins_over_the_statement_it_rep
             anchor: None,
             pr: Some(12),
             parents: Vec::new(),
+            claim_change: None,
+            claim_change_why: None,
+            previous_owner: None,
+            previous_kind: None,
+            previous_started: None,
+            previous_last_seen: None,
+            previous_why: None,
         })
         .expect("append alpha's statement");
     assert!(sweep(alpha.path()).status.success());

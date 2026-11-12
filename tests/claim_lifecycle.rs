@@ -36,6 +36,48 @@ fn unwritable(ledger: &Path) -> bool {
     true
 }
 
+/// The entry of `entries` whose text starts with `prefix`.
+fn entry_starting<'a>(entries: &'a [Value], prefix: &str) -> &'a Value {
+    entries
+        .iter()
+        .find(|entry| {
+            entry["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with(prefix))
+        })
+        .unwrap_or_else(|| panic!("no entry whose text starts with {prefix:?}: {entries:?}"))
+}
+
+/// Whether `token` is a durable last-seen token: a timestamp, or one of the
+/// two words for a window that saw nothing. The age a refusal prints ("3h
+/// ago") would still read as three hours next year.
+fn durable_sighting(token: &Value) -> bool {
+    token.as_str().is_some_and(|token| {
+        token == "none-since-claim"
+            || token == "none-within-window"
+            || token.parse::<jiff::Timestamp>().is_ok()
+    })
+}
+
+/// Run knives in `lab`'s checkout as the harness session `owner`, against
+/// the config home `home`, and fail the test when it does not exit 0.
+fn ran(lab: &Lab, home: &Path, owner: &str, args: &[&str]) -> std::process::Output {
+    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(args)
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home)
+        .env("HOME", lab.temp_path())
+        .env("KNIVES_OWNER", owner)
+        .output()
+        .expect("run knives");
+    assert!(
+        output.status.success(),
+        "{args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
 #[test]
 fn start_resumes_the_same_harness_sessions_claim_without_mutating_it() {
     // A second invocation from the same harness session must acknowledge the
@@ -1009,5 +1051,176 @@ fn cli_dispatch_records_an_observation_before_running_the_command() {
             .as_str()
             .is_some_and(|timestamp| timestamp.parse::<jiff::Timestamp>().is_ok()),
         "was: {seen}"
+    );
+}
+
+#[test]
+fn claim_events_name_what_happened_to_the_holder_in_fields() {
+    // A tool asking who holds a branch reads fields, never prose: an entry's
+    // sentence is written for a person and free to be reworded. A field no
+    // write set is absent, so a reader can tell "nothing displaced" from
+    // "displaced someone unnamed".
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let run = |owner: &str, args: &[&str]| ran(&lab, home.path(), owner, args);
+
+    run(
+        "agent-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    run(
+        "agent-one",
+        &["--text", "start", "feat/gamma", "--repo", "demo"],
+    );
+    let held: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("state"),
+    )
+    .expect("parse state");
+    let started = held["claims"]["demo/feat/gamma"]["started"].clone();
+    run(
+        "agent-two",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            "rescue stalled work",
+        ],
+    );
+    run(
+        "agent-two",
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    let events = run(
+        "agent-two",
+        &[
+            "--json",
+            "notch",
+            "feat/gamma",
+            "--events",
+            "--repo",
+            "demo",
+        ],
+    );
+    let read: Value = serde_json::from_slice(&events.stdout).expect("events JSON");
+    let entries = read["entries"].as_array().expect("entries").clone();
+
+    let claimed = entry_starting(&entries, "claimed: port it");
+    assert_eq!(claimed["claim_change"], "claimed");
+    assert_eq!(claimed["claim_change_why"], "port it");
+    assert!(
+        claimed.get("previous_owner").is_none(),
+        "a first claim displaced nobody: {claimed}"
+    );
+
+    let resumed = entry_starting(&entries, "resumed");
+    assert_eq!(resumed["claim_change"], "resumed");
+    assert_eq!(resumed["claim_change_why"], "port it");
+    assert!(
+        resumed.get("previous_owner").is_none(),
+        "a resume displaced nobody: {resumed}"
+    );
+
+    let taken = entry_starting(&entries, "seized from agent-one");
+    assert_eq!(taken["claim_change"], "taken");
+    assert_eq!(taken["claim_change_why"], "rescue stalled work");
+    assert_eq!(taken["previous_owner"], "agent-one");
+    assert_eq!(taken["previous_kind"], "harness-session");
+    assert_eq!(taken["previous_started"], started);
+    assert_eq!(taken["previous_why"], "port it");
+    assert!(
+        durable_sighting(&taken["previous_last_seen"]),
+        "was: {taken}"
+    );
+
+    let released = entry_starting(&entries, "claim released");
+    assert_eq!(released["claim_change"], "released");
+    assert!(
+        released.get("claim_change_why").is_none(),
+        "an ordinary release has no reason to give: {released}"
+    );
+    assert!(
+        released.get("previous_owner").is_none(),
+        "a release of one's own claim displaced nobody: {released}"
+    );
+}
+
+#[test]
+fn a_forced_release_records_the_claim_it_ended() {
+    // The agent whose claim another agent released reads it here: the one
+    // entry that ended the claim names who held it, since when, when it was
+    // last seen working and why it was held at all.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let run = |owner: &str, args: &[&str]| ran(&lab, home.path(), owner, args);
+
+    run(
+        "agent-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    let held: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("state"),
+    )
+    .expect("parse state");
+    let started = held["claims"]["demo/feat/gamma"]["started"].clone();
+    run(
+        "agent-two",
+        &[
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--no-cleanup",
+            "--force",
+            "--why",
+            "release stalled work",
+        ],
+    );
+
+    let events = run(
+        "agent-two",
+        &[
+            "--json",
+            "notch",
+            "feat/gamma",
+            "--events",
+            "--repo",
+            "demo",
+        ],
+    );
+    let read: Value = serde_json::from_slice(&events.stdout).expect("events JSON");
+    let entries = read["entries"].as_array().expect("entries").clone();
+
+    let released = entry_starting(&entries, "released agent-one's claim by force");
+    assert_eq!(released["claim_change"], "released");
+    assert_eq!(released["claim_change_why"], "release stalled work");
+    assert_eq!(released["previous_owner"], "agent-one");
+    assert_eq!(released["previous_kind"], "harness-session");
+    assert_eq!(released["previous_started"], started);
+    assert_eq!(released["previous_why"], "port it");
+    assert!(
+        durable_sighting(&released["previous_last_seen"]),
+        "was: {released}"
     );
 }

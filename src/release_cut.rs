@@ -12,7 +12,7 @@ use knives::commands::claim::Bound;
 use knives::commands::release;
 use knives::forge::github::CliForge;
 use knives::ids::{BookmarkRef, ReleaseScheme, RemoteName, RepoName};
-use knives::ledger::{Draft, Kind, Ledger};
+use knives::ledger::{Draft, Ledger};
 use knives::release_model::{
     RecordedCut, StackedHistoryContext, carried_branches, last_series_cut, members_event_text,
     previous_release_for_cut, series_members, trunk_positions,
@@ -618,20 +618,19 @@ fn record_cut_event(
         )
     });
     scribe_for(fork, bound)?.record(&Draft {
-        subject: Some(cut.name),
-        kind: Kind::Event,
-        disposition: None,
-        statement: None,
-        text: format!(
-            "cut {} as {} (change {}) with {} parent(s): {members_text}{delta}",
-            cut.name,
-            cut.created.short(),
-            change.short(),
-            members.len()
-        ),
         evidence,
-        pr: None,
         parents: recorded_parents(&opened, entry, &parents)?,
+        ..Draft::event(
+            Some(cut.name),
+            format!(
+                "cut {} as {} (change {}) with {} parent(s): {members_text}{delta}",
+                cut.name,
+                cut.created.short(),
+                change.short(),
+                members.len()
+            ),
+            None,
+        )
     })?;
     Ok(())
 }

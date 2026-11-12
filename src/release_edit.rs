@@ -11,7 +11,7 @@ use knives::commands::claim::Bound;
 use knives::commands::release;
 use knives::forge::github::CliForge;
 use knives::ids::{BranchName, CommitId, ReleaseScheme, RepoName};
-use knives::ledger::{Draft, Kind, Ledger};
+use knives::ledger::{Draft, Ledger};
 use knives::release_model::{
     MemberEvidence, MemberHistory, MemberLookup, MemberSuccession, SeriesFit,
     StackedHistoryContext, carried_from_tips, carries_member_line, last_recorded_parents,
@@ -692,24 +692,23 @@ pub(crate) fn record_edit_event(
         .map(|(_, commit)| commit.clone())
         .collect();
     scribe_for(fork, bound)?.record(&Draft {
-        subject: Some(record.release),
-        kind: Kind::Event,
-        disposition: None,
-        statement: None,
-        text: format!(
-            "edited {} as {} (change {}) with {} parent(s): {}; parents: {}",
-            record.release,
-            record.created.short(),
-            record.change.short(),
-            parents.len(),
-            record.delta,
-            members_event_text(record.provenance)
-        ),
         evidence: std::iter::once(record.created.as_str().to_owned())
             .chain(parents.iter().map(|commit| commit.as_str().to_owned()))
             .collect(),
-        pr: None,
         parents: recorded_parents(opened, fork.entry, &parents)?,
+        ..Draft::event(
+            Some(record.release),
+            format!(
+                "edited {} as {} (change {}) with {} parent(s): {}; parents: {}",
+                record.release,
+                record.created.short(),
+                record.change.short(),
+                parents.len(),
+                record.delta,
+                members_event_text(record.provenance)
+            ),
+            None,
+        )
     })?;
     Ok(())
 }

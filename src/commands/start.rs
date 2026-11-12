@@ -21,7 +21,7 @@ use crate::jj::{
     remove_prunable_worktree, repo_immutable_heads, set_repo_immutable_heads, user_immutable_heads,
     workspace_identity, workspace_recorded_elsewhere,
 };
-use crate::ledger::{Ledger, Scribe};
+use crate::ledger::{ClaimChange, Displaced, Draft, Ledger, Scribe};
 use crate::release_model::newest_release;
 use crate::seen;
 use crate::store::{Store, default_state_path};
@@ -309,6 +309,8 @@ fn force_claim(
             return Ok(Exit::Usage);
         }
     };
+    let displaced =
+        (previous.owner != context.identity.owner).then(|| Displaced::of(previous, last_seen));
     record_claim(
         context,
         reason,
@@ -319,6 +321,7 @@ fn force_claim(
             previous.started,
             last_seen_provenance(last_seen),
         ),
+        displaced.as_ref(),
     )?;
     println!(
         "seized {}\n{workspace_notice}",
@@ -346,13 +349,16 @@ fn resume_claim(
         context.fork.checkout.path.clone(),
         context.identity.owner.clone(),
     )
-    .event(
-        Some(context.branch.as_str()),
-        event.to_owned(),
-        context.store.tracked_pull(&BranchTarget::new(
-            context.fork.upstream.clone(),
-            context.branch.clone(),
-        )),
+    .record(
+        &Draft::event(
+            Some(context.branch.as_str()),
+            event.to_owned(),
+            context.store.tracked_pull(&BranchTarget::new(
+                context.fork.upstream.clone(),
+                context.branch.clone(),
+            )),
+        )
+        .about_claim(Some(ClaimChange::Resumed), Some(claim.why.as_str()), None),
     )?;
     println!(
         "{event}\n{}\n{workspace_notice}",
@@ -389,6 +395,7 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
             context,
             reason,
             format!("claimed: {reason} (adopted existing workspace)"),
+            None,
         )?;
         println!(
             "adopted existing workspace {} at {change}; left as-is\nclaimed {}/{} for {}",
@@ -412,7 +419,7 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
         &Repo::open(&context.fork.checkout.path)?,
         &context.workspace,
     )?;
-    record_claim(context, reason, format!("claimed: {reason}"))?;
+    record_claim(context, reason, format!("claimed: {reason}"), None)?;
     println!(
         "workspace {} at {change} based on {base_revision} ({base_label})\nclaimed {}/{} for {}",
         context.destination.display(),
@@ -423,17 +430,39 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
     Ok(Exit::Ok)
 }
 
-fn record_claim(context: &mut StartContext<'_>, reason: &str, event: String) -> anyhow::Result<()> {
+/// Write the claim and the entry that explains it.
+///
+/// `displaced` is the holder this write took the claim from, where another
+/// owner name held it. That, and only that, makes the entry a `taken` one:
+/// a forced start over the caller's own claim displaced nobody, however its
+/// prose reads.
+fn record_claim(
+    context: &mut StartContext<'_>,
+    reason: &str,
+    event: String,
+    displaced: Option<&Displaced>,
+) -> anyhow::Result<()> {
     let target = BranchTarget::new(context.fork.upstream.clone(), context.branch.clone());
     let pull = context.store.tracked_pull(&target);
     let _ = context.store.claim(&target, &context.identity, reason);
+    let change = if displaced.is_some() {
+        ClaimChange::Taken
+    } else {
+        ClaimChange::Claimed
+    };
     Scribe::new(
         Ledger::for_fork(context.fork),
         context.fork.upstream.clone(),
         context.fork.checkout.path.clone(),
         context.identity.owner.clone(),
     )
-    .event(Some(context.branch.as_str()), event, pull)?;
+    .record(
+        &Draft::event(Some(context.branch.as_str()), event, pull).about_claim(
+            Some(change),
+            Some(reason),
+            displaced,
+        ),
+    )?;
     context.store.save()?;
     Ok(())
 }
