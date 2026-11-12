@@ -62,21 +62,23 @@ fn shown(output: &Output) -> String {
     )
 }
 
-fn claim_held(home: &tempfile::TempDir) -> bool {
+/// What `state.json` records about the branch's claim, null where it records
+/// none.
+fn claim_state(home: &tempfile::TempDir) -> Value {
     let state: Value = serde_json::from_str(
         &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
     )
     .expect("parse state");
-    state["claims"]["demo/feat/gamma"]["owner"] == Value::String(OWNER.to_owned())
+    state["claims"]["demo/feat/gamma"].clone()
+}
+
+fn claim_held(home: &tempfile::TempDir) -> bool {
+    claim_state(home)["owner"] == Value::String(OWNER.to_owned())
 }
 
 /// Whether `state.json` records any claim on the branch, whoever holds it.
 fn claim_recorded(home: &tempfile::TempDir) -> bool {
-    let state: Value = serde_json::from_str(
-        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
-    )
-    .expect("parse state");
-    !state["claims"]["demo/feat/gamma"].is_null()
+    !claim_state(home).is_null()
 }
 
 /// The fork's ledger entries, oldest first.

@@ -113,6 +113,22 @@ pub fn live_users(directory: &Path, session: Option<Session<'_>>) -> Vec<LiveUse
         .collect()
 }
 
+/// The processes using `directory` that are not this run's own, with the
+/// harness session read from the environment.
+///
+/// [`live_users`] takes the session as an argument so a test can state one;
+/// every caller outside a test wants the one this process runs under, and
+/// two of them spelled the same two steps.
+pub fn others_using(directory: &Path) -> Vec<LiveUser> {
+    let session = crate::commands::claim::harness_session();
+    live_users(
+        directory,
+        session
+            .as_ref()
+            .map(|(name, value)| (*name, value.as_str())),
+    )
+}
+
 /// The program name of `pid`, as `/proc/<pid>/comm` gives it.
 fn comm_of(pid: u32) -> String {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))

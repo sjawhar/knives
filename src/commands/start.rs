@@ -16,10 +16,11 @@ use crate::config::Role;
 use crate::detect::BookmarkTips;
 use crate::ids::{BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, WorkspaceName};
 use crate::jj::{
-    Repo, StaleRegistration, WorkspaceIdentity, add_workspace, fetch_all, forget_workspace,
-    is_workspace_named, path_occupant, registered_workspace_path, remove_finished_worktree,
-    remove_prunable_worktree, repo_immutable_heads, set_repo_immutable_heads, user_immutable_heads,
-    workspace_identity, workspace_recorded_elsewhere,
+    MAX_ACTIVITY_OPS, Repo, StaleRegistration, WorkspaceIdentity, add_workspace, fetch_all,
+    forget_workspace, is_workspace_named, path_occupant, registered_workspace_path,
+    remove_finished_worktree, remove_prunable_worktree, repo_immutable_heads,
+    set_repo_immutable_heads, user_immutable_heads, workspace_identity,
+    workspace_recorded_elsewhere,
 };
 use crate::ledger::{ClaimChange, Displaced, Draft, Ledger, Scribe};
 use crate::release_model::newest_release;
@@ -265,9 +266,10 @@ pub fn run(
         opened: Repo::open(checkout)?,
         destination,
     };
-    let activity = context
-        .opened
-        .workspace_activity(&BTreeSet::from([context.workspace.clone()]), 200)?;
+    let activity = context.opened.workspace_activity(
+        &BTreeSet::from([context.workspace.clone()]),
+        MAX_ACTIVITY_OPS,
+    )?;
     let observations = seen::load();
     let claim_seen = held
         .as_ref()
@@ -329,17 +331,15 @@ fn refuse_claim(
 /// namespace, and the lines say which case this is rather than leaving the
 /// reader to compare two places by eye.
 fn claim_evidence(claim: &crate::store::Claim, workspace: &Path) -> String {
-    let session = crate::commands::claim::harness_session();
-    let users = crate::liveness::live_users(
-        workspace,
-        session
-            .as_ref()
-            .map(|(name, value)| (*name, value.as_str())),
-    );
+    let users = crate::liveness::others_using(workspace);
     // A directory that vanished leaves the same empty list as a workspace
     // nobody is in, so the path is judged on its own. A dangling symbolic
     // link is something at the path, as it is everywhere else in this file.
-    let nothing_there = std::fs::symlink_metadata(workspace).is_err();
+    // Only a path that is not there at all is nothing there: an `lstat` that
+    // failed for any other reason leaves a workspace that may hold live work,
+    // and this evidence claims neither way.
+    let nothing_there = std::fs::symlink_metadata(workspace)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
     let mut lines = vec![format!(
         "its workspace is {}{}",
         workspace.display(),
@@ -403,8 +403,7 @@ fn force_claim(
             return Ok(Exit::Usage);
         }
     };
-    let displaced =
-        (previous.owner != context.identity.owner).then(|| Displaced::of(previous, last_seen));
+    let displaced = Displaced::over(previous, &context.identity, last_seen);
     record_claim(
         context,
         reason,

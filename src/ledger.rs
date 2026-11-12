@@ -185,8 +185,10 @@ impl ClaimChange {
 /// The claim a write displaced, in the tokens an entry records it with.
 ///
 /// Built once from the claim and its last sighting because `start --force`
-/// and `finish --force` record the same five values about the same event:
-/// two hand-written mappings of a claim onto those fields would drift.
+/// and `finish --force` record the same five values about the same event,
+/// and decide from the same sixth ([`Displaced::over`]) whether there was a
+/// displacement at all: two hand-written mappings of a claim onto those
+/// fields would drift.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Displaced {
     pub owner: String,
@@ -210,6 +212,16 @@ impl Displaced {
             last_seen: crate::commands::claim::last_seen_provenance(last_seen),
             why: claim.why.clone(),
         }
+    }
+
+    /// The same, where `identity` is taking the claim from another owner
+    /// name, and nothing where the claim is its own.
+    pub fn over(
+        claim: &crate::store::Claim,
+        identity: &crate::commands::claim::Identity,
+        last_seen: crate::seen::LastSeen,
+    ) -> Option<Self> {
+        (claim.owner != identity.owner).then(|| Self::of(claim, last_seen))
     }
 }
 
@@ -446,10 +458,12 @@ pub enum LedgerError {
         path: PathBuf,
         reason: std::io::Error,
     },
-    #[error("writing {path}: {source}")]
+    /// The reason rides in the message, as [`LedgerError::Read`]'s does and
+    /// for the same reason.
+    #[error("writing {path}: {reason}")]
     Write {
         path: PathBuf,
-        source: std::io::Error,
+        reason: std::io::Error,
     },
     #[error("{path} is not a ledger entry: {detail}")]
     Parse { path: PathBuf, detail: String },
@@ -684,21 +698,21 @@ impl Ledger {
             Frontmatter::of(entry).into_toml(entry.statement.as_ref())?,
             entry.text
         );
-        std::fs::create_dir_all(&self.path).map_err(|source| LedgerError::Write {
+        std::fs::create_dir_all(&self.path).map_err(|reason| LedgerError::Write {
             path: self.path.clone(),
-            source,
+            reason,
         })?;
         let path = self.path.join(entry_file_name(ts));
         let mut temporary =
-            tempfile::NamedTempFile::new_in(&self.path).map_err(|source| LedgerError::Write {
+            tempfile::NamedTempFile::new_in(&self.path).map_err(|reason| LedgerError::Write {
                 path: self.path.clone(),
-                source,
+                reason,
             })?;
         temporary
             .write_all(contents.as_bytes())
-            .map_err(|source| LedgerError::Write {
+            .map_err(|reason| LedgerError::Write {
                 path: path.clone(),
-                source,
+                reason,
             })?;
         persist_entry(temporary, path.clone())?;
         APPENDED.store(true, Ordering::Relaxed);
@@ -1267,11 +1281,11 @@ fn persist_entry(temporary: tempfile::NamedTempFile, path: PathBuf) -> Result<()
         .persist_noclobber(&path)
         .map(|_| ())
         .map_err(|error| {
-            let source = error.error;
-            if source.kind() == std::io::ErrorKind::AlreadyExists {
+            let reason = error.error;
+            if reason.kind() == std::io::ErrorKind::AlreadyExists {
                 LedgerError::Collision { path }
             } else {
-                LedgerError::Write { path, source }
+                LedgerError::Write { path, reason }
             }
         })
 }

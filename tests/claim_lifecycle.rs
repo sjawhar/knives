@@ -62,14 +62,7 @@ fn durable_sighting(token: &Value) -> bool {
 /// Run knives in `lab`'s checkout as the harness session `owner`, against
 /// the config home `home`, and fail the test when it does not exit 0.
 fn ran(lab: &Lab, home: &Path, owner: &str, args: &[&str]) -> std::process::Output {
-    let output = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args(args)
-        .current_dir(&lab.work)
-        .env("KNIVES_CONFIG_HOME", home)
-        .env("HOME", lab.temp_path())
-        .env("KNIVES_OWNER", owner)
-        .output()
-        .expect("run knives");
+    let output = tried(lab, home, owner, args);
     assert!(
         output.status.success(),
         "{args:?} failed: {}",
@@ -786,17 +779,9 @@ fn start_refuses_a_held_claim_whose_operation_log_cannot_be_read() {
     // sighting is the only thing the unreadable log costs.
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
-    let run = |owner: &str, args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_knives"))
-            .args(args)
-            .current_dir(&lab.work)
-            .env("KNIVES_CONFIG_HOME", home.path())
-            .env("HOME", lab.temp_path())
-            .env("KNIVES_OWNER", owner)
-            .output()
-            .expect("run knives")
-    };
-    let first = run(
+    ran(
+        &lab,
+        home.path(),
         "agent-one",
         &[
             "--text",
@@ -808,17 +793,14 @@ fn start_refuses_a_held_claim_whose_operation_log_cannot_be_read() {
             "port it",
         ],
     );
-    assert!(
-        first.status.success(),
-        "first start failed: {}",
-        String::from_utf8_lossy(&first.stderr)
-    );
     if !unreadable_operation_log(&lab.work) {
         return;
     }
 
     // When: another session starts the branch the unreadable checkout holds.
-    let refused = run(
+    let refused = tried(
+        &lab,
+        home.path(),
         "agent-two",
         &["--text", "start", "feat/gamma", "--repo", "demo"],
     );
@@ -847,17 +829,9 @@ fn finish_refuses_a_held_claim_whose_operation_log_cannot_be_read() {
     // and nothing about the unreadable log reaches the exit code.
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
-    let run = |owner: &str, args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_knives"))
-            .args(args)
-            .current_dir(&lab.work)
-            .env("KNIVES_CONFIG_HOME", home.path())
-            .env("HOME", lab.temp_path())
-            .env("KNIVES_OWNER", owner)
-            .output()
-            .expect("run knives")
-    };
-    let started = run(
+    ran(
+        &lab,
+        home.path(),
         "agent-one",
         &[
             "--text",
@@ -869,17 +843,14 @@ fn finish_refuses_a_held_claim_whose_operation_log_cannot_be_read() {
             "port it",
         ],
     );
-    assert!(
-        started.status.success(),
-        "start failed: {}",
-        String::from_utf8_lossy(&started.stderr)
-    );
     if !unreadable_operation_log(&lab.work) {
         return;
     }
 
     // When: another session finishes the branch agent-one holds.
-    let refused = run(
+    let refused = tried(
+        &lab,
+        home.path(),
         "agent-two",
         &["--text", "finish", "feat/gamma", "--repo", "demo"],
     );

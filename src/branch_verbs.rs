@@ -209,7 +209,7 @@ pub(crate) fn run_finish(
         )?
     };
     println!("{}/{branch}: claim {claim}; {disposal}", fork.name);
-    Ok(Exit::worst(floor, Exit::Ok))
+    Ok(floor)
 }
 
 /// Forgets this branch's workspace and removes its directory, and says what
@@ -476,13 +476,7 @@ fn live_users_gate(
     directory: &Path,
     options: &FinishOptions<'_>,
 ) -> Result<Option<String>, Exit> {
-    let session = knives::commands::claim::harness_session();
-    let users = knives::liveness::live_users(
-        directory,
-        session
-            .as_ref()
-            .map(|(name, value)| (*name, value.as_str())),
-    );
+    let users = knives::liveness::others_using(directory);
     if users.is_empty() {
         return Ok(None);
     }
@@ -648,8 +642,7 @@ fn finish_claim_gate(
             Ok(FinishClaimGate::Continue(Released {
                 text: Some(forced_release_event(&claim, last_seen, why)),
                 why: Some(why.to_owned()),
-                displaced: (claim.owner != identity.owner)
-                    .then(|| Displaced::of(&claim, last_seen)),
+                displaced: Displaced::over(&claim, &identity, last_seen),
             }))
         }
     }
