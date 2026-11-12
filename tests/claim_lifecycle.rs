@@ -78,6 +78,74 @@ fn ran(lab: &Lab, home: &Path, owner: &str, args: &[&str]) -> std::process::Outp
     output
 }
 
+/// [`ran`], for a run whose exit the test reads itself: a refusal and a
+/// finding are what these tests are about, not failures of the fixture.
+fn tried(lab: &Lab, home: &Path, owner: &str, args: &[&str]) -> std::process::Output {
+    lab::knives_command(&lab.work, home, lab.temp_path(), args)
+        .env("KNIVES_OWNER", owner)
+        .output()
+        .expect("run knives")
+}
+
+/// Every entry of the demo fork's ledger in `home`, oldest first.
+fn ledger_of(home: &Path) -> Vec<knives::ledger::Entry> {
+    knives::ledger::Ledger::at(home.join("ledger").join("demo"))
+        .read()
+        .expect("read ledger")
+        .entries
+}
+
+/// The entry of the demo fork's ledger that records claim change `change`,
+/// newest first.
+fn claim_change(home: &Path, change: &str) -> knives::ledger::Entry {
+    ledger_of(home)
+        .into_iter()
+        .rev()
+        .find(|entry| entry.claim_change.as_deref() == Some(change))
+        .unwrap_or_else(|| panic!("no {change} entry in {:?}", ledger_of(home)))
+}
+
+/// Who holds `demo/<branch>` in `home`'s state, when anybody does.
+fn holder_of(home: &Path, branch: &str) -> Option<String> {
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join("state.json")).ok()?)
+            .expect("parse state");
+    state["claims"][format!("demo/{branch}")]["owner"]
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+/// Rewrite the demo fork's ledger as an older knives wrote it: every entry
+/// without the claim fields, which that knives had no word for.
+fn without_claim_fields(home: &Path) {
+    let ledger = home.join("ledger").join("demo");
+    for dirent in std::fs::read_dir(&ledger).expect("read ledger directory") {
+        let path = dirent.expect("ledger entry").path();
+        let text = std::fs::read_to_string(&path).expect("read entry");
+        let older: String = text
+            .lines()
+            .filter(|line| !line.starts_with("claim_change") && !line.starts_with("previous_"))
+            .fold(String::new(), |mut text, line| {
+                text.push_str(line);
+                text.push('\n');
+                text
+            });
+        std::fs::write(&path, older).expect("rewrite entry");
+    }
+}
+
+/// Make the ledger directory `ledger` unreadable, so the store fails on it
+/// before anything else; `false` when this user reads it anyway (root
+/// ignores modes), and the caller has nothing to test.
+fn unreadable(ledger: &Path) -> bool {
+    std::fs::set_permissions(ledger, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    if std::fs::read_dir(ledger).is_ok() {
+        std::fs::set_permissions(ledger, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        return false;
+    }
+    true
+}
+
 #[test]
 fn start_resumes_the_same_harness_sessions_claim_without_mutating_it() {
     // A second invocation from the same harness session must acknowledge the
@@ -1375,4 +1443,463 @@ fn a_forced_release_records_the_claim_it_ended() {
         durable_sighting(&released["previous_last_seen"]),
         "was: {released}"
     );
+}
+
+/// `agent-one` claims `feat/gamma` and `agent-two` takes it by force: the
+/// chain every displaced-owner test starts from, and the directory the
+/// takeover left in place.
+fn taken_over(lab: &Lab, home: &Path) -> std::path::PathBuf {
+    ran(
+        lab,
+        home,
+        "agent-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    ran(
+        lab,
+        home,
+        "agent-two",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            "rescue stalled work",
+        ],
+    );
+    lab.work.parent().expect("parent").join("feat-gamma")
+}
+
+#[test]
+fn a_displaced_owners_finish_names_the_takeover_and_offers_no_release() {
+    // Measured with v3.2.4: the refusal named the taker as if it were the
+    // caller's own claim, said nothing of the claim this caller lost, and
+    // offered a `finish --force` that releases the taker's live claim and
+    // leaves the branch claimed by nobody.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = taken_over(&lab, home.path());
+    let taken = claim_change(home.path(), "taken");
+    let entries = ledger_of(home.path()).len();
+
+    // When: the owner that lost the claim finishes the branch
+    let told = tried(
+        &lab,
+        home.path(),
+        "agent-one",
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    // Then: it learns who took its claim, when, why, and who holds the
+    // branch now, and is told how to take it back rather than how to release
+    // a claim that is not its own. Nothing moved.
+    let stderr = String::from_utf8_lossy(&told.stderr);
+    assert_eq!(told.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "agent-two took agent-one's claim on demo/feat/gamma at {}: rescue stalled work",
+            taken.ts
+        )),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("is claimed by agent-two"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("use `knives start feat/gamma --force --why"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("knives finish feat/gamma --force"),
+        "the release of the holder's live claim was offered: {stderr}"
+    );
+    assert_eq!(
+        holder_of(home.path(), "feat/gamma").as_deref(),
+        Some("agent-two")
+    );
+    assert!(workspace.is_dir(), "the holder's workspace was removed");
+    assert_eq!(
+        ledger_of(home.path()).len(),
+        entries,
+        "a finish that changed nothing wrote to the ledger"
+    );
+}
+
+#[test]
+fn a_displaced_owner_standing_in_the_lost_workspace_is_told_the_same() {
+    // Possession of the directory is how an agent runs `finish` at all, and
+    // after a takeover the directory is the new holder's: the caller that
+    // stands in it must learn what happened, not release the claim it is
+    // standing on.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = taken_over(&lab, home.path());
+    let taken = claim_change(home.path(), "taken");
+
+    let told = lab::knives_command(
+        &workspace,
+        home.path(),
+        lab.temp_path(),
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    )
+    .env("KNIVES_OWNER", "agent-one")
+    .output()
+    .expect("finish from inside the lost workspace");
+
+    let stderr = String::from_utf8_lossy(&told.stderr);
+    assert_eq!(told.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "agent-two took agent-one's claim on demo/feat/gamma at {}: rescue stalled work",
+            taken.ts
+        )),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("knives finish feat/gamma --force"),
+        "the release of the holder's live claim was offered: {stderr}"
+    );
+    assert_eq!(
+        holder_of(home.path(), "feat/gamma").as_deref(),
+        Some("agent-two")
+    );
+    assert!(workspace.is_dir(), "the holder's workspace was removed");
+}
+
+#[test]
+fn a_displaced_owners_finish_disposes_of_the_workspace_nobody_holds() {
+    // The claim was released, not taken: there is no holder to protect, so
+    // the caller is told what happened and its own workspace is disposed of
+    // in the same run.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    ran(
+        &lab,
+        home.path(),
+        "agent-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    let workspace = lab.work.parent().expect("parent").join("feat-gamma");
+    ran(
+        &lab,
+        home.path(),
+        "agent-two",
+        &[
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            "release stalled work",
+        ],
+    );
+    let released = claim_change(home.path(), "released");
+
+    let told = tried(
+        &lab,
+        home.path(),
+        "agent-one",
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    let stderr = String::from_utf8_lossy(&told.stderr);
+    let stdout = String::from_utf8_lossy(&told.stdout);
+    assert_eq!(told.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "agent-two released agent-one's claim on demo/feat/gamma at {}: release stalled work",
+            released.ts
+        )),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("nobody holds demo/feat/gamma now"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("use `knives start feat/gamma` to claim it again"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("--force --why"),
+        "a forced command was offered where nobody holds the branch: {stderr}"
+    );
+    assert!(
+        stdout.contains("workspace feat-gamma forgotten"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !workspace.exists(),
+        "the caller's own workspace was not disposed of"
+    );
+}
+
+#[test]
+fn a_displaced_owners_finish_names_the_takeover_after_the_taker_finished() {
+    // The entry that ended this caller's claim is the takeover, however many
+    // releases of someone else's claim came after it.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let _workspace = taken_over(&lab, home.path());
+    let taken = claim_change(home.path(), "taken");
+    ran(
+        &lab,
+        home.path(),
+        "agent-two",
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    let told = tried(
+        &lab,
+        home.path(),
+        "agent-one",
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    let stderr = String::from_utf8_lossy(&told.stderr);
+    assert_eq!(told.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "agent-two took agent-one's claim on demo/feat/gamma at {}: rescue stalled work",
+            taken.ts
+        )),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("nobody holds demo/feat/gamma now"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("use `knives start feat/gamma` to claim it again"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_chapter_the_owner_closed_itself_ends_the_search() {
+    // The owner took the branch up again after the takeover and handed it
+    // back itself. A later finish of the unheld branch must say nothing of a
+    // takeover two chapters old.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let _workspace = taken_over(&lab, home.path());
+    let finish = ["--text", "finish", "feat/gamma", "--repo", "demo"];
+    ran(&lab, home.path(), "agent-two", &finish);
+    ran(
+        &lab,
+        home.path(),
+        "agent-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "take it up again",
+        ],
+    );
+    ran(&lab, home.path(), "agent-one", &finish);
+
+    // When: the owner finishes the branch it already handed back
+    let again = tried(&lab, home.path(), "agent-one", &finish);
+
+    // Then: an ordinary finish of nothing
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    let stdout = String::from_utf8_lossy(&again.stdout);
+    assert_eq!(again.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("was not held"), "stdout: {stdout}");
+    assert!(
+        !stderr.contains("agent-one's claim"),
+        "a takeover the owner already answered was reported: {stderr}"
+    );
+}
+
+#[test]
+fn a_resume_in_the_lost_directory_does_not_hide_the_takeover() {
+    // A displaced agent goes on working where it stands, and its resume
+    // records no claim of its own: the takeover is still what ended its
+    // claim, and still what its finish must be told.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = taken_over(&lab, home.path());
+    let taken = claim_change(home.path(), "taken");
+    let resumed = lab::knives_command(
+        &workspace,
+        home.path(),
+        lab.temp_path(),
+        &["--text", "start", "feat/gamma", "--repo", "demo"],
+    )
+    .env("KNIVES_OWNER", "agent-one")
+    .output()
+    .expect("resume in the lost workspace");
+    assert!(
+        resumed.status.success(),
+        "resume failed: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(claim_change(home.path(), "resumed").owner, "agent-one");
+
+    let told = tried(
+        &lab,
+        home.path(),
+        "agent-one",
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    let stderr = String::from_utf8_lossy(&told.stderr);
+    assert_eq!(told.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "agent-two took agent-one's claim on demo/feat/gamma at {}: rescue stalled work",
+            taken.ts
+        )),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_caller_that_never_held_the_branch_keeps_the_refusal_it_always_got() {
+    // Releasing the claim of an agent that is gone is what the forced finish
+    // is for, and a caller the ledger never names as a displaced owner must
+    // still be told so.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let _workspace = taken_over(&lab, home.path());
+
+    let refused = tried(
+        &lab,
+        home.path(),
+        "agent-three",
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("is claimed by agent-two"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("use `knives finish feat/gamma --force --why"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("agent-three's claim"),
+        "a claim this caller never held was reported: {stderr}"
+    );
+}
+
+#[test]
+fn a_ledger_without_claim_fields_keeps_the_refusal_it_always_gave() {
+    // Every entry an older knives wrote carries no claim change, and prose
+    // is never read for one: such a ledger answers nothing, and the caller
+    // gets the refusal it got before the fields existed.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let _workspace = taken_over(&lab, home.path());
+    without_claim_fields(home.path());
+    assert!(
+        ledger_of(home.path())
+            .iter()
+            .all(|entry| entry.claim_change.is_none() && entry.previous_owner.is_none()),
+        "the fixture left claim fields behind"
+    );
+
+    let refused = tried(
+        &lab,
+        home.path(),
+        "agent-one",
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("is claimed by agent-two"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("use `knives finish feat/gamma --force --why"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_fork_ledger_that_cannot_be_read_fails_the_finish_naming_it_once() {
+    // The finish fails before it reads a workspace or touches a claim, and
+    // the one line it prints says which file could not be read and why,
+    // once: the reason used to arrive twice, and never as the ledger's.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    ran(
+        &lab,
+        home.path(),
+        "agent-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    let workspace = lab.work.parent().expect("parent").join("feat-gamma");
+    let ledger = home.path().join("ledger").join("demo");
+    if !unreadable(&ledger) {
+        return;
+    }
+
+    let failed = tried(
+        &lab,
+        home.path(),
+        "agent-one",
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+    std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert_eq!(failed.status.code(), Some(3), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "reading the fork's ledger at {}",
+            ledger.display()
+        )),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("Permission denied").count(),
+        1,
+        "the reason is printed more than once: {stderr}"
+    );
+    assert_eq!(
+        holder_of(home.path(), "feat/gamma").as_deref(),
+        Some("agent-one"),
+        "the claim changed under an unreadable ledger"
+    );
+    assert!(workspace.is_dir(), "the workspace was disposed of");
 }

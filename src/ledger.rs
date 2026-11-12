@@ -437,10 +437,14 @@ impl Frontmatter {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
-    #[error("reading {path}: {source}")]
+    /// The reason rides in the message rather than in the error chain. `main`
+    /// prints an error with its chain (`{error:#}`) and a status row prints
+    /// an unreadable ledger's text alone, so a `source` field would read
+    /// twice in the one and be missing from the other.
+    #[error("reading the fork's ledger at {path}: {reason}")]
     Read {
         path: PathBuf,
-        source: std::io::Error,
+        reason: std::io::Error,
     },
     #[error("writing {path}: {source}")]
     Write {
@@ -767,17 +771,17 @@ impl Ledger {
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(listed);
             }
-            Err(source) => {
+            Err(reason) => {
                 return Err(LedgerError::Read {
                     path: self.path.clone(),
-                    source,
+                    reason,
                 });
             }
         };
         for dirent in listing {
-            let unreadable = |source| LedgerError::Read {
+            let unreadable = |reason| LedgerError::Read {
                 path: self.path.clone(),
-                source,
+                reason,
             };
             let dirent = dirent.map_err(unreadable)?;
             let path = dirent.path();
@@ -812,9 +816,9 @@ struct Listed {
 fn parse_files(files: Vec<PathBuf>) -> impl Iterator<Item = ParsedFile> {
     files.into_iter().map(|path| {
         let parsed = std::fs::read(&path)
-            .map_err(|source| LedgerError::Read {
+            .map_err(|reason| LedgerError::Read {
                 path: path.clone(),
-                source,
+                reason,
             })
             .and_then(|bytes| parse_bytes(&path, &bytes));
         (path, parsed)

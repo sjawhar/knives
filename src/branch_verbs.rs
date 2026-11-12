@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use knives::bind::Fork;
 use knives::cli::Exit;
 use knives::commands::claim::{
-    Bound, ClaimContext, ClaimDecision, current_identity, decide, last_seen_provenance,
+    Bound, ClaimContext, ClaimDecision, Identity, current_identity, decide, last_seen_provenance,
     possession_permits_release, render_claim_context,
 };
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
@@ -19,7 +19,7 @@ use knives::ids::{BranchName, BranchTarget, Requirement};
 use knives::jj::{
     Repo, StaleRegistration, WorkspaceIdentity, path_occupant, remove_finished_worktree,
 };
-use knives::ledger::{ClaimChange, Displaced, Draft, Stated};
+use knives::ledger::{ClaimChange, Displaced, Draft, Entry, Stated};
 use knives::statement::{Statement, StatementKind};
 use knives::store::{Store, default_state_path};
 
@@ -63,7 +63,13 @@ pub(crate) struct FinishOptions<'a> {
 
 enum FinishClaimGate {
     Continue(Released),
-    Refuse,
+    /// Another owner took or released the caller's own claim and nobody
+    /// holds the branch now. The caller has been told so; its own workspace
+    /// is still disposed of, and the finish reports a finding whatever that
+    /// disposal gives.
+    Lost,
+    /// The gate has said everything there is to say; exit with this.
+    Refuse(Exit),
 }
 
 /// What the claim gate leaves for the entry `finish` writes.
@@ -92,6 +98,9 @@ struct Released {
 /// What does not survive a removal is anything jj never tracks, which is what
 /// `--no-cleanup` is for. Another process still using the workspace, or a claim taken in
 /// a place whose processes this one cannot see, refuses it unless `--force`.
+/// A release that displaced another owner removes nothing and forgets
+/// nothing: that directory is the displaced owner's, and so is the work in
+/// it jj never tracked.
 /// `bound` is the registry and the fork the current directory is inside, by
 /// the name its claims are kept under, which names a terminal user acting
 /// from a fork's workspace.
@@ -129,15 +138,21 @@ pub(crate) fn run_finish(
     // workspace: a caller the gate refuses reads no directory and scans no
     // process table, and a workspace whose state jj cannot read no longer
     // hides the claim question from a caller that does not hold the claim.
-    let released = match finish_claim_gate(fork, target, &store, options, bound)? {
-        FinishClaimGate::Continue(released) => released,
-        FinishClaimGate::Refuse => return Ok(Exit::Usage),
+    let (released, floor) = match finish_claim_gate(fork, target, &store, options, bound)? {
+        FinishClaimGate::Continue(released) => (released, Exit::Ok),
+        FinishClaimGate::Lost => (Released::default(), Exit::Findings),
+        FinishClaimGate::Refuse(exit) => return Ok(exit),
     };
     // Read-only checks before the claim is touched: a refusal leaves everything
-    // as it was.
-    let cleared = match clear_workspace(fork, branch, &directory, options) {
-        Ok(cleared) => cleared,
-        Err(exit) => return Ok(exit),
+    // as it was. A release over another owner's claim reads nothing from their
+    // workspace at all, because it will neither snapshot nor dispose of it.
+    let cleared = if released.displaced.is_some() {
+        Cleared::default()
+    } else {
+        match clear_workspace(fork, branch, &directory, options) {
+            Ok(cleared) => cleared,
+            Err(exit) => return Ok(exit),
+        }
     };
     let kept = keep_working_copy(fork, branch, cleared.working_copy.as_deref());
     let forced = joined(released.text, cleared.over_live_users);
@@ -183,23 +198,51 @@ pub(crate) fn run_finish(
         );
         return Ok(Exit::Incomplete);
     }
-    let registration = release_registration(
-        place.checkout,
+    let disposal = if let Some(displaced) = released.displaced.as_ref() {
+        left_to_its_owner(&place, &displaced.owner)
+    } else {
+        ordinary_disposal(
+            &place,
+            cleared.identity.as_ref(),
+            cleared.present,
+            options.cleanup,
+        )?
+    };
+    println!("{}/{branch}: claim {claim}; {disposal}", fork.name);
+    Ok(Exit::worst(floor, Exit::Ok))
+}
+
+/// Forgets this branch's workspace and removes its directory, and says what
+/// became of each.
+fn ordinary_disposal(
+    place: &Place<'_>,
+    identity: Option<&WorkspaceIdentity>,
+    present: bool,
+    cleanup: bool,
+) -> anyhow::Result<String> {
+    let registration =
+        release_registration(place.checkout, place.workspace, place.directory, present);
+    let removal = removal_note(place, identity, &registration, cleanup)?;
+    Ok(format!(
+        "workspace {} {registration}; {removal}",
+        place.workspace
+    ))
+}
+
+/// Why a release that displaced another owner leaves their workspace exactly
+/// as it is.
+///
+/// What jj never tracked in that directory is the displaced owner's work, and
+/// the session that forces a release is not the one to delete it. Its own
+/// `knives finish` disposes of both the directory and the registration, which
+/// is why the registration has to survive this release too.
+fn left_to_its_owner(place: &Place<'_>, owner: &str) -> String {
+    format!(
+        "{} and its `{}` registration are left as they are: the directory is {owner}'s, and \
+         what jj never tracked in it is not this session's to delete",
+        place.directory.display(),
         place.workspace,
-        place.directory,
-        cleared.present,
-    );
-    let removal = removal_note(
-        &place,
-        cleared.identity.as_ref(),
-        &registration,
-        options.cleanup,
-    )?;
-    println!(
-        "{}/{branch}: claim {claim}; workspace {workspace} {registration}; {removal}",
-        fork.name
-    );
-    Ok(Exit::Ok)
+    )
 }
 
 /// Where this branch's workspace lives, by the three names the disposal needs.
@@ -300,6 +343,10 @@ fn finish_provenance(
 
 /// What is at the branch's workspace path, and what the read-only checks
 /// before the claim is touched allow `finish` to go on with.
+///
+/// The default is what a `finish` that will not look at the workspace reads
+/// of it: nothing there, nothing to snapshot, nothing forced.
+#[derive(Default)]
 struct Cleared {
     /// What sits at the path, when anything does.
     identity: Option<WorkspaceIdentity>,
@@ -557,7 +604,7 @@ fn finish_claim_gate(
         .find(|claim| claim.branch == target.branch.as_str())
         .cloned()
     else {
-        return Ok(FinishClaimGate::Continue(Released::default()));
+        return unheld_gate(target, store, options, bound);
     };
     let cwd = std::env::current_dir()?;
     let identity = current_identity(bound)?;
@@ -586,17 +633,14 @@ fn finish_claim_gate(
             let last_seen =
                 knives::seen::last_seen_in(&claim, &fork.checkout.path, &knives::seen::load());
             if !options.force {
-                let anonymous_note = if decision == ClaimDecision::RefuseAnonymous {
-                    "both sides are anonymous identities, so they can never match; "
-                } else {
-                    ""
-                };
-                eprintln!(
-                    "{anonymous_note}{}\nuse `knives finish {} --force --why \"…\"` to release the claim",
-                    render_claim_context(&claim, last_seen, jiff::Timestamp::now()),
-                    target.branch,
-                );
-                return Ok(FinishClaimGate::Refuse);
+                return Ok(refuse_held(&Refusal {
+                    target,
+                    entries: store.ledger_entries(&target.repo),
+                    identity: &identity,
+                    claim: &claim,
+                    last_seen,
+                    anonymous: decision == ClaimDecision::RefuseAnonymous,
+                }));
             }
             let why = options
                 .why
@@ -609,6 +653,128 @@ fn finish_claim_gate(
             }))
         }
     }
+}
+
+/// A branch nobody holds: an ordinary finish of nothing, unless this fork's
+/// ledger says another owner ended the caller's own claim on it. The caller
+/// is told that first, because the claim it believed it still held is why it
+/// is finishing at all; its own workspace is disposed of all the same.
+fn unheld_gate(
+    target: &BranchTarget,
+    store: &Store,
+    options: &FinishOptions<'_>,
+    bound: Bound<'_>,
+) -> anyhow::Result<FinishClaimGate> {
+    if options.force {
+        return Ok(FinishClaimGate::Continue(Released::default()));
+    }
+    let identity = current_identity(bound)?;
+    let entries = store.ledger_entries(&target.repo);
+    let Some(lost) = claim_ended(entries, &target.branch, &identity.owner) else {
+        return Ok(FinishClaimGate::Continue(Released::default()));
+    };
+    eprintln!(
+        "{}\nnobody holds {} now\nuse `knives start {}` to claim it again",
+        displacement(target, &identity.owner, lost),
+        target.key(),
+        target.branch,
+    );
+    Ok(FinishClaimGate::Lost)
+}
+
+/// What a refusal of a claim this caller does not hold is decided from.
+struct Refusal<'a> {
+    target: &'a BranchTarget,
+    /// This fork's ledger as the store read it, oldest first: what became of
+    /// the caller's own claim is in it ([`claim_ended`]).
+    entries: &'a [Entry],
+    identity: &'a Identity,
+    claim: &'a knives::store::Claim,
+    last_seen: knives::seen::LastSeen,
+    /// Both sides resolved to an OS user name, which can never match.
+    anonymous: bool,
+}
+
+/// Refuse a finish of a claim the caller does not hold, and say what to do
+/// instead.
+///
+/// An owner whose own claim the ledger says was taken or released is told
+/// that, and is never offered the `finish --force` line: that command would
+/// release the live claim of whoever holds the branch now and leave it
+/// claimed by nobody. Taking the branch back is `start --force`, which
+/// records the change; releasing a gone agent's claim is what the other
+/// refusal is for.
+fn refuse_held(refusal: &Refusal<'_>) -> FinishClaimGate {
+    let context = render_claim_context(refusal.claim, refusal.last_seen, jiff::Timestamp::now());
+    let branch = &refusal.target.branch;
+    if let Some(lost) = claim_ended(refusal.entries, branch, &refusal.identity.owner) {
+        eprintln!(
+            "{}\n{context}\nnothing was changed here: the workspace and its registration are \
+             the holder's\nuse `knives start {branch} --force --why \"…\"` to take the branch back",
+            displacement(refusal.target, &refusal.identity.owner, lost),
+        );
+        return FinishClaimGate::Refuse(Exit::Findings);
+    }
+    let anonymous_note = if refusal.anonymous {
+        "both sides are anonymous identities, so they can never match; "
+    } else {
+        ""
+    };
+    eprintln!(
+        "{anonymous_note}{context}\nuse `knives finish {branch} --force --why \"…\"` to release \
+         the claim"
+    );
+    FinishClaimGate::Refuse(Exit::Usage)
+}
+
+/// What this fork's ledger says became of `owner`'s claim: who ended it,
+/// when, and the reason that owner gave for ending it.
+fn displacement(target: &BranchTarget, owner: &str, lost: &Entry) -> String {
+    // `claim_ended` answers with a taken or a released entry and nothing else.
+    let verb = match lost.claim_change() {
+        Some(ClaimChange::Taken) => "took",
+        _ => "released",
+    };
+    let why = lost
+        .claim_change_why
+        .as_deref()
+        .map_or_else(String::new, |why| format!(": {why}"));
+    format!(
+        "{} {verb} {owner}'s claim on {} at {}{why}",
+        lost.owner,
+        target.key(),
+        lost.ts,
+    )
+}
+
+/// The entry that ended `owner`'s claim on `branch`, read newest first, or
+/// nothing where this fork's ledger records no such end.
+///
+/// The search stops at the newest claim or release `owner` itself wrote,
+/// which closed the chapter before it: an owner that claimed the branch
+/// again, or handed it back itself, is not told about a takeover it has
+/// already answered. An entry that records no claim change — every entry an
+/// older knives wrote — neither stops the search nor answers it, and neither
+/// does a resume, so an owner that took its work up again in the directory it
+/// had lost is still told who took the branch.
+fn claim_ended<'a>(entries: &'a [Entry], branch: &BranchName, owner: &str) -> Option<&'a Entry> {
+    for entry in entries.iter().rev() {
+        if entry.subject.as_deref() != Some(branch.as_str()) {
+            continue;
+        }
+        match entry.claim_change() {
+            Some(ClaimChange::Claimed | ClaimChange::Released) if entry.owner == owner => {
+                return None;
+            }
+            Some(ClaimChange::Taken | ClaimChange::Released)
+                if entry.previous_owner.as_deref() == Some(owner) =>
+            {
+                return Some(entry);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The claim's own holder finishing from another place: a host or agent box
@@ -642,7 +808,7 @@ fn place_gate(
         claim.owner,
         target.branch,
     );
-    FinishClaimGate::Refuse
+    FinishClaimGate::Refuse(Exit::Usage)
 }
 
 /// Pull `fork`'s ledger before a write built from what it states, and say
