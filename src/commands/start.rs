@@ -150,6 +150,10 @@ struct StartContext<'a> {
     store: &'a mut Store,
     fork: &'a Fork<'a>,
     branch: &'a BranchName,
+    /// The reason the caller gave, which every path that writes a claim
+    /// needs: a claim taken, seized, or held and now held for another
+    /// reason.
+    why: Option<&'a str>,
     identity: Identity,
     upstream_trunk: String,
     destination: PathBuf,
@@ -254,6 +258,7 @@ pub fn run(
         store: &mut store,
         fork,
         branch,
+        why,
         identity,
         upstream_trunk: entry.trunk_ref(),
         workspace: WorkspaceName::new(workspace_for(branch.as_str())),
@@ -270,15 +275,14 @@ pub fn run(
 
     if forced {
         let (previous, last_seen) = claim_context(held.as_ref(), claim_seen)?;
-        let reason = why.ok_or_else(|| anyhow::anyhow!("--force requires --why"))?;
-        return force_claim(&mut context, previous, last_seen, reason);
+        return force_claim(&mut context, previous, last_seen);
     }
 
     match decision {
         ClaimDecision::Resume { possession } => {
-            resume_claim(&context, held.as_ref(), claim_seen, possession)
+            resume_claim(&mut context, held.as_ref(), claim_seen, possession)
         }
-        ClaimDecision::Take => take_claim(&mut context, why.unwrap_or("started work")),
+        ClaimDecision::Take => take_claim(&mut context),
         // Both returned above, before the repository was opened.
         ClaimDecision::RefuseAnonymous | ClaimDecision::RefuseHeld => Err(anyhow::anyhow!(
             "a refused claim reached the paths that open the repository"
@@ -385,8 +389,10 @@ fn force_claim(
     context: &mut StartContext<'_>,
     previous: &crate::store::Claim,
     last_seen: crate::seen::LastSeen,
-    reason: &str,
 ) -> anyhow::Result<Exit> {
+    let reason = context
+        .why
+        .ok_or_else(|| anyhow::anyhow!("--force requires --why"))?;
     let workspace_notice = match workspace_notice(context, true)? {
         Ok(notice) => notice,
         // Refused before seizing, as `take_claim` refuses before claiming: a
@@ -419,7 +425,7 @@ fn force_claim(
 }
 
 fn resume_claim(
-    context: &StartContext<'_>,
+    context: &mut StartContext<'_>,
     held: Option<&crate::store::Claim>,
     claim_seen: Option<crate::seen::LastSeen>,
     possession: bool,
@@ -431,6 +437,22 @@ fn resume_claim(
     } else {
         "resumed"
     };
+    let target = BranchTarget::new(context.fork.upstream.clone(), context.branch.clone());
+    // The reason a claim carries is why the work is held now, so its holder
+    // saying why again replaces it: a reader of a refusal days later is told
+    // what the branch is for today, not what the first `start` was for.
+    // Nobody else speaks for the claim, and the possession arm resumes
+    // under names that may differ: a session standing in the directory of
+    // another owner's claim leaves that owner's reason alone.
+    let restated = match context.why {
+        Some(why) if claim.owner == context.identity.owner => {
+            context.store.restate_claim(&target, why)
+        }
+        _ => None,
+    };
+    let claim = restated.as_ref().unwrap_or(claim);
+    // The immutable explanation before the mutable claim state, as a release
+    // records it: a failed append leaves the reason the claim already held.
     Scribe::new(
         Ledger::for_fork(context.fork),
         context.fork.upstream.clone(),
@@ -441,13 +463,11 @@ fn resume_claim(
         &Draft::event(
             Some(context.branch.as_str()),
             event.to_owned(),
-            context.store.tracked_pull(&BranchTarget::new(
-                context.fork.upstream.clone(),
-                context.branch.clone(),
-            )),
+            context.store.tracked_pull(&target),
         )
         .about_claim(Some(ClaimChange::Resumed), Some(claim.why.as_str()), None),
     )?;
+    context.store.save()?;
     println!(
         "{event}\n{}\n{workspace_notice}",
         render_claim_context(claim, last_seen, jiff::Timestamp::now()),
@@ -455,7 +475,8 @@ fn resume_claim(
     Ok(Exit::Ok)
 }
 
-fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Exit> {
+fn take_claim(context: &mut StartContext<'_>) -> anyhow::Result<Exit> {
+    let reason = context.why.unwrap_or("started work");
     if context.destination.exists() {
         if let Some(line) = adoption_refusal(
             &context.destination,

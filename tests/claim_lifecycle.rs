@@ -215,6 +215,252 @@ fn start_resumes_the_same_harness_sessions_claim_without_mutating_it() {
     );
 }
 
+/// The whole claim on `demo/<branch>` in `home`'s state, or `Value::Null`
+/// where none is held: a resume that writes the reason must be read for
+/// what it left alone as much as for what it wrote.
+fn claim_of(home: &Path, branch: &str) -> Value {
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join("state.json")).expect("state"))
+            .expect("parse state");
+    state["claims"][format!("demo/{branch}")].clone()
+}
+
+/// [`tried`]'s command, built to run in `cwd` instead of the checkout, with
+/// no harness variable set: standing in the claimed workspace is what the
+/// caller is proving, and the identity is the caller's own to state.
+fn knives_at(lab: &Lab, home: &Path, cwd: &Path, args: &[&str]) -> Command {
+    lab::knives_command(cwd, home, lab.temp_path(), args)
+}
+
+#[test]
+fn start_with_a_reason_restates_the_holders_claim_without_moving_when_it_was_taken() {
+    // Measured with v3.2.4: a claim three days old still gave the reason its
+    // first `start` gave, so every refusal naming it was out of date. The
+    // holder saying why again replaces it; when and where the claim was
+    // taken are facts of that moment and stay as they are.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let _workspace = claimed_by_agent_one(&lab, home.path());
+    let taken = claim_of(home.path(), "feat/gamma");
+    assert!(
+        taken["place"].is_string(),
+        "the fixture must record where the claim was taken: {taken}"
+    );
+
+    let resumed = ran(
+        &lab,
+        home.path(),
+        "agent-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "finish the port",
+        ],
+    );
+
+    let stdout = String::from_utf8_lossy(&resumed.stdout);
+    assert!(stdout.contains("resumed"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("finish the port"),
+        "the resume must show the reason the claim now holds: {stdout}"
+    );
+    assert!(
+        !stdout.contains("port it"),
+        "the replaced reason must not be what the reader is told: {stdout}"
+    );
+    let now = claim_of(home.path(), "feat/gamma");
+    assert_eq!(now["why"], "finish the port");
+    assert_eq!(now["started"], taken["started"], "claim now: {now}");
+    assert_eq!(now["place"], taken["place"], "claim now: {now}");
+    assert_eq!(now["owner"], taken["owner"], "claim now: {now}");
+    assert_eq!(now["kind"], taken["kind"], "claim now: {now}");
+    let entry = claim_change(home.path(), "resumed");
+    assert_eq!(entry.text, "resumed");
+    assert_eq!(
+        entry.claim_change_why.as_deref(),
+        Some("finish the port"),
+        "the entry carries the reason the claim holds after it: {entry:?}"
+    );
+}
+
+#[test]
+fn start_with_a_reason_from_inside_the_workspace_restates_the_holders_claim() {
+    // The holder reaches its own claim through either arm of a resume: its
+    // name from outside the directory, possession from inside it. The same
+    // `--why` must land the same way.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = claimed_by_agent_one(&lab, home.path());
+    let taken = claim_of(home.path(), "feat/gamma");
+
+    let resumed = knives_at(
+        &lab,
+        home.path(),
+        &workspace,
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "finish the port",
+        ],
+    )
+    .env("KNIVES_OWNER", "agent-one")
+    .output()
+    .expect("resume from the workspace");
+
+    let stdout = String::from_utf8_lossy(&resumed.stdout);
+    assert!(
+        resumed.status.success(),
+        "resume failed: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(
+        stdout.contains("finish the port"),
+        "the resume must show the reason the claim now holds: {stdout}"
+    );
+    let now = claim_of(home.path(), "feat/gamma");
+    assert_eq!(now["why"], "finish the port");
+    assert_eq!(now["started"], taken["started"], "claim now: {now}");
+    assert_eq!(now["place"], taken["place"], "claim now: {now}");
+    let entry = claim_change(home.path(), "resumed");
+    assert_eq!(entry.text, "resumed via workspace possession");
+    assert_eq!(
+        entry.claim_change_why.as_deref(),
+        Some("finish the port"),
+        "the entry carries the reason the claim holds after it: {entry:?}"
+    );
+}
+
+#[test]
+fn start_without_a_reason_leaves_the_one_the_claim_holds() {
+    // A resume that says nothing says nothing: the reason is the holder's
+    // last word on the work, not a field every `start` blanks.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let _workspace = claimed_by_agent_one(&lab, home.path());
+    let taken = claim_of(home.path(), "feat/gamma");
+
+    let resumed = ran(
+        &lab,
+        home.path(),
+        "agent-one",
+        &["--text", "start", "feat/gamma", "--repo", "demo"],
+    );
+
+    assert!(
+        String::from_utf8_lossy(&resumed.stdout).contains("port it"),
+        "stdout: {}",
+        String::from_utf8_lossy(&resumed.stdout)
+    );
+    assert_eq!(claim_of(home.path(), "feat/gamma"), taken);
+    let entry = claim_change(home.path(), "resumed");
+    assert_eq!(entry.claim_change_why.as_deref(), Some("port it"));
+}
+
+#[test]
+fn start_with_a_reason_from_another_name_in_the_workspace_leaves_the_claim_alone() {
+    // Possession resumes the work, not the claim: a session of another name
+    // standing in the directory is working there, and the reason the branch
+    // is held is still its holder's to give.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = claimed_by_agent_one(&lab, home.path());
+    let taken = claim_of(home.path(), "feat/gamma");
+
+    let resumed = knives_at(
+        &lab,
+        home.path(),
+        &workspace,
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "pick up the rebase",
+        ],
+    )
+    .env("KNIVES_OWNER", "agent-two")
+    .output()
+    .expect("resume from the workspace");
+
+    assert!(
+        resumed.status.success(),
+        "possession resume failed: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(
+        claim_of(home.path(), "feat/gamma"),
+        taken,
+        "another name's resume writes nothing to the claim"
+    );
+    let entry = claim_change(home.path(), "resumed");
+    assert_eq!(entry.text, "resumed via workspace possession");
+    assert_eq!(
+        entry.claim_change_why.as_deref(),
+        Some("port it"),
+        "the entry carries the reason the claim holds: {entry:?}"
+    );
+}
+
+#[test]
+fn start_with_a_reason_from_the_derived_holder_restates_the_claim() {
+    // With no harness naming the session, the sole claimant of the fork is
+    // who the caller is taken to be. That name is the claim's own, so the
+    // reason it gives is the holder's and replaces the one held.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = claimed_by_agent_one(&lab, home.path());
+    let taken = claim_of(home.path(), "feat/gamma");
+
+    let resumed = knives_at(
+        &lab,
+        home.path(),
+        &workspace,
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "finish the port",
+        ],
+    )
+    .env("USER", "terminal-user")
+    .output()
+    .expect("resume from the workspace");
+
+    assert!(
+        resumed.status.success(),
+        "derived resume failed: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let now = claim_of(home.path(), "feat/gamma");
+    assert_eq!(now["why"], "finish the port");
+    assert_eq!(now["owner"], "agent-one", "claim now: {now}");
+    assert_eq!(
+        now["kind"], taken["kind"],
+        "the claim's identity source is not the resuming caller's: {now}"
+    );
+    assert_eq!(now["started"], taken["started"], "claim now: {now}");
+    assert_eq!(now["place"], taken["place"], "claim now: {now}");
+    let entry = claim_change(home.path(), "resumed");
+    assert_eq!(
+        entry.claim_change_why.as_deref(),
+        Some("finish the port"),
+        "the entry carries the reason the claim holds after it: {entry:?}"
+    );
+}
+
 #[test]
 fn start_refuses_two_anonymous_owners_with_the_same_name() {
     // Equal OS-user strings are not a trustworthy identity proof, so the second

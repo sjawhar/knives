@@ -418,6 +418,22 @@ impl Store {
         record
     }
 
+    /// Put `why` in place of the reason the claim on `target` carries, and
+    /// change nothing else about it; `None` where nothing is claimed there.
+    ///
+    /// The reason a reader is shown must be the reason the work is held for
+    /// now, not the one its first `start` gave days ago. Only the reason
+    /// moves: [`Store::claim`] sets a new `started` and a new `place`,
+    /// which are when and where the claim was taken and belong to that
+    /// moment alone, so taking work up again must not write them.
+    pub fn restate_claim(&mut self, target: &BranchTarget, why: &str) -> Option<Claim> {
+        let key = target.key();
+        let mut record = self.state.claims.get(&key)?.clone();
+        why.clone_into(&mut record.why);
+        self.set_claim(key, Some(record.clone()));
+        Some(record)
+    }
+
     pub fn release_claim(&mut self, target: &BranchTarget) -> bool {
         let key = target.key();
         let had = self.state.claims.contains_key(&key);
@@ -897,6 +913,29 @@ mod tests {
         let _ = subject.claim(&target(), &os_user("someone"), "w");
         assert!(subject.release_claim(&target()));
         assert!(!subject.release_claim(&target()));
+        assert_eq!(subject.claims(None), Vec::<&Claim>::new());
+    }
+
+    #[test]
+    fn restating_a_claim_writes_its_reason_and_leaves_when_and_where_it_was_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut subject = store(dir.path());
+        let taken = subject.claim(&target(), &os_user("someone"), "port it");
+
+        let restated = subject.restate_claim(&target(), "finish the port").unwrap();
+
+        assert_eq!(restated.why, "finish the port");
+        assert_eq!(restated.started, taken.started);
+        assert_eq!(restated.place, taken.place);
+        assert_eq!(subject.claims(None), vec![&restated]);
+    }
+
+    #[test]
+    fn restating_a_reason_where_nothing_is_claimed_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut subject = store(dir.path());
+
+        assert_eq!(subject.restate_claim(&target(), "port it"), None);
         assert_eq!(subject.claims(None), Vec::<&Claim>::new());
     }
 
@@ -1392,6 +1431,38 @@ mod tests {
         );
         let reread = Store::open(path, &FormerNames::new(), &[]).unwrap();
         assert_eq!(reread.claims(None)[0].owner, "seizer");
+    }
+
+    #[test]
+    fn a_restated_reason_over_a_claim_moved_since_it_was_read_is_refused() {
+        // Given: a claim, read by the writer about to say why it is held,
+        // then seized by a writer that bypassed the fork's lock.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut first = Store::open(path.clone(), &FormerNames::new(), &[]).unwrap();
+        let _ = first.claim(&target(), &os_user("first"), "port it");
+        first.save().unwrap();
+        let mut resuming = Store::open(path.clone(), &FormerNames::new(), &[]).unwrap();
+        let mut seizing = Store::open(path.clone(), &FormerNames::new(), &[]).unwrap();
+        let _ = seizing.claim(&target(), &os_user("seizer"), "rescue it");
+        seizing.save().unwrap();
+
+        // When: the resume saves its new reason.
+        assert!(
+            resuming
+                .restate_claim(&target(), "finish the port")
+                .is_some()
+        );
+        let error = resuming.save().unwrap_err();
+
+        // Then: the seizer's claim stands, reason and all.
+        assert!(
+            matches!(error, StoreError::ClaimMoved { .. }),
+            "was: {error}"
+        );
+        let reread = Store::open(path, &FormerNames::new(), &[]).unwrap();
+        assert_eq!(reread.claims(None)[0].owner, "seizer");
+        assert_eq!(reread.claims(None)[0].why, "rescue it");
     }
 
     #[test]
