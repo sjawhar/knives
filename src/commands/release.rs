@@ -692,7 +692,7 @@ pub fn reap_superseded(
     'names: for (name, targets) in by_name {
         for target in &targets {
             if let Some(reason) = repo.what_rests_on(target)? {
-                report.kept.push((name.clone(), reason));
+                report.kept.push((name, reason));
                 continue 'names;
             }
         }
