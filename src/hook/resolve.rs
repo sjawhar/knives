@@ -8,6 +8,7 @@ use serde_json::Value;
 use crate::bind;
 use crate::config::{Registry, expand_registry_path};
 use crate::ids::{RepoName, UpstreamName};
+use crate::ledger::problem_human_text;
 
 /// The registry entry a checkout is, by both of its names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,7 +117,10 @@ pub fn match_checkout<'a>(paths: &[PathBuf], registry: &'a Registry) -> Option<M
         };
         let under_root = registry.trust.contains_root(&root);
         let remotes = bind::remotes(&root).unwrap_or_else(|error| {
-            eprintln!("knives hook: {error}");
+            // git's stderr and the root's path reach the session's stderr:
+            // escaped as `report` (src/commands/hook.rs) escapes every other
+            // `knives hook:` line.
+            eprintln!("knives hook: {}", problem_human_text(&error.to_string()));
             BTreeMap::new()
         });
         let upstream = remotes.get("upstream");

@@ -550,9 +550,10 @@ pub fn target_name(target: &Target, fallback: &str) -> String {
 
 /// Render the human-readable branch-and-commit census.
 ///
-/// A branch, an orphan and a check target are names jj holds in a ref, and
-/// the repository is a registry key; a note and a problem quote jj and the
-/// forge, so those reach the terminal escaped.
+/// A branch, an orphan and a check target are names read from the
+/// repository's refs, which a remote can give a C1 character, and a note and
+/// a problem quote jj and the forge, so all of them reach the terminal
+/// escaped; the repository is a registry key.
 pub fn render_census(report: &CensusReport) -> String {
     let mut lines = vec![format!("{}: census", report.repo)];
     let mut notes = report.notes.iter();
@@ -576,7 +577,12 @@ pub fn render_census(report: &CensusReport) -> String {
     if report.orphans.is_empty() {
         lines.push("  none".to_owned());
     } else {
-        lines.extend(report.orphans.iter().map(|orphan| format!("  {orphan}")));
+        lines.extend(
+            report
+                .orphans
+                .iter()
+                .map(|orphan| format!("  {}", crate::ledger::inline_human_text(orphan))),
+        );
     }
     lines.extend(notes.map(|note| format!("note: {}", crate::ledger::inline_human_text(note))));
     lines.extend(
@@ -589,7 +595,11 @@ pub fn render_census(report: &CensusReport) -> String {
 }
 
 fn render_census_row(lines: &mut Vec<String>, row: &BranchCarriage) {
-    lines.push(format!("  {} @ {}", row.branch, row.tip.short()));
+    lines.push(format!(
+        "  {} @ {}",
+        crate::ledger::inline_human_text(&row.branch),
+        row.tip.short()
+    ));
     lines.extend(row.checks.iter().map(|check| render_check(check, "    ")));
     let pull = match row.in_open_pull {
         Some(true) => "yes",
@@ -601,9 +611,9 @@ fn render_census_row(lines: &mut Vec<String>, row: &BranchCarriage) {
 
 /// Render the human-readable form of a multi-target carriage report.
 ///
-/// The revision is the caller's own argument and a check target is a name jj
-/// holds in a ref; a note and a problem quote jj and the forge, so those
-/// reach the terminal escaped.
+/// The revision is the caller's own argument; a check target is a name read
+/// from the repository's refs, and a note and a problem quote jj and the
+/// forge, so those reach the terminal escaped.
 pub fn render_carries(report: &CarriesReport) -> String {
     let mut lines = vec![format!("{}: {}", report.repo, report.revision)];
     lines.extend(report.checks.iter().map(|check| render_check(check, "  ")));
@@ -639,11 +649,11 @@ fn render_check(check: &TargetCheck, indent: &str) -> String {
     };
     let target = if check.target.is_empty() {
         match check.role {
-            TargetRole::UpstreamTrunk => "upstream trunk",
-            TargetRole::LiveRelease | TargetRole::SupersededRelease => "unnamed release",
+            TargetRole::UpstreamTrunk => "upstream trunk".to_owned(),
+            TargetRole::LiveRelease | TargetRole::SupersededRelease => "unnamed release".to_owned(),
         }
     } else {
-        check.target.as_str()
+        crate::ledger::inline_human_text(&check.target)
     };
     format!(
         "{indent}{verdict:<19}{target} @ {}  (evidence {}: {reason})",
@@ -800,8 +810,9 @@ mod tests {
     use crate::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName};
 
     use super::{
-        CarriesReport, CarryCheck, CarryVerdict, CensusInput, CensusReport, CensusTargets, Target,
-        TargetRole, census_member, orphan_status, render_carries, render_census, targets,
+        BranchCarriage, CarriesReport, CarryCheck, CarryVerdict, CensusInput, CensusReport,
+        CensusTargets, Target, TargetCheck, TargetRole, census_member, orphan_status,
+        render_carries, render_census, targets,
     };
 
     fn local(name: &str) -> BookmarkRef {
@@ -1104,6 +1115,55 @@ mod tests {
         );
         assert!(
             carries.contains("  note: gh said \u{fffd}2J"),
+            "was: {carries:?}"
+        );
+    }
+
+    #[test]
+    fn a_census_escapes_the_branch_orphan_and_target_names_it_read_from_refs() {
+        // git takes `refs/heads/feat<U+009B>m`, and jj imports it from a remote
+        // as the bookmark `feat<U+009B>m@origin`.
+        let check = || TargetCheck {
+            target: "release/\u{9b}2J".to_owned(),
+            commit: CommitId::new("aaaa"),
+            role: TargetRole::LiveRelease,
+            verdict: CarryVerdict::CarriedExact,
+            evidence: CommitId::new("bbbb"),
+        };
+        let census = CensusReport {
+            repo: "demo".to_owned(),
+            rows: vec![BranchCarriage {
+                branch: "feat\u{9b}m".to_owned(),
+                tip: CommitId::new("cccc"),
+                checks: vec![check()],
+                in_open_pull: Some(false),
+                orphan: Some(true),
+            }],
+            orphans: vec!["feat\u{9b}m".to_owned()],
+            notes: Vec::new(),
+            problems: Vec::new(),
+        };
+        let carries = CarriesReport {
+            repo: "demo".to_owned(),
+            revision: "@".to_owned(),
+            checks: vec![check()],
+            notes: Vec::new(),
+            problems: Vec::new(),
+        };
+
+        let census = render_census(&census);
+        let carries = render_carries(&carries);
+
+        for text in [&census, &carries] {
+            assert!(
+                !text.chars().any(|c| c.is_control() && c != '\n'),
+                "was: {text:?}"
+            );
+        }
+        assert!(census.contains("  feat\u{fffd}m @ cccc"), "was: {census:?}");
+        assert!(census.contains("\n  feat\u{fffd}m"), "was: {census:?}");
+        assert!(
+            carries.contains("release/\u{fffd}2J @ aaaa"),
             "was: {carries:?}"
         );
     }

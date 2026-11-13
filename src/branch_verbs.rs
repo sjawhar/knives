@@ -828,7 +828,7 @@ fn displacement(target: &BranchTarget, owner: &str, change: ClaimChange, lost: &
         inline_human_text(&lost.owner),
         inline_human_text(owner),
         target.key(),
-        lost.ts,
+        inline_human_text(&lost.ts),
     )
 }
 

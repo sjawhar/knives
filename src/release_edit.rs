@@ -11,7 +11,7 @@ use knives::commands::claim::Bound;
 use knives::commands::release;
 use knives::forge::github::CliForge;
 use knives::ids::{BranchName, CommitId, ReleaseScheme, RepoName};
-use knives::ledger::{Draft, Ledger};
+use knives::ledger::{Draft, Ledger, inline_human_text};
 use knives::release_model::{
     MemberEvidence, MemberHistory, MemberLookup, MemberSuccession, SeriesFit,
     StackedHistoryContext, carried_from_tips, carries_member_line, last_recorded_parents,
@@ -83,6 +83,12 @@ impl ReleaseInHand {
             trunk_tips: trunk_positions(opened, entry)?,
         })
     }
+
+    /// The release's name for a terminal line: a name read from the
+    /// repository, which a remote can give a C1 character.
+    fn shown_name(&self) -> String {
+        inline_human_text(&self.name)
+    }
 }
 
 /// Everything an edit reads: whose release, which repository, which release,
@@ -127,16 +133,20 @@ impl EditContext<'_> {
             SeriesFit::Selected => Ok(false),
             SeriesFit::Other(label) => {
                 println!(
-                    "{}: {branch} forks from the base of the {label}, not {}'s; \
+                    "{}: {} forks from the base of the {label}, not {}'s; \
                      refusing {before}: `knives release --series <name>` acts on its series",
-                    self.repo, self.release.name
+                    self.repo,
+                    inline_human_text(branch),
+                    self.release.shown_name()
                 );
                 Ok(true)
             }
             SeriesFit::None(why) => {
+                // `why` names repos.toml bases and commit ids (`series_fit`).
                 println!(
-                    "{}: {branch} belongs to no release series: {why}; refusing {before}",
-                    self.repo
+                    "{}: {} belongs to no release series: {why}; refusing {before}",
+                    self.repo,
+                    inline_human_text(branch)
                 );
                 Ok(true)
             }
@@ -180,18 +190,20 @@ impl EditContext<'_> {
             MemberHistory::CarriedMerges { merges, own } => {
                 let listed: Vec<&str> = merges.iter().map(knives::ids::CommitId::short).collect();
                 println!(
-                    "{}: {branch}'s history carries merge(s) {} whose other lines {} already \
+                    "{}: {}'s history carries merge(s) {} whose other lines {} already \
                      carries; it brings only its own {own} commit(s)",
                     self.repo,
+                    inline_human_text(branch),
                     listed.join(", "),
-                    self.release.name
+                    self.release.shown_name()
                 );
                 Ok(Some(true))
             }
             MemberHistory::Stacked(stacked) => {
                 println!(
                     "{}: {}; rebase it off the trunk before {before}",
-                    self.repo, stacked.detail
+                    self.repo,
+                    inline_human_text(&stacked.detail)
                 );
                 Ok(None)
             }
@@ -257,7 +269,7 @@ impl EditContext<'_> {
                     {
                         println!(
                             "{repo}: {}; rebase it off the trunk before advancing onto it",
-                            stacked.detail
+                            inline_human_text(&stacked.detail)
                         );
                         return Ok(false);
                     }
@@ -267,9 +279,10 @@ impl EditContext<'_> {
                         "include"
                     };
                     println!(
-                        "{repo}: {branch}'s history carries merges of lines {} already \
+                        "{repo}: {}'s history carries merges of lines {} already \
                          carries; a bare advance leaves it alone: {verb} it by name",
-                        release.name
+                        inline_human_text(branch),
+                        release.shown_name()
                     );
                 }
                 Ok(false)
@@ -277,7 +290,7 @@ impl EditContext<'_> {
             MemberHistory::Stacked(stacked) => {
                 println!(
                     "{repo}: {}; rebase it off the trunk before advancing onto it",
-                    stacked.detail
+                    inline_human_text(&stacked.detail)
                 );
                 Ok(false)
             }
@@ -305,7 +318,7 @@ impl EditContext<'_> {
         if let MemberHistory::Stacked(stacked) = member_history(self.stacked, branch, tip)? {
             println!(
                 "{repo}: {}; rebase it off the trunk before advancing onto it",
-                stacked.detail
+                inline_human_text(&stacked.detail)
             );
             return Ok(None);
         }
@@ -313,15 +326,16 @@ impl EditContext<'_> {
         if self.refuse_if_trunk_has(branch, tip, lookup.parents.first())? {
             return Ok(None);
         }
+        let shown_branch = inline_human_text(branch);
         match (lookup.parents.first(), lookup.evidence) {
             (Some(recorded), MemberEvidence::Record) => println!(
-                "{repo}: {branch} matched {} by the last cut or edit record only; nothing in \
-                 the repository ties them (no ancestry, no shared change id)",
+                "{repo}: {shown_branch} matched {} by the last cut or edit record only; nothing \
+                 in the repository ties them (no ancestry, no shared change id)",
                 recorded.short()
             ),
             (Some(recorded), MemberEvidence::LandedRecord) => println!(
-                "{repo}: {branch} matched {} by the last cut or edit record; that parent has \
-                 landed upstream, so the branch's tip continues it only by name",
+                "{repo}: {shown_branch} matched {} by the last cut or edit record; that parent \
+                 has landed upstream, so the branch's tip continues it only by name",
                 recorded.short()
             ),
             (_, MemberEvidence::Succession) | (None, _) => {}
@@ -329,10 +343,10 @@ impl EditContext<'_> {
         if self.integrates(branch, tip, &lookup)? {
             let listed: Vec<&str> = lookup.parents.iter().map(CommitId::short).collect();
             println!(
-                "{repo}: {branch} merges {} member(s) of {} ({}) and builds on them; `knives \
-                 release include {branch}` adds it beside them",
+                "{repo}: {shown_branch} merges {} member(s) of {} ({}) and builds on them; \
+                 `knives release include {shown_branch}` adds it beside them",
                 lookup.parents.len(),
-                release.name,
+                release.shown_name(),
                 listed.join(", ")
             );
             return Ok(None);
@@ -356,20 +370,23 @@ impl EditContext<'_> {
         if !knives::release_model::trunk_reaches(self.opened, &self.release.trunk_tips, tip)? {
             return Ok(false);
         }
+        let shown_branch = inline_human_text(branch);
         match carried {
             None => println!(
-                "{}: the trunk already has {branch}, tip included, so it is not a member of \
-                 {}: a parent the trunk reaches is a base, and taking it as one would move the \
-                 shared base; `knives release rebase` onto a trunk that has it brings it in",
-                self.repo, self.release.name
+                "{}: the trunk already has {shown_branch}, tip included, so it is not a member \
+                 of {}: a parent the trunk reaches is a base, and taking it as one would move \
+                 the shared base; `knives release rebase` onto a trunk that has it brings it in",
+                self.repo,
+                self.release.shown_name()
             ),
             Some(parent) => println!(
-                "{}: the trunk already has the whole of {branch}, past the {} that {} carries \
-                 for it; moving the member onto a tip the trunk reaches would make it a base \
-                 parent; `knives release rebase` retires the landed parent and brings the rest in",
+                "{}: the trunk already has the whole of {shown_branch}, past the {} that {} \
+                 carries for it; moving the member onto a tip the trunk reaches would make it a \
+                 base parent; `knives release rebase` retires the landed parent and brings the \
+                 rest in",
                 self.repo,
                 parent.short(),
-                self.release.name
+                self.release.shown_name()
             ),
         }
         Ok(true)
@@ -414,10 +431,13 @@ pub(crate) fn published_refusal(
 ) -> anyhow::Result<Option<String>> {
     Ok(
         release::published_release(opened, ledger, release)?.map(|evidence| {
+            // The release is a name read from the repository; the evidence
+            // quotes a tag or a ledger entry.
             format!(
-                "{} is published ({evidence}); {doing} it would move a published release: cut a \
+                "{} is published ({}); {doing} it would move a published release: cut a \
                  new dated release first, then {todo} that",
-                release.name
+                inline_human_text(release.name),
+                inline_human_text(&evidence)
             )
         }),
     )
@@ -442,13 +462,14 @@ fn refuse_if_frozen(
     {
         return false;
     }
+    let shown_release = inline_human_text(release_name);
     match scheme {
         ReleaseScheme::Dated | ReleaseScheme::Series(_) => println!(
-            "{repo}: every pin of {release_name} is frozen, so editing it would reach nobody; \
+            "{repo}: every pin of {shown_release} is frozen, so editing it would reach nobody; \
              cut a new dated release first"
         ),
         ReleaseScheme::Fixed(_) => println!(
-            "{repo}: every pin of {release_name} is frozen, so editing the fixed branch would \
+            "{repo}: every pin of {shown_release} is frozen, so editing the fixed branch would \
              reach nobody; update the frozen consumer pins, or change the release scheme before \
              editing it (fixed branches cannot reach revision pins)"
         ),
@@ -614,10 +635,13 @@ fn apply_edit(
         },
         context.bound,
     )?;
+    // The delta names branches read from the repository, and the reason the
+    // caller gave; the ledger keeps it raw.
     println!(
-        "{repo}: {} now has {} parent(s): {delta}",
-        release.name,
-        new_parents.len()
+        "{repo}: {} now has {} parent(s): {}",
+        release.shown_name(),
+        new_parents.len(),
+        inline_human_text(delta)
     );
     report_replaced(repo, &release.name, &written);
     match knives::jj::conflicted_files(&fork.checkout.path, created.as_str()) {
@@ -634,16 +658,39 @@ pub(crate) fn report_replaced(
     release: &str,
     written: &knives::jj::ReleaseWritten,
 ) {
+    for line in replaced_lines(repo, release, written) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`report_replaced`] prints. The release is a name read from the
+/// repository, and what keeps the old commit (`what_keeps`, src/jj.rs) names
+/// bookmarks, tags and jj workspaces, so each is escaped.
+fn replaced_lines(
+    repo: &RepoName,
+    release: &str,
+    written: &knives::jj::ReleaseWritten,
+) -> Vec<String> {
+    let shown_release = inline_human_text(release);
+    let mut lines = Vec::new();
     if let Some(replaced) = &written.replaced {
         let old = replaced.commit.short();
-        match &replaced.kept {
-            None => println!("{repo}: abandoned {old}, the {release} commit this write replaced"),
-            Some(reason) => println!(
-                "{repo}: note: kept {old}, the {release} commit this write replaced: {reason}"
-            ),
-        }
+        lines.push(replaced.kept.as_ref().map_or_else(
+            || format!("{repo}: abandoned {old}, the {shown_release} commit this write replaced"),
+            |reason| {
+                format!(
+                    "{repo}: note: kept {old}, the {shown_release} commit this write replaced: {}",
+                    inline_human_text(reason)
+                )
+            },
+        ));
     }
-    report_abandoned_earlier(repo, release, &written.abandoned_earlier);
+    lines.extend(abandoned_earlier_lines(
+        repo,
+        release,
+        &written.abandoned_earlier,
+    ));
+    lines
 }
 
 /// One line per earlier write of `release` abandoned because nothing rests on
@@ -653,12 +700,26 @@ pub(crate) fn report_abandoned_earlier(
     release: &str,
     abandoned: &[knives::ids::CommitId],
 ) {
-    for commit in abandoned {
-        println!(
-            "{repo}: abandoned {}, an earlier {release} commit nothing rests on any more",
-            commit.short()
-        );
+    for line in abandoned_earlier_lines(repo, release, abandoned) {
+        println!("{line}");
     }
+}
+
+fn abandoned_earlier_lines(
+    repo: &RepoName,
+    release: &str,
+    abandoned: &[knives::ids::CommitId],
+) -> Vec<String> {
+    let shown_release = inline_human_text(release);
+    abandoned
+        .iter()
+        .map(|commit| {
+            format!(
+                "{repo}: abandoned {}, an earlier {shown_release} commit nothing rests on any more",
+                commit.short()
+            )
+        })
+        .collect()
 }
 
 /// The commits the fork's ledger records knives writing under `release`.
@@ -751,13 +812,16 @@ pub(crate) fn release_is_locally_movable(
     if opened.local_bookmark_tip(name).is_some() {
         return true;
     }
+    let shown = inline_human_text(name);
     match knives::ids::BookmarkRef::parse(name) {
         knives::ids::BookmarkRef::Remote { branch, remote } => println!(
-            "{repo}: {name} is here only as a remote ref, so there is no local bookmark to \
-             move; `jj bookmark track {branch}@{remote}` first"
+            "{repo}: {shown} is here only as a remote ref, so there is no local bookmark to \
+             move; `jj bookmark track {}@{}` first",
+            inline_human_text(branch.as_str()),
+            inline_human_text(remote.as_str())
         ),
         knives::ids::BookmarkRef::Local(_) => println!(
-            "{repo}: {name} has no single local position, so there is nothing to move; \
+            "{repo}: {shown} has no single local position, so there is nothing to move; \
              resolve its divergence first"
         ),
     }
@@ -770,15 +834,19 @@ fn include_edit(
     why: Option<&str>,
 ) -> anyhow::Result<EditOutcome> {
     let (repo, opened, release) = (context.repo, context.opened, context.release);
+    // The caller typed the target, but these lines are the ones that print
+    // the release's own name beside it, and the caller may have copied the
+    // target from a remote bookmark jj imported.
+    let (shown_target, shown_release) = (inline_human_text(target), release.shown_name());
     let tip = opened
         .local_bookmark_tip(target)
         .or_else(|| opened.resolve_commit(target).ok());
     let Some(tip) = tip else {
-        println!("{repo}: {target} is neither a local bookmark nor a resolvable revision");
+        println!("{repo}: {shown_target} is neither a local bookmark nor a resolvable revision");
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     };
     if release.parents.contains(&tip) {
-        println!("{repo}: {} already carries {target}", release.name);
+        println!("{repo}: {shown_release} already carries {shown_target}");
         return Ok(EditOutcome::Settled(Exit::Ok));
     }
     if opened.is_ancestor(&release.commit, &tip)? {
@@ -786,9 +854,8 @@ fn include_edit(
         // the cut in its own successor's ancestry, and it carries the whole
         // release with it rather than one branch's work.
         println!(
-            "{repo}: {target} is stacked on {}, so it is not a member of it; rebase it off \
-             the trunk to include it",
-            release.name
+            "{repo}: {shown_target} is stacked on {shown_release}, so it is not a member of it; \
+             rebase it off the trunk to include it"
         );
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
@@ -798,9 +865,9 @@ fn include_edit(
         // this is not a member; say which situation holds rather than
         // pretending the include happened.
         println!(
-            "{repo}: {target}'s content is already in {} through another parent's history; \
-             it is not a member parent itself, and whichever parent carries it represents it",
-            release.name
+            "{repo}: {shown_target}'s content is already in {shown_release} through another \
+             parent's history; it is not a member parent itself, and whichever parent carries \
+             it represents it"
         );
         return Ok(EditOutcome::Settled(Exit::Ok));
     }
@@ -810,9 +877,8 @@ fn include_edit(
         // member scan below, because a member that landed upstream is an
         // ancestor of the trunk and would otherwise answer for it.
         println!(
-            "{repo}: {target} is the trunk, not a feature or fix branch; {} carries \
-             upstream through its members' bases, never as a parent",
-            release.name
+            "{repo}: {shown_target} is the trunk, not a feature or fix branch; {shown_release} \
+             carries upstream through its members' bases, never as a parent"
         );
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
@@ -833,9 +899,9 @@ fn include_edit(
     if integrates {
         let listed: Vec<&str> = lookup.parents.iter().map(CommitId::short).collect();
         println!(
-            "{repo}: {target} builds on {} member(s) of {} ({}), which stay members",
+            "{repo}: {shown_target} builds on {} member(s) of {shown_release} ({}), which stay \
+             members",
             lookup.parents.len(),
-            release.name,
             listed.join(", ")
         );
     } else if let Some(parent) =
@@ -850,7 +916,7 @@ fn include_edit(
         {
             println!(
                 "{repo}: {}; rebase it off the trunk before advancing onto it",
-                stacked.detail
+                inline_human_text(&stacked.detail)
             );
             return Ok(EditOutcome::Settled(Exit::Incomplete));
         }
@@ -859,24 +925,21 @@ fn include_edit(
         let parent = parent.short();
         match lookup.evidence {
             MemberEvidence::Succession => println!(
-                "{repo}: {} carries {parent} of {target}, and the branch has moved on (grown or \
-                 rebased); moving a member is its own decision: `knives release advance \
-                 {target}`",
-                release.name
+                "{repo}: {shown_release} carries {parent} of {shown_target}, and the branch has \
+                 moved on (grown or rebased); moving a member is its own decision: `knives \
+                 release advance {shown_target}`"
             ),
             MemberEvidence::Record => println!(
-                "{repo}: {} carries {target} as {parent} per its last cut or edit, and the \
-                 branch has moved on without ancestry or change ids back to it (rebased \
-                 outside jj?); including it again would carry it twice: `knives release \
-                 advance {target}` moves it through that record",
-                release.name
+                "{repo}: {shown_release} carries {shown_target} as {parent} per its last cut or \
+                 edit, and the branch has moved on without ancestry or change ids back to it \
+                 (rebased outside jj?); including it again would carry it twice: `knives \
+                 release advance {shown_target}` moves it through that record"
             ),
             MemberEvidence::LandedRecord => println!(
-                "{repo}: {} carries {target} as {parent} per its last cut or edit, and \
-                 {parent} has landed upstream; including the branch again would carry it \
-                 twice: `knives release advance {target}` moves the member to the branch's \
-                 tip, `knives release rebase` retires the landed parent",
-                release.name
+                "{repo}: {shown_release} carries {shown_target} as {parent} per its last cut or \
+                 edit, and {parent} has landed upstream; including the branch again would carry \
+                 it twice: `knives release advance {shown_target}` moves the member to the \
+                 branch's tip, `knives release rebase` retires the landed parent"
             ),
         }
         return Ok(EditOutcome::Settled(Exit::Incomplete));
@@ -891,6 +954,7 @@ fn include_edit(
 /// Remove one member parent. The branch and its bookmark are untouched.
 fn drop_edit(context: &EditContext<'_>, target: &str, why: &str) -> anyhow::Result<EditOutcome> {
     let (repo, opened, release) = (context.repo, context.opened, context.release);
+    let (shown_target, shown_release) = (inline_human_text(target), release.shown_name());
     let mut candidates = Vec::new();
     if let Some(tip) = opened.local_bookmark_tip(target) {
         if release.parents.contains(&tip) {
@@ -908,14 +972,14 @@ fn drop_edit(context: &EditContext<'_>, target: &str, why: &str) -> anyhow::Resu
             candidates.push(commit);
         }
     } else {
-        println!("{repo}: {target} is neither a local bookmark nor a resolvable revision");
+        println!("{repo}: {shown_target} is neither a local bookmark nor a resolvable revision");
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
     match candidates.as_slice() {
         [] => {
             println!(
-                "{repo}: {} carries no parent of {target}; name the parent's commit id",
-                release.name
+                "{repo}: {shown_release} carries no parent of {shown_target}; name the parent's \
+                 commit id"
             );
             Ok(EditOutcome::Settled(Exit::Incomplete))
         }
@@ -936,7 +1000,7 @@ fn drop_edit(context: &EditContext<'_>, target: &str, why: &str) -> anyhow::Resu
             }
             if !carried_elsewhere {
                 println!(
-                    "{repo}: no remaining member carries {target}'s content; the release \
+                    "{repo}: no remaining member carries {shown_target}'s content; the release \
                      loses it"
                 );
             }
@@ -946,9 +1010,9 @@ fn drop_edit(context: &EditContext<'_>, target: &str, why: &str) -> anyhow::Resu
         many => {
             let listed: Vec<&str> = many.iter().map(CommitId::short).collect();
             println!(
-                "{repo}: {target} matches {} parents of {} ({}); name one by commit id",
+                "{repo}: {shown_target} matches {} parents of {shown_release} ({}); name one by \
+                 commit id",
                 many.len(),
-                release.name,
                 listed.join(", ")
             );
             Ok(EditOutcome::Settled(Exit::Incomplete))
@@ -1007,7 +1071,8 @@ fn advance_edit(
         if branches.is_empty() {
             println!(
                 "{}: every member of {} is at its branch tip",
-                context.repo, context.release.name
+                context.repo,
+                context.release.shown_name()
             );
         }
         return Ok(EditOutcome::Settled(Exit::Ok));
@@ -1067,11 +1132,12 @@ fn advance_every_member(
             [] => {}
             [(branch, tip)] => advances.push((index, branch.clone(), tip.clone())),
             many => {
+                // Bookmark names read from the repository.
                 let names: Vec<String> = many.iter().map(|(branch, _)| branch.clone()).collect();
                 ambiguous.push(format!(
                     "parent {} has several advanced branches ({})",
                     parent.short(),
-                    names.join(", ")
+                    inline_human_text(&names.join(", "))
                 ));
             }
         }
@@ -1106,9 +1172,10 @@ fn advance_every_member(
         for (branch, stale_parents) in &overreaching {
             let listed: Vec<&str> = stale_parents.iter().map(CommitId::short).collect();
             println!(
-                "{repo}: {branch} descends from {} parents of {} ({}); drop and include instead",
+                "{repo}: {} descends from {} parents of {} ({}); drop and include instead",
+                inline_human_text(branch),
                 stale_parents.len(),
-                release.name,
+                release.shown_name(),
                 listed.join(", ")
             );
         }
@@ -1133,9 +1200,11 @@ fn advance_named_members(
     branches: &[BranchName],
 ) -> anyhow::Result<Option<(Vec<knives::ids::CommitId>, Vec<String>)>> {
     let (repo, opened, release) = (context.repo, context.opened, context.release);
+    let shown_release = release.shown_name();
     let mut parents = release.parents.clone();
     let mut moved: Vec<String> = Vec::new();
     for branch in branches {
+        let shown_branch = inline_human_text(branch.as_str());
         let named = carried
             .iter()
             .find(|(carried, _)| carried == branch.as_str())
@@ -1146,24 +1215,22 @@ fn advance_named_members(
                 // can never carry, and naming one here reached the same mover the
                 // bare advance deliberately keeps them away from.
                 println!(
-                    "{repo}: {branch} is the trunk or a release name, so it is never a member \
-                     of {}",
-                    release.name
+                    "{repo}: {shown_branch} is the trunk or a release name, so it is never a \
+                     member of {shown_release}"
                 );
             } else {
-                println!("{repo}: no local bookmark named {branch}");
+                println!("{repo}: no local bookmark named {shown_branch}");
             }
             return Ok(None);
         };
         if parents.contains(&tip) {
-            println!("{repo}: {branch} is already at its tip in {}", release.name);
+            println!("{repo}: {shown_branch} is already at its tip in {shown_release}");
             continue;
         }
         if opened.is_ancestor(&release.commit, &tip)? {
             println!(
-                "{repo}: {branch} is stacked on {}, so advancing a member onto it would fold \
-                 in work nobody included and put the cut in its own ancestry",
-                release.name
+                "{repo}: {shown_branch} is stacked on {shown_release}, so advancing a member \
+                 onto it would fold in work nobody included and put the cut in its own ancestry"
             );
             return Ok(None);
         }
@@ -1180,9 +1247,8 @@ fn advance_named_members(
         match (lookup.parents.as_slice(), replaced) {
             ([], _) => {
                 println!(
-                    "{repo}: {} carries no parent of {branch}; `knives release include \
-                     {branch}` adds it",
-                    release.name
+                    "{repo}: {shown_release} carries no parent of {shown_branch}; `knives \
+                     release include {shown_branch}` adds it"
                 );
                 return Ok(None);
             }
@@ -1207,10 +1273,9 @@ fn advance_named_members(
             (many, None) => {
                 let listed: Vec<&str> = many.iter().map(CommitId::short).collect();
                 println!(
-                    "{repo}: {branch} descends from {} parents of {} ({}); drop and \
-                     include instead",
+                    "{repo}: {shown_branch} descends from {} parents of {shown_release} ({}); \
+                     drop and include instead",
                     many.len(),
-                    release.name,
                     listed.join(", ")
                 );
                 return Ok(None);
@@ -1237,6 +1302,7 @@ fn advance_named_member_from(
     old: &knives::ids::CommitId,
 ) -> anyhow::Result<Option<(Vec<knives::ids::CommitId>, Vec<String>)>> {
     let (repo, opened, release) = (context.repo, context.opened, context.release);
+    let (shown_branch, shown_release) = (inline_human_text(branch.as_str()), release.shown_name());
     let Some(tip) = carried
         .iter()
         .find(|(carried, _)| carried == branch.as_str())
@@ -1244,20 +1310,18 @@ fn advance_named_member_from(
     else {
         if opened.local_bookmark_tip(branch.as_str()).is_some() {
             println!(
-                "{repo}: {branch} is the trunk or a release name, so it is never a member \
-                 of {}",
-                release.name
+                "{repo}: {shown_branch} is the trunk or a release name, so it is never a member \
+                 of {shown_release}"
             );
         } else {
-            println!("{repo}: no local bookmark named {branch}");
+            println!("{repo}: no local bookmark named {shown_branch}");
         }
         return Ok(None);
     };
     if opened.is_ancestor(&release.commit, &tip)? {
         println!(
-            "{repo}: {branch} is stacked on {}, so advancing a member onto it would fold in \
-             work nobody included and put the cut in its own ancestry",
-            release.name
+            "{repo}: {shown_branch} is stacked on {shown_release}, so advancing a member onto \
+             it would fold in work nobody included and put the cut in its own ancestry"
         );
         return Ok(None);
     }
@@ -1279,15 +1343,14 @@ fn advance_named_member_from(
     }
     let mut parents = release.parents.clone();
     if parents.contains(&tip) {
-        println!("{repo}: {branch} is already at its tip in {}", release.name);
+        println!("{repo}: {shown_branch} is already at its tip in {shown_release}");
         return Ok(Some((parents, Vec::new())));
     }
     let Some(index) = parents.iter().position(|parent| parent == old) else {
         println!(
-            "{repo}: {} is not a parent of {}; `knives release include {branch}` adds \
-             {branch} instead",
-            old.short(),
-            release.name
+            "{repo}: {} is not a parent of {shown_release}; `knives release include \
+             {shown_branch}` adds {shown_branch} instead",
+            old.short()
         );
         return Ok(None);
     };
@@ -1295,4 +1358,41 @@ fn advance_named_member_from(
         *slot = tip;
     }
     Ok(Some((parents, vec![branch.to_string()])))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use knives::ids::ChangeId;
+    use knives::jj::{ReleaseWritten, ReplacedRelease};
+
+    #[test]
+    fn a_kept_replaced_commit_names_its_workspace_and_release_escaped() {
+        // `jj workspace add --name` accepts ESC and C1; `what_keeps` names
+        // the workspace whose working copy rests on the replaced commit.
+        let written = ReleaseWritten {
+            commit: CommitId::new("aaaa"),
+            change: ChangeId::new("zzzz"),
+            replaced: Some(ReplacedRelease {
+                commit: CommitId::new("bbbb"),
+                kept: Some("the working copy of workspace ws\u{1b}x\u{9b}y rests on it".to_owned()),
+            }),
+            abandoned_earlier: vec![CommitId::new("cccc")],
+        };
+
+        let lines = replaced_lines(&RepoName::new("demo"), "release/x\u{9b}2J", &written);
+
+        for line in &lines {
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+        }
+        assert_eq!(
+            lines,
+            [
+                "demo: note: kept bbbb, the release/x\u{fffd}2J commit this write replaced: the \
+                 working copy of workspace ws\u{fffd}x\u{fffd}y rests on it",
+                "demo: abandoned cccc, an earlier release/x\u{fffd}2J commit nothing rests on any \
+                 more",
+            ]
+        );
+    }
 }

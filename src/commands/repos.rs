@@ -436,10 +436,10 @@ pub fn gather(input: &GatherInput<'_>) -> Report {
 /// One line per repository, with what could not be answered below it.
 ///
 /// A repository's name is a registry key and its release remote a registry
-/// value, and the newest release is a git ref no control character reaches;
-/// the checkout path comes off disk, the lag line quotes what a consumer
-/// repository pins, and a note or a problem quotes git, jj or the forge, so
-/// those reach the terminal escaped.
+/// value. The newest release is a ref read from a repository, which a remote
+/// can give a C1 character; the checkout path comes off disk, the lag line
+/// quotes what a consumer repository pins, and a note or a problem quotes
+/// git, jj or the forge, so those reach the terminal escaped.
 pub fn render(report: &Report) -> String {
     let mut lines = Vec::new();
     let note_line = |note: &String| inline_human_text(note);
@@ -473,7 +473,7 @@ pub fn render(report: &Report) -> String {
         }
         match &repo.newest_release {
             Some(newest) => {
-                let _ = write!(line, "  newest={newest}");
+                let _ = write!(line, "  newest={}", inline_human_text(newest));
             }
             None => line.push_str("  newest=none"),
         }
@@ -1231,9 +1231,9 @@ mod tests {
     #[test]
     fn render_escapes_the_checkout_path_the_lag_and_every_note_and_problem() {
         // The path comes off disk, the lag line quotes what a consumer
-        // repository pins, and the notes and problems quote git and the
-        // forge; the registry key, its release remote and the release ref
-        // are what the registry and git hold.
+        // repository pins, the newest release is a ref a remote can give a
+        // C1 character, and the notes and problems quote git and the forge;
+        // the registry key and its release remote are what the registry holds.
         let report = Report {
             repos: vec![RepoRow {
                 name: "tool".to_owned(),
@@ -1243,7 +1243,7 @@ mod tests {
                 ambiguous: 0,
                 disagrees: false,
                 release_remote: Some("release".to_owned()),
-                newest_release: Some("release/2026-08-05@origin".to_owned()),
+                newest_release: Some("release/2026-08-05\u{9b}m@origin".to_owned()),
                 behind: Some("acme/behind pins release/\u{7}2026-07-20".to_owned()),
                 notes: vec!["could not compare: \u{1b}]0;pwned\u{7}".to_owned()],
                 problems: vec!["gh said\nfatal: \u{1b}[31mno".to_owned()],
@@ -1261,7 +1261,7 @@ mod tests {
         assert!(
             text.contains(
                 "tool  /home/me/\u{fffd}[2Jtool  release-remote=release  \
-                 newest=release/2026-08-05@origin  BEHIND: acme/behind pins \
+                 newest=release/2026-08-05\u{fffd}m@origin  BEHIND: acme/behind pins \
                  release/\u{fffd}2026-07-20"
             ),
             "was: {text:?}"

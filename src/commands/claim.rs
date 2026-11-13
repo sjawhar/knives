@@ -118,9 +118,11 @@ pub fn render_claim_context(
 
 /// Renders a compact claim row for an advisory surface.
 ///
-/// The owner name and the reason are another session's text, escaped for the
-/// same reason [`render_claim_context`] escapes them: these rows are printed
-/// by the session hook, into the terminal of a caller that wrote none of it.
+/// The subject, the owner name and the reason are another session's text,
+/// escaped for the same reason [`render_claim_context`] escapes them: these
+/// rows are printed by the session hook, into the terminal of a caller that
+/// wrote none of it. The subject is the branch the state file records, which
+/// a ref read from a remote can give a C1 character.
 pub fn render_claim_line(
     subject: &str,
     claim: &Claim,
@@ -130,7 +132,8 @@ pub fn render_claim_line(
     let claimed_age =
         crate::ledger::age(&claim.started, now).unwrap_or_else(|| "unknown".to_owned());
     format!(
-        "{subject} ({}, {}, claimed {claimed_age} ago, {}): {}",
+        "{} ({}, {}, claimed {claimed_age} ago, {}): {}",
+        crate::ledger::inline_human_text(subject),
         crate::ledger::inline_human_text(&claim.owner),
         owner_kind_label(claim.kind),
         render_last_seen(last_seen, now),

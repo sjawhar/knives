@@ -397,12 +397,12 @@ pub fn exit_for(report: &Report) -> Exit {
 
 /// Render a compact census for an interactive terminal.
 ///
-/// The fork is a registry key, a consumer is named as the registry or the
-/// caller named it, and a release reference is a git ref no control
-/// character reaches. What a consumer repository holds — a pin's file, its
-/// reference, the commit it locks — and every problem or note quoting git,
-/// jj or the forge reaches the terminal escaped; the pin's kind and each
-/// verdict are this module's own words.
+/// The fork is a registry key and a consumer is named as the registry or the
+/// caller named it. A release reference is a ref read from the release
+/// remote, which can give it a C1 character; it, what a consumer repository
+/// holds — a pin's file, its reference, the commit it locks — and every
+/// problem or note quoting git, jj or the forge reach the terminal escaped;
+/// the pin's kind and each verdict are this module's own words.
 pub fn render(report: &Report) -> String {
     let mut lines = report.newest.as_ref().map_or_else(
         || format!("{}: newest release unavailable", report.fork),
@@ -410,7 +410,7 @@ pub fn render(report: &Report) -> String {
             format!(
                 "{}: newest {} @ {} (release remote, {})",
                 report.fork,
-                newest.reference,
+                inline_human_text(&newest.reference),
                 inline_human_text(short_id(&newest.commit)),
                 newest.source
             )
@@ -461,7 +461,9 @@ fn render_verdict(verdict: &PinVerdict) -> String {
                 inline_human_text(short_id(expected))
             )
         }
-        PinVerdict::BehindName { newest } => format!("behind: newest is {newest}"),
+        PinVerdict::BehindName { newest } => {
+            format!("behind: newest is {}", inline_human_text(newest))
+        }
         PinVerdict::UnknownName => "unknown release".to_owned(),
         PinVerdict::OffScheme => "off-scheme reference".to_owned(),
     }
@@ -767,11 +769,15 @@ mod tests {
 
     #[test]
     fn render_escapes_what_a_consumer_repository_and_a_tool_answered() {
-        // A pin's file and reference are a consumer repository's content; a
-        // problem and a note quote git, jj or the forge.
+        // A pin's file and reference are a consumer repository's content, the
+        // newest release is a ref the release remote can give a C1 character,
+        // and a problem and a note quote git, jj or the forge.
         let report = Report {
             fork: "demo".to_owned(),
-            newest: Some(release("release/2026-08-05", "aaaa\u{1b}[2Jaaaaaaaa")),
+            newest: Some(release(
+                "release/2026-08-05\u{9b}m",
+                "aaaa\u{1b}[2Jaaaaaaaa",
+            )),
             consumers: vec![ConsumerRow {
                 consumer: "acme/consumer".to_owned(),
                 pins: vec![PinRow {
@@ -780,7 +786,9 @@ mod tests {
                     reference: "release/\u{7}2026-01-01".to_owned(),
                     kind: "tag".to_owned(),
                     locked: Some("bbbb\u{1b}bbbbbbbb".to_owned()),
-                    verdict: Some(PinVerdict::UnknownName),
+                    verdict: Some(PinVerdict::BehindName {
+                        newest: "release/2026-08-05\u{9d}m".to_owned(),
+                    }),
                 }],
                 notes: vec!["forge unreachable: \u{1b}]0;pwned\u{7}".to_owned()],
                 problem: None,
@@ -793,6 +801,16 @@ mod tests {
 
         assert!(!text.contains('\u{1b}'), "was: {text:?}");
         assert!(!text.contains('\u{7}'), "was: {text:?}");
+        assert!(!text.contains('\u{9b}'), "was: {text:?}");
+        assert!(!text.contains('\u{9d}'), "was: {text:?}");
+        assert!(
+            text.starts_with("demo: newest release/2026-08-05\u{fffd}m @ "),
+            "was: {text:?}"
+        );
+        assert!(
+            text.contains("behind: newest is release/2026-08-05\u{fffd}m"),
+            "was: {text:?}"
+        );
         assert!(
             text.contains("PROBLEM: could not read; fatal: \u{fffd}[2J"),
             "was: {text:?}"

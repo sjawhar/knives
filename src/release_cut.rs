@@ -12,7 +12,7 @@ use knives::commands::claim::Bound;
 use knives::commands::release;
 use knives::forge::github::CliForge;
 use knives::ids::{BookmarkRef, ReleaseScheme, RemoteName, RepoName};
-use knives::ledger::{Draft, Ledger};
+use knives::ledger::{Draft, Ledger, inline_human_text, problem_human_text};
 use knives::release_model::{
     RecordedCut, StackedHistoryContext, carried_branches, last_series_cut, members_event_text,
     previous_release_for_cut, series_members, trunk_positions,
@@ -92,7 +92,7 @@ pub(crate) fn run_release(
         {
             println!(
                 "{repo}: refusing to cut {name}: {} is the newest release, so a dated cut takes a name that sorts after it (the reap after a cut keeps only the newest name)",
-                previous_ref.branch()
+                inline_human_text(previous_ref.branch().as_str())
             );
             return Ok(Exit::Incomplete);
         }
@@ -118,8 +118,9 @@ pub(crate) fn run_release(
                 carried_branches(&opened, entry.trunk(), &scheme)?,
             )?;
             if !unfit.is_empty() {
+                // Each line names a bookmark read from the repository.
                 for line in &unfit {
-                    println!("{repo}: {line}");
+                    println!("{repo}: {}", inline_human_text(line));
                 }
                 println!(
                     "{repo}: refusing the first cut of the {}: rebase each branch above onto \
@@ -208,19 +209,19 @@ pub(crate) fn run_release(
                         commits: &[Some(published), Some(previous_tip)],
                     },
                 )?;
+                // The previous release is a name read from the repository, and
+                // the evidence names a tag on it.
+                let shown_previous = inline_human_text(previous_ref.branch().as_str());
                 if frozen_previous {
                     println!(
-                        "{repo}: {name} starts identical to {}@{publish_remote} ({}); every pin of {} is frozen, so this new name is the composition to edit — `include`, `advance`, `drop` or `rebase` it before pushing",
-                        previous_ref.branch(),
-                        published.short(),
-                        previous_ref.branch()
+                        "{repo}: {name} starts identical to {shown_previous}@{publish_remote} ({}); every pin of {shown_previous} is frozen, so this new name is the composition to edit — `include`, `advance`, `drop` or `rebase` it before pushing",
+                        published.short()
                     );
                 } else if let Some(evidence) = published_previous {
                     println!(
-                        "{repo}: {name} starts identical to {}@{publish_remote} ({}); {} is published ({evidence}), so this new name is the composition to edit — `include`, `advance`, `drop` or `rebase` it before pushing",
-                        previous_ref.branch(),
+                        "{repo}: {name} starts identical to {shown_previous}@{publish_remote} ({}); {shown_previous} is published ({}), so this new name is the composition to edit — `include`, `advance`, `drop` or `rebase` it before pushing",
                         published.short(),
-                        previous_ref.branch()
+                        inline_human_text(&evidence)
                     );
                 } else if matches!(scheme, ReleaseScheme::Fixed(_))
                     // The pulled plan refused on any problem this read finds.
@@ -259,18 +260,15 @@ pub(crate) fn run_release(
                         stated_drop: None,
                     };
                     record_cut_event(fork, &completed, bound)?;
-                    match &previous_recorded {
-                        Some(recorded) => println!(
-                            "{repo}: recorded published composition {name}@{publish_remote} ({}) as the cut; previous recorded cut {} was {}",
-                            published.short(),
-                            recorded.name,
-                            recorded.commit.short()
-                        ),
-                        None => println!(
-                            "{repo}: recorded published composition {name}@{publish_remote} ({}) as the cut; no previous recorded cut",
-                            published.short()
-                        ),
-                    }
+                    println!(
+                        "{}",
+                        recorded_published_line(
+                            repo,
+                            (&name, publish_remote),
+                            published,
+                            previous_recorded.as_ref()
+                        )
+                    );
                     if let Some(orphaned) = &orphaned {
                         report_stated_drop(fork, orphaned)?;
                     }
@@ -280,8 +278,7 @@ pub(crate) fn run_release(
                     return Ok(worst);
                 } else {
                     println!(
-                        "{repo}: refusing to cut {name}: identical to {}@{publish_remote} ({}); nothing to cut",
-                        previous_ref.branch(),
+                        "{repo}: refusing to cut {name}: identical to {shown_previous}@{publish_remote} ({}); nothing to cut",
                         published.short()
                     );
                     return Ok(Exit::Incomplete);
@@ -377,7 +374,8 @@ fn release_plan_exit(
     println!("{}", release::render(&plan));
     let mut exit = release::exit_for(&plan);
     if let Some(lag) = release::trunk_lag(opened, plan.release.as_deref(), &entry.trunk_ref()) {
-        println!("  !! {lag}");
+        // The line names the release, a ref read from the repository.
+        println!("  !! {}", inline_human_text(&lag));
         exit = exit.worst(Exit::Findings);
     }
     Ok((exit, plan.pins))
@@ -391,30 +389,36 @@ fn release_plan_exit(
 /// like success while work is gone. The refused candidate was never a
 /// published operation, so nothing is abandoned and nothing needs cleanup.
 fn report_cut_audit(repo: &RepoName, audit: &release::CutAudit) -> Option<Exit> {
+    // Each name is a member's bookmark, read from the repository.
     for name in &audit.carried {
         println!(
-            "  {name}: diverges where the previous release already did \
-             (a recorded resolution); carried forward"
+            "  {}: diverges where the previous release already did \
+             (a recorded resolution); carried forward",
+            inline_human_text(name)
         );
     }
     for name in &audit.inconclusive {
         println!(
-            "  {name}: content check inconclusive (replay conflicted; \
-             re-check after resolving the cut's conflicts)"
+            "  {}: content check inconclusive (replay conflicted; \
+             re-check after resolving the cut's conflicts)",
+            inline_human_text(name)
         );
     }
     if audit.passed() {
         return None;
     }
     for name in &audit.missing {
-        println!("  !! {name}: the cut tree is missing or diverges from the member's content");
+        println!(
+            "  !! {}: the cut tree is missing or diverges from the member's content",
+            inline_human_text(name)
+        );
     }
     // Paths jj's diff named, so each reaches the terminal escaped.
     for file in &audit.unexplained {
         println!(
             "  !! {}: changed between the previous release and this cut \
              with no member or trunk explaining it",
-            knives::ledger::inline_human_text(file)
+            inline_human_text(file)
         );
     }
     println!("{repo}: cut discarded; nothing was written at all. Fix the inputs and re-cut.");
@@ -503,51 +507,101 @@ fn report_uncarried_cut(
     on_drop: DropDisposition,
 ) -> Option<Exit> {
     let recorded = recorded?;
+    for line in uncarried_cut_lines(repo, recorded, check, on_drop) {
+        println!("{line}");
+    }
+    (!check.dropped.is_empty() && !matches!(on_drop, DropDisposition::Allowed))
+        .then_some(Exit::Incomplete)
+}
+
+/// The lines [`report_uncarried_cut`] prints.
+///
+/// The previous cut's name and its members are a ledger entry's subject and
+/// evidence, which a peer's pulled ledger can carry any text in; a member is
+/// rendered with the bookmark that holds it, a name read from the
+/// repository. Each is escaped here; the cut event keeps them raw.
+fn uncarried_cut_lines(
+    repo: &RepoName,
+    recorded: &RecordedCut,
+    check: &release::CompositionCheck,
+    on_drop: DropDisposition,
+) -> Vec<String> {
+    let previous = inline_human_text(&recorded.name);
+    let mut lines = Vec::new();
     for (member, twin) in &check.twins {
-        println!(
-            "{repo}: {member} is carried by {}, which has the same tree",
+        lines.push(format!(
+            "{repo}: {} is carried by {}, which has the same tree",
+            inline_human_text(member),
             twin.short()
-        );
+        ));
     }
     for member in &check.inconclusive {
-        println!(
-            "  {}: recorded by the {} cut; carry check inconclusive (replay conflicted; \
+        lines.push(format!(
+            "  {}: recorded by the {previous} cut; carry check inconclusive (replay conflicted; \
              re-check after resolving the cut's conflicts)",
-            member.name, recorded.name
-        );
+            inline_human_text(&member.name)
+        ));
     }
     if check.dropped.is_empty() {
-        return None;
+        return lines;
     }
+    let dropped: Vec<String> = check
+        .dropped
+        .iter()
+        .map(|member| inline_human_text(member))
+        .collect();
     if matches!(on_drop, DropDisposition::Allowed) {
-        println!(
-            "{repo}: --allow-drop: cutting without {} member(s) the previous cut {} recorded: {}",
-            check.dropped.len(),
-            recorded.name,
-            check.dropped.join(", ")
-        );
-        return None;
+        lines.push(format!(
+            "{repo}: --allow-drop: cutting without {} member(s) the previous cut {previous} \
+             recorded: {}",
+            dropped.len(),
+            dropped.join(", ")
+        ));
+        return lines;
     }
-    println!(
-        "{repo}: refusing to cut: the previous cut {} recorded {} member(s) this cut does not \
-         carry:",
-        recorded.name,
-        check.dropped.len()
-    );
-    for member in &check.dropped {
-        println!("    {member}");
-    }
+    lines.push(format!(
+        "{repo}: refusing to cut: the previous cut {previous} recorded {} member(s) this cut \
+         does not carry:",
+        dropped.len()
+    ));
+    lines.extend(dropped.iter().map(|member| format!("    {member}")));
     let outcome = match on_drop {
         DropDisposition::RefuseDiscardingCandidate => "the candidate was discarded",
         DropDisposition::Allowed | DropDisposition::RefuseRecordingNothing => {
             "nothing was recorded"
         }
     };
-    println!(
+    lines.push(format!(
         "  {outcome}; `knives release include <branch>` restores a member, \
          or re-run with --allow-drop to state the drop is intended"
+    ));
+    lines
+}
+
+/// What a cut that recorded the published composition says: that, and the
+/// previous recorded cut it follows. The previous cut's name and commit are a
+/// ledger entry's subject and first evidence string, so each is escaped.
+fn recorded_published_line(
+    repo: &RepoName,
+    (name, publish_remote): (&str, &str),
+    published: &knives::ids::CommitId,
+    previous: Option<&RecordedCut>,
+) -> String {
+    let previous = previous.map_or_else(
+        || "no previous recorded cut".to_owned(),
+        |recorded| {
+            format!(
+                "previous recorded cut {} was {}",
+                inline_human_text(&recorded.name),
+                inline_human_text(recorded.commit.short())
+            )
+        },
     );
-    Some(Exit::Incomplete)
+    format!(
+        "{repo}: recorded published composition {name}@{publish_remote} ({}) as the cut; \
+         {previous}",
+        published.short()
+    )
 }
 
 struct CompletedCut<'a> {
@@ -701,7 +755,12 @@ fn report_completed_cut(
     );
     match claims {
         Err(error) => {
-            println!("  could not read claims, so no workspace is named for removal: {error}");
+            // A `StoreError` printed here, not through main's `error_line`:
+            // it quotes the state file's path and serde's reading of it.
+            println!(
+                "  could not read claims, so no workspace is named for removal: {}",
+                problem_human_text(&error.to_string())
+            );
         }
         Ok(store) => {
             live.extend(
@@ -711,18 +770,8 @@ fn report_completed_cut(
                     .map(|claim| claim.branch.clone()),
             );
             let orphans = release::workspaces_to_clean(&present, &recorded, &live);
-            if orphans.is_empty() {
-                println!("  no workspace belongs to a branch that no longer exists");
-            } else {
-                println!(
-                    "  {} workspace(s) belong to branches that no longer exist: {}",
-                    orphans.len(),
-                    orphans.join(", ")
-                );
-                println!(
-                    "  no bookmark or live claim holds them; remove with `jj workspace forget \
-                     <name>` once you have checked them"
-                );
+            for line in orphan_workspace_lines(&orphans) {
+                println!("{line}");
             }
         }
     }
@@ -731,6 +780,27 @@ fn report_completed_cut(
         report_stated_drop(fork, orphaned)?;
     }
     Ok(exit)
+}
+
+/// What a cut says about the jj workspaces whose branch is gone.
+///
+/// A workspace name is whatever its creator passed to `jj workspace add
+/// --name`, and jj accepts a control character there, so each is escaped.
+fn orphan_workspace_lines(orphans: &[String]) -> Vec<String> {
+    if orphans.is_empty() {
+        return vec!["  no workspace belongs to a branch that no longer exists".to_owned()];
+    }
+    let names: Vec<String> = orphans.iter().map(|name| inline_human_text(name)).collect();
+    vec![
+        format!(
+            "  {} workspace(s) belong to branches that no longer exist: {}",
+            names.len(),
+            names.join(", ")
+        ),
+        "  no bookmark or live claim holds them; remove with `jj workspace forget \
+         <name>` once you have checked them"
+            .to_owned(),
+    ]
 }
 
 /// Say what an `--allow-drop` cut dropped, judged after the reap: a commit the
@@ -774,20 +844,20 @@ fn report_orphaned_cut(
     orphaned: &OrphanedLineage,
     allow_drop: bool,
 ) -> Option<Exit> {
+    // The previous release is a ref read from the repository.
+    let previous = inline_human_text(&orphaned.previous);
     if allow_drop {
         println!(
-            "{repo}: --allow-drop: cutting without {} commit(s) reachable only from {} or its \
-             descendants; what is dropped is said once the cut is done",
-            orphaned.commits.len(),
-            orphaned.previous
+            "{repo}: --allow-drop: cutting without {} commit(s) reachable only from {previous} \
+             or its descendants; what is dropped is said once the cut is done",
+            orphaned.commits.len()
         );
         return None;
     }
     println!(
         "{repo}: refusing to cut: {} commit(s) are reachable only from \
-         {} or its descendants and would be dropped:",
-        orphaned.commits.len(),
-        orphaned.previous
+         {previous} or its descendants and would be dropped:",
+        orphaned.commits.len()
     );
     for commit in &orphaned.commits {
         println!("    {}", commit.short());
@@ -847,9 +917,10 @@ fn refuse_stacked_first_cut(
     let mut refused = false;
     for (branch, tip) in carried {
         if let Some(stacked) = knives::release_model::stacked_history(context, branch, tip)? {
+            // The detail names the branch and the release refs it stacks on.
             println!(
                 "{repo}: {}; rebase it off the trunk before cutting",
-                stacked.detail
+                inline_human_text(&stacked.detail)
             );
             refused = true;
         }
@@ -1031,27 +1102,47 @@ const fn reap_exit(report: &knives::commands::release::ReapReport) -> Exit {
 }
 
 fn print_reap(repo: &RepoName, reaped: &Reaped) {
-    let report = &reaped.report;
-    if report.reaped.is_empty() && report.forgotten_only.is_empty() && report.kept.is_empty() {
-        println!("{repo}: nothing to reap");
-    }
-    for name in &report.reaped {
-        println!(
-            "{repo}: reaped {name} (refs forgotten everywhere, commit abandoned; remote untouched)"
-        );
-    }
-    for (name, why) in &report.forgotten_only {
-        println!("{repo}: reaped {name} (refs forgotten everywhere; commit kept, {why})");
-    }
-    for (name, reason) in &report.kept {
-        println!("{repo}: kept {name}: {reason}");
-    }
-    for note in &report.notes {
-        println!("{repo}: ! {note}");
+    for line in reap_lines(repo, &reaped.report) {
+        println!("{line}");
     }
     for (name, commit) in &reaped.abandoned_earlier {
         super::release_edit::report_abandoned_earlier(repo, name, std::slice::from_ref(commit));
     }
+}
+
+/// The lines a reap reports. Each name is a release ref read from the
+/// repository; a reason names the bookmarks, tags and jj workspaces that keep
+/// a cut (`what_rests_on`), and a note quotes jj's error. The machine payload
+/// keeps all of it raw.
+fn reap_lines(repo: &RepoName, report: &knives::commands::release::ReapReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    if report.reaped.is_empty() && report.forgotten_only.is_empty() && report.kept.is_empty() {
+        lines.push(format!("{repo}: nothing to reap"));
+    }
+    for name in &report.reaped {
+        lines.push(format!(
+            "{repo}: reaped {} (refs forgotten everywhere, commit abandoned; remote untouched)",
+            inline_human_text(name)
+        ));
+    }
+    for (name, why) in &report.forgotten_only {
+        lines.push(format!(
+            "{repo}: reaped {} (refs forgotten everywhere; commit kept, {})",
+            inline_human_text(name),
+            inline_human_text(why)
+        ));
+    }
+    for (name, reason) in &report.kept {
+        lines.push(format!(
+            "{repo}: kept {}: {}",
+            inline_human_text(name),
+            inline_human_text(reason)
+        ));
+    }
+    for note in &report.notes {
+        lines.push(format!("{repo}: ! {}", problem_human_text(note)));
+    }
+    lines
 }
 
 fn print_previous_release_position(opened: &knives::jj::Repo, entry: &knives::config::RepoEntry) {
@@ -1062,5 +1153,142 @@ fn print_previous_release_position(opened: &knives::jj::Repo, entry: &knives::co
         );
     } else if matches!(entry.release_scheme(), ReleaseScheme::Fixed(_)) {
         println!("  no previous release position: this is the first cut of the fixed branch");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use knives::commands::release::{CompositionCheck, ReapReport, Unverified};
+    use knives::ids::CommitId;
+
+    /// ESC opens a C0 sequence, U+009B is the C1 CSI; neither may reach a
+    /// terminal.
+    const HOSTILE: &str = "x\u{1b}]0;pwned\u{7}\u{9b}2J";
+    const ESCAPED: &str = "x\u{fffd}]0;pwned\u{fffd}\u{fffd}2J";
+
+    fn assert_escaped(lines: &[String]) {
+        for line in lines {
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_recorded_cut_from_the_ledger_reaches_the_terminal_escaped() {
+        // The previous cut's name is a ledger entry's subject and its commit
+        // the entry's first evidence string: a pulled peer ledger writes both.
+        let recorded = RecordedCut {
+            name: format!("release/{HOSTILE}"),
+            commit: CommitId::new(HOSTILE),
+            members: vec![CommitId::new(HOSTILE)],
+        };
+        let repo = RepoName::new("demo");
+        let check = CompositionCheck {
+            dropped: vec![format!("{HOSTILE} (not known to this repository)")],
+            inconclusive: vec![Unverified {
+                commit: CommitId::new("aaaa"),
+                name: format!("feat/{HOSTILE}@aaaa"),
+            }],
+            twins: vec![(format!("feat/{HOSTILE}@bbbb"), CommitId::new("cccc"))],
+        };
+
+        let published = recorded_published_line(
+            &repo,
+            ("release/2026-11-13", "origin"),
+            &CommitId::new("dddd"),
+            Some(&recorded),
+        );
+        let mut lines = vec![published.clone()];
+        for on_drop in [
+            DropDisposition::Allowed,
+            DropDisposition::RefuseDiscardingCandidate,
+        ] {
+            lines.extend(uncarried_cut_lines(&repo, &recorded, &check, on_drop));
+        }
+
+        assert_escaped(&lines);
+        assert!(
+            published.ends_with(&format!(
+                "previous recorded cut release/{ESCAPED} was {}",
+                ids_prefix(ESCAPED)
+            )),
+            "{published:?}"
+        );
+        let text = lines.join("\n");
+        assert!(
+            text.contains(&format!("the previous cut release/{ESCAPED} recorded")),
+            "{text:?}"
+        );
+        assert!(
+            text.contains(&format!("    {ESCAPED} (not known to this repository)")),
+            "{text:?}"
+        );
+        assert!(
+            text.contains(&format!(
+                "feat/{ESCAPED}@aaaa: recorded by the release/{ESCAPED}"
+            )),
+            "{text:?}"
+        );
+        assert!(
+            text.contains(&format!("feat/{ESCAPED}@bbbb is carried by cccc")),
+            "{text:?}"
+        );
+    }
+
+    /// What `short` keeps of an escaped id: its first twelve characters.
+    fn ids_prefix(text: &str) -> String {
+        text.chars().take(12).collect()
+    }
+
+    #[test]
+    fn a_workspace_name_with_a_control_character_reaches_the_terminal_escaped() {
+        // `jj workspace add --name` accepts ESC and C1 in a name.
+        let lines = orphan_workspace_lines(&["plain".to_owned(), format!("ws{HOSTILE}")]);
+
+        assert_escaped(&lines);
+        assert!(
+            lines
+                .first()
+                .is_some_and(|line| line.ends_with(&format!("no longer exist: plain, ws{ESCAPED}"))),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_reap_names_its_cuts_and_their_keepers_escaped() {
+        let report = ReapReport {
+            reaped: vec![format!("release/{HOSTILE}")],
+            forgotten_only: vec![(
+                "release/2026-01-01".to_owned(),
+                format!("aaaa still pinned by bookmark {HOSTILE}"),
+            )],
+            kept: vec![(
+                "release/2026-01-02".to_owned(),
+                format!("the working copy of workspace ws{HOSTILE} rests on it"),
+            )],
+            notes: vec![format!(
+                "release/2026-01-03: refs forgotten: jj said\nError: {HOSTILE}"
+            )],
+        };
+
+        let lines = reap_lines(&RepoName::new("demo"), &report);
+
+        assert_escaped(&lines);
+        let text = lines.join("\n");
+        assert!(
+            text.contains(&format!("reaped release/{ESCAPED} (refs")),
+            "{text:?}"
+        );
+        assert!(text.contains(&format!("bookmark {ESCAPED})")), "{text:?}");
+        assert!(
+            text.contains(&format!(
+                "kept release/2026-01-02: the working copy of workspace ws{ESCAPED}"
+            )),
+            "{text:?}"
+        );
+        assert!(
+            text.contains(&format!("jj said; Error: {ESCAPED}")),
+            "{text:?}"
+        );
     }
 }

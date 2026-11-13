@@ -1345,19 +1345,23 @@ pub fn gather_members(
 
 /// Render the gathered parent state and optional audit in the cut command's words.
 pub fn render_members(report: &MembersReport) -> String {
+    use crate::ledger::inline_human_text;
+    // The release, its holders, its advancing branches and the audit's
+    // labels are names read from the repository; git takes a C1 character
+    // in a ref name, and jj imports such a ref as a remote bookmark.
     let mut lines = vec![format!(
         "{} @ {} — {} parents",
-        report.release,
+        inline_human_text(&report.release),
         report.commit.short(),
         report.parent_count
     )];
     for member in &report.members {
-        let mut description = member.held_by.join(", ");
+        let mut description = inline_human_text(&member.held_by.join(", "));
         if !member.advanced.is_empty() {
             if !description.is_empty() {
                 description.push_str(", ");
             }
-            description.push_str(&member.advanced.join(", "));
+            description.push_str(&inline_human_text(&member.advanced.join(", ")));
         }
         if description.is_empty() {
             description.push_str("bare commit — nothing holds it");
@@ -1370,14 +1374,16 @@ pub fn render_members(report: &MembersReport) -> String {
     if let Some(audit) = &report.audit {
         for name in &audit.carried {
             lines.push(format!(
-                "  {name}: diverges where the previous release already did \
-                 (a recorded resolution); carried forward"
+                "  {}: diverges where the previous release already did \
+                 (a recorded resolution); carried forward",
+                inline_human_text(name)
             ));
         }
         for name in &audit.inconclusive {
             lines.push(format!(
-                "  {name}: content check inconclusive (replay conflicted; \
-                 re-check after resolving the cut's conflicts)"
+                "  {}: content check inconclusive (replay conflicted; \
+                 re-check after resolving the cut's conflicts)",
+                inline_human_text(name)
             ));
         }
         for member in report.members.iter().filter(|member| !member.base_parent) {
@@ -1386,12 +1392,16 @@ pub fn render_members(report: &MembersReport) -> String {
                 && !audit.inconclusive.contains(&name)
                 && !audit.missing.contains(&name)
             {
-                lines.push(format!("  {name}: carried (replay empty)"));
+                lines.push(format!(
+                    "  {}: carried (replay empty)",
+                    inline_human_text(&name)
+                ));
             }
         }
         for name in &audit.missing {
             lines.push(format!(
-                "  !! {name}: the cut tree is missing or diverges from the member's content"
+                "  !! {}: the cut tree is missing or diverges from the member's content",
+                inline_human_text(name)
             ));
         }
         // Paths jj's diff named, so each goes out escaped.
@@ -1399,7 +1409,7 @@ pub fn render_members(report: &MembersReport) -> String {
             lines.push(format!(
                 "  !! {}: changed between the previous release and this cut \
                  with no member or trunk explaining it",
-                crate::ledger::inline_human_text(file)
+                inline_human_text(file)
             ));
         }
     }
@@ -1409,7 +1419,7 @@ pub fn render_members(report: &MembersReport) -> String {
         report
             .notes
             .iter()
-            .map(|note| format!("! {}", crate::ledger::inline_human_text(note))),
+            .map(|note| format!("! {}", inline_human_text(note))),
     );
     // A problem can name a path from disk or another machine's ledger ref.
     lines.extend(
@@ -1436,7 +1446,13 @@ pub fn render(plan: &Plan) -> String {
         return lines.join("\n");
     };
 
-    lines.push(format!("{}: {release}", plan.repo));
+    // The release and the parents' bookmarks are names read from the
+    // repository, which a remote can give a C1 character.
+    lines.push(format!(
+        "{}: {}",
+        plan.repo,
+        crate::ledger::inline_human_text(release)
+    ));
     let stacked = plan
         .base_findings
         .iter()
@@ -1454,7 +1470,7 @@ pub fn render(plan: &Plan) -> String {
         let held = if names.is_empty() {
             "no bookmark".to_owned()
         } else {
-            names.join(", ")
+            crate::ledger::inline_human_text(&names.join(", "))
         };
         lines.push(format!("    {}  {held}", commit.short()));
     }

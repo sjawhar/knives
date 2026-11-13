@@ -106,7 +106,7 @@ pub fn render(report: &Report) -> String {
                             .map_or_else(|| "(this repo)".to_owned(), inline_human_text);
                         format!(
                             "{repo}  {}  {subject}  {}",
-                            flag.ts,
+                            inline_human_text(&flag.ts),
                             inline_human_text(&flag.what)
                         )
                     })
@@ -147,7 +147,7 @@ pub fn render(report: &Report) -> String {
             for entry in entries {
                 lines.push(format!(
                     "  {}  {:<5}  {}",
-                    entry.ts,
+                    inline_human_text(&entry.ts),
                     entry.kind,
                     heading(entry)
                 ));
@@ -168,7 +168,7 @@ pub fn render(report: &Report) -> String {
                 lines.push(format!(
                     "  + {} machine event(s), newest: {} {}",
                     events.count,
-                    events.newest_ts,
+                    inline_human_text(&events.newest_ts),
                     inline_human_text(&events.newest_text)
                 ));
             }

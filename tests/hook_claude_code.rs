@@ -229,9 +229,9 @@ fn session_start_escapes_the_control_characters_of_a_claim_row() {
     // terminal receives at every session start.
     let repos = Repositories::new();
     repos.configure(false);
-    repos.write_state(&json!({"claims": {"maintainer/beta/feat/claimed": {
+    repos.write_state(&json!({"claims": {"maintainer/beta/feat/claimed\u{9b}m": {
         "repo": "maintainer/beta",
-        "branch": "feat/claimed",
+        "branch": "feat/claimed\u{9b}m",
         "owner": HOSTILE_OWNER,
         "why": HOSTILE_WHY,
         "started": "2026-01-01T00:00:00Z",
@@ -245,7 +245,9 @@ fn session_start_escapes_the_control_characters_of_a_claim_row() {
     // Then: the row names the claim with every control character as U+FFFD,
     // and nothing but the line feeds this tool writes itself survives.
     assert!(
-        context.contains(&format!("feat/claimed ({ESCAPED_OWNER}, os-user, claimed ")),
+        context.contains(&format!(
+            "feat/claimed\u{fffd}m ({ESCAPED_OWNER}, os-user, claimed "
+        )),
         "was: {context:?}"
     );
     assert!(
@@ -332,6 +334,43 @@ fn an_error_the_hook_reports_reaches_stderr_escaped_and_on_one_line() {
         "was: {errors:?}"
     );
     assert_eq!(errors.lines().count(), 1, "was: {errors:?}");
+    for (index, character) in errors.char_indices() {
+        assert!(
+            !character.is_control() || character == '\n',
+            "{character:?} reached the terminal at byte {index}: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn remotes_the_hook_cannot_read_reach_stderr_escaped() {
+    // `match_checkout` (src/hook/resolve.rs) says on stderr why it could not
+    // read a checkout's remotes, quoting git and the checkout's path. git
+    // turns an ASCII control character of its own message into `?` but
+    // passes a UTF-8 C1 character through, so a `.git` pointer naming a
+    // directory with U+009B (CSI) in it reaches the session as git wrote it;
+    // the checkout's own directory name carries ESC.
+    let repos = Repositories::new();
+    repos.configure(false);
+    let broken = repos.home.path().join("broken\u{1b}]0;pwned\u{7}");
+    std::fs::create_dir(&broken).expect("create checkout");
+    std::fs::write(broken.join(".git"), "gitdir: /nowhere/\u{9b}2J\u{9d}x\n")
+        .expect("write git pointer");
+    std::fs::write(broken.join("file.txt"), "content").expect("write file");
+    let read = post_tool_use_read(repos.home.path(), &broken.join("file.txt"), SESSION_ID);
+
+    // When: a tool call touches a file of that checkout.
+    let (success, _, errors) = run_hook_input(repos.home.path(), &read.to_string());
+
+    // Then: the hook still answers, and its one line about the remotes
+    // carries every control character as U+FFFD.
+    assert!(success, "a hook must never fail the session: {errors:?}");
+    assert!(
+        errors.contains("knives hook: reading remotes of ")
+            && errors.contains("broken\u{fffd}]0;pwned\u{fffd}")
+            && errors.contains("/nowhere/\u{fffd}2J\u{fffd}x"),
+        "was: {errors:?}"
+    );
     for (index, character) in errors.char_indices() {
         assert!(
             !character.is_control() || character == '\n',

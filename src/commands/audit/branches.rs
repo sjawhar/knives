@@ -438,15 +438,20 @@ fn pull_snapshot(
 /// reaches the terminal escaped ([`inline_human_text`]), and so do the
 /// template headings and the file names of the forbidden-identifier scan,
 /// which are content of a repository someone else pushed. The branch name is
-/// a jj bookmark, which jj refuses a control character in, and a forbidden
-/// term is the registry's own word.
+/// a bookmark read from the repository, which a remote can give a C1
+/// character, so it is escaped too; a forbidden term is the registry's own
+/// word.
 pub(super) fn render_branch(row: &BranchFacts) -> String {
     let origin = match row.tip_matches_origin {
         Some(true) => "same",
         Some(false) => "differs",
         None => "absent",
     };
-    let mut line = format!("{}  tip {}  origin {origin}", row.branch, row.tip.short());
+    let mut line = format!(
+        "{}  tip {}  origin {origin}",
+        inline_human_text(row.branch.as_str()),
+        row.tip.short()
+    );
     if row.fork_only {
         line.push_str("  fork-only");
     }
@@ -733,9 +738,10 @@ mod tests {
     #[test]
     fn a_branch_row_escapes_what_the_forge_and_the_repository_answered() {
         // The forge's words, a template heading from a repository someone
-        // else pushed, and the file the forbidden scan found in a diff.
+        // else pushed, the file the forbidden scan found in a diff, and a
+        // bookmark name a remote gave a C1 character.
         let tip = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let mut row = local_row("feat/a", tip);
+        let mut row = local_row("feat/\u{9b}a", tip);
         row.pull = Some(PullSnapshot {
             number: 7,
             url: String::new(),
@@ -764,6 +770,7 @@ mod tests {
         assert!(!line.contains('\u{1b}'), "was: {line:?}");
         assert!(!line.contains('\u{7}'), "was: {line:?}");
         assert!(!line.contains('\u{9b}'), "was: {line:?}");
+        assert!(line.starts_with("feat/\u{fffd}a  tip "), "was: {line:?}");
         assert!(
             line.contains(
                 "mergeable=MERGE\u{fffd}[2JABLE merge_state=BLO\u{fffd}CKED \

@@ -85,6 +85,49 @@ fn members_counts_parents_and_names_their_holders() {
 }
 
 #[test]
+fn members_escapes_a_remote_bookmark_a_remote_gave_a_c1_character() {
+    // Given: a cut whose member another clone also pushed under a name with
+    // U+009B (CSI) in it. git takes that ref name (it refuses only C0), and
+    // while `jj bookmark create` refuses it, `jj git fetch` imports it as the
+    // remote bookmark `feat<U+009B>m@origin`, which then holds the member.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let released = commit_at(&lab, "feat/alpha");
+    lab.push_branch("feat/alpha");
+    lab::git_output(
+        &lab.temp_origin(),
+        [
+            "update-ref",
+            "refs/heads/feat\u{9b}m",
+            "refs/heads/feat/alpha",
+        ],
+    );
+    lab.jj_work(["git", "fetch", "--remote", "origin"]);
+
+    // When: the release's members are listed through the real CLI.
+    let output = knives_release(&lab, &home, &["members"]);
+
+    // Then: the member row names that holder with U+FFFD in place of CSI.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "members failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let short: String = released.as_str().chars().take(12).collect();
+    let row = stdout
+        .lines()
+        .find(|line| line.starts_with(&format!("- {short} ")))
+        .unwrap_or_else(|| panic!("no row for the member: {stdout}"));
+    assert!(row.contains("feat\u{fffd}m@origin"), "was: {row:?}");
+    assert!(
+        !stdout.chars().any(|c| c.is_control() && c != '\n'),
+        "a control character reached the terminal: {stdout:?}"
+    );
+}
+
+#[test]
 fn members_verify_reports_a_dropped_members_content() {
     // Given: the same hand-resolved conflicting cut as the recut scenario,
     // where the release tree contains neither member's original content.
