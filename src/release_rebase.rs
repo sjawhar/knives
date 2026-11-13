@@ -280,11 +280,15 @@ fn stale_rule_exit(fork: &Fork<'_>) -> anyhow::Result<Option<Exit>> {
     if !stated.written_by_knives || stated.rule == rule {
         return Ok(None);
     }
+    // The rule is read back from this checkout's jj config, which an earlier
+    // `knives start` wrote but a person may have edited since, so it reaches
+    // the terminal escaped; `rule` is the entry's `repos.toml` value.
     println!(
         "{}: this checkout's jj config states immutable_heads() = `{}`, written by an \
          earlier `knives start`; this fork runs under `{rule}`. Any `knives start <branch>` \
          in this fork refreshes it; rebase again after that. Nothing moved",
-        fork.name, stated.rule
+        fork.name,
+        knives::ledger::inline_human_text(&stated.rule)
     );
     Ok(Some(Exit::Incomplete))
 }
@@ -364,11 +368,14 @@ fn classify_rebase_parents(
         // an instruction to put a copy back on the old base.
         let moved = stale_parent_moved_branches(opened, entry, &parent.commit)?;
         match moved {
+            // `moved` is jj's account of where the member went, built from the
+            // bookmarks and ids it holds, so the refusal escapes it.
             Some(moved) => eprintln!(
                 "{repo}: refusing to rebase {release_name}: parent {} is stale{no_bookmark}; it \
-                 was {moved}. `knives release advance` moves the member to its branch, then \
+                 was {}. `knives release advance` moves the member to its branch, then \
                  re-run; carrying the old commit could ship pre-rewrite code.",
                 parent.commit.short(),
+                knives::ledger::inline_human_text(&moved),
             ),
             None => eprintln!(
                 "{repo}: refusing to rebase {release_name}: parent {} is stale{no_bookmark}, and \
@@ -493,9 +500,11 @@ fn merged_rebase_target(
     }) {
         Ok(opened_snapshot) => opened_snapshot,
         Err(error) => {
+            // The forge's own text, which prints more than one line.
             eprintln!(
-                "{repo}: could not ask the forge which pull requests merged: {error}; \
-                 provide a commit to rebase onto"
+                "{repo}: could not ask the forge which pull requests merged: {}; \
+                 provide a commit to rebase onto",
+                knives::ledger::problem_human_text(&error.to_string())
             );
             return Ok(None);
         }
@@ -503,9 +512,11 @@ fn merged_rebase_target(
     let snapshot = match opened_snapshot.complete_with(entry.trunk(), select_merged_numbers) {
         Ok(snapshot) => snapshot,
         Err(error) => {
+            // The forge's own text, as above.
             eprintln!(
-                "{repo}: could not ask the forge which pull requests merged: {error}; \
-                 provide a commit to rebase onto"
+                "{repo}: could not ask the forge which pull requests merged: {}; \
+                 provide a commit to rebase onto",
+                knives::ledger::problem_human_text(&error.to_string())
             );
             return Ok(None);
         }
@@ -554,7 +565,11 @@ fn merged_rebase_target(
         }))
     })();
     if let Err(note) = snapshot.persist(None) {
-        eprintln!("{repo}: {note}");
+        // The note carries the OS's message and the cache path it names.
+        eprintln!(
+            "{repo}: {}",
+            knives::ledger::problem_human_text(&note.to_string())
+        );
     }
     result
 }

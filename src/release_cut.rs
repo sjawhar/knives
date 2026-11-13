@@ -409,10 +409,12 @@ fn report_cut_audit(repo: &RepoName, audit: &release::CutAudit) -> Option<Exit> 
     for name in &audit.missing {
         println!("  !! {name}: the cut tree is missing or diverges from the member's content");
     }
+    // Paths jj's diff named, so each reaches the terminal escaped.
     for file in &audit.unexplained {
         println!(
-            "  !! {file}: changed between the previous release and this cut \
-             with no member or trunk explaining it"
+            "  !! {}: changed between the previous release and this cut \
+             with no member or trunk explaining it",
+            knives::ledger::inline_human_text(file)
         );
     }
     println!("{repo}: cut discarded; nothing was written at all. Fix the inputs and re-cut.");

@@ -194,14 +194,19 @@ pub(crate) fn run_finish(
     // would otherwise keep the claim, and the branch with it, with a session
     // that has already walked away; the directory is instead left exactly as
     // it is, and the next `start` of this branch adopts it untouched.
+    //
+    // The path is the one jj recorded for the workspace and the refusal is
+    // jj's own text, which prints more than one line, so they reach the
+    // terminal escaped ([`inline_human_text`] and
+    // [`knives::ledger::problem_human_text`]).
     if let Err(refused) = kept {
         eprintln!(
             "{}/{branch}: claim {claim}; jj could not snapshot all of the working copy at {}, \
              so the workspace is kept exactly as it is and the next `knives start {branch}` \
              adopts that directory without touching what is in it\n{}",
             fork.name,
-            refused.at.display(),
-            refused.refused,
+            inline_human_text(&refused.at.display().to_string()),
+            knives::ledger::problem_human_text(&refused.refused.to_string()),
         );
         return Ok(Exit::Incomplete);
     }
@@ -422,12 +427,18 @@ fn clear_workspace(
     let working_copy = match resolved {
         Some(WorkspaceIdentity::Ours(name)) if *name == workspace => Some(at.to_owned()),
         Some(WorkspaceIdentity::Unreadable(detail)) => {
+            // The path is where the workspace landed on disk, the checkout is
+            // the one found for this fork, and the detail is jj's own, which
+            // prints more than one line: all three go out escaped
+            // ([`inline_human_text`] and
+            // [`knives::ledger::problem_human_text`]).
             eprintln!(
                 "{}/{branch}: {} is a workspace of {} whose working-copy state could not be read \
-                 ({detail}); it cannot be snapshotted, so it is not forgotten; nothing was changed",
+                 ({}); it cannot be snapshotted, so it is not forgotten; nothing was changed",
                 fork.name,
-                at.display(),
-                checkout.display()
+                inline_human_text(&at.display().to_string()),
+                inline_human_text(&checkout.display().to_string()),
+                knives::ledger::problem_human_text(detail),
             );
             return Err(Exit::Incomplete);
         }
@@ -553,6 +564,10 @@ enum Registration {
     Failed(String),
 }
 
+/// The disposal line a terminal reads. The path is the one jj recorded for
+/// the name and the detail is jj's own text, which prints more than one line,
+/// so both go out escaped ([`inline_human_text`] and
+/// [`knives::ledger::problem_human_text`]).
 impl std::fmt::Display for Registration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -561,9 +576,13 @@ impl std::fmt::Display for Registration {
             Self::Elsewhere(path) => write!(
                 f,
                 "not forgotten (it is registered at {}; finish or forget it there)",
-                path.display()
+                inline_human_text(&path.display().to_string())
             ),
-            Self::Failed(detail) => write!(f, "not forgotten ({detail})"),
+            Self::Failed(detail) => write!(
+                f,
+                "not forgotten ({})",
+                knives::ledger::problem_human_text(detail)
+            ),
         }
     }
 }
@@ -1074,7 +1093,9 @@ fn with_requirements(required: &[Requirement], added: &[Requirement]) -> Vec<Str
 
 #[cfg(test)]
 mod tests {
-    use super::{spoken, with_requirements};
+    use std::path::PathBuf;
+
+    use super::{Registration, spoken, with_requirements};
     use knives::ids::Requirement;
 
     #[test]
@@ -1107,6 +1128,22 @@ mod tests {
                 &[parse("sibling#49"), parse("another#3")],
             ),
             ["another#3", "other#7", "sibling#49"]
+        );
+    }
+
+    /// The disposal line `finish` prints names the path jj recorded for the
+    /// workspace and quotes jj's own failure text, which runs to more than one
+    /// line; neither may carry a terminal control sequence.
+    #[test]
+    fn a_control_character_in_a_registration_reaches_the_terminal_escaped() {
+        assert_eq!(
+            Registration::Elsewhere(PathBuf::from("/forks/work/feat\u{7}-a")).to_string(),
+            "not forgotten (it is registered at /forks/work/feat\u{fffd}-a; finish or forget it \
+             there)"
+        );
+        assert_eq!(
+            Registration::Failed("Error: a\u{1b}[31mb\nand more".to_owned()).to_string(),
+            "not forgotten (Error: a\u{fffd}[31mb and more)"
         );
     }
 }

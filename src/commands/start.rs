@@ -116,6 +116,12 @@ pub fn possesses(cwd: &Path, fork: &Fork<'_>, branch: &BranchName) -> bool {
 /// canonicalised when it exists, as the checkout already is, so a spelling
 /// through a symlink is judged by where it lands; one that does not exist yet
 /// has only its spelling.
+///
+/// Both lines are refusals a terminal reads. The registered checkout is found
+/// on disk, and the workspace directory is the path jj recorded for the name
+/// when it has one ([`locate_workspace`]), so both reach the terminal escaped
+/// ([`crate::ledger::inline_human_text`]). The `workspaces` root is the
+/// entry's own `repos.toml` value and stays raw.
 pub fn collides_with_checkout(fork: &Fork<'_>, branch: &BranchName) -> Option<String> {
     let checkout = &fork.checkout.path;
     let spelled = fork.workspace_root();
@@ -134,15 +140,15 @@ pub fn collides_with_checkout(fork: &Fork<'_>, branch: &BranchName) -> Option<St
              live in the working copy they belong to",
             fork.name,
             root.display(),
-            checkout.display()
+            crate::ledger::inline_human_text(&checkout.display().to_string())
         ));
     }
     (workspace == "default" || checkout.starts_with(&directory)).then(|| {
         format!(
             "branch {branch} maps to workspace {workspace} at {}, which is the registered \
              checkout itself or contains it; refusing to touch {}",
-            directory.display(),
-            checkout.display()
+            crate::ledger::inline_human_text(&directory.display().to_string()),
+            crate::ledger::inline_human_text(&checkout.display().to_string())
         )
     })
 }
@@ -232,8 +238,15 @@ pub fn run(
             None
         };
         set_repo_immutable_heads(checkout, &rule)?;
+        // The repository-level rule is this entry's `repos.toml` value, but the
+        // user-level one it shadows is read back from the jj config a person on
+        // this machine wrote, so the line prints it escaped
+        // ([`crate::ledger::inline_human_text`]).
         let shadow = shadowed.map_or_else(String::new, |user_rule| {
-            format!(" (shadows the user-level rule {user_rule} here)")
+            format!(
+                " (shadows the user-level rule {} here)",
+                crate::ledger::inline_human_text(&user_rule)
+            )
         });
         println!("jj immutable_heads() {verb} {repo_name}'s repository config: {rule}{shadow}");
     }
@@ -632,39 +645,48 @@ fn resume_workspace_notice(context: &StartContext<'_>) -> String {
 /// anywhere, what sits at the path is not knives' to assume, registered name or
 /// not. The checkout itself and its ancestors never get this far:
 /// [`collides_with_checkout`] refuses them before any claim work.
+///
+/// Every value here is read off disk: the workspace name and the store path
+/// jj recorded, the path jj recorded for this name (the destination the
+/// caller located), the link's target, and jj's own detail for a working copy
+/// it cannot read. All of them reach the terminal escaped
+/// ([`crate::ledger::inline_human_text`], and
+/// [`crate::ledger::problem_human_text`] for jj's detail, which prints more
+/// than one line); the branch's own workspace name is this process's.
 fn adoption_refusal(destination: &Path, checkout: &Path, name: &WorkspaceName) -> Option<String> {
-    let shown = destination.display();
+    let shown = crate::ledger::inline_human_text(&destination.display().to_string());
+    let here = crate::ledger::inline_human_text(&checkout.display().to_string());
     let line = match workspace_identity(destination, checkout) {
         WorkspaceIdentity::Ours(actual) if actual == *name => return None,
-        WorkspaceIdentity::Ours(actual) => format!(
-            "cannot adopt {shown}: it is workspace {actual} of {}, not {name}; forget or finish \
-             workspace {actual}, or choose a different branch",
-            checkout.display()
-        ),
+        WorkspaceIdentity::Ours(actual) => {
+            let actual = crate::ledger::inline_human_text(actual.as_str());
+            format!(
+                "cannot adopt {shown}: it is workspace {actual} of {here}, not {name}; forget or \
+                 finish workspace {actual}, or choose a different branch"
+            )
+        }
         WorkspaceIdentity::Foreign(store) => format!(
-            "cannot adopt {shown}: it belongs to repository {}, not {}; move the foreign \
+            "cannot adopt {shown}: it belongs to repository {}, not {here}; move the foreign \
              workspace or choose a different branch",
-            store.display(),
-            checkout.display()
+            crate::ledger::inline_human_text(&store.display().to_string())
         ),
         WorkspaceIdentity::Unreadable(detail) => format!(
-            "cannot adopt {shown}: it is a workspace of {} whose working-copy state could not \
-             be read ({detail})",
-            checkout.display()
+            "cannot adopt {shown}: it is a workspace of {here} whose working-copy state could \
+             not be read ({})",
+            crate::ledger::problem_human_text(&detail)
         ),
         WorkspaceIdentity::Repository => format!(
-            "cannot adopt {shown}: it is a repository in its own right, not a workspace of {}; \
-             choose a different branch",
-            checkout.display()
+            "cannot adopt {shown}: it is a repository in its own right, not a workspace of \
+             {here}; choose a different branch"
         ),
         WorkspaceIdentity::SymbolicLink(target) => format!(
             "cannot adopt {shown}: it is a symbolic link to {}; start from the real directory \
              or choose a different branch",
-            target.display()
+            crate::ledger::inline_human_text(&target.display().to_string())
         ),
         WorkspaceIdentity::NotAWorkspace => format!(
-            "cannot adopt {shown}: not a workspace of {}; move it or choose a different branch",
-            checkout.display()
+            "cannot adopt {shown}: not a workspace of {here}; move it or choose a different \
+             branch"
         ),
     };
     Some(line)
@@ -1066,5 +1088,41 @@ mod tests {
             &BranchName::new("feat/a/b"),
         );
         assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("feat-a-b"));
+    }
+
+    /// The collision refusal both `start` and `finish` print names the
+    /// registered checkout and the directory jj recorded for the workspace,
+    /// neither of which this process wrote.
+    #[test]
+    fn a_control_character_in_a_checkout_path_reaches_the_terminal_escaped() {
+        let checkout = PathBuf::from("/home/u/for\u{7}ks/tool/default");
+        let sibling_entry = entry(None);
+        let fork = Fork::at("tool", &sibling_entry, &checkout);
+        let line = collides_with_checkout(&fork, &BranchName::new("default")).expect("a collision");
+        assert!(!line.contains('\u{7}'), "{line}");
+        assert_eq!(
+            line.matches("/home/u/for\u{fffd}ks/tool/").count(),
+            2,
+            "the workspace directory and the checkout: {line}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_control_character_in_a_symlink_target_reaches_the_adoption_refusal_escaped() {
+        // The target is whatever the link holds, which is nothing this process
+        // wrote: a refusal that printed it raw would hand the directory's owner
+        // the refused caller's terminal.
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("feat-alpha");
+        std::os::unix::fs::symlink("/elsewhere/wor\u{1b}[31mk", &destination).unwrap();
+        let line = adoption_refusal(
+            &destination,
+            Path::new("/home/u/forks/tool/default"),
+            &WorkspaceName::new("feat-alpha"),
+        )
+        .expect("a refusal");
+        assert!(!line.contains('\u{1b}'), "{line}");
+        assert!(line.contains("/elsewhere/wor\u{fffd}[31mk"), "{line}");
     }
 }

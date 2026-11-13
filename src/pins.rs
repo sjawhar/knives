@@ -276,12 +276,20 @@ pub const PIN_FILES: &[&str] = &[
 ];
 
 /// One line per pin; the caller decides what an empty list means.
+///
+/// The file name and the reference are read out of a consumer's checkout,
+/// which this process did not write, so both reach the terminal escaped
+/// ([`crate::ledger::inline_human_text`]) — as `knives consumers` escapes the
+/// same two fields. The line number and the kind are this process's own.
 pub fn render(pins: &[Pin]) -> String {
     pins.iter()
         .map(|pin| {
             format!(
                 "  {}:{} {} ({})",
-                pin.file, pin.line, pin.reference, pin.kind
+                crate::ledger::inline_human_text(&pin.file),
+                pin.line,
+                crate::ledger::inline_human_text(&pin.reference),
+                pin.kind
             )
         })
         .collect::<Vec<_>>()
@@ -434,6 +442,26 @@ mod tests {
         assert_eq!(
             problems,
             vec!["uv.lock:1: malformed locked commit fragment `12345`"]
+        );
+    }
+
+    /// A consumer's pin file and reference are read out of a repository this
+    /// process did not write; the release plan prints this render, so neither
+    /// may carry a terminal control sequence.
+    #[test]
+    fn a_control_character_in_a_pin_reaches_the_terminal_escaped() {
+        let rendered = render(&[Pin {
+            file: "pyproject\u{7}.toml".to_owned(),
+            line: 12,
+            reference: "release/2026-07-28\u{1b}[31m".to_owned(),
+            kind: PinKind::Frozen,
+            locked: None,
+            on_scheme: true,
+            source: String::new(),
+        }]);
+        assert_eq!(
+            rendered,
+            "  pyproject\u{fffd}.toml:12 release/2026-07-28\u{fffd}[31m (frozen)"
         );
     }
 }

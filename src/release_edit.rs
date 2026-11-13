@@ -488,10 +488,17 @@ fn edit_release(
     let plan = release::pulled_plan(fork, bound.registry, &consumers)?;
     if !plan.problems.is_empty() {
         println!("{}", release::render(&plan));
+        // The plan's own render escaped these one line above; this summary
+        // quotes the same jj, forge and consumer text, so it escapes each
+        // problem too ([`knives::ledger::problem_human_text`]).
         println!(
             "{repo}: {} not applied; the plan could not answer: {}",
             change.verb(),
-            plan.problems.join("; ")
+            plan.problems
+                .iter()
+                .map(|problem| knives::ledger::problem_human_text(problem))
+                .collect::<Vec<_>>()
+                .join("; ")
         );
         return Ok(Exit::Incomplete);
     }
