@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{FormerNames, default_config_path};
 use crate::ids::{BranchTarget, Requirement, UpstreamName};
-use crate::ledger::{Entry, Ledger, LedgerError, unmigrated};
+use crate::ledger::{Entry, Ledger, LedgerError, inline_human_text, unmigrated};
 use crate::lock::{FileLock, LockError, LockWait};
 use crate::statement::{StatementKind, Statements};
 
@@ -192,8 +192,9 @@ pub struct Store {
     state: State,
     /// The ledger of each repository the store was opened for, read once
     /// when the store opens, or why it could not be read at all: only a
-    /// store opened for a report of many forks keeps one it could not read
-    /// ([`Store::open_each`]); every other open fails on it.
+    /// store opened with [`Store::open_each`] or
+    /// [`Store::open_each_for_update`] keeps one it could not read; every
+    /// other open fails on it.
     ledgers: BTreeMap<UpstreamName, Result<ForkLedger, LedgerError>>,
     writes: Writes,
     /// The lock on each fork a store opened for update was opened for
@@ -274,7 +275,10 @@ impl Store {
         Self::read(path, repos, Writes::Replayed(Vec::new()), Vec::new())?.migrated(former)
     }
 
-    /// [`Store::open_for_update`] as [`Store::open_each`] opens a store.
+    /// [`Store::open_for_update`] as [`Store::open_each`] opens a store: for
+    /// a writer that may still answer a caller without a ledger it could not
+    /// read, and fails on that ledger ([`Store::all_read`]) before anything
+    /// that needs it.
     pub fn open_each_for_update(
         path: PathBuf,
         former: &FormerNames,
@@ -285,8 +289,16 @@ impl Store {
     }
 
     /// Refuse a store that could not read one of the ledgers it was opened
-    /// for, naming the first.
-    fn all_read(mut self) -> Result<Self, StoreError> {
+    /// for, naming the first: what [`Store::open`] and
+    /// [`Store::open_for_update`] do on opening, for a store opened with
+    /// [`Store::open_each_for_update`] once it needs every ledger. The lock a
+    /// store opened for update holds stays held.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Ledger`] with why the first unreadable ledger could not
+    /// be read.
+    pub fn all_read(mut self) -> Result<Self, StoreError> {
         let unreadable = self
             .ledgers
             .iter()
@@ -418,6 +430,22 @@ impl Store {
         record
     }
 
+    /// Put `why` in place of the reason the claim on `target` carries, and
+    /// change nothing else about it; `None` where nothing is claimed there.
+    ///
+    /// The reason a reader is shown must be the reason the work is held for
+    /// now, not the one its first `start` gave days ago. Only the reason
+    /// moves: [`Store::claim`] sets a new `started` and a new `place`,
+    /// which are when and where the claim was taken and belong to that
+    /// moment alone, so taking work up again must not write them.
+    pub fn restate_claim(&mut self, target: &BranchTarget, why: &str) -> Option<Claim> {
+        let key = target.key();
+        let mut record = self.state.claims.get(&key)?.clone();
+        why.clone_into(&mut record.why);
+        self.set_claim(key, Some(record.clone()));
+        Some(record)
+    }
+
     pub fn release_claim(&mut self, target: &BranchTarget) -> bool {
         let key = target.key();
         let had = self.state.claims.contains_key(&key);
@@ -431,6 +459,10 @@ impl Store {
     /// The decision to take or release a claim was made from that one, so
     /// the save refuses when the file holds another: a writer that bypassed
     /// the fork's lock (an older knives, a hand edit) moved it meanwhile.
+    ///
+    /// The owner that moved it is that writer's own text, and the refusal is
+    /// printed to a terminal, so it goes out escaped
+    /// ([`inline_human_text`]) while the state file keeps the raw name.
     fn set_claim(&mut self, key: String, next: Option<Claim>) {
         let read = self.state.claims.get(&key).cloned();
         self.change(Box::new(move |state, path| {
@@ -441,7 +473,7 @@ impl Store {
                     key: key.clone(),
                     now: now.map_or_else(
                         || "now unheld".to_owned(),
-                        |claim| format!("now held by {}", claim.owner),
+                        |claim| format!("now held by {}", inline_human_text(&claim.owner)),
                     ),
                 });
             }
@@ -569,8 +601,9 @@ impl Store {
         }
     }
     /// Why `repo`'s ledger could not be read at all, for a store opened with
-    /// [`Store::open_each`]: that fork's report is this, and nothing else
-    /// about it may be asked of the store.
+    /// [`Store::open_each`] or [`Store::open_each_for_update`]: that fork's
+    /// answer is this, and nothing else about its ledger may be asked of the
+    /// store.
     pub fn unreadable(&self, repo: &UpstreamName) -> Option<&LedgerError> {
         self.ledgers.get(repo)?.as_ref().err()
     }
@@ -818,6 +851,13 @@ mod tests {
                 anchor: None,
                 pr: None,
                 parents: Vec::new(),
+                claim_change: None,
+                claim_change_why: None,
+                previous_owner: None,
+                previous_kind: None,
+                previous_started: None,
+                previous_last_seen: None,
+                previous_why: None,
             })
             .unwrap();
     }
@@ -890,6 +930,29 @@ mod tests {
         let _ = subject.claim(&target(), &os_user("someone"), "w");
         assert!(subject.release_claim(&target()));
         assert!(!subject.release_claim(&target()));
+        assert_eq!(subject.claims(None), Vec::<&Claim>::new());
+    }
+
+    #[test]
+    fn restating_a_claim_writes_its_reason_and_leaves_when_and_where_it_was_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut subject = store(dir.path());
+        let taken = subject.claim(&target(), &os_user("someone"), "port it");
+
+        let restated = subject.restate_claim(&target(), "finish the port").unwrap();
+
+        assert_eq!(restated.why, "finish the port");
+        assert_eq!(restated.started, taken.started);
+        assert_eq!(restated.place, taken.place);
+        assert_eq!(subject.claims(None), vec![&restated]);
+    }
+
+    #[test]
+    fn restating_a_reason_where_nothing_is_claimed_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut subject = store(dir.path());
+
+        assert_eq!(subject.restate_claim(&target(), "port it"), None);
         assert_eq!(subject.claims(None), Vec::<&Claim>::new());
     }
 
@@ -1361,6 +1424,45 @@ mod tests {
     }
 
     #[test]
+    fn the_owner_that_moved_a_claim_is_named_escaped_and_kept_raw_in_the_file() {
+        // Given: the writer that moved the claim put control characters in
+        // its own owner name. The refusal is printed to a terminal, so raw
+        // that writer would choose what the losing caller's terminal
+        // receives; the state file stays the raw record. C1 controls count:
+        // U+009B is CSI and U+009D is OSC.
+        let hostile = "first-\u{1b}]0;x\u{7}\u{9b}31m\u{9d}2;y";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut first = Store::open(path.clone(), &FormerNames::new(), &[]).unwrap();
+        let mut second = Store::open(path.clone(), &FormerNames::new(), &[]).unwrap();
+        let _ = first.claim(&target(), &os_user(hostile), "w");
+        let _ = second.claim(&target(), &os_user("second"), "w");
+        first.save().unwrap();
+
+        // When: the second saves over the claim it read as free.
+        let error = second.save().unwrap_err();
+
+        // Then: the message names that owner with every control character of
+        // it as U+FFFD, and the file holds the name as it was written.
+        assert!(
+            matches!(
+                &error,
+                StoreError::ClaimMoved { now, .. }
+                    if now == "now held by first-\u{fffd}]0;x\u{fffd}\u{fffd}31m\u{fffd}2;y"
+            ),
+            "was: {error}"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains(['\u{1b}', '\u{7}', '\u{9b}', '\u{9d}']),
+            "a control character reached the terminal: {error}"
+        );
+        let reread = Store::open(path, &FormerNames::new(), &[]).unwrap();
+        assert_eq!(reread.claims(None)[0].owner, hostile);
+    }
+
+    #[test]
     fn a_release_of_a_claim_moved_since_it_was_read_is_refused() {
         // Given: a claim, read by a writer that will release it, then seized
         // by a writer that bypassed the fork's lock.
@@ -1385,6 +1487,38 @@ mod tests {
         );
         let reread = Store::open(path, &FormerNames::new(), &[]).unwrap();
         assert_eq!(reread.claims(None)[0].owner, "seizer");
+    }
+
+    #[test]
+    fn a_restated_reason_over_a_claim_moved_since_it_was_read_is_refused() {
+        // Given: a claim, read by the writer about to say why it is held,
+        // then seized by a writer that bypassed the fork's lock.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut first = Store::open(path.clone(), &FormerNames::new(), &[]).unwrap();
+        let _ = first.claim(&target(), &os_user("first"), "port it");
+        first.save().unwrap();
+        let mut resuming = Store::open(path.clone(), &FormerNames::new(), &[]).unwrap();
+        let mut seizing = Store::open(path.clone(), &FormerNames::new(), &[]).unwrap();
+        let _ = seizing.claim(&target(), &os_user("seizer"), "rescue it");
+        seizing.save().unwrap();
+
+        // When: the resume saves its new reason.
+        assert!(
+            resuming
+                .restate_claim(&target(), "finish the port")
+                .is_some()
+        );
+        let error = resuming.save().unwrap_err();
+
+        // Then: the seizer's claim stands, reason and all.
+        assert!(
+            matches!(error, StoreError::ClaimMoved { .. }),
+            "was: {error}"
+        );
+        let reread = Store::open(path, &FormerNames::new(), &[]).unwrap();
+        assert_eq!(reread.claims(None)[0].owner, "seizer");
+        assert_eq!(reread.claims(None)[0].why, "rescue it");
     }
 
     #[test]

@@ -602,11 +602,17 @@ pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
     Ok(report)
 }
 
+/// The sync's notes and problems, then one line per tracked pull request.
+///
+/// A note and a problem quote jj, git or the forge, and a row's label is
+/// built from what the forge answered and the head ref it named, so each
+/// reaches the terminal escaped; the transition and the forge state are this
+/// module's own words, and the repository is a registry key.
 pub fn render(report: &Report) -> String {
     let mut lines: Vec<String> = report
         .notes
         .iter()
-        .map(|note| format!("! {note}"))
+        .map(|note| format!("! {}", crate::ledger::inline_human_text(note)))
         .collect();
     // What could not be answered, so an exit of 3 never arrives unexplained;
     // a problem can name a path from disk or another machine's ledger ref.
@@ -632,7 +638,7 @@ pub fn render(report: &Report) -> String {
             row.state,
             row.forge_state
                 .map_or_else(|| "unknown".to_owned(), |state| state.to_string()),
-            row.label
+            crate::ledger::inline_human_text(&row.label)
         ));
     }
     lines.join("\n")
@@ -917,6 +923,33 @@ mod tests {
     }
 
     #[test]
+    fn a_rows_label_and_a_note_render_with_control_characters_escaped() {
+        // A label carries the head ref and the state the forge answered; a
+        // note quotes jj, git or the forge.
+        let report = Report {
+            repo: "demo".to_owned(),
+            rows: vec![Row {
+                number: 1234,
+                label: "feat/\u{1b}]0;pwned\u{7}foo".to_owned(),
+                state: PullState::Unchanged,
+                forge_state: Some(ForgeState::Merged),
+            }],
+            notes: vec!["fetched \u{1b}[2J".to_owned()],
+            problems: Vec::new(),
+        };
+
+        let text = render(&report);
+
+        assert!(!text.contains('\u{1b}'), "was: {text:?}");
+        assert!(!text.contains('\u{7}'), "was: {text:?}");
+        assert!(text.contains("! fetched \u{fffd}[2J"), "was: {text:?}");
+        assert!(
+            text.contains("feat/\u{fffd}]0;pwned\u{fffd}foo"),
+            "was: {text:?}"
+        );
+    }
+
+    #[test]
     fn a_wrapped_sentence_in_a_problem_stays_one_sentence() {
         // git wraps its advice at about 60 columns; a line that continues a
         // sentence starts lower-case and joins with a space, not "; ".
@@ -1105,6 +1138,13 @@ mod repeated_transition_tests {
             anchor: None,
             pr,
             parents: Vec::new(),
+            claim_change: None,
+            claim_change_why: None,
+            previous_owner: None,
+            previous_kind: None,
+            previous_started: None,
+            previous_last_seen: None,
+            previous_why: None,
         }
     }
 

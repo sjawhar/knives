@@ -143,6 +143,13 @@ mod tests {
             anchor: None,
             pr,
             parents: Vec::new(),
+            claim_change: None,
+            claim_change_why: None,
+            previous_owner: None,
+            previous_kind: None,
+            previous_started: None,
+            previous_last_seen: None,
+            previous_why: None,
         }
     }
 

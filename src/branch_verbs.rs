@@ -11,15 +11,17 @@ use std::path::{Path, PathBuf};
 use knives::bind::Fork;
 use knives::cli::Exit;
 use knives::commands::claim::{
-    Bound, ClaimContext, ClaimDecision, current_identity, decide, last_seen_provenance,
-    render_claim_context,
+    Bound, ClaimContext, ClaimDecision, Identity, current_identity, decide, last_seen_provenance,
+    possession_permits_release, render_claim_context,
 };
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
-use knives::ids::{BranchName, BranchTarget, Requirement};
+use knives::ids::{BranchName, BranchTarget, Requirement, UpstreamName};
 use knives::jj::{
     Repo, StaleRegistration, WorkspaceIdentity, path_occupant, remove_finished_worktree,
 };
-use knives::ledger::{Draft, Stated};
+use knives::ledger::{
+    ClaimChange, Displaced, Draft, Entry, LedgerError, Stated, inline_human_text,
+};
 use knives::statement::{Statement, StatementKind};
 use knives::store::{Store, default_state_path};
 
@@ -62,17 +64,47 @@ pub(crate) struct FinishOptions<'a> {
 }
 
 enum FinishClaimGate {
-    Continue(Option<String>),
-    Refuse,
+    Continue(Released),
+    /// Another owner took or released the caller's own claim and nobody
+    /// holds the branch now. The caller has been told so; its own workspace
+    /// is still disposed of, and the finish exits with the worse of a
+    /// finding and what that disposal gives: `2` where a live process
+    /// refuses the removal, `3` where jj cannot read the workspace state or
+    /// snapshot the working copy.
+    Lost,
+    /// The gate has said everything there is to say; exit with this.
+    Refuse(Exit),
+}
+
+/// What the claim gate leaves for the entry `finish` writes.
+///
+/// The gate is the one place that reads the claim before `release_claim`
+/// removes it, and the one place that looks up its last sighting, so what
+/// the entry records about the displaced holder travels from here rather
+/// than being read a second time.
+#[derive(Default)]
+struct Released {
+    /// The prose a forced release carries; absent when nothing forced it.
+    text: Option<String>,
+    /// The `--why` that forced the release, which the entry records as the
+    /// reason the claim changed hands.
+    why: Option<String>,
+    /// The holder this release displaced, where another owner name held the
+    /// claim.
+    displaced: Option<Displaced>,
 }
 
 /// Hand a branch back and remove its workspace. The inverse of `start`.
 ///
 /// Removing the directory loses no work: the working copy is snapshotted into its commit
-/// first, and a snapshot that fails or leaves a file out refuses the finish. What does
-/// not survive is anything jj never tracks, which is what `--no-cleanup` is for. Another
-/// process still using the workspace, or a claim taken in a place whose processes this
-/// one cannot see, refuses it too unless `--force`.
+/// first, and a snapshot that fails or leaves a file out keeps the directory exactly as
+/// it is, for the next `start` of this branch to adopt, while the claim still comes back.
+/// What does not survive a removal is anything jj never tracks, which is what
+/// `--no-cleanup` is for. Another process still using the workspace, or a claim taken in
+/// a place whose processes this one cannot see, refuses it unless `--force`.
+/// A release that displaced another owner removes nothing and forgets
+/// nothing: that directory is the displaced owner's, and so is the work in
+/// it jj never tracked.
 /// `bound` is the registry and the fork the current directory is inside, by
 /// the name its claims are kept under, which names a terminal user acting
 /// from a fork's workspace.
@@ -83,7 +115,6 @@ pub(crate) fn run_finish(
     bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
-    let checkout_path = &fork.checkout.path;
     // Without this, `finish` would forget the primary workspace and delete the
     // checkout itself.
     if let Some(line) = collides_with_checkout(fork, branch) {
@@ -92,41 +123,74 @@ pub(crate) fn run_finish(
     }
     let workspace = knives::commands::wip::workspace_for(branch.as_str());
     let directory = workspace_path(fork, branch);
+    let place = Place {
+        checkout: &fork.checkout.path,
+        workspace: &workspace,
+        directory: &directory,
+    };
     // The fork's lock is taken first and held to the end: between the snapshot
     // and the removal, a `start` of this branch would otherwise take the lock,
     // adopt the workspace, and write in it, and this removal would take that
     // work with it. A claim writer on this fork waits for the removal, which a
     // workspace with a build tree in it can make seconds long.
-    let mut store = Store::open_for_update(
+    //
+    // A fork ledger that cannot be read does not fail the open: a caller the
+    // claim gate refuses needs the ledger only to search it for who ended
+    // its own claim, and the refusal it gets must not turn into a failure
+    // because that search cannot run ([`read_ledger`]).
+    let store = Store::open_each_for_update(
         default_state_path(),
         &bound.registry.former_names(),
         &[&fork.upstream],
     )?;
+    // Who may hand the claim back is settled before anything is read from the
+    // workspace: a caller the gate refuses reads no directory and scans no
+    // process table, and a workspace whose state jj cannot read no longer
+    // hides the claim question from a caller that does not hold the claim.
+    let (released, floor) = match finish_claim_gate(fork, target, &store, options, bound)? {
+        FinishClaimGate::Continue(released) => (released, Exit::Ok),
+        FinishClaimGate::Lost => (Released::default(), Exit::Findings),
+        FinishClaimGate::Refuse(exit) => return Ok(exit),
+    };
+    // Everything past the gate reads the ledger's statements and writes an
+    // entry to it, so a ledger that could not be read fails the finish here,
+    // with the one line naming it, before the workspace is read or the claim
+    // touched.
+    let mut store = store.all_read()?;
     // Read-only checks before the claim is touched: a refusal leaves everything
-    // as it was.
+    // as it was. A release over another owner's claim reads their workspace
+    // too: `knives start` refuses to adopt a workspace whose state jj cannot
+    // read, so releasing the claim over one would leave the branch closed to
+    // everybody.
     let cleared = match clear_workspace(fork, branch, &directory, options) {
         Ok(cleared) => cleared,
         Err(exit) => return Ok(exit),
     };
-    let forced_release = match finish_claim_gate(fork, target, &store, options, bound)? {
-        FinishClaimGate::Continue(event) => event,
-        FinishClaimGate::Refuse => return Ok(Exit::Usage),
+    // What that release does not do is write in the directory: the displaced
+    // owner's working copy is theirs to snapshot, as the disposal below is
+    // theirs to run.
+    let kept = if released.displaced.is_some() {
+        Ok(())
+    } else {
+        keep_working_copy(fork, branch, cleared.working_copy.as_deref())
     };
-    if let Err(exit) = keep_working_copy(fork, branch, cleared.working_copy.as_deref()) {
-        return Ok(exit);
-    }
-    let forced = joined(forced_release, cleared.over_live_users);
+    // The reason a forced release changed the claim. The live-process gate
+    // is the one force the claim gate does not see: the claim's own holder
+    // passing it leaves the gate's `why` empty.
+    let why = released.why.or_else(|| {
+        cleared
+            .over_live_users
+            .as_ref()
+            .and(options.why)
+            .map(str::to_owned)
+    });
+    let forced = joined(released.text, cleared.over_live_users);
     let had = store.release_claim(target);
     let pr = store.tracked_pull(target);
     // Persist the immutable explanation before the mutable claim state. A failed
     // append then leaves the old claim in place instead of silently releasing or
     // seizing work without the provenance that explains why.
-    let provenance = forced
-        .map(|text| match options.superseded_by {
-            Some(replacement) => format!("{text}; superseded by {replacement}"),
-            None => text,
-        })
-        .or_else(|| release_event(had, options.superseded_by));
+    let provenance = finish_provenance(forced, had, options.superseded_by);
     if let Some(text) = provenance {
         // `--superseded-by` always leaves provenance to carry it: the replacement
         // rides on the one entry that already names it.
@@ -138,25 +202,129 @@ pub(crate) fn run_finish(
                 },
                 replaces: store.statement_stamp(target, StatementKind::Superseded),
             }),
-            ..Draft::event(Some(branch.as_str()), text, pr)
+            ..Draft::event(Some(branch.as_str()), text, pr).about_claim(
+                had.then_some(ClaimChange::Released),
+                why.as_deref(),
+                released.displaced.as_ref(),
+            )
         })?;
     }
     store.save()?;
 
     let claim = if had { "released" } else { "was not held" };
-    let registration = release_registration(checkout_path, &workspace, &directory, cleared.present);
-    let shown = directory.display();
-    let checkout = checkout_path.display();
-    let removal = match cleared.identity {
+    // The release does not wait on the working copy. A snapshot jj refuses
+    // would otherwise keep the claim, and the branch with it, with a session
+    // that has already walked away; the directory is instead left exactly as
+    // it is, and the next `start` of this branch adopts it untouched.
+    //
+    // The path is the one jj recorded for the workspace and the refusal is
+    // jj's own text, which prints more than one line, so they reach the
+    // terminal escaped ([`inline_human_text`] and
+    // [`knives::ledger::problem_human_text`]).
+    if let Err(refused) = kept {
+        eprintln!(
+            "{}/{branch}: claim {claim}; jj could not snapshot all of the working copy at {}, \
+             so the workspace is kept exactly as it is and the next `knives start {branch}` \
+             adopts that directory without touching what is in it\n{}",
+            fork.name,
+            inline_human_text(&refused.at.display().to_string()),
+            knives::ledger::problem_human_text(&refused.refused.to_string()),
+        );
+        return Ok(Exit::Incomplete);
+    }
+    let disposal = if let Some(displaced) = released.displaced.as_ref() {
+        left_to_its_owner(&place, &displaced.owner)
+    } else {
+        ordinary_disposal(
+            &place,
+            cleared.identity.as_ref(),
+            cleared.present,
+            options.cleanup,
+        )?
+    };
+    println!("{}/{branch}: claim {claim}; {disposal}", fork.name);
+    Ok(floor)
+}
+
+/// Forgets this branch's workspace and removes its directory, and says what
+/// became of each.
+fn ordinary_disposal(
+    place: &Place<'_>,
+    identity: Option<&WorkspaceIdentity>,
+    present: bool,
+    cleanup: bool,
+) -> anyhow::Result<String> {
+    let registration =
+        release_registration(place.checkout, place.workspace, place.directory, present);
+    let removal = removal_note(place, identity, &registration, cleanup)?;
+    Ok(format!(
+        "workspace {} {registration}; {removal}",
+        place.workspace
+    ))
+}
+
+/// Why a release that displaced another owner leaves their workspace exactly
+/// as it is.
+///
+/// What jj never tracked in that directory is the displaced owner's work, and
+/// the session that forces a release is not the one to delete it. Its own
+/// `knives finish` disposes of both the directory and the registration, which
+/// is why the registration has to survive this release too.
+///
+/// The owner name is the displaced session's own text, copied from the claim
+/// it wrote into the state file every session of this machine reads, and the
+/// directory is the path jj recorded for the workspace when it has one
+/// (`workspace_path`, `src/commands/start.rs`), which whichever session
+/// registered that workspace chose, so this line prints both escaped
+/// ([`inline_human_text`]): raw, either would let another session choose
+/// what the forcing caller's terminal receives.
+fn left_to_its_owner(place: &Place<'_>, owner: &str) -> String {
+    format!(
+        "{} and its `{}` registration are left as they are: the directory is {}'s, and \
+         what jj never tracked in it is not this session's to delete",
+        inline_human_text(&place.directory.display().to_string()),
+        place.workspace,
+        inline_human_text(owner),
+    )
+}
+
+/// Where this branch's workspace lives, by the three names the disposal needs.
+struct Place<'a> {
+    checkout: &'a Path,
+    workspace: &'a str,
+    directory: &'a Path,
+}
+
+/// Removes the directory, when this branch's own workspace is what sits there
+/// and its registration was cleared, and says what became of it either way.
+///
+/// Every value here is read off disk: the path jj recorded for the workspace
+/// when it has one (`workspace_path`, `src/commands/start.rs`), the checkout
+/// found for this fork, the workspace name and the store path jj recorded
+/// for what sits at the path, a link's target, and jj's own detail for a
+/// working copy it cannot read. All of them reach the terminal escaped
+/// ([`inline_human_text`], and [`knives::ledger::problem_human_text`] for
+/// jj's detail, which prints more than one line); the branch's own workspace
+/// name is this process's.
+fn removal_note(
+    place: &Place<'_>,
+    identity: Option<&WorkspaceIdentity>,
+    registration: &Registration,
+    cleanup: bool,
+) -> anyhow::Result<String> {
+    let shown = inline_human_text(&place.directory.display().to_string());
+    let checkout = inline_human_text(&place.checkout.display().to_string());
+    let workspace = place.workspace;
+    Ok(match identity {
         None => format!(
             "no directory at {shown}{}",
-            stale_worktree_note(checkout_path, &directory)
+            stale_worktree_note(place.checkout, place.directory)
         ),
         Some(WorkspaceIdentity::Ours(name)) if name.as_str() == workspace => {
             // A registration that could not be forgotten keeps its directory: with
             // the directory gone, every later `start` dies on jj's "already exists",
             // `--force` included, where a retried `finish` would have cleaned up.
-            let removable = options.cleanup
+            let removable = cleanup
                 && !matches!(
                     registration,
                     Registration::Failed(_) | Registration::Elsewhere(_)
@@ -165,10 +333,10 @@ pub(crate) fn run_finish(
                 // Safe because jj already snapshotted the working copy into a commit:
                 // the work is in the repository and reachable by change id. Untracked
                 // files are the exception, which is what --no-cleanup is for.
-                std::fs::remove_dir_all(&directory)?;
+                std::fs::remove_dir_all(place.directory)?;
                 format!(
                     "{shown} removed; its commits remain in the repository{}",
-                    stale_worktree_note(checkout_path, &directory)
+                    stale_worktree_note(place.checkout, place.directory)
                 )
             } else {
                 format!("{shown} left on disk")
@@ -178,32 +346,31 @@ pub(crate) fn run_finish(
         // proved nothing about it: `jj workspace forget` exits 0 for a name it does
         // not know.
         Some(WorkspaceIdentity::Ours(name)) => {
-            format!("{shown} is workspace {name} of {checkout}, not {workspace}, left alone")
+            format!(
+                "{shown} is workspace {} of {checkout}, not {workspace}, left alone",
+                inline_human_text(name.as_str())
+            )
         }
         Some(WorkspaceIdentity::Unreadable(detail)) => format!(
             "{shown} is a workspace of {checkout} whose working-copy state could not be read \
-             ({detail}), left alone"
+             ({}), left alone",
+            knives::ledger::problem_human_text(detail)
         ),
         Some(WorkspaceIdentity::Foreign(store)) => format!(
             "{shown} belongs to repository {}, not {checkout}, left alone",
-            store.display()
+            inline_human_text(&store.display().to_string())
         ),
         Some(WorkspaceIdentity::Repository) => {
             format!("{shown} is a repository in its own right, not a workspace, left alone")
         }
         Some(WorkspaceIdentity::SymbolicLink(target_path)) => format!(
             "{shown} is a symbolic link to {}, left alone",
-            target_path.display()
+            inline_human_text(&target_path.display().to_string())
         ),
         Some(WorkspaceIdentity::NotAWorkspace) => {
             format!("{shown} is not a workspace of {checkout}, left alone")
         }
-    };
-    println!(
-        "{}/{branch}: claim {claim}; workspace {workspace} {registration}; {removal}",
-        fork.name
-    );
-    Ok(Exit::Ok)
+    })
 }
 
 /// Two optional provenance texts as one.
@@ -212,6 +379,22 @@ fn joined(first: Option<String>, second: Option<String>) -> Option<String> {
         (Some(first), Some(second)) => Some(format!("{first}; {second}")),
         (first, second) => first.or(second),
     }
+}
+
+/// The prose the one entry a `finish` writes carries, or nothing when it has
+/// nothing to record: what forced the finish, what the branch was superseded
+/// by, and whether a claim was released at all.
+fn finish_provenance(
+    forced: Option<String>,
+    had: bool,
+    superseded_by: Option<&str>,
+) -> Option<String> {
+    forced
+        .map(|text| match superseded_by {
+            Some(replacement) => format!("{text}; superseded by {replacement}"),
+            None => text,
+        })
+        .or_else(|| release_event(had, superseded_by))
 }
 
 /// What is at the branch's workspace path, and what the read-only checks
@@ -281,12 +464,18 @@ fn clear_workspace(
     let working_copy = match resolved {
         Some(WorkspaceIdentity::Ours(name)) if *name == workspace => Some(at.to_owned()),
         Some(WorkspaceIdentity::Unreadable(detail)) => {
+            // The path is where the workspace landed on disk, the checkout is
+            // the one found for this fork, and the detail is jj's own, which
+            // prints more than one line: all three go out escaped
+            // ([`inline_human_text`] and
+            // [`knives::ledger::problem_human_text`]).
             eprintln!(
                 "{}/{branch}: {} is a workspace of {} whose working-copy state could not be read \
-                 ({detail}); it cannot be snapshotted, so it is not forgotten; nothing was changed",
+                 ({}); it cannot be snapshotted, so it is not forgotten; nothing was changed",
                 fork.name,
-                at.display(),
-                checkout.display()
+                inline_human_text(&at.display().to_string()),
+                inline_human_text(&checkout.display().to_string()),
+                knives::ledger::problem_human_text(detail),
             );
             return Err(Exit::Incomplete);
         }
@@ -304,16 +493,22 @@ fn clear_workspace(
     })
 }
 
+/// A working copy jj would not snapshot whole, and where it sits.
+struct NotSnapshotted {
+    at: PathBuf,
+    refused: knives::jj::JjError,
+}
+
 /// Snapshots this branch's working copy into jj before it is forgotten, and
 /// names the commit that keeps it at once, before anything can fail on the
-/// way to removing it. A snapshot that fails or leaves something out refuses
-/// the finish with the claim and the workspace as they were; what jj did
-/// snapshot stays in its commit.
+/// way to removing it. A snapshot that fails or leaves something out leaves
+/// the workspace as it is and the disposal undone; what jj did snapshot stays
+/// in its commit, and the claim is handed back either way.
 fn keep_working_copy(
     fork: &Fork<'_>,
     branch: &BranchName,
     working_copy: Option<&Path>,
-) -> Result<(), Exit> {
+) -> Result<(), NotSnapshotted> {
     let Some(working_copy) = working_copy else {
         return Ok(());
     };
@@ -322,16 +517,10 @@ fn keep_working_copy(
             println!("{}/{branch}: its working copy is kept as {kept}", fork.name);
             Ok(())
         }
-        Err(error) => {
-            eprintln!(
-                "{}/{branch}: could not snapshot all of the working copy at {} into jj, so \
-                 forgetting or removing it could lose edits; the claim and the workspace are \
-                 left as they were\n{error}",
-                fork.name,
-                working_copy.display()
-            );
-            Err(Exit::Incomplete)
-        }
+        Err(refused) => Err(NotSnapshotted {
+            at: working_copy.to_owned(),
+            refused,
+        }),
     }
 }
 
@@ -339,19 +528,27 @@ fn keep_working_copy(
 /// process (not this one, its ancestors, or its own harness's) with its working
 /// directory or an open file there. `Ok` to go on, carrying the forced finish's
 /// provenance when `--force` went over one.
+///
+/// The same list of processes goes two ways, and only one of them is escaped:
+/// a command line comes from `/proc/<pid>/cmdline` of a process this caller
+/// did not start, so the refusal a terminal reads escapes it
+/// ([`inline_human_text`]), as `knives start`'s refusal escapes these same
+/// lines (`claim_evidence`, `src/commands/start.rs`), while the forced
+/// finish's provenance keeps it raw as [`forced_release_event`] keeps the raw
+/// owner, because the entry is the durable record and its reader escapes it
+/// when it prints it.
+///
+/// The directory is where this branch's working copy landed on disk: the
+/// path jj recorded for the workspace when it has one (`workspace_path`,
+/// `src/commands/start.rs`), or what a symbolic link there points at. Either
+/// way another session chose it, so the refusal prints it escaped too.
 fn live_users_gate(
     fork: &Fork<'_>,
     branch: &BranchName,
     directory: &Path,
     options: &FinishOptions<'_>,
 ) -> Result<Option<String>, Exit> {
-    let session = knives::commands::claim::harness_session();
-    let users = knives::liveness::live_users(
-        directory,
-        session
-            .as_ref()
-            .map(|(name, value)| (*name, value.as_str())),
-    );
+    let users = knives::liveness::others_using(directory);
     if users.is_empty() {
         return Ok(None);
     }
@@ -365,11 +562,12 @@ fn live_users_gate(
             "finished by force while in use by {list}: {why}"
         )));
     }
+    let shown = inline_human_text(&list);
     eprintln!(
-        "{}/{branch}: {} is in use by {list}; finishing would take the directory from under \
+        "{}/{branch}: {} is in use by {shown}; finishing would take the directory from under \
          it\nuse `knives finish {branch} --force --why \"…\"` once it is done",
         fork.name,
-        directory.display()
+        inline_human_text(&directory.display().to_string())
     );
     Err(Exit::Usage)
 }
@@ -380,16 +578,26 @@ fn live_users_gate(
 /// or prunable, and the next `start` at that path would fail on it. One that
 /// stays because something else now sits at the path is named, with what is
 /// there, so the failing `start` is not a surprise.
+///
+/// This note goes on the disposal line a terminal reads: the directory is
+/// the path jj recorded for the workspace when it has one (`workspace_path`,
+/// `src/commands/start.rs`), what sits there is read off disk, a link's
+/// target among it, and the failure is git's own text, which prints more
+/// than one line, so all three go out escaped ([`inline_human_text`] and
+/// [`knives::ledger::problem_human_text`]).
 fn stale_worktree_note(checkout: &Path, directory: &Path) -> String {
     match remove_finished_worktree(checkout, directory) {
         Ok(StaleRegistration::Removed) => "; stale Git worktree registration removed".to_owned(),
         Ok(StaleRegistration::None | StaleRegistration::Locked) => String::new(),
         Ok(StaleRegistration::Occupied) => format!(
             "; {} is {}, so its stale Git worktree registration was not cleared",
-            directory.display(),
-            path_occupant(directory)
+            inline_human_text(&directory.display().to_string()),
+            inline_human_text(&path_occupant(directory))
         ),
-        Err(error) => format!("; Git worktree registration not cleared ({error})"),
+        Err(error) => format!(
+            "; Git worktree registration not cleared ({})",
+            knives::ledger::problem_human_text(&error.to_string())
+        ),
     }
 }
 
@@ -408,6 +616,10 @@ enum Registration {
     Failed(String),
 }
 
+/// The disposal line a terminal reads. The path is the one jj recorded for
+/// the name and the detail is jj's own text, which prints more than one line,
+/// so both go out escaped ([`inline_human_text`] and
+/// [`knives::ledger::problem_human_text`]).
 impl std::fmt::Display for Registration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -416,9 +628,13 @@ impl std::fmt::Display for Registration {
             Self::Elsewhere(path) => write!(
                 f,
                 "not forgotten (it is registered at {}; finish or forget it there)",
-                path.display()
+                inline_human_text(&path.display().to_string())
             ),
-            Self::Failed(detail) => write!(f, "not forgotten ({detail})"),
+            Self::Failed(detail) => write!(
+                f,
+                "not forgotten ({})",
+                knives::ledger::problem_human_text(detail)
+            ),
         }
     }
 }
@@ -473,47 +689,247 @@ fn finish_claim_gate(
         .find(|claim| claim.branch == target.branch.as_str())
         .cloned()
     else {
-        return Ok(FinishClaimGate::Continue(None));
+        return unheld_gate(target, store, options, bound);
     };
-    let workspace = knives::commands::wip::workspace_for(target.branch.as_str());
     let cwd = std::env::current_dir()?;
     let identity = current_identity(bound)?;
-    let decision = decide(&ClaimContext {
+    let decision = match decide(&ClaimContext {
         held: Some(&claim),
         identity: &identity,
         in_claimed_workspace: possesses(&cwd, fork, &target.branch),
-    });
+    }) {
+        // Standing in the directory is evidence enough to take work up again,
+        // never to hand back a claim taken under another name: after a takeover
+        // the directory belongs to the new holder, and the finish an agent runs
+        // from inside it would otherwise release that holder's claim and remove
+        // the directory under it.
+        ClaimDecision::Resume { possession: true }
+            if !possession_permits_release(&claim, &identity) =>
+        {
+            ClaimDecision::RefuseHeld
+        }
+        decision => decision,
+    };
     match decision {
         ClaimDecision::Resume { .. } | ClaimDecision::Take => {
+            // The holder's finish is a release, which writes the ledger: with
+            // the ledger unreadable it goes on only to fail on that in
+            // `run_finish`, naming it as it always has, rather than being
+            // refused for the place first.
+            if store.unreadable(&target.repo).is_some() {
+                return Ok(FinishClaimGate::Continue(Released::default()));
+            }
             Ok(place_gate(&claim, target, options))
         }
         ClaimDecision::RefuseAnonymous | ClaimDecision::RefuseHeld => {
-            let activity = Repo::open(&fork.checkout.path)?.workspace_activity(
-                &std::collections::BTreeSet::from([knives::ids::WorkspaceName::new(workspace)]),
-                knives::jj::MAX_ACTIVITY_OPS,
-            )?;
-            let last_seen = knives::seen::last_seen(&claim, &activity, &knives::seen::load());
+            let last_seen =
+                knives::seen::last_seen_in(&claim, &fork.checkout.path, &knives::seen::load());
             if !options.force {
-                let anonymous_note = if decision == ClaimDecision::RefuseAnonymous {
-                    "both sides are anonymous identities, so they can never match; "
-                } else {
-                    ""
-                };
-                eprintln!(
-                    "{anonymous_note}{}\nuse `knives finish {} --force --why \"…\"` to release the claim",
-                    render_claim_context(&claim, last_seen, jiff::Timestamp::now()),
-                    target.branch,
-                );
-                return Ok(FinishClaimGate::Refuse);
+                return Ok(refuse_held(&Refusal {
+                    target,
+                    ledger: read_ledger(store, &target.repo),
+                    identity: &identity,
+                    claim: &claim,
+                    last_seen,
+                    anonymous: decision == ClaimDecision::RefuseAnonymous,
+                }));
             }
             let why = options
                 .why
                 .ok_or_else(|| anyhow::anyhow!("--force requires --why"))?;
-            Ok(FinishClaimGate::Continue(Some(forced_release_event(
-                &claim, last_seen, why,
-            ))))
+            Ok(FinishClaimGate::Continue(Released {
+                text: Some(forced_release_event(&claim, last_seen, why)),
+                why: Some(why.to_owned()),
+                displaced: Displaced::over(&claim, &identity, last_seen),
+            }))
         }
     }
+}
+
+/// A branch nobody holds: an ordinary finish of nothing, unless this fork's
+/// ledger says another owner ended the caller's own claim on it. The caller
+/// is told that first, because the claim it believed it still held is why it
+/// is finishing at all; its own workspace is disposed of all the same.
+///
+/// A ledger that could not be read answers nothing here: the finish goes on
+/// to fail on it in `run_finish`, naming it, before anything is touched. The
+/// search is what would tell the caller that its claim was ended, and a
+/// finish of nothing without it would report a claim that "was not held" and
+/// remove the workspace of an owner that was never told why.
+fn unheld_gate(
+    target: &BranchTarget,
+    store: &Store,
+    options: &FinishOptions<'_>,
+    bound: Bound<'_>,
+) -> anyhow::Result<FinishClaimGate> {
+    if options.force {
+        return Ok(FinishClaimGate::Continue(Released::default()));
+    }
+    let Ok(entries) = read_ledger(store, &target.repo) else {
+        return Ok(FinishClaimGate::Continue(Released::default()));
+    };
+    let identity = current_identity(bound)?;
+    let Some((change, lost)) = claim_ended(entries, &target.branch, &identity.owner) else {
+        return Ok(FinishClaimGate::Continue(Released::default()));
+    };
+    eprintln!(
+        "{}\nnobody holds {} now\nuse `knives start {}` to claim it again",
+        displacement(target, &identity.owner, change, lost),
+        target.key(),
+        target.branch,
+    );
+    Ok(FinishClaimGate::Lost)
+}
+
+/// `repo`'s ledger as the store read it, oldest first, or why it could not
+/// be read. `run_finish` opens its store keeping a ledger it cannot read
+/// ([`Store::open_each_for_update`]), on which every other ledger accessor
+/// of the store panics, so the claim gate asks for the ledger only this way.
+fn read_ledger<'a>(store: &'a Store, repo: &UpstreamName) -> Result<&'a [Entry], &'a LedgerError> {
+    store
+        .unreadable(repo)
+        .map_or_else(|| Ok(store.ledger_entries(repo)), Err)
+}
+
+/// What a refusal of a claim this caller does not hold is decided from.
+struct Refusal<'a> {
+    target: &'a BranchTarget,
+    /// This fork's ledger as the store read it, oldest first: what became of
+    /// the caller's own claim is in it ([`claim_ended`]). Why it could not
+    /// be read, where it could not: the refusal is given without the search.
+    ledger: Result<&'a [Entry], &'a LedgerError>,
+    identity: &'a Identity,
+    claim: &'a knives::store::Claim,
+    last_seen: knives::seen::LastSeen,
+    /// Both sides resolved to an OS user name, which can never match.
+    anonymous: bool,
+}
+
+/// Refuse a finish of a claim the caller does not hold, and say what to do
+/// instead.
+///
+/// An owner whose own claim the ledger says was taken or released is told
+/// that, and is never offered the `finish --force` line: that command would
+/// release the live claim of whoever holds the branch now and leave it
+/// claimed by nobody. Taking the branch back is `start --force`, which
+/// records the change; releasing a gone agent's claim is what the other
+/// refusal is for.
+///
+/// A ledger that could not be read is not searched: the caller gets the
+/// refusal it would get with nothing found there, and one line saying the
+/// ledger could not be read and why. The reason is text this process did not
+/// write: a path, the operating system's error, or what a parser said of an
+/// entry file the ledger pull may have brought from another machine, and it
+/// can run over more than one line, so it goes out escaped
+/// ([`knives::ledger::problem_human_text`]).
+fn refuse_held(refusal: &Refusal<'_>) -> FinishClaimGate {
+    let context = render_claim_context(refusal.claim, refusal.last_seen, jiff::Timestamp::now());
+    let branch = &refusal.target.branch;
+    // The notice belongs to a caller another owner name displaced. A caller
+    // whose own name holds the claim lost it to nobody: it is refused because
+    // two identities of that name cannot be told apart, and telling it that
+    // its claim was taken would name the branch it holds as somebody else's.
+    if refusal.claim.owner != refusal.identity.owner
+        && let Ok(entries) = refusal.ledger
+        && let Some((change, lost)) = claim_ended(entries, branch, &refusal.identity.owner)
+    {
+        eprintln!(
+            "{}\n{context}\nnothing was changed here: the workspace and its registration are \
+             the holder's\nuse `knives start {branch} --force --why \"…\"` to take the branch back",
+            displacement(refusal.target, &refusal.identity.owner, change, lost),
+        );
+        return FinishClaimGate::Refuse(Exit::Findings);
+    }
+    let anonymous_note = if refusal.anonymous {
+        "both sides are anonymous identities, so they can never match; "
+    } else {
+        ""
+    };
+    let unread = refusal.ledger.err().map_or_else(String::new, |error| {
+        format!(
+            "the fork's ledger could not be read, so it was not searched for who ended a claim \
+             of yours on {branch} ({})\n",
+            knives::ledger::problem_human_text(&error.to_string())
+        )
+    });
+    eprintln!(
+        "{anonymous_note}{context}\n{unread}use `knives finish {branch} --force --why \"…\"` to \
+         release the claim"
+    );
+    FinishClaimGate::Refuse(Exit::Usage)
+}
+
+/// What this fork's ledger says became of `owner`'s claim: who ended it,
+/// how, when, and the reason that owner gave for ending it.
+///
+/// `change` is the change the entry recorded, as [`claim_ended`] matched it,
+/// so each word here is the one its own change carries and a later search
+/// cannot make this print a verb the entry never recorded.
+///
+/// Both owner names and the reason are text this process did not write, so
+/// all three go to the terminal escaped ([`inline_human_text`]). `lost.owner`
+/// and the reason come off a ledger entry, which the ledger pull may have
+/// brought from another machine: an entry naming this caller as the owner it
+/// displaced would otherwise send terminal control sequences to the caller's
+/// own terminal. `owner` is this run's identity, and with no harness variable
+/// set that name is read back from a claim in the state file
+/// (`crate::commands::hook::owner_for`), which another session wrote. The
+/// timestamp is escaped too: a ledger read already rejects an entry whose
+/// `ts` no timestamp can be parsed from, but the `ts` is text another machine
+/// wrote, and the escape keeps this line safe without depending on that parser.
+fn displacement(target: &BranchTarget, owner: &str, change: ClaimChange, lost: &Entry) -> String {
+    let verb = match change {
+        ClaimChange::Taken => "took",
+        ClaimChange::Released => "released",
+        ClaimChange::Claimed => "claimed",
+        ClaimChange::Resumed => "resumed",
+    };
+    let why = lost
+        .claim_change_why
+        .as_deref()
+        .map_or_else(String::new, |why| format!(": {}", inline_human_text(why)));
+    format!(
+        "{} {verb} {}'s claim on {} at {}{why}",
+        inline_human_text(&lost.owner),
+        inline_human_text(owner),
+        target.key(),
+        inline_human_text(&lost.ts),
+    )
+}
+
+/// The entry that ended `owner`'s claim on `branch`, read newest first, with
+/// the change it recorded, or nothing where this fork's ledger records no
+/// such end.
+///
+/// The search stops at the newest claim or release `owner` itself wrote,
+/// which closed the chapter before it: an owner that claimed the branch
+/// again, or handed it back itself, is not told about a takeover it has
+/// already answered. An entry that records no claim change — every entry an
+/// older knives wrote — neither stops the search nor answers it, and neither
+/// does a resume, so an owner that took its work up again in the directory it
+/// had lost is still told who took the branch.
+fn claim_ended<'a>(
+    entries: &'a [Entry],
+    branch: &BranchName,
+    owner: &str,
+) -> Option<(ClaimChange, &'a Entry)> {
+    for entry in entries.iter().rev() {
+        if entry.subject.as_deref() != Some(branch.as_str()) {
+            continue;
+        }
+        match entry.claim_change() {
+            Some(ClaimChange::Claimed | ClaimChange::Released) if entry.owner == owner => {
+                return None;
+            }
+            Some(change @ (ClaimChange::Taken | ClaimChange::Released))
+                if entry.previous_owner.as_deref() == Some(owner) =>
+            {
+                return Some((change, entry));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The claim's own holder finishing from another place: a host or agent box
@@ -521,6 +937,11 @@ fn finish_claim_gate(
 /// use there cannot be checked. A duplicate harness of the same session in
 /// another box is the case: the identity matches and the claim cannot tell
 /// them apart. Refused without `--force`; a forced finish records the reason.
+///
+/// The owner and the place are the text of whatever session took the claim,
+/// held in a state file every session of this machine reads, so the refusal
+/// prints both escaped ([`inline_human_text`]): raw, that session would
+/// choose what this caller's terminal receives.
 fn place_gate(
     claim: &knives::store::Claim,
     target: &BranchTarget,
@@ -528,22 +949,27 @@ fn place_gate(
 ) -> FinishClaimGate {
     let here = knives::liveness::this_place();
     let Some(taken) = claim.place.as_deref().filter(|taken| *taken != here) else {
-        return FinishClaimGate::Continue(None);
+        return FinishClaimGate::Continue(Released::default());
     };
     if let Some(why) = options.why.filter(|_| options.force) {
-        return FinishClaimGate::Continue(Some(format!(
-            "finished by force from {here}, not {taken} where the claim was taken: {why}"
-        )));
+        return FinishClaimGate::Continue(Released {
+            text: Some(format!(
+                "finished by force from {here}, not {taken} where the claim was taken: {why}"
+            )),
+            why: Some(why.to_owned()),
+            displaced: None,
+        });
     }
     eprintln!(
-        "{} was claimed by {} in {taken}; this finish runs in {here}, which cannot see whether a \
+        "{} was claimed by {} in {}; this finish runs in {here}, which cannot see whether a \
          process there still works in the workspace\nuse `knives finish {} --force --why \"…\"` \
          once nothing there uses it",
         claim.key(),
-        claim.owner,
+        inline_human_text(&claim.owner),
+        inline_human_text(taken),
         target.branch,
     );
-    FinishClaimGate::Refuse
+    FinishClaimGate::Refuse(Exit::Usage)
 }
 
 /// Pull `fork`'s ledger before a write built from what it states, and say
@@ -762,8 +1188,11 @@ fn with_requirements(required: &[Requirement], added: &[Requirement]) -> Vec<Str
 
 #[cfg(test)]
 mod tests {
-    use super::{spoken, with_requirements};
+    use std::path::PathBuf;
+
+    use super::{Place, Registration, left_to_its_owner, removal_note, spoken, with_requirements};
     use knives::ids::Requirement;
+    use knives::jj::WorkspaceIdentity;
 
     #[test]
     fn track_prose_preserves_the_established_human_output() {
@@ -796,5 +1225,69 @@ mod tests {
             ),
             ["another#3", "other#7", "sibling#49"]
         );
+    }
+
+    /// The disposal line `finish` prints names the path jj recorded for the
+    /// workspace and quotes jj's own failure text, which runs to more than one
+    /// line; neither may carry a terminal control sequence.
+    #[test]
+    fn a_control_character_in_a_registration_reaches_the_terminal_escaped() {
+        assert_eq!(
+            Registration::Elsewhere(PathBuf::from("/forks/work/feat\u{7}-a")).to_string(),
+            "not forgotten (it is registered at /forks/work/feat\u{fffd}-a; finish or forget it \
+             there)"
+        );
+        assert_eq!(
+            Registration::Failed("Error: a\u{1b}[31mb\nand more".to_owned()).to_string(),
+            "not forgotten (Error: a\u{fffd}[31mb and more)"
+        );
+    }
+
+    /// The directory of the disposal line is the path jj recorded for the
+    /// workspace, which whichever session registered it chose, and what sits
+    /// there is read off disk; neither may drive the terminal of the session
+    /// that runs `finish`.
+    #[test]
+    fn a_control_character_in_a_registered_workspace_path_reaches_the_disposal_line_escaped() {
+        let directory = PathBuf::from("/forks/work/feat-a\u{1b}]0;held\u{9b}7m");
+        let checkout = PathBuf::from("/forks/work/default");
+        let place = Place {
+            checkout: &checkout,
+            workspace: "feat-a",
+            directory: &directory,
+        };
+        let note = removal_note(
+            &place,
+            Some(&WorkspaceIdentity::Foreign(PathBuf::from(
+                "/other/re\u{7}po",
+            ))),
+            &Registration::Forgotten,
+            true,
+        )
+        .expect("a removal note");
+        assert!(!note.contains('\u{1b}'), "{note}");
+        assert!(
+            note.contains("/forks/work/feat-a\u{fffd}]0;held\u{fffd}7m"),
+            "{note}"
+        );
+        assert!(note.contains("/other/re\u{fffd}po"), "{note}");
+    }
+
+    /// The line a forced release prints for the displaced owner names the same
+    /// registered path beside that owner's own name.
+    #[test]
+    fn a_control_character_in_a_displaced_owners_workspace_path_reaches_the_terminal_escaped() {
+        let directory = PathBuf::from("/forks/work/feat-b\u{1b}[31m");
+        let checkout = PathBuf::from("/forks/work/default");
+        let place = Place {
+            checkout: &checkout,
+            workspace: "feat-b",
+            directory: &directory,
+        };
+        let line = left_to_its_owner(&place, "agent\u{7}-two");
+        assert!(!line.contains('\u{1b}'), "{line}");
+        assert!(!line.contains('\u{7}'), "{line}");
+        assert!(line.contains("/forks/work/feat-b\u{fffd}[31m"), "{line}");
+        assert!(line.contains("agent\u{fffd}-two"), "{line}");
     }
 }

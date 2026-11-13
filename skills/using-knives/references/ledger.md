@@ -45,6 +45,13 @@ knives notch -m 'this fork needs a cut before the pin moves'
 | `anchor` | Automatic subject tip at write time. Absent when it did not resolve. |
 | `pr` | Explicit stamp, else the subject's tracked PR. |
 | `statement` | What `track`, `depends`, `finish --superseded-by` and `ledger migrate` stated: `{kind, value}`. Kind is `pull`, `fork-only`, `superseded` or `depends` (the comma-joined list that the writer knew). |
+| `claim_change` | What the entry did to the claim on its subject: `claimed`, `taken`, `released` or `resumed`. Absent on an entry that changed no claim, and on every entry an older knives wrote. |
+| `claim_change_why` | The reason that goes with the change: the reason the claim holds after it for `claimed`, `taken` and `resumed`, and the `--why` of a forced release for `released`. Absent when the change has none. |
+| `previous_owner` | The owner whose claim the entry took or released. Absent where it displaced nobody. |
+| `previous_kind` | How that owner's name was resolved: `harness-session`, `workspace-derived` or `os-user`. |
+| `previous_started` | When that owner's claim was taken. |
+| `previous_last_seen` | The durable token of that owner's last sighting: a timestamp, `none-since-claim`, `none-within-window` or `unreadable-operation-log`. |
+| `previous_why` | That owner's own reason for the claim. |
 
 Statement rules:
 
@@ -67,8 +74,8 @@ A command records an event that it sees. A failed ledger write fails the command
 
 | Command | Entry |
 |---|---|
-| `start` | `claimed: <why>`. On a held claim, `resumed` or `resumed via workspace possession`. |
-| `finish` | `claim released`, with the supersession if given, also when unheld. |
+| `start` | `claimed: <why>`, carrying `claim_change` `claimed`. A forced start writes `seized from <owner> (…): <why>`, carrying `taken` where another owner name held the claim and `claimed` where the caller held it itself. On a held claim, `resumed` or `resumed via workspace possession`, carrying `resumed`. |
+| `finish` | `claim released`, with the supersession if given, also when unheld. It carries `claim_change` `released` where a claim was released, and no claim change where none was held. |
 | `track --pr/--fork-only/--forget` | The changed statement. |
 | `depends --on` | `requires <owner>/<name>#<number>`, by upstream name, however `--on` spelled it. |
 | `release cut` | The full parent set, the cut change id beside the commit id, and the carried-parent delta from the prior cut. |
@@ -94,7 +101,7 @@ A command records an event that it sees. A failed ledger write fails the command
 - knives never rewrites an entry, and has no rotation. Only two things remove an entry file: `ledger migrate` (it moves the file), and a sweep that discards an uncommitted repeat transition of this machine. Readers ignore unknown frontmatter keys. There is no version field.
 - Exits: `0` done, `2` usage error, `3` unreadable directory or entry. A repository with no ledger yet gives `0` and `no notches yet`.
 - Commands that read branch statements read the ledger of each fork they work on, at start. These are `status`, `audit`, `pushed`, `sync`, `track`, `depends`, `finish`, `start`, and a `notch` note about a branch without `--pr`.
-- An entry that does not parse stops the command with exit `3` and names the file. A multi-fork `status`, `audit` or `sync` marks that fork `ledger unavailable: …` instead, exits `3`, and reports the other forks.
+- An entry that does not parse stops the command with exit `3` and names the file. A multi-fork `status`, `audit` or `sync` marks that fork `ledger unavailable: …` instead, exits `3`, and reports the other forks. An unforced `finish` of a claim that another identity holds still gives its refusal with exit `2`, and adds one line that says the ledger could not be read and why.
 - Content from a newer knives never stops a command, because machines and sessions run different versions. An entry of an unknown `kind` is left out of reads.
 - A statement that this knives cannot fully read states nothing. Such a statement has an unknown kind, a field other than `kind` and `value`, or a bad value. A bad value is a `pull` that is not decimal, or a `depends` part that is not `<owner>/<name>#<number>`. Each is a problem that names the file in `status`, `notch` (read or `--verify`), `audit`, `pushed`, `sync` and every release command. They exit `3` and answer from the rest. A release write refuses. Read in part, it could make an older statement or a shorter list look live.
 - A peer tree can hold only regular `<owner>/<repository>/<file>` entries. Any other path, such as a nested entry or a control character in a name, refuses the whole pull before it writes. A well-shaped peer entry that does not parse is left out. It is a problem that names the machine ref and path, and each pull checks it again.

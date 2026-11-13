@@ -71,8 +71,34 @@ pub fn decide(context: &ClaimContext<'_>) -> ClaimDecision {
     }
 }
 
+/// Whether standing in the claimed workspace lets this caller release the
+/// claim.
+///
+/// [`decide`] resumes on possession alone, which is right for taking work up:
+/// the directory is the evidence that the claim's own session left it there.
+/// Handing the claim back is the opposite question. A takeover gives the
+/// directory to its new holder, and an agent runs `knives finish` from inside
+/// it, so possession alone would let any later session standing there hand
+/// back a claim it never took, and the directory would go with it. Equal owner
+/// names release, whatever kind of identity each side is; two anonymous
+/// callers under one OS user name go on releasing each other's claims from
+/// inside the directory, as they always have.
+pub fn possession_permits_release(claim: &Claim, identity: &Identity) -> bool {
+    claim.owner == identity.owner
+}
+
 /// Renders the complete claim context shared by refusals and other claim
 /// lifecycle notices.
+///
+/// The owner name and the reason are the text of whatever session took the
+/// claim — another agent of this machine, through `knives start --why` — and
+/// every session of the machine reads that state file, so both reach the
+/// terminal escaped ([`crate::ledger::inline_human_text`]): a reason holding
+/// a terminal control sequence would otherwise drive the terminal of every
+/// caller this context is printed to, which is the refused `start`, the
+/// refused `finish`, the notice after a seizure and the notice after a
+/// resume. The age and the sighting are this process's own words about
+/// timestamps, and need no escaping.
 pub fn render_claim_context(
     claim: &Claim,
     last_seen: crate::seen::LastSeen,
@@ -83,14 +109,20 @@ pub fn render_claim_context(
     format!(
         "{} is claimed by {} ({}), claimed {claimed_age} ago, {}: {}",
         claim.key(),
-        claim.owner,
+        crate::ledger::inline_human_text(&claim.owner),
         owner_kind_label(claim.kind),
         render_last_seen(last_seen, now),
-        claim.why,
+        crate::ledger::inline_human_text(&claim.why),
     )
 }
 
 /// Renders a compact claim row for an advisory surface.
+///
+/// The subject, the owner name and the reason are another session's text,
+/// escaped for the same reason [`render_claim_context`] escapes them: these
+/// rows are printed by the session hook, into the terminal of a caller that
+/// wrote none of it. The subject is the branch the state file records, which
+/// a ref read from a remote can give a C1 character.
 pub fn render_claim_line(
     subject: &str,
     claim: &Claim,
@@ -100,11 +132,12 @@ pub fn render_claim_line(
     let claimed_age =
         crate::ledger::age(&claim.started, now).unwrap_or_else(|| "unknown".to_owned());
     format!(
-        "{subject} ({}, {}, claimed {claimed_age} ago, {}): {}",
-        claim.owner,
+        "{} ({}, {}, claimed {claimed_age} ago, {}): {}",
+        crate::ledger::inline_human_text(subject),
+        crate::ledger::inline_human_text(&claim.owner),
         owner_kind_label(claim.kind),
         render_last_seen(last_seen, now),
-        claim.why,
+        crate::ledger::inline_human_text(&claim.why),
     )
 }
 
@@ -120,6 +153,9 @@ pub fn render_last_seen(last_seen: crate::seen::LastSeen, now: jiff::Timestamp) 
         crate::seen::LastSeen::NoneWithinWindow => {
             "not seen within the observation window".to_owned()
         }
+        crate::seen::LastSeen::Unreadable => {
+            "the jj operation log could not be read, so no sighting is reported".to_owned()
+        }
     }
 }
 
@@ -129,6 +165,7 @@ pub fn last_seen_provenance(last_seen: crate::seen::LastSeen) -> String {
         crate::seen::LastSeen::At(timestamp) => timestamp.to_string(),
         crate::seen::LastSeen::NoneSinceClaim => "none-since-claim".to_owned(),
         crate::seen::LastSeen::NoneWithinWindow => "none-within-window".to_owned(),
+        crate::seen::LastSeen::Unreadable => "unreadable-operation-log".to_owned(),
     }
 }
 
@@ -604,5 +641,36 @@ mod tests {
         };
 
         assert_eq!(decide(&context), ClaimDecision::RefuseHeld);
+    }
+
+    #[test]
+    fn possession_releases_only_the_claim_of_the_same_owner_name() {
+        let claim = held("agent-one", OwnerKind::HarnessSession);
+
+        assert!(possession_permits_release(
+            &claim,
+            &identity("agent-one", OwnerKind::HarnessSession)
+        ));
+        assert!(!possession_permits_release(
+            &claim,
+            &identity("agent-two", OwnerKind::HarnessSession)
+        ));
+    }
+
+    #[test]
+    fn possession_releases_across_identity_kinds_that_name_the_same_owner() {
+        // The name is the owner; how each side came by it is not the question a
+        // release asks. Two anonymous callers under one OS user name keep
+        // releasing each other's claims from inside the directory.
+        let claim = held("terminal-user", OwnerKind::OsUser);
+
+        assert!(possession_permits_release(
+            &claim,
+            &identity("terminal-user", OwnerKind::OsUser)
+        ));
+        assert!(possession_permits_release(
+            &held("agent-one", OwnerKind::HarnessSession),
+            &identity("agent-one", OwnerKind::WorkspaceDerived)
+        ));
     }
 }

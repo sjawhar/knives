@@ -108,6 +108,13 @@ fn a_second_migration_writes_nothing_and_leaves_one_entry_per_statement() {
             anchor: None,
             pr: Some(4545),
             parents: Vec::new(),
+            claim_change: None,
+            claim_change_why: None,
+            previous_owner: None,
+            previous_kind: None,
+            previous_started: None,
+            previous_last_seen: None,
+            previous_why: None,
         })
         .expect("append the prose event");
     lab::state_on_ledger(

@@ -9,6 +9,7 @@ use crate::config::RepoEntry;
 use crate::forge::ChecksSummary;
 use crate::ids::{BookmarkRef, BranchName, BranchTarget, CommitId, ReleaseScheme, is_release_name};
 use crate::jj::{self, Repo};
+use crate::ledger::inline_human_text;
 use crate::snapshot::CompletedSnapshot;
 
 use super::{AuditInput, Report};
@@ -431,26 +432,42 @@ fn pull_snapshot(
 
 /// One branch row, every fact as a fixed token so a reader can scan a column;
 /// `-` is an unanswered fact.
+///
+/// What the forge answered — whether it calls the pull mergeable, its merge
+/// state, its review decision, the name it gives each check conclusion —
+/// reaches the terminal escaped ([`inline_human_text`]), and so do the
+/// template headings and the file names of the forbidden-identifier scan,
+/// which are content of a repository someone else pushed. The branch name is
+/// a bookmark read from the repository, which a remote can give a C1
+/// character, so it is escaped too; a forbidden term is the registry's own
+/// word.
 pub(super) fn render_branch(row: &BranchFacts) -> String {
     let origin = match row.tip_matches_origin {
         Some(true) => "same",
         Some(false) => "differs",
         None => "absent",
     };
-    let mut line = format!("{}  tip {}  origin {origin}", row.branch, row.tip.short());
+    let mut line = format!(
+        "{}  tip {}  origin {origin}",
+        inline_human_text(row.branch.as_str()),
+        row.tip.short()
+    );
     if row.fork_only {
         line.push_str("  fork-only");
     }
     let pull = row.pull.as_ref();
     match pull {
         Some(pull) => {
+            let answered = |value: Option<&String>| {
+                value.map_or_else(|| "-".to_owned(), |value| inline_human_text(value))
+            };
             let _ = write!(
                 line,
                 "  pr #{} mergeable={} merge_state={} review={} head={}",
                 pull.number,
-                pull.mergeable.as_deref().unwrap_or("-"),
-                pull.merge_state_status.as_deref().unwrap_or("-"),
-                pull.review_decision.as_deref().unwrap_or("-"),
+                answered(pull.mergeable.as_ref()),
+                answered(pull.merge_state_status.as_ref()),
+                answered(pull.review_decision.as_ref()),
                 if pull.head_matches_tip {
                     "matches"
                 } else {
@@ -479,7 +496,7 @@ fn push_checks(line: &mut String, checks: Option<&CheckCounts>) {
             let conclusions = checks
                 .conclusions
                 .iter()
-                .map(|(conclusion, count)| format!("{conclusion} {count}"))
+                .map(|(conclusion, count)| format!("{} {count}", inline_human_text(conclusion)))
                 .collect::<Vec<_>>()
                 .join(", ");
             let _ = write!(
@@ -505,7 +522,12 @@ fn push_template(line: &mut String, missing: Option<&[String]>) {
     match missing {
         Some([]) => line.push_str("  template none missing"),
         Some(missing) => {
-            let _ = write!(line, "  template missing: {}", missing.join(", "));
+            let headings = missing
+                .iter()
+                .map(|heading| inline_human_text(heading))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(line, "  template missing: {headings}");
         }
         None => line.push_str("  template -"),
     }
@@ -517,7 +539,7 @@ fn push_forbidden(line: &mut String, hits: Option<&[crate::forbidden::Hit]>) {
         Some(hits) => {
             let places = hits
                 .iter()
-                .map(|hit| format!("{}:{} {}", hit.file, hit.line, hit.term))
+                .map(|hit| format!("{}:{} {}", inline_human_text(&hit.file), hit.line, hit.term))
                 .collect::<Vec<_>>()
                 .join(", ");
             let _ = write!(line, "  forbidden {} hits: {places}", hits.len());
@@ -710,6 +732,63 @@ mod tests {
             render_branch(&full).contains("  template none missing  forbidden 1 hits"),
             "was: {}",
             render_branch(&full)
+        );
+    }
+
+    #[test]
+    fn a_branch_row_escapes_what_the_forge_and_the_repository_answered() {
+        // The forge's words, a template heading from a repository someone
+        // else pushed, the file the forbidden scan found in a diff, and a
+        // bookmark name a remote gave a C1 character.
+        let tip = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut row = local_row("feat/\u{9b}a", tip);
+        row.pull = Some(PullSnapshot {
+            number: 7,
+            url: String::new(),
+            head: tip.to_owned(),
+            head_matches_tip: true,
+            mergeable: Some("MERGE\u{1b}[2JABLE".to_owned()),
+            merge_state_status: Some("BLO\u{7}CKED".to_owned()),
+            review_decision: Some("APPRO\u{9b}VED".to_owned()),
+            checks: Some(CheckCounts {
+                total: 1,
+                pending: 0,
+                conclusions: BTreeMap::from([("SUC\u{1b}]0;x\u{7}CESS".to_owned(), 1)]),
+            }),
+            unresolved_review_threads: None,
+            template_missing: Some(vec!["Appro\u{1b}[31mach".to_owned()]),
+        });
+        row.forbidden = Some(vec![crate::forbidden::Hit {
+            file: "infra/\u{1b}[2Japp.py".to_owned(),
+            line: 9,
+            term: "acme-corp".to_owned(),
+            text: "deploy(\"acme-corp\")".to_owned(),
+        }]);
+
+        let line = render_branch(&row);
+
+        assert!(!line.contains('\u{1b}'), "was: {line:?}");
+        assert!(!line.contains('\u{7}'), "was: {line:?}");
+        assert!(!line.contains('\u{9b}'), "was: {line:?}");
+        assert!(line.starts_with("feat/\u{fffd}a  tip "), "was: {line:?}");
+        assert!(
+            line.contains(
+                "mergeable=MERGE\u{fffd}[2JABLE merge_state=BLO\u{fffd}CKED \
+                 review=APPRO\u{fffd}VED"
+            ),
+            "was: {line:?}"
+        );
+        assert!(
+            line.contains("checks 1 (SUC\u{fffd}]0;x\u{fffd}CESS 1; 0 pending)"),
+            "was: {line:?}"
+        );
+        assert!(
+            line.contains("template missing: Appro\u{fffd}[31mach"),
+            "was: {line:?}"
+        );
+        assert!(
+            line.contains("forbidden 1 hits: infra/\u{fffd}[2Japp.py:9 acme-corp"),
+            "was: {line:?}"
         );
     }
 

@@ -15,6 +15,7 @@ use crate::detect::{Finding, divergent_changes, stale_parents};
 use crate::forge::{Forge, PullSummary};
 use crate::ids::{BookmarkRef, is_release_name};
 use crate::jj::Repo;
+use crate::ledger::inline_human_text;
 use crate::snapshot::{self, SnapshotConfig};
 use crate::store::Store;
 
@@ -136,11 +137,19 @@ pub struct BranchState {
 }
 
 impl BranchState {
+    /// The branch name and the claim's owner are text this process did not
+    /// write: jj named the branch, and whichever session took the claim wrote
+    /// its owner name into the state file every session of this machine
+    /// reads. Both reach the terminal escaped ([`inline_human_text`]), as
+    /// every other printer of a branch name and a claim owner does
+    /// (`src/commands/status/render.rs`, `claim_evidence` in
+    /// `src/commands/start.rs`). Everything else on this line is this
+    /// module's own words about booleans.
     pub fn render(&self) -> String {
-        let mut bits = vec![format!("  {}", self.branch)];
+        let mut bits = vec![format!("  {}", inline_human_text(&self.branch))];
         bits.push(self.claimed_by.as_ref().map_or_else(
             || "unclaimed".to_owned(),
-            |owner| format!("claimed by {owner}"),
+            |owner| format!("claimed by {}", inline_human_text(owner)),
         ));
         if self.stale_release_parent {
             bits.push("a release still pins an older commit of it".to_owned());
@@ -406,12 +415,26 @@ fn branch_states_with_findings(
     Ok((states, findings))
 }
 
+/// The report as a terminal reads it.
+///
+/// Every value a party other than this process wrote goes out escaped
+/// ([`inline_human_text`]): a branch name jj printed, a claim owner from the
+/// state file, a finding's detail built from either, and the problems and
+/// notes, which quote what jj, the forge and the filesystem said, paths from
+/// other machines' refs among them. What stays raw is this module's own
+/// prose, the counts and the stated cap (numbers parsed here), the
+/// convention file names (this file's own constants) and the repo key, which
+/// the registry refuses to load with a control character in it
+/// ([`crate::ledger::is_ledger_component`]). This command has no machine
+/// surface — `run_preflight` prints this text and nothing else — so the raw
+/// values stay where their writers put them: the state file and the ledger,
+/// which are records their reader escapes when it prints them.
 pub fn render(report: &Report) -> String {
     let mut lines: Vec<String> = report
         .problems
         .iter()
         .chain(&report.notes)
-        .map(|message| format!("! {message}"))
+        .map(|message| format!("! {}", inline_human_text(message)))
         .collect();
     lines.push(format!("{}: convention files", report.repo));
     lines.extend(report.conventions.iter().map(Convention::render));
@@ -429,10 +452,12 @@ pub fn render(report: &Report) -> String {
     if report.claimed_branches.is_empty() {
         lines.push("  claimed branches: none".to_owned());
     } else {
-        lines.push(format!(
-            "  claimed branches: {}",
-            report.claimed_branches.join(", ")
-        ));
+        let shown: Vec<String> = report
+            .claimed_branches
+            .iter()
+            .map(|branch| inline_human_text(branch))
+            .collect();
+        lines.push(format!("  claimed branches: {}", shown.join(", ")));
     }
     if report.branch_state.is_empty() {
         lines.push("  branches: none".to_owned());
@@ -441,7 +466,7 @@ pub fn render(report: &Report) -> String {
         lines.extend(report.branch_state.iter().map(BranchState::render));
     }
     for finding in &report.findings {
-        lines.push(format!("  !! {}", finding.detail));
+        lines.push(format!("  !! {}", inline_human_text(&finding.detail)));
     }
     lines.push("  judgment is not this command's job: run the pre-PR skill next".to_owned());
     lines.join("\n")
@@ -605,6 +630,51 @@ mod tests {
             ..Report::default()
         };
         assert!(render(&report).contains("judgment is not this command's job"));
+    }
+
+    #[test]
+    fn every_value_another_party_wrote_reaches_the_terminal_escaped() {
+        // jj named the branch, whichever session took the claim wrote its
+        // owner into the state file, and a problem quotes what jj, the forge
+        // or the filesystem said: raw, any of them chooses what the terminal
+        // of whoever runs `knives preflight` receives.
+        let report = Report {
+            repo: "demo".to_owned(),
+            claimed_branches: vec!["feat-\u{1b}]0;x\u{7}census".to_owned()],
+            branch_state: vec![BranchState {
+                branch: "feat-\u{1b}]0;x\u{7}census".to_owned(),
+                claimed_by: Some("agent\u{1b}]0;held\u{9b}31m-a".to_owned()),
+                stale_release_parent: false,
+                divergent: false,
+                landed: None,
+            }],
+            problems: vec!["could not read our branches: \u{9b}31m".to_owned()],
+            ..Report::default()
+        };
+
+        let text = render(&report);
+
+        assert!(
+            text.contains(
+                "  feat-\u{fffd}]0;x\u{fffd}census; claimed by agent\u{fffd}]0;held\u{fffd}31m-a; \
+                 landed: not probed"
+            ),
+            "was: {text:?}"
+        );
+        assert!(
+            text.contains("claimed branches: feat-\u{fffd}]0;x\u{fffd}census"),
+            "was: {text:?}"
+        );
+        assert!(
+            text.contains("! could not read our branches: \u{fffd}31m"),
+            "was: {text:?}"
+        );
+        for character in text.chars() {
+            assert!(
+                !character.is_control() || character == '\n',
+                "{character:?} reached the terminal: {text:?}"
+            );
+        }
     }
 }
 

@@ -12,6 +12,7 @@ use crate::consumer_pins::{
 };
 use crate::ids::{CommitId, ReleaseScheme, short_id};
 use crate::jj::{self, Repo};
+use crate::ledger::{inline_human_text, problem_human_text};
 use crate::pins::{Pin, PinVerdict};
 use crate::release_model::{ConsumerScan, newest_release, repo_slug};
 
@@ -395,6 +396,13 @@ pub fn exit_for(report: &Report) -> Exit {
 }
 
 /// Render a compact census for an interactive terminal.
+///
+/// The fork is a registry key and a consumer is named as the registry or the
+/// caller named it. A release reference is a ref read from the release
+/// remote, which can give it a C1 character; it, what a consumer repository
+/// holds — a pin's file, its reference, the commit it locks — and every
+/// problem or note quoting git, jj or the forge reach the terminal escaped;
+/// the pin's kind and each verdict are this module's own words.
 pub fn render(report: &Report) -> String {
     let mut lines = report.newest.as_ref().map_or_else(
         || format!("{}: newest release unavailable", report.fork),
@@ -402,32 +410,32 @@ pub fn render(report: &Report) -> String {
             format!(
                 "{}: newest {} @ {} (release remote, {})",
                 report.fork,
-                newest.reference,
-                short_id(&newest.commit),
+                inline_human_text(&newest.reference),
+                inline_human_text(short_id(&newest.commit)),
                 newest.source
             )
         },
     );
     for problem in &report.problems {
-        let _ = write!(lines, "\n  PROBLEM: {problem}");
+        let _ = write!(lines, "\n  PROBLEM: {}", problem_human_text(problem));
     }
     for consumer in &report.consumers {
         let _ = write!(lines, "\n  {}", consumer.consumer);
         if let Some(problem) = &consumer.problem {
-            let _ = write!(lines, ": PROBLEM: {problem}");
+            let _ = write!(lines, ": PROBLEM: {}", problem_human_text(problem));
         } else {
             lines.push(':');
             for pin in &consumer.pins {
                 let _ = write!(
                     lines,
                     "\n    {}:{}  {}  {}{}  {}",
-                    pin.file,
+                    inline_human_text(&pin.file),
                     pin.line,
-                    pin.reference,
+                    inline_human_text(&pin.reference),
                     pin.kind,
-                    pin.locked
-                        .as_deref()
-                        .map_or_else(String::new, |locked| format!("  @{}", short_id(locked))),
+                    pin.locked.as_deref().map_or_else(String::new, |locked| {
+                        format!("  @{}", inline_human_text(short_id(locked)))
+                    }),
                     pin.verdict
                         .as_ref()
                         .map_or_else(|| "unclassified".to_owned(), render_verdict)
@@ -435,11 +443,11 @@ pub fn render(report: &Report) -> String {
             }
         }
         for note in &consumer.notes {
-            let _ = write!(lines, "\n    {note}");
+            let _ = write!(lines, "\n    {}", inline_human_text(note));
         }
     }
     for note in &report.notes {
-        let _ = write!(lines, "\n  note: {note}");
+        let _ = write!(lines, "\n  note: {}", inline_human_text(note));
     }
     lines
 }
@@ -448,9 +456,14 @@ fn render_verdict(verdict: &PinVerdict) -> String {
     match verdict {
         PinVerdict::Current => "current".to_owned(),
         PinVerdict::StaleLock { expected } => {
-            format!("stale lock: expected @{}", short_id(expected))
+            format!(
+                "stale lock: expected @{}",
+                inline_human_text(short_id(expected))
+            )
         }
-        PinVerdict::BehindName { newest } => format!("behind: newest is {newest}"),
+        PinVerdict::BehindName { newest } => {
+            format!("behind: newest is {}", inline_human_text(newest))
+        }
         PinVerdict::UnknownName => "unknown release".to_owned(),
         PinVerdict::OffScheme => "off-scheme reference".to_owned(),
     }
@@ -462,8 +475,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ConsumerContext, Release, Report, consumer_row, consumer_slug_row, exit_for,
-        local_remote_skew_note, render, verdict,
+        ConsumerContext, ConsumerRow, PinRow, Release, Report, consumer_row, consumer_slug_row,
+        exit_for, local_remote_skew_note, render, verdict,
     };
     use crate::cli::Exit;
     use crate::consumer_pins::ConsumerHeadMemo;
@@ -751,6 +764,63 @@ mod tests {
                 "local view has release/2026-08-05 @ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, remote has release/2026-08-05 @ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb — the checkout is behind or ahead of the remote"
                     .to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn render_escapes_what_a_consumer_repository_and_a_tool_answered() {
+        // A pin's file and reference are a consumer repository's content, the
+        // newest release is a ref the release remote can give a C1 character,
+        // and a problem and a note quote git, jj or the forge.
+        let report = Report {
+            fork: "demo".to_owned(),
+            newest: Some(release(
+                "release/2026-08-05\u{9b}m",
+                "aaaa\u{1b}[2Jaaaaaaaa",
+            )),
+            consumers: vec![ConsumerRow {
+                consumer: "acme/consumer".to_owned(),
+                pins: vec![PinRow {
+                    file: "deps/\u{1b}[2Jlock.toml".to_owned(),
+                    line: 3,
+                    reference: "release/\u{7}2026-01-01".to_owned(),
+                    kind: "tag".to_owned(),
+                    locked: Some("bbbb\u{1b}bbbbbbbb".to_owned()),
+                    verdict: Some(PinVerdict::BehindName {
+                        newest: "release/2026-08-05\u{9d}m".to_owned(),
+                    }),
+                }],
+                notes: vec!["forge unreachable: \u{1b}]0;pwned\u{7}".to_owned()],
+                problem: None,
+            }],
+            notes: vec!["git said \u{1b}[31mno".to_owned()],
+            problems: vec!["could not read\nfatal: \u{1b}[2J".to_owned()],
+        };
+
+        let text = render(&report);
+
+        assert!(!text.contains('\u{1b}'), "was: {text:?}");
+        assert!(!text.contains('\u{7}'), "was: {text:?}");
+        assert!(!text.contains('\u{9b}'), "was: {text:?}");
+        assert!(!text.contains('\u{9d}'), "was: {text:?}");
+        assert!(
+            text.starts_with("demo: newest release/2026-08-05\u{fffd}m @ "),
+            "was: {text:?}"
+        );
+        assert!(
+            text.contains("behind: newest is release/2026-08-05\u{fffd}m"),
+            "was: {text:?}"
+        );
+        assert!(
+            text.contains("PROBLEM: could not read; fatal: \u{fffd}[2J"),
+            "was: {text:?}"
+        );
+        assert!(
+            text.contains(
+                "deps/\u{fffd}[2Jlock.toml:3  release/\u{fffd}2026-01-01  tag  \
+                 @bbbb\u{fffd}bbbbbbb"
+            ),
+            "was: {text:?}"
         );
     }
 }

@@ -211,6 +211,174 @@ fn session_start_inside_a_managed_repo_emits_the_notice_with_claims() {
     assert!(!context.contains("beta instructions"), "was: {context}");
 }
 
+/// A claim's owner and reason holding the control characters of an OSC
+/// sequence, with the C1 introducers a terminal reading UTF-8 as ISO 2022
+/// acts on beside the C0 ones (U+009B is CSI, U+009D is OSC).
+const HOSTILE_OWNER: &str = "agent-\u{1b}]0;x\u{7}\u{9b}31m\u{9d}2;y-one";
+const HOSTILE_WHY: &str = "porting \u{1b}]0;seized\u{7}upstream";
+/// The same two as every terminal must read them.
+const ESCAPED_OWNER: &str = "agent-\u{fffd}]0;x\u{fffd}\u{fffd}31m\u{fffd}2;y-one";
+const ESCAPED_WHY: &str = "porting \u{fffd}]0;seized\u{fffd}upstream";
+
+#[test]
+fn session_start_escapes_the_control_characters_of_a_claim_row() {
+    // The row this notice carries is `render_claim_line`
+    // (src/commands/claim.rs), and its owner and reason are the text of
+    // whichever session took the claim, held in a state file every session of
+    // this machine reads: raw, that session would choose what this one's
+    // terminal receives at every session start.
+    let repos = Repositories::new();
+    repos.configure(false);
+    repos.write_state(&json!({"claims": {"maintainer/beta/feat/claimed\u{9b}m": {
+        "repo": "maintainer/beta",
+        "branch": "feat/claimed\u{9b}m",
+        "owner": HOSTILE_OWNER,
+        "why": HOSTILE_WHY,
+        "started": "2026-01-01T00:00:00Z",
+        "files": []
+    }}}));
+    let start = event("session-start", &repos.beta, None);
+
+    // When: Claude Code starts inside the repository that claim names.
+    let context = additional_context(&run_hook(repos.home.path(), &start));
+
+    // Then: the row names the claim with every control character as U+FFFD,
+    // and nothing but the line feeds this tool writes itself survives.
+    assert!(
+        context.contains(&format!(
+            "feat/claimed\u{fffd}m ({ESCAPED_OWNER}, os-user, claimed "
+        )),
+        "was: {context:?}"
+    );
+    assert!(
+        context.contains(&format!("): {ESCAPED_WHY}")),
+        "was: {context:?}"
+    );
+    for (index, character) in context.char_indices() {
+        assert!(
+            !character.is_control() || character == '\n',
+            "{character:?} reached the session at byte {index}: {context:?}"
+        );
+    }
+}
+
+/// The `upstream` URL of a checkout someone else configured, carrying the
+/// control characters of an OSC sequence, and the same URL as every terminal
+/// and every model's context must read it.
+const HOSTILE_UPSTREAM: &str = "https://forge.invalid/other\u{1b}]0;pwned\u{7}/alpha";
+const ESCAPED_UPSTREAM: &str = "https://forge.invalid/other\u{fffd}]0;pwned\u{fffd}/alpha";
+
+#[test]
+fn a_refusal_naming_a_disagreeing_remote_reaches_the_session_escaped() {
+    // When knives cannot say who holds which branch it says so in place of
+    // the roster (`refusal_notice`, src/commands/hook.rs), and the refusal it
+    // quotes is built from what the checkout's git config holds: the
+    // `upstream` URL of a clone this session did not make. That text goes
+    // into the model's context, which the harness shows in its transcript.
+    let repos = Repositories::new();
+    repos.configure(false);
+    lab::git_set_remote_url(&repos.alpha, "upstream", HOSTILE_UPSTREAM);
+    let start = event("session-start", &repos.alpha, None);
+
+    // When: Claude Code starts inside the checkout whose upstream disagrees
+    // with the registry.
+    let context = additional_context(&run_hook(repos.home.path(), &start));
+
+    // Then: the refusal still names the remote, with every control character
+    // as U+FFFD and nothing but the line feeds this tool writes itself.
+    assert!(
+        context.contains("knives cannot read who has claimed which branch"),
+        "was: {context:?}"
+    );
+    assert!(
+        context.contains(&format!("its upstream remote is {ESCAPED_UPSTREAM} and")),
+        "was: {context:?}"
+    );
+    for (index, character) in context.char_indices() {
+        assert!(
+            !character.is_control() || character == '\n',
+            "{character:?} reached the session at byte {index}: {context:?}"
+        );
+    }
+}
+
+#[test]
+fn an_error_the_hook_reports_reaches_stderr_escaped_and_on_one_line() {
+    // Every failure of an event is said on stderr and nowhere else
+    // (`report`, src/commands/hook.rs), and the harness that spawned the hook
+    // keeps that stream with the session. The `toml` parser quotes the line
+    // it refused over several lines of its own, so a registry entry pasted
+    // from a `knives register` run elsewhere decides what this session's
+    // terminal receives on every tool call until it is fixed.
+    let repos = Repositories::new();
+    repos.configure(false);
+    std::fs::write(
+        repos.home.path().join("repos.toml"),
+        "broken \u{1b}]0;pwned\u{7} line\n",
+    )
+    .expect("write registry");
+    let read = post_tool_use_read(repos.home.path(), &repos.beta.join("file.txt"), SESSION_ID);
+
+    // When: a tool call that needs the registry is answered.
+    let (success, _, errors) = run_hook_input(repos.home.path(), &read.to_string());
+
+    // Then: the hook still answers, and the parser's quotation arrives folded
+    // into one line with every control character as U+FFFD.
+    assert!(success, "a hook must never fail the session: {errors:?}");
+    assert!(
+        errors.contains("knives hook: ") && errors.contains("is not a valid registry"),
+        "was: {errors:?}"
+    );
+    assert!(
+        errors.contains("1 | broken \u{fffd}]0;pwned\u{fffd} line"),
+        "was: {errors:?}"
+    );
+    assert_eq!(errors.lines().count(), 1, "was: {errors:?}");
+    for (index, character) in errors.char_indices() {
+        assert!(
+            !character.is_control() || character == '\n',
+            "{character:?} reached the terminal at byte {index}: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn remotes_the_hook_cannot_read_reach_stderr_escaped() {
+    // `match_checkout` (src/hook/resolve.rs) says on stderr why it could not
+    // read a checkout's remotes, quoting the checkout's path and git's own
+    // message. The checkout's directory name carries ESC, BEL and U+009B
+    // (CSI); which of them git quotes back, and how, differs between git
+    // versions (one names the gitfile, another the directory it points to),
+    // so the test pins the path the hook names itself and asks of the whole
+    // line only that no control character survives.
+    let repos = Repositories::new();
+    repos.configure(false);
+    let broken = repos.home.path().join("broken\u{1b}]0;pwned\u{7}\u{9b}2J");
+    std::fs::create_dir(&broken).expect("create checkout");
+    std::fs::write(broken.join(".git"), "gitdir: /nowhere/\u{9b}2J\u{9d}x\n")
+        .expect("write git pointer");
+    std::fs::write(broken.join("file.txt"), "content").expect("write file");
+    let read = post_tool_use_read(repos.home.path(), &broken.join("file.txt"), SESSION_ID);
+
+    // When: a tool call touches a file of that checkout.
+    let (success, _, errors) = run_hook_input(repos.home.path(), &read.to_string());
+
+    // Then: the hook still answers, and its one line about the remotes
+    // carries every control character as U+FFFD.
+    assert!(success, "a hook must never fail the session: {errors:?}");
+    assert!(
+        errors.contains("knives hook: reading remotes of ")
+            && errors.contains("broken\u{fffd}]0;pwned\u{fffd}\u{fffd}2J"),
+        "was: {errors:?}"
+    );
+    for (index, character) in errors.char_indices() {
+        assert!(
+            !character.is_control() || character == '\n',
+            "{character:?} reached the terminal at byte {index}: {errors:?}"
+        );
+    }
+}
+
 #[test]
 fn session_start_reemits_a_notice_when_the_roster_changes() {
     // A one-time boolean must not hide a new claim when a session starts again

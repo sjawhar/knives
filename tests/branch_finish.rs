@@ -111,7 +111,7 @@ fn starting_and_finishing_a_branch_leaves_its_reason_in_the_ledger() {
 
 /// A claim written straight into the store, so a `finish` test starts from a held
 /// branch without `start` putting its own event in the ledger first.
-fn hold_claim(home: &tempfile::TempDir, branch: &str) {
+fn hold_claim(home: &tempfile::TempDir, branch: &str, owner: &str) {
     let mut store = Store::open_for_update(
         home.path().join("state.json"),
         &knives::config::FormerNames::new(),
@@ -124,7 +124,7 @@ fn hold_claim(home: &tempfile::TempDir, branch: &str) {
             BranchName::new(branch),
         ),
         &knives::commands::claim::Identity {
-            owner: "ses_fff688".to_owned(),
+            owner: owner.to_owned(),
             kind: OwnerKind::HarnessSession,
         },
         "carrying the queue fix",
@@ -209,7 +209,7 @@ fn finish_releases_without_consulting_the_forge() {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let (home, _consumer) = release_test_home(&lab);
-    hold_claim(&home, "feat/alpha");
+    hold_claim(&home, "feat/alpha", "ses_fff688");
     lab::state_on_ledger(
         home.path(),
         "demo",
@@ -448,8 +448,10 @@ fn finish_force_requires_why() {
 
 #[test]
 fn finish_by_possession_still_releases() {
-    // Physical presence in the claim's workspace is an intentional possession
-    // proof even when no harness identity survives into the finishing process.
+    // Physical presence in the claim's workspace releases it when the caller
+    // resolves to the name the claim carries: with one claimant on the fork
+    // and no harness variable in the environment, the derived owner is that
+    // claimant.
     let lab = lab::Lab::new();
     let (home, _consumer) = release_test_home(&lab);
     let workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
@@ -475,11 +477,60 @@ fn finish_by_possession_still_releases() {
 }
 
 #[test]
+fn finish_by_possession_is_refused_when_the_fork_has_a_second_claimant() {
+    // Two claimants and no harness variable: no owner can be derived from
+    // state, so the caller is the OS user, a name the claim does not carry.
+    // Standing in the directory is then no permission to hand the claim back —
+    // after a takeover the directory belongs to whoever took it.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
+    hold_claim(&home, "feat/delta", "ses_fff688");
+
+    let refused = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "finish", "feat/gamma", "--repo", "demo"])
+        .current_dir(&workspace)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env_remove("KNIVES_OWNER")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("OMP_SESSION_ID")
+        .env("USER", "terminal-user")
+        .output()
+        .expect("finish held workspace from inside");
+
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert!(
+        stderr.contains("is claimed by agent-one"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("knives finish feat/gamma --force --why"),
+        "stderr: {stderr}"
+    );
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert_eq!(
+        state["claims"]["demo/feat/gamma"]["owner"],
+        Value::String("agent-one".to_owned())
+    );
+    assert!(workspace.is_dir(), "the claimed workspace was removed");
+}
+
+#[test]
 fn finishing_a_held_branch_without_a_successor_records_only_the_release() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let (home, _consumer) = release_test_home(&lab);
-    hold_claim(&home, "feat/alpha");
+    hold_claim(&home, "feat/alpha", "ses_fff688");
 
     let finished = knives_finish(&lab, &home, &["feat/alpha"]);
     assert!(finished.status.success());
@@ -713,7 +764,7 @@ fn a_stated_pull_request_lives_on_the_ledger_and_status_shows_it() {
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let (home, _consumer) = release_test_home(&lab);
-    hold_claim(&home, "feat/alpha");
+    hold_claim(&home, "feat/alpha", "ses_fff688");
     let state_path = home.path().join("state.json");
     let state_before = std::fs::read(&state_path).expect("read state");
     let knives = |args: &[&str]| {
@@ -1053,5 +1104,232 @@ fn finishing_keeps_a_vanished_workspace_jj_recorded_no_path_for() {
         stdout.contains("workspace feat-gamma not forgotten (")
             && stdout.contains("Workspace has no recorded path"),
         "{stdout}"
+    );
+}
+
+/// `knives start feat/gamma --force --why <why>` in the lab's checkout as
+/// the harness session `owner`.
+fn force_start_gamma(lab: &Lab, home: &tempfile::TempDir, owner: &str, why: &str) -> Output {
+    lab::knives_command(
+        &lab.work,
+        home.path(),
+        lab.temp_path(),
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            why,
+        ],
+    )
+    .env("KNIVES_OWNER", owner)
+    .output()
+    .expect("force start")
+}
+
+/// `knives finish feat/gamma` in the lab's checkout as the harness session
+/// `owner`, whatever it exits.
+fn finish_gamma_as(lab: &Lab, home: &tempfile::TempDir, owner: &str) -> Output {
+    lab::knives_command(
+        &lab.work,
+        home.path(),
+        lab.temp_path(),
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    )
+    .env("KNIVES_OWNER", owner)
+    .output()
+    .expect("run finish")
+}
+
+/// `knives finish feat/gamma --force --why <why>` in the lab's checkout as
+/// the harness session `owner`, whatever it exits.
+fn force_finish_gamma_as(lab: &Lab, home: &tempfile::TempDir, owner: &str, why: &str) -> Output {
+    lab::knives_command(
+        &lab.work,
+        home.path(),
+        lab.temp_path(),
+        &[
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            why,
+        ],
+    )
+    .env("KNIVES_OWNER", owner)
+    .output()
+    .expect("force finish")
+}
+
+/// The demo fork's ledger entries in `home`, oldest first.
+fn ledger_entries(home: &tempfile::TempDir) -> Vec<knives::ledger::Entry> {
+    knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .read()
+        .expect("read ledger")
+        .entries
+}
+
+#[test]
+fn a_forced_release_refuses_a_workspace_whose_state_cannot_be_read() {
+    // `knives start` refuses to adopt a workspace whose working-copy state jj
+    // cannot read, so a release over one would leave the branch closed to
+    // everybody: nobody holds it, and no `--force` can help, because there is
+    // nothing to force. The release over another owner's claim reads that
+    // directory for this refusal, and writes nothing in it.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
+    std::fs::write(
+        workspace.join(".jj/working_copy/checkout"),
+        b"\xff\xfe garbage",
+    )
+    .expect("corrupt the working-copy state");
+    let before = ledger_entries(&home).len();
+
+    let refused = force_finish_gamma_as(&lab, &home, "agent-two", "owner session died");
+
+    // Then: the refusal, the claim where it was, and nothing on the ledger
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(3), "stderr: {stderr}");
+    assert!(
+        stderr.contains("whose working-copy state could not be read"),
+        "stderr: {stderr}"
+    );
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert_eq!(
+        state["claims"]["demo/feat/gamma"]["owner"],
+        Value::String("agent-one".to_owned()),
+        "claim: {}",
+        state["claims"]
+    );
+    assert_eq!(
+        ledger_entries(&home).len(),
+        before,
+        "a finish that changed nothing wrote to the ledger"
+    );
+}
+
+#[test]
+fn a_forced_release_leaves_the_displaced_owners_workspace_as_it_is() {
+    // What jj never tracked in that directory is the displaced owner's work,
+    // and the session that forces the release is not the one to delete it.
+    // The owner's own `finish` disposes of the directory and the
+    // registration, which is why both have to survive this.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
+    let untracked = workspace.join("scratch.txt");
+    std::fs::write(&untracked, "jj never saw this\n").expect("write untracked work");
+    let operations_before = lab::operation_ids(&lab.work);
+
+    let forced = force_finish_gamma_as(&lab, &home, "agent-two", "owner session died");
+
+    // Then: the claim came back with its provenance, and nothing in the
+    // directory or in jj's record of it moved.
+    let stdout = String::from_utf8_lossy(&forced.stdout);
+    let stderr = String::from_utf8_lossy(&forced.stderr);
+    assert!(
+        forced.status.success(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stdout.contains("claim released"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("are left as they are") && stdout.contains("the directory is agent-one's"),
+        "stdout: {stdout}"
+    );
+    // The working copy is the displaced owner's to snapshot: a snapshot of it
+    // writes an operation into the repository the two workspaces share, and
+    // it would commit the untracked file this release must leave alone.
+    assert!(
+        !stdout.contains("its working copy is kept as"),
+        "the displaced owner's working copy was snapshotted: {stdout}"
+    );
+    assert_eq!(
+        lab::operation_ids(&lab.work),
+        operations_before,
+        "the release wrote an operation into the displaced owner's repository"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&untracked).expect("read the untracked work"),
+        "jj never saw this\n"
+    );
+    let names = Command::new("jj")
+        .args(["--ignore-working-copy", "workspace", "list"])
+        .current_dir(&lab.work)
+        .output()
+        .expect("jj workspace list");
+    let names = String::from_utf8_lossy(&names.stdout);
+    assert!(
+        names.contains("feat-gamma"),
+        "the registration went: {names}"
+    );
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
+    )
+    .expect("parse state");
+    assert!(
+        state["claims"].get("demo/feat/gamma").is_none(),
+        "claim remained: {}",
+        state["claims"]
+    );
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .read()
+        .expect("read ledger")
+        .entries;
+    let released = entries.last().expect("an entry for the release");
+    assert_eq!(released.claim_change.as_deref(), Some("released"));
+    assert_eq!(released.previous_owner.as_deref(), Some("agent-one"));
+}
+
+#[test]
+fn a_claim_the_caller_made_after_the_takeover_ends_the_search() {
+    // Given: a takeover, then the owner's own fresh claim on the branch,
+    // which closes that chapter, and a holder today that no entry records
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let _workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
+    let taken = force_start_gamma(&lab, &home, "agent-two", "rescue stalled work");
+    assert!(
+        taken.status.success(),
+        "force start failed: {}",
+        String::from_utf8_lossy(&taken.stderr)
+    );
+    let handed_back = finish_gamma_as(&lab, &home, "agent-two");
+    assert!(
+        handed_back.status.success(),
+        "finish failed: {}",
+        String::from_utf8_lossy(&handed_back.stderr)
+    );
+    let _again = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
+    hold_claim(&home, "feat/gamma", "agent-three");
+
+    // When: the owner finishes the branch a third session now holds
+    let refused = finish_gamma_as(&lab, &home, "agent-one");
+
+    // Then: the refusal of a claim that is simply not this caller's, because
+    // the search stopped at the caller's own claim and never reached the
+    // takeover before it
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("is claimed by agent-three"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("use `knives finish feat/gamma --force --why"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("agent-one's claim"),
+        "a takeover the caller's own later claim closed was reported: {stderr}"
     );
 }

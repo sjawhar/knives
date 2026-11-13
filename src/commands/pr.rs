@@ -7,6 +7,7 @@ use crate::cli::Exit;
 use crate::detect::pull_state::{PullState, pull_state_findings};
 use crate::forge::{DiffTotals, Forge, PullDetails, TimelineEvent, TimelineEventKind};
 use crate::ids::short_id;
+use crate::ledger::inline_human_text;
 
 #[derive(Debug, serde::Serialize)]
 pub struct Report {
@@ -130,22 +131,32 @@ pub fn exit_for(report: &Report) -> Exit {
 
 /// `ai#4545  CLOSED  feat/egress-guard -> main  @ab12cd34ef56  review APPROVED  updated …  <url>`
 /// plus a trailing ` [empty-diff]`-style bracket for each answered incident flag.
+///
+/// Every field but the registry key, the number and this module's own words
+/// is the forge's answer — its state, the head and base branch names it
+/// reports, its review decision, its url, its own timestamp text, the ids of
+/// a force-push — so each reaches the terminal escaped
+/// ([`inline_human_text`]), as `status`'s pull cell escapes the same answers.
+/// A note quotes the cache write that could not be made.
 pub fn render(report: &Report) -> String {
+    let review = if report.review.is_empty() {
+        "-".to_owned()
+    } else {
+        inline_human_text(&report.review)
+    };
     let mut line = format!(
-        "{}#{}  {}{}  {} -> {}  @{}  review {}  updated {}",
+        "{}#{}  {}{}  {} -> {}  @{}  review {review}  updated {}",
         report.repo,
         report.number,
-        report.state,
+        inline_human_text(&report.state),
         if report.is_draft { " (draft)" } else { "" },
-        report.branch,
-        report.base.as_deref().unwrap_or("unknown"),
-        short_id(&report.head),
-        if report.review.is_empty() {
-            "-"
-        } else {
-            &report.review
-        },
-        report.updated,
+        inline_human_text(&report.branch),
+        report
+            .base
+            .as_deref()
+            .map_or_else(|| "unknown".to_owned(), inline_human_text),
+        short_forge_id(&report.head),
+        inline_human_text(&report.updated),
     );
     if let Some(diff) = report.diff
         && diff.empty()
@@ -160,7 +171,7 @@ pub fn render(report: &Report) -> String {
     }
     if !report.url.is_empty() {
         line.push_str("  ");
-        line.push_str(&report.url);
+        line.push_str(&inline_human_text(&report.url));
     }
     if let Some(events) = &report.timeline {
         for event in events {
@@ -171,33 +182,40 @@ pub fn render(report: &Report) -> String {
     for note in &report.notes {
         line.push('\n');
         line.push_str("  note: ");
-        line.push_str(note);
+        line.push_str(&inline_human_text(note));
     }
     line
 }
 
+/// The twelve characters a forge-answered id shows, escaped. The escape maps
+/// each character to one character, so the cut lands where it landed before
+/// it, and the twelve shown are the whole of what reaches the terminal.
+fn short_forge_id(id: &str) -> String {
+    inline_human_text(short_id(id))
+}
+
 fn render_timeline_event(event: &TimelineEvent) -> String {
+    let at = inline_human_text(&event.at);
     match &event.kind {
         TimelineEventKind::ForcePush { before, after } => format!(
-            "  {}  force-push  {} (tree {}) -> {} (tree {}){}",
-            event.at,
-            short_id(&before.commit),
-            short_id(&before.tree),
-            short_id(&after.commit),
-            short_id(&after.tree),
+            "  {at}  force-push  {} (tree {}) -> {} (tree {}){}",
+            short_forge_id(&before.commit),
+            short_forge_id(&before.tree),
+            short_forge_id(&after.commit),
+            short_forge_id(&after.tree),
             if before.tree != "unknown" && before.tree == after.tree {
                 "  [same tree]"
             } else {
                 ""
             }
         ),
-        TimelineEventKind::HeadDeleted => format!("  {}  head-deleted", event.at),
-        TimelineEventKind::HeadRestored => format!("  {}  head-restored", event.at),
-        TimelineEventKind::Closed => format!("  {}  closed", event.at),
-        TimelineEventKind::Reopened => format!("  {}  reopened", event.at),
+        TimelineEventKind::HeadDeleted => format!("  {at}  head-deleted"),
+        TimelineEventKind::HeadRestored => format!("  {at}  head-restored"),
+        TimelineEventKind::Closed => format!("  {at}  closed"),
+        TimelineEventKind::Reopened => format!("  {at}  reopened"),
         TimelineEventKind::Merged { commit } => commit.as_deref().map_or_else(
-            || format!("  {}  merged", event.at),
-            |commit| format!("  {}  merged  @{}", event.at, short_id(commit)),
+            || format!("  {at}  merged"),
+            |commit| format!("  {at}  merged  @{}", short_forge_id(commit)),
         ),
     }
 }
@@ -331,6 +349,49 @@ mod tests {
              review APPROVED  updated 2026-08-30T00:00:00Z  [empty-diff]  \
              [deleted-head-ref]  [empty-tip-commit]  https://example.test/demo/pull/4545"
         );
+    }
+
+    #[test]
+    fn render_escapes_every_control_character_the_forge_answered() {
+        // A head branch, a state, a review decision, a url, the forge's own
+        // timestamp text and a timeline event's time are its answer, not
+        // this process's text.
+        let report = Report {
+            repo: "demo".to_owned(),
+            number: 4545,
+            state: "CLO\u{1b}[2JSED".to_owned(),
+            branch: "feat/\u{7}egress".to_owned(),
+            base: Some("ma\u{9b}in".to_owned()),
+            head: "ab12\u{1b}cd34ef56dead".to_owned(),
+            review: "APPRO\u{1b}]0;pwned\u{7}VED".to_owned(),
+            updated: "2026-08-30\u{1b}[31m".to_owned(),
+            url: "https://example.test/\u{1b}[2J".to_owned(),
+            is_draft: false,
+            mergeable: None,
+            diff: None,
+            head_ref_deleted: None,
+            tip_commit_empty: None,
+            timeline: Some(vec![crate::forge::TimelineEvent {
+                at: "2026-08-30\u{1b}[0m".to_owned(),
+                kind: crate::forge::TimelineEventKind::Closed,
+            }]),
+            notes: vec!["could not persist: \u{1b}[2J".to_owned()],
+        };
+
+        let text = render(&report);
+
+        assert!(!text.contains('\u{1b}'), "was: {text:?}");
+        assert!(!text.contains('\u{7}'), "was: {text:?}");
+        assert!(!text.contains('\u{9b}'), "was: {text:?}");
+        assert!(
+            text.contains("review APPRO\u{fffd}]0;pwned\u{fffd}VED"),
+            "was: {text:?}"
+        );
+        assert!(
+            text.contains("feat/\u{fffd}egress -> ma\u{fffd}in"),
+            "was: {text:?}"
+        );
+        assert!(text.contains("@ab12\u{fffd}cd34ef5"), "was: {text:?}");
     }
 
     #[test]

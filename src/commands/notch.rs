@@ -49,7 +49,9 @@ pub enum Report {
     Written {
         #[serde(skip)]
         repo: String,
-        wrote: Entry,
+        /// Boxed: an [`Entry`] is far larger than this enum's other variants,
+        /// and an unboxed one would make every `Report` that size.
+        wrote: Box<Entry>,
     },
     Verified {
         repo: String,
@@ -104,7 +106,7 @@ pub fn render(report: &Report) -> String {
                             .map_or_else(|| "(this repo)".to_owned(), inline_human_text);
                         format!(
                             "{repo}  {}  {subject}  {}",
-                            flag.ts,
+                            inline_human_text(&flag.ts),
                             inline_human_text(&flag.what)
                         )
                     })
@@ -145,7 +147,7 @@ pub fn render(report: &Report) -> String {
             for entry in entries {
                 lines.push(format!(
                     "  {}  {:<5}  {}",
-                    entry.ts,
+                    inline_human_text(&entry.ts),
                     entry.kind,
                     heading(entry)
                 ));
@@ -166,7 +168,7 @@ pub fn render(report: &Report) -> String {
                 lines.push(format!(
                     "  + {} machine event(s), newest: {} {}",
                     events.count,
-                    events.newest_ts,
+                    inline_human_text(&events.newest_ts),
                     inline_human_text(&events.newest_text)
                 ));
             }
@@ -367,18 +369,14 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
             let owner = current_identity(request.bound)?.owner;
             let scribe = Scribe::new(ledger, upstream.clone(), path.clone(), owner);
             let written = scribe.record(&Draft {
-                subject: request.subject,
                 kind: Kind::Note,
                 disposition: request.disposition.map(str::to_owned),
-                statement: None,
-                text: text.to_owned(),
                 evidence: request.evidence.to_vec(),
-                pr,
-                parents: Vec::new(),
+                ..Draft::event(request.subject, text.to_owned(), pr)
             })?;
             Report::Written {
                 repo: repo.to_string(),
-                wrote: written,
+                wrote: Box::new(written),
             }
         }
         None if request.verify => verify(&ledger, path, repo, request)?,
@@ -433,6 +431,13 @@ mod tests {
             anchor: Some("6c42fe71aaaaaaaa".to_owned()),
             pr: Some(1157),
             parents: Vec::new(),
+            claim_change: None,
+            claim_change_why: None,
+            previous_owner: None,
+            previous_kind: None,
+            previous_started: None,
+            previous_last_seen: None,
+            previous_why: None,
         }
     }
 
@@ -569,6 +574,13 @@ mod tests {
                     anchor: None,
                     pr: Some(7),
                     parents: Vec::new(),
+                    claim_change: None,
+                    claim_change_why: None,
+                    previous_owner: None,
+                    previous_kind: None,
+                    previous_started: None,
+                    previous_last_seen: None,
+                    previous_why: None,
                 })
                 .expect("record event");
         }
@@ -586,6 +598,13 @@ mod tests {
                 anchor: None,
                 pr: Some(7),
                 parents: Vec::new(),
+                claim_change: None,
+                claim_change_why: None,
+                previous_owner: None,
+                previous_kind: None,
+                previous_started: None,
+                previous_last_seen: None,
+                previous_why: None,
             })
             .expect("record note");
         let repo = RepoName::new("demo");
@@ -623,11 +642,11 @@ mod tests {
     fn a_repo_level_entry_is_headed_by_the_repo_rather_than_an_empty_subject() {
         let report = Report::Written {
             repo: "a-repo".to_owned(),
-            wrote: Entry {
+            wrote: Box::new(Entry {
                 anchor: None,
                 pr: None,
                 ..entry(None, Kind::Note, "the fork needs a cut")
-            },
+            }),
         };
         assert_eq!(render(&report), "notched a-repo itself");
     }

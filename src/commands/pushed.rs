@@ -252,8 +252,19 @@ pub fn render(report: &Report) -> String {
             ),
         );
     }
+    // A row names its branch, a bookmark read from the repository that a
+    // remote can give a C1 character. `render_row` also writes the detail of
+    // audit's machine-recorded finding, which stays raw, so the escape is
+    // here, at the terminal.
     for row in &report.rows {
-        append_line(&mut lines, &format!("{}: {}", report.repo, render_row(row)));
+        append_line(
+            &mut lines,
+            &format!(
+                "{}: {}",
+                report.repo,
+                crate::ledger::inline_human_text(&render_row(row))
+            ),
+        );
     }
     lines
 }
@@ -309,5 +320,42 @@ fn render_verdict(row: &Row, verdict: &Verdict) -> String {
             remote_commit.short(),
             row.local.as_ref().map_or("", CommitId::short)
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_branch_name_with_a_control_character_reaches_the_terminal_escaped() {
+        // git takes a C1 character in a ref name, and jj imports such a ref.
+        let report = Report {
+            repo: "demo".to_owned(),
+            rows: vec![Row {
+                branch: "feat\u{9b}m".to_owned(),
+                local: None,
+                verdicts: vec![Verdict::RemoteOnly {
+                    remote: "origin".to_owned(),
+                    remote_commit: CommitId::new("aaaa"),
+                }],
+            }],
+            problems: Vec::new(),
+        };
+
+        let rendered = render(&report);
+
+        assert_eq!(
+            rendered,
+            "demo: feat\u{fffd}m  no local bookmark  origin still has feat\u{fffd}m at aaaa \
+             (no local bookmark)"
+        );
+        // The audit finding built from the same row keeps the raw name.
+        assert!(
+            report
+                .rows
+                .first()
+                .is_some_and(|row| render_row(row).contains("feat\u{9b}m"))
+        );
     }
 }

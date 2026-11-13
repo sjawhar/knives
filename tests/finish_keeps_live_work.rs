@@ -62,12 +62,31 @@ fn shown(output: &Output) -> String {
     )
 }
 
-fn claim_held(home: &tempfile::TempDir) -> bool {
+/// What `state.json` records about the branch's claim, null where it records
+/// none.
+fn claim_state(home: &tempfile::TempDir) -> Value {
     let state: Value = serde_json::from_str(
         &std::fs::read_to_string(home.path().join("state.json")).expect("read state"),
     )
     .expect("parse state");
-    state["claims"]["demo/feat/gamma"]["owner"] == Value::String(OWNER.to_owned())
+    state["claims"]["demo/feat/gamma"].clone()
+}
+
+fn claim_held(home: &tempfile::TempDir) -> bool {
+    claim_state(home)["owner"] == Value::String(OWNER.to_owned())
+}
+
+/// Whether `state.json` records any claim on the branch, whoever holds it.
+fn claim_recorded(home: &tempfile::TempDir) -> bool {
+    !claim_state(home).is_null()
+}
+
+/// The fork's ledger entries, oldest first.
+fn ledger_entries(home: &tempfile::TempDir) -> Vec<knives::ledger::Entry> {
+    knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .read()
+        .expect("read ledger")
+        .entries
 }
 
 fn jj(checkout: &Path, args: &[&str]) -> String {
@@ -148,7 +167,7 @@ fn finish_keeps_an_edit_no_jj_command_has_seen_and_names_its_commit() {
 }
 
 #[test]
-fn finish_changes_nothing_when_jj_cannot_snapshot_every_file() {
+fn finish_releases_the_claim_and_keeps_the_workspace_when_jj_cannot_snapshot_every_file() {
     // Given: a new file over jj's default snapshot.max-new-file-size (1 MiB)
     let lab = Lab::new();
     let (home, _consumer) = release_test_home(&lab);
@@ -158,12 +177,30 @@ fn finish_changes_nothing_when_jj_cannot_snapshot_every_file() {
     // When: the branch is finished
     let refused = finish(&lab, &home, &[]);
 
-    // Then: it refuses, the workspace and the file are there, the claim is held
+    // Then: it exits incomplete, naming what jj refused, and the claim is gone:
+    // the branch is not locked to a session that has already walked away
     assert_eq!(refused.status.code(), Some(3), "{}", shown(&refused));
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(stderr.contains("big.bin"), "{}", shown(&refused));
+    assert!(stderr.contains("claim released"), "{}", shown(&refused));
+    assert!(!claim_recorded(&home), "{}", shown(&refused));
+    let entries = ledger_entries(&home);
+    assert_eq!(
+        entries.last().map(|entry| entry.text.as_str()),
+        Some("claim released"),
+        "was: {entries:?}"
+    );
+    assert_eq!(
+        entries
+            .last()
+            .and_then(|entry| entry.claim_change.as_deref()),
+        Some("released"),
+        "was: {entries:?}"
+    );
+
+    // And: the directory and the workspace are exactly as they were, so the
+    // next `start` of this branch adopts them with the edit still in place
     assert!(workspace.join("big.bin").is_file());
-    assert!(claim_held(&home), "{}", shown(&refused));
     let names = jj(&lab.work, &["workspace", "list", "-T", r#"name ++ "\n""#]);
     assert!(names.contains("feat-gamma"), "{names}");
 }
@@ -200,6 +237,44 @@ fn finish_refuses_while_a_process_works_in_the_workspace() {
     // Then: finish goes through
     assert!(finished.status.success(), "{}", shown(&finished));
     assert!(!workspace.exists());
+}
+
+#[test]
+fn finish_refusing_a_live_process_escapes_the_control_characters_of_its_command() {
+    // Given: a process in the workspace whose command line carries terminal
+    // control characters, which the session that started it chose. The start
+    // refusal escapes this same list (src/commands/start.rs, claim_evidence);
+    // the finish refusal prints it, so it is text a terminal reads too.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    let sleeper = Sleeper::spawn(|command| {
+        use std::os::unix::process::CommandExt;
+        command
+            .current_dir(&workspace)
+            .arg0("sleep\u{1b}]0;held\u{7}");
+    });
+
+    // When: the holder finishes the branch
+    let refused = finish(&lab, &home, &[]);
+
+    // Then: it refuses and names the process, and no control character of that
+    // command line survived into the terminal
+    assert_eq!(refused.status.code(), Some(2), "{}", shown(&refused));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(&format!("pid {}", sleeper.pid())),
+        "{}",
+        shown(&refused)
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "an escape character reached the terminal: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains('\u{7}'),
+        "a bell character reached the terminal: {stderr:?}"
+    );
 }
 
 #[test]
@@ -334,6 +409,110 @@ fn a_duplicate_under_the_same_launcher_counts() {
     );
     assert!(workspace.is_dir());
     assert!(claim_held(&home));
+}
+
+#[test]
+fn a_forced_release_over_another_owners_claim_records_the_live_process() {
+    // The release leaves the displaced owner's workspace as it is, and it
+    // still reads it: the live-process gate is what `--force` passes here,
+    // and the one entry carries both the forced release and what was working
+    // in the directory.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    let sleeper = Sleeper::spawn(|command| {
+        command.current_dir(&workspace);
+    });
+
+    // When: another session releases the claim by force
+    let forced = lab::knives_command(
+        &lab.work,
+        home.path(),
+        lab.temp_path(),
+        &[
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            "the owner session died",
+        ],
+    )
+    .env("KNIVES_OWNER", "agent-two")
+    .output()
+    .expect("force finish another owner's claim");
+
+    // Then: the release goes through, the entry names the process it went
+    // over beside the claim it ended, and the directory is untouched
+    assert!(forced.status.success(), "{}", shown(&forced));
+    let entries = ledger_entries(&home);
+    let released = entries.last().expect("an entry for the release");
+    assert!(
+        released
+            .text
+            .contains(&format!("released {OWNER}'s claim by force")),
+        "was: {released:?}"
+    );
+    assert!(
+        released.text.contains(&format!(
+            "finished by force while in use by pid {} (sleep 120)",
+            sleeper.pid()
+        )) && released.text.ends_with(": the owner session died"),
+        "was: {released:?}"
+    );
+    assert_eq!(released.claim_change.as_deref(), Some("released"));
+    assert_eq!(released.previous_owner.as_deref(), Some(OWNER));
+    assert!(!claim_recorded(&home), "{}", shown(&forced));
+    assert!(workspace.is_dir(), "{}", shown(&forced));
+}
+
+#[test]
+fn the_owners_forced_release_over_a_live_process_records_its_why() {
+    // The claim's own holder, finishing in the place it claimed from, passes
+    // only the live-process gate with `--force --why`: that reason is why the
+    // claim was released, and the entry's field says so, not only its prose.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    let sleeper = Sleeper::spawn(|command| {
+        command.current_dir(&workspace);
+    });
+
+    // When: the owner finishes by force over the process
+    let forced = finish(
+        &lab,
+        &home,
+        &["--force", "--why", "the owner forces its own"],
+    );
+
+    // Then: the release entry carries the `--why` as the claim change's reason
+    assert!(forced.status.success(), "{}", shown(&forced));
+    let entries = ledger_entries(&home);
+    let released = entries.last().expect("an entry for the release");
+    assert_eq!(
+        released.claim_change.as_deref(),
+        Some("released"),
+        "was: {released:?}"
+    );
+    assert!(
+        released.text.contains(&format!(
+            "finished by force while in use by pid {} (sleep 120)",
+            sleeper.pid()
+        )),
+        "was: {released:?}"
+    );
+    assert_eq!(
+        released.claim_change_why.as_deref(),
+        Some("the owner forces its own"),
+        "was: {released:?}"
+    );
+    assert!(
+        released.previous_owner.is_none(),
+        "the owner displaced nobody: {released:?}"
+    );
+    assert!(!claim_recorded(&home), "{}", shown(&forced));
 }
 
 /// Moves the workspace at `workspace` to a sibling and leaves `workspace` a
@@ -482,7 +661,7 @@ fn finish_touches_nothing_before_it_holds_the_forks_lock() {
 }
 
 #[test]
-fn finish_changes_nothing_when_a_file_name_is_not_utf8() {
+fn finish_releases_the_claim_and_keeps_the_workspace_when_a_file_name_is_not_utf8() {
     use std::os::unix::ffi::OsStrExt as _;
     // Given: a file whose name jj cannot snapshot
     let lab = Lab::new();
@@ -494,10 +673,26 @@ fn finish_changes_nothing_when_a_file_name_is_not_utf8() {
     // When: the branch is finished
     let refused = finish(&lab, &home, &[]);
 
-    // Then: it refuses; the file, the workspace and the claim stay
+    // Then: it exits incomplete and the claim comes back; the file and the
+    // workspace are left exactly as they were
     assert_eq!(refused.status.code(), Some(3), "{}", shown(&refused));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("claim released"),
+        "{}",
+        shown(&refused)
+    );
+    assert!(!claim_recorded(&home), "{}", shown(&refused));
+    let entries = ledger_entries(&home);
+    assert_eq!(
+        entries
+            .last()
+            .and_then(|entry| entry.claim_change.as_deref()),
+        Some("released"),
+        "was: {entries:?}"
+    );
     assert!(workspace.join(name).is_file());
-    assert!(claim_held(&home));
+    let names = jj(&lab.work, &["workspace", "list", "-T", r#"name ++ "\n""#]);
+    assert!(names.contains("feat-gamma"), "{names}");
 }
 
 #[test]
@@ -520,6 +715,49 @@ fn finish_does_not_forget_a_workspace_whose_state_cannot_be_read() {
     let names = jj(&lab.work, &["workspace", "list", "-T", r#"name ++ "\n""#]);
     assert!(names.contains("feat-gamma"), "{names}");
     assert!(claim_held(&home));
+}
+
+#[test]
+fn a_stranger_gets_the_claim_refusal_when_the_workspace_state_cannot_be_read() {
+    // Given: a claim held by one session, and a workspace whose working-copy
+    // state is corrupt. The workspace refusal used to come first, which hid the
+    // claim question: a stranger learnt the directory was unreadable and never
+    // that the branch was not theirs to hand back.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    std::fs::write(
+        workspace.join(".jj/working_copy/checkout"),
+        b"\xff\xfe garbage",
+    )
+    .expect("corrupt the working-copy state");
+
+    // When: another session finishes the branch
+    let refused = lab::knives_command(
+        &lab.work,
+        home.path(),
+        lab.temp_path(),
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    )
+    .env("KNIVES_OWNER", "someone-else")
+    .output()
+    .expect("finish as another session");
+
+    // Then: the refusal is the claim's, not the workspace's
+    assert_eq!(refused.status.code(), Some(2), "{}", shown(&refused));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(&format!("is claimed by {OWNER}")),
+        "{}",
+        shown(&refused)
+    );
+    assert!(
+        !stderr.contains("working-copy state could not be read"),
+        "{}",
+        shown(&refused)
+    );
+    assert!(claim_held(&home), "{}", shown(&refused));
+    assert!(workspace.is_dir());
 }
 
 #[test]
@@ -550,7 +788,9 @@ fn the_kept_commit_is_named_even_when_removal_fails() {
 
 #[test]
 fn finish_refuses_a_claim_taken_in_another_place() {
-    // Given: the claim was taken in another agent box (its place recorded)
+    // Given: the claim was taken in another agent box (its place recorded).
+    // The place is the text of whatever session took the claim, so the
+    // refusal must print it escaped.
     let lab = Lab::new();
     let (home, _consumer) = release_test_home(&lab);
     let workspace = start(&lab, &home);
@@ -562,19 +802,25 @@ fn finish_refuses_a_claim_taken_in_another_place() {
         state["claims"]["demo/feat/gamma"]["place"].is_string(),
         "start recorded no place: {state}"
     );
-    state["claims"]["demo/feat/gamma"]["place"] = Value::String("other-box pid:[1]".to_owned());
+    state["claims"]["demo/feat/gamma"]["place"] =
+        Value::String("other-box \u{1b}]0;held\u{7} pid:[1]".to_owned());
     std::fs::write(&path, state.to_string()).expect("write state");
 
     // When: the same session finishes from here
     let refused = finish(&lab, &home, &[]);
 
-    // Then: it refuses, names the other place, and keeps the claim and the
-    // workspace
+    // Then: it refuses, names the other place with every control character
+    // of it as U+FFFD, and keeps the claim and the workspace
+    let stderr = String::from_utf8_lossy(&refused.stderr);
     assert_eq!(refused.status.code(), Some(2), "{}", shown(&refused));
     assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("other-box pid:[1]"),
+        stderr.contains("other-box \u{fffd}]0;held\u{fffd} pid:[1]"),
         "{}",
         shown(&refused)
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "an escape character reached the terminal: {stderr:?}"
     );
     assert!(claim_held(&home));
     assert!(workspace.is_dir());

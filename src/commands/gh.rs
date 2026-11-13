@@ -12,6 +12,8 @@ use std::os::unix::{
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::ledger::{inline_human_text, problem_human_text};
+
 const DEFAULT_HOST: &str = "github.com";
 
 const GIT_WRAPPER: &str = r#"#!/bin/bash
@@ -65,6 +67,13 @@ const DETACHED_BOOKMARK: &str = "__jj_detached__";
 ///
 /// Every successful execution path exits the process, making the `Infallible` success type
 /// compiler-checked.
+///
+/// The one refusal this function prints names the shim it found on `PATH`
+/// and what the kernel said about it: a path off disk and an OS message,
+/// neither of them this process's words, so both reach the terminal escaped
+/// ([`inline_human_text`] — an exec failure is one line). `gh`'s own
+/// arguments are never printed here, and the "real gh not found" line is
+/// this module's.
 pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
     if let Some(shim) = reentry_shim() {
         // The shim applies the agent-context rules and the routing include, then
@@ -72,7 +81,11 @@ pub fn run(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
         // mints normally. Recursion is bounded by construction; the shim's depth
         // guard is the backstop.
         let error = Command::new(&shim).args(args).exec();
-        eprintln!("knives gh: cannot exec {}: {error}", shim.display());
+        eprintln!(
+            "knives gh: cannot exec {}: {}",
+            inline_human_text(&shim.display().to_string()),
+            inline_human_text(&error.to_string())
+        );
         std::process::exit(126);
     }
     let Ok(real_gh) = real_gh() else {
@@ -189,6 +202,13 @@ struct Routed {
 /// The App token this call runs with and the target it was minted for, or None
 /// to leave gh on its own auth. Exits instead when the checkout's git cannot be
 /// read or the helper refuses.
+///
+/// Two values here come from outside this process and reach the terminal
+/// escaped: what git said when the checkout's remotes could not be read
+/// (several lines when git wraps its advice, so [`problem_human_text`]), and
+/// the directory this call runs in ([`inline_human_text`]). The remedy is
+/// this module's own `&'static str`, chosen by gh's subcommand, and the
+/// refusal above it is this module's sentence.
 fn routed_token(args: &[String], cwd: &Path) -> Option<Routed> {
     let resolved = match resolve_target_url(args, cwd) {
         Ok(resolved) => resolved,
@@ -197,7 +217,7 @@ fn routed_token(args: &[String], cwd: &Path) -> Option<Routed> {
             // falling through would run gh on ambient auth, and an agent
             // session has none, so the agent would see gh's login error
             // instead of git's.
-            eprintln!("knives gh: {error}");
+            eprintln!("knives gh: {}", problem_human_text(&error.to_string()));
             std::process::exit(1);
         }
     };
@@ -213,7 +233,7 @@ fn routed_token(args: &[String], cwd: &Path) -> Option<Routed> {
             if let Some(remedy) = no_target_remedy(args) {
                 eprintln!(
                     "knives gh: no target repository (no -R/--repo flag, no <owner>/<repo> argument, no owner in the api path, and no GitHub remote in {}); {remedy} Setting GH_TOKEN bypasses App routing.",
-                    cwd.display()
+                    inline_human_text(&cwd.display().to_string())
                 );
             }
             return None;
@@ -304,6 +324,14 @@ const STDERR_LINE_KEPT: usize = 4096;
 /// routed to, where that owner came from, and how to name the node's
 /// repository: GitHub's answer for a node of another owner is the same as
 /// for a node that does not exist.
+///
+/// That line's three values are not this process's words: the target, and
+/// the owner taken from it, were read off the checkout's git remote (a call
+/// that named either would not be a guessed route), and the directory comes
+/// off disk. Each is one line, so each reaches the terminal through
+/// [`inline_human_text`]. gh's own stderr is copied through as gh wrote it:
+/// it is gh's terminal, relayed byte for byte like its stdout, and knives
+/// rewrites neither.
 fn gh_exit_code_naming_a_guessed_route(gh: &mut Command, target: &str, cwd: &Path) -> i32 {
     use std::io::Write as _;
     gh.stdin(Stdio::inherit())
@@ -345,8 +373,10 @@ fn gh_exit_code_naming_a_guessed_route(gh: &mut Command, target: &str, cwd: &Pat
             .unwrap_or(target);
         let _ = writeln!(
             std::io::stderr(),
-            "knives gh: GitHub found no node for this call. knives found no owner or repository in the call, so it ran it as the GitHub App of owner {owner}, which the checkout in {} chose ({target}). GitHub gives the same answer for a node in a repository of another owner. Run the call again with GH_REPO=<owner>/<repo> of the node's repository set (gh api takes no -R), or from a checkout of that repository.",
-            cwd.display()
+            "knives gh: GitHub found no node for this call. knives found no owner or repository in the call, so it ran it as the GitHub App of owner {}, which the checkout in {} chose ({}). GitHub gives the same answer for a node in a repository of another owner. Run the call again with GH_REPO=<owner>/<repo> of the node's repository set (gh api takes no -R), or from a checkout of that repository.",
+            inline_human_text(owner),
+            inline_human_text(&cwd.display().to_string()),
+            inline_human_text(target)
         );
     }
     code
@@ -408,6 +438,13 @@ fn no_target_remedy(args: &[String]) -> Option<&'static str> {
 /// fresh token, says so in one stderr line, and runs the same command again.
 /// The last run's status is the call's, so `--exit-status` and gh's own exit
 /// codes are kept.
+///
+/// The target the unrouted line names is an owner and repository: either
+/// this call's own `-R` argument or one read off the checkout's git remote
+/// ([`resolve_target_url`]), and a reader of this line cannot tell which, so
+/// it reaches the terminal escaped ([`inline_human_text`] — a target is one
+/// line). The restart line carries only this module's words and the seconds
+/// it waited.
 fn gh_exit_code(gh: &mut Command, renew: Option<&str>) -> i32 {
     gh.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -428,7 +465,8 @@ fn gh_exit_code(gh: &mut Command, renew: Option<&str>) -> i32 {
             Mint::Refused(code) => return code,
             Mint::Unrouted => {
                 eprintln!(
-                    "knives gh: the watch outlived its App token and gh-app-token no longer answers for {target}"
+                    "knives gh: the watch outlived its App token and gh-app-token no longer answers for {}",
+                    inline_human_text(target)
                 );
                 return 1;
             }
@@ -923,6 +961,13 @@ fn bool_flag_set(flags: &[String], name: &str) -> bool {
 /// The helper is told how long the token must stay valid (`min_lifetime`
 /// seconds, through [`MIN_LIFETIME_ENV`]): it caches tokens and would otherwise
 /// hand out one with as little as five minutes left.
+///
+/// The three refusals printed here name the profile and what the OS said
+/// about the helper process: the profile is the word git's own
+/// `credential.<host>.helper` config carries after `!gh-app-token`, and the
+/// OS message is one line, so both reach the terminal through
+/// [`inline_human_text`]. The helper's own stderr is inherited, so what it
+/// says it says to gh's terminal itself, as gh's does.
 pub(crate) fn mint_token(target_url: &str, min_lifetime: u64) -> Mint {
     let Some(path) = credential_path(target_url) else {
         return Mint::Unrouted;
@@ -959,7 +1004,11 @@ pub(crate) fn mint_token(target_url: &str, min_lifetime: u64) -> Mint {
     {
         Ok(child) => child,
         Err(error) => {
-            eprintln!("knives gh: cannot run gh-app-token {profile}: {error}");
+            eprintln!(
+                "knives gh: cannot run gh-app-token {}: {}",
+                inline_human_text(profile),
+                inline_human_text(&error.to_string())
+            );
             return Mint::Refused(127);
         }
     };
@@ -971,7 +1020,11 @@ pub(crate) fn mint_token(target_url: &str, min_lifetime: u64) -> Mint {
     let output = match child.wait_with_output() {
         Ok(output) => output,
         Err(error) => {
-            eprintln!("knives gh: gh-app-token {profile}: {error}");
+            eprintln!(
+                "knives gh: gh-app-token {}: {}",
+                inline_human_text(profile),
+                inline_human_text(&error.to_string())
+            );
             return Mint::Refused(1);
         }
     };
@@ -979,7 +1032,10 @@ pub(crate) fn mint_token(target_url: &str, min_lifetime: u64) -> Mint {
         return Mint::Refused(exit_code(output.status));
     }
     let Ok(answer) = std::str::from_utf8(&output.stdout) else {
-        eprintln!("knives gh: gh-app-token {profile} answered non-UTF-8");
+        eprintln!(
+            "knives gh: gh-app-token {} answered non-UTF-8",
+            inline_human_text(profile)
+        );
         return Mint::Refused(1);
     };
     if answer

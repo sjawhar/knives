@@ -134,6 +134,97 @@ pub enum EntryClass {
     Disposition,
 }
 
+/// What a `start` or a `finish` did to the claim on an entry's subject.
+///
+/// Four words, named here once: every writer spells them from this enum and
+/// every reader reads them through [`ClaimChange::read`], so a reader asking
+/// who holds a branch never parses an entry's prose, which is written for a
+/// person and free to be reworded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimChange {
+    /// A claim written for the caller where no other owner name held one: a
+    /// first claim, an adopted workspace, and a forced start over the
+    /// caller's own claim alike.
+    Claimed,
+    /// A claim written for the caller over a claim another owner name held.
+    Taken,
+    /// A claim released, by its own owner or by a forced finish.
+    Released,
+    /// A claim resumed, by its own owner name or by possession of its
+    /// workspace.
+    Resumed,
+}
+
+impl ClaimChange {
+    /// The word an entry carries for this change.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claimed => "claimed",
+            Self::Taken => "taken",
+            Self::Released => "released",
+            Self::Resumed => "resumed",
+        }
+    }
+
+    /// The change `word` names, or `None` for any other string.
+    ///
+    /// Entries are never rewritten, so a later knives may record a change
+    /// this one has no word for. Such an entry reads as changing no claim
+    /// rather than as an error, exactly as an unknown frontmatter key does.
+    pub fn read(word: &str) -> Option<Self> {
+        match word {
+            "claimed" => Some(Self::Claimed),
+            "taken" => Some(Self::Taken),
+            "released" => Some(Self::Released),
+            "resumed" => Some(Self::Resumed),
+            _ => None,
+        }
+    }
+}
+
+/// The claim a write displaced, in the tokens an entry records it with.
+///
+/// Built once from the claim and its last sighting because `start --force`
+/// and `finish --force` record the same five values about the same event,
+/// and decide from the same sixth ([`Displaced::over`]) whether there was a
+/// displacement at all: two hand-written mappings of a claim onto those
+/// fields would drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Displaced {
+    pub owner: String,
+    /// How that owner's name was resolved
+    /// ([`crate::commands::claim::owner_kind_label`]).
+    pub kind: String,
+    pub started: String,
+    /// The last sighting of its work
+    /// ([`crate::commands::claim::last_seen_provenance`]).
+    pub last_seen: String,
+    /// The displaced owner's own reason for the claim.
+    pub why: String,
+}
+
+impl Displaced {
+    pub fn of(claim: &crate::store::Claim, last_seen: crate::seen::LastSeen) -> Self {
+        Self {
+            owner: claim.owner.clone(),
+            kind: crate::commands::claim::owner_kind_label(claim.kind).to_owned(),
+            started: claim.started.clone(),
+            last_seen: crate::commands::claim::last_seen_provenance(last_seen),
+            why: claim.why.clone(),
+        }
+    }
+
+    /// The same, where `identity` is taking the claim from another owner
+    /// name, and nothing where the claim is its own.
+    pub fn over(
+        claim: &crate::store::Claim,
+        identity: &crate::commands::claim::Identity,
+        last_seen: crate::seen::LastSeen,
+    ) -> Option<Self> {
+        (claim.owner != identity.owner).then(|| Self::of(claim, last_seen))
+    }
+}
+
 /// One entry of the ledger.
 ///
 /// Unknown frontmatter keys are ignored rather than rejected: entries are never
@@ -193,6 +284,44 @@ pub struct Entry {
     /// left no ancestry or change id to say so.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parents: Vec<RecordedParent>,
+    /// What happened to the claim on the subject, as [`ClaimChange`] words it;
+    /// absent on an entry that changed no claim.
+    ///
+    /// A string on both surfaces on purpose: a typed field would make an
+    /// entry a later knives wrote, recording a change this one has no word
+    /// for, unreadable here. [`Entry::claim_change`] reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_change: Option<String>,
+    /// The reason the claim carries after this entry — the caller's `--why` —
+    /// so a reader learns why a branch changed hands without the prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_change_why: Option<String>,
+    /// The owner whose claim this entry took or released. Absent where the
+    /// write displaced nobody: its own owner's claim, or no claim at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_owner: Option<String>,
+    /// How [`Entry::previous_owner`]'s name was resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_kind: Option<String>,
+    /// When [`Entry::previous_owner`]'s claim was taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_started: Option<String>,
+    /// The last sighting of [`Entry::previous_owner`]'s work: the durable
+    /// token, never the "3h ago" a refusal shows, which rots on the page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_last_seen: Option<String>,
+    /// [`Entry::previous_owner`]'s own reason, which this write ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_why: Option<String>,
+}
+
+impl Entry {
+    /// The claim change this entry records, read through [`ClaimChange`]: a
+    /// word this knives does not know reads as no change, so a search over
+    /// the ledger skips it rather than failing on it.
+    pub fn claim_change(&self) -> Option<ClaimChange> {
+        self.claim_change.as_deref().and_then(ClaimChange::read)
+    }
 }
 
 /// One release parent as an event recorded it.
@@ -237,6 +366,20 @@ struct Frontmatter {
     pr: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     parents: Vec<RecordedParent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim_change: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim_change_why: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_started: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_last_seen: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_why: Option<String>,
 }
 
 impl Frontmatter {
@@ -253,6 +396,13 @@ impl Frontmatter {
             anchor: entry.anchor.clone(),
             pr: entry.pr,
             parents: entry.parents.clone(),
+            claim_change: entry.claim_change.clone(),
+            claim_change_why: entry.claim_change_why.clone(),
+            previous_owner: entry.previous_owner.clone(),
+            previous_kind: entry.previous_kind.clone(),
+            previous_started: entry.previous_started.clone(),
+            previous_last_seen: entry.previous_last_seen.clone(),
+            previous_why: entry.previous_why.clone(),
         }
     }
 
@@ -286,21 +436,34 @@ impl Frontmatter {
             anchor: self.anchor,
             pr: self.pr,
             parents: self.parents,
+            claim_change: self.claim_change,
+            claim_change_why: self.claim_change_why,
+            previous_owner: self.previous_owner,
+            previous_kind: self.previous_kind,
+            previous_started: self.previous_started,
+            previous_last_seen: self.previous_last_seen,
+            previous_why: self.previous_why,
         }
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
-    #[error("reading {path}: {source}")]
+    /// The reason rides in the message rather than in the error chain. `main`
+    /// prints an error with its chain (`{error:#}`) and a status row prints
+    /// an unreadable ledger's text alone, so a `source` field would read
+    /// twice in the one and be missing from the other.
+    #[error("reading the fork's ledger at {path}: {reason}")]
     Read {
         path: PathBuf,
-        source: std::io::Error,
+        reason: std::io::Error,
     },
-    #[error("writing {path}: {source}")]
+    /// The reason rides in the message, as [`LedgerError::Read`]'s does and
+    /// for the same reason.
+    #[error("writing {path}: {reason}")]
     Write {
         path: PathBuf,
-        source: std::io::Error,
+        reason: std::io::Error,
     },
     #[error("{path} is not a ledger entry: {detail}")]
     Parse { path: PathBuf, detail: String },
@@ -535,21 +698,21 @@ impl Ledger {
             Frontmatter::of(entry).into_toml(entry.statement.as_ref())?,
             entry.text
         );
-        std::fs::create_dir_all(&self.path).map_err(|source| LedgerError::Write {
+        std::fs::create_dir_all(&self.path).map_err(|reason| LedgerError::Write {
             path: self.path.clone(),
-            source,
+            reason,
         })?;
         let path = self.path.join(entry_file_name(ts));
         let mut temporary =
-            tempfile::NamedTempFile::new_in(&self.path).map_err(|source| LedgerError::Write {
+            tempfile::NamedTempFile::new_in(&self.path).map_err(|reason| LedgerError::Write {
                 path: self.path.clone(),
-                source,
+                reason,
             })?;
         temporary
             .write_all(contents.as_bytes())
-            .map_err(|source| LedgerError::Write {
+            .map_err(|reason| LedgerError::Write {
                 path: path.clone(),
-                source,
+                reason,
             })?;
         persist_entry(temporary, path.clone())?;
         APPENDED.store(true, Ordering::Relaxed);
@@ -622,17 +785,17 @@ impl Ledger {
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(listed);
             }
-            Err(source) => {
+            Err(reason) => {
                 return Err(LedgerError::Read {
                     path: self.path.clone(),
-                    source,
+                    reason,
                 });
             }
         };
         for dirent in listing {
-            let unreadable = |source| LedgerError::Read {
+            let unreadable = |reason| LedgerError::Read {
                 path: self.path.clone(),
-                source,
+                reason,
             };
             let dirent = dirent.map_err(unreadable)?;
             let path = dirent.path();
@@ -667,9 +830,9 @@ struct Listed {
 fn parse_files(files: Vec<PathBuf>) -> impl Iterator<Item = ParsedFile> {
     files.into_iter().map(|path| {
         let parsed = std::fs::read(&path)
-            .map_err(|source| LedgerError::Read {
+            .map_err(|reason| LedgerError::Read {
                 path: path.clone(),
-                source,
+                reason,
             })
             .and_then(|bytes| parse_bytes(&path, &bytes));
         (path, parsed)
@@ -831,16 +994,17 @@ pub fn age(ts: &str, now: jiff::Timestamp) -> Option<String> {
 
 /// Render ledger text for an inline human terminal field.
 ///
-/// C0 controls and DEL become U+FFFD so compact fields cannot emit terminal
-/// control sequences while JSON remains the raw structured representation.
+/// Every control character becomes U+FFFD so compact fields cannot emit
+/// terminal control sequences while JSON remains the raw structured
+/// representation.
 pub fn inline_human_text(text: &str) -> String {
     escape_human_text(text, false)
 }
 
 /// Render ledger body prose for a human terminal.
 ///
-/// Line feeds remain available for the caller to indent; every other C0
-/// control and DEL becomes U+FFFD.
+/// Line feeds remain available for the caller to indent; every other control
+/// character becomes U+FFFD.
 pub fn body_human_text(text: &str) -> String {
     escape_human_text(text, true)
 }
@@ -875,10 +1039,16 @@ fn continues_sentence(line: &str) -> bool {
     line.starts_with(char::is_lowercase) && !prefixed
 }
 
+/// Every [`char::is_control`] character becomes U+FFFD: the C0 controls and
+/// DEL, and the C1 controls U+0080 to U+009F too, two of which a terminal
+/// reading UTF-8 as ISO 2022 takes for introducers (U+009B is CSI, U+009D is
+/// OSC). [`is_ledger_component`] already judges a name by the same question,
+/// and an escaper that asked a narrower one let half the controls through
+/// every field it renders.
 fn escape_human_text(text: &str, preserve_line_feeds: bool) -> String {
     text.chars()
         .map(|character| {
-            if character.is_ascii_control() && !(preserve_line_feeds && character == '\n') {
+            if character.is_control() && !(preserve_line_feeds && character == '\n') {
                 '\u{fffd}'
             } else {
                 character
@@ -906,6 +1076,16 @@ pub struct Draft<'a> {
     /// The parent set a release cut or edit leaves behind; empty for every
     /// other entry.
     pub parents: Vec<RecordedParent>,
+    /// What the write this entry records did to the claim on its subject, as
+    /// [`Draft::about_claim`] sets it; `None` on every entry that changed no
+    /// claim.
+    pub claim_change: Option<String>,
+    pub claim_change_why: Option<String>,
+    pub previous_owner: Option<String>,
+    pub previous_kind: Option<String>,
+    pub previous_started: Option<String>,
+    pub previous_last_seen: Option<String>,
+    pub previous_why: Option<String>,
 }
 
 /// A statement a [`Draft`] makes, with the stamp of the one it replaces.
@@ -933,6 +1113,41 @@ impl<'a> Draft<'a> {
             evidence: Vec::new(),
             pr,
             parents: Vec::new(),
+            claim_change: None,
+            claim_change_why: None,
+            previous_owner: None,
+            previous_kind: None,
+            previous_started: None,
+            previous_last_seen: None,
+            previous_why: None,
+        }
+    }
+
+    /// Record what this entry's write did to the claim on its subject:
+    /// `change`, the reason `why` the claim carries after it, and the holder
+    /// `displaced` where another owner name held the claim this write took
+    /// or released.
+    ///
+    /// `None` for `change` records nothing about the holder, whatever else
+    /// is given: a `finish` that only states a supersession, and every write
+    /// that is not about a claim, left the holder as it was.
+    #[must_use]
+    pub fn about_claim(
+        self,
+        change: Option<ClaimChange>,
+        why: Option<&str>,
+        displaced: Option<&Displaced>,
+    ) -> Self {
+        let Some(change) = change else { return self };
+        Self {
+            claim_change: Some(change.as_str().to_owned()),
+            claim_change_why: why.map(str::to_owned),
+            previous_owner: displaced.map(|previous| previous.owner.clone()),
+            previous_kind: displaced.map(|previous| previous.kind.clone()),
+            previous_started: displaced.map(|previous| previous.started.clone()),
+            previous_last_seen: displaced.map(|previous| previous.last_seen.clone()),
+            previous_why: displaced.map(|previous| previous.why.clone()),
+            ..self
         }
     }
 }
@@ -1012,6 +1227,13 @@ impl Scribe {
             anchor: self.anchor(draft.subject),
             pr: draft.pr,
             parents: draft.parents.clone(),
+            claim_change: draft.claim_change.clone(),
+            claim_change_why: draft.claim_change_why.clone(),
+            previous_owner: draft.previous_owner.clone(),
+            previous_kind: draft.previous_kind.clone(),
+            previous_started: draft.previous_started.clone(),
+            previous_last_seen: draft.previous_last_seen.clone(),
+            previous_why: draft.previous_why.clone(),
         };
         let path = self.ledger.append(&entry)?;
         Ok((entry, path))
@@ -1066,11 +1288,11 @@ fn persist_entry(temporary: tempfile::NamedTempFile, path: PathBuf) -> Result<()
         .persist_noclobber(&path)
         .map(|_| ())
         .map_err(|error| {
-            let source = error.error;
-            if source.kind() == std::io::ErrorKind::AlreadyExists {
+            let reason = error.error;
+            if reason.kind() == std::io::ErrorKind::AlreadyExists {
                 LedgerError::Collision { path }
             } else {
-                LedgerError::Write { path, source }
+                LedgerError::Write { path, reason }
             }
         })
 }
@@ -1273,6 +1495,13 @@ mod tests {
             parents: Vec::new(),
             disposition: None,
             statement: None,
+            claim_change: None,
+            claim_change_why: None,
+            previous_owner: None,
+            previous_kind: None,
+            previous_started: None,
+            previous_last_seen: None,
+            previous_why: None,
         }
     }
     fn entry_at(ts: &str, subject: Option<&str>, text: &str) -> Entry {
@@ -2049,6 +2278,30 @@ mod tests {
     }
 
     #[test]
+    fn every_control_character_is_escaped_and_only_a_body_keeps_its_line_feeds() {
+        // A C1 control is a control character a terminal reading UTF-8 as
+        // ISO 2022 acts on: U+009B is CSI and U+009D is OSC, so an escaper
+        // that asked only `is_ascii_control` let an introducer through.
+        assert_eq!(
+            inline_human_text("a\u{1b}[2Jb\u{7f}c\u{9b}31md\u{9d}0;xe\u{85}f"),
+            "a\u{fffd}[2Jb\u{fffd}c\u{fffd}31md\u{fffd}0;xe\u{fffd}f"
+        );
+        // The line feed a caller indents by survives in a body and nowhere
+        // else; every other control, C1 included, goes either way.
+        assert_eq!(inline_human_text("one\ntwo"), "one\u{fffd}two");
+        assert_eq!(body_human_text("one\ntwo\u{9b}0m"), "one\ntwo\u{fffd}0m");
+        assert_eq!(body_human_text("one\rtwo"), "one\u{fffd}two");
+        // A problem joins its lines, so a line feed never reads as U+FFFD,
+        // and what it joins is escaped the same way.
+        assert_eq!(
+            problem_human_text("fatal: a\u{9b}31m\nhint: b"),
+            "fatal: a\u{fffd}31m; hint: b"
+        );
+        // Text with no control character is handed back as it is.
+        assert_eq!(inline_human_text("plain — text"), "plain — text");
+    }
+
+    #[test]
     fn stamps_drawn_back_to_back_strictly_advance() {
         // A tight loop outpaces the clock's real granularity somewhere; the
         // bump keeps every stamp strictly later than the one before anyway.
@@ -2195,14 +2448,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let written = scribe(dir.path())
             .record(&Draft {
-                subject: None,
                 kind: Kind::Note,
-                disposition: None,
-                statement: None,
-                text: "the release remote is out of date".to_owned(),
                 evidence: vec!["06d778b9".to_owned(), "a-repo#1157".to_owned()],
-                pr: None,
-                parents: Vec::new(),
+                ..Draft::event(None, "the release remote is out of date".to_owned(), None)
             })
             .unwrap();
 
@@ -2354,6 +2602,93 @@ mod tests {
             .unwrap();
         let text = std::fs::read_to_string(only_file(plain.path())).unwrap();
         assert!(!text.contains("parents"), "was: {text}");
+    }
+
+    #[test]
+    fn a_claim_change_round_trips_through_every_field_it_names() {
+        // Seven fields on three hand-written mirrors: one dropped from any of
+        // them reads back as nothing, and the ledger would say a branch
+        // changed hands without saying whose it was.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(dir.path().join("a-repo"));
+        let taken = Entry {
+            kind: Kind::Event,
+            claim_change: Some(ClaimChange::Taken.as_str().to_owned()),
+            claim_change_why: Some("rescue stalled work".to_owned()),
+            previous_owner: Some("ses_older".to_owned()),
+            previous_kind: Some("harness-session".to_owned()),
+            previous_started: Some("2026-08-14T09:00:00Z".to_owned()),
+            previous_last_seen: Some("2026-08-15T21:00:00Z".to_owned()),
+            previous_why: Some("port it".to_owned()),
+            ..entry(Some("feat/alpha"), "seized from ses_older")
+        };
+        ledger.append(&taken).unwrap();
+
+        let read = ledger.read().unwrap().entries;
+        assert_eq!(read, vec![taken]);
+        assert_eq!(read[0].claim_change(), Some(ClaimChange::Taken));
+        // Flat keys, never a table: toml writes a nested value as a
+        // `[section]`, and every key after it would land inside it.
+        let text = std::fs::read_to_string(only_file(ledger.path())).unwrap();
+        assert!(
+            text.contains("\nprevious_owner = \"ses_older\"\n"),
+            "was: {text}"
+        );
+        assert!(!text.contains('['), "was: {text}");
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain = Ledger::at(plain_dir.path().join("a-repo"));
+        plain
+            .append(&entry(Some("feat/beta"), "still investigating"))
+            .unwrap();
+        let plain_text = std::fs::read_to_string(only_file(plain.path())).unwrap();
+        assert!(!plain_text.contains("claim_change"), "was: {plain_text}");
+        assert!(!plain_text.contains("previous_"), "was: {plain_text}");
+    }
+
+    #[test]
+    fn an_entry_written_without_the_claim_fields_reads_as_no_claim_change() {
+        // Every entry written before this knives: it must read, and it must
+        // not read as a change of holder nobody recorded.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(dir.path().join("a-repo"));
+        std::fs::create_dir_all(ledger.path()).unwrap();
+        std::fs::write(
+            ledger.path().join("20260815T221403.000000000Z-4f2a.md"),
+            "+++\nts = \"2026-08-15T22:14:03Z\"\nowner = \"ses_fff688\"\n\
+             subject = \"feat/alpha\"\nkind = \"event\"\n+++\nclaim released\n",
+        )
+        .unwrap();
+
+        let read = ledger.read().unwrap().entries;
+        assert_eq!(read.len(), 1, "was: {read:?}");
+        assert_eq!(read[0].claim_change, None);
+        assert_eq!(read[0].claim_change_why, None);
+        assert_eq!(read[0].previous_owner, None);
+        assert_eq!(read[0].previous_kind, None);
+        assert_eq!(read[0].previous_started, None);
+        assert_eq!(read[0].previous_last_seen, None);
+        assert_eq!(read[0].previous_why, None);
+        assert_eq!(read[0].claim_change(), None);
+    }
+
+    #[test]
+    fn a_claim_change_word_this_knives_does_not_know_reads_as_no_change() {
+        // A later knives may record a change this one has no word for. The
+        // entry stays readable, keeps the word for whoever does know it, and
+        // answers no change here rather than the nearest one it does know.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(dir.path().join("a-repo"));
+        let later = Entry {
+            kind: Kind::Event,
+            claim_change: Some("parked".to_owned()),
+            ..entry(Some("feat/alpha"), "parked the claim")
+        };
+        ledger.append(&later).unwrap();
+
+        let read = ledger.read().unwrap().entries;
+        assert_eq!(read, vec![later]);
+        assert_eq!(read[0].claim_change(), None);
     }
 
     #[test]

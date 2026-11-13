@@ -16,12 +16,13 @@ use crate::config::Role;
 use crate::detect::BookmarkTips;
 use crate::ids::{BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, WorkspaceName};
 use crate::jj::{
-    Repo, StaleRegistration, WorkspaceIdentity, add_workspace, fetch_all, forget_workspace,
-    is_workspace_named, path_occupant, registered_workspace_path, remove_finished_worktree,
-    remove_prunable_worktree, repo_immutable_heads, set_repo_immutable_heads, user_immutable_heads,
-    workspace_identity, workspace_recorded_elsewhere,
+    MAX_ACTIVITY_OPS, Repo, StaleRegistration, WorkspaceIdentity, add_workspace, fetch_all,
+    forget_workspace, is_workspace_named, path_occupant, registered_workspace_path,
+    remove_finished_worktree, remove_prunable_worktree, repo_immutable_heads,
+    set_repo_immutable_heads, user_immutable_heads, workspace_identity,
+    workspace_recorded_elsewhere,
 };
-use crate::ledger::{Ledger, Scribe};
+use crate::ledger::{ClaimChange, Displaced, Draft, Ledger, Scribe};
 use crate::release_model::newest_release;
 use crate::seen;
 use crate::store::{Store, default_state_path};
@@ -115,6 +116,12 @@ pub fn possesses(cwd: &Path, fork: &Fork<'_>, branch: &BranchName) -> bool {
 /// canonicalised when it exists, as the checkout already is, so a spelling
 /// through a symlink is judged by where it lands; one that does not exist yet
 /// has only its spelling.
+///
+/// Both lines are refusals a terminal reads. The registered checkout is found
+/// on disk, and the workspace directory is the path jj recorded for the name
+/// when it has one ([`locate_workspace`]), so both reach the terminal escaped
+/// ([`crate::ledger::inline_human_text`]). The `workspaces` root is the
+/// entry's own `repos.toml` value and stays raw.
 pub fn collides_with_checkout(fork: &Fork<'_>, branch: &BranchName) -> Option<String> {
     let checkout = &fork.checkout.path;
     let spelled = fork.workspace_root();
@@ -133,15 +140,15 @@ pub fn collides_with_checkout(fork: &Fork<'_>, branch: &BranchName) -> Option<St
              live in the working copy they belong to",
             fork.name,
             root.display(),
-            checkout.display()
+            crate::ledger::inline_human_text(&checkout.display().to_string())
         ));
     }
     (workspace == "default" || checkout.starts_with(&directory)).then(|| {
         format!(
             "branch {branch} maps to workspace {workspace} at {}, which is the registered \
              checkout itself or contains it; refusing to touch {}",
-            directory.display(),
-            checkout.display()
+            crate::ledger::inline_human_text(&directory.display().to_string()),
+            crate::ledger::inline_human_text(&checkout.display().to_string())
         )
     })
 }
@@ -150,6 +157,10 @@ struct StartContext<'a> {
     store: &'a mut Store,
     fork: &'a Fork<'a>,
     branch: &'a BranchName,
+    /// The reason the caller gave, which every path that writes a claim
+    /// needs: a claim taken, seized, or held and now held for another
+    /// reason.
+    why: Option<&'a str>,
     identity: Identity,
     upstream_trunk: String,
     destination: PathBuf,
@@ -190,16 +201,22 @@ pub fn run(
     let cwd = std::env::current_dir()?;
     let destination = workspace_path(fork, branch);
     let in_claimed_workspace = possesses(&cwd, fork, branch);
-    let mut context = StartContext {
-        store: &mut store,
-        fork,
-        branch,
-        identity: current_identity(bound)?,
-        upstream_trunk: entry.trunk_ref(),
-        workspace: WorkspaceName::new(workspace_for(branch.as_str())),
-        opened: Repo::open(checkout)?,
-        destination,
-    };
+    let identity = current_identity(bound)?;
+    let held = store
+        .claims(Some(&fork.upstream))
+        .into_iter()
+        .find(|claim| claim.branch == branch.as_str())
+        .cloned();
+    // Who holds the branch is in the state file alone, so the decision is made
+    // before the repository is opened: a checkout whose operation log cannot be
+    // read must still say who holds the claim it is refusing, rather than die
+    // on a read only the refusal's sighting ever wanted.
+    let decision = decide(&ClaimContext {
+        held: held.as_ref(),
+        identity: &identity,
+        in_claimed_workspace,
+    });
+    let forced = force && held.is_some();
     // A rule a human stated is their decision: `status` reports one that
     // differs, and nothing overwrites it. knives' own earlier write (marked by
     // its `doc`) is refreshed when the entry's rule has moved on. A user-level
@@ -221,49 +238,70 @@ pub fn run(
             None
         };
         set_repo_immutable_heads(checkout, &rule)?;
+        // The repository-level rule is this entry's `repos.toml` value, but the
+        // user-level one it shadows is read back from the jj config a person on
+        // this machine wrote, so the line prints it escaped
+        // ([`crate::ledger::inline_human_text`]).
         let shadow = shadowed.map_or_else(String::new, |user_rule| {
-            format!(" (shadows the user-level rule {user_rule} here)")
+            format!(
+                " (shadows the user-level rule {} here)",
+                crate::ledger::inline_human_text(&user_rule)
+            )
         });
         println!("jj immutable_heads() {verb} {repo_name}'s repository config: {rule}{shadow}");
     }
-    let held = context
-        .store
-        .claims(Some(&fork.upstream))
-        .into_iter()
-        .find(|claim| claim.branch == branch.as_str())
-        .cloned();
-    let activity = context
-        .opened
-        .workspace_activity(&BTreeSet::from([context.workspace.clone()]), 200)?;
+    if !forced
+        && matches!(
+            decision,
+            ClaimDecision::RefuseAnonymous | ClaimDecision::RefuseHeld
+        )
+    {
+        let claim = held
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("claim decision lacked held claim context"))?;
+        let last_seen = seen::last_seen_in(claim, checkout, &seen::load());
+        return Ok(refuse_claim(
+            claim,
+            &destination,
+            last_seen,
+            decision == ClaimDecision::RefuseAnonymous,
+        ));
+    }
+    // Everything below acts on the repository, so this is where it is opened.
+    let mut context = StartContext {
+        store: &mut store,
+        fork,
+        branch,
+        why,
+        identity,
+        upstream_trunk: entry.trunk_ref(),
+        workspace: WorkspaceName::new(workspace_for(branch.as_str())),
+        opened: Repo::open(checkout)?,
+        destination,
+    };
+    let activity = context.opened.workspace_activity(
+        &BTreeSet::from([context.workspace.clone()]),
+        MAX_ACTIVITY_OPS,
+    )?;
     let observations = seen::load();
     let claim_seen = held
         .as_ref()
         .map(|claim| seen::last_seen(claim, &activity, &observations));
-    let decision = decide(&ClaimContext {
-        held: held.as_ref(),
-        identity: &context.identity,
-        in_claimed_workspace,
-    });
 
-    if force && held.is_some() {
+    if forced {
         let (previous, last_seen) = claim_context(held.as_ref(), claim_seen)?;
-        let reason = why.ok_or_else(|| anyhow::anyhow!("--force requires --why"))?;
-        return force_claim(&mut context, previous, last_seen, reason);
+        return force_claim(&mut context, previous, last_seen);
     }
 
     match decision {
-        ClaimDecision::RefuseAnonymous => {
-            let (claim, last_seen) = claim_context(held.as_ref(), claim_seen)?;
-            Ok(refuse_claim(branch, claim, last_seen, true))
-        }
-        ClaimDecision::RefuseHeld => {
-            let (claim, last_seen) = claim_context(held.as_ref(), claim_seen)?;
-            Ok(refuse_claim(branch, claim, last_seen, false))
-        }
         ClaimDecision::Resume { possession } => {
-            resume_claim(&context, held.as_ref(), claim_seen, possession)
+            resume_claim(&mut context, held.as_ref(), claim_seen, possession)
         }
-        ClaimDecision::Take => take_claim(&mut context, why.unwrap_or("started work")),
+        ClaimDecision::Take => take_claim(&mut context),
+        // Both returned above, before the repository was opened.
+        ClaimDecision::RefuseAnonymous | ClaimDecision::RefuseHeld => Err(anyhow::anyhow!(
+            "a refused claim reached the paths that open the repository"
+        )),
     }
 }
 
@@ -276,8 +314,8 @@ fn claim_context(
 }
 
 fn refuse_claim(
-    branch: &BranchName,
     claim: &crate::store::Claim,
+    workspace: &Path,
     last_seen: crate::seen::LastSeen,
     anonymous: bool,
 ) -> Exit {
@@ -287,18 +325,107 @@ fn refuse_claim(
         ""
     };
     eprintln!(
-        "{anonymous_note}{}\nuse `knives start {branch} --force --why \"…\"` to seize the claim",
+        "{anonymous_note}{}\n{}\nuse `knives start {} --force --why \"…\"` to seize the claim",
         render_claim_context(claim, last_seen, jiff::Timestamp::now()),
+        claim_evidence(claim, workspace),
+        claim.branch,
     );
     Exit::Usage
+}
+
+/// What the refused caller needs to judge the claim: where its workspace is,
+/// what runs in it, where it was taken, and what those facts are worth.
+///
+/// A holder's name sorts nothing when one machine holds forty claims of one
+/// session. The question a refused agent has is whether the work is still
+/// live, and the only evidence of that on this machine is a process inside
+/// the workspace. [`crate::liveness::live_users`] sees what this process can
+/// see, so its silence proves nothing about a claim taken in another PID
+/// namespace, and the lines say which case this is rather than leaving the
+/// reader to compare two places by eye.
+///
+/// A process line is another party's text: the command comes from the
+/// `/proc/<pid>/cmdline` of a process this caller did not start, or its
+/// `/proc/<pid>/comm` when that is empty, and the path is a path on disk, so
+/// both go to the terminal escaped
+/// ([`crate::ledger::inline_human_text`]) — whoever started that process
+/// would otherwise choose what the refused caller's terminal receives. The
+/// place is the same: whatever session took the claim wrote it into the state
+/// file, so it goes out escaped too. The workspace path is the one jj
+/// recorded for the name when it has one ([`workspace_path`]), chosen by
+/// whichever session registered that workspace, so it goes out escaped as
+/// well. The pid is a number this process read as one, and the branch is
+/// this caller's own argument.
+fn claim_evidence(claim: &crate::store::Claim, workspace: &Path) -> String {
+    let users = crate::liveness::others_using(workspace);
+    // A directory that vanished leaves the same empty list as a workspace
+    // nobody is in, so the path is judged on its own. A dangling symbolic
+    // link is something at the path, as it is everywhere else in this file.
+    // Only a path that is not there at all is nothing there: an `lstat` that
+    // failed for any other reason leaves a workspace that may hold live work,
+    // and this evidence claims neither way.
+    let nothing_there = std::fs::symlink_metadata(workspace)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    let mut lines = vec![format!(
+        "its workspace is {}{}",
+        crate::ledger::inline_human_text(&workspace.display().to_string()),
+        if nothing_there {
+            ", and nothing is at that path"
+        } else {
+            ""
+        },
+    )];
+    if users.is_empty() {
+        lines.push("no process of this machine is in it".to_owned());
+    } else {
+        lines.extend(
+            users
+                .iter()
+                .map(|user| format!("  {}", crate::ledger::inline_human_text(&user.to_string()))),
+        );
+    }
+    let here = crate::liveness::this_place();
+    let taken_here = claim.place.as_deref() == Some(here.as_str());
+    lines.push(match claim.place.as_deref() {
+        Some(_) if taken_here => "the claim was taken in this place".to_owned(),
+        Some(place) => format!(
+            "the claim was taken in another place, {}",
+            crate::ledger::inline_human_text(place)
+        ),
+        None => "the claim records no place".to_owned(),
+    });
+    lines.push(
+        match (users.is_empty(), taken_here) {
+            (false, _) => {
+                "a process named above is evidence that the work in the workspace is live"
+            }
+            (true, true) => {
+                "the list was read in the place the claim was taken, so nothing this machine can \
+                 see is working in the workspace"
+            }
+            (true, false) => {
+                "an empty list is evidence of nothing here, because this machine cannot see the \
+                 processes of another host or agent box"
+            }
+        }
+        .to_owned(),
+    );
+    lines.push(
+        "the list leaves out this run's own processes, the processes of its harness session, and \
+         any process this user cannot inspect"
+            .to_owned(),
+    );
+    lines.join("\n")
 }
 
 fn force_claim(
     context: &mut StartContext<'_>,
     previous: &crate::store::Claim,
     last_seen: crate::seen::LastSeen,
-    reason: &str,
 ) -> anyhow::Result<Exit> {
+    let reason = context
+        .why
+        .ok_or_else(|| anyhow::anyhow!("--force requires --why"))?;
     let workspace_notice = match workspace_notice(context, true)? {
         Ok(notice) => notice,
         // Refused before seizing, as `take_claim` refuses before claiming: a
@@ -309,6 +436,7 @@ fn force_claim(
             return Ok(Exit::Usage);
         }
     };
+    let displaced = Displaced::over(previous, &context.identity, last_seen);
     record_claim(
         context,
         reason,
@@ -319,6 +447,7 @@ fn force_claim(
             previous.started,
             last_seen_provenance(last_seen),
         ),
+        displaced.as_ref(),
     )?;
     println!(
         "seized {}\n{workspace_notice}",
@@ -328,7 +457,7 @@ fn force_claim(
 }
 
 fn resume_claim(
-    context: &StartContext<'_>,
+    context: &mut StartContext<'_>,
     held: Option<&crate::store::Claim>,
     claim_seen: Option<crate::seen::LastSeen>,
     possession: bool,
@@ -340,20 +469,37 @@ fn resume_claim(
     } else {
         "resumed"
     };
+    let target = BranchTarget::new(context.fork.upstream.clone(), context.branch.clone());
+    // The reason a claim carries is why the work is held now, so its holder
+    // saying why again replaces it: a reader of a refusal days later is told
+    // what the branch is for today, not what the first `start` was for.
+    // Nobody else speaks for the claim, and the possession arm resumes
+    // under names that may differ: a session standing in the directory of
+    // another owner's claim leaves that owner's reason alone.
+    let restated = match context.why {
+        Some(why) if claim.owner == context.identity.owner => {
+            context.store.restate_claim(&target, why)
+        }
+        _ => None,
+    };
+    let claim = restated.as_ref().unwrap_or(claim);
+    // The immutable explanation before the mutable claim state, as a release
+    // records it: a failed append leaves the reason the claim already held.
     Scribe::new(
         Ledger::for_fork(context.fork),
         context.fork.upstream.clone(),
         context.fork.checkout.path.clone(),
         context.identity.owner.clone(),
     )
-    .event(
-        Some(context.branch.as_str()),
-        event.to_owned(),
-        context.store.tracked_pull(&BranchTarget::new(
-            context.fork.upstream.clone(),
-            context.branch.clone(),
-        )),
+    .record(
+        &Draft::event(
+            Some(context.branch.as_str()),
+            event.to_owned(),
+            context.store.tracked_pull(&target),
+        )
+        .about_claim(Some(ClaimChange::Resumed), Some(claim.why.as_str()), None),
     )?;
+    context.store.save()?;
     println!(
         "{event}\n{}\n{workspace_notice}",
         render_claim_context(claim, last_seen, jiff::Timestamp::now()),
@@ -361,7 +507,20 @@ fn resume_claim(
     Ok(Exit::Ok)
 }
 
-fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Exit> {
+/// Claim the branch and say so, adopting the directory that is already there
+/// or making a new workspace.
+///
+/// Every owner name printed here goes out escaped
+/// ([`crate::ledger::inline_human_text`]), this run's own included: with no
+/// harness variable set the identity is read back from a claim in the state
+/// file that another session wrote
+/// (`crate::commands::hook::owner_for`), and a printer that escaped only
+/// that case would be a rule no reader of this code, and no reader of the
+/// output, could tell apart from the other. Bound once, so both `claimed …
+/// for` lines say the same thing and one test covers both.
+fn take_claim(context: &mut StartContext<'_>) -> anyhow::Result<Exit> {
+    let reason = context.why.unwrap_or("started work");
+    let owner = crate::ledger::inline_human_text(&context.identity.owner);
     if context.destination.exists() {
         if let Some(line) = adoption_refusal(
             &context.destination,
@@ -389,13 +548,13 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
             context,
             reason,
             format!("claimed: {reason} (adopted existing workspace)"),
+            None,
         )?;
         println!(
-            "adopted existing workspace {} at {change}; left as-is\nclaimed {}/{} for {}",
-            context.destination.display(),
+            "adopted existing workspace {} at {change}; left as-is\nclaimed {}/{} for {owner}",
+            crate::ledger::inline_human_text(&context.destination.display().to_string()),
             context.fork.name,
             context.branch,
-            context.identity.owner,
         );
         return Ok(Exit::Ok);
     }
@@ -412,47 +571,78 @@ fn take_claim(context: &mut StartContext<'_>, reason: &str) -> anyhow::Result<Ex
         &Repo::open(&context.fork.checkout.path)?,
         &context.workspace,
     )?;
-    record_claim(context, reason, format!("claimed: {reason}"))?;
+    record_claim(context, reason, format!("claimed: {reason}"), None)?;
     println!(
-        "workspace {} at {change} based on {base_revision} ({base_label})\nclaimed {}/{} for {}",
-        context.destination.display(),
+        "workspace {} at {change} based on {base_revision} ({base_label})\nclaimed {}/{} for \
+         {owner}",
+        crate::ledger::inline_human_text(&context.destination.display().to_string()),
         context.fork.name,
         context.branch,
-        context.identity.owner,
     );
     Ok(Exit::Ok)
 }
 
-fn record_claim(context: &mut StartContext<'_>, reason: &str, event: String) -> anyhow::Result<()> {
+/// Write the claim and the entry that explains it.
+///
+/// `displaced` is the holder this write took the claim from, where another
+/// owner name held it. That, and only that, makes the entry a `taken` one:
+/// a forced start over the caller's own claim displaced nobody, however its
+/// prose reads.
+fn record_claim(
+    context: &mut StartContext<'_>,
+    reason: &str,
+    event: String,
+    displaced: Option<&Displaced>,
+) -> anyhow::Result<()> {
     let target = BranchTarget::new(context.fork.upstream.clone(), context.branch.clone());
     let pull = context.store.tracked_pull(&target);
     let _ = context.store.claim(&target, &context.identity, reason);
+    let change = if displaced.is_some() {
+        ClaimChange::Taken
+    } else {
+        ClaimChange::Claimed
+    };
     Scribe::new(
         Ledger::for_fork(context.fork),
         context.fork.upstream.clone(),
         context.fork.checkout.path.clone(),
         context.identity.owner.clone(),
     )
-    .event(Some(context.branch.as_str()), event, pull)?;
+    .record(
+        &Draft::event(Some(context.branch.as_str()), event, pull).about_claim(
+            Some(change),
+            Some(reason),
+            displaced,
+        ),
+    )?;
     context.store.save()?;
     Ok(())
 }
 
+/// The workspace line for a resumed claim: where this branch's workspace is
+/// and what its working copy is at, or why there is nothing to resume in.
+///
+/// The path is the one jj recorded for the workspace when it has one
+/// ([`workspace_path`]), which whichever session registered it chose, and
+/// the error is jj's own text, which prints more than one line, so both
+/// reach the terminal escaped ([`crate::ledger::inline_human_text`] and
+/// [`crate::ledger::problem_human_text`]). The branch and the workspace name
+/// are this process's own.
 fn resume_workspace_notice(context: &StartContext<'_>) -> String {
+    let shown = crate::ledger::inline_human_text(&context.destination.display().to_string());
     if !context.destination.exists() {
         return format!(
-            "workspace missing at {}; `knives start {} --force --why \"…\"` rebuilds it",
-            context.destination.display(),
+            "workspace missing at {shown}; `knives start {} --force --why \"…\"` rebuilds it",
             context.branch
         );
     }
     match workspace_change(&context.opened, &context.workspace) {
-        Ok(change) => format!("workspace {} at {change}", context.destination.display()),
+        Ok(change) => format!("workspace {shown} at {change}"),
         Err(error) => format!(
-            "workspace {} is present but not registered as {} ({error}); \
+            "workspace {shown} is present but not registered as {} ({}); \
              `knives start {} --force --why \"…\"` rebuilds it",
-            context.destination.display(),
             context.workspace,
+            crate::ledger::problem_human_text(&error.to_string()),
             context.branch
         ),
     }
@@ -466,39 +656,48 @@ fn resume_workspace_notice(context: &StartContext<'_>) -> String {
 /// anywhere, what sits at the path is not knives' to assume, registered name or
 /// not. The checkout itself and its ancestors never get this far:
 /// [`collides_with_checkout`] refuses them before any claim work.
+///
+/// Every value here is read off disk: the workspace name and the store path
+/// jj recorded, the path jj recorded for this name (the destination the
+/// caller located), the link's target, and jj's own detail for a working copy
+/// it cannot read. All of them reach the terminal escaped
+/// ([`crate::ledger::inline_human_text`], and
+/// [`crate::ledger::problem_human_text`] for jj's detail, which prints more
+/// than one line); the branch's own workspace name is this process's.
 fn adoption_refusal(destination: &Path, checkout: &Path, name: &WorkspaceName) -> Option<String> {
-    let shown = destination.display();
+    let shown = crate::ledger::inline_human_text(&destination.display().to_string());
+    let here = crate::ledger::inline_human_text(&checkout.display().to_string());
     let line = match workspace_identity(destination, checkout) {
         WorkspaceIdentity::Ours(actual) if actual == *name => return None,
-        WorkspaceIdentity::Ours(actual) => format!(
-            "cannot adopt {shown}: it is workspace {actual} of {}, not {name}; forget or finish \
-             workspace {actual}, or choose a different branch",
-            checkout.display()
-        ),
+        WorkspaceIdentity::Ours(actual) => {
+            let actual = crate::ledger::inline_human_text(actual.as_str());
+            format!(
+                "cannot adopt {shown}: it is workspace {actual} of {here}, not {name}; forget or \
+                 finish workspace {actual}, or choose a different branch"
+            )
+        }
         WorkspaceIdentity::Foreign(store) => format!(
-            "cannot adopt {shown}: it belongs to repository {}, not {}; move the foreign \
+            "cannot adopt {shown}: it belongs to repository {}, not {here}; move the foreign \
              workspace or choose a different branch",
-            store.display(),
-            checkout.display()
+            crate::ledger::inline_human_text(&store.display().to_string())
         ),
         WorkspaceIdentity::Unreadable(detail) => format!(
-            "cannot adopt {shown}: it is a workspace of {} whose working-copy state could not \
-             be read ({detail})",
-            checkout.display()
+            "cannot adopt {shown}: it is a workspace of {here} whose working-copy state could \
+             not be read ({})",
+            crate::ledger::problem_human_text(&detail)
         ),
         WorkspaceIdentity::Repository => format!(
-            "cannot adopt {shown}: it is a repository in its own right, not a workspace of {}; \
-             choose a different branch",
-            checkout.display()
+            "cannot adopt {shown}: it is a repository in its own right, not a workspace of \
+             {here}; choose a different branch"
         ),
         WorkspaceIdentity::SymbolicLink(target) => format!(
             "cannot adopt {shown}: it is a symbolic link to {}; start from the real directory \
              or choose a different branch",
-            target.display()
+            crate::ledger::inline_human_text(&target.display().to_string())
         ),
         WorkspaceIdentity::NotAWorkspace => format!(
-            "cannot adopt {shown}: not a workspace of {}; move it or choose a different branch",
-            checkout.display()
+            "cannot adopt {shown}: not a workspace of {here}; move it or choose a different \
+             branch"
         ),
     };
     Some(line)
@@ -507,6 +706,11 @@ fn adoption_refusal(destination: &Path, checkout: &Path, name: &WorkspaceName) -
 /// The workspace line for a claim being seized: the existing workspace, or the
 /// one just created. `Err` is the refusal line; nothing is claimed in that case,
 /// so a plain `start` afterwards is the way back.
+///
+/// The path is the one jj recorded for the workspace when it has one
+/// ([`workspace_path`]), so both lines print it escaped
+/// ([`crate::ledger::inline_human_text`]); the refusal escapes its own values
+/// ([`adoption_refusal`]).
 fn workspace_notice(
     context: &StartContext<'_>,
     left_as_is: bool,
@@ -522,14 +726,14 @@ fn workspace_notice(
         let retained = if left_as_is { "; left as-is" } else { "" };
         return Ok(Ok(format!(
             "workspace {} at {}{retained}",
-            context.destination.display(),
+            crate::ledger::inline_human_text(&context.destination.display().to_string()),
             workspace_change(&context.opened, &context.workspace)?,
         )));
     }
     Ok(match create_workspace(context, Leftovers::Clear)? {
         WorkspaceBase::Created { revision, label } => Ok(format!(
             "created missing workspace {} at {} based on {revision} ({label})",
-            context.destination.display(),
+            crate::ledger::inline_human_text(&context.destination.display().to_string()),
             workspace_change(
                 &Repo::open(&context.fork.checkout.path)?,
                 &context.workspace
@@ -555,7 +759,11 @@ enum Leftovers {
 
 fn clear_vanished_workspace(context: &StartContext<'_>) -> anyhow::Result<()> {
     let checkout = &context.fork.checkout.path;
-    let shown = context.destination.display();
+    // The path is the one jj recorded for the workspace when it has one
+    // ([`workspace_path`]), so the lines a terminal reads print it escaped
+    // ([`crate::ledger::inline_human_text`]); the refusals below are errors,
+    // which `main::error_line` escapes once for all of them.
+    let shown = crate::ledger::inline_human_text(&context.destination.display().to_string());
     // Nothing is forgotten while something sits at the path: `add` would fail
     // on it, and the forget could not be taken back.
     if std::fs::symlink_metadata(&context.destination).is_ok() {
@@ -695,7 +903,7 @@ fn create_workspace(
             StaleRegistration::None => {}
             StaleRegistration::Removed => println!(
                 "removed a stale Git worktree registration at {} (its directory was gone)",
-                context.destination.display()
+                crate::ledger::inline_human_text(&context.destination.display().to_string())
             ),
             StaleRegistration::Locked => anyhow::bail!(
                 "a locked Git worktree registration at {} has no directory there; if it is \
@@ -900,5 +1108,41 @@ mod tests {
             &BranchName::new("feat/a/b"),
         );
         assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("feat-a-b"));
+    }
+
+    /// The collision refusal both `start` and `finish` print names the
+    /// registered checkout and the directory jj recorded for the workspace,
+    /// neither of which this process wrote.
+    #[test]
+    fn a_control_character_in_a_checkout_path_reaches_the_terminal_escaped() {
+        let checkout = PathBuf::from("/home/u/for\u{7}ks/tool/default");
+        let sibling_entry = entry(None);
+        let fork = Fork::at("tool", &sibling_entry, &checkout);
+        let line = collides_with_checkout(&fork, &BranchName::new("default")).expect("a collision");
+        assert!(!line.contains('\u{7}'), "{line}");
+        assert_eq!(
+            line.matches("/home/u/for\u{fffd}ks/tool/").count(),
+            2,
+            "the workspace directory and the checkout: {line}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_control_character_in_a_symlink_target_reaches_the_adoption_refusal_escaped() {
+        // The target is whatever the link holds, which is nothing this process
+        // wrote: a refusal that printed it raw would hand the directory's owner
+        // the refused caller's terminal.
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("feat-alpha");
+        std::os::unix::fs::symlink("/elsewhere/wor\u{1b}[31mk", &destination).unwrap();
+        let line = adoption_refusal(
+            &destination,
+            Path::new("/home/u/forks/tool/default"),
+            &WorkspaceName::new("feat-alpha"),
+        )
+        .expect("a refusal");
+        assert!(!line.contains('\u{1b}'), "{line}");
+        assert!(line.contains("/elsewhere/wor\u{fffd}[31mk"), "{line}");
     }
 }

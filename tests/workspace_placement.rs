@@ -258,25 +258,51 @@ fn start_refuses_to_adopt_a_directory_that_is_not_a_workspace_of_the_checkout() 
 }
 
 #[test]
-fn finish_from_inside_the_configured_workspace_releases_by_possession() {
+fn finish_from_inside_the_configured_workspace_releases_only_to_the_claims_owner() {
     // Given: a branch started by one owner into the configured directory
     let lab = Lab::new();
     let (home, workspaces) = home_with_workspaces(&lab);
     assert!(start_gamma(&lab, &home).status.success());
     let workspace = workspaces.join("feat-gamma");
+    let finish_as = |owner: &str| {
+        lab::knives_command(
+            &workspace,
+            home.path(),
+            lab.temp_path(),
+            &["--text", "finish", "feat/gamma"],
+        )
+        .env("KNIVES_OWNER", owner)
+        .output()
+        .expect("run finish from inside")
+    };
 
     // When: another owner finishes it from inside, naming no repository
-    let finished = lab::knives_command(
-        &workspace,
-        home.path(),
-        lab.temp_path(),
-        &["--text", "finish", "feat/gamma"],
-    )
-    .env("KNIVES_OWNER", "someone-else")
-    .output()
-    .expect("run finish from inside");
+    let refused = finish_as("someone-else");
 
-    // Then: the repository is inferred through the pointer and possession releases the claim
+    // Then: standing in the directory is no permission to hand back a claim
+    // taken under another name; nothing is released and nothing removed
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("is claimed by ses_fff688"),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(workspace.is_dir(), "the workspace directory was removed");
+    assert_eq!(
+        workspaces_of(&lab.work),
+        vec!["default".to_owned(), "feat-gamma".to_owned()]
+    );
+
+    // When: the claim's own owner finishes it from inside, naming no repository
+    let finished = finish_as("ses_fff688");
+
+    // Then: the repository is inferred through the pointer and the claim is released
     assert!(
         finished.status.success(),
         "finish from inside failed: {}",
@@ -407,7 +433,7 @@ fn start_refuses_to_adopt_a_plain_directory_even_when_the_name_is_registered() {
 }
 
 #[test]
-fn finish_by_possession_sees_through_a_symlinked_workspaces_directory() {
+fn finish_through_a_symlinked_workspaces_directory_releases_only_to_the_claims_owner() {
     // Given: `workspaces` spelled through a symlink, as a directory on another disk
     // would be. The shell's cwd is the physical path; the registry's is not.
     let lab = Lab::new();
@@ -433,18 +459,41 @@ fn finish_by_possession_sees_through_a_symlinked_workspaces_directory() {
         "fixture: workspace not created through the link"
     );
 
-    // When: another owner finishes from inside, standing on the physical path
-    let finished = lab::knives_command(
-        &workspace,
-        home.path(),
-        lab.temp_path(),
-        &["--text", "finish", "feat/gamma", "--repo", "demo"],
-    )
-    .env("KNIVES_OWNER", "someone-else")
-    .output()
-    .expect("run finish from inside");
+    let finish_as = |owner: &str| {
+        lab::knives_command(
+            &workspace,
+            home.path(),
+            lab.temp_path(),
+            &["--text", "finish", "feat/gamma", "--repo", "demo"],
+        )
+        .env("KNIVES_OWNER", owner)
+        .output()
+        .expect("run finish from inside")
+    };
 
-    // Then: possession is recognised and the claim released
+    // When: another owner finishes from inside, standing on the physical path
+    let refused = finish_as("someone-else");
+
+    // Then: possession of a directory claimed under another name releases
+    // nothing and removes nothing
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("is claimed by ses_fff688"),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(workspace.is_dir(), "the workspace directory was removed");
+
+    // When: the claim's own owner finishes from inside, on the physical path
+    let finished = finish_as("ses_fff688");
+
+    // Then: possession is recognised through the link and the claim released
     assert!(
         finished.status.success(),
         "possession through a symlink was not recognised: {}",

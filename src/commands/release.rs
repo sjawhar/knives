@@ -692,7 +692,7 @@ pub fn reap_superseded(
     'names: for (name, targets) in by_name {
         for target in &targets {
             if let Some(reason) = repo.what_rests_on(target)? {
-                report.kept.push((name.clone(), reason));
+                report.kept.push((name, reason));
                 continue 'names;
             }
         }
@@ -1345,19 +1345,23 @@ pub fn gather_members(
 
 /// Render the gathered parent state and optional audit in the cut command's words.
 pub fn render_members(report: &MembersReport) -> String {
+    use crate::ledger::inline_human_text;
+    // The release, its holders, its advancing branches and the audit's
+    // labels are names read from the repository; git takes a C1 character
+    // in a ref name, and jj imports such a ref as a remote bookmark.
     let mut lines = vec![format!(
         "{} @ {} — {} parents",
-        report.release,
+        inline_human_text(&report.release),
         report.commit.short(),
         report.parent_count
     )];
     for member in &report.members {
-        let mut description = member.held_by.join(", ");
+        let mut description = inline_human_text(&member.held_by.join(", "));
         if !member.advanced.is_empty() {
             if !description.is_empty() {
                 description.push_str(", ");
             }
-            description.push_str(&member.advanced.join(", "));
+            description.push_str(&inline_human_text(&member.advanced.join(", ")));
         }
         if description.is_empty() {
             description.push_str("bare commit — nothing holds it");
@@ -1370,14 +1374,16 @@ pub fn render_members(report: &MembersReport) -> String {
     if let Some(audit) = &report.audit {
         for name in &audit.carried {
             lines.push(format!(
-                "  {name}: diverges where the previous release already did \
-                 (a recorded resolution); carried forward"
+                "  {}: diverges where the previous release already did \
+                 (a recorded resolution); carried forward",
+                inline_human_text(name)
             ));
         }
         for name in &audit.inconclusive {
             lines.push(format!(
-                "  {name}: content check inconclusive (replay conflicted; \
-                 re-check after resolving the cut's conflicts)"
+                "  {}: content check inconclusive (replay conflicted; \
+                 re-check after resolving the cut's conflicts)",
+                inline_human_text(name)
             ));
         }
         for member in report.members.iter().filter(|member| !member.base_parent) {
@@ -1386,22 +1392,35 @@ pub fn render_members(report: &MembersReport) -> String {
                 && !audit.inconclusive.contains(&name)
                 && !audit.missing.contains(&name)
             {
-                lines.push(format!("  {name}: carried (replay empty)"));
+                lines.push(format!(
+                    "  {}: carried (replay empty)",
+                    inline_human_text(&name)
+                ));
             }
         }
         for name in &audit.missing {
             lines.push(format!(
-                "  !! {name}: the cut tree is missing or diverges from the member's content"
+                "  !! {}: the cut tree is missing or diverges from the member's content",
+                inline_human_text(name)
             ));
         }
+        // Paths jj's diff named, so each goes out escaped.
         for file in &audit.unexplained {
             lines.push(format!(
-                "  !! {file}: changed between the previous release and this cut \
-                 with no member or trunk explaining it"
+                "  !! {}: changed between the previous release and this cut \
+                 with no member or trunk explaining it",
+                inline_human_text(file)
             ));
         }
     }
-    lines.extend(report.notes.iter().map(|note| format!("! {note}")));
+    // A note quotes jj, the forge or a consumer's pin files; the report keeps
+    // the raw text for `--json`, and this line is the one a terminal reads.
+    lines.extend(
+        report
+            .notes
+            .iter()
+            .map(|note| format!("! {}", inline_human_text(note))),
+    );
     // A problem can name a path from disk or another machine's ledger ref.
     lines.extend(
         report
@@ -1417,13 +1436,23 @@ pub fn render(plan: &Plan) -> String {
         .problems
         .iter()
         .map(|problem| format!("!! {}", crate::ledger::problem_human_text(problem)))
-        .chain(plan.notes.iter().map(|note| format!("! {note}")))
+        .chain(
+            plan.notes
+                .iter()
+                .map(|note| format!("! {}", crate::ledger::inline_human_text(note))),
+        )
         .collect();
     let Some(release) = &plan.release else {
         return lines.join("\n");
     };
 
-    lines.push(format!("{}: {release}", plan.repo));
+    // The release and the parents' bookmarks are names read from the
+    // repository, which a remote can give a C1 character.
+    lines.push(format!(
+        "{}: {}",
+        plan.repo,
+        crate::ledger::inline_human_text(release)
+    ));
     let stacked = plan
         .base_findings
         .iter()
@@ -1441,7 +1470,7 @@ pub fn render(plan: &Plan) -> String {
         let held = if names.is_empty() {
             "no bookmark".to_owned()
         } else {
-            names.join(", ")
+            crate::ledger::inline_human_text(&names.join(", "))
         };
         lines.push(format!("    {}  {held}", commit.short()));
     }
@@ -1451,11 +1480,17 @@ pub fn render(plan: &Plan) -> String {
     } else {
         lines.push(format!("  {} stale parent(s):", plan.stale.len()));
         for finding in &plan.stale {
-            lines.push(format!("    {}", finding.detail));
+            lines.push(format!(
+                "    {}",
+                crate::ledger::inline_human_text(&finding.detail)
+            ));
         }
     }
     for finding in &plan.base_findings {
-        lines.push(format!("  !! {}", finding.detail));
+        lines.push(format!(
+            "  !! {}",
+            crate::ledger::inline_human_text(&finding.detail)
+        ));
     }
 
     // The verdict line below says "nothing pins this release" on its own; a
@@ -1935,6 +1970,76 @@ mod tests {
         let carried = carried_from_tips(&tips, "dev", &fixed);
         // Then: only the feature is cargo; the fixed branch advances in place.
         assert_eq!(carried, vec![("feat/x".to_owned(), CommitId::new("bbb"))]);
+    }
+
+    /// Nothing in a release report that this process did not write — a path a
+    /// jj diff named, a note quoting the forge, a finding detail built from jj
+    /// text, a consumer's pin — may carry a terminal control sequence out to
+    /// the reader. The plan keeps the raw text for `--json`; this is the line
+    /// a terminal reads.
+    #[test]
+    fn a_control_character_in_a_plan_reaches_the_terminal_escaped() {
+        let raw = "a\u{7}b";
+        let finding = |detail: &str| {
+            Finding::new(
+                FindingKind::StackedHistory,
+                Subject::Branch(BranchName::new("feat/alpha")),
+                detail,
+            )
+        };
+        let plan = Plan {
+            repo: "work".to_owned(),
+            release: Some("release/2026-07-28".to_owned()),
+            notes: vec![raw.to_owned()],
+            stale: vec![finding(raw)],
+            base_findings: vec![finding(raw)],
+            pins: vec![Pin {
+                file: raw.to_owned(),
+                reference: raw.to_owned(),
+                ..pin(PinKind::Frozen)
+            }],
+            ..Plan::default()
+        };
+        let rendered = render(&plan);
+        assert!(!rendered.contains('\u{7}'), "{rendered}");
+        assert_eq!(
+            rendered.matches("a\u{fffd}b").count(),
+            5,
+            "note, stale detail, base finding, pin file and pin reference: {rendered}"
+        );
+        assert_eq!(plan.notes[0], raw, "the plan itself keeps the raw note");
+    }
+
+    #[test]
+    fn a_control_character_in_a_members_report_reaches_the_terminal_escaped() {
+        let raw = "src/a\u{7}b.rs";
+        let report = MembersReport {
+            repo: "work".to_owned(),
+            release: "release/2026-07-28".to_owned(),
+            commit: CommitId::new(PUBLISHED),
+            parent_count: 0,
+            members: Vec::new(),
+            audit: Some(CutAudit {
+                unexplained: vec![raw.to_owned()],
+                ..CutAudit::default()
+            }),
+            notes: vec![raw.to_owned()],
+            problems: Vec::new(),
+        };
+        let rendered = render_members(&report);
+        assert!(!rendered.contains('\u{7}'), "{rendered}");
+        assert_eq!(
+            rendered.matches("src/a\u{fffd}b.rs").count(),
+            2,
+            "the unexplained diff path and the note: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_control_character_in_a_conflicted_path_reaches_the_terminal_escaped() {
+        let rendered = conflict_guidance(&["src/a\u{7}b.rs".to_owned()]);
+        assert!(!rendered.contains('\u{7}'), "{rendered}");
+        assert!(rendered.contains("src/a\u{fffd}b.rs"), "{rendered}");
     }
 }
 
@@ -2496,6 +2601,13 @@ mod cut_tests {
             anchor: None,
             pr: None,
             parents: Vec::new(),
+            claim_change: None,
+            claim_change_why: None,
+            previous_owner: None,
+            previous_kind: None,
+            previous_started: None,
+            previous_last_seen: None,
+            previous_why: None,
         }
     }
 
@@ -2672,7 +2784,12 @@ pub fn conflict_guidance(files: &[String]) -> String {
         "  {} conflicted file(s), which is expected:",
         files.len()
     )];
-    lines.extend(files.iter().map(|file| format!("    {file}")));
+    // The paths are jj's, named by the conflict it reports.
+    lines.extend(
+        files
+            .iter()
+            .map(|file| format!("    {}", crate::ledger::inline_human_text(file))),
+    );
     lines.push(
         "  resolve as a union: keep every branch's addition, keep any shared helper \
          defined exactly once, and land each config key in every loader"

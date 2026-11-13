@@ -14,6 +14,7 @@ use knives::commands::release;
 use knives::forge::PullRequest;
 use knives::forge::github::CliForge;
 use knives::ids::{ReleaseScheme, RepoName};
+use knives::ledger::inline_human_text;
 use knives::release_model::{BranchSuccessions, carried_from_tips, trunk_positions};
 
 use super::release_edit::{
@@ -144,16 +145,18 @@ pub(crate) fn run_rebase(
     let Some((members, shed)) = classify_rebase_parents(&context, &release_name, &onto)? else {
         return Ok(Exit::Incomplete);
     };
+    // The release is a name read from the repository.
+    let shown_release = inline_human_text(&release_name);
     if all_landed(&opened, &members, &onto)? {
         println!(
-            "{repo}: every member of {release_name} has landed in {reference}; rebasing \
+            "{repo}: every member of {shown_release} has landed in {reference}; rebasing \
              would make the trunk the only parent, so nothing moved \u{2014} reap the release \
              or include new work"
         );
         return Ok(Exit::Incomplete);
     }
     if members.is_empty() {
-        println!("{repo}: {release_name} has no member parents to move; nothing to rebase");
+        println!("{repo}: {shown_release} has no member parents to move; nothing to rebase");
         return Ok(Exit::Incomplete);
     }
     shed_stale_bases(fork, (&release_name, &release_commit), &members, shed)?;
@@ -203,15 +206,20 @@ pub(crate) fn run_rebase(
         &kept_releases,
         &format!("knives: {release_name}: keep every pushed release where it was"),
     )?;
+    // Release names read from the repository.
     for (name, commit) in &restored {
         println!(
-            "{repo}: {name} stays at {}: it is pushed or published, and a rebase moves only the \
+            "{repo}: {} stays at {}: it is pushed or published, and a rebase moves only the \
              release in hand and its members",
+            inline_human_text(name),
             commit.short()
         );
     }
     for name in &followers {
-        println!("{repo}: {name} follows the rebase: it was never pushed or published");
+        println!(
+            "{repo}: {} follows the rebase: it was never pushed or published",
+            inline_human_text(name)
+        );
     }
     report_rebased_release(
         fork,
@@ -253,13 +261,14 @@ fn frozen_rebase_exit(
     if effect != release::RepairEffect::NewDatedName {
         return None;
     }
+    let shown_release = inline_human_text(release_name);
     match scheme {
         ReleaseScheme::Dated | ReleaseScheme::Series(_) => println!(
-            "{repo}: every pin of {release_name} is frozen, so moving it would reach \
+            "{repo}: every pin of {shown_release} is frozen, so moving it would reach \
              nobody; cut a new dated release instead"
         ),
         ReleaseScheme::Fixed(_) => println!(
-            "{repo}: every pin of {release_name} is frozen, so moving the fixed branch \
+            "{repo}: every pin of {shown_release} is frozen, so moving the fixed branch \
              would reach nobody; update the frozen consumer pins, or change the release \
              scheme before advancing it (fixed branches cannot reach revision pins)"
         ),
@@ -280,11 +289,15 @@ fn stale_rule_exit(fork: &Fork<'_>) -> anyhow::Result<Option<Exit>> {
     if !stated.written_by_knives || stated.rule == rule {
         return Ok(None);
     }
+    // The rule is read back from this checkout's jj config, which an earlier
+    // `knives start` wrote but a person may have edited since, so it reaches
+    // the terminal escaped; `rule` is the entry's `repos.toml` value.
     println!(
         "{}: this checkout's jj config states immutable_heads() = `{}`, written by an \
          earlier `knives start`; this fork runs under `{rule}`. Any `knives start <branch>` \
          in this fork refreshes it; rebase again after that. Nothing moved",
-        fork.name, stated.rule
+        fork.name,
+        knives::ledger::inline_human_text(&stated.rule)
     );
     Ok(Some(Exit::Incomplete))
 }
@@ -363,18 +376,23 @@ fn classify_rebase_parents(
         // the refusal says how it moves — never "fix the branch", which read as
         // an instruction to put a copy back on the old base.
         let moved = stale_parent_moved_branches(opened, entry, &parent.commit)?;
+        // The release is a name read from the repository.
+        let shown_release = inline_human_text(release_name);
         match moved {
+            // `moved` is jj's account of where the member went, built from the
+            // bookmarks and ids it holds, so the refusal escapes it.
             Some(moved) => eprintln!(
-                "{repo}: refusing to rebase {release_name}: parent {} is stale{no_bookmark}; it \
-                 was {moved}. `knives release advance` moves the member to its branch, then \
+                "{repo}: refusing to rebase {shown_release}: parent {} is stale{no_bookmark}; it \
+                 was {}. `knives release advance` moves the member to its branch, then \
                  re-run; carrying the old commit could ship pre-rewrite code.",
                 parent.commit.short(),
+                inline_human_text(&moved),
             ),
             None => eprintln!(
-                "{repo}: refusing to rebase {release_name}: parent {} is stale{no_bookmark}, and \
-                 no local branch continues it. Drop it from the release (`knives release drop \
-                 {}`) or restore its branch, then re-run; carrying it could ship pre-rewrite \
-                 code.",
+                "{repo}: refusing to rebase {shown_release}: parent {} is stale{no_bookmark}, \
+                 and no local branch continues it. Drop it from the release (`knives release \
+                 drop {}`) or restore its branch, then re-run; carrying it could ship \
+                 pre-rewrite code.",
                 parent.commit.short(),
                 parent.commit.short(),
             ),
@@ -426,9 +444,13 @@ fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option
     if !opened.is_ancestor(&destination.onto, release_commit)? {
         return Ok(None);
     }
+    // The release is a name read from the repository; the destination is the
+    // caller's argument or a commit id this run resolved.
     println!(
-        "{}: {release_name} already contains {}",
-        fork.name, destination.reference
+        "{}: {} already contains {}",
+        fork.name,
+        inline_human_text(release_name),
+        destination.reference
     );
     let exit = if no_drop {
         Exit::Ok
@@ -493,9 +515,11 @@ fn merged_rebase_target(
     }) {
         Ok(opened_snapshot) => opened_snapshot,
         Err(error) => {
+            // The forge's own text, which prints more than one line.
             eprintln!(
-                "{repo}: could not ask the forge which pull requests merged: {error}; \
-                 provide a commit to rebase onto"
+                "{repo}: could not ask the forge which pull requests merged: {}; \
+                 provide a commit to rebase onto",
+                knives::ledger::problem_human_text(&error.to_string())
             );
             return Ok(None);
         }
@@ -503,9 +527,11 @@ fn merged_rebase_target(
     let snapshot = match opened_snapshot.complete_with(entry.trunk(), select_merged_numbers) {
         Ok(snapshot) => snapshot,
         Err(error) => {
+            // The forge's own text, as above.
             eprintln!(
-                "{repo}: could not ask the forge which pull requests merged: {error}; \
-                 provide a commit to rebase onto"
+                "{repo}: could not ask the forge which pull requests merged: {}; \
+                 provide a commit to rebase onto",
+                knives::ledger::problem_human_text(&error.to_string())
             );
             return Ok(None);
         }
@@ -554,7 +580,11 @@ fn merged_rebase_target(
         }))
     })();
     if let Err(note) = snapshot.persist(None) {
-        eprintln!("{repo}: {note}");
+        // The note carries the OS's message and the cache path it names.
+        eprintln!(
+            "{repo}: {}",
+            knives::ledger::problem_human_text(&note.to_string())
+        );
     }
     result
 }
@@ -682,9 +712,11 @@ fn drop_landed_members(
             continue;
         }
         if knives::jj::carries_work_past(path, &destination.onto, &tip)? {
+            // The head branch is the forge's name for it, a ref a remote gave.
             println!(
                 "{repo}: kept {}: it carries work past #{}",
-                pull.head_ref_name, pull.number
+                inline_human_text(&pull.head_ref_name),
+                pull.number
             );
             continue;
         }
@@ -697,9 +729,10 @@ fn drop_landed_members(
     if deltas.is_empty() {
         return Ok(Exit::Ok);
     }
+    let shown_release = inline_human_text(release_name);
     if kept.is_empty() {
         println!(
-            "{repo}: every member of {release_name} landed; dropping them all would leave it \
+            "{repo}: every member of {shown_release} landed; dropping them all would leave it \
              without a parent, so nothing was dropped"
         );
         return Ok(Exit::Incomplete);
@@ -733,9 +766,11 @@ fn drop_landed_members(
         },
         bound,
     )?;
+    // The delta names the forge's head branches; the ledger keeps it raw.
     println!(
-        "{repo}: {release_name} now has {} parent(s): {delta}",
-        kept.len()
+        "{repo}: {shown_release} now has {} parent(s): {}",
+        kept.len(),
+        inline_human_text(&delta)
     );
     report_replaced(repo, release_name, &written);
     match knives::jj::conflicted_files(path, created.as_str()) {
@@ -799,9 +834,11 @@ fn report_rebased_release(
     } else {
         String::new()
     };
+    // The release is a name read from the repository; the reference is the
+    // caller's argument or a commit id this run resolved.
     println!(
         "{repo}: {} rebased onto {} ({}), {} member(s) moved with it{stale_bases}",
-        rebased.name,
+        inline_human_text(rebased.name),
         rebased.reference,
         rebased.onto.short(),
         new_parents.len()
@@ -821,6 +858,20 @@ fn report_tagged_copies(
     copies: &[knives::jj::TaggedCopy],
     restored: &[(String, knives::ids::CommitId)],
 ) {
+    for line in tagged_copy_lines(repo, copies, restored) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`report_tagged_copies`] prints. Tag and release names are read
+/// from the repository, and what keeps a copy names bookmarks, tags and jj
+/// workspaces (`what_keeps`, src/jj.rs), so each is escaped.
+fn tagged_copy_lines(
+    repo: &RepoName,
+    copies: &[knives::jj::TaggedCopy],
+    restored: &[(String, knives::ids::CommitId)],
+) -> Vec<String> {
+    let mut lines = Vec::new();
     for copy in copies {
         let mut names: Vec<String> = copy.tags.iter().map(|tag| format!("tag {tag}")).collect();
         names.extend(
@@ -832,16 +883,20 @@ fn report_tagged_copies(
         let of = format!(
             "the rebased copy of {} ({})",
             copy.original.short(),
-            names.join(", ")
+            inline_human_text(&names.join(", "))
         );
-        match &copy.kept {
-            None => println!(
-                "{repo}: abandoned {}, {of}; the original keeps its name",
-                copy.copy.short()
-            ),
-            Some(reason) => println!("{repo}: note: kept {}, {of}: {reason}", copy.copy.short()),
-        }
+        let copy_id = copy.copy.short();
+        lines.push(copy.kept.as_ref().map_or_else(
+            || format!("{repo}: abandoned {copy_id}, {of}; the original keeps its name"),
+            |reason| {
+                format!(
+                    "{repo}: note: kept {copy_id}, {of}: {}",
+                    inline_human_text(reason)
+                )
+            },
+        ));
     }
+    lines
 }
 
 /// `feat/alpha (now 1a2b3c4d5e6f)` for every maintained branch that continues a
@@ -863,4 +918,32 @@ fn stale_parent_moved_branches(
         .map(|(branch, tip)| format!("{branch} (now {})", tip.short()))
         .collect();
     Ok((!moved.is_empty()).then(|| moved.join(", ")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use knives::ids::CommitId;
+    use knives::jj::TaggedCopy;
+
+    #[test]
+    fn a_rebased_copy_names_its_tags_releases_and_keepers_escaped() {
+        let copies = [TaggedCopy {
+            original: CommitId::new("aaaa"),
+            tags: vec!["v1\u{9b}2J".to_owned()],
+            copy: CommitId::new("bbbb"),
+            kept: Some("the working copy of workspace ws\u{1b}x rests on it".to_owned()),
+        }];
+        let restored = [("release/2026-01-01\u{9d}".to_owned(), CommitId::new("aaaa"))];
+
+        let lines = tagged_copy_lines(&RepoName::new("demo"), &copies, &restored);
+
+        assert_eq!(
+            lines,
+            [
+                "demo: note: kept bbbb, the rebased copy of aaaa (tag v1\u{fffd}2J, \
+              release/2026-01-01\u{fffd}): the working copy of workspace ws\u{fffd}x rests on it"
+            ]
+        );
+    }
 }

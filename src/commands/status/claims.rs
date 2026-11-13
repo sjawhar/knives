@@ -165,6 +165,10 @@ pub(super) fn fold_claims(
             LastSeen::NoneWithinWindow => {
                 row.seen = Some(SeenWindow::NoneWithinWindow);
             }
+            // A failed operation walk reaches `status` as no activity at all,
+            // which `claim_last_seen` answers from the sidecar alone, so this
+            // state never arrives here and the row gains no field.
+            LastSeen::Unreadable => {}
         }
     }
     let mut unclaimed = workspaces.unwrap_or_default();
