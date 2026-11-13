@@ -1211,6 +1211,56 @@ fn start_adopts_an_existing_workspace_for_an_unclaimed_branch() {
 }
 
 #[test]
+fn the_path_of_a_workspace_another_session_registered_reaches_the_terminal_escaped() {
+    // A jj workspace is registered by whoever runs `jj workspace add`, at any
+    // path that session chooses, and knives reads that path off disk. So it is
+    // text this process did not write, like the claim owner and the process
+    // command line beside it, and both the adoption line of `start` and the
+    // disposal line of `finish` print it.
+    let lab = lab::Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = lab
+        .work
+        .parent()
+        .expect("parent")
+        .join("feat-gamma-\u{1b}]0;held\u{9b}7m");
+    knives::jj::add_workspace(&lab.work, "feat-gamma", &workspace, "main@upstream")
+        .expect("create existing workspace");
+
+    let adopted = knives_at(
+        &lab,
+        home.path(),
+        &lab.work,
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "adopt it",
+        ],
+    )
+    .env("KNIVES_OWNER", "agent-one")
+    .output()
+    .expect("adopt workspace");
+    free_of_control_characters(&String::from_utf8_lossy(&adopted.stdout));
+    free_of_control_characters(&String::from_utf8_lossy(&adopted.stderr));
+
+    let finished = knives_at(
+        &lab,
+        home.path(),
+        &lab.work,
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    )
+    .env("KNIVES_OWNER", "agent-one")
+    .output()
+    .expect("finish the branch");
+    free_of_control_characters(&String::from_utf8_lossy(&finished.stdout));
+    free_of_control_characters(&String::from_utf8_lossy(&finished.stderr));
+}
+
+#[test]
 fn start_adopts_a_no_cleanup_forgotten_workspace_without_resetting_it() {
     // `finish --no-cleanup` intentionally keeps the directory, but forgets its
     // registration. Starting it again must reattach that exact working copy.
