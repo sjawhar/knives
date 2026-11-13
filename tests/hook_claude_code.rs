@@ -345,14 +345,15 @@ fn an_error_the_hook_reports_reaches_stderr_escaped_and_on_one_line() {
 #[test]
 fn remotes_the_hook_cannot_read_reach_stderr_escaped() {
     // `match_checkout` (src/hook/resolve.rs) says on stderr why it could not
-    // read a checkout's remotes, quoting git and the checkout's path. git
-    // turns an ASCII control character of its own message into `?` but
-    // passes a UTF-8 C1 character through, so a `.git` pointer naming a
-    // directory with U+009B (CSI) in it reaches the session as git wrote it;
-    // the checkout's own directory name carries ESC.
+    // read a checkout's remotes, quoting the checkout's path and git's own
+    // message. The checkout's directory name carries ESC, BEL and U+009B
+    // (CSI); which of them git quotes back, and how, differs between git
+    // versions (one names the gitfile, another the directory it points to),
+    // so the test pins the path the hook names itself and asks of the whole
+    // line only that no control character survives.
     let repos = Repositories::new();
     repos.configure(false);
-    let broken = repos.home.path().join("broken\u{1b}]0;pwned\u{7}");
+    let broken = repos.home.path().join("broken\u{1b}]0;pwned\u{7}\u{9b}2J");
     std::fs::create_dir(&broken).expect("create checkout");
     std::fs::write(broken.join(".git"), "gitdir: /nowhere/\u{9b}2J\u{9d}x\n")
         .expect("write git pointer");
@@ -367,8 +368,7 @@ fn remotes_the_hook_cannot_read_reach_stderr_escaped() {
     assert!(success, "a hook must never fail the session: {errors:?}");
     assert!(
         errors.contains("knives hook: reading remotes of ")
-            && errors.contains("broken\u{fffd}]0;pwned\u{fffd}")
-            && errors.contains("/nowhere/\u{fffd}2J\u{fffd}x"),
+            && errors.contains("broken\u{fffd}]0;pwned\u{fffd}\u{fffd}2J"),
         "was: {errors:?}"
     );
     for (index, character) in errors.char_indices() {
