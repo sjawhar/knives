@@ -250,6 +250,7 @@ pub fn gather(input: GatherInput<'_>) -> Report {
     match snapshot::open(SnapshotConfig {
         forge,
         path: checkout,
+        upstream: entry.remote(crate::config::Role::Upstream),
         remotes: [
             entry.remote(crate::config::Role::Origin),
             entry.remote(crate::config::Role::Release),
@@ -553,6 +554,7 @@ mod tests {
         let opened = snapshot::open(SnapshotConfig {
             forge: &forge,
             path: Path::new("/fake"),
+            upstream: "https://forge.invalid/fake-owner/fake-repo",
             remotes: ["origin", "release"],
             cache_root: Some(cache.path()),
         })

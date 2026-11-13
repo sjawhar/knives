@@ -29,19 +29,21 @@ const PR_STATE: &str = "all";
 // deterministically 502 on another. Merge-state is live-batch-only (I2).
 const PR_SUMMARY_FIELDS: &str = "number,state,reviewDecision,headRefName,headRefOid,updatedAt,\
      isDraft,url,headRepositoryOwner,baseRefName,mergeCommit";
-const SUMMARY_LIST_ARGS: [&str; 8] = [
-    "pr",
-    "list",
-    "--state",
-    PR_STATE,
-    "--limit",
-    "300",
-    "--json",
-    PR_SUMMARY_FIELDS,
-];
-
-pub const fn summary_list_args() -> &'static [&'static str; 8] {
-    &SUMMARY_LIST_ARGS
+/// The base window's `gh pr list` of `repository`, named with `-R` so gh takes
+/// no repository from the checkout's remotes.
+pub const fn summary_list_args(repository: &str) -> [&str; 10] {
+    [
+        "pr",
+        "list",
+        "-R",
+        repository,
+        "--state",
+        PR_STATE,
+        "--limit",
+        "300",
+        "--json",
+        PR_SUMMARY_FIELDS,
+    ]
 }
 
 /// The fields asked for by the cheap pull-request list.
@@ -303,19 +305,30 @@ fn joined_forge_call<T>(
 }
 
 impl Forge for CliForge {
-    fn repo_identity(&self, repo: &Path) -> Result<RepoIdentity, ForgeError> {
-        let payload = Self::run(repo, &["repo", "view", "--json", "nameWithOwner,id"])?;
+    fn repo_identity(
+        &self,
+        repo: &Path,
+        upstream: &str,
+        origin: &str,
+    ) -> Result<RepoIdentity, ForgeError> {
+        let repository = super::pull_repository(upstream, origin)?;
+        let payload = Self::run(
+            repo,
+            &["repo", "view", repository, "--json", "nameWithOwner,id"],
+        )?;
         parse_identity(&payload)
     }
 
     fn list_pull_requests(
         &self,
         repo: &Path,
+        target: &RepoIdentity,
         authors: &[String],
     ) -> Result<Vec<PullSummary>, ForgeError> {
+        let repository = target.name_with_owner.as_str();
         std::thread::scope(|scope| {
             let base = scope.spawn(|| {
-                let payload = Self::run(repo, &SUMMARY_LIST_ARGS)?;
+                let payload = Self::run(repo, &summary_list_args(repository))?;
                 parse_summaries(&payload)
             });
             let author_lists = authors
@@ -326,6 +339,8 @@ impl Forge for CliForge {
                         let args = [
                             "pr",
                             "list",
+                            "-R",
+                            repository,
                             "--state",
                             PR_STATE,
                             "--limit",
@@ -2563,13 +2578,15 @@ printf '{}'
         assert!(matches!(error, ForgeError::Target { .. }), "was: {error}");
     }
     #[test]
-    fn cache_list_contract_omits_live_merge_state_fields() {
-        let args = summary_list_args();
+    fn cache_list_contract_names_its_repository_and_omits_live_merge_state_fields() {
+        let args = summary_list_args("our-org/some-repo");
         assert_eq!(
             args,
-            &[
+            [
                 "pr",
                 "list",
+                "-R",
+                "our-org/some-repo",
                 "--state",
                 "all",
                 "--limit",

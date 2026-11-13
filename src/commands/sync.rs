@@ -543,6 +543,7 @@ pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
         match crate::snapshot::open(crate::snapshot::SnapshotConfig {
             forge,
             path,
+            upstream: entry.remote(Role::Upstream),
             remotes: [entry.remote(Role::Origin), entry.remote(Role::Release)],
             cache_root: cache,
         }) {
@@ -1037,6 +1038,7 @@ mod tests {
         let opened = crate::snapshot::open(crate::snapshot::SnapshotConfig {
             forge: &forge,
             path: Path::new("/fake"),
+            upstream: "https://forge.invalid/fake-owner/fake-repo",
             remotes: ["origin", "release"],
             cache_root: Some(cache.path()),
         })
@@ -1205,7 +1207,12 @@ mod comment_activity_tests {
     }
 
     impl Forge for ErroringForge {
-        fn repo_identity(&self, _repo: &Path) -> Result<RepoIdentity, ForgeError> {
+        fn repo_identity(
+            &self,
+            _repo: &Path,
+            _upstream: &str,
+            _origin: &str,
+        ) -> Result<RepoIdentity, ForgeError> {
             Ok(RepoIdentity {
                 name_with_owner: "fake-owner/fake-repo".to_owned(),
                 id: "FAKEID".to_owned(),
@@ -1215,6 +1222,7 @@ mod comment_activity_tests {
         fn list_pull_requests(
             &self,
             _repo: &Path,
+            _target: &RepoIdentity,
             _authors: &[String],
         ) -> Result<Vec<PullSummary>, ForgeError> {
             Ok(self.pull_requests.iter().map(PullSummary::of).collect())
@@ -1291,7 +1299,12 @@ mod comment_activity_tests {
     struct PullListUnavailable;
 
     impl Forge for PullListUnavailable {
-        fn repo_identity(&self, _repo: &Path) -> Result<RepoIdentity, ForgeError> {
+        fn repo_identity(
+            &self,
+            _repo: &Path,
+            _upstream: &str,
+            _origin: &str,
+        ) -> Result<RepoIdentity, ForgeError> {
             Ok(RepoIdentity {
                 name_with_owner: "fake-owner/fake-repo".to_owned(),
                 id: "FAKEID".to_owned(),
@@ -1301,6 +1314,7 @@ mod comment_activity_tests {
         fn list_pull_requests(
             &self,
             _repo: &Path,
+            _target: &RepoIdentity,
             _authors: &[String],
         ) -> Result<Vec<PullSummary>, ForgeError> {
             Err(ForgeError::Command {

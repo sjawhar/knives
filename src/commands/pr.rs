@@ -67,14 +67,18 @@ pub fn gather(request: &Request<'_>) -> anyhow::Result<Option<Report>> {
     let opened = crate::snapshot::open(crate::snapshot::SnapshotConfig {
         forge: request.forge,
         path,
+        upstream: entry.remote(crate::config::Role::Upstream),
         remotes,
         cache_root: request.cache_root,
     })?;
     let number = request.number;
     let snapshot = opened.complete_with(&number, |_, number| vec![*number])?;
     let timeline = if request.timeline && snapshot.fact(number).is_some() {
-        let target = request.forge.repo_identity(path)?;
-        Some(request.forge.pull_timeline(path, &target, number)?)
+        Some(
+            request
+                .forge
+                .pull_timeline(path, opened.identity(), number)?,
+        )
     } else {
         None
     };

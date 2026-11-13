@@ -131,7 +131,10 @@ masks, so the question "what is this weird branch" is usually answered before yo
 
 - `git`, `curl`, `tar`.
 - `gh`, the GitHub CLI, logged in (`gh auth login`). Every command that reads the forge goes
-  through it. Install: <https://github.com/cli/cli#installation>.
+  through it, and every call names its repository: a fork's pull requests are read from its
+  upstream's repository, or from its origin's when the upstream is a local path. gh takes none
+  from the checkout's remotes, so a `gh repo set-default` there changes no report.
+  Install: <https://github.com/cli/cli#installation>.
 - `jj` 0.45.1 with jj-vcs/jj#9941. knives embeds `jj-lib` 0.45.1 (pinned in `Cargo.toml`), and
   the installed `jj` must agree with it about the on-disk repository format. Upstream 0.45.1 lacks
   #9941 (upstream ships it from 0.46.0), so install the 0.45.1 build that carries it:

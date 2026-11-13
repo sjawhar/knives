@@ -507,6 +507,7 @@ fn merged_rebase_target(
     let opened_snapshot = match knives::snapshot::open(knives::snapshot::SnapshotConfig {
         forge: &forge,
         path: &fork.checkout.path,
+        upstream: entry.remote(knives::config::Role::Upstream),
         remotes: [
             entry.remote(knives::config::Role::Origin),
             entry.remote(knives::config::Role::Release),

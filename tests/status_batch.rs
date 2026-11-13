@@ -207,7 +207,12 @@ struct CountingForge {
 }
 
 impl Forge for CountingForge {
-    fn repo_identity(&self, _repo: &std::path::Path) -> Result<RepoIdentity, ForgeError> {
+    fn repo_identity(
+        &self,
+        _repo: &std::path::Path,
+        _upstream: &str,
+        _origin: &str,
+    ) -> Result<RepoIdentity, ForgeError> {
         Ok(RepoIdentity {
             name_with_owner: "fake-owner/fake-repo".to_owned(),
             id: "FAKEID".to_owned(),
@@ -217,6 +222,7 @@ impl Forge for CountingForge {
     fn list_pull_requests(
         &self,
         _repo: &std::path::Path,
+        _target: &RepoIdentity,
         _authors: &[String],
     ) -> Result<Vec<PullSummary>, ForgeError> {
         Ok(self.pull_requests.values().map(PullSummary::of).collect())
