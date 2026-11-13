@@ -351,9 +351,11 @@ fn refuse_claim(
 /// ([`crate::ledger::inline_human_text`]) — whoever started that process
 /// would otherwise choose what the refused caller's terminal receives. The
 /// place is the same: whatever session took the claim wrote it into the state
-/// file, so it goes out escaped too. The pid is a number this process read as
-/// one, and the workspace path and the branch are this caller's own
-/// arguments.
+/// file, so it goes out escaped too. The workspace path is the one jj
+/// recorded for the name when it has one ([`workspace_path`]), chosen by
+/// whichever session registered that workspace, so it goes out escaped as
+/// well. The pid is a number this process read as one, and the branch is
+/// this caller's own argument.
 fn claim_evidence(claim: &crate::store::Claim, workspace: &Path) -> String {
     let users = crate::liveness::others_using(workspace);
     // A directory that vanished leaves the same empty list as a workspace
@@ -366,7 +368,7 @@ fn claim_evidence(claim: &crate::store::Claim, workspace: &Path) -> String {
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
     let mut lines = vec![format!(
         "its workspace is {}{}",
-        workspace.display(),
+        crate::ledger::inline_human_text(&workspace.display().to_string()),
         if nothing_there {
             ", and nothing is at that path"
         } else {
@@ -550,7 +552,7 @@ fn take_claim(context: &mut StartContext<'_>) -> anyhow::Result<Exit> {
         )?;
         println!(
             "adopted existing workspace {} at {change}; left as-is\nclaimed {}/{} for {owner}",
-            context.destination.display(),
+            crate::ledger::inline_human_text(&context.destination.display().to_string()),
             context.fork.name,
             context.branch,
         );
@@ -573,7 +575,7 @@ fn take_claim(context: &mut StartContext<'_>) -> anyhow::Result<Exit> {
     println!(
         "workspace {} at {change} based on {base_revision} ({base_label})\nclaimed {}/{} for \
          {owner}",
-        context.destination.display(),
+        crate::ledger::inline_human_text(&context.destination.display().to_string()),
         context.fork.name,
         context.branch,
     );
@@ -617,21 +619,30 @@ fn record_claim(
     Ok(())
 }
 
+/// The workspace line for a resumed claim: where this branch's workspace is
+/// and what its working copy is at, or why there is nothing to resume in.
+///
+/// The path is the one jj recorded for the workspace when it has one
+/// ([`workspace_path`]), which whichever session registered it chose, and
+/// the error is jj's own text, which prints more than one line, so both
+/// reach the terminal escaped ([`crate::ledger::inline_human_text`] and
+/// [`crate::ledger::problem_human_text`]). The branch and the workspace name
+/// are this process's own.
 fn resume_workspace_notice(context: &StartContext<'_>) -> String {
+    let shown = crate::ledger::inline_human_text(&context.destination.display().to_string());
     if !context.destination.exists() {
         return format!(
-            "workspace missing at {}; `knives start {} --force --why \"…\"` rebuilds it",
-            context.destination.display(),
+            "workspace missing at {shown}; `knives start {} --force --why \"…\"` rebuilds it",
             context.branch
         );
     }
     match workspace_change(&context.opened, &context.workspace) {
-        Ok(change) => format!("workspace {} at {change}", context.destination.display()),
+        Ok(change) => format!("workspace {shown} at {change}"),
         Err(error) => format!(
-            "workspace {} is present but not registered as {} ({error}); \
+            "workspace {shown} is present but not registered as {} ({}); \
              `knives start {} --force --why \"…\"` rebuilds it",
-            context.destination.display(),
             context.workspace,
+            crate::ledger::problem_human_text(&error.to_string()),
             context.branch
         ),
     }
@@ -695,6 +706,11 @@ fn adoption_refusal(destination: &Path, checkout: &Path, name: &WorkspaceName) -
 /// The workspace line for a claim being seized: the existing workspace, or the
 /// one just created. `Err` is the refusal line; nothing is claimed in that case,
 /// so a plain `start` afterwards is the way back.
+///
+/// The path is the one jj recorded for the workspace when it has one
+/// ([`workspace_path`]), so both lines print it escaped
+/// ([`crate::ledger::inline_human_text`]); the refusal escapes its own values
+/// ([`adoption_refusal`]).
 fn workspace_notice(
     context: &StartContext<'_>,
     left_as_is: bool,
@@ -710,14 +726,14 @@ fn workspace_notice(
         let retained = if left_as_is { "; left as-is" } else { "" };
         return Ok(Ok(format!(
             "workspace {} at {}{retained}",
-            context.destination.display(),
+            crate::ledger::inline_human_text(&context.destination.display().to_string()),
             workspace_change(&context.opened, &context.workspace)?,
         )));
     }
     Ok(match create_workspace(context, Leftovers::Clear)? {
         WorkspaceBase::Created { revision, label } => Ok(format!(
             "created missing workspace {} at {} based on {revision} ({label})",
-            context.destination.display(),
+            crate::ledger::inline_human_text(&context.destination.display().to_string()),
             workspace_change(
                 &Repo::open(&context.fork.checkout.path)?,
                 &context.workspace
@@ -743,7 +759,11 @@ enum Leftovers {
 
 fn clear_vanished_workspace(context: &StartContext<'_>) -> anyhow::Result<()> {
     let checkout = &context.fork.checkout.path;
-    let shown = context.destination.display();
+    // The path is the one jj recorded for the workspace when it has one
+    // ([`workspace_path`]), so the lines a terminal reads print it escaped
+    // ([`crate::ledger::inline_human_text`]); the refusals below are errors,
+    // which `main::error_line` escapes once for all of them.
+    let shown = crate::ledger::inline_human_text(&context.destination.display().to_string());
     // Nothing is forgotten while something sits at the path: `add` would fail
     // on it, and the forget could not be taken back.
     if std::fs::symlink_metadata(&context.destination).is_ok() {
@@ -883,7 +903,7 @@ fn create_workspace(
             StaleRegistration::None => {}
             StaleRegistration::Removed => println!(
                 "removed a stale Git worktree registration at {} (its directory was gone)",
-                context.destination.display()
+                crate::ledger::inline_human_text(&context.destination.display().to_string())
             ),
             StaleRegistration::Locked => anyhow::bail!(
                 "a locked Git worktree registration at {} has no directory there; if it is \

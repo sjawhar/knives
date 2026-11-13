@@ -250,15 +250,17 @@ fn ordinary_disposal(
 /// is why the registration has to survive this release too.
 ///
 /// The owner name is the displaced session's own text, copied from the claim
-/// it wrote into the state file every session of this machine reads, so this
-/// line prints it escaped ([`inline_human_text`]): raw, the session this
-/// release displaces would choose what the forcing caller's terminal
-/// receives.
+/// it wrote into the state file every session of this machine reads, and the
+/// directory is the path jj recorded for the workspace when it has one
+/// (`workspace_path`, `src/commands/start.rs`), which whichever session
+/// registered that workspace chose, so this line prints both escaped
+/// ([`inline_human_text`]): raw, either would let another session choose
+/// what the forcing caller's terminal receives.
 fn left_to_its_owner(place: &Place<'_>, owner: &str) -> String {
     format!(
         "{} and its `{}` registration are left as they are: the directory is {}'s, and \
          what jj never tracked in it is not this session's to delete",
-        place.directory.display(),
+        inline_human_text(&place.directory.display().to_string()),
         place.workspace,
         inline_human_text(owner),
     )
@@ -273,14 +275,23 @@ struct Place<'a> {
 
 /// Removes the directory, when this branch's own workspace is what sits there
 /// and its registration was cleared, and says what became of it either way.
+///
+/// Every value here is read off disk: the path jj recorded for the workspace
+/// when it has one (`workspace_path`, `src/commands/start.rs`), the checkout
+/// found for this fork, the workspace name and the store path jj recorded
+/// for what sits at the path, a link's target, and jj's own detail for a
+/// working copy it cannot read. All of them reach the terminal escaped
+/// ([`inline_human_text`], and [`knives::ledger::problem_human_text`] for
+/// jj's detail, which prints more than one line); the branch's own workspace
+/// name is this process's.
 fn removal_note(
     place: &Place<'_>,
     identity: Option<&WorkspaceIdentity>,
     registration: &Registration,
     cleanup: bool,
 ) -> anyhow::Result<String> {
-    let shown = place.directory.display();
-    let checkout = place.checkout.display();
+    let shown = inline_human_text(&place.directory.display().to_string());
+    let checkout = inline_human_text(&place.checkout.display().to_string());
     let workspace = place.workspace;
     Ok(match identity {
         None => format!(
@@ -313,22 +324,26 @@ fn removal_note(
         // proved nothing about it: `jj workspace forget` exits 0 for a name it does
         // not know.
         Some(WorkspaceIdentity::Ours(name)) => {
-            format!("{shown} is workspace {name} of {checkout}, not {workspace}, left alone")
+            format!(
+                "{shown} is workspace {} of {checkout}, not {workspace}, left alone",
+                inline_human_text(name.as_str())
+            )
         }
         Some(WorkspaceIdentity::Unreadable(detail)) => format!(
             "{shown} is a workspace of {checkout} whose working-copy state could not be read \
-             ({detail}), left alone"
+             ({}), left alone",
+            knives::ledger::problem_human_text(detail)
         ),
         Some(WorkspaceIdentity::Foreign(store)) => format!(
             "{shown} belongs to repository {}, not {checkout}, left alone",
-            store.display()
+            inline_human_text(&store.display().to_string())
         ),
         Some(WorkspaceIdentity::Repository) => {
             format!("{shown} is a repository in its own right, not a workspace, left alone")
         }
         Some(WorkspaceIdentity::SymbolicLink(target_path)) => format!(
             "{shown} is a symbolic link to {}, left alone",
-            target_path.display()
+            inline_human_text(&target_path.display().to_string())
         ),
         Some(WorkspaceIdentity::NotAWorkspace) => {
             format!("{shown} is not a workspace of {checkout}, left alone")
@@ -500,6 +515,11 @@ fn keep_working_copy(
 /// finish's provenance keeps it raw as [`forced_release_event`] keeps the raw
 /// owner, because the entry is the durable record and its reader escapes it
 /// when it prints it.
+///
+/// The directory is where this branch's working copy landed on disk: the
+/// path jj recorded for the workspace when it has one (`workspace_path`,
+/// `src/commands/start.rs`), or what a symbolic link there points at. Either
+/// way another session chose it, so the refusal prints it escaped too.
 fn live_users_gate(
     fork: &Fork<'_>,
     branch: &BranchName,
@@ -525,7 +545,7 @@ fn live_users_gate(
         "{}/{branch}: {} is in use by {shown}; finishing would take the directory from under \
          it\nuse `knives finish {branch} --force --why \"…\"` once it is done",
         fork.name,
-        directory.display()
+        inline_human_text(&directory.display().to_string())
     );
     Err(Exit::Usage)
 }
@@ -536,16 +556,26 @@ fn live_users_gate(
 /// or prunable, and the next `start` at that path would fail on it. One that
 /// stays because something else now sits at the path is named, with what is
 /// there, so the failing `start` is not a surprise.
+///
+/// This note goes on the disposal line a terminal reads: the directory is
+/// the path jj recorded for the workspace when it has one (`workspace_path`,
+/// `src/commands/start.rs`), what sits there is read off disk, a link's
+/// target among it, and the failure is git's own text, which prints more
+/// than one line, so all three go out escaped ([`inline_human_text`] and
+/// [`knives::ledger::problem_human_text`]).
 fn stale_worktree_note(checkout: &Path, directory: &Path) -> String {
     match remove_finished_worktree(checkout, directory) {
         Ok(StaleRegistration::Removed) => "; stale Git worktree registration removed".to_owned(),
         Ok(StaleRegistration::None | StaleRegistration::Locked) => String::new(),
         Ok(StaleRegistration::Occupied) => format!(
             "; {} is {}, so its stale Git worktree registration was not cleared",
-            directory.display(),
-            path_occupant(directory)
+            inline_human_text(&directory.display().to_string()),
+            inline_human_text(&path_occupant(directory))
         ),
-        Err(error) => format!("; Git worktree registration not cleared ({error})"),
+        Err(error) => format!(
+            "; Git worktree registration not cleared ({})",
+            knives::ledger::problem_human_text(&error.to_string())
+        ),
     }
 }
 
@@ -1095,8 +1125,9 @@ fn with_requirements(required: &[Requirement], added: &[Requirement]) -> Vec<Str
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Registration, spoken, with_requirements};
+    use super::{Place, Registration, left_to_its_owner, removal_note, spoken, with_requirements};
     use knives::ids::Requirement;
+    use knives::jj::WorkspaceIdentity;
 
     #[test]
     fn track_prose_preserves_the_established_human_output() {
@@ -1145,5 +1176,53 @@ mod tests {
             Registration::Failed("Error: a\u{1b}[31mb\nand more".to_owned()).to_string(),
             "not forgotten (Error: a\u{fffd}[31mb and more)"
         );
+    }
+
+    /// The directory of the disposal line is the path jj recorded for the
+    /// workspace, which whichever session registered it chose, and what sits
+    /// there is read off disk; neither may drive the terminal of the session
+    /// that runs `finish`.
+    #[test]
+    fn a_control_character_in_a_registered_workspace_path_reaches_the_disposal_line_escaped() {
+        let directory = PathBuf::from("/forks/work/feat-a\u{1b}]0;held\u{9b}7m");
+        let checkout = PathBuf::from("/forks/work/default");
+        let place = Place {
+            checkout: &checkout,
+            workspace: "feat-a",
+            directory: &directory,
+        };
+        let note = removal_note(
+            &place,
+            Some(&WorkspaceIdentity::Foreign(PathBuf::from(
+                "/other/re\u{7}po",
+            ))),
+            &Registration::Forgotten,
+            true,
+        )
+        .expect("a removal note");
+        assert!(!note.contains('\u{1b}'), "{note}");
+        assert!(
+            note.contains("/forks/work/feat-a\u{fffd}]0;held\u{fffd}7m"),
+            "{note}"
+        );
+        assert!(note.contains("/other/re\u{fffd}po"), "{note}");
+    }
+
+    /// The line a forced release prints for the displaced owner names the same
+    /// registered path beside that owner's own name.
+    #[test]
+    fn a_control_character_in_a_displaced_owners_workspace_path_reaches_the_terminal_escaped() {
+        let directory = PathBuf::from("/forks/work/feat-b\u{1b}[31m");
+        let checkout = PathBuf::from("/forks/work/default");
+        let place = Place {
+            checkout: &checkout,
+            workspace: "feat-b",
+            directory: &directory,
+        };
+        let line = left_to_its_owner(&place, "agent\u{7}-two");
+        assert!(!line.contains('\u{1b}'), "{line}");
+        assert!(!line.contains('\u{7}'), "{line}");
+        assert!(line.contains("/forks/work/feat-b\u{fffd}[31m"), "{line}");
+        assert!(line.contains("agent\u{fffd}-two"), "{line}");
     }
 }
