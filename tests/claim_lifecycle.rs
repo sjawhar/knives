@@ -2861,10 +2861,11 @@ fn a_ledger_without_claim_fields_keeps_the_refusal_it_always_gave() {
 }
 
 #[test]
-fn a_fork_ledger_that_cannot_be_read_fails_the_finish_naming_it_once() {
-    // The finish fails before it reads a workspace or touches a claim, and
-    // the one line it prints says which file could not be read and why,
-    // once: the reason used to arrive twice, and never as the ledger's.
+fn the_holders_finish_fails_on_a_fork_ledger_that_cannot_be_read_naming_it_once() {
+    // The holder's release writes the ledger, so the finish fails before it
+    // reads a workspace or touches a claim, and the one line it prints says
+    // which file could not be read and why, once: the reason used to arrive
+    // twice, and never as the ledger's.
     let lab = Lab::new();
     let (home, _consumer) = release_test_home(&lab);
     ran(
@@ -2914,5 +2915,150 @@ fn a_fork_ledger_that_cannot_be_read_fails_the_finish_naming_it_once() {
         Some("agent-one"),
         "the claim changed under an unreadable ledger"
     );
+    assert!(workspace.is_dir(), "the workspace was disposed of");
+}
+
+#[test]
+fn a_caller_without_the_claim_is_refused_when_the_fork_ledger_cannot_be_read() {
+    // The ledger is read for this caller only to search it for who ended
+    // its own claim. Measured with v3.2.4 and before this change: exit 3
+    // and the ledger's line alone, so the caller never learnt who holds the
+    // branch. A ledger that cannot be read skips the search, never the
+    // refusal.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    ran(
+        &lab,
+        home.path(),
+        "agent-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    let workspace = lab.work.parent().expect("parent").join("feat-gamma");
+    let ledger = home.path().join("ledger").join("demo");
+    if !unreadable(&ledger) {
+        return;
+    }
+
+    // When: another session finishes the branch
+    let refused = tried(
+        &lab,
+        home.path(),
+        "agent-two",
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+    std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    // Then: the refusal it gets with a readable ledger, and one line saying
+    // the ledger could not be read and why; nothing moved
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("is claimed by agent-one"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("use `knives finish feat/gamma --force --why"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "the fork's ledger could not be read, so it was not searched for who ended a claim \
+             of yours on feat/gamma (reading the fork's ledger at {}: Permission denied",
+            ledger.display()
+        )),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("Permission denied").count(),
+        1,
+        "the reason is printed more than once: {stderr}"
+    );
+    assert_eq!(
+        holder_of(home.path(), "feat/gamma").as_deref(),
+        Some("agent-one"),
+        "the claim changed under an unreadable ledger"
+    );
+    assert!(workspace.is_dir(), "the holder's workspace was disposed of");
+}
+
+#[test]
+fn a_finish_nobody_holds_fails_on_a_fork_ledger_that_cannot_be_read() {
+    // Nobody holds the branch, so there is no refusal to give: the ledger
+    // is what says whether another owner ended the caller's claim, and a
+    // finish without it would call that claim "not held" and remove the
+    // workspace. It fails as it did before this change, naming the ledger
+    // once, and touches nothing.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    ran(
+        &lab,
+        home.path(),
+        "agent-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    ran(
+        &lab,
+        home.path(),
+        "agent-two",
+        &[
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            "release stalled work",
+        ],
+    );
+    assert_eq!(holder_of(home.path(), "feat/gamma"), None);
+    let workspace = lab.work.parent().expect("parent").join("feat-gamma");
+    assert!(workspace.is_dir(), "fixture: the forced release removed it");
+    let ledger = home.path().join("ledger").join("demo");
+    if !unreadable(&ledger) {
+        return;
+    }
+
+    // When: the owner whose claim was released finishes the branch
+    let failed = tried(
+        &lab,
+        home.path(),
+        "agent-one",
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+    std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    // Then: the ledger's line, once, and nothing touched
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert_eq!(failed.status.code(), Some(3), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "reading the fork's ledger at {}",
+            ledger.display()
+        )),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("Permission denied").count(),
+        1,
+        "the reason is printed more than once: {stderr}"
+    );
+    assert_eq!(holder_of(home.path(), "feat/gamma"), None);
     assert!(workspace.is_dir(), "the workspace was disposed of");
 }

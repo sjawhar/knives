@@ -468,6 +468,53 @@ fn a_forced_release_over_another_owners_claim_records_the_live_process() {
     assert!(workspace.is_dir(), "{}", shown(&forced));
 }
 
+#[test]
+fn the_owners_forced_release_over_a_live_process_records_its_why() {
+    // The claim's own holder, finishing in the place it claimed from, passes
+    // only the live-process gate with `--force --why`: that reason is why the
+    // claim was released, and the entry's field says so, not only its prose.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    let sleeper = Sleeper::spawn(|command| {
+        command.current_dir(&workspace);
+    });
+
+    // When: the owner finishes by force over the process
+    let forced = finish(
+        &lab,
+        &home,
+        &["--force", "--why", "the owner forces its own"],
+    );
+
+    // Then: the release entry carries the `--why` as the claim change's reason
+    assert!(forced.status.success(), "{}", shown(&forced));
+    let entries = ledger_entries(&home);
+    let released = entries.last().expect("an entry for the release");
+    assert_eq!(
+        released.claim_change.as_deref(),
+        Some("released"),
+        "was: {released:?}"
+    );
+    assert!(
+        released.text.contains(&format!(
+            "finished by force while in use by pid {} (sleep 120)",
+            sleeper.pid()
+        )),
+        "was: {released:?}"
+    );
+    assert_eq!(
+        released.claim_change_why.as_deref(),
+        Some("the owner forces its own"),
+        "was: {released:?}"
+    );
+    assert!(
+        released.previous_owner.is_none(),
+        "the owner displaced nobody: {released:?}"
+    );
+    assert!(!claim_recorded(&home), "{}", shown(&forced));
+}
+
 /// Moves the workspace at `workspace` to a sibling and leaves `workspace` a
 /// chain of two symbolic links to it; returns where it now is.
 fn behind_two_links(workspace: &Path) -> PathBuf {

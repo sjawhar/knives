@@ -15,11 +15,13 @@ use knives::commands::claim::{
     possession_permits_release, render_claim_context,
 };
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
-use knives::ids::{BranchName, BranchTarget, Requirement};
+use knives::ids::{BranchName, BranchTarget, Requirement, UpstreamName};
 use knives::jj::{
     Repo, StaleRegistration, WorkspaceIdentity, path_occupant, remove_finished_worktree,
 };
-use knives::ledger::{ClaimChange, Displaced, Draft, Entry, Stated, inline_human_text};
+use knives::ledger::{
+    ClaimChange, Displaced, Draft, Entry, LedgerError, Stated, inline_human_text,
+};
 use knives::statement::{Statement, StatementKind};
 use knives::store::{Store, default_state_path};
 
@@ -131,7 +133,12 @@ pub(crate) fn run_finish(
     // adopt the workspace, and write in it, and this removal would take that
     // work with it. A claim writer on this fork waits for the removal, which a
     // workspace with a build tree in it can make seconds long.
-    let mut store = Store::open_for_update(
+    //
+    // A fork ledger that cannot be read does not fail the open: a caller the
+    // claim gate refuses needs the ledger only to search it for who ended
+    // its own claim, and the refusal it gets must not turn into a failure
+    // because that search cannot run ([`read_ledger`]).
+    let store = Store::open_each_for_update(
         default_state_path(),
         &bound.registry.former_names(),
         &[&fork.upstream],
@@ -145,6 +152,11 @@ pub(crate) fn run_finish(
         FinishClaimGate::Lost => (Released::default(), Exit::Findings),
         FinishClaimGate::Refuse(exit) => return Ok(exit),
     };
+    // Everything past the gate reads the ledger's statements and writes an
+    // entry to it, so a ledger that could not be read fails the finish here,
+    // with the one line naming it, before the workspace is read or the claim
+    // touched.
+    let mut store = store.all_read()?;
     // Read-only checks before the claim is touched: a refusal leaves everything
     // as it was. A release over another owner's claim reads their workspace
     // too: `knives start` refuses to adopt a workspace whose state jj cannot
@@ -162,6 +174,16 @@ pub(crate) fn run_finish(
     } else {
         keep_working_copy(fork, branch, cleared.working_copy.as_deref())
     };
+    // The reason a forced release changed the claim. The live-process gate
+    // is the one force the claim gate does not see: the claim's own holder
+    // passing it leaves the gate's `why` empty.
+    let why = released.why.or_else(|| {
+        cleared
+            .over_live_users
+            .as_ref()
+            .and(options.why)
+            .map(str::to_owned)
+    });
     let forced = joined(released.text, cleared.over_live_users);
     let had = store.release_claim(target);
     let pr = store.tracked_pull(target);
@@ -182,7 +204,7 @@ pub(crate) fn run_finish(
             }),
             ..Draft::event(Some(branch.as_str()), text, pr).about_claim(
                 had.then_some(ClaimChange::Released),
-                released.why.as_deref(),
+                why.as_deref(),
                 released.displaced.as_ref(),
             )
         })?;
@@ -690,6 +712,13 @@ fn finish_claim_gate(
     };
     match decision {
         ClaimDecision::Resume { .. } | ClaimDecision::Take => {
+            // The holder's finish is a release, which writes the ledger: with
+            // the ledger unreadable it goes on only to fail on that in
+            // `run_finish`, naming it as it always has, rather than being
+            // refused for the place first.
+            if store.unreadable(&target.repo).is_some() {
+                return Ok(FinishClaimGate::Continue(Released::default()));
+            }
             Ok(place_gate(&claim, target, options))
         }
         ClaimDecision::RefuseAnonymous | ClaimDecision::RefuseHeld => {
@@ -698,7 +727,7 @@ fn finish_claim_gate(
             if !options.force {
                 return Ok(refuse_held(&Refusal {
                     target,
-                    entries: store.ledger_entries(&target.repo),
+                    ledger: read_ledger(store, &target.repo),
                     identity: &identity,
                     claim: &claim,
                     last_seen,
@@ -721,6 +750,12 @@ fn finish_claim_gate(
 /// ledger says another owner ended the caller's own claim on it. The caller
 /// is told that first, because the claim it believed it still held is why it
 /// is finishing at all; its own workspace is disposed of all the same.
+///
+/// A ledger that could not be read answers nothing here: the finish goes on
+/// to fail on it in `run_finish`, naming it, before anything is touched. The
+/// search is what would tell the caller that its claim was ended, and a
+/// finish of nothing without it would report a claim that "was not held" and
+/// remove the workspace of an owner that was never told why.
 fn unheld_gate(
     target: &BranchTarget,
     store: &Store,
@@ -730,8 +765,10 @@ fn unheld_gate(
     if options.force {
         return Ok(FinishClaimGate::Continue(Released::default()));
     }
+    let Ok(entries) = read_ledger(store, &target.repo) else {
+        return Ok(FinishClaimGate::Continue(Released::default()));
+    };
     let identity = current_identity(bound)?;
-    let entries = store.ledger_entries(&target.repo);
     let Some((change, lost)) = claim_ended(entries, &target.branch, &identity.owner) else {
         return Ok(FinishClaimGate::Continue(Released::default()));
     };
@@ -744,12 +781,23 @@ fn unheld_gate(
     Ok(FinishClaimGate::Lost)
 }
 
+/// `repo`'s ledger as the store read it, oldest first, or why it could not
+/// be read. `run_finish` opens its store keeping a ledger it cannot read
+/// ([`Store::open_each_for_update`]), on which every other ledger accessor
+/// of the store panics, so the claim gate asks for the ledger only this way.
+fn read_ledger<'a>(store: &'a Store, repo: &UpstreamName) -> Result<&'a [Entry], &'a LedgerError> {
+    store
+        .unreadable(repo)
+        .map_or_else(|| Ok(store.ledger_entries(repo)), Err)
+}
+
 /// What a refusal of a claim this caller does not hold is decided from.
 struct Refusal<'a> {
     target: &'a BranchTarget,
     /// This fork's ledger as the store read it, oldest first: what became of
-    /// the caller's own claim is in it ([`claim_ended`]).
-    entries: &'a [Entry],
+    /// the caller's own claim is in it ([`claim_ended`]). Why it could not
+    /// be read, where it could not: the refusal is given without the search.
+    ledger: Result<&'a [Entry], &'a LedgerError>,
     identity: &'a Identity,
     claim: &'a knives::store::Claim,
     last_seen: knives::seen::LastSeen,
@@ -766,6 +814,14 @@ struct Refusal<'a> {
 /// claimed by nobody. Taking the branch back is `start --force`, which
 /// records the change; releasing a gone agent's claim is what the other
 /// refusal is for.
+///
+/// A ledger that could not be read is not searched: the caller gets the
+/// refusal it would get with nothing found there, and one line saying the
+/// ledger could not be read and why. The reason is text this process did not
+/// write: a path, the operating system's error, or what a parser said of an
+/// entry file the ledger pull may have brought from another machine, and it
+/// can run over more than one line, so it goes out escaped
+/// ([`knives::ledger::problem_human_text`]).
 fn refuse_held(refusal: &Refusal<'_>) -> FinishClaimGate {
     let context = render_claim_context(refusal.claim, refusal.last_seen, jiff::Timestamp::now());
     let branch = &refusal.target.branch;
@@ -774,7 +830,8 @@ fn refuse_held(refusal: &Refusal<'_>) -> FinishClaimGate {
     // two identities of that name cannot be told apart, and telling it that
     // its claim was taken would name the branch it holds as somebody else's.
     if refusal.claim.owner != refusal.identity.owner
-        && let Some((change, lost)) = claim_ended(refusal.entries, branch, &refusal.identity.owner)
+        && let Ok(entries) = refusal.ledger
+        && let Some((change, lost)) = claim_ended(entries, branch, &refusal.identity.owner)
     {
         eprintln!(
             "{}\n{context}\nnothing was changed here: the workspace and its registration are \
@@ -788,9 +845,16 @@ fn refuse_held(refusal: &Refusal<'_>) -> FinishClaimGate {
     } else {
         ""
     };
+    let unread = refusal.ledger.err().map_or_else(String::new, |error| {
+        format!(
+            "the fork's ledger could not be read, so it was not searched for who ended a claim \
+             of yours on {branch} ({})\n",
+            knives::ledger::problem_human_text(&error.to_string())
+        )
+    });
     eprintln!(
-        "{anonymous_note}{context}\nuse `knives finish {branch} --force --why \"…\"` to release \
-         the claim"
+        "{anonymous_note}{context}\n{unread}use `knives finish {branch} --force --why \"…\"` to \
+         release the claim"
     );
     FinishClaimGate::Refuse(Exit::Usage)
 }

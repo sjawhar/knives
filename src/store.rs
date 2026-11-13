@@ -192,8 +192,9 @@ pub struct Store {
     state: State,
     /// The ledger of each repository the store was opened for, read once
     /// when the store opens, or why it could not be read at all: only a
-    /// store opened for a report of many forks keeps one it could not read
-    /// ([`Store::open_each`]); every other open fails on it.
+    /// store opened with [`Store::open_each`] or
+    /// [`Store::open_each_for_update`] keeps one it could not read; every
+    /// other open fails on it.
     ledgers: BTreeMap<UpstreamName, Result<ForkLedger, LedgerError>>,
     writes: Writes,
     /// The lock on each fork a store opened for update was opened for
@@ -274,7 +275,10 @@ impl Store {
         Self::read(path, repos, Writes::Replayed(Vec::new()), Vec::new())?.migrated(former)
     }
 
-    /// [`Store::open_for_update`] as [`Store::open_each`] opens a store.
+    /// [`Store::open_for_update`] as [`Store::open_each`] opens a store: for
+    /// a writer that may still answer a caller without a ledger it could not
+    /// read, and fails on that ledger ([`Store::all_read`]) before anything
+    /// that needs it.
     pub fn open_each_for_update(
         path: PathBuf,
         former: &FormerNames,
@@ -285,8 +289,16 @@ impl Store {
     }
 
     /// Refuse a store that could not read one of the ledgers it was opened
-    /// for, naming the first.
-    fn all_read(mut self) -> Result<Self, StoreError> {
+    /// for, naming the first: what [`Store::open`] and
+    /// [`Store::open_for_update`] do on opening, for a store opened with
+    /// [`Store::open_each_for_update`] once it needs every ledger. The lock a
+    /// store opened for update holds stays held.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Ledger`] with why the first unreadable ledger could not
+    /// be read.
+    pub fn all_read(mut self) -> Result<Self, StoreError> {
         let unreadable = self
             .ledgers
             .iter()
@@ -589,8 +601,9 @@ impl Store {
         }
     }
     /// Why `repo`'s ledger could not be read at all, for a store opened with
-    /// [`Store::open_each`]: that fork's report is this, and nothing else
-    /// about it may be asked of the store.
+    /// [`Store::open_each`] or [`Store::open_each_for_update`]: that fork's
+    /// answer is this, and nothing else about its ledger may be asked of the
+    /// store.
     pub fn unreadable(&self, repo: &UpstreamName) -> Option<&LedgerError> {
         self.ledgers.get(repo)?.as_ref().err()
     }
