@@ -874,8 +874,9 @@ fn refuse_held(refusal: &Refusal<'_>) -> FinishClaimGate {
 /// own terminal. `owner` is this run's identity, and with no harness variable
 /// set that name is read back from a claim in the state file
 /// (`crate::commands::hook::owner_for`), which another session wrote. The
-/// timestamp needs no escaping: a ledger read rejects an entry whose `ts` no
-/// timestamp can be parsed from.
+/// timestamp is escaped too: a ledger read already rejects an entry whose
+/// `ts` no timestamp can be parsed from, but the `ts` is text another machine
+/// wrote, and the escape keeps this line safe without depending on that parser.
 fn displacement(target: &BranchTarget, owner: &str, change: ClaimChange, lost: &Entry) -> String {
     let verb = match change {
         ClaimChange::Taken => "took",
