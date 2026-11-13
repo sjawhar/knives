@@ -230,6 +230,56 @@ pub fn install_failing_gh(shim: &Path, log: &Path) {
     );
 }
 
+/// Install the snapshot shim behind a gate standing in for a gh wrapper that holds
+/// one owner's token, in a checkout whose remotes name more than one owner: the gate
+/// appends each call's arguments to `log`, and refuses (exit 2, and a `REFUSED` line
+/// in `log`) every call that names no repository, since gh would take the
+/// repository from those remotes and the wrapper cannot tell whose token to send. It
+/// reads the argument shapes knives sends, not every gh syntax: a call names a
+/// repository by a positional argument to `repo view`, by `-R` or `--repo` on any
+/// other command, by a GraphQL call's `owner` field, or by an `api repos/...`
+/// endpoint; a call that names one reaches the snapshot shim. A test that uses it
+/// also checks the exact repository each call names.
+pub fn install_repository_requiring_gh(shim: &Path, pulls: &str, log: &Path) {
+    let answers = shim.join("answers");
+    std::fs::create_dir_all(&answers).expect("create the snapshot shim directory");
+    install_snapshot_gh(&answers, pulls, &[]);
+    install_executable(
+        &shim.join("gh"),
+        &format!(
+            "#!/bin/sh\n\
+             log=\"{log}\"\n\
+             printf '%s\\n' \"$*\" >> \"$log\"\n\
+             named=\n\
+             previous=\n\
+             case \"$1 $2\" in\n\
+             \"repo view\") case \"$3\" in ''|-*) ;; *) named=yes ;; esac ;;\n\
+             \"api graphql\")\n\
+               for argument in \"$@\"; do\n\
+                 case \"$previous $argument\" in \"-f owner=\"?*|\"-F owner=\"?*) named=yes ;; esac\n\
+                 previous=$argument\n\
+               done ;;\n\
+             \"api repos/\"*) named=yes ;;\n\
+             *)\n\
+               for argument in \"$@\"; do\n\
+                 case \"$previous\" in -R|--repo) [ -n \"$argument\" ] && named=yes ;; esac\n\
+                 case \"$argument\" in --repo=?*) named=yes ;; esac\n\
+                 previous=$argument\n\
+               done ;;\n\
+             esac\n\
+             if [ -z \"$named\" ]; then\n\
+               printf 'REFUSED %s\\n' \"$*\" >> \"$log\"\n\
+               echo 'gh wrapper: the command names no repository and the remotes of the working \
+             directory name more than one owner, so it sends no token; name one repository' >&2\n\
+               exit 2\n\
+             fi\n\
+             exec \"{answer}\" \"$@\"\n",
+            log = log.display(),
+            answer = answers.join("gh").display(),
+        ),
+    );
+}
+
 pub fn path_with_gh_shim(shim: &Path) -> std::ffi::OsString {
     std::env::join_paths(
         std::iter::once(shim.to_owned()).chain(std::env::split_paths(

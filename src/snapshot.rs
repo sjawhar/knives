@@ -15,6 +15,9 @@ use crate::forge_cache::{self, CacheFile};
 pub struct SnapshotConfig<'a> {
     pub forge: &'a dyn Forge,
     pub path: &'a Path,
+    /// The upstream remote. The forge names the repository the pull requests
+    /// live in from it and origin ([`crate::forge::pull_repository`]).
+    pub upstream: &'a str,
     /// Origin and release remotes: authors derive from them (`search_authors`),
     /// and `ours()` filters pull requests to their head-repository owners.
     pub remotes: [&'a str; 2],
@@ -25,8 +28,8 @@ pub struct SnapshotConfig<'a> {
 impl fmt::Debug for SnapshotConfig<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SnapshotConfig")
-            .field("forge", &true)
             .field("path", &self.path)
+            .field("upstream", &self.upstream)
             .field("remotes", &self.remotes)
             .field("cache_root", &self.cache_root)
             .finish()
@@ -54,7 +57,10 @@ impl fmt::Debug for Opened<'_> {
 }
 
 pub fn open(config: SnapshotConfig<'_>) -> Result<Opened<'_>, ForgeError> {
-    let identity = config.forge.repo_identity(config.path)?;
+    let [origin, _] = config.remotes;
+    let identity = config
+        .forge
+        .repo_identity(config.path, config.upstream, origin)?;
     let file = config
         .cache_root
         .and_then(|root| forge_cache::cache_path(root, &identity));
@@ -70,6 +76,11 @@ pub fn open(config: SnapshotConfig<'_>) -> Result<Opened<'_>, ForgeError> {
 }
 
 impl Opened<'_> {
+    /// The forge's own name for the repository the pull requests live in.
+    pub const fn identity(&self) -> &RepoIdentity {
+        &self.identity
+    }
+
     /// Landed verdict cached under this key, from the same single read.
     pub fn landed_cached(&self, key: &str) -> Option<LandedVerdict> {
         self.read
@@ -112,10 +123,10 @@ impl Opened<'_> {
         }
 
         let authors = crate::forge::search_authors(&self.config.remotes);
-        let mut rows = self
-            .config
-            .forge
-            .list_pull_requests(self.config.path, &authors)?;
+        let mut rows =
+            self.config
+                .forge
+                .list_pull_requests(self.config.path, &self.identity, &authors)?;
         rows.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
         let sweep_max = rows
             .iter()
@@ -363,6 +374,7 @@ mod tests {
 
     const EARLIER: &str = "2026-08-01T00:00:00Z";
     const LATER: &str = "2026-08-02T00:00:00Z";
+    const UPSTREAM_REMOTE: &str = concat!("https://github", ".com/fake-owner/fake-repo");
     const ORIGIN_REMOTE: &str = concat!("https://github", ".com/fake-owner/fake-repo.git");
     const RELEASE_REMOTE: &str = concat!("git@github", ".com:fake-owner/fake-repo.git");
 
@@ -370,6 +382,7 @@ mod tests {
         SnapshotConfig {
             forge: fake,
             path: Path::new("/fake"),
+            upstream: UPSTREAM_REMOTE,
             remotes: [ORIGIN_REMOTE, RELEASE_REMOTE],
             cache_root: root,
         }

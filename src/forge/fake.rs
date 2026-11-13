@@ -79,7 +79,12 @@ const fn vanished_pull(number: u64, state: String) -> PullRequest {
 }
 
 impl Forge for FakeForge {
-    fn repo_identity(&self, _repo: &Path) -> Result<RepoIdentity, ForgeError> {
+    fn repo_identity(
+        &self,
+        _repo: &Path,
+        _upstream: &str,
+        _origin: &str,
+    ) -> Result<RepoIdentity, ForgeError> {
         if self.fail_identity {
             return Err(fake_failure("identity"));
         }
@@ -92,6 +97,7 @@ impl Forge for FakeForge {
     fn list_pull_requests(
         &self,
         _repo: &Path,
+        _target: &RepoIdentity,
         _authors: &[String],
     ) -> Result<Vec<PullSummary>, ForgeError> {
         if self.fail_list {

@@ -589,6 +589,7 @@ mod tests {
         snapshot::open(SnapshotConfig {
             forge,
             path: Path::new("/fake"),
+            upstream: "git@github.com:owner/upstream.git",
             remotes: [ORIGIN, ORIGIN],
             cache_root: None,
         })

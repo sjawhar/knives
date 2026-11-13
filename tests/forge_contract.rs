@@ -373,10 +373,10 @@ fn a_recorded_timeline_payload_decodes() {
 }
 
 #[test]
-fn the_pull_request_list_argument_array_requests_every_state() {
-    let arguments = summary_list_args();
-    assert_eq!(arguments.get(2), Some(&"--state"));
-    assert_eq!(arguments.get(3), Some(&"all"));
+fn the_pull_request_list_argument_array_names_its_repository_and_requests_every_state() {
+    let arguments = summary_list_args("our-org/some-repo");
+    assert_eq!(arguments.get(2..4), Some(&["-R", "our-org/some-repo"][..]));
+    assert_eq!(arguments.get(4..6), Some(&["--state", "all"][..]));
 }
 
 #[test]

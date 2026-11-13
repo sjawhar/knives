@@ -659,6 +659,7 @@ fn pull_head_findings(
     let opened = snapshot::open(SnapshotConfig {
         forge,
         path: &fork.checkout.path,
+        upstream: entry.remote(Role::Upstream),
         remotes: [entry.remote(Role::Origin), entry.remote(Role::Release)],
         cache_root: input.cache_root,
     })?;
@@ -907,7 +908,12 @@ mod tests {
     }
 
     impl Forge for ChangingFactsForge {
-        fn repo_identity(&self, _repo: &Path) -> Result<RepoIdentity, ForgeError> {
+        fn repo_identity(
+            &self,
+            _repo: &Path,
+            _upstream: &str,
+            _origin: &str,
+        ) -> Result<RepoIdentity, ForgeError> {
             Ok(RepoIdentity {
                 name_with_owner: "fake-owner/fake-repo".to_owned(),
                 id: "FAKEID".to_owned(),
@@ -917,6 +923,7 @@ mod tests {
         fn list_pull_requests(
             &self,
             _repo: &Path,
+            _target: &RepoIdentity,
             _authors: &[String],
         ) -> Result<Vec<PullSummary>, ForgeError> {
             Ok(vec![PullSummary::of(&self.discovery)])

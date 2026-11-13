@@ -259,6 +259,7 @@ fn census_pulls(
     let opened = match snapshot::open(SnapshotConfig {
         forge,
         path: &fork.checkout.path,
+        upstream: entry.remote(Role::Upstream),
         remotes: [entry.remote(Role::Origin), entry.remote(Role::Release)],
         cache_root,
     }) {

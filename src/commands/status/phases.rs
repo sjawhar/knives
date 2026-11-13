@@ -468,6 +468,7 @@ pub(super) fn open_forge_snapshot<'a>(
     crate::snapshot::open(crate::snapshot::SnapshotConfig {
         forge,
         path,
+        upstream: entry.remote(Role::Upstream),
         remotes: [entry.remote(Role::Origin), entry.remote(Role::Release)],
         cache_root,
     })
@@ -566,6 +567,7 @@ mod tests {
         let seeded_opened = crate::snapshot::open(crate::snapshot::SnapshotConfig {
             forge: &seeded,
             path: Path::new("/fake"),
+            upstream: "https://forge.invalid/fake-owner/fake-repo",
             remotes: ["origin", "release"],
             cache_root: Some(cache.path()),
         })
@@ -592,6 +594,7 @@ mod tests {
         let live_opened = crate::snapshot::open(crate::snapshot::SnapshotConfig {
             forge: &opened,
             path: Path::new("/fake"),
+            upstream: "https://forge.invalid/fake-owner/fake-repo",
             remotes: ["origin", "release"],
             cache_root: Some(cache.path()),
         })

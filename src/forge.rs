@@ -447,6 +447,25 @@ pub fn remote_owner(remote: &str) -> Option<&str> {
     (!owner.is_empty()).then_some(owner)
 }
 
+/// The forge repository a fork's pull requests live in, `<owner>/<name>`: its
+/// upstream's, or its origin's when the upstream names none (a local path).
+///
+/// For a registered GitHub fork with no override, this is the repository gh
+/// resolved from the checkout's remotes when a call named none (`upstream`
+/// before `origin`). gh's overrides — `GH_REPO`, a `gh repo set-default`
+/// marker, a `github` remote — no longer apply: the registry decides. Every
+/// forge call names it now, because a gh wrapper that holds one owner's token
+/// refuses a call naming no repository in a checkout whose remotes name two
+/// owners, and a fork's upstream and origin always do.
+pub fn pull_repository<'a>(upstream: &'a str, origin: &'a str) -> Result<&'a str, ForgeError> {
+    crate::remote_url::remote_slug(upstream)
+        .or_else(|| crate::remote_url::remote_slug(origin))
+        .ok_or_else(|| ForgeError::Unnamed {
+            upstream: upstream.to_owned(),
+            origin: origin.to_owned(),
+        })
+}
+
 /// The account names whose full pull-request history is worth fetching.
 ///
 /// Derived from the same remotes that snapshot filtering uses. An organization
@@ -500,6 +519,12 @@ pub enum ForgeError {
     /// The forge named a repository that cannot be split into owner and name.
     #[error("the forge reported the repository as `{named}`, which is not `<owner>/<name>`")]
     Target { named: String },
+    /// Neither remote a fork's pull requests can live in names a forge repository.
+    #[error(
+        "neither the upstream remote `{upstream}` nor the origin remote `{origin}` names a \
+         forge repository `<owner>/<name>`"
+    )]
+    Unnamed { upstream: String, origin: String },
     /// The forge answered with errors instead of data. Raised rather than read as
     /// "no details": a partial answer that reads as "nothing to compare" would
     /// render a red pull request as clean.
@@ -523,13 +548,23 @@ pub enum ForgeError {
 /// `Send + Sync` because `status` gathers repositories concurrently and probes
 /// branches on scoped threads, and both share one forge.
 pub trait Forge: Send + Sync {
-    /// The forge's own name and GraphQL id for this checkout, once per run.
-    fn repo_identity(&self, repo: &Path) -> Result<RepoIdentity, ForgeError>;
+    /// The forge's own name and GraphQL id for the repository a fork's pull
+    /// requests live in, [`pull_repository`] of its `upstream` and `origin`
+    /// remotes, once per run. `repo`, here and below, is only the directory gh
+    /// runs in: every call names its repository, and none is taken from the
+    /// checkout's remotes.
+    fn repo_identity(
+        &self,
+        repo: &Path,
+        upstream: &str,
+        origin: &str,
+    ) -> Result<RepoIdentity, ForgeError>;
 
-    /// Cold path: the cheap-field wide lists (base window ∥ author-scoped), deduped.
+    /// Cold path: `target`'s cheap-field wide lists (base window ∥ author-scoped), deduped.
     fn list_pull_requests(
         &self,
         repo: &Path,
+        target: &RepoIdentity,
         authors: &[String],
     ) -> Result<Vec<PullSummary>, ForgeError>;
 
@@ -620,6 +655,30 @@ mod tests {
         assert_eq!(remote_owner(&https), Some("our-org"));
         assert_eq!(remote_owner(&ssh), Some("our-org"));
         assert_eq!(remote_owner("https://example.invalid/x/y"), None);
+    }
+
+    #[test]
+    fn the_pull_repository_is_the_upstreams_then_the_origins_and_never_guessed() {
+        use super::{ForgeError, pull_repository};
+        let upstream = format!("https://{HOST}/maintainer/demo.git");
+        let origin = format!("git@{HOST}:our-fork/demo.git");
+        assert_eq!(
+            pull_repository(&upstream, &origin).expect("the upstream names one"),
+            "maintainer/demo"
+        );
+        assert_eq!(
+            pull_repository("/srv/git/demo.git", &origin).expect("the origin names one"),
+            "our-fork/demo",
+            "a local-path upstream names no forge repository, so the origin's is the one"
+        );
+        let error = pull_repository("/srv/git/demo.git", "/srv/git/fork.git")
+            .expect_err("neither remote names a forge repository");
+        assert!(matches!(error, ForgeError::Unnamed { .. }), "was: {error}");
+        assert!(
+            error.to_string().contains("/srv/git/demo.git")
+                && error.to_string().contains("/srv/git/fork.git"),
+            "was: {error}"
+        );
     }
 
     use super::*;
