@@ -18,7 +18,7 @@ use knives::release_model::{
     members_event_text, previous_release_for_cut, series_members, trunk_positions,
 };
 
-use super::release_edit::{recorded_parents, release_writes, report_hidden, union_event_text};
+use super::release_edit::{announce_unchecked, recorded_parents, report_hidden, union_event_text};
 use super::scribe_for;
 
 pub(crate) enum ReleaseInvocation {
@@ -104,13 +104,30 @@ pub(crate) fn run_release(
         // base is never a direct parent — it is reachable through every member.
         // An earlier write of the previous release a fast-forward push gave it
         // is no member, so the cut carries every parent but those.
+        let previous_ledger = match &previous {
+            Some(_) => Ledger::for_fork(fork).read()?.entries,
+            None => Vec::new(),
+        };
+        let previous_published = previous.as_ref().and_then(|(reference, _)| {
+            tips.get(&BookmarkRef::Remote {
+                branch: reference.branch().clone(),
+                remote: RemoteName::new(entry.publish_remote()),
+            })
+        });
         let previous_writes = match &previous {
-            Some((reference, _)) => release_writes(fork, &opened, reference.branch().as_str())?,
+            Some((reference, _)) => EarlierWrites::read(
+                &opened,
+                reference.branch().as_str(),
+                &previous_ledger,
+                previous_published,
+            )?,
             None => EarlierWrites::default(),
         };
-        let previous_carriers = match &previous {
-            Some((_, commit)) => previous_writes.carriers(&opened.parent_commits(commit.as_str())?),
-            None => Vec::new(),
+        let (previous_carriers, previous_members) = match &previous {
+            Some((_, commit)) => {
+                previous_writes.partition(&opened.parent_commits(commit.as_str())?)
+            }
+            None => (Vec::new(), Vec::new()),
         };
         // A cut built over a release that carries a change knives did not
         // write or adopt would carry it forward under a new name, after which
@@ -120,18 +137,13 @@ pub(crate) fn run_release(
         // is cut, says so, and its event carries the mark.
         let (carried_from, unchecked) = match &previous {
             Some((reference, commit)) => {
-                let entries = Ledger::for_fork(fork).read()?.entries;
-                let published = tips.get(&BookmarkRef::Remote {
-                    branch: reference.branch().clone(),
-                    remote: RemoteName::new(entry.publish_remote()),
-                });
                 let in_hand = release::InHand {
                     repo: &opened,
-                    ledger: &entries,
+                    ledger: &previous_ledger,
                     name: reference.branch().as_str(),
                     commit,
                     writes: &previous_writes,
-                    published,
+                    published: previous_published,
                 };
                 let standing = release::in_hand_write(&in_hand)?;
                 if let Some(refusal) = release::in_hand_refusal(&in_hand, &standing, entry)? {
@@ -141,28 +153,17 @@ pub(crate) fn run_release(
                 }
                 let from = match &standing {
                     release::InHandWrite::Recorded => release::CarriedFrom::Recorded,
-                    release::InHandWrite::Unchecked(unchecked) => {
-                        println!(
-                            "{repo}: {}",
-                            release::unchecked_line(in_hand.name, commit, unchecked)
-                        );
-                        release::CarriedFrom::Unchecked
-                    }
+                    release::InHandWrite::Unchecked(_) => release::CarriedFrom::Unchecked,
                     release::InHandWrite::Unrecorded { .. } | release::InHandWrite::NoRecord => {
                         release::CarriedFrom::Unledgered
                     }
                 };
-                (from, release::unchecked_suffix(&standing))
+                (from, announce_unchecked(repo, &in_hand, &standing))
             }
             None => (release::CarriedFrom::Unledgered, String::new()),
         };
         let (carried, members, audit_base) = if let Some((_, previous)) = &previous {
-            let parents: Vec<knives::ids::CommitId> = opened
-                .parent_commits(previous.as_str())?
-                .into_iter()
-                .filter(|parent| !previous_carriers.contains(parent))
-                .collect();
-            let carried = release::parent_sources(&opened, entry, &scheme, &parents)?;
+            let carried = release::parent_sources(&opened, entry, &scheme, &previous_members)?;
             let members = carried.clone();
             let base =
                 release::shared_base(&opened, previous, &trunk)?.unwrap_or_else(|| trunk.clone());
@@ -473,15 +474,15 @@ fn release_plan_exit(
 /// unexplained content refuses the cut, because naming it would look exactly
 /// like success while work is gone. The refused candidate was never a
 /// published operation, so nothing is abandoned and nothing needs cleanup.
-/// A divergence carried from the release in hand reads as that release's
-/// recorded resolution when it is knives' own write (`previous_recorded`).
+/// A divergence carried from the release in hand reads by how that release
+/// stands to its recorded writes (`carried_from`).
 fn report_cut_audit(
     repo: &RepoName,
     audit: &release::CutAudit,
-    previous_recorded: release::CarriedFrom,
+    carried_from: release::CarriedFrom,
 ) -> Option<Exit> {
     for name in &audit.carried {
-        println!("{}", release::carried_row(name, previous_recorded));
+        println!("{}", release::carried_row(name, carried_from));
     }
     // Each name is a member's bookmark, read from the repository.
     for name in &audit.inconclusive {
@@ -1254,7 +1255,7 @@ impl ReapPayload {
 /// neither: every ref knives owns is gone and the commit stays on purpose, so
 /// there is nothing to act on, and a cut whose reap met one must not exit
 /// non-zero for as long as the pin exists. Neither is a cut kept only for
-/// what its own name published on it (D16): consumers were given that, and
+/// what its own name published on it: consumers were given that, and
 /// the newer cut redoes it.
 fn reap_exit(report: &knives::commands::release::ReapReport) -> Exit {
     let acted_on = report

@@ -1241,6 +1241,15 @@ impl EarlierWrites {
             .collect()
     }
 
+    /// A release's `parents` split into its carriers ([`Self::carriers`])
+    /// and its members, the rest, each in parent order.
+    pub fn partition(&self, parents: &[CommitId]) -> (Vec<CommitId>, Vec<CommitId>) {
+        parents
+            .iter()
+            .cloned()
+            .partition(|parent| self.contains(parent))
+    }
+
     /// [`Self::carriers`] of a parent set a ledger event recorded, whose
     /// commits may since have been abandoned: a hidden commit this repository
     /// holds is a carrier when its change id is a recorded write's.
@@ -1292,7 +1301,7 @@ pub fn carriers(
 /// the write's own parents where this repository holds it and the event's
 /// evidence after the write where it does not, with no branch recorded for
 /// any.
-pub fn recorded_parent_set(
+fn recorded_parent_set(
     repo: &Repo,
     (event, write): (&Entry, &RecordedWrite),
 ) -> Result<Vec<RecordedParent>, jj::JjError> {
@@ -1458,6 +1467,7 @@ mod carrier_tests {
     use std::path::{Path, PathBuf};
 
     use super::{CommitId, Entry, Kind, RecordedParent, carrier_label, carriers};
+    use crate::config::test_support::run_jj;
     use crate::jj::Repo;
 
     const RELEASE: &str = "integration";
@@ -1489,27 +1499,6 @@ mod carrier_tests {
             previous_last_seen: None,
             previous_why: None,
         }
-    }
-
-    /// `jj` in `path`, which must succeed. Identity comes from the
-    /// environment: a repo-level write would outlive the temporary
-    /// repository under `$XDG_CONFIG_HOME`.
-    fn run_jj(path: &Path, args: &[&str]) {
-        let output = std::process::Command::new("jj")
-            .current_dir(path)
-            .args(args)
-            .env("JJ_CONFIG", "/dev/null")
-            .env("JJ_USER", "knives tests")
-            .env("JJ_EMAIL", "tests@example.invalid")
-            .output()
-            .expect("run jj test fixture command");
-        assert!(
-            output.status.success(),
-            "jj {} failed:\nstdout:\n{}\nstderr:\n{}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
     }
 
     /// A repository holding one commit on the root per name, each bookmarked

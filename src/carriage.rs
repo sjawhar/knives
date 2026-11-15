@@ -366,13 +366,13 @@ fn census_rows(
                         let members = slice
                             .iter()
                             .map(|input| {
+                                let check_input = CheckInput::new(
+                                    &repo,
+                                    &input.branch,
+                                    &input.tip,
+                                    targets.trunk,
+                                );
                                 census_member(input, targets, &mut problems, |target| {
-                                    let check_input = CheckInput {
-                                        repo: &repo,
-                                        revision: &input.branch,
-                                        tip: &input.tip,
-                                        trunk: targets.trunk,
-                                    };
                                     check(&check_input, target)
                                 })
                             })
@@ -783,6 +783,35 @@ pub struct CheckInput<'a> {
     /// The upstream trunk: a release target replays the tip's change from
     /// its fork point with it.
     pub trunk: &'a CommitId,
+    /// The tip's fork point with the trunk, read once, by the first release
+    /// target that needs it.
+    fork_point: std::cell::OnceCell<CommitId>,
+}
+
+impl<'a> CheckInput<'a> {
+    pub const fn new(
+        repo: &'a Repo,
+        revision: &'a str,
+        tip: &'a CommitId,
+        trunk: &'a CommitId,
+    ) -> Self {
+        Self {
+            repo,
+            revision,
+            tip,
+            trunk,
+            fork_point: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The tip's fork point with the trunk ([`Repo::fork_point`]).
+    fn fork_point(&self) -> Result<&CommitId, crate::jj::JjError> {
+        if let Some(fork_point) = self.fork_point.get() {
+            return Ok(fork_point);
+        }
+        let fork_point = self.repo.fork_point(self.tip, self.trunk)?;
+        Ok(self.fork_point.get_or_init(|| fork_point))
+    }
 }
 
 /// The three-way verdict of one revision against one target.
@@ -800,7 +829,7 @@ pub fn check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryChe
             TargetRole::LiveRelease | TargetRole::SupersededRelease => {
                 match input.repo.fork_point_replay_outcome(
                     input.tip,
-                    input.trunk,
+                    input.fork_point()?,
                     &target.commit,
                 )? {
                     RebaseOutcome::Empty => CarryVerdict::CarriedExact,

@@ -755,28 +755,32 @@ impl Repo {
         })
     }
 
-    /// The net change `revision` makes from its fork point with `trunk`,
-    /// replayed onto `target`, with a release log the target holds as a union
-    /// left out ([`replayed_tree`]).
+    /// The net change `revision` makes from `fork_point`, its fork point with
+    /// the trunk ([`Self::fork_point`]), replayed onto `target`, with a
+    /// release log the target holds as a union left out ([`replayed_tree`]).
     ///
     /// This answers whether `target`'s tree holds a revision it already
     /// reaches. [`Self::tree_replay_outcome`] cannot: its base is the common
     /// ancestor of the two, which for such a revision is the revision itself,
     /// so it always reads empty. A release merge reaches every member it names
     /// as a parent whatever its tree holds, so a hand resolution that dropped
-    /// a member's change is seen only from the member's own fork point. That
-    /// is the trunk itself when the histories criss-cross, as
-    /// `uncarried_recorded_members` takes a member's base.
+    /// a member's change is seen only from the member's own fork point.
     pub fn fork_point_replay_outcome(
         &self,
         revision: &CommitId,
-        trunk: &CommitId,
+        fork_point: &CommitId,
         target: &CommitId,
     ) -> Result<RebaseOutcome, JjError> {
-        let base = self
+        self.net_diff_outcome(fork_point.as_str(), revision.as_str(), target.as_str())
+    }
+
+    /// Where `revision` forked from `trunk`: their one common ancestor, or the
+    /// trunk itself when the histories criss-cross to several, as
+    /// `uncarried_recorded_members` takes a member's base.
+    pub fn fork_point(&self, revision: &CommitId, trunk: &CommitId) -> Result<CommitId, JjError> {
+        Ok(self
             .common_ancestor(std::slice::from_ref(revision), trunk)?
-            .unwrap_or_else(|| trunk.clone());
-        self.net_diff_outcome(base.as_str(), revision.as_str(), target.as_str())
+            .unwrap_or_else(|| trunk.clone()))
     }
 
     /// Replays the net tree effect of `base..revision` onto a target.
@@ -1023,6 +1027,19 @@ impl Repo {
             && recorded.tree_ids() == current.tree_ids())
     }
 
+    /// Whether `current` is the recorded commit `recorded`, or a metadata
+    /// rewrite of it ([`Self::is_metadata_rewrite`]). A recorded commit this
+    /// repository does not hold has no rewrite here.
+    pub fn is_same_or_metadata_rewrite(
+        &self,
+        recorded: &CommitId,
+        current: &CommitId,
+    ) -> Result<bool, JjError> {
+        Ok(recorded == current
+            || (self.resolve_commit(recorded.as_str()).is_ok()
+                && self.is_metadata_rewrite(recorded.as_str(), current.as_str())?))
+    }
+
     /// Whether `first` and `second` hold the same tree, whatever their
     /// parents: a release written onto other parents can still hold exactly
     /// the content it held before. Either may be hidden; each is read by id.
@@ -1044,13 +1061,27 @@ impl Repo {
     /// that is not UTF-8 is counted as it is rather than through a lossy
     /// porcelain print.
     pub fn file_bytes(&self, revision: &CommitId, path: &str) -> Result<Option<Vec<u8>>, JjError> {
-        let path = RepoPath::from_internal_string(path).map_err(|error| JjError::Revision {
-            revision: path.to_owned(),
-            detail: error.to_string(),
-        })?;
+        let path = internal_path(path)?;
         let tree = self.commit(revision.as_str())?.tree();
         let value = block_on(tree.path_value(path)).map_err(|error| store_error(&error))?;
         regular_file_content(self.repo.store(), path, &value)
+    }
+
+    /// Whether `path` (repository-internal, `/`-separated) holds the same
+    /// value at `first` and `second`: the same file, symlink, directory or
+    /// conflict, or nothing at either.
+    pub fn same_path_value(
+        &self,
+        first: &CommitId,
+        second: &CommitId,
+        path: &str,
+    ) -> Result<bool, JjError> {
+        let path = internal_path(path)?;
+        let value = |revision: &CommitId| {
+            let tree = self.commit(revision.as_str())?.tree();
+            block_on(tree.path_value(path)).map_err(|error| store_error(&error))
+        };
+        Ok(value(first)? == value(second)?)
     }
 
     /// The visible commits that share `revision`'s change id, other than
@@ -1207,7 +1238,7 @@ impl Repo {
     }
 
     /// Whether all that rests on `commits`, the refs and earlier writes of
-    /// release `name`, is what that name published (D16): every visible
+    /// release `name`, is what that name published: every visible
     /// descendant of them is reachable from `name`'s ref on `publish_remote`
     /// or from a tagged commit among them and their descendants, and nothing
     /// else names any of those commits - no workspace has one checked out,
@@ -1225,18 +1256,24 @@ impl Repo {
         (name, publish_remote): (&str, &str),
     ) -> Result<bool, JjError> {
         let mut held: Vec<JjCommitId> = Vec::new();
-        let mut descendants: Vec<JjCommitId> = Vec::new();
         for commit in commits {
             let id = self.commit(commit.as_str())?.id().clone();
-            for descendant in self.descendants_of(&id)? {
-                if !descendants.contains(&descendant) {
-                    descendants.push(descendant);
-                }
-            }
             if !held.contains(&id) {
                 held.push(id);
             }
         }
+        // Each commit's visible descendants, itself excluded: the
+        // descendants of their children, read up to the visible heads only,
+        // so a hidden commit among them is no descendant of another.
+        let descendants: Vec<JjCommitId> = self
+            .revset_ids(
+                ResolvedRevsetExpression::commits(held.clone())
+                    .children()
+                    .dag_range_to(&ResolvedRevsetExpression::visible_heads()),
+                name,
+            )?
+            .into_iter()
+            .collect();
         // An empty working copy of this checkout on one of them is what
         // `jj new` leaves and jj drops when it moves on: it holds nothing.
         let here = workspace_name_at(&self.path).ok();
@@ -1280,11 +1317,20 @@ impl Repo {
                 heads.push(tip.clone());
             }
         }
+        let mut tagged: HashSet<JjCommitId> = HashSet::new();
+        for (_, targets) in self.repo.view().tags() {
+            tagged.extend(targets.local_target.added_ids().cloned());
+            for (remote, remote_ref) in targets.remote_refs {
+                if remote != jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO {
+                    tagged.extend(remote_ref.target.added_ids().cloned());
+                }
+            }
+        }
         for id in &held {
             if !checked_out_by(self, id).is_empty() {
                 return Ok(false);
             }
-            if !self.tags_on(&commit_id(id))?.is_empty() {
+            if tagged.contains(id) {
                 heads.push(id.clone());
             }
         }
@@ -1301,12 +1347,6 @@ impl Repo {
             }
         }
         Ok(true)
-    }
-
-    /// The visible descendants of `commit`, itself excluded.
-    pub fn visible_descendants(&self, commit: &CommitId) -> Result<Vec<CommitId>, JjError> {
-        let id = self.commit(commit.as_str())?.id().clone();
-        Ok(self.descendants_of(&id)?.iter().map(commit_id).collect())
     }
 
     /// What keeps `commit` besides release `name`'s own local ref and jj's
@@ -1853,6 +1893,16 @@ fn regular_file_content(
     let Some(Some(TreeValue::File { id, .. })) = value.as_resolved() else {
         return Ok(None);
     };
+    file_content(store, path, id)
+}
+
+/// The content of the file `id` at `path`, or `None` where it is not one
+/// resolved text.
+fn file_content(
+    store: &jj_lib::store::Store,
+    path: &RepoPath,
+    id: &FileId,
+) -> Result<Option<Vec<u8>>, JjError> {
     let content = block_on(extract_as_single_hunk(
         &Merge::normal(id.clone()),
         store,
@@ -1860,6 +1910,14 @@ fn regular_file_content(
     ))
     .map_err(|error| store_error(&error))?;
     Ok(content.into_resolved().ok().map(Vec::from))
+}
+
+/// `path` as a repository-internal path, `/`-separated.
+fn internal_path(path: &str) -> Result<&RepoPath, JjError> {
+    RepoPath::from_internal_string(path).map_err(|error| JjError::Revision {
+        revision: path.to_owned(),
+        detail: error.to_string(),
+    })
 }
 
 /// Replays `base..revision` onto a target and classifies the resulting content.
@@ -2632,6 +2690,9 @@ pub struct ReleaseWritten {
     pub hidden: Vec<HiddenHead>,
     /// The release logs the write resolved itself, as the union of their sides.
     pub unions: Vec<UnionedFile>,
+    /// Whether the written commit holds its source's tree; `false` for a
+    /// fresh merge, which has no source.
+    pub same_tree_as_source: bool,
 }
 
 /// A commit a knives write abandoned because the write left it a visible
@@ -2723,6 +2784,9 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
         )?;
         (written, None, unions)
     };
+    let same_tree_as_source = source
+        .as_ref()
+        .is_some_and(|source| source.tree_ids() == written.tree_ids());
     let mut replaced = None;
     let mut abandoned_earlier = Vec::new();
     let moved = MovedName {
@@ -2791,6 +2855,7 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
         abandoned_earlier,
         hidden,
         unions,
+        same_tree_as_source,
     })
 }
 
@@ -2936,23 +3001,17 @@ fn successor_of(
         })
         .filter(|id| id != commit.id())
         .collect();
-    let waker = Waker::noop();
-    let mut context = Context::from_waker(waker);
     for sibling in siblings {
         let mut walk = std::pin::pin!(jj_lib::evolution::walk_predecessors(
             tx.base_repo(),
             std::slice::from_ref(&sibling),
         ));
-        loop {
-            match walk.as_mut().poll_next(&mut context) {
-                Poll::Ready(Some(entry)) => {
-                    let entry = entry.map_err(|error| walk_error(error.to_string()))?;
-                    if entry.predecessor_ids().contains(commit.id()) {
-                        return Ok(Some(sibling));
-                    }
-                }
-                Poll::Ready(None) => break,
-                Poll::Pending => std::thread::yield_now(),
+        while let Some(entry) = block_on(std::future::poll_fn(|context| {
+            walk.as_mut().poll_next(context)
+        })) {
+            let entry = entry.map_err(|error| walk_error(error.to_string()))?;
+            if entry.predecessor_ids().contains(commit.id()) {
+                return Ok(Some(sibling));
             }
         }
     }
@@ -3380,7 +3439,7 @@ fn regular_files(value: &MergedTreeValue) -> Option<RegularFiles> {
     })
 }
 
-/// The release a hand resolution is measured against (D7).
+/// The release a hand resolution is measured against.
 #[derive(Debug, Clone, Copy)]
 pub enum ResolutionBaseline<'a> {
     /// The recorded write the resolution equals: the commit knives itself
@@ -3430,11 +3489,10 @@ pub struct ResolutionChanges {
 /// release log the union resolves is no conflict of the baseline, and a log a
 /// person changed past it is a change beyond the conflicts.
 pub fn resolution_changes(
-    repo: &Path,
+    repo: &Repo,
     baseline: ResolutionBaseline<'_>,
     resolution: &CommitId,
 ) -> Result<ResolutionChanges, JjError> {
-    let repo = Repo::open(repo)?;
     let resolution = repo.commit(resolution.as_str())?.tree();
     let baseline = match baseline {
         ResolutionBaseline::Written(commit) => repo.commit(commit.as_str())?.tree(),
@@ -3445,7 +3503,7 @@ pub fn resolution_changes(
         } => repo.rebuilt_write((write, carriers), members)?,
         ResolutionBaseline::Automerge(parents) => {
             validate_parents(None, parents)?;
-            let (parent_commits, parent_ids) = resolved_parents(&repo, parents)?;
+            let (parent_commits, parent_ids) = resolved_parents(repo, parents)?;
             let mut scratch = repo.repo.start_transaction();
             let (merged, _) = merged_release(&mut scratch, (&parent_commits, parent_ids), "")?;
             merged.tree()
@@ -3466,13 +3524,7 @@ pub fn resolution_changes(
             let mut sides = Vec::new();
             for term in values.before.adds() {
                 if let Some(TreeValue::File { id, .. }) = term {
-                    let content = block_on(extract_as_single_hunk(
-                        &Merge::normal(id.clone()),
-                        store,
-                        &entry.path,
-                    ))
-                    .map_err(|error| store_error(&error))?;
-                    sides.extend(content.into_resolved().ok().map(Vec::from));
+                    sides.extend(file_content(store, &entry.path, id)?);
                 }
             }
             sides

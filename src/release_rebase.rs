@@ -20,8 +20,8 @@ use knives::release_model::{
 };
 
 use super::release_edit::{
-    EditRecord, published_refusal, record_edit_event, refuse_unrecorded,
-    release_is_locally_movable, release_writes, report_hidden, report_replaced, unchecked_mark,
+    EditRecord, record_edit_event, refuse_edit_in_hand, release_is_locally_movable, release_writes,
+    report_hidden, report_replaced,
 };
 
 /// Rebase the whole composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
@@ -129,26 +129,14 @@ pub(crate) fn run_rebase(
         writes: &writes,
         published: plan.published.as_ref(),
     };
-    let standing = match refuse_unrecorded((repo, "rebase"), entry, &in_hand)? {
-        Ok(standing) => standing,
-        Err(exit) => return Ok(exit),
-    };
-    if let Some(refusal) = published_refusal(
-        &opened,
-        &ledger,
-        release::ReleaseAt {
-            scheme: &scheme,
-            name: &release_name,
-            commits: &[Some(&release_commit), plan.published.as_ref()],
-        },
-        ("rebasing", "rebase"),
-    )? {
-        println!("{repo}: {refusal}");
-        return Ok(Exit::Incomplete);
-    }
-    let unchecked = unchecked_mark(repo, &in_hand, &standing);
+    let unchecked =
+        match refuse_edit_in_hand((repo, "rebase"), entry, &in_hand, ("rebasing", "rebase"))? {
+            Ok(unchecked) => unchecked,
+            Err(exit) => return Ok(exit),
+        };
     if let Some(exit) = existing_rebase_exit(ExistingRebaseInput {
         opened: &opened,
+        writes: &writes,
         fork,
         release_name: &release_name,
         release_commit: &release_commit,
@@ -198,14 +186,14 @@ pub(crate) fn run_rebase(
     );
     // Everything below reads the release the write left, not the old one.
     let opened = knives::jj::Repo::open(path)?;
-    let in_hand = opened.resolve_commit(&release_name)?;
+    let after_shed = opened.resolve_commit(&release_name)?;
     // Every earlier write of the name still visible, other than the release
     // in hand and the write just made, is one more commit the rebase may
     // copy: a carrier a conflicted write left visible, which nothing hid.
     // Its copy is cleaned up as a tagged release's is.
     let releases_own = [
         opened.change_id_of(release_commit.as_str())?,
-        opened.change_id_of(in_hand.as_str())?,
+        opened.change_id_of(after_shed.as_str())?,
     ];
     let mut earlier_originals = Vec::new();
     for earlier in
@@ -336,7 +324,7 @@ pub(crate) fn run_rebase(
     }
     // The rebase recorded the release it moved, so what it drops next is
     // dropped from a recorded write.
-    drop_landed_members(fork, &release_name, &destination, (bound, ""))
+    drop_landed_members(fork, (&release_name, &destination), (bound, ""))
 }
 
 fn frozen_rebase_exit(
@@ -538,6 +526,8 @@ struct RebaseTargetInput<'a> {
 #[derive(Clone, Copy)]
 struct ExistingRebaseInput<'a> {
     opened: &'a knives::jj::Repo,
+    /// Every earlier write of the release, read from `opened`.
+    writes: &'a EarlierWrites,
     fork: &'a Fork<'a>,
     release_name: &'a str,
     release_commit: &'a knives::ids::CommitId,
@@ -551,6 +541,7 @@ struct ExistingRebaseInput<'a> {
 fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option<Exit>> {
     let ExistingRebaseInput {
         opened,
+        writes,
         fork,
         release_name,
         release_commit,
@@ -573,7 +564,12 @@ fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option
     let exit = if no_drop {
         Exit::Ok
     } else {
-        drop_landed_members(fork, release_name, destination, (bound, unchecked))?
+        drop_landed_members_in(
+            fork,
+            (opened, writes),
+            (release_name, destination),
+            (bound, unchecked),
+        )?
     };
     Ok(Some(exit))
 }
@@ -801,6 +797,36 @@ fn all_landed(
     Ok(true)
 }
 
+/// [`drop_landed_members_in`] over the repository as it is now, opened here.
+///
+/// With no landed tip a parent of the release there is nothing to drop, so
+/// the release's earlier writes are not read.
+fn drop_landed_members(
+    fork: &Fork<'_>,
+    (release_name, destination): (&str, &RebaseDestination),
+    (bound, unchecked): (Bound<'_>, &str),
+) -> anyhow::Result<Exit> {
+    if destination.landed.is_empty() {
+        return Ok(Exit::Ok);
+    }
+    let opened = knives::jj::Repo::open(&fork.checkout.path)?;
+    let release_parents = opened.parent_commits(release_name)?;
+    if !destination.landed.iter().any(|pull| {
+        opened
+            .local_bookmark_tip(&pull.head_ref_name)
+            .is_some_and(|tip| release_parents.contains(&tip))
+    }) {
+        return Ok(Exit::Ok);
+    }
+    let writes = release_writes(fork, &opened, release_name)?;
+    drop_landed_members_in(
+        fork,
+        (&opened, &writes),
+        (release_name, destination),
+        (bound, unchecked),
+    )
+}
+
 /// Drop the members whose pull requests landed at or before the rebase target.
 ///
 /// Only a member carrying nothing past the target is dropped: a branch with
@@ -808,26 +834,19 @@ fn all_landed(
 /// that is said instead. The drop duplicates the release onto the kept parents,
 /// exactly as `drop` does, so recorded conflict resolutions carry forward, and
 /// leaves out the release's carriers, as every write composing from its
-/// parents does. `unchecked` is the mark its event ends with
-/// ([`release::unchecked_suffix`]).
-fn drop_landed_members(
+/// parents does. `opened` is the repository as it is now, and `writes` the
+/// release's earlier writes read from it. `unchecked` is the mark its event
+/// ends with ([`release::unchecked_suffix`]).
+fn drop_landed_members_in(
     fork: &Fork<'_>,
-    release_name: &str,
-    destination: &RebaseDestination,
+    (opened, writes): (&knives::jj::Repo, &EarlierWrites),
+    (release_name, destination): (&str, &RebaseDestination),
     (bound, unchecked): (Bound<'_>, &str),
 ) -> anyhow::Result<Exit> {
-    if destination.landed.is_empty() {
-        return Ok(Exit::Ok);
-    }
     let repo = &fork.name;
     let entry = fork.entry;
     let path = &fork.checkout.path;
-    let opened = knives::jj::Repo::open(path)?;
-    let writes = release_writes(fork, &opened, release_name)?;
-    let (carriers, parents): (Vec<knives::ids::CommitId>, Vec<knives::ids::CommitId>) = opened
-        .parent_commits(release_name)?
-        .into_iter()
-        .partition(|parent| writes.contains(parent));
+    let (carriers, parents) = writes.partition(&opened.parent_commits(release_name)?);
     let mut kept = parents.clone();
     let mut deltas: Vec<String> = Vec::new();
     for pull in &destination.landed {
@@ -864,7 +883,7 @@ fn drop_landed_members(
         return Ok(Exit::Incomplete);
     }
     let release = opened.resolve_commit(release_name)?;
-    let provenance = release::parent_sources(&opened, entry, &entry.release_scheme(), &kept)?;
+    let provenance = release::parent_sources(opened, entry, &entry.release_scheme(), &kept)?;
     let delta = deltas.join("; ");
     let message = release::composition_message(release_name, &provenance, &delta);
     let written = knives::jj::write_release(
@@ -883,7 +902,7 @@ fn drop_landed_members(
     let created = written.commit.clone();
     record_edit_event(
         fork,
-        &opened,
+        opened,
         &EditRecord {
             release: release_name,
             delta: &delta,

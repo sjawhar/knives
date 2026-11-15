@@ -411,9 +411,7 @@ fn an_extra_parent_beside_a_carrier_is_refused_as_a_membership_change_outside_kn
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
     park(&lab);
     release_ok(&lab, &home, &["include", "feat/gamma"]);
-    lab.jj_work(["new", "main@origin", "-m", "stranger"]);
-    std::fs::write(lab.work.join("stranger.txt"), "stranger\n").expect("write");
-    lab.jj_work(["bookmark", "create", "feat/stranger", "-r", "@"]);
+    lab.branch("feat/stranger", "stranger.txt", "stranger\n");
     park(&lab);
     lab.jj_work([
         "rebase",

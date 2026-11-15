@@ -95,10 +95,7 @@ impl ReleaseInHand {
     ) -> anyhow::Result<Self> {
         let commit = opened.resolve_commit(&name)?;
         let writes = EarlierWrites::read(opened, &name, ledger, published)?;
-        let (carriers, parents) = opened
-            .parent_commits(&name)?
-            .into_iter()
-            .partition(|parent| writes.contains(parent));
+        let (carriers, parents) = writes.partition(&opened.parent_commits(&name)?);
         Ok(Self {
             name,
             commit,
@@ -452,7 +449,7 @@ pub(crate) fn run_release_edit(
 /// Why a published dated release must not move ([`release::published_release`]),
 /// as the line to print after the repo name, or `None`. `verb` is the gerund
 /// and the imperative of the move refused.
-pub(crate) fn published_refusal(
+fn published_refusal(
     opened: &knives::jj::Repo,
     ledger: &[knives::ledger::Entry],
     release: release::ReleaseAt<'_>,
@@ -464,11 +461,7 @@ pub(crate) fn published_refusal(
 
 /// [`published_refusal`]'s line for the release `name`, which `evidence` marks
 /// published.
-pub(crate) fn published_refusal_text(
-    name: &str,
-    evidence: &str,
-    (doing, todo): (&str, &str),
-) -> String {
+fn published_refusal_text(name: &str, evidence: &str, (doing, todo): (&str, &str)) -> String {
     // The release is a name read from the repository; the evidence quotes a
     // tag or a ledger entry.
     format!(
@@ -509,7 +502,7 @@ pub(crate) fn refuse_unresolved_trunk(
 /// and the next write would read it as knives' own, though nothing measured
 /// what it kept of each member. So it refuses before it writes, naming the
 /// `adopt` that measures and records it, or the remedy `adopt` itself gives.
-pub(crate) fn refuse_unrecorded(
+fn refuse_unrecorded(
     (repo, verb): (&RepoName, &str),
     entry: &knives::config::RepoEntry,
     release: &release::InHand<'_>,
@@ -526,7 +519,7 @@ pub(crate) fn refuse_unrecorded(
 /// against its recorded writes ([`release::unchecked_line`]), and give the
 /// mark the write's ledger event ends with ([`release::unchecked_suffix`]):
 /// nothing for any other release.
-pub(crate) fn unchecked_mark(
+pub(crate) fn announce_unchecked(
     repo: &RepoName,
     release: &release::InHand<'_>,
     standing: &release::InHandWrite,
@@ -540,43 +533,57 @@ pub(crate) fn unchecked_mark(
     release::unchecked_suffix(standing)
 }
 
-/// Refuse, saying why, an edit of the release in hand that carries a change
-/// knives did not write or adopt ([`refuse_unrecorded`]), or one that is
-/// published ([`published_refusal`]): `Err` after refusing, otherwise the
-/// mark the edit's event ends with ([`unchecked_mark`]). `published` is the
-/// publish remote's commit of the release in jj's view.
-fn refuse_edit_in_hand(
+/// Refuse, saying why, an edit or a rebase of the release in hand that
+/// carries a change knives did not write or adopt ([`refuse_unrecorded`]),
+/// or one that is published ([`published_refusal`]): `Err` after refusing,
+/// otherwise the mark the write's event ends with ([`announce_unchecked`]).
+/// `verb` names the write refused, and `moving` is the gerund and the
+/// imperative of the move a published release refuses.
+pub(crate) fn refuse_edit_in_hand(
     (repo, verb): (&RepoName, &str),
     entry: &knives::config::RepoEntry,
-    (opened, ledger): (&knives::jj::Repo, &[knives::ledger::Entry]),
-    (release, published): (&ReleaseInHand, Option<&knives::ids::CommitId>),
+    in_hand: &release::InHand<'_>,
+    moving: (&str, &str),
 ) -> anyhow::Result<Result<String, Exit>> {
-    let in_hand = release::InHand {
-        repo: opened,
-        ledger,
-        name: &release.name,
-        commit: &release.commit,
-        writes: &release.writes,
-        published,
-    };
-    let standing = match refuse_unrecorded((repo, verb), entry, &in_hand)? {
+    let standing = match refuse_unrecorded((repo, verb), entry, in_hand)? {
         Ok(standing) => standing,
         Err(exit) => return Ok(Err(exit)),
     };
     if let Some(refusal) = published_refusal(
-        opened,
-        ledger,
+        in_hand.repo,
+        in_hand.ledger,
         release::ReleaseAt {
             scheme: &entry.release_scheme(),
-            name: &release.name,
-            commits: &[Some(&release.commit), published],
+            name: in_hand.name,
+            commits: &[Some(in_hand.commit), in_hand.published],
         },
-        ("editing", "edit"),
+        moving,
     )? {
         println!("{repo}: {refusal}");
         return Ok(Err(Exit::Incomplete));
     }
-    Ok(Ok(unchecked_mark(repo, &in_hand, &standing)))
+    Ok(Ok(announce_unchecked(repo, in_hand, &standing)))
+}
+
+/// Refuse, saying what the plan could not answer, a write from a plan with
+/// problems: `true` after refusing. `verb` names the write.
+pub(crate) fn refuse_plan_problems(repo: &RepoName, plan: &release::Plan, verb: &str) -> bool {
+    if plan.problems.is_empty() {
+        return false;
+    }
+    println!("{}", release::render(plan));
+    // The plan's own render escaped these one line above; this summary
+    // quotes the same jj, forge and consumer text, so it escapes each
+    // problem too ([`knives::ledger::problem_human_text`]).
+    println!(
+        "{repo}: {verb} not applied; the plan could not answer: {}",
+        plan.problems
+            .iter()
+            .map(|problem| knives::ledger::problem_human_text(problem))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    true
 }
 
 /// Refuse, saying so, an edit of a release every pin of which is frozen:
@@ -643,20 +650,7 @@ fn edit_release(
         heads,
     };
     let plan = release::pulled_plan(fork, bound.registry, &consumers)?;
-    if !plan.problems.is_empty() {
-        println!("{}", release::render(&plan));
-        // The plan's own render escaped these one line above; this summary
-        // quotes the same jj, forge and consumer text, so it escapes each
-        // problem too ([`knives::ledger::problem_human_text`]).
-        println!(
-            "{repo}: {} not applied; the plan could not answer: {}",
-            change.verb(),
-            plan.problems
-                .iter()
-                .map(|problem| knives::ledger::problem_human_text(problem))
-                .collect::<Vec<_>>()
-                .join("; ")
-        );
+    if refuse_plan_problems(repo, &plan, change.verb()) {
         return Ok(Exit::Incomplete);
     }
     let Some(release_name) = plan.release.clone() else {
@@ -682,15 +676,19 @@ fn edit_release(
         release_name,
         (&ledger, plan.published.as_ref()),
     )?;
-    let unchecked = match refuse_edit_in_hand(
-        (repo, change.verb()),
-        entry,
-        (&opened, &ledger),
-        (&release, plan.published.as_ref()),
-    )? {
-        Ok(unchecked) => unchecked,
-        Err(exit) => return Ok(exit),
+    let in_hand = release::InHand {
+        repo: &opened,
+        ledger: &ledger,
+        name: &release.name,
+        commit: &release.commit,
+        writes: &release.writes,
+        published: plan.published.as_ref(),
     };
+    let unchecked =
+        match refuse_edit_in_hand((repo, change.verb()), entry, &in_hand, ("editing", "edit"))? {
+            Ok(unchecked) => unchecked,
+            Err(exit) => return Ok(exit),
+        };
     let releases = knives::release_model::release_refs_by_commit(
         &opened.bookmark_tips()?,
         &entry.release_scheme(),
@@ -779,8 +777,7 @@ fn apply_edit(
     )?;
     if let Some(target) = uncarried {
         let shown_target = inline_human_text(target);
-        let reopened = knives::jj::Repo::open(&fork.checkout.path)?;
-        if reopened.same_tree(&release.commit, created)? {
+        if written.same_tree_as_source {
             println!(
                 "{repo}: {shown_target} left the parent set of {}, and the release's content did \
                  not change",
@@ -979,13 +976,13 @@ pub(crate) fn record_edit_event(
         ..Draft::event(
             Some(record.release),
             format!(
-                "edited {} as {} (change {}) with {} parent(s): {}; parents: {}{}{}",
-                record.release,
-                record.created.short(),
-                record.change.short(),
-                parents.len(),
-                record.delta,
-                members_event_text(record.provenance),
+                "{}{}{}",
+                edit_event_text(
+                    record.release,
+                    (record.created, record.change),
+                    record.provenance,
+                    record.delta
+                ),
                 union_event_text(record.unions),
                 record.unchecked
             ),
@@ -993,6 +990,24 @@ pub(crate) fn record_edit_event(
         )
     })?;
     Ok(())
+}
+
+/// An edit event's text through its parents: `edited <release> as <commit>
+/// (change <id>) with <n> parent(s): <delta>; parents: <provenance>`. A
+/// write's unions and its unchecked mark close the text after it.
+pub(crate) fn edit_event_text(
+    release: &str,
+    (created, change): (&knives::ids::CommitId, &knives::ids::ChangeId),
+    provenance: &[(String, knives::ids::CommitId)],
+    delta: &str,
+) -> String {
+    format!(
+        "edited {release} as {} (change {}) with {} parent(s): {delta}; parents: {}",
+        created.short(),
+        change.short(),
+        provenance.len(),
+        members_event_text(provenance)
+    )
 }
 
 /// `; union: CHANGELOG.md, RELEASE_NOTES.md` for the release logs a write
@@ -1614,6 +1629,7 @@ mod tests {
             abandoned_earlier: vec![CommitId::new("cccc")],
             hidden: Vec::new(),
             unions: Vec::new(),
+            same_tree_as_source: false,
         };
 
         let lines = replaced_lines(&RepoName::new("demo"), "release/x\u{9b}2J", &written);

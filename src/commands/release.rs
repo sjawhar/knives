@@ -218,14 +218,9 @@ pub fn published_release(
 
 /// The `record: published …` note half of [`published_release`]: the newest
 /// such note on `release` that names one of `commits` in its evidence,
-/// rendered for a human, or `None`.
-///
-/// A note names a commit by its id as a string, so this reads no repository
-/// and answers for a commit this one does not hold: a write made on another
-/// machine is published by its note all the same. A tag can name only a
-/// commit the repository holds, which is why [`published_release`] needs
-/// them held.
-pub fn published_note(ledger: &[Entry], release: &str, commits: &[&CommitId]) -> Option<String> {
+/// rendered for a human, or `None`. A note names a commit by its id as a
+/// string, so this reads only the ledger.
+fn published_note(ledger: &[Entry], release: &str, commits: &[&CommitId]) -> Option<String> {
     let recorded = ledger.iter().rev().find_map(|entry| {
         let is_record = entry.kind == Kind::Note
             && entry.subject.as_deref() == Some(release)
@@ -398,15 +393,13 @@ impl Plan {
         ledger: &[Entry],
     ) -> anyhow::Result<Vec<ReleaseParent>> {
         let commits: Vec<CommitId> = parents.iter().map(|parent| parent.commit.clone()).collect();
-        self.carriers = crate::release_model::carriers(
-            repo,
-            release,
-            &commits,
-            (ledger, self.published.as_ref()),
-        )?;
+        let (carriers, members) =
+            EarlierWrites::read(repo, release, ledger, self.published.as_ref())?
+                .partition(&commits);
+        self.carriers = carriers;
         Ok(parents
             .iter()
-            .filter(|parent| !self.carriers.contains(&parent.commit))
+            .filter(|parent| members.contains(&parent.commit))
             .cloned()
             .collect())
     }
@@ -689,7 +682,7 @@ pub struct ReapReport {
     pub kept: Vec<(String, String)>,
     /// The names among `kept` whose cut is kept only for what that release
     /// published on it ([`Repo::rests_only_on_published`]): kept on purpose,
-    /// with nothing for a person to act on (D16).
+    /// with nothing for a person to act on.
     pub kept_published: Vec<String>,
     /// Non-fatal notes: an abandon that failed for a reason other than a pin,
     /// and a cleanup of a reaped name's earlier writes that failed.
@@ -1014,20 +1007,12 @@ pub fn in_hand_write(release: &InHand<'_>) -> Result<InHandWrite, crate::jj::JjE
     let mut any = false;
     for (event, write) in crate::release_model::recorded_write_events(ledger, name) {
         any = true;
-        if write.commit == *commit
-            || (repo.resolve_commit(write.commit.as_str()).is_ok()
-                && repo.is_metadata_rewrite(write.commit.as_str(), commit.as_str())?)
-        {
+        if repo.is_same_or_metadata_rewrite(&write.commit, commit)? {
             return Ok(unless_marked(event, write, InHandWrite::Recorded));
         }
     }
     let parents = repo.parent_commits(commit.as_str())?;
-    let carriers = writes.carriers(&parents);
-    let members: Vec<CommitId> = parents
-        .iter()
-        .filter(|parent| !carriers.contains(parent))
-        .cloned()
-        .collect();
+    let (_, members) = writes.partition(&parents);
     // A release whose every parent is a carrier has no member to compose
     // from, so the in-between commit a write builds never stands on no
     // parent, whether or not the ledger records a write of the name.
@@ -1052,17 +1037,25 @@ pub fn in_hand_write(release: &InHand<'_>) -> Result<InHandWrite, crate::jj::JjE
             matched.write,
         )));
     }
+    // A write marked unchecked leaves the release unchecked, whatever its
+    // tree holds ([`Unchecked::Inherited`]).
+    if let Some(reason) = crate::release_model::unchecked_mark(matched.event) {
+        return Ok(InHandWrite::Unchecked(Unchecked::Inherited {
+            write: matched.write,
+            reason: reason.to_owned(),
+        }));
+    }
     let write_carriers =
         writes.recorded_carriers(repo, &repo.parent_commits(matched.write.commit.as_str())?)?;
-    let held =
+    Ok(
         if repo.holds_rebased_write((&matched.write.commit, &write_carriers), &members, commit)? {
             InHandWrite::Recorded
         } else {
             InHandWrite::Unrecorded {
-                write: matched.write.clone(),
+                write: matched.write,
             }
-        };
-    Ok(unless_marked(matched.event, matched.write, held))
+        },
+    )
 }
 
 /// How a release in hand measured against `write` stands (`held`), unless
@@ -1341,16 +1334,50 @@ pub fn published_remedy_text(
     ))
 }
 
+/// The published remedy for a hand edit of `name` at `commit`
+/// ([`published_remedy_text`]), as one line after the repository's name.
+///
+/// `None` when the publish remote holds the commit ([`publish_remote_holds`])
+/// or nothing marks the release published ([`published_release`], read over
+/// the commit and `published`, the publish remote's commit of the name).
+pub fn published_hand_edit_refusal(
+    (repo, ledger): (&Repo, &[Entry]),
+    (name, commit, published): (&str, &CommitId, Option<&CommitId>),
+    entry: &RepoEntry,
+) -> Result<Option<String>, crate::jj::JjError> {
+    if publish_remote_holds(repo, commit, published)? {
+        return Ok(None);
+    }
+    let Some(evidence) = published_release(
+        repo,
+        ledger,
+        ReleaseAt {
+            scheme: &entry.release_scheme(),
+            name,
+            commits: &[Some(commit), published],
+        },
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(published_remedy_text(
+        repo,
+        (name, commit, &evidence),
+        (entry, published),
+        None,
+    )?))
+}
+
 /// Why a write over the release in hand refuses, as one line after the
 /// repository's name, or `None` when it does not.
 ///
 /// Only an unrecorded release refuses ([`InHandWrite::Unrecorded`]): it is
-/// recorded with `knives release adopt`, unless it is published as
-/// [`published_release`] reads it over the release and the publish remote's
-/// commit, and the publish remote does not hold it: `adopt` refuses that
-/// too, so the write prints the published remedy instead. A release whose
-/// every parent is a carrier refuses too, with the remedy `adopt` gives it
-/// ([`no_match_refusal`]): a write has no member to compose it from.
+/// recorded with `knives release adopt`, unless it is a published release
+/// the publish remote does not hold ([`published_hand_edit_refusal`]):
+/// `adopt` refuses that too, so the write prints the published remedy
+/// instead. A release whose every parent is a carrier refuses too, with the
+/// remedy `adopt` gives it ([`no_match_refusal`]): a write has no member to
+/// compose it from.
 pub fn in_hand_refusal(
     release: &InHand<'_>,
     standing: &InHandWrite,
@@ -1364,7 +1391,6 @@ pub fn in_hand_refusal(
         published,
         ..
     } = *release;
-    let scheme = &entry.release_scheme();
     let write = match standing {
         InHandWrite::Unrecorded { write } => write,
         InHandWrite::Unchecked(Unchecked::NoMatch(no_match @ NoMatch::AllCarriers { .. })) => {
@@ -1374,23 +1400,10 @@ pub fn in_hand_refusal(
             return Ok(None);
         }
     };
-    if !publish_remote_holds(repo, commit, published)?
-        && let Some(evidence) = published_release(
-            repo,
-            ledger,
-            ReleaseAt {
-                scheme,
-                name,
-                commits: &[Some(commit), published],
-            },
-        )?
+    if let Some(remedy) =
+        published_hand_edit_refusal((repo, ledger), (name, commit, published), entry)?
     {
-        return Ok(Some(published_remedy_text(
-            repo,
-            (name, commit, &evidence),
-            (entry, published),
-            None,
-        )?));
+        return Ok(Some(remedy));
     }
     let shown = crate::ledger::inline_human_text(name);
     Ok(Some(format!(
@@ -3198,9 +3211,7 @@ pub fn uncarried_recorded_members(
             check.dropped.push(recorded_member_name(member, delta.tips));
             continue;
         }
-        let base = repo
-            .common_ancestor(std::slice::from_ref(member), delta.trunk)?
-            .unwrap_or_else(|| delta.trunk.clone());
+        let base = repo.fork_point(member, delta.trunk)?;
         match subject.replay_outcome(path, base.as_str(), member.as_str())? {
             RebaseOutcome::Empty => {}
             RebaseOutcome::Conflicted if cut_is_conflicted => {
@@ -3310,7 +3321,10 @@ mod cut_tests {
         );
     }
 
-    fn cut_event(subject: &str, created: &str, members: &[&str]) -> Entry {
+    /// A cut event of `subject` recording `created` on `members`, as
+    /// `record_cut_event` writes one: its text begins `cut <subject> as`,
+    /// and its evidence is the commit, then the members.
+    pub(super) fn cut_event(subject: &str, created: &str, members: &[&str]) -> Entry {
         let mut evidence = vec![created.to_owned()];
         evidence.extend(members.iter().map(|sha| (*sha).to_owned()));
         Entry {
@@ -3322,7 +3336,8 @@ mod cut_tests {
             disposition: None,
             statement: None,
             text: format!(
-                "cut {subject} as {created} with {} parent(s)",
+                "cut {subject} as {} with {} parent(s)",
+                crate::ids::short_id(created),
                 members.len()
             ),
             evidence,
@@ -3660,7 +3675,9 @@ mod members_tests {
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
 
+    use super::cut_tests::cut_event;
     use super::*;
+    use crate::config::test_support::run_jj;
 
     fn row(commit: &str, held_by: &[&str], advanced: &[&str], base_parent: bool) -> MemberRow {
         MemberRow {
@@ -3817,27 +3834,6 @@ mod members_tests {
         );
     }
 
-    /// Identity comes from the environment, not `config set --repo`: a repo-level
-    /// write mints a `config-id` and a directory under `$XDG_CONFIG_HOME/jj/repos/`
-    /// that outlives the temporary repository.
-    fn run_jj(path: &Path, args: &[&str]) {
-        let output = std::process::Command::new("jj")
-            .current_dir(path)
-            .args(args)
-            .env("JJ_CONFIG", "/dev/null")
-            .env("JJ_USER", "knives tests")
-            .env("JJ_EMAIL", "tests@example.invalid")
-            .output()
-            .expect("run jj test fixture command");
-        assert!(
-            output.status.success(),
-            "jj {} failed:\nstdout:\n{}\nstderr:\n{}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-
     #[test]
     fn member_parent_count_ignores_parent_shaped_commit_message_prose() {
         let _environment = crate::config::test_support::environment_lock();
@@ -3905,38 +3901,6 @@ mod members_tests {
         assert!(render_members(&members).contains("bare commit — nothing holds it"));
     }
 
-    /// A cut event of `name` recording `commit` on `members`, as
-    /// `record_cut_event` writes one: its text begins `cut <name> as`, and
-    /// its evidence is the commit, then the members.
-    fn cut_event(name: &str, commit: &str, members: &[&CommitId]) -> Entry {
-        let mut evidence = vec![commit.to_owned()];
-        evidence.extend(members.iter().map(|member| member.as_str().to_owned()));
-        Entry {
-            ts: "2026-08-30T00:00:00Z".to_owned(),
-            owner: "test".to_owned(),
-            email: None,
-            subject: Some(name.to_owned()),
-            kind: Kind::Event,
-            disposition: None,
-            statement: None,
-            text: format!(
-                "cut {name} as {} with 1 parent(s)",
-                crate::ids::short_id(commit)
-            ),
-            evidence,
-            anchor: None,
-            pr: None,
-            parents: Vec::new(),
-            claim_change: None,
-            claim_change_why: None,
-            previous_owner: None,
-            previous_kind: None,
-            previous_started: None,
-            previous_last_seen: None,
-            previous_why: None,
-        }
-    }
-
     #[test]
     fn a_release_in_hand_is_recorded_by_its_tree_unrecorded_unmatched_or_has_no_record() {
         // Given: a release commit knives recorded on one member, the same
@@ -3980,7 +3944,7 @@ mod members_tests {
         run_jj(&repository, &["new"]);
         let edited = at(&repository, name);
         let opened = Repo::open(&repository).expect("open test repository");
-        let ledger = [cut_event(name, written.as_str(), &[&member])];
+        let ledger = [cut_event(name, written.as_str(), &[member.as_str()])];
         let standing = |ledger: &[Entry], commit: &CommitId| {
             let writes = EarlierWrites::read(&opened, name, ledger, None).expect("read writes");
             in_hand_write(&InHand {
@@ -4013,14 +3977,14 @@ mod members_tests {
         // And: a matched write this repository does not hold leaves the edit
         // unchecked, the write absent.
         let absent = CommitId::new("f".repeat(40));
-        let elsewhere = [cut_event(name, absent.as_str(), &[&member])];
+        let elsewhere = [cut_event(name, absent.as_str(), &[member.as_str()])];
         assert_eq!(
             standing(&elsewhere, &edited),
             InHandWrite::Unchecked(Unchecked::WriteAbsent(recorded_cut(&absent)))
         );
         // And: a write recorded on other members matches nothing, which is
         // unchecked too.
-        let other = [cut_event(name, absent.as_str(), &[&absent])];
+        let other = [cut_event(name, absent.as_str(), &[absent.as_str()])];
         assert_eq!(
             standing(&other, &edited),
             InHandWrite::Unchecked(Unchecked::NoMatch(NoMatch::Members))

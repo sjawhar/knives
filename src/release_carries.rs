@@ -188,12 +188,7 @@ pub(crate) fn run_revision_carries(
         selected_target.role = TargetRole::UpstreamTrunk;
     }
     let checks = CarriesChecks {
-        input: CheckInput {
-            repo: &opened,
-            revision,
-            tip: &tip,
-            trunk: &trunk,
-        },
+        input: CheckInput::new(&opened, revision, &tip, &trunk),
         fallback: target.unwrap_or(trunk_name.as_str()),
     };
     let mut report = CarriesReport {

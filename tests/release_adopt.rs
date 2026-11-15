@@ -31,8 +31,8 @@ mod lab;
 
 use knives::ledger::{Entry, Kind, RecordedParent};
 use lab::{
-    Lab, ReleaseOutput, commit_at, file_at_revision, home_after_first_cut, knives_release,
-    release_command, release_parents, release_test_home,
+    Lab, ReleaseOutput, commit_at, extend_branch, file_at_revision, home_after_first_cut,
+    knives_release, release_command, release_parents, release_test_home,
 };
 
 const RELEASE: &str = "release/2026-08-04";
@@ -884,7 +884,7 @@ fn a_renumber_by_hand_is_adopted_only_with_a_why_and_keeps_the_recorded_parents(
     let (lab, home) = unioned_first_cut();
     let cut = commit_at(&lab, RELEASE);
     let cut_event = newest_event(&home, RELEASE);
-    grow(&lab, SAMI11, &[("sami11.txt", "follow-up\n")]);
+    extend_branch(&lab, SAMI11, "sami11.txt", "follow-up\n");
     let parents = release_parents(&lab, RELEASE);
     let renumbered = file_at_revision(&lab, RELEASE, "CHANGELOG.md").replacen(
         "## [1.55.1-sami.11] — 2026-11-13",
@@ -1446,7 +1446,7 @@ fn a_conflicted_file_losing_every_block_of_a_member_exits_with_findings() {
 }
 
 #[test]
-fn a_renumbered_ygo_changelog_exits_clean_and_one_losing_a_members_section_does_not() {
+fn a_renumbered_ygo_changelog_exits_clean() {
     // Given (q19): the ygo history's unioned cut of split-from-store and
     // sami11, sami11's heading renumbered by hand.
     let (lab, home) = unioned_first_cut();
@@ -1463,8 +1463,12 @@ fn a_renumbered_ygo_changelog_exits_clean_and_one_losing_a_members_section_does_
     // Then: the renumber keeps sami11's block, so the exit is 0.
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
     assert!(!stdout(&output).contains("!!"), "{}", text(&output));
+}
 
-    // Given: the same cut in a new lab, sami11's whole section removed.
+#[test]
+fn a_ygo_changelog_losing_a_members_section_exits_with_findings() {
+    // Given (q19): the ygo history's unioned cut of split-from-store and
+    // sami11, sami11's whole section removed by hand.
     let (lab, home) = unioned_first_cut();
     let (preamble, sections) = ygo_preamble_and_sections();
     let without = format!("{preamble}{}{sections}", block(SPLIT_LOG));
@@ -1483,19 +1487,6 @@ fn a_renumbered_ygo_changelog_exits_clean_and_one_losing_a_members_section_does_
     );
 }
 
-/// A member `name` forked from the fork's trunk ([`log_lab`]), inserting
-/// `sections` above the trunk's release log ([`LOG_BASE`]).
-fn log_member(lab: &Lab, name: &str, sections: &str) {
-    lab.jj_work(["new", "-r", "main@origin", "-m", name]);
-    std::fs::write(
-        lab.work.join("CHANGELOG.md"),
-        format!("{sections}{LOG_BASE}"),
-    )
-    .expect("write the log");
-    lab.jj_work(["bookmark", "create", name, "-r", "@"]);
-    lab.jj_work(["new"]);
-}
-
 const LOG_BASE: &str = "## [1.0.0]\n- base\n";
 
 /// A lab whose trunk, upstream and on the fork, holds [`LOG_BASE`].
@@ -1512,8 +1503,16 @@ fn a_members_two_sections_split_by_another_members_section_exit_clean() {
     // by the cut; then beta's section moved between alpha's two by hand, the
     // shape ygo's split-one-path left.
     let lab = log_lab();
-    log_member(&lab, "feat/alpha", "## [1.2.0]\n- two\n## [1.1.0]\n- one\n");
-    log_member(&lab, "feat/beta", "## [1.1.5]\n- other\n");
+    lab.branch(
+        "feat/alpha",
+        "CHANGELOG.md",
+        &format!("## [1.2.0]\n- two\n## [1.1.0]\n- one\n{LOG_BASE}"),
+    );
+    lab.branch(
+        "feat/beta",
+        "CHANGELOG.md",
+        &format!("## [1.1.5]\n- other\n{LOG_BASE}"),
+    );
     let (home, _consumer) = release_test_home(&lab);
     let cut = knives_release(&lab, &home, &["cut", RELEASE]);
     assert!(
@@ -1543,8 +1542,16 @@ fn a_one_line_section_dropped_from_the_release_log_exits_with_findings() {
     // Given: alpha inserting a section, delta a one-line one, unioned by the
     // cut; then delta's line removed by hand.
     let lab = log_lab();
-    log_member(&lab, "feat/alpha", "## [1.1.0]\n- one\n");
-    log_member(&lab, "feat/delta", "## [1.4.0] delta\n");
+    lab.branch(
+        "feat/alpha",
+        "CHANGELOG.md",
+        &format!("## [1.1.0]\n- one\n{LOG_BASE}"),
+    );
+    lab.branch(
+        "feat/delta",
+        "CHANGELOG.md",
+        &format!("## [1.4.0] delta\n{LOG_BASE}"),
+    );
     let (home, _consumer) = release_test_home(&lab);
     let cut = knives_release(&lab, &home, &["cut", RELEASE]);
     assert!(
