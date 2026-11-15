@@ -24,6 +24,14 @@ fn evidence_token(value: &str) -> Result<String, String> {
         .ok_or_else(|| "evidence must not be blank".to_owned())
 }
 
+/// A `--why` that holds a reason. The record keeps it for the person who
+/// reads it later, and an empty or whitespace-only one tells them nothing.
+fn reason_text(value: &str) -> Result<String, String> {
+    (!value.trim().is_empty())
+        .then(|| value.to_owned())
+        .ok_or_else(|| "a why must hold a reason, not be empty or only whitespace".to_owned())
+}
+
 /// Process exit codes, as a type so a command cannot invent one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
@@ -569,8 +577,9 @@ pub enum ReleaseAction {
         branch: String,
         /// Why it was dropped. Required, and recorded on the release itself:
         /// dropping shipped content without a reason is how a release becomes
-        /// unexplainable later.
-        #[arg(long)]
+        /// unexplainable later. It must hold a reason: an empty or
+        /// whitespace-only value is refused.
+        #[arg(long, value_parser = reason_text)]
         why: String,
     },
     /// Advance member parents to their branches' current tips.
@@ -614,8 +623,9 @@ pub enum ReleaseAction {
         /// The release name. Defaults to the release in hand.
         reference: Option<String>,
         /// Why the commit changes files the conflicts did not touch. Recorded
-        /// in adopt's ledger event.
-        #[arg(long)]
+        /// in adopt's ledger event. It must hold a reason: an empty or
+        /// whitespace-only value is refused.
+        #[arg(long, value_parser = reason_text)]
         why: Option<String>,
     },
     /// The release's parents, or whether a revision's content is carried.
@@ -878,6 +888,32 @@ mod tests {
         // And: a repo-level note needs no subject, so the model's absent subject
         // is reachable.
         assert!(Cli::try_parse_from(["knives", "notch", "-m", "the fork needs a cut"]).is_ok());
+    }
+
+    #[test]
+    fn adopt_and_drop_refuse_a_why_that_holds_no_reason() {
+        // Given: each verb with an empty and a whitespace-only `--why`.
+        for blank in ["", "   ", " \t\n"] {
+            for argv in [
+                vec!["knives", "release", "adopt", "--why", blank],
+                vec!["knives", "release", "drop", "feat/y", "--why", blank],
+            ] {
+                // When / Then: the parser refuses it, naming the flag.
+                let error = Cli::try_parse_from(&argv)
+                    .map(|_| ())
+                    .expect_err("a blank why parsed");
+                assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+                assert!(error.to_string().contains("--why"), "{argv:?}: {error}");
+            }
+        }
+        // And: a real reason parses, padded or not.
+        assert!(
+            Cli::try_parse_from(["knives", "release", "adopt", "--why", " renumbered "]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["knives", "release", "drop", "feat/y", "--why", "not ready"])
+                .is_ok()
+        );
     }
 
     #[test]

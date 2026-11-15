@@ -32,7 +32,7 @@ mod lab;
 use knives::ledger::{Entry, Kind, RecordedParent};
 use lab::{
     Lab, ReleaseOutput, commit_at, extend_branch, file_at_revision, home_after_first_cut,
-    knives_release, release_command, release_parents, release_test_home,
+    knives_release, operation_ids, release_command, release_parents, release_test_home,
 };
 
 const RELEASE: &str = "release/2026-08-04";
@@ -707,6 +707,68 @@ fn adopt_refuses_a_change_beyond_the_conflicts_without_a_why() {
         text(&output)
     );
     assert_eq!(ledger_entries(&home), before);
+}
+
+#[test]
+fn adopt_refuses_a_why_that_holds_no_reason_and_writes_nothing() {
+    // Given: a cut with no conflict, a note added on it by hand: a change
+    // beyond the conflicts, which needs a reason.
+    let (lab, home, _consumer) = two_branch_cut();
+    finish_in_place(&lab, &[("notes.txt", "by hand\n")]);
+    let noted = commit_at(&lab, RELEASE);
+    let parents = release_parents(&lab, RELEASE);
+    let entries = ledger_entries(&home);
+    let operations = operation_ids(&lab.work);
+
+    for blank in ["", "   "] {
+        // When: it is adopted with a why that is empty or only whitespace.
+        let output = adopt(&lab, &home, &["--why", blank]);
+
+        // Then: a usage error that names --why, and nothing is written: the
+        // ledger, the release and the operation log are as they were.
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{blank:?}: {}",
+            text(&output)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--why")
+                && stderr.contains("a why must hold a reason, not be empty or only whitespace"),
+            "{blank:?}: {stderr}"
+        );
+        assert_eq!(ledger_entries(&home), entries, "{blank:?}");
+        assert_eq!(commit_at(&lab, RELEASE), noted, "{blank:?}");
+        assert_eq!(release_parents(&lab, RELEASE), parents, "{blank:?}");
+        assert_eq!(operation_ids(&lab.work), operations, "{blank:?}");
+    }
+
+    // When (control): the same command with a reason.
+    let output = adopt(&lab, &home, &["--why", "a note"]);
+
+    // Then: it is recorded, the reason kept beside the changed file.
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout(&output).contains(
+            "  1 file(s) changed beyond the baseline's conflicts, because: a note\n    \
+             notes.txt\n"
+        ),
+        "{}",
+        text(&output)
+    );
+    let event = newest_event(&home, RELEASE);
+    assert_eq!(
+        event.evidence.first().map(String::as_str),
+        Some(noted.as_str())
+    );
+    assert!(
+        event
+            .text
+            .contains("changed beyond the baseline's conflicts: notes.txt (why: a note)"),
+        "{}",
+        event.text
+    );
 }
 
 #[test]

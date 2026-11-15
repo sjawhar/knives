@@ -430,6 +430,61 @@ fn a_drop_without_a_why_is_a_usage_error() {
 }
 
 #[test]
+fn a_drop_whose_why_holds_no_reason_is_a_usage_error_and_writes_nothing() {
+    // Given: a release cut from alpha and beta.
+    let (lab, home, _consumer) = two_branch_cut();
+    let cut = commit_at(&lab, "release/2026-08-04");
+    let parents = release_parents(&lab, "release/2026-08-04");
+    let ledger = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"));
+    let entries = ledger.read().expect("read ledger").entries;
+    let operations = operation_ids(&lab.work);
+
+    for blank in ["", "   "] {
+        // When: beta is dropped with a why that is empty or only whitespace.
+        let output = knives_release(&lab, &home, &["drop", "feat/beta", "--why", blank]);
+
+        // Then: a usage error that names --why, and nothing is written: the
+        // ledger, the release and the operation log are as they were.
+        assert_eq!(output.status.code(), Some(2), "{blank:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--why")
+                && stderr.contains("a why must hold a reason, not be empty or only whitespace"),
+            "{blank:?}: {stderr}"
+        );
+        assert_eq!(
+            ledger.read().expect("reread ledger").entries,
+            entries,
+            "{blank:?}"
+        );
+        assert_eq!(commit_at(&lab, "release/2026-08-04"), cut, "{blank:?}");
+        assert_eq!(
+            release_parents(&lab, "release/2026-08-04"),
+            parents,
+            "{blank:?}"
+        );
+        assert_eq!(operation_ids(&lab.work), operations, "{blank:?}");
+    }
+
+    // When (control): the same drop with a reason.
+    let stdout = drop_beta(&lab, &home);
+
+    // Then: beta's parent leaves, and the reason is recorded with the drop.
+    assert!(stdout.contains("dropped feat/beta: not ready"), "{stdout}");
+    assert_eq!(
+        release_parents(&lab, "release/2026-08-04").len(),
+        parents.len() - 1
+    );
+    let recorded = ledger.read().expect("read ledger after the drop").entries;
+    assert!(
+        recorded
+            .iter()
+            .any(|entry| entry.text.contains("dropped feat/beta: not ready")),
+        "{recorded:?}"
+    );
+}
+
+#[test]
 fn include_by_commit_id_adds_that_exact_parent() {
     // A commit that no bookmark names is still includable by id.
     let lab = Lab::new();
