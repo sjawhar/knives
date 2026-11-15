@@ -18,6 +18,12 @@
 //! so a reader sees that at once and settles it with `knives release adopt
 //! --why`.
 //!
+//! One insertion is left to a person too: a side's block whose last line has
+//! no newline, where something would follow it. Written verbatim, that line
+//! and the next would run together into one line no side wrote, and the union
+//! never adds a byte to keep them apart. Such a block is unioned only where it
+//! ends the file.
+//!
 //! Everything here is bytes in, bytes out: no repository, no file, no
 //! `String`. A changelog carries CRLF line endings and, on an old project,
 //! bytes that are not UTF-8, and a release write must hand back what it was
@@ -86,8 +92,17 @@ pub fn union_of<T: AsRef<[u8]>>(
         content: Vec::new(),
         first_lines: Vec::new(),
     };
+    // Whether the bytes written last are an inserted block whose last line
+    // has no newline. Nothing may follow such a block: its last line and the
+    // next one would run together into a line no side wrote, and the union
+    // adds no byte to keep them apart. So such a block is written only where
+    // it ends the file, and any byte after it leaves the conflict to a person.
+    let mut unterminated = false;
     for hunk in &hunks {
         if let Some(resolved) = hunk.as_resolved() {
+            if unterminated {
+                return None;
+            }
             union.content.extend_from_slice(resolved);
             continue;
         }
@@ -107,9 +122,13 @@ pub fn union_of<T: AsRef<[u8]>>(
             if inserted.is_empty() || written.contains(&inserted) {
                 continue;
             }
+            if unterminated {
+                return None;
+            }
             written.push(inserted);
             union.first_lines.push(first_line(inserted).to_vec());
             union.content.extend_from_slice(inserted);
+            unterminated = !inserted.ends_with(b"\n");
         }
     }
     Some(union)
@@ -418,6 +437,45 @@ mod tests {
     }
 
     #[test]
+    fn two_blocks_with_no_final_newline_are_not_a_union() {
+        // Given: two sides that each append a block at the end of a file,
+        // neither of them with a final newline
+        let options = merge_options();
+        let contents = merge_of(
+            [b"# Changelog\n"],
+            [b"# Changelog\n## a\n- a", b"# Changelog\n## b\n- b"],
+        );
+
+        // When: the write tries to union them, in either order
+        // Then: there is none, because the last line of the block written
+        // first and the first line of the other would be written as one line
+        assert_eq!(union_of(&contents, None, &options), None);
+        assert_eq!(
+            union_of(&contents, Some(b"# Changelog\n## a\n- a"), &options),
+            None
+        );
+    }
+
+    #[test]
+    fn a_block_with_no_final_newline_is_unioned_only_where_it_ends_the_file() {
+        // Given: two sides appending to the end of a file, the first of them
+        // in jj's term order without a final newline
+        let options = merge_options();
+        let contents = merge_of([b"a\n"], [b"a\nb", b"a\nc\n"]);
+
+        // When: that block would be written first
+        // Then: there is none, because the other side's block would follow it
+        // on its last line
+        assert_eq!(union_of(&contents, None, &options), None);
+
+        // When: the earlier release holds that block, so it is written last
+        let union = union_of(&contents, Some(b"a\nb"), &options).expect("both sides only inserted");
+        // Then: it ends the file, verbatim
+        assert_bytes(&union.content, b"a\nc\nb");
+        assert_eq!(headings(&union), ["c", "b"]);
+    }
+
+    #[test]
     fn crlf_line_endings_survive() {
         // Given: a file with CRLF line endings that two sides insert into
         let options = merge_options();
@@ -508,6 +566,33 @@ mod tests {
             b"# log\n\n## new\n\n## old\n",
             b"# log\n\n## old\n",
             b"# log\n\n## renamed\n",
+            &options
+        ));
+    }
+
+    #[test]
+    fn a_target_that_ran_a_block_into_the_next_does_not_mask_it() {
+        // Given: two members that each appended a block with no final
+        // newline, and a target that wrote both with the last line of one run
+        // into the first line of the other
+        let options = merge_options();
+        let base: &[u8] = b"# Changelog\n";
+        let member_a: &[u8] = b"# Changelog\n## a\n- a";
+        let member_b: &[u8] = b"# Changelog\n## b\n- b";
+        let run_together: &[u8] = b"# Changelog\n## b\n- b## a\n- a";
+
+        // When: either member's change is replayed onto that target
+        // Then: neither is masked, because neither block is a whole run of
+        // the target's lines
+        assert!(!masks(run_together, base, member_a, &options));
+        assert!(!masks(run_together, base, member_b, &options));
+
+        // When: the target ends with one member's block, as a union writes it
+        // Then: that member is masked
+        assert!(masks(
+            b"# Changelog\n## b\n- b\n## a\n- a",
+            base,
+            member_a,
             &options
         ));
     }
