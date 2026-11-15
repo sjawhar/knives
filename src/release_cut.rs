@@ -171,6 +171,22 @@ pub(crate) fn run_release(
             trunk: &trunk,
             tips: &tips,
         };
+        // A divergence the previous release already has is a recorded
+        // resolution only when that release is knives' own write. A hand edit
+        // of a recorded write that nothing recorded may have dropped a
+        // member's change, so its carried rows send the operator to `adopt`,
+        // which measures the resolution. A release the ledger records no
+        // write of has nothing for `adopt` to replace and reads as it did.
+        let previous_unrecorded = match &previous {
+            Some((reference, commit)) => release::in_hand_write(
+                &opened,
+                &gate.ledger.read()?.entries,
+                reference.branch().as_str(),
+                commit,
+            )?
+            .is_unrecorded(),
+            None => false,
+        };
         // A cut names a composition consumers can pin. When the publish remote
         // already holds the previous cut with exactly this tree on exactly these
         // parents, a new name ships nothing and only burns a dated name and a
@@ -240,9 +256,12 @@ pub(crate) fn run_release(
                             trunk: &audit_base,
                         },
                     )?;
-                    if let Some(exit) = report_cut_audit(repo, &audit) {
+                    if let Some(exit) = report_cut_audit(repo, &audit, previous_unrecorded) {
                         return Ok(exit);
                     }
+                    // Beside the refusal, never through it: the cut is
+                    // recorded and the exit says what it carried.
+                    worst = worst.worst(release::carried_exit(&audit, previous_unrecorded));
                     let mut subject = release::CutSubject::Committed(published);
                     let (recorded, check) =
                         match recorded_composition_check(repo, &mut subject, &gate, allow_drop)? {
@@ -299,9 +318,12 @@ pub(crate) fn run_release(
                 trunk: &audit_base,
             },
         )?;
-        if let Some(exit) = report_cut_audit(repo, &audit) {
+        if let Some(exit) = report_cut_audit(repo, &audit, previous_unrecorded) {
             return Ok(exit);
         }
+        // Beside the refusal, never through it: the cut is written and the
+        // exit says what it carried.
+        worst = worst.worst(release::carried_exit(&audit, previous_unrecorded));
         let (recorded, check) = {
             let mut subject = release::CutSubject::Candidate(&mut candidate);
             match recorded_composition_check(repo, &mut subject, &gate, allow_drop)? {
@@ -394,15 +416,17 @@ fn release_plan_exit(
 /// unexplained content refuses the cut, because naming it would look exactly
 /// like success while work is gone. The refused candidate was never a
 /// published operation, so nothing is abandoned and nothing needs cleanup.
-fn report_cut_audit(repo: &RepoName, audit: &release::CutAudit) -> Option<Exit> {
-    // Each name is a member's bookmark, read from the repository.
+/// A divergence carried from a previous release no event records is named
+/// as such (`previous_unrecorded`); the caller turns it into findings.
+fn report_cut_audit(
+    repo: &RepoName,
+    audit: &release::CutAudit,
+    previous_unrecorded: bool,
+) -> Option<Exit> {
     for name in &audit.carried {
-        println!(
-            "  {}: diverges where the previous release already did \
-             (a recorded resolution); carried forward",
-            inline_human_text(name)
-        );
+        println!("{}", release::carried_row(name, previous_unrecorded));
     }
+    // Each name is a member's bookmark, read from the repository.
     for name in &audit.inconclusive {
         println!(
             "  {}: content check inconclusive (replay conflicted; \

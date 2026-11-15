@@ -730,6 +730,85 @@ impl Repo {
         })
     }
 
+    /// The net change `revision` makes from its fork point with `trunk`,
+    /// replayed onto `target`, with a release log the target holds as a union
+    /// left out ([`replayed_tree`]).
+    ///
+    /// This answers whether `target`'s tree holds a revision it already
+    /// reaches. [`Self::tree_replay_outcome`] cannot: its base is the common
+    /// ancestor of the two, which for such a revision is the revision itself,
+    /// so it always reads empty. A release merge reaches every member it names
+    /// as a parent whatever its tree holds, so a hand resolution that dropped
+    /// a member's change is seen only from the member's own fork point. That
+    /// is the trunk itself when the histories criss-cross, as
+    /// `uncarried_recorded_members` takes a member's base.
+    pub fn fork_point_replay_outcome(
+        &self,
+        revision: &CommitId,
+        trunk: &CommitId,
+        target: &CommitId,
+    ) -> Result<RebaseOutcome, JjError> {
+        let base = self
+            .common_ancestor(std::slice::from_ref(revision), trunk)?
+            .unwrap_or_else(|| trunk.clone());
+        self.net_diff_outcome(base.as_str(), revision.as_str(), target.as_str())
+    }
+
+    /// Replays the net tree effect of `base..revision` onto a target.
+    ///
+    /// A scratch child of `base` carrying `revision`'s tree has the range's net
+    /// effect as its diff by construction. Replaying that one synthetic commit
+    /// avoids the conflicts that replaying each source commit manufactures when an
+    /// intermediate commit is applied to a tree that already has the range's final
+    /// content.
+    ///
+    /// A release log whose block the target already holds as part of a union is
+    /// left out of the synthetic commit ([`replayed_tree`]): the replay reads what
+    /// the target lacks, and a union lacks nothing of the block it holds.
+    ///
+    /// A read, not a mutation: the replay runs inside a jj-lib transaction that is
+    /// dropped without ever becoming an operation (#18). No other reader of the
+    /// shared repository can observe it at any point, so there are no synthetic
+    /// bookmarks, no cleanup guard, and no crash-recovery machinery.
+    fn net_diff_outcome(
+        &self,
+        base: &str,
+        revision: &str,
+        onto: &str,
+    ) -> Result<RebaseOutcome, JjError> {
+        let base = self.commit(base)?;
+        let revision = self.commit(revision)?;
+        let onto = self.commit(onto)?;
+        // `base..revision` is empty exactly when the base already reaches the tip.
+        if self.backend_is_ancestor(revision.id(), base.id())? {
+            return Ok(RebaseOutcome::Empty);
+        }
+        let mut tx = self.repo.start_transaction();
+        let tree = replayed_tree(&base.tree(), revision.tree(), &onto.tree())?;
+        let synthetic = block_on(
+            tx.repo_mut()
+                .new_commit(vec![base.id().clone()], tree)
+                .write(),
+        )
+        .map_err(|error| store_error(&error))?;
+        let replayed = block_on(rebase_commit(
+            tx.repo_mut(),
+            synthetic,
+            vec![onto.id().clone()],
+        ))
+        .map_err(|error| store_error(&error))?;
+        let outcome = if replayed.has_conflict() {
+            RebaseOutcome::Conflicted
+        } else if block_on(replayed.is_empty(tx.repo())).map_err(|error| store_error(&error))? {
+            RebaseOutcome::Empty
+        } else {
+            RebaseOutcome::CleanNonEmpty
+        };
+        // Dropped, never committed: the probe leaves no trace in the op log.
+        drop(tx);
+        Ok(outcome)
+    }
+
     /// [`Self::is_ancestor`] by backend id, saving the hex round-trip.
     fn backend_is_ancestor(
         &self,
@@ -1350,60 +1429,14 @@ pub fn carries_work_past(repo: &Path, base: &CommitId, tip: &CommitId) -> Result
     Ok(states.lines().any(|line| line.trim() == "false"))
 }
 
-/// Replays the net tree effect of `base..revision` onto a target.
-///
-/// A scratch child of `base` carrying `revision`'s tree has the range's net
-/// effect as its diff by construction. Replaying that one synthetic commit
-/// avoids the conflicts that replaying each source commit manufactures when an
-/// intermediate commit is applied to a tree that already has the range's final
-/// content.
-///
-/// A release log whose block the target already holds as part of a union is
-/// left out of the synthetic commit ([`replayed_tree`]): the replay reads what
-/// the target lacks, and a union lacks nothing of the block it holds.
-///
-/// A read, not a mutation: the replay runs inside a jj-lib transaction that is
-/// dropped without ever becoming an operation (#18). No other reader of the
-/// shared repository can observe it at any point, so there are no synthetic
-/// bookmarks, no cleanup guard, and no crash-recovery machinery.
+/// [`Repo::net_diff_outcome`] in a repository opened for the one probe.
 pub fn probe_net_diff(
     repo: &Path,
     base: &str,
     revision: &str,
     onto: &str,
 ) -> Result<RebaseOutcome, JjError> {
-    let repo = Repo::open(repo)?;
-    let base = repo.commit(base)?;
-    let revision = repo.commit(revision)?;
-    let onto = repo.commit(onto)?;
-    // `base..revision` is empty exactly when the base already reaches the tip.
-    if repo.backend_is_ancestor(revision.id(), base.id())? {
-        return Ok(RebaseOutcome::Empty);
-    }
-    let mut tx = repo.repo.start_transaction();
-    let tree = replayed_tree(&base.tree(), revision.tree(), &onto.tree())?;
-    let synthetic = block_on(
-        tx.repo_mut()
-            .new_commit(vec![base.id().clone()], tree)
-            .write(),
-    )
-    .map_err(|error| store_error(&error))?;
-    let replayed = block_on(rebase_commit(
-        tx.repo_mut(),
-        synthetic,
-        vec![onto.id().clone()],
-    ))
-    .map_err(|error| store_error(&error))?;
-    let outcome = if replayed.has_conflict() {
-        RebaseOutcome::Conflicted
-    } else if block_on(replayed.is_empty(tx.repo())).map_err(|error| store_error(&error))? {
-        RebaseOutcome::Empty
-    } else {
-        RebaseOutcome::CleanNonEmpty
-    };
-    // Dropped, never committed: the probe leaves no trace in the op log.
-    drop(tx);
-    Ok(outcome)
+    Repo::open(repo)?.net_diff_outcome(base, revision, onto)
 }
 
 /// `revision`'s tree, as the synthetic commit of a replay of `base..revision`

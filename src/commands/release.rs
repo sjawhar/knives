@@ -777,6 +777,98 @@ pub fn earlier_writes(
     Ok(writes)
 }
 
+/// How a release's commit in hand stands to the writes the ledger records
+/// under its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InHandWrite {
+    /// It is the newest recorded write, or that write re-signed or
+    /// metaedited ([`Repo::is_metadata_rewrite`]), which audit already reads
+    /// as it.
+    Recorded,
+    /// The name has a recorded write and the commit is neither it nor such a
+    /// copy of it: a release finished by hand that no `knives release adopt`
+    /// recorded. `newest` is that write where this repository holds it.
+    Unrecorded { newest: Option<CommitId> },
+    /// The ledger records no write of the name: a release older than the
+    /// ledger, or one made with no knives at all. `adopt` has no write for it
+    /// to replace, so it is read as it always was.
+    NoRecord,
+}
+
+impl InHandWrite {
+    /// Whether the commit is a hand edit of a recorded write that no `adopt`
+    /// recorded: the one standing whose carried rows send the operator to
+    /// `adopt`.
+    pub const fn is_unrecorded(&self) -> bool {
+        matches!(self, Self::Unrecorded { .. })
+    }
+}
+
+/// Whether `commit`, the release `name` holds here, is its newest recorded
+/// write.
+///
+/// A divergence the release already has is a recorded resolution only when
+/// it is: a hand edit nothing recorded may have dropped a member's change,
+/// and a cut built from it would carry the loss forward under a new name.
+pub fn in_hand_write(
+    repo: &Repo,
+    ledger: &[Entry],
+    name: &str,
+    commit: &CommitId,
+) -> Result<InHandWrite, crate::jj::JjError> {
+    let Some(newest) = crate::release_model::recorded_writes(ledger, name).next() else {
+        return Ok(InHandWrite::NoRecord);
+    };
+    // A write made on another machine and never fetched is not held here;
+    // the commit in hand, which is, cannot be it.
+    let Ok(newest) = repo.resolve_commit(newest.commit.as_str()) else {
+        return Ok(InHandWrite::Unrecorded { newest: None });
+    };
+    if newest == *commit || repo.is_metadata_rewrite(newest.as_str(), commit.as_str())? {
+        return Ok(InHandWrite::Recorded);
+    }
+    Ok(InHandWrite::Unrecorded {
+        newest: Some(newest),
+    })
+}
+
+/// The row for a member the audited release diverges from exactly where the
+/// release it is held against already did ([`CutAudit::carried`]).
+///
+/// That divergence is a recorded resolution only when the release it is held
+/// against is knives' own write. One finished by hand and never adopted is
+/// named as such, with the command that records it, since nothing measured
+/// what its resolution kept of each member.
+pub fn carried_row(name: &str, unrecorded: bool) -> String {
+    // Each name is a member's bookmark, read from the repository.
+    let name = crate::ledger::inline_human_text(name);
+    if unrecorded {
+        format!(
+            "  {name}: diverges where the unrecorded in-hand release already does; \
+             record it with `knives release adopt` and cut again"
+        )
+    } else {
+        format!(
+            "  {name}: diverges where the previous release already did \
+             (a recorded resolution); carried forward"
+        )
+    }
+}
+
+/// The exit carried rows give: findings when the release they diverge with
+/// is unrecorded.
+///
+/// Its resolution is to be recorded before a cut carries it on. Nothing is
+/// refused: a resolution that kept every member's change is the common case,
+/// and `adopt` is what measures it.
+pub const fn carried_exit(audit: &CutAudit, unrecorded: bool) -> Exit {
+    if unrecorded && !audit.carried.is_empty() {
+        Exit::Findings
+    } else {
+        Exit::Ok
+    }
+}
+
 /// The newest dated cut's branch name — unqualified, unlike
 /// [`previous_release_for_cut`]'s — and its live commit: the local ref when
 /// present, otherwise whichever of our remotes carries it.
@@ -1245,6 +1337,13 @@ pub struct MembersReport {
     /// `--verify` only: `audit_cut`'s four buckets, reusing the cut path's phrasing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit: Option<CutAudit>,
+    /// `--verify` only: whether the release is a hand edit of its newest
+    /// recorded write that no `adopt` recorded ([`InHandWrite::Unrecorded`]).
+    /// Such a release is held against that write where this repository holds
+    /// it, and a divergence the write already had is reported as the
+    /// unrecorded release's, for `adopt` to record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unrecorded: Option<bool>,
     pub notes: Vec<String>,
     pub problems: Vec<String>,
 }
@@ -1290,11 +1389,15 @@ fn member_label(member: &MemberRow) -> String {
 }
 
 /// Gather the parents, holders, and optional content audit for a named release.
+///
+/// `verify` holds the fork's ledger when the content is to be replayed
+/// (`--verify`): whether the release is its newest recorded write decides
+/// what the audit holds it against.
 pub fn gather_members(
     opened: &Repo,
     fork: &Fork<'_>,
     name: &str,
-    verify: bool,
+    verify: Option<&[Entry]>,
 ) -> anyhow::Result<MembersReport> {
     let entry = fork.entry;
     let commit = opened.resolve_commit(name)?;
@@ -1321,8 +1424,23 @@ pub fn gather_members(
         .into_iter()
         .map(|parent| member_row(opened, parent, trunk.as_ref(), &successions))
         .collect::<anyhow::Result<_>>()?;
-    let audit = if verify {
-        trunk
+    let (audit, unrecorded) = if let Some(ledger) = verify {
+        // The ledger records writes under the name, never under a remote's ref.
+        let standing = in_hand_write(
+            opened,
+            ledger,
+            BookmarkRef::parse(name).branch().as_str(),
+            &commit,
+        )?;
+        // An unrecorded release is held against the write it replaced, as a
+        // cut is held against the release it duplicates: a divergence that
+        // write already had is the hand resolution, which `adopt` measures and
+        // records, and one it did not have is still missing.
+        let previous = match &standing {
+            InHandWrite::Unrecorded { newest } => newest.as_ref(),
+            InHandWrite::Recorded | InHandWrite::NoRecord => None,
+        };
+        let audit = trunk
             .as_ref()
             .map(|trunk| {
                 let members: Vec<(String, CommitId)> = members
@@ -1334,15 +1452,13 @@ pub fn gather_members(
                     &fork.checkout.path,
                     &members,
                     CutSubject::Committed(&commit),
-                    AuditContext {
-                        previous: None,
-                        trunk,
-                    },
+                    AuditContext { previous, trunk },
                 )
             })
-            .transpose()?
+            .transpose()?;
+        (audit, Some(standing.is_unrecorded()))
     } else {
-        None
+        (None, None)
     };
     Ok(MembersReport {
         repo: fork.checkout.path.display().to_string(),
@@ -1351,6 +1467,7 @@ pub fn gather_members(
         parent_count: members.len(),
         members,
         audit,
+        unrecorded,
         notes: Vec::new(),
         problems,
     })
@@ -1386,11 +1503,7 @@ pub fn render_members(report: &MembersReport) -> String {
     }
     if let Some(audit) = &report.audit {
         for name in &audit.carried {
-            lines.push(format!(
-                "  {}: diverges where the previous release already did \
-                 (a recorded resolution); carried forward",
-                inline_human_text(name)
-            ));
+            lines.push(carried_row(name, report.unrecorded == Some(true)));
         }
         for name in &audit.inconclusive {
             lines.push(format!(
@@ -2036,6 +2149,7 @@ mod tests {
                 unexplained: vec![raw.to_owned()],
                 ..CutAudit::default()
             }),
+            unrecorded: Some(false),
             notes: vec![raw.to_owned()],
             problems: Vec::new(),
         };
@@ -2932,6 +3046,7 @@ mod members_tests {
     }
 
     fn report(audit: Option<CutAudit>) -> MembersReport {
+        let unrecorded = audit.as_ref().map(|_| false);
         MembersReport {
             repo: "demo".to_owned(),
             release: "release/2026-08-30".to_owned(),
@@ -2949,6 +3064,7 @@ mod members_tests {
                 row("eeeeeeeeeeeeeeee", &["main@upstream"], &[], true),
             ],
             audit,
+            unrecorded,
             notes: Vec::new(),
             problems: Vec::new(),
         }
@@ -2977,6 +3093,31 @@ mod members_tests {
                 "  !! Cargo.lock: changed between the previous release and this cut with no member or trunk explaining it"
             )
         );
+    }
+
+    #[test]
+    fn members_render_a_divergence_an_unrecorded_release_carries_as_one_to_adopt() {
+        // Given: a verified release that is not its newest recorded write,
+        // whose audit carried one member's divergence from that write.
+        let mut report = report(Some(CutAudit {
+            carried: vec!["feat/alpha@aaaaaaaaaaaa".to_owned()],
+            ..CutAudit::default()
+        }));
+        report.unrecorded = Some(true);
+
+        // When: it is rendered.
+        let rendered = render_members(&report);
+
+        // Then: the row names the unrecorded release and the command that
+        // records it, never a recorded resolution.
+        assert!(
+            rendered.contains(
+                "  feat/alpha@aaaaaaaaaaaa: diverges where the unrecorded in-hand release already \
+                 does; record it with `knives release adopt` and cut again\n"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("a recorded resolution"), "{rendered}");
     }
 
     #[test]
@@ -3014,6 +3155,7 @@ mod members_tests {
                 inconclusive: Vec::new(),
                 carried: Vec::new(),
             }),
+            unrecorded: Some(false),
             notes: Vec::new(),
             problems: Vec::new(),
         };
@@ -3039,6 +3181,7 @@ mod members_tests {
                 false,
             )],
             audit: None,
+            unrecorded: None,
             notes: Vec::new(),
             problems: Vec::new(),
         };
@@ -3106,7 +3249,7 @@ mod members_tests {
         let fork = Fork::at("demo", &entry, &repository);
         let opened = Repo::open(&repository).expect("open test repository");
         let members =
-            gather_members(&opened, &fork, "release/2026-08-30", false).expect("gather members");
+            gather_members(&opened, &fork, "release/2026-08-30", None).expect("gather members");
 
         assert_eq!(members.parent_count, 2);
     }
@@ -3129,11 +3272,101 @@ mod members_tests {
         let fork = Fork::at("demo", &entry, &repository);
         let opened = Repo::open(&repository).expect("open test repository");
         let members =
-            gather_members(&opened, &fork, "release/2026-08-30", false).expect("gather members");
+            gather_members(&opened, &fork, "release/2026-08-30", None).expect("gather members");
 
         assert_eq!(members.members.len(), 1);
         assert_eq!(members.members[0].held_by, Vec::<String>::new());
         assert_eq!(members.members[0].advanced, Vec::<String>::new());
         assert!(render_members(&members).contains("bare commit — nothing holds it"));
+    }
+
+    /// A cut event of `name` recording `commit`, as `record_cut_event`
+    /// writes one: its text begins `cut <name> as`, and its evidence is the
+    /// commit, then the members.
+    fn cut_event(name: &str, commit: &str) -> Entry {
+        Entry {
+            ts: "2026-08-30T00:00:00Z".to_owned(),
+            owner: "test".to_owned(),
+            email: None,
+            subject: Some(name.to_owned()),
+            kind: Kind::Event,
+            disposition: None,
+            statement: None,
+            text: format!(
+                "cut {name} as {} with 1 parent(s)",
+                crate::ids::short_id(commit)
+            ),
+            evidence: vec![commit.to_owned(), "member0000000".to_owned()],
+            anchor: None,
+            pr: None,
+            parents: Vec::new(),
+            claim_change: None,
+            claim_change_why: None,
+            previous_owner: None,
+            previous_kind: None,
+            previous_started: None,
+            previous_last_seen: None,
+            previous_why: None,
+        }
+    }
+
+    #[test]
+    fn a_release_in_hand_is_its_recorded_write_an_unrecorded_edit_or_has_no_record() {
+        // Given: a release commit knives recorded, the same commit reworded
+        // (a metadata rewrite), and then its tree edited by hand, which keeps
+        // the change id and moves the bookmark.
+        let _environment = crate::config::test_support::environment_lock();
+        let directory = tempfile::tempdir().expect("create test repository");
+        let repository = directory.path().join("repo");
+        let repository_text = repository.display().to_string();
+        let name = "release/2026-08-30";
+        let at = |repository: &Path| {
+            Repo::open(repository)
+                .expect("open test repository")
+                .resolve_commit(name)
+                .expect("resolve the release")
+        };
+        run_jj(directory.path(), &["git", "init", &repository_text]);
+        run_jj(&repository, &["new", "-r", "root()", "-m", "release"]);
+        run_jj(&repository, &["bookmark", "create", name, "-r", "@"]);
+        let written = at(&repository);
+        run_jj(
+            &repository,
+            &["describe", "-r", name, "-m", "release, reworded"],
+        );
+        let reworded = at(&repository);
+        std::fs::write(repository.join("resolved.txt"), "by hand\n").expect("edit by hand");
+        run_jj(&repository, &["new"]);
+        let edited = at(&repository);
+        let opened = Repo::open(&repository).expect("open test repository");
+        let ledger = [cut_event(name, written.as_str())];
+        let standing = |ledger: &[Entry], commit: &CommitId| {
+            in_hand_write(&opened, ledger, name, commit).expect("read the standing")
+        };
+
+        // When/Then: the recorded write and its reworded copy are recorded.
+        assert_eq!(standing(&ledger, &written), InHandWrite::Recorded);
+        assert_eq!(standing(&ledger, &reworded), InHandWrite::Recorded);
+        // And: the hand edit is unrecorded, held against the write it replaced.
+        let unrecorded = standing(&ledger, &edited);
+        assert_eq!(
+            unrecorded,
+            InHandWrite::Unrecorded {
+                newest: Some(written)
+            }
+        );
+        assert!(unrecorded.is_unrecorded());
+        // And: a newest write this repository does not hold leaves the edit
+        // unrecorded with nothing to hold it against.
+        let elsewhere = [cut_event(name, &"f".repeat(40))];
+        assert_eq!(
+            standing(&elsewhere, &edited),
+            InHandWrite::Unrecorded { newest: None }
+        );
+        // And: a name the ledger records no write of has no record, which is
+        // not unrecorded.
+        let no_record = standing(&[], &edited);
+        assert_eq!(no_record, InHandWrite::NoRecord);
+        assert!(!no_record.is_unrecorded());
     }
 }

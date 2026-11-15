@@ -23,8 +23,8 @@ mod lab;
 use knives::ids::ReleaseScheme;
 use knives::jj::Repo;
 use lab::{
-    Lab, commit_at, file_at_revision, home_after_first_cut, knives_release, release_parents,
-    release_test_home,
+    Lab, commit_at, file_at_revision, home_after_first_cut, knives_release, operation_ids,
+    release_parents, release_test_home,
 };
 
 #[test]
@@ -585,6 +585,59 @@ fn a_flat_release_recuts_after_upstream_drift_collides_with_a_member() {
     );
 }
 
+/// Cut `name` from the hand-resolved `shared.txt` release and hold the cut to
+/// what carrying that resolution means: written, nothing refused as a loss,
+/// every row of `rows` printed, the resolution in its tree, and the exit
+/// `code`. Returns its stdout.
+fn cut_carrying_the_resolution(
+    lab: &Lab,
+    home: &tempfile::TempDir,
+    name: &str,
+    (rows, code): (&[String], i32),
+) -> String {
+    let output = knives_release(lab, home, &["cut", name]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        stdout.contains(&format!("cut {name} as")),
+        "re-cut was refused: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !stdout.contains("missing or diverges"),
+        "a carried resolution was refused as a loss: {stdout}"
+    );
+    for row in rows {
+        assert!(
+            stdout.contains(row.as_str()),
+            "missing carried-resolution report: {stdout}"
+        );
+    }
+    assert_eq!(output.status.code(), Some(code), "{stdout}");
+    assert_eq!(
+        file_at_revision(lab, name, "shared.txt"),
+        "merged\n",
+        "the resolution must survive the re-cut"
+    );
+    stdout
+}
+
+/// The cut's row for a member whose divergence the release it carries from,
+/// which nothing recorded, already has.
+fn unrecorded_row(member: &str) -> String {
+    format!(
+        "  {member}: diverges where the unrecorded in-hand release already does; record it \
+         with `knives release adopt` and cut again"
+    )
+}
+
+/// The cut's row for a member whose divergence a recorded release already has.
+fn recorded_row(member: &str) -> String {
+    format!(
+        "  {member}: diverges where the previous release already did (a recorded \
+         resolution); carried forward"
+    )
+}
+
 #[test]
 fn a_recut_carries_a_recorded_resolution_that_dropped_content() {
     // Given: two members conflicting on one file, the conflict resolved by hand
@@ -602,37 +655,83 @@ fn a_recut_carries_a_recorded_resolution_that_dropped_content() {
     lab.jj_work(["edit", "release/2026-08-04"]);
     std::fs::write(lab.work.join("shared.txt"), "merged\n").expect("resolve by hand");
     lab.jj_work(["new"]);
+    let (alpha, beta) = (commit_at(&lab, "feat/alpha"), commit_at(&lab, "feat/beta"));
 
-    // When: the identical composition is re-cut under a new name.
-    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    // When: the hand resolution, which nothing recorded, is verified.
+    let verified = knives_release(&lab, &home, &["members", "release/2026-08-04", "--verify"]);
 
-    // Then: the recorded resolution is carried, reported, and not refused —
-    // the audit charges a cut only with divergence it introduces.
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Then: each member's divergence from the recorded cut is named as the
+    // unrecorded release's, with the command that records it, as a finding.
+    let stdout = String::from_utf8_lossy(&verified.stdout);
+    assert_eq!(verified.status.code(), Some(1), "{stdout}");
+    for (member, tip) in [("feat/alpha", &alpha), ("feat/beta", &beta)] {
+        assert!(
+            stdout.contains(&unrecorded_row(&format!("{member}@{}", tip.short()))),
+            "{stdout}"
+        );
+    }
+
+    // When: the identical composition is re-cut under a new name, with no
+    // adopt recording the resolution first. The working copy steps off the
+    // release, or the reap after the cut keeps it for that, a finding of its
+    // own.
+    lab.jj_work(["new", "main@origin"]);
+    let before_cut = operation_ids(&lab.work)
+        .first()
+        .cloned()
+        .expect("the operation before the cut");
+    let rows = [unrecorded_row("feat/alpha"), unrecorded_row("feat/beta")];
+
+    // Then: the resolution is carried and not refused — the audit charges a
+    // cut only with divergence it introduces — but the rows say the release
+    // it carries from is unrecorded and name `adopt`, and the cut exits 1.
+    let stdout = cut_carrying_the_resolution(&lab, &home, "release/2026-08-05", (&rows, 1));
+    assert!(!stdout.contains("a recorded resolution"), "{stdout}");
+
+    // Given: that cut, never pushed, taken back with the reap that followed
+    // it, and the hand resolution recorded as the first release's newest
+    // write. It kept no line either member added, so `adopt` records it and
+    // says so with findings.
+    lab.jj_work(["op", "restore", before_cut.as_str()]);
+    let adopted = knives_release(
+        &lab,
+        &home,
+        &[
+            "adopt",
+            "release/2026-08-04",
+            "--why",
+            "kept neither side of shared.txt",
+        ],
+    );
+    let adopted_stdout = String::from_utf8_lossy(&adopted.stdout);
     assert!(
-        stdout.contains("cut release/2026-08-05 as"),
-        "re-cut was refused: {stdout}\n{}",
-        String::from_utf8_lossy(&output.stderr)
+        adopted_stdout.contains("as the newest write of release/2026-08-04"),
+        "{adopted_stdout}\n{}",
+        String::from_utf8_lossy(&adopted.stderr)
     );
+    assert_eq!(adopted.status.code(), Some(1), "{adopted_stdout}");
+
+    // When: the recorded release is verified.
+    let verified = knives_release(&lab, &home, &["members", "release/2026-08-04", "--verify"]);
+
+    // Then: verifying a release that is its recorded write reads as it always
+    // has: nothing is held against an earlier write, so nothing is carried.
+    let stdout = String::from_utf8_lossy(&verified.stdout);
+    assert!(!stdout.contains("diverges where"), "{stdout}");
     assert!(
-        !stdout.contains("missing or diverges"),
-        "a recorded resolution was refused as a loss: {stdout}"
+        stdout.contains(&format!(
+            "  !! feat/alpha@{}: the cut tree is missing or diverges from the member's content",
+            alpha.short()
+        )),
+        "{stdout}"
     );
-    assert!(
-        stdout.contains(
-            "feat/alpha: diverges where the previous release already did \
-             (a recorded resolution); carried forward"
-        ) && stdout.contains(
-            "feat/beta: diverges where the previous release already did \
-             (a recorded resolution); carried forward"
-        ),
-        "missing carried-resolution report: {stdout}"
-    );
-    assert_eq!(
-        file_at_revision(&lab, "release/2026-08-05", "shared.txt"),
-        "merged\n",
-        "the resolution must survive the re-cut"
-    );
+
+    // When: the composition is re-cut.
+    let rows = [recorded_row("feat/alpha"), recorded_row("feat/beta")];
+
+    // Then: the recut's rows read the resolution as recorded, and it exits 0.
+    let stdout = cut_carrying_the_resolution(&lab, &home, "release/2026-08-06", (&rows, 0));
+    assert!(!stdout.contains("unrecorded"), "{stdout}");
 }
 
 #[test]
