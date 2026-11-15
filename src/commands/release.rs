@@ -9,7 +9,7 @@
 //! as their union, and refuses while the release in hand carries a change
 //! knives did not write or adopt, printing the steps that record it. Every one
 //! of them writes locally only, and none of them pushes.
-// allow: SIZE_OK: 4025 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
+// allow: SIZE_OK: 3998 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -909,13 +909,16 @@ pub enum InHandWrite {
     /// `write`, the matched write ([`matched_write`]), rebased onto its
     /// members. Every write refuses it until `adopt` records it.
     Unrecorded { write: RecordedWrite },
-    /// The ledger records writes of the name, and nothing here can measure
-    /// the release against them ([`Unchecked`]). A write over it proceeds and
-    /// says so.
+    /// Nothing here can measure the release against the writes the ledger
+    /// records of its name ([`Unchecked`]). A write over it proceeds and says
+    /// so, except over a release whose every parent is an earlier write
+    /// ([`NoMatch::AllCarriers`], whether or not the ledger records a write of
+    /// the name), which every write and `adopt` refuse.
     Unchecked(Unchecked),
     /// The ledger records no write of the name: a release older than the
     /// ledger, or one made with no knives at all. `adopt` has no write for it
-    /// to replace, so it is read as it always was.
+    /// to replace, so it is read as it always was. A release whose every
+    /// parent is an earlier write is [`Self::Unchecked`] instead.
     NoRecord,
 }
 
