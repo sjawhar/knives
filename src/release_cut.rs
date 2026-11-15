@@ -134,7 +134,8 @@ pub(crate) fn run_release(
         // it reads as recorded; so the tree decides before any audit does,
         // and the cut refuses whatever the audit's rows would say. The rows
         // name a release that is recorded as one; one knives could not check
-        // is cut, says so, and its event carries the mark.
+        // is cut, says so, and its event carries the mark; one the ledger
+        // records no write of is cut, and its rows say nothing measured it.
         let (carried_from, unchecked) = match &previous {
             Some((reference, commit)) => {
                 let in_hand = release::InHand {
@@ -154,9 +155,13 @@ pub(crate) fn run_release(
                 let from = match &standing {
                     release::InHandWrite::Recorded => release::CarriedFrom::Recorded,
                     release::InHandWrite::Unchecked(_) => release::CarriedFrom::Unchecked,
-                    release::InHandWrite::Unrecorded { .. } | release::InHandWrite::NoRecord => {
-                        release::CarriedFrom::Unledgered
-                    }
+                    release::InHandWrite::NoRecord => release::CarriedFrom::Unledgered,
+                    // `in_hand_refusal` refuses every unrecorded release, so
+                    // the refusal above has returned before this match.
+                    release::InHandWrite::Unrecorded { .. } => anyhow::bail!(
+                        "{repo}: the in-hand refusal returns first for an unrecorded release, \
+                         yet the cut of {name} reached its carried rows over one; this is a bug"
+                    ),
                 };
                 (from, announce_unchecked(repo, &in_hand, &standing))
             }

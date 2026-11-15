@@ -465,11 +465,29 @@ fn a_name_the_ledger_records_no_write_of_is_not_refused() {
     // When: from the same state, the composition is cut under a new name.
     lab.jj_work(["op", "restore", before[0].as_str()]);
     std::fs::remove_dir_all(&ledger).expect("remove the ledger again");
-    let out = release_ran(&lab, &home, &["cut", NEXT]);
+    let cut = release_in(&lab, &home, &lab.work, &["cut", NEXT]);
+    let out = stdout(&cut);
 
-    // Then: it is not refused, and the resolution is carried.
-    assert!(out.contains(&format!("cut {NEXT} as")), "{out}");
+    // Then: it is written, not refused, and exits 0, and the resolution is
+    // carried.
+    assert!(out.contains(&format!("cut {NEXT} as")), "{}", text(&cut));
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
     assert_eq!(file_at_revision(&lab, NEXT, "shared.txt"), "merged\n");
+    // And: nothing measured the divergence each member's row reports, so
+    // the row says the ledger records no write of the release in hand and to
+    // check it by hand, never that a recorded resolution was carried forward.
+    for member in ["feat/alpha", "feat/beta"] {
+        assert!(
+            out.contains(&format!(
+                "  {member}: the ledger records no write of the release in hand, so nothing \
+                 measured its divergence from this member; check that divergence by hand\n"
+            )),
+            "{out}"
+        );
+    }
+    assert!(!out.contains("diverges where"), "{out}");
+    assert!(!out.contains("carried forward"), "{out}");
+    assert!(!out.contains("recorded resolution"), "{out}");
 }
 
 #[test]

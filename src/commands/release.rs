@@ -9,7 +9,7 @@
 //! as their union, and refuses while the release in hand carries a change
 //! knives did not write or adopt, printing the steps that record it. Every one
 //! of them writes locally only, and none of them pushes.
-// allow: SIZE_OK: 3998 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
+// allow: SIZE_OK: 4021 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -916,9 +916,12 @@ pub enum InHandWrite {
     /// the name), which every write and `adopt` refuse.
     Unchecked(Unchecked),
     /// The ledger records no write of the name: a release older than the
-    /// ledger, or one made with no knives at all. `adopt` has no write for it
-    /// to replace, so it is read as it always was. A release whose every
-    /// parent is an earlier write is [`Self::Unchecked`] instead.
+    /// ledger, or one made with no knives at all. No write refuses it or marks
+    /// it unchecked, and `adopt` has no write for it to replace, so nothing
+    /// measures it: a cut's carried rows say the ledger records no write of
+    /// it and that a person must check each divergence by hand
+    /// ([`CarriedFrom::Unledgered`]). A release whose every parent is an
+    /// earlier write is [`Self::Unchecked`] instead.
     NoRecord,
 }
 
@@ -1427,7 +1430,10 @@ pub enum CarriedFrom {
     /// One knives could not check against its recorded writes
     /// ([`InHandWrite::Unchecked`]).
     Unchecked,
-    /// One the ledger records no write of, or no release at all.
+    /// One the ledger records no write of ([`InHandWrite::NoRecord`]), or no
+    /// release at all. Nothing measured where it diverges from a member, and
+    /// `adopt` refuses a release with no recorded write, so its row says a
+    /// person must check that divergence by hand.
     Unledgered,
 }
 
@@ -1435,10 +1441,13 @@ pub enum CarriedFrom {
 /// release it is held against already did ([`CutAudit::carried`]).
 ///
 /// Held against a recorded write, the divergence is a resolution knives
-/// wrote or `adopt` recorded. Held against an unchecked release, nothing
-/// measured it, and the row says so. A release finished by hand and never
-/// adopted refuses the write before any row is printed, and one the ledger
-/// records no write of reads as it always has.
+/// wrote or `adopt` recorded, and the row says it is carried forward. Held
+/// against an unchecked release, nothing measured it, and the row says to
+/// record the release with `adopt` and cut again. Held against a release the
+/// ledger records no write of, nothing measured it either, and `adopt`
+/// refuses such a release, so the row says the ledger records no write of it
+/// and to check the divergence by hand. A release finished by hand and never
+/// adopted refuses the write before any row is printed.
 pub fn carried_row(name: &str, from: CarriedFrom) -> String {
     // Each name is a member's bookmark, read from the repository.
     let name = crate::ledger::inline_human_text(name);
@@ -1452,8 +1461,8 @@ pub fn carried_row(name: &str, from: CarriedFrom) -> String {
              with `knives release adopt` and cut again"
         ),
         CarriedFrom::Unledgered => format!(
-            "  {name}: diverges where the previous release already did \
-             (a recorded resolution); carried forward"
+            "  {name}: the ledger records no write of the release in hand, so nothing \
+             measured its divergence from this member; check that divergence by hand"
         ),
     }
 }
@@ -2864,9 +2873,10 @@ pub struct CutAudit {
     pub unexplained: Vec<String>,
     pub inconclusive: Vec<String>,
     /// Members the cut diverges from exactly as the previous release already
-    /// did: a recorded conflict resolution, published and deliberate. Reported,
-    /// never refused — the audit charges a cut only with divergence it
-    /// introduces.
+    /// did. Reported, never refused — the audit charges a cut only with
+    /// divergence it introduces. Whether that divergence is a recorded
+    /// resolution is the caller's question: each row says how the previous
+    /// release stands to its recorded writes ([`carried_row`]).
     pub carried: Vec<String>,
 }
 
@@ -3724,20 +3734,25 @@ mod members_tests {
             inconclusive: Vec::new(),
         };
 
+        let rendered = render_members(&report(Some(audit)));
         assert_eq!(
-            render_members(&report(Some(audit))),
+            rendered,
             concat!(
                 "release/2026-08-30 @ rrrrrrrrrrrr — 4 parents\n",
                 "- aaaaaaaaaaaa feat/alpha\n",
                 "- bbbbbbbbbbbb feat/beta advanced to cccccccccccc\n",
                 "- dddddddddddd bare commit — nothing holds it\n",
                 "- eeeeeeeeeeee main@upstream (base parent)\n",
-                "  feat/alpha@aaaaaaaaaaaa: diverges where the previous release already did (a recorded resolution); carried forward\n",
+                "  feat/alpha@aaaaaaaaaaaa: the ledger records no write of the release in hand, so nothing measured its divergence from this member; check that divergence by hand\n",
                 "  feat/beta@bbbbbbbbbbbb: carried (replay empty)\n",
                 "  !! dddddddddddd: the cut tree is missing or diverges from the member's content\n",
                 "  !! Cargo.lock: changed between the previous release and this cut with no member or trunk explaining it"
             )
         );
+        // And: nothing in it calls an unmeasured divergence a recorded
+        // resolution carried forward.
+        assert!(!rendered.contains("carried forward"), "{rendered}");
+        assert!(!rendered.contains("recorded resolution"), "{rendered}");
     }
 
     #[test]
@@ -3748,8 +3763,8 @@ mod members_tests {
 
         // When/Then: held against a recorded write, the row says the release
         // in hand is one; against an unchecked one, that it is unrecorded;
-        // against a release the ledger records no write of, it reads as it
-        // always has.
+        // against a release the ledger records no write of, that nothing
+        // measured the divergence, so a person checks it by hand.
         assert_eq!(
             carried_row(member, CarriedFrom::Recorded),
             "  feat/alpha@aaaaaaaaaaaa: diverges where the release in hand (a recorded write) \
@@ -3760,11 +3775,19 @@ mod members_tests {
             "  feat/alpha@aaaaaaaaaaaa: diverges where the unrecorded in-hand release already \
              does; record it with `knives release adopt` and cut again"
         );
+        let unledgered = carried_row(member, CarriedFrom::Unledgered);
         assert_eq!(
-            carried_row(member, CarriedFrom::Unledgered),
-            "  feat/alpha@aaaaaaaaaaaa: diverges where the previous release already did (a \
-             recorded resolution); carried forward"
+            unledgered,
+            "  feat/alpha@aaaaaaaaaaaa: the ledger records no write of the release in hand, so \
+             nothing measured its divergence from this member; check that divergence by hand"
         );
+        // And: it has neither the carried rows' `diverges where` shape nor
+        // their `carried forward`, says nothing is a recorded resolution, and
+        // names no `adopt`, which refuses a release with no recorded write.
+        assert!(!unledgered.contains("diverges where"), "{unledgered}");
+        assert!(!unledgered.contains("carried forward"), "{unledgered}");
+        assert!(!unledgered.contains("recorded resolution"), "{unledgered}");
+        assert!(!unledgered.contains("adopt"), "{unledgered}");
     }
 
     #[test]
