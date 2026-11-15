@@ -3,9 +3,13 @@
 //! Everything here is a check, never a prompt. A CLI in a non-interactive agent
 //! session has nobody to ask, so it decides from evidence and says what it
 //! decided. Planning is the default because everything else here writes: a cut
-//! names a composition, and `include`, `drop`, `advance` and `rebase` change
-//! one. Every one of them writes locally only, and none of them pushes.
-// allow: SIZE_OK: 2594 lines - the release lifecycle's plan, members, cut, edit, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
+//! names a composition, `include`, `drop`, `advance` and `rebase` change one,
+//! and `adopt` records a release finished by hand as the name's newest write.
+//! Every write leaves a conflict of only added release-log sections resolved
+//! as their union, and refuses while the release in hand carries a change
+//! knives did not write or adopt, printing the steps that record it. Every one
+//! of them writes locally only, and none of them pushes.
+// allow: SIZE_OK: 4025 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
