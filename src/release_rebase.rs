@@ -322,9 +322,9 @@ pub(crate) fn run_rebase(
     if no_drop {
         return Ok(Exit::Ok);
     }
-    // The rebase recorded the release it moved, so what it drops next is
-    // dropped from a recorded write.
-    drop_landed_members(fork, (&release_name, &destination), (bound, ""))
+    // What it drops next is dropped from the rebase's own write, so its event
+    // carries the same mark as the rebase's.
+    drop_landed_members(fork, (&release_name, &destination), (bound, &unchecked))
 }
 
 fn frozen_rebase_exit(

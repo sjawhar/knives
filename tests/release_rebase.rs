@@ -5,8 +5,10 @@
 //! followed dated release that moved sideways is repaired with a merge. A bare
 //! rebase finds its target through the merged pull requests read from the
 //! snapshot and drops members whose work landed — by merge or by squash — unless
-//! `--no-drop` or work past the pull keeps them; a second rebase does not grow
-//! the release, and one already at its target still drops landed members.
+//! `--no-drop` or work past the pull keeps them, and the drop's event carries
+//! the rebase's mark when knives could not check the release in hand; a second
+//! rebase does not grow the release, and one already at its target still
+//! drops landed members.
 
 #![allow(
     clippy::expect_used,
@@ -655,6 +657,104 @@ fn a_bare_rebase_drops_a_member_whose_pull_request_landed() {
             .contains("dropped feat/alpha: landed upstream as #7"),
         "the release description must record the drop"
     );
+}
+
+/// Every event the fork's ledger records about `name`, oldest first.
+fn events_about(home: &tempfile::TempDir, name: &str) -> Vec<knives::ledger::Entry> {
+    knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .read()
+        .expect("read the ledger")
+        .entries
+        .into_iter()
+        .filter(|entry| {
+            entry.kind == knives::ledger::Kind::Event && entry.subject.as_deref() == Some(name)
+        })
+        .collect()
+}
+
+#[test]
+fn a_landed_drop_after_a_rebase_keeps_the_mark_of_an_unchecked_release() {
+    // Given: alpha, beta and gamma cut, beta and gamma both writing
+    // shared.txt; then the ledger removed, so the name has no recorded write,
+    // and the conflict resolved by hand; then alpha merged upstream by a merge
+    // commit.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "shared.txt", "beta\n");
+    lab.branch("feat/gamma", "shared.txt", "gamma\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", release]);
+    assert!(
+        String::from_utf8_lossy(&cut.stdout).contains(&format!("cut {release} as")),
+        "{cut:?}"
+    );
+    std::fs::remove_dir_all(home.path().join("ledger").join("demo")).expect("remove the ledger");
+    lab.jj_work(["edit", release]);
+    std::fs::write(lab.work.join("shared.txt"), "merged\n").expect("resolve by hand");
+    lab.jj_work(["new", "main@origin"]);
+    lab.publish_pull("feat/alpha", 7);
+    lab.merge_pull_with_merge_commit(7);
+    let merged_at = commit_at(&lab, "main@upstream");
+    let pulls = format!(
+        "[{}]",
+        pull_record(7, "MERGED", "feat/alpha", Some(merged_at.as_str()))
+    );
+
+    // When: the bare rebase lands on the merge commit, then drops alpha.
+    let output = knives_release_with_forge(&lab, &home, &pulls, &["rebase"]);
+
+    // Then: the rebase and the drop each wrote an event of the release, and
+    // both carry the mark of the release in hand nothing checked: the drop
+    // is from the rebase's write.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "rebase failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("dropped feat/alpha: landed upstream as #7"),
+        "missing drop report: {stdout}"
+    );
+    let events = events_about(&home, release);
+    let texts: Vec<&str> = events.iter().map(|event| event.text.as_str()).collect();
+    let [rebased, dropped] = texts.as_slice() else {
+        panic!("expected the rebase's event and the drop's: {texts:?}");
+    };
+    assert!(rebased.contains(": rebased onto "), "{rebased}");
+    assert!(
+        dropped.contains(": dropped feat/alpha: landed upstream as #7;"),
+        "{dropped}"
+    );
+    for text in [rebased, dropped] {
+        assert!(text.ends_with("; unchecked: no record"), "{text}");
+    }
+
+    // When: the release is cut under a new name.
+    let next = "release/2026-08-05";
+    let cut = knives_release(&lab, &home, &["cut", next]);
+
+    // Then: the cut reads the release in hand as unchecked, never as a
+    // recorded write whose divergence it carries forward.
+    let out = String::from_utf8_lossy(&cut.stdout);
+    assert!(
+        out.contains(&format!("cut {next} as")),
+        "{out}\n{}",
+        String::from_utf8_lossy(&cut.stderr)
+    );
+    let unchecked_row = "diverges where the unrecorded in-hand release already does; record it \
+                         with `knives release adopt` and cut again";
+    for member in ["feat/beta", "feat/gamma"] {
+        let row =
+            |line: &str| line.starts_with(&format!("  {member}")) && line.ends_with(unchecked_row);
+        assert!(out.lines().any(row), "{member}: {out}");
+    }
+    assert!(!out.contains("(a recorded write)"), "{out}");
+    let marked = events_about(&home, next)
+        .last()
+        .is_some_and(|event| event.text.ends_with("; unchecked: no record"));
+    assert!(marked, "{:?}", events_about(&home, next));
 }
 
 #[test]
