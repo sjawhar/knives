@@ -362,6 +362,10 @@ pub struct Plan {
     /// been pushed yet, which nothing can have pinned by commit.
     pub published: Option<CommitId>,
     pub parents: Vec<(CommitId, Vec<String>)>,
+    /// The parents that are earlier writes of the release, never members
+    /// ([`crate::release_model::carriers`]): listed among `parents`,
+    /// labelled, and read by no member check.
+    pub carriers: Vec<CommitId>,
     pub stale: Vec<Finding>,
     pub pins: Vec<Pin>,
     /// A consumer could not be consulted, so `pins` may lack the pin that
@@ -373,6 +377,63 @@ pub struct Plan {
     /// for incompleteness. Keying on every note instead would make a routine
     /// remark like "14 superseded releases not scanned" look like a failure.
     pub problems: Vec<String>,
+}
+
+impl Plan {
+    /// Read which of `release`'s `parents` are carriers into
+    /// [`Plan::carriers`], from `ledger` and [`Plan::published`]; the
+    /// parents without them, which every member check reads.
+    ///
+    /// A carrier is an earlier write of the release a fast-forward push gave
+    /// it, never a member: no member check reads it, and the parent list
+    /// labels it.
+    fn read_carriers(
+        &mut self,
+        repo: &Repo,
+        (release, parents): (&str, &[ReleaseParent]),
+        ledger: &[Entry],
+    ) -> anyhow::Result<Vec<ReleaseParent>> {
+        let commits: Vec<CommitId> = parents.iter().map(|parent| parent.commit.clone()).collect();
+        self.carriers = crate::release_model::carriers(
+            repo,
+            release,
+            &commits,
+            (ledger, self.published.as_ref()),
+        )?;
+        Ok(parents
+            .iter()
+            .filter(|parent| !self.carriers.contains(&parent.commit))
+            .cloned()
+            .collect())
+    }
+
+    /// The plan's parent list, one line per parent with what holds it, a
+    /// carrier of `release` labelled as one. Bookmarks are names read from
+    /// the repository, so each is escaped.
+    fn parent_lines(&self, release: &str) -> Vec<String> {
+        use crate::ledger::inline_human_text;
+        let label =
+            crate::release_model::carrier_label(BookmarkRef::parse(release).branch().as_str());
+        self.parents
+            .iter()
+            .map(|(commit, names)| {
+                let held = if names.is_empty() {
+                    "no bookmark".to_owned()
+                } else {
+                    inline_human_text(&names.join(", "))
+                };
+                if self.carriers.contains(commit) {
+                    format!(
+                        "    {}  {} ({held})",
+                        commit.short(),
+                        inline_human_text(&label)
+                    )
+                } else {
+                    format!("    {}  {held}", commit.short())
+                }
+            })
+            .collect()
+    }
 }
 
 /// Whether the release in hand already contains the upstream trunk.
@@ -625,6 +686,9 @@ pub struct ReapReport {
     /// Non-fatal notes: an abandon that failed for a reason other than a pin,
     /// and a cleanup of a reaped name's earlier writes that failed.
     pub notes: Vec<String>,
+    /// The heads the reap's abandons exposed, hidden in the same operation
+    /// ([`crate::jj::HiddenHead`]).
+    pub hidden: Vec<crate::jj::HiddenHead>,
 }
 
 /// Reap every superseded dated cut: forget its refs everywhere, abandon its commits.
@@ -692,6 +756,7 @@ pub fn reap_superseded(
                 })
                 .collect(),
             notes: Vec::new(),
+            hidden: Vec::new(),
         });
     }
 
@@ -700,8 +765,10 @@ pub fn reap_superseded(
         forgotten_only: Vec::new(),
         kept: Vec::new(),
         notes: Vec::new(),
+        hidden: Vec::new(),
     };
     let mut entries: Vec<(String, Vec<CommitId>)> = Vec::new();
+    let mut reaped_writes: Vec<CommitId> = Vec::new();
     'names: for (name, targets) in by_name {
         for target in &targets {
             if let Some(reason) = repo.what_rests_on(target)? {
@@ -711,11 +778,9 @@ pub fn reap_superseded(
         }
         // An edit that replaced a commit of this name kept it for what rests
         // on it; once no ref names it, this name is all that will retire it.
-        for earlier in earlier_writes(repo, ledger, &name)?
-            .into_iter()
-            .filter(|commit| !targets.contains(commit))
-        {
-            if let Some(reason) = repo.what_rests_on(&earlier)? {
+        let earlier = earlier_writes(repo, ledger, &name)?;
+        for earlier in earlier.iter().filter(|commit| !targets.contains(commit)) {
+            if let Some(reason) = repo.what_rests_on(earlier)? {
                 report.kept.push((
                     name.clone(),
                     format!("{}, an earlier {name} commit: {reason}", earlier.short()),
@@ -723,13 +788,21 @@ pub fn reap_superseded(
                 continue 'names;
             }
         }
+        reaped_writes.extend(earlier);
         entries.push((name, targets));
     }
     if !entries.is_empty() {
         let names: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
         let operation = format!("knives: reap {}", names.join(", "));
-        let outcome = crate::jj::forget_and_abandon(repo_path, &entries, &operation)?;
+        let live = live_dated_release(&tips, scheme, publish_remote).map(|(_, commit)| commit);
+        let outcome = crate::jj::forget_and_abandon(
+            repo_path,
+            &entries,
+            (&reaped_writes, live.as_ref()),
+            &operation,
+        )?;
         report.reaped = outcome.abandoned;
+        report.hidden = outcome.hidden;
         for (name, error) in outcome.refused {
             match error {
                 crate::jj::JjError::Immutable { commit, pin } => report
@@ -872,7 +945,7 @@ pub const fn carried_exit(audit: &CutAudit, unrecorded: bool) -> Exit {
 /// The newest dated cut's branch name — unqualified, unlike
 /// [`previous_release_for_cut`]'s — and its live commit: the local ref when
 /// present, otherwise whichever of our remotes carries it.
-fn live_dated_release(
+pub fn live_dated_release(
     tips: &BookmarkTips,
     scheme: &ReleaseScheme,
     publish_remote: &str,
@@ -988,6 +1061,7 @@ pub fn plan(
         .cloned();
 
     let parents = repo.parents_of(commit.as_str())?;
+    let members = plan.read_carriers(&repo, (reference.branch().as_str(), &parents), ledger)?;
     let trunk_tip = repo.resolve_commit(&entry.trunk_ref()).ok();
     let trunks = trunk_positions(&repo, entry)?;
     let base = match &trunk_tip {
@@ -995,7 +1069,7 @@ pub fn plan(
         None => None,
     };
     let mut member_parents = Vec::new();
-    for parent in &parents {
+    for parent in &members {
         let trunk_reachable = match &trunk_tip {
             Some(trunk) => repo.is_ancestor(&parent.commit, trunk)?,
             None => false,
@@ -1030,7 +1104,7 @@ pub fn plan(
         replaced: None,
     });
     if let Some(context) = stacked_context {
-        member_histories(context, &parents, &member_parents, &mut plan)?;
+        member_histories(context, &members, &member_parents, &mut plan)?;
     }
     plan.stale = stale_parents(&member_parents, &tips);
     // Only the selected series' branches are candidates; one that fits no
@@ -1045,7 +1119,7 @@ pub fn plan(
         repo: &repo,
         reference: &reference.to_string(),
         release: &commit,
-        parents: &parents,
+        parents: &members,
         trunks: &trunks,
         stacked: stacked_context,
         branches: &series_branches,
@@ -1321,6 +1395,9 @@ pub struct MemberRow {
     pub advanced: Vec<String>,
     /// A trunk-reachable parent is the base of a legacy cut, not a member.
     pub base_parent: bool,
+    /// An earlier write of the release a fast-forward push gave it
+    /// ([`crate::release_model::carriers`]): no member, and labelled so.
+    pub carrier: bool,
 }
 
 /// The structural and semantic membership of one release.
@@ -1348,18 +1425,23 @@ pub struct MembersReport {
     pub problems: Vec<String>,
 }
 
-/// Gather one parent's current holders, descendants, and trunk relation.
+/// Gather one parent's current holders, descendants, and trunk relation. A
+/// carrier is no branch's parent, so no branch is read as continuing it.
 fn member_row(
     opened: &Repo,
-    parent: ReleaseParent,
+    (parent, carrier): (ReleaseParent, bool),
     trunk: Option<&CommitId>,
     successions: &BranchSuccessions<'_>,
 ) -> anyhow::Result<MemberRow> {
-    let advanced = successions
-        .successors_of(&parent.commit)?
-        .into_iter()
-        .map(|(branch, tip)| format!("{branch} advanced to {}", tip.short()))
-        .collect();
+    let advanced = if carrier {
+        Vec::new()
+    } else {
+        successions
+            .successors_of(&parent.commit)?
+            .into_iter()
+            .map(|(branch, tip)| format!("{branch} advanced to {}", tip.short()))
+            .collect()
+    };
     let base_parent = trunk.map_or(Ok(false), |trunk| opened.is_ancestor(&parent.commit, trunk))?;
     Ok(MemberRow {
         commit: parent.commit,
@@ -1370,7 +1452,14 @@ fn member_row(
             .collect(),
         advanced,
         base_parent,
+        carrier,
     })
+}
+
+/// Whether a row is one the content audit holds the release to: neither a
+/// legacy cut's base nor an earlier write of the release.
+const fn is_member(member: &MemberRow) -> bool {
+    !member.base_parent && !member.carrier
 }
 
 /// The label audit buckets use for a member row.
@@ -1390,14 +1479,16 @@ fn member_label(member: &MemberRow) -> String {
 
 /// Gather the parents, holders, and optional content audit for a named release.
 ///
-/// `verify` holds the fork's ledger when the content is to be replayed
+/// `ledger` is the fork's ledger: the writes it records under the name, with
+/// the publish remote's commit of it, are the carriers a row labels
+/// ([`crate::release_model::carriers`]). `verify` replays the content
 /// (`--verify`): whether the release is its newest recorded write decides
 /// what the audit holds it against.
 pub fn gather_members(
     opened: &Repo,
     fork: &Fork<'_>,
     name: &str,
-    verify: Option<&[Entry]>,
+    (ledger, verify): (&[Entry], bool),
 ) -> anyhow::Result<MembersReport> {
     let entry = fork.entry;
     let commit = opened.resolve_commit(name)?;
@@ -1414,24 +1505,32 @@ pub fn gather_members(
         }
     };
     let trunks = trunk_positions(opened, entry)?;
-    let branches = carried_from_tips(
-        &opened.bookmark_tips()?,
-        entry.trunk(),
-        &entry.release_scheme(),
-    );
+    let tips = opened.bookmark_tips()?;
+    let branches = carried_from_tips(&tips, entry.trunk(), &entry.release_scheme());
     let successions = BranchSuccessions::of(opened, &trunks, &branches)?;
+    // The ledger records writes under the name, never under a remote's ref.
+    let release = BookmarkRef::parse(name).branch().clone();
+    let published = tips.get(&BookmarkRef::Remote {
+        branch: release.clone(),
+        remote: RemoteName::new(entry.publish_remote()),
+    });
+    let parent_commits: Vec<CommitId> =
+        parents.iter().map(|parent| parent.commit.clone()).collect();
+    let carriers = crate::release_model::carriers(
+        opened,
+        release.as_str(),
+        &parent_commits,
+        (ledger, published),
+    )?;
     let members: Vec<MemberRow> = parents
         .into_iter()
-        .map(|parent| member_row(opened, parent, trunk.as_ref(), &successions))
+        .map(|parent| {
+            let carrier = carriers.contains(&parent.commit);
+            member_row(opened, (parent, carrier), trunk.as_ref(), &successions)
+        })
         .collect::<anyhow::Result<_>>()?;
-    let (audit, unrecorded) = if let Some(ledger) = verify {
-        // The ledger records writes under the name, never under a remote's ref.
-        let standing = in_hand_write(
-            opened,
-            ledger,
-            BookmarkRef::parse(name).branch().as_str(),
-            &commit,
-        )?;
+    let (audit, unrecorded) = if verify {
+        let standing = in_hand_write(opened, ledger, release.as_str(), &commit)?;
         // An unrecorded release is held against the write it replaced, as a
         // cut is held against the release it duplicates: a divergence that
         // write already had is the hand resolution, which `adopt` measures and
@@ -1445,7 +1544,7 @@ pub fn gather_members(
             .map(|trunk| {
                 let members: Vec<(String, CommitId)> = members
                     .iter()
-                    .filter(|member| !member.base_parent)
+                    .filter(|member| is_member(member))
                     .map(|member| (member_label(member), member.commit.clone()))
                     .collect();
                 audit_cut(
@@ -1485,6 +1584,8 @@ pub fn render_members(report: &MembersReport) -> String {
         report.commit.short(),
         report.parent_count
     )];
+    let label =
+        crate::release_model::carrier_label(BookmarkRef::parse(&report.release).branch().as_str());
     for member in &report.members {
         let mut description = inline_human_text(&member.held_by.join(", "));
         if !member.advanced.is_empty() {
@@ -1492,6 +1593,13 @@ pub fn render_members(report: &MembersReport) -> String {
                 description.push_str(", ");
             }
             description.push_str(&inline_human_text(&member.advanced.join(", ")));
+        }
+        if member.carrier {
+            description = if description.is_empty() {
+                inline_human_text(&label)
+            } else {
+                format!("{} ({description})", inline_human_text(&label))
+            };
         }
         if description.is_empty() {
             description.push_str("bare commit — nothing holds it");
@@ -1512,7 +1620,7 @@ pub fn render_members(report: &MembersReport) -> String {
                 inline_human_text(name)
             ));
         }
-        for member in report.members.iter().filter(|member| !member.base_parent) {
+        for member in report.members.iter().filter(|member| is_member(member)) {
             let name = member_label(member);
             if !audit.carried.contains(&name)
                 && !audit.inconclusive.contains(&name)
@@ -1592,14 +1700,7 @@ pub fn render(plan: &Plan) -> String {
             plan.parents.len()
         )
     });
-    for (commit, names) in &plan.parents {
-        let held = if names.is_empty() {
-            "no bookmark".to_owned()
-        } else {
-            crate::ledger::inline_human_text(&names.join(", "))
-        };
-        lines.push(format!("    {}  {held}", commit.short()));
-    }
+    lines.extend(plan.parent_lines(release));
 
     if plan.stale.is_empty() {
         lines.push("  every parent is still its branch tip".to_owned());
@@ -2316,12 +2417,14 @@ pub fn workspaces_to_clean(
 /// a failed audit simply drops — and verify it has exactly the parents asked
 /// for.
 ///
-/// `Some(previous)` duplicates the previous release onto the new parent set,
-/// preserving its recorded conflict resolutions. Adding a branch or advancing
-/// the base therefore avoids replaying old conflicts; dropping an entangled
-/// branch surfaces a focused conflict rather than silently retaining its
-/// content. `None` builds a fresh flat merge. Both paths produce a flat octopus
-/// of exactly `request.parents`.
+/// `Some((previous, carriers))` duplicates the previous release onto the new
+/// parent set, preserving its recorded conflict resolutions, with `carriers`,
+/// its parents that are earlier writes of its name, left out of what the
+/// duplicate measures it against ([`jj::CutSpec::carriers`]). Adding a branch
+/// or advancing the base therefore avoids replaying old conflicts; dropping
+/// an entangled branch surfaces a focused conflict rather than silently
+/// retaining its content. `None` builds a fresh flat merge. Both paths
+/// produce a flat octopus of exactly `request.parents`.
 /// The parent-count guard catches a silent failure: a cut that dropped a parent
 /// looks exactly like one that did not, until work goes missing downstream.
 ///
@@ -2329,13 +2432,14 @@ pub fn workspaces_to_clean(
 pub fn candidate_cut(
     repo: &Path,
     request: &Cut,
-    previous: Option<&CommitId>,
+    previous: Option<(&CommitId, &[CommitId])>,
 ) -> anyhow::Result<jj::Candidate> {
     let candidate = jj::candidate_release(
         repo,
         jj::CutSpec {
-            source: previous.cloned(),
+            source: previous.map(|(previous, _)| previous.clone()),
             parents: request.parents.clone(),
+            carriers: previous.map_or_else(Vec::new, |(_, carriers)| carriers.to_vec()),
             message: request.message(),
         },
     )?;
@@ -2354,17 +2458,25 @@ pub fn candidate_cut(
 ///
 /// Dated cuts retain ordinary bookmark-movement protection because each name
 /// records a new release. Fixed cuts deliberately move their existing release
-/// name, which may already exist on the remote.
+/// name, which may already exist on the remote. `earlier` are the earlier
+/// writes of the release the cut duplicates and `publish_remote` where the
+/// name publishes, for what the cut leaves a head nothing holds
+/// ([`jj::Candidate::publish`]).
 pub fn publish_cut(
     candidate: jj::Candidate,
     name: &str,
     scheme: &ReleaseScheme,
-) -> anyhow::Result<CommitId> {
+    (earlier, publish_remote): (&[CommitId], Option<&str>),
+) -> anyhow::Result<jj::PublishedCut> {
     let motion = match scheme {
         ReleaseScheme::Dated | ReleaseScheme::Series(_) => jj::BookmarkMotion::ForwardOnly,
         ReleaseScheme::Fixed(_) => jj::BookmarkMotion::Anywhere,
     };
-    Ok(candidate.publish((name, motion), &format!("knives: cut {name}"))?)
+    Ok(candidate.publish(
+        (name, motion),
+        (earlier, publish_remote),
+        &format!("knives: cut {name}"),
+    )?)
 }
 
 /// The cut being audited: an unpublished candidate in its scratch transaction,
@@ -2491,9 +2603,10 @@ pub fn audit_cut(
 }
 
 /// Create and name a fresh cut for direct callers that do not need an audit.
+/// A fresh merge replaces nothing, so it has no earlier write to hide.
 pub fn cut(repo: &Path, request: &Cut, scheme: &ReleaseScheme) -> anyhow::Result<CommitId> {
     let candidate = candidate_cut(repo, request, None)?;
-    publish_cut(candidate, &request.name, scheme)
+    Ok(publish_cut(candidate, &request.name, scheme, (&[], None))?.commit)
 }
 
 /// A recorded member whose carry check answered nothing either way.
@@ -3042,6 +3155,7 @@ mod members_tests {
             held_by: held_by.iter().map(ToString::to_string).collect(),
             advanced: advanced.iter().map(ToString::to_string).collect(),
             base_parent,
+            carrier: false,
         }
     }
 
@@ -3248,8 +3362,8 @@ mod members_tests {
         let entry = RepoEntry::new("upstream", "origin");
         let fork = Fork::at("demo", &entry, &repository);
         let opened = Repo::open(&repository).expect("open test repository");
-        let members =
-            gather_members(&opened, &fork, "release/2026-08-30", None).expect("gather members");
+        let members = gather_members(&opened, &fork, "release/2026-08-30", (&[], false))
+            .expect("gather members");
 
         assert_eq!(members.parent_count, 2);
     }
@@ -3271,8 +3385,8 @@ mod members_tests {
         let entry = RepoEntry::new("upstream", "origin");
         let fork = Fork::at("demo", &entry, &repository);
         let opened = Repo::open(&repository).expect("open test repository");
-        let members =
-            gather_members(&opened, &fork, "release/2026-08-30", None).expect("gather members");
+        let members = gather_members(&opened, &fork, "release/2026-08-30", (&[], false))
+            .expect("gather members");
 
         assert_eq!(members.members.len(), 1);
         assert_eq!(members.members[0].held_by, Vec::<String>::new());

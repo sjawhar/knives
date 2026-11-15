@@ -22,11 +22,12 @@ use knives::ids::{
 use knives::jj::{Repo, ResolutionBaseline, ResolutionChanges};
 use knives::ledger::{Draft, Entry, Ledger, RecordedParent, inline_human_text};
 use knives::release_model::{
-    RecordedWrite, carrier_label, carriers, members_event_text, recorded_write_events,
+    EarlierWrites, RecordedWrite, carrier_label, members_event_text, recorded_write_events,
 };
 
 use super::release_edit::{
     published_refusal_text, recorded_parents, refuse_unresolved_trunk, report_abandoned_earlier,
+    report_hidden,
 };
 use super::scribe_for;
 
@@ -316,11 +317,17 @@ impl Adopting<'_, '_> {
             .filter(|parent| !recorded.contains(parent))
             .cloned()
             .collect();
-        let found: Vec<CommitId> =
-            carriers(&held.name, &extra, self.ledger, held.published.as_ref())
-                .into_iter()
-                .filter(|carrier| *carrier != replaced.write.commit)
-                .collect();
+        let writes = EarlierWrites::read(
+            &held.opened,
+            &held.name,
+            self.ledger,
+            held.published.as_ref(),
+        )?;
+        let found: Vec<CommitId> = writes
+            .carriers(&extra)
+            .into_iter()
+            .filter(|carrier| *carrier != replaced.write.commit)
+            .collect();
         let child = held.parents.contains(&replaced.write.commit);
         let strays: Vec<CommitId> = extra
             .into_iter()
@@ -557,11 +564,20 @@ fn measure<'a>(
         .filter(|(_, commit)| members.contains(commit))
         .cloned()
         .collect();
+    // Every file the commit changes against its baseline is counted, a file
+    // the baseline left without a conflict too: restoring such a file can
+    // drop a member's line as surely as resolving a conflict can.
+    let touched: Vec<String> = changes
+        .resolved
+        .iter()
+        .chain(&changes.beyond)
+        .cloned()
+        .collect();
     let lost = lost_lines(
         &held.opened,
         &trunk,
         &member_sources,
-        (&held.commit, &changes.resolved),
+        (&held.commit, &touched),
     )?;
     Ok(Some(Adoption {
         change: held.opened.change_id_of(held.commit.as_str())?,
@@ -574,7 +590,7 @@ fn measure<'a>(
     }))
 }
 
-/// One member's added lines of one resolved file, never none, and how many of
+/// One member's added lines of one changed file, never none, and how many of
 /// them the resolution does not hold.
 struct LostLines {
     member: String,
@@ -583,10 +599,10 @@ struct LostLines {
     absent: usize,
 }
 
-/// D8's counts: for each resolved file and each member that added lines to
-/// it, the member's added non-blank lines, from its fork point with the trunk
-/// to its tip, that the resolution holds fewer times than the member added
-/// them.
+/// D8's counts: for each file the commit changes against its baseline and
+/// each member that added lines to it, the member's added non-blank lines,
+/// from its fork point with the trunk to its tip, that the resolution holds
+/// fewer times than the member added them.
 ///
 /// The fork point is the member's own, so a trunk that moved on since is never
 /// charged to it. Counted as a multiset because a release log repeats lines
@@ -690,10 +706,11 @@ fn adopt(
     // Each earlier write that is now a visible head nothing rests on goes, as
     // after a cut: a resolution with its own change id leaves the write it
     // replaces as exactly such a head, which audit names as anonymous.
-    let earlier = release::earlier_writes(&held.opened, &ledger, &held.name)?;
+    let earlier = EarlierWrites::read(&held.opened, &held.name, &ledger, held.published.as_ref())?;
     let abandoned = knives::jj::abandon_unheld_writes(
         &fork.checkout.path,
-        &earlier,
+        earlier.commits(),
+        Some(&held.commit),
         &format!(
             "knives: {}: abandon earlier writes nothing rests on",
             held.name
@@ -701,7 +718,8 @@ fn adopt(
     )?;
     record(&adopting, &adoption, bound)?;
     report(&adopting, &adoption);
-    report_abandoned_earlier(repo, &held.name, &abandoned);
+    report_abandoned_earlier(repo, &held.name, &abandoned.abandoned);
+    report_hidden(repo, &held.name, &abandoned.hidden);
     Ok(if adoption.loses_a_member() {
         Exit::Findings
     } else {

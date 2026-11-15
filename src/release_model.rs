@@ -1078,32 +1078,88 @@ pub fn recorded_write_events<'a>(
     })
 }
 
+/// Every earlier write of one release name this repository holds.
+///
+/// That is each commit the ledger records as a cut or an edit of the name
+/// ([`recorded_writes`]), the publish remote's commit of the name as the
+/// caller reads that ref, and every visible rewrite of either
+/// ([`Repo::rewrites_of`]).
+///
+/// A `jj rebase` or `jj describe` that moves a recorded write leaves the
+/// recorded id hidden and the commit that matters under a new id with the
+/// same change id. A recorded write is a release merge and a member is a
+/// feature branch, so the two never share a change id, and the rewrite test
+/// cannot take a member for a write. A write this repository does not hold
+/// (another machine's, never fetched) can be no parent here and has no
+/// rewrite to read, so it is left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EarlierWrites(Vec<CommitId>);
+
+impl EarlierWrites {
+    /// The earlier writes of `release`, each once, recorded writes newest
+    /// first, then the published commit, each followed by its rewrites.
+    pub fn read(
+        repo: &Repo,
+        release: &str,
+        entries: &[Entry],
+        published: Option<&CommitId>,
+    ) -> Result<Self, jj::JjError> {
+        let mut writes: Vec<CommitId> = Vec::new();
+        let written = recorded_writes(entries, release).map(|write| write.commit);
+        for commit in written.chain(published.cloned()) {
+            if writes.contains(&commit) || repo.resolve_commit(commit.as_str()).is_err() {
+                continue;
+            }
+            let rewrites = repo.rewrites_of(commit.as_str())?;
+            writes.push(commit);
+            for rewrite in rewrites {
+                if !writes.contains(&rewrite) {
+                    writes.push(rewrite);
+                }
+            }
+        }
+        Ok(Self(writes))
+    }
+
+    pub fn commits(&self) -> &[CommitId] {
+        &self.0
+    }
+
+    pub fn contains(&self, commit: &CommitId) -> bool {
+        self.0.contains(commit)
+    }
+
+    /// Which of a release's `parents` are among these writes, in parent
+    /// order: its carriers ([`carriers`]).
+    pub fn carriers(&self, parents: &[CommitId]) -> Vec<CommitId> {
+        parents
+            .iter()
+            .filter(|parent| self.contains(parent))
+            .cloned()
+            .collect()
+    }
+}
+
 /// The parents of `release` that are fast-forward carriers: earlier writes of
-/// the same name, never members.
+/// the same name ([`EarlierWrites`]), never members.
 ///
 /// A push of a release that does not descend from its published position is
 /// made a fast-forward by giving it that position as one more parent, so the
 /// release then carries an older write of itself. Read as a member, the
 /// carrier accumulates: every later write would keep it, and each push would
-/// add one more. A parent is a carrier exactly when the ledger records it as
-/// a cut or an edit of `release` ([`recorded_writes`]) or it is `published`,
-/// the publish remote's commit of the name, as the caller reads that ref. No
-/// other parent is one, however it is named: a write recorded under another
-/// release name is that release's, and here it is a member like any other.
+/// add one more. So every write that composes from a release's parents leaves
+/// its carriers out, and the plan and `members` label them. `entries` is the
+/// ledger and `published` the publish remote's commit of the name as the
+/// caller reads that ref. No other parent is a carrier, however it is named:
+/// a write recorded under another release name is that release's, and here
+/// it is a member like any other.
 pub fn carriers(
+    repo: &Repo,
     release: &str,
     parents: &[CommitId],
-    entries: &[Entry],
-    published: Option<&CommitId>,
-) -> Vec<CommitId> {
-    let written: Vec<CommitId> = recorded_writes(entries, release)
-        .map(|write| write.commit)
-        .collect();
-    parents
-        .iter()
-        .filter(|parent| published == Some(*parent) || written.contains(parent))
-        .cloned()
-        .collect()
+    (entries, published): (&[Entry], Option<&CommitId>),
+) -> Result<Vec<CommitId>, jj::JjError> {
+    Ok(EarlierWrites::read(repo, release, entries, published)?.carriers(parents))
 }
 
 /// The branch label a carrier of `release` ([`carriers`]) takes where a
@@ -1136,13 +1192,16 @@ pub fn last_series_cut(entries: &[Entry], entry: &RepoEntry) -> Option<RecordedC
 
 #[cfg(test)]
 mod carrier_tests {
+    use std::path::{Path, PathBuf};
+
     use super::{CommitId, Entry, Kind, RecordedParent, carrier_label, carriers};
+    use crate::jj::Repo;
 
     const RELEASE: &str = "integration";
 
     /// A cut or edit event of `subject` that names `commit` first in its
     /// evidence, as both writers record it.
-    fn event(subject: &str, text: String, commit: &str) -> Entry {
+    fn event(subject: &str, text: String, commit: &CommitId) -> Entry {
         Entry {
             ts: "2026-11-15T00:00:00Z".to_owned(),
             owner: "test".to_owned(),
@@ -1152,7 +1211,7 @@ mod carrier_tests {
             disposition: None,
             statement: None,
             text,
-            evidence: vec![commit.to_owned(), "member0000000".to_owned()],
+            evidence: vec![commit.as_str().to_owned(), "member0000000".to_owned()],
             anchor: None,
             pr: None,
             parents: vec![RecordedParent {
@@ -1169,57 +1228,141 @@ mod carrier_tests {
         }
     }
 
+    /// `jj` in `path`, which must succeed. Identity comes from the
+    /// environment: a repo-level write would outlive the temporary
+    /// repository under `$XDG_CONFIG_HOME`.
+    fn run_jj(path: &Path, args: &[&str]) {
+        let output = std::process::Command::new("jj")
+            .current_dir(path)
+            .args(args)
+            .env("JJ_CONFIG", "/dev/null")
+            .env("JJ_USER", "knives tests")
+            .env("JJ_EMAIL", "tests@example.invalid")
+            .output()
+            .expect("run jj test fixture command");
+        assert!(
+            output.status.success(),
+            "jj {} failed:\nstdout:\n{}\nstderr:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// A repository holding one commit on the root per name, each bookmarked
+    /// by its name, with the working copy moved off them.
+    fn repository(directory: &Path, names: &[&str]) -> PathBuf {
+        let path = directory.join("repo");
+        run_jj(
+            directory,
+            &["git", "init", path.to_str().expect("utf-8 path")],
+        );
+        for name in names {
+            run_jj(&path, &["new", "-r", "root()", "-m", name]);
+            run_jj(&path, &["bookmark", "create", name, "-r", "@"]);
+        }
+        run_jj(&path, &["new", "-r", "root()"]);
+        path
+    }
+
+    fn at(path: &Path, revision: &str) -> CommitId {
+        Repo::open(path)
+            .expect("open test repository")
+            .resolve_commit(revision)
+            .expect("resolve a fixture commit")
+    }
+
     #[test]
-    fn earlier_writes_of_the_name_and_its_published_commit_are_carriers() {
-        // Given: a recorded cut and a recorded edit of the release, and its
-        // publish remote at a third commit no event names.
+    fn earlier_writes_of_the_name_its_published_commit_and_a_rewrite_are_carriers() {
+        // Given: a recorded cut and two recorded edits of the release, the
+        // second edit since reworded (its recorded id hidden, its rewrite
+        // visible), and the publish remote at a fourth commit no event names.
+        let _environment = crate::config::test_support::environment_lock();
+        let directory = tempfile::tempdir().expect("create test directory");
+        let path = repository(
+            directory.path(),
+            &["member", "cut", "edit", "published", "reworded"],
+        );
+        let (member, cut, edit) = (at(&path, "member"), at(&path, "cut"), at(&path, "edit"));
+        let (published, recorded) = (at(&path, "published"), at(&path, "reworded"));
         let entries = [
             event(
                 RELEASE,
-                format!("cut {RELEASE} as cut000000000 with 1 parent(s): feat/member"),
-                "cut000000000",
+                format!(
+                    "cut {RELEASE} as {} with 1 parent(s): feat/member",
+                    cut.short()
+                ),
+                &cut,
             ),
             event(
                 RELEASE,
-                format!("edited {RELEASE} as edit00000000 with 1 parent(s): included x"),
-                "edit00000000",
+                format!(
+                    "edited {RELEASE} as {} with 1 parent(s): included x",
+                    edit.short()
+                ),
+                &edit,
+            ),
+            event(
+                RELEASE,
+                format!(
+                    "edited {RELEASE} as {} with 1 parent(s): included y",
+                    recorded.short()
+                ),
+                &recorded,
             ),
         ];
-        let (cut, edit) = (CommitId::new("cut000000000"), CommitId::new("edit00000000"));
-        let published = CommitId::new("published000");
+        run_jj(
+            &path,
+            &["describe", "-r", "reworded", "-m", "reworded again"],
+        );
+        let rewrite = at(&path, "reworded");
+        assert_ne!(rewrite, recorded, "the describe rewrote the recorded edit");
         let parents = [
-            CommitId::new("member0000000"),
+            member,
             cut.clone(),
             edit.clone(),
             published.clone(),
+            rewrite.clone(),
         ];
+        let opened = Repo::open(&path).expect("open test repository");
 
         // When: the release's parents are read for carriers.
-        let found = carriers(RELEASE, &parents, &entries, Some(&published));
+        let found = carriers(&opened, RELEASE, &parents, (&entries, Some(&published)))
+            .expect("read carriers");
 
-        // Then: each earlier write and the published commit is one, in the
-        // release's parent order; the member is not.
-        assert_eq!(found, [cut, edit, published]);
+        // Then: the cut, the edit, the published commit and the rewrite of
+        // the reworded edit are each one, in the release's parent order; the
+        // member is not.
+        assert_eq!(found, [cut, edit, published, rewrite]);
     }
 
     #[test]
     fn a_member_a_bare_commit_and_another_releases_write_are_not_carriers() {
         // Given: a write recorded under another release name, and a member
         // and a bare commit no event names as a write.
+        let _environment = crate::config::test_support::environment_lock();
+        let directory = tempfile::tempdir().expect("create test directory");
+        let path = repository(directory.path(), &["feat/member", "bare", "other"]);
+        let (member, bare, other) = (
+            at(&path, "feat/member"),
+            at(&path, "bare"),
+            at(&path, "other"),
+        );
+        run_jj(&path, &["bookmark", "delete", "bare"]);
         let entries = [event(
             "release/2026-08-04",
-            "cut release/2026-08-04 as other0000000 with 1 parent(s): feat/member".to_owned(),
-            "other0000000",
+            format!(
+                "cut release/2026-08-04 as {} with 1 parent(s): feat/member",
+                other.short()
+            ),
+            &other,
         )];
-        let parents = [
-            CommitId::new("member0000000"),
-            CommitId::new("bare00000000"),
-            CommitId::new("other0000000"),
-        ];
+        let parents = [member, bare, other];
+        let opened = Repo::open(&path).expect("open test repository");
 
         // When: the release's parents are read for carriers, its publish
         // remote holding no ref of the name.
-        let found = carriers(RELEASE, &parents, &entries, None);
+        let found = carriers(&opened, RELEASE, &parents, (&entries, None)).expect("read carriers");
 
         // Then: none of them is a carrier.
         assert_eq!(found, Vec::<CommitId>::new());

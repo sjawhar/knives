@@ -61,6 +61,7 @@ fn a_forgotten_and_abandoned_release_disappears_and_the_remote_keeps_it() {
     let outcome = knives::jj::forget_and_abandon(
         &lab.work,
         &[("release/2026-08-04".to_owned(), vec![release.clone()])],
+        (&[], None),
         "knives: reap release/2026-08-04",
     )
     .expect("reap the release");
@@ -72,6 +73,7 @@ fn a_forgotten_and_abandoned_release_disappears_and_the_remote_keeps_it() {
             ("feat/alpha-child".to_owned(), vec![alpha_child.clone()]),
             ("feat/beta".to_owned(), vec![beta.clone()]),
         ],
+        (&[], None),
         "knives: reap the feature chain",
     )
     .expect("reap the feature chain");

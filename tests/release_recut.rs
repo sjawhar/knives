@@ -795,6 +795,7 @@ fn a_foreign_pull_request_can_be_fetched_and_carried_as_a_release_parent() {
         &knives::jj::ReleaseWrite {
             source: None,
             parents: &[trunk, fetched],
+            carriers: &[],
             message: Some("release: with a foreign PR"),
             bookmark: None,
             publish_remote: None,

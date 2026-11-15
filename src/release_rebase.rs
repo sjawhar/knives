@@ -15,11 +15,13 @@ use knives::forge::PullRequest;
 use knives::forge::github::CliForge;
 use knives::ids::{ReleaseScheme, RepoName};
 use knives::ledger::inline_human_text;
-use knives::release_model::{BranchSuccessions, carried_from_tips, trunk_positions};
+use knives::release_model::{
+    BranchSuccessions, EarlierWrites, carried_from_tips, carrier_label, trunk_positions,
+};
 
 use super::release_edit::{
-    EditRecord, earlier_writes, published_refusal, record_edit_event, release_is_locally_movable,
-    report_replaced,
+    EditRecord, published_refusal, record_edit_event, release_is_locally_movable, release_writes,
+    report_hidden, report_replaced,
 };
 
 /// Rebase the whole composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
@@ -137,10 +139,16 @@ pub(crate) fn run_rebase(
     })? {
         return Ok(exit);
     }
+    // An earlier write of the release a fast-forward push gave it is no
+    // member: nothing classifies it, and the write before the rebase leaves
+    // it out, so the rebase moves the members and the release only.
+    let writes = EarlierWrites::read(&opened, &release_name, &ledger, plan.published.as_ref())?;
+    let carriers = writes.carriers(&opened.parent_commits(release_commit.as_str())?);
     let context = RebaseContext {
         repo,
         entry,
         opened: &opened,
+        carriers: &carriers,
     };
     let Some((members, shed)) = classify_rebase_parents(&context, &release_name, &onto)? else {
         return Ok(Exit::Incomplete);
@@ -159,12 +167,40 @@ pub(crate) fn run_rebase(
         println!("{repo}: {shown_release} has no member parents to move; nothing to rebase");
         return Ok(Exit::Incomplete);
     }
-    let shed_write = shed_stale_bases(fork, (&release_name, &release_commit), &members, shed)?;
-    // The release the rebase moves: the shed write, when there was one.
+    // Every refusal is behind: the one write the rebase makes before it
+    // moves anything sheds the stale bases and leaves the carriers out.
+    let shed_write = shed_stale_bases(
+        fork,
+        (&release_name, &release_commit),
+        (&members, shed),
+        (&carriers, writes.commits()),
+    )?;
+    // The release the rebase moves: the write, when there was one.
     let (before_rebase, shed_unions) = shed_write.map_or_else(
         || (release_commit.clone(), Vec::new()),
         |written| (written.commit, written.unions),
     );
+    // Everything below reads the release the write left, not the old one.
+    let opened = knives::jj::Repo::open(path)?;
+    let in_hand = opened.resolve_commit(&release_name)?;
+    // Every earlier write of the name still visible, other than the release
+    // in hand and the write just made, is one more commit the rebase may
+    // copy: a carrier a conflicted write left visible, which nothing hid.
+    // Its copy is cleaned up as a tagged release's is.
+    let releases_own = [
+        opened.change_id_of(release_commit.as_str())?,
+        opened.change_id_of(in_hand.as_str())?,
+    ];
+    let mut earlier_originals = Vec::new();
+    for earlier in
+        EarlierWrites::read(&opened, &release_name, &ledger, plan.published.as_ref())?.commits()
+    {
+        if opened.is_visible(earlier)?
+            && !releases_own.contains(&opened.change_id_of(earlier.as_str())?)
+        {
+            earlier_originals.push(earlier.clone());
+        }
+    }
     // A pushed or published release name stays where it is: the rebase
     // rewrites each descendant of a moved member, earlier release merges among
     // them, and a push of the moved name would move what consumers were given.
@@ -241,18 +277,43 @@ pub(crate) fn run_rebase(
     // After the provenance is recorded, so a failed cleanup cannot leave the
     // rebased release described with its pre-rebase parents.
     let mut originals = tagged;
-    for (_, commit) in &restored {
+    for commit in restored
+        .iter()
+        .map(|(_, commit)| commit)
+        .chain(&earlier_originals)
+    {
         if !originals.contains(commit) {
             originals.push(commit.clone());
         }
     }
-    let copies = knives::jj::abandon_tagged_copies(
+    let rebased = knives::jj::Repo::open(path)?;
+    let cleaned = knives::jj::abandon_tagged_copies(
         path,
         &originals,
-        &onto,
+        (
+            &onto,
+            knives::jj::RebasedName {
+                name: &release_name,
+                publish_remote: entry.publish_remote(),
+                commit: &rebased.resolve_commit(&release_name)?,
+                earlier: EarlierWrites::read(
+                    &rebased,
+                    &release_name,
+                    &ledger,
+                    plan.published.as_ref(),
+                )?
+                .commits(),
+            },
+        ),
         &format!("knives: {release_name}: abandon rebased copies of earlier releases"),
     )?;
-    report_tagged_copies(repo, &copies, &restored);
+    report_tagged_copies(
+        repo,
+        &cleaned.copies,
+        (&restored, &earlier_originals),
+        &release_name,
+    );
+    report_hidden(repo, &release_name, &cleaned.hidden);
     if no_drop {
         return Ok(Exit::Ok);
     }
@@ -309,15 +370,33 @@ fn stale_rule_exit(fork: &Fork<'_>) -> anyhow::Result<Option<Exit>> {
     Ok(Some(Exit::Incomplete))
 }
 
-/// Rewrite the release to its member parents only, shedding stale bases; what
-/// the write made, or `None` when there was nothing to shed.
+/// Rewrite the release to its member parents only, shedding stale bases and
+/// leaving out its carriers, the earlier writes of it a fast-forward push gave
+/// it, in one write; what the write made, or `None` when there was neither to
+/// leave out.
+///
+/// A carrier left in would make the rebase copy it: `jj rebase -b` rewrites
+/// every descendant of the members it moves, and a carrier is a merge of
+/// them. Written out first, the release's resolutions over it become its own
+/// change and move with it, and the carrier is hidden in the same write when
+/// nothing holds it.
 fn shed_stale_bases(
     fork: &Fork<'_>,
     (release_name, release_commit): (&str, &knives::ids::CommitId),
-    members: &[knives::ids::CommitId],
-    shed: usize,
+    (members, shed): (&[knives::ids::CommitId], usize),
+    (carriers, earlier): (&[knives::ids::CommitId], &[knives::ids::CommitId]),
 ) -> anyhow::Result<Option<knives::jj::ReleaseWritten>> {
-    if shed == 0 {
+    let mut done = Vec::new();
+    if shed > 0 {
+        done.push(format!("shed {shed} stale base parent(s)"));
+    }
+    if !carriers.is_empty() {
+        done.push(format!(
+            "leave out {} earlier write(s) of the release",
+            carriers.len()
+        ));
+    }
+    if done.is_empty() {
         return Ok(None);
     }
     let written = knives::jj::write_release(
@@ -325,11 +404,12 @@ fn shed_stale_bases(
         &knives::jj::ReleaseWrite {
             source: Some(release_commit),
             parents: members,
+            carriers,
             message: None,
             bookmark: Some(release_name),
             publish_remote: Some(fork.entry.publish_remote()),
-            earlier: &earlier_writes(fork, release_name)?,
-            operation: &format!("knives: {release_name}: shed {shed} stale base parent(s)"),
+            earlier,
+            operation: &format!("knives: {release_name}: {}", done.join("; ")),
         },
     )?;
     report_replaced(&fork.name, release_name, &written);
@@ -341,6 +421,9 @@ struct RebaseContext<'a> {
     repo: &'a RepoName,
     entry: &'a knives::config::RepoEntry,
     opened: &'a knives::jj::Repo,
+    /// The release's parents that are earlier writes of it, which no
+    /// classification reads.
+    carriers: &'a [knives::ids::CommitId],
 }
 
 /// The release's moving members and the count of shed legacy base parents, or
@@ -350,7 +433,8 @@ struct RebaseContext<'a> {
 /// carries pre-rewrite code onto the new base. A held parent — any bookmark
 /// still on it whose branch is neither a release name nor the trunk — is a
 /// member and moves. An unheld parent already reachable from the target is a
-/// legacy trunk parent: the base is never a parent, so it is shed.
+/// legacy trunk parent: the base is never a parent, so it is shed. A carrier
+/// is neither: the write before the rebase leaves it out.
 fn classify_rebase_parents(
     context: &RebaseContext<'_>,
     release_name: &str,
@@ -358,7 +442,11 @@ fn classify_rebase_parents(
 ) -> anyhow::Result<Option<(Vec<knives::ids::CommitId>, usize)>> {
     let (repo, entry, opened) = (context.repo, context.entry, context.opened);
     let scheme = entry.release_scheme();
-    let parents = opened.parents_of(release_name)?;
+    let parents: Vec<knives::detect::ReleaseParent> = opened
+        .parents_of(release_name)?
+        .into_iter()
+        .filter(|parent| !context.carriers.contains(&parent.commit))
+        .collect();
     let mut members: Vec<knives::ids::CommitId> = Vec::new();
     let mut shed = 0usize;
     for parent in &parents {
@@ -696,7 +784,9 @@ fn all_landed(
 /// Only a member carrying nothing past the target is dropped: a branch with
 /// commits beyond its merged pull request still holds undelivered work, and
 /// that is said instead. The drop duplicates the release onto the kept parents,
-/// exactly as `drop` does, so recorded conflict resolutions carry forward.
+/// exactly as `drop` does, so recorded conflict resolutions carry forward, and
+/// leaves out the release's carriers, as every write composing from its
+/// parents does.
 fn drop_landed_members(
     fork: &Fork<'_>,
     release_name: &str,
@@ -710,7 +800,11 @@ fn drop_landed_members(
     let entry = fork.entry;
     let path = &fork.checkout.path;
     let opened = knives::jj::Repo::open(path)?;
-    let parents = opened.parent_commits(release_name)?;
+    let writes = release_writes(fork, &opened, release_name)?;
+    let (carriers, parents): (Vec<knives::ids::CommitId>, Vec<knives::ids::CommitId>) = opened
+        .parent_commits(release_name)?
+        .into_iter()
+        .partition(|parent| writes.contains(parent));
     let mut kept = parents.clone();
     let mut deltas: Vec<String> = Vec::new();
     for pull in &destination.landed {
@@ -755,10 +849,11 @@ fn drop_landed_members(
         &knives::jj::ReleaseWrite {
             source: Some(&release),
             parents: &kept,
+            carriers: &carriers,
             message: Some(&message),
             bookmark: Some(release_name),
             publish_remote: Some(entry.publish_remote()),
-            earlier: &earlier_writes(fork, release_name)?,
+            earlier: writes.commits(),
             operation: &format!("knives: {release_name}: {delta}"),
         },
     )?;
@@ -890,26 +985,31 @@ fn rebase_unions(
     described
 }
 
-/// One line per copy the rebase made of an earlier release — tagged, or named
-/// by a release bookmark put back on it: abandoned, or kept with a note naming
-/// what rests on it.
+/// One line per copy the rebase made of an earlier release — tagged, named
+/// by a release bookmark put back on it, or an earlier write of the release
+/// in hand (`carriers`): abandoned, or kept with a note naming what rests on
+/// it.
 fn report_tagged_copies(
     repo: &RepoName,
     copies: &[knives::jj::TaggedCopy],
-    restored: &[(String, knives::ids::CommitId)],
+    (restored, carriers): (&[(String, knives::ids::CommitId)], &[knives::ids::CommitId]),
+    release: &str,
 ) {
-    for line in tagged_copy_lines(repo, copies, restored) {
+    for line in tagged_copy_lines(repo, copies, (restored, carriers), release) {
         println!("{line}");
     }
 }
 
 /// The lines [`report_tagged_copies`] prints. Tag and release names are read
 /// from the repository, and what keeps a copy names bookmarks, tags and jj
-/// workspaces (`what_keeps`, src/jj.rs), so each is escaped.
+/// workspaces (`what_keeps`, src/jj.rs), so each is escaped. A copy of an
+/// earlier write of `release` is labelled as one, so no reader takes it for a
+/// member's.
 fn tagged_copy_lines(
     repo: &RepoName,
     copies: &[knives::jj::TaggedCopy],
-    restored: &[(String, knives::ids::CommitId)],
+    (restored, carriers): (&[(String, knives::ids::CommitId)], &[knives::ids::CommitId]),
+    release: &str,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     for copy in copies {
@@ -920,14 +1020,23 @@ fn tagged_copy_lines(
                 .filter(|(_, commit)| *commit == copy.original)
                 .map(|(name, _)| name.clone()),
         );
+        let keeps_a_name = !names.is_empty();
+        if carriers.contains(&copy.original) {
+            names.push(carrier_label(release));
+        }
         let of = format!(
             "the rebased copy of {} ({})",
             copy.original.short(),
             inline_human_text(&names.join(", "))
         );
         let copy_id = copy.copy.short();
+        let original = if keeps_a_name {
+            "the original keeps its name"
+        } else {
+            "the original stays where it was"
+        };
         lines.push(copy.kept.as_ref().map_or_else(
-            || format!("{repo}: abandoned {copy_id}, {of}; the original keeps its name"),
+            || format!("{repo}: abandoned {copy_id}, {of}; {original}"),
             |reason| {
                 format!(
                     "{repo}: note: kept {copy_id}, {of}: {}",
@@ -976,13 +1085,43 @@ mod tests {
         }];
         let restored = [("release/2026-01-01\u{9d}".to_owned(), CommitId::new("aaaa"))];
 
-        let lines = tagged_copy_lines(&RepoName::new("demo"), &copies, &restored);
+        let lines = tagged_copy_lines(
+            &RepoName::new("demo"),
+            &copies,
+            (&restored, &[]),
+            "release/2026-01-02",
+        );
 
         assert_eq!(
             lines,
             [
                 "demo: note: kept bbbb, the rebased copy of aaaa (tag v1\u{fffd}2J, \
               release/2026-01-01\u{fffd}): the working copy of workspace ws\u{fffd}x rests on it"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rebased_copy_of_an_earlier_write_is_labelled_a_carrier_copy() {
+        // Given: a rebase's copy of an earlier write of the release in hand,
+        // which no tag or release bookmark names, abandoned.
+        let copies = [TaggedCopy {
+            original: CommitId::new("aaaa"),
+            tags: Vec::new(),
+            copy: CommitId::new("bbbb"),
+            kept: None,
+        }];
+        let carriers = [CommitId::new("aaaa")];
+
+        // When: the rebase reports it.
+        let lines = tagged_copy_lines(&RepoName::new("demo"), &copies, (&[], &carriers), "sami");
+
+        // Then: the copy is named as an earlier write's, never a member's.
+        assert_eq!(
+            lines,
+            [
+                "demo: abandoned bbbb, the rebased copy of aaaa (sami earlier write (carrier, \
+                 not a member)); the original stays where it was"
             ]
         );
     }

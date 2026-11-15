@@ -13,7 +13,7 @@ use knives::forge::github::CliForge;
 use knives::ids::{BranchName, CommitId, ReleaseScheme, RepoName};
 use knives::ledger::{Draft, Ledger, inline_human_text};
 use knives::release_model::{
-    MemberEvidence, MemberHistory, MemberLookup, MemberSuccession, SeriesFit,
+    EarlierWrites, MemberEvidence, MemberHistory, MemberLookup, MemberSuccession, SeriesFit,
     StackedHistoryContext, carried_from_tips, carries_member_line, last_recorded_parents,
     member_history, member_parents, members_event_text, series_fit, trunk_positions,
 };
@@ -49,37 +49,62 @@ impl ReleaseEdit {
 /// What an edit decided: a new parent set to write with the delta that describes
 /// it, or an already-reported end.
 enum EditOutcome {
-    Done(Vec<knives::ids::CommitId>, String),
+    Done {
+        parents: Vec<knives::ids::CommitId>,
+        delta: String,
+        /// The target of a drop whose parent no remaining member's history
+        /// carries: whether the release loses its content is read from the
+        /// written tree ([`apply_edit`]).
+        uncarried: Option<String>,
+    },
     Settled(Exit),
 }
 
 /// The release in hand: a flat merge of feature and fix branches.
 ///
-/// Every parent is a member. The upstream base is never a direct parent — it
-/// is reachable through every member, because members fork from it — so there
-/// is no role to classify and nothing for a landed member to be mistaken for.
+/// Every parent is a member, except an earlier write of the release a
+/// fast-forward push gave it, a carrier, which no new composition keeps. The
+/// upstream base is never a direct parent — it is reachable through every
+/// member, because members fork from it — so there is no role to classify
+/// and nothing for a landed member to be mistaken for.
 struct ReleaseInHand {
     name: String,
     commit: knives::ids::CommitId,
+    /// The members: the release's parents, its carriers left out.
     parents: Vec<knives::ids::CommitId>,
+    /// The parents that are earlier writes of the release
+    /// ([`knives::release_model::carriers`]).
+    carriers: Vec<knives::ids::CommitId>,
+    /// Every earlier write of the name, which the write hides once it leaves
+    /// one a head nothing holds.
+    writes: EarlierWrites,
     /// Where the trunk sits, upstream and locally. The trunk is not a feature
     /// branch, so neither position is ever a member.
     trunk_tips: Vec<knives::ids::CommitId>,
 }
 
 impl ReleaseInHand {
-    /// Read the release's parents: the members.
+    /// Read the release's parents: the members and the carriers, the latter
+    /// from the ledger's writes of the name and `published`, the publish
+    /// remote's commit of it in jj's view.
     fn read(
         opened: &knives::jj::Repo,
         entry: &knives::config::RepoEntry,
         name: String,
+        (ledger, published): (&[knives::ledger::Entry], Option<&knives::ids::CommitId>),
     ) -> anyhow::Result<Self> {
         let commit = opened.resolve_commit(&name)?;
-        let parents = opened.parent_commits(&name)?;
+        let writes = EarlierWrites::read(opened, &name, ledger, published)?;
+        let (carriers, parents) = opened
+            .parent_commits(&name)?
+            .into_iter()
+            .partition(|parent| writes.contains(parent));
         Ok(Self {
             name,
             commit,
             parents,
+            carriers,
+            writes,
             trunk_tips: trunk_positions(opened, entry)?,
         })
     }
@@ -566,9 +591,14 @@ fn edit_release(
     if !release_is_locally_movable(&opened, repo, &release_name) {
         return Ok(Exit::Incomplete);
     }
-    let release = ReleaseInHand::read(&opened, entry, release_name)?;
     // The pulled plan refused on any problem this read finds.
     let ledger = Ledger::for_fork(fork).read()?.entries;
+    let release = ReleaseInHand::read(
+        &opened,
+        entry,
+        release_name,
+        (&ledger, plan.published.as_ref()),
+    )?;
     if let Some(refusal) = published_refusal(
         &opened,
         &ledger,
@@ -612,20 +642,28 @@ fn edit_release(
             advance_edit(&context, entry, branches, from.as_deref())?
         }
     };
-    let (new_parents, delta) = match outcome {
+    let (parents, delta, uncarried) = match outcome {
         EditOutcome::Settled(exit) => return Ok(exit),
-        EditOutcome::Done(parents, delta) => (parents, delta),
+        EditOutcome::Done {
+            parents,
+            delta,
+            uncarried,
+        } => (parents, delta, uncarried),
     };
-    apply_edit(&context, fork, &new_parents, &delta)
+    apply_edit(&context, fork, (&parents, &delta, uncarried.as_deref()))
 }
 
 /// Write the edited release — duplicated onto its new parent set, described,
 /// its name moved — record the parent set in the ledger, and report.
+///
+/// `uncarried` is the target of a drop whose parent no remaining member's
+/// history carries. Whether the release lost that content is read from the
+/// written tree: jj merges the remaining parents over their real merge base,
+/// so the content can survive, and then the drop says so instead of a loss.
 fn apply_edit(
     context: &EditContext<'_>,
     fork: &Fork<'_>,
-    new_parents: &[knives::ids::CommitId],
-    delta: &str,
+    (new_parents, delta, uncarried): (&[knives::ids::CommitId], &str, Option<&str>),
 ) -> anyhow::Result<Exit> {
     let (repo, opened, release) = (context.repo, context.opened, context.release);
     let entry = fork.entry;
@@ -636,10 +674,11 @@ fn apply_edit(
         &knives::jj::ReleaseWrite {
             source: Some(&release.commit),
             parents: new_parents,
+            carriers: &release.carriers,
             message: Some(&message),
             bookmark: Some(&release.name),
             publish_remote: Some(entry.publish_remote()),
-            earlier: &earlier_writes(fork, &release.name)?,
+            earlier: release.writes.commits(),
             operation: &format!("knives: {}: {delta}", release.name),
         },
     )?;
@@ -657,6 +696,22 @@ fn apply_edit(
         },
         context.bound,
     )?;
+    if let Some(target) = uncarried {
+        let shown_target = inline_human_text(target);
+        let reopened = knives::jj::Repo::open(&fork.checkout.path)?;
+        if reopened.same_tree(&release.commit, created)? {
+            println!(
+                "{repo}: {shown_target} left the parent set of {}, and the release's content did \
+                 not change",
+                release.shown_name()
+            );
+        } else {
+            println!(
+                "{repo}: no remaining member carries {shown_target}'s content; the release loses \
+                 it"
+            );
+        }
+    }
     // The delta names branches read from the repository, and the reason the
     // caller gave; the ledger keeps it raw.
     println!(
@@ -712,6 +767,7 @@ fn replaced_lines(
         release,
         &written.abandoned_earlier,
     ));
+    lines.extend(hidden_lines(repo, release, &written.hidden));
     lines
 }
 
@@ -744,15 +800,60 @@ fn abandoned_earlier_lines(
         .collect()
 }
 
-/// The commits the fork's ledger records knives writing under `release`.
-pub(crate) fn earlier_writes(
+/// One line per head a write left that nothing held, and abandoned in the
+/// same operation (`hide_exposed`, src/jj.rs).
+pub(crate) fn report_hidden(repo: &RepoName, release: &str, hidden: &[knives::jj::HiddenHead]) {
+    for line in hidden_lines(repo, release, hidden) {
+        println!("{line}");
+    }
+}
+
+fn hidden_lines(repo: &RepoName, release: &str, hidden: &[knives::jj::HiddenHead]) -> Vec<String> {
+    let shown_release = inline_human_text(release);
+    hidden
+        .iter()
+        .map(|head| {
+            let commit = head.commit.short();
+            head.superseded_by.as_ref().map_or_else(
+                || {
+                    format!(
+                        "{repo}: abandoned {commit}, an earlier {shown_release} commit this write \
+                         left a head nothing holds"
+                    )
+                },
+                |by| {
+                    format!(
+                        "{repo}: abandoned {commit}, which this write left a head nothing holds; \
+                         its rewrite {} is visible",
+                        by.short()
+                    )
+                },
+            )
+        })
+        .collect()
+}
+
+/// Every earlier write of `release` ([`EarlierWrites`]): the fork's ledger's
+/// writes of the name, and the publish remote's commit of it in `opened`'s
+/// view.
+pub(crate) fn release_writes(
     fork: &Fork<'_>,
+    opened: &knives::jj::Repo,
     release: &str,
-) -> anyhow::Result<Vec<knives::ids::CommitId>> {
+) -> anyhow::Result<EarlierWrites> {
     let entries = Ledger::for_fork(fork).read()?.entries;
-    Ok(knives::release_model::recorded_writes(&entries, release)
-        .map(|write| write.commit)
-        .collect())
+    let published = opened
+        .bookmark_tips()?
+        .remove(&knives::ids::BookmarkRef::Remote {
+            branch: BranchName::new(release),
+            remote: knives::ids::RemoteName::new(fork.entry.publish_remote()),
+        });
+    Ok(EarlierWrites::read(
+        opened,
+        release,
+        &entries,
+        published.as_ref(),
+    )?)
 }
 
 /// What one release edit wrote: the name, the delta, the new merge with its
@@ -986,7 +1087,11 @@ fn include_edit(
     parents.push(tip);
     let why = why.map_or_else(String::new, |why| format!(" ({why})"));
     let delta = format!("included {target}{why}");
-    Ok(EditOutcome::Done(parents, delta))
+    Ok(EditOutcome::Done {
+        parents,
+        delta,
+        uncarried: None,
+    })
 }
 
 /// Remove one member parent. The branch and its bookmark are untouched.
@@ -1006,7 +1111,9 @@ fn drop_edit(context: &EditContext<'_>, target: &str, why: &str) -> anyhow::Resu
             candidates.extend(context.member_parents(target, &tip)?.parents);
         }
     } else if let Ok(commit) = opened.resolve_commit(target) {
-        if release.parents.contains(&commit) {
+        // A carrier is no member, but dropping it by its id is what a person
+        // who read it in the parent list asks for: the write leaves it out.
+        if release.parents.contains(&commit) || release.carriers.contains(&commit) {
             candidates.push(commit);
         }
     } else {
@@ -1025,10 +1132,10 @@ fn drop_edit(context: &EditContext<'_>, target: &str, why: &str) -> anyhow::Resu
             let mut parents = release.parents.clone();
             parents.retain(|kept| kept != parent);
             // A drop only removes the parent; whether the content survives
-            // depends on the remaining members' ancestry. Losing it is often
-            // the point (a bad fix) and sometimes a surprise (a landed pull
-            // the members' bases do not reach yet), so the fact is stated
-            // rather than judged.
+            // depends on the remaining members. Losing it is often the point
+            // (a bad fix) and sometimes a surprise (a landed pull the
+            // members' bases do not reach yet), so the fact is stated rather
+            // than judged, once the written tree says which it is.
             let mut carried_elsewhere = false;
             for kept in &parents {
                 if opened.is_ancestor(parent, kept)? {
@@ -1036,14 +1143,12 @@ fn drop_edit(context: &EditContext<'_>, target: &str, why: &str) -> anyhow::Resu
                     break;
                 }
             }
-            if !carried_elsewhere {
-                println!(
-                    "{repo}: no remaining member carries {shown_target}'s content; the release \
-                     loses it"
-                );
-            }
             let delta = format!("dropped {target}: {why}");
-            Ok(EditOutcome::Done(parents, delta))
+            Ok(EditOutcome::Done {
+                parents,
+                delta,
+                uncarried: (!carried_elsewhere).then(|| target.to_owned()),
+            })
         }
         many => {
             let listed: Vec<&str> = many.iter().map(CommitId::short).collect();
@@ -1123,7 +1228,11 @@ fn advance_edit(
         }
     }
     let delta = format!("advanced {}", moved.join(", "));
-    Ok(EditOutcome::Done(deduped, delta))
+    Ok(EditOutcome::Done {
+        parents: deduped,
+        delta,
+        uncarried: None,
+    })
 }
 
 /// Advance every member whose branch has moved on. `None` is a refusal that
@@ -1416,6 +1525,7 @@ mod tests {
                 kept: Some("the working copy of workspace ws\u{1b}x\u{9b}y rests on it".to_owned()),
             }),
             abandoned_earlier: vec![CommitId::new("cccc")],
+            hidden: Vec::new(),
             unions: Vec::new(),
         };
 
@@ -1431,6 +1541,36 @@ mod tests {
                  working copy of workspace ws\u{fffd}x\u{fffd}y rests on it",
                 "demo: abandoned cccc, an earlier release/x\u{fffd}2J commit nothing rests on any \
                  more",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hidden_head_is_named_as_an_earlier_write_or_with_its_rewrite() {
+        // Given: a write that hid an earlier write of the release and a
+        // member commit a visible rewrite supersedes.
+        let hidden = [
+            knives::jj::HiddenHead {
+                commit: CommitId::new("dddd"),
+                superseded_by: None,
+            },
+            knives::jj::HiddenHead {
+                commit: CommitId::new("eeee"),
+                superseded_by: Some(CommitId::new("ffff")),
+            },
+        ];
+
+        // When: the write reports them.
+        let lines = hidden_lines(&RepoName::new("demo"), "sami\u{9b}2J", &hidden);
+
+        // Then: each says why it was the write's to hide, the name escaped.
+        assert_eq!(
+            lines,
+            [
+                "demo: abandoned dddd, an earlier sami\u{fffd}2J commit this write left a head \
+                 nothing holds",
+                "demo: abandoned eeee, which this write left a head nothing holds; its rewrite \
+                 ffff is visible",
             ]
         );
     }

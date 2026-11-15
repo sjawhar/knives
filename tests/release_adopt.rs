@@ -659,6 +659,57 @@ fn adopt_refuses_a_change_beyond_the_conflicts_without_a_why() {
     assert_eq!(ledger_entries(&home), before);
 }
 
+#[test]
+fn a_restore_beyond_the_conflicts_that_drops_a_members_line_is_recorded_with_findings() {
+    // Given: a cut with no conflict, then alpha's file restored from the
+    // trunk on the release by hand: a file the cut left without a conflict,
+    // every line alpha added to it gone.
+    let (lab, home, _consumer) = two_branch_cut();
+    lab.jj_work([
+        "restore",
+        "--from",
+        "main@origin",
+        "--into",
+        RELEASE,
+        "alpha.txt",
+    ]);
+    let restored = commit_at(&lab, RELEASE);
+
+    // When: it is adopted, with a reason for the change.
+    let output = adopt(&lab, &home, &["--why", "a restore"]);
+
+    // Then: it is recorded, and alpha's count in the file changed beyond the
+    // conflicts is printed, flagged, and makes the exit findings.
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        out.contains(
+            "  1 file(s) changed beyond the baseline's conflicts, because: a restore\n    \
+             alpha.txt\n"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "  !! feat/alpha: 1 of 1 added line(s) of alpha.txt absent from the resolution: \
+             every line it added is gone\n"
+        ),
+        "{out}"
+    );
+    let event = newest_event(&home, RELEASE);
+    assert_eq!(
+        event.evidence.first().map(String::as_str),
+        Some(restored.as_str())
+    );
+    assert!(
+        event
+            .text
+            .contains("added lines absent: feat/alpha 1 of 1 in alpha.txt"),
+        "{}",
+        event.text
+    );
+}
+
 /// The base release log split where every ygo member inserts its own block:
 /// above the first `## ` section.
 fn ygo_preamble_and_sections() -> (&'static str, &'static str) {

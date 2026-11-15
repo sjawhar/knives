@@ -1663,6 +1663,7 @@ fn a_discarded_candidate_leaves_no_trace() {
         knives::jj::CutSpec {
             source: None,
             parents: vec![alpha.clone(), beta],
+            carriers: Vec::new(),
             message: "release: doomed candidate".to_owned(),
         },
     )

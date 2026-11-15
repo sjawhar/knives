@@ -24,11 +24,13 @@ use super::parallelism;
 /// the release `reference` names, or the one in hand.
 ///
 /// The ledger is pulled first, as every release command's is, when the
-/// answer reads it: with no `reference` the release in hand is the plan's,
-/// and `verify` holds the release against its newest recorded write when it
-/// is not that write. A pull that failed is one of the report's problems.
-/// The plan's other problems (a consumer whose pins could not be read) are
-/// not: they are about the next cut, not about which release this is.
+/// answer reads it beyond labelling the release's earlier writes: with no
+/// `reference` the release in hand is the plan's, and `verify` holds the
+/// release against its newest recorded write when it is not that write. A
+/// pull that failed is one of the report's problems. The plan's other
+/// problems (a consumer whose pins could not be read) are not: they are
+/// about the next cut, not about which release this is. A named release read
+/// without `verify` labels its carriers from the ledger this machine has.
 #[allow(
     clippy::too_many_arguments,
     reason = "the fork, the registry its ledger is pulled through, the reference, the replay request and the output format are independent inputs"
@@ -49,7 +51,10 @@ pub(crate) fn run_release_members(
     let (entries, pull_problems) = if reference.is_none() || verify {
         release::pulled_ledger(fork, registry)?
     } else {
-        (Vec::new(), Vec::new())
+        (
+            knives::ledger::Ledger::for_fork(fork).read()?.entries,
+            Vec::new(),
+        )
     };
     let reference = if let Some(reference) = reference {
         std::borrow::Cow::Borrowed(reference)
@@ -71,8 +76,7 @@ pub(crate) fn run_release_members(
         };
         std::borrow::Cow::Owned(reference)
     };
-    let mut report =
-        release::gather_members(&opened, fork, &reference, verify.then_some(&entries[..]))?;
+    let mut report = release::gather_members(&opened, fork, &reference, (&entries, verify))?;
     report.problems.extend(pull_problems);
     let exit = members_exit(&report, verify);
     print_members(&report, output)?;

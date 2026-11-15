@@ -14,11 +14,11 @@ use knives::forge::github::CliForge;
 use knives::ids::{BookmarkRef, ReleaseScheme, RemoteName, RepoName};
 use knives::ledger::{Draft, Ledger, inline_human_text, problem_human_text};
 use knives::release_model::{
-    RecordedCut, StackedHistoryContext, carried_branches, last_series_cut, members_event_text,
-    previous_release_for_cut, series_members, trunk_positions,
+    EarlierWrites, RecordedCut, StackedHistoryContext, carried_branches, last_series_cut,
+    members_event_text, previous_release_for_cut, series_members, trunk_positions,
 };
 
-use super::release_edit::{recorded_parents, union_event_text};
+use super::release_edit::{recorded_parents, release_writes, report_hidden, union_event_text};
 use super::scribe_for;
 
 pub(crate) enum ReleaseInvocation {
@@ -102,8 +102,22 @@ pub(crate) fn run_release(
         // first cut has no composition to carry, so it starts from every branch: a
         // release is a flat merge of feature and fix branches, and the upstream
         // base is never a direct parent — it is reachable through every member.
+        // An earlier write of the previous release a fast-forward push gave it
+        // is no member, so the cut carries every parent but those.
+        let previous_writes = match &previous {
+            Some((reference, _)) => release_writes(fork, &opened, reference.branch().as_str())?,
+            None => EarlierWrites::default(),
+        };
+        let previous_carriers = match &previous {
+            Some((_, commit)) => previous_writes.carriers(&opened.parent_commits(commit.as_str())?),
+            None => Vec::new(),
+        };
         let (carried, members, audit_base) = if let Some((_, previous)) = &previous {
-            let parents = opened.parent_commits(previous.as_str())?;
+            let parents: Vec<knives::ids::CommitId> = opened
+                .parent_commits(previous.as_str())?
+                .into_iter()
+                .filter(|parent| !previous_carriers.contains(parent))
+                .collect();
             let carried = release::parent_sources(&opened, entry, &scheme, &parents)?;
             let members = carried.clone();
             let base =
@@ -156,7 +170,13 @@ pub(crate) fn run_release(
             (carried, members, base)
         };
         let request = release::Cut::from_carried(name.clone(), &carried);
-        let mut candidate = release::candidate_cut(path, &request, previous_commit.as_ref())?;
+        let mut candidate = release::candidate_cut(
+            path,
+            &request,
+            previous_commit
+                .as_ref()
+                .map(|previous| (previous, previous_carriers.as_slice())),
+        )?;
         // The orphan gate protects unreachable commits; this protects the
         // composition itself. The previous cut's ledger event is the only
         // record of a parent set that survives the bookmark moving, so every
@@ -334,7 +354,13 @@ pub(crate) fn run_release(
         // The publish rebuilds the audited tree, so the candidate's unions are
         // what ships.
         let unions = candidate.unions().to_vec();
-        let created = release::publish_cut(candidate, &request.name, &scheme)?;
+        let published = release::publish_cut(
+            candidate,
+            &request.name,
+            &scheme,
+            (previous_writes.commits(), Some(entry.publish_remote())),
+        )?;
+        let created = published.commit;
         let completed = CompletedCut {
             name: &name,
             request: &request,
@@ -348,6 +374,13 @@ pub(crate) fn run_release(
         };
         record_cut_event(fork, &completed, bound)?;
         worst = worst.worst(report_completed_cut(fork, &opened, &completed, bound)?);
+        report_hidden(
+            repo,
+            previous
+                .as_ref()
+                .map_or(name.as_str(), |(reference, _)| reference.branch().as_str()),
+            &published.hidden,
+        );
     }
     Ok(worst)
 }
@@ -978,50 +1011,81 @@ fn reap_after_cut(fork: &Fork<'_>) -> anyhow::Result<Exit> {
 /// ledger records knives writing under it, and their visible rewrites — that
 /// are visible heads nothing rests on: a replaced commit once kept for a
 /// working copy that has since moved on would otherwise stay an anonymous head
-/// for good. Returns each abandoned commit with its name, and a note for each
-/// name whose cleanup failed: the reap itself is already committed, so its
-/// report must still reach the operator.
+/// for good. Returns each abandoned commit with its name, each head those
+/// abandons exposed and hid with its name, and a note for each name whose
+/// cleanup failed: the reap itself is already committed, so its report must
+/// still reach the operator.
 fn abandon_reaped_writes(
     fork: &Fork<'_>,
     report: &knives::commands::release::ReapReport,
     ledger: &[knives::ledger::Entry],
-) -> (Vec<(String, knives::ids::CommitId)>, Vec<String>) {
+) -> ReapedWrites {
     let names: Vec<&str> = report
         .reaped
         .iter()
         .chain(report.forgotten_only.iter().map(|(name, _)| name))
         .map(String::as_str)
         .collect();
-    let mut abandoned_earlier = Vec::new();
-    let mut notes = Vec::new();
+    let mut done = ReapedWrites::default();
     if names.is_empty() {
-        return (abandoned_earlier, notes);
+        return done;
     }
     let reopened = match knives::jj::Repo::open(&fork.checkout.path) {
         Ok(reopened) => reopened,
         Err(error) => {
-            notes.push(format!("earlier writes not cleaned up: {error}"));
-            return (abandoned_earlier, notes);
+            done.notes
+                .push(format!("earlier writes not cleaned up: {error}"));
+            return done;
         }
     };
+    // The live cut's conflicts stop the hiding: its superseded cuts are then
+    // the record of their last resolution.
+    let live = reopened.bookmark_tips().ok().and_then(|tips| {
+        release::live_dated_release(
+            &tips,
+            &fork.entry.dated_scheme(),
+            fork.entry.publish_remote(),
+        )
+    });
     for name in names {
         let abandoned = release::earlier_writes(&reopened, ledger, name).and_then(|earlier| {
             knives::jj::abandon_unheld_writes(
                 &fork.checkout.path,
                 &earlier,
+                live.as_ref().map(|(_, commit)| commit),
                 &format!("knives: {name}: abandon earlier writes nothing rests on"),
             )
         });
         match abandoned {
-            Ok(abandoned) => abandoned_earlier.extend(
-                abandoned
-                    .into_iter()
-                    .map(|commit| (name.to_owned(), commit)),
-            ),
-            Err(error) => notes.push(format!("{name}: earlier writes not cleaned up: {error}")),
+            Ok(abandoned) => {
+                done.abandoned.extend(
+                    abandoned
+                        .abandoned
+                        .into_iter()
+                        .map(|commit| (name.to_owned(), commit)),
+                );
+                done.hidden.extend(
+                    abandoned
+                        .hidden
+                        .into_iter()
+                        .map(|head| (name.to_owned(), head)),
+                );
+            }
+            Err(error) => done
+                .notes
+                .push(format!("{name}: earlier writes not cleaned up: {error}")),
         }
     }
-    (abandoned_earlier, notes)
+    done
+}
+
+/// What [`abandon_reaped_writes`] did, each commit with the name it was a
+/// write of, and the notes of each name whose cleanup failed.
+#[derive(Default)]
+struct ReapedWrites {
+    abandoned: Vec<(String, knives::ids::CommitId)>,
+    hidden: Vec<(String, knives::jj::HiddenHead)>,
+    notes: Vec<String>,
 }
 
 /// Reap superseded dated cuts on demand, in the chosen output.
@@ -1035,10 +1099,12 @@ pub(crate) fn run_reap(fork: &Fork<'_>, output: knives::cli::Output) -> anyhow::
     Ok(reap_exit(&reaped.report))
 }
 
-/// What one reap did: the report, and the earlier writes it abandoned after.
+/// What one reap did: the report, the earlier writes it abandoned after, and
+/// every head its abandons exposed and hid, each with its name.
 struct Reaped {
     report: knives::commands::release::ReapReport,
     abandoned_earlier: Vec<(String, knives::ids::CommitId)>,
+    hidden: Vec<(String, knives::jj::HiddenHead)>,
 }
 
 /// The reap both callers run, on the repository as it is now. The ledger's
@@ -1048,18 +1114,26 @@ fn reap(fork: &Fork<'_>) -> anyhow::Result<Reaped> {
     let path = &fork.checkout.path;
     let opened = knives::jj::Repo::open(path)?;
     let ledger = Ledger::for_fork(fork).read()?.entries;
-    let report = release::reap_superseded(
+    let mut report = release::reap_superseded(
         &opened,
         &fork.entry.dated_scheme(),
         fork.entry.publish_remote(),
         &ledger,
     )?;
-    let (abandoned_earlier, notes) = abandon_reaped_writes(fork, &report, &ledger);
-    let mut report = report;
-    report.notes.extend(notes);
+    let cleaned = abandon_reaped_writes(fork, &report, &ledger);
+    report.notes.extend(cleaned.notes);
+    // The reap's own abandons hid what they exposed in one operation over
+    // every reaped name, so those heads are named with all of them.
+    let reaped_names = report.reaped.join(", ");
+    let mut hidden: Vec<(String, knives::jj::HiddenHead)> = std::mem::take(&mut report.hidden)
+        .into_iter()
+        .map(|head| (reaped_names.clone(), head))
+        .collect();
+    hidden.extend(cleaned.hidden);
     Ok(Reaped {
         report,
-        abandoned_earlier,
+        abandoned_earlier: cleaned.abandoned,
+        hidden,
     })
 }
 
@@ -1078,6 +1152,10 @@ struct ReapPayload {
     notes: Vec<String>,
     /// Earlier writes of a reaped name abandoned because nothing rests on them.
     abandoned_earlier: Vec<AbandonedWrite>,
+    /// Heads the reap's abandons exposed and hid in the same operation: an
+    /// earlier write of a reaped name, or a commit a visible rewrite
+    /// supersedes.
+    hidden: Vec<HiddenWrite>,
 }
 
 #[derive(serde::Serialize)]
@@ -1090,6 +1168,15 @@ struct NamedReason {
 struct AbandonedWrite {
     name: String,
     commit: String,
+}
+
+#[derive(serde::Serialize)]
+struct HiddenWrite {
+    name: String,
+    commit: String,
+    /// The visible commit that rewrote it; absent for an earlier write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<String>,
 }
 
 impl ReapPayload {
@@ -1117,6 +1204,15 @@ impl ReapPayload {
                     commit: commit.as_str().to_owned(),
                 })
                 .collect(),
+            hidden: reaped
+                .hidden
+                .iter()
+                .map(|(name, head)| HiddenWrite {
+                    name: name.clone(),
+                    commit: head.commit.as_str().to_owned(),
+                    superseded_by: head.superseded_by.as_ref().map(|by| by.as_str().to_owned()),
+                })
+                .collect(),
         }
     }
 }
@@ -1141,6 +1237,9 @@ fn print_reap(repo: &RepoName, reaped: &Reaped) {
     }
     for (name, commit) in &reaped.abandoned_earlier {
         super::release_edit::report_abandoned_earlier(repo, name, std::slice::from_ref(commit));
+    }
+    for (name, head) in &reaped.hidden {
+        report_hidden(repo, name, std::slice::from_ref(head));
     }
 }
 
@@ -1303,6 +1402,7 @@ mod tests {
             notes: vec![format!(
                 "release/2026-01-03: refs forgotten: jj said\nError: {HOSTILE}"
             )],
+            hidden: Vec::new(),
         };
 
         let lines = reap_lines(&RepoName::new("demo"), &report);

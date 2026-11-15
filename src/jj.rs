@@ -998,6 +998,13 @@ impl Repo {
             && recorded.tree_ids() == current.tree_ids())
     }
 
+    /// Whether `first` and `second` hold the same tree, whatever their
+    /// parents: a release written onto other parents can still hold exactly
+    /// the content it held before. Either may be hidden; each is read by id.
+    pub fn same_tree(&self, first: &CommitId, second: &CommitId) -> Result<bool, JjError> {
+        Ok(self.commit(first.as_str())?.tree_ids() == self.commit(second.as_str())?.tree_ids())
+    }
+
     /// The bytes `path` (repository-internal, `/`-separated) holds at
     /// `revision`, or `None` where it holds no one resolved regular file:
     /// absent, a symlink, a directory, a conflict. Read in-process, so a file
@@ -2236,6 +2243,12 @@ pub struct ReleaseWrite<'a> {
     /// merge of exactly `parents`.
     pub source: Option<&'a CommitId>,
     pub parents: &'a [CommitId],
+    /// The parents of `source` that are earlier writes of the name, never
+    /// members ([`crate::release_model::carriers`]). With any, the source is
+    /// first written again on its other parents with its own tree
+    /// ([`duplicated_without_carriers`]), so what the source resolved over a
+    /// carrier becomes its own change and the duplicate keeps it.
+    pub carriers: &'a [CommitId],
     /// `None` keeps the source's own message (fresh merges must name one).
     pub message: Option<&'a str>,
     /// Point this bookmark at the written commit, sideways moves allowed —
@@ -2247,11 +2260,13 @@ pub struct ReleaseWrite<'a> {
     /// is the published position the next push replaces, so it does not keep
     /// a replaced source.
     pub publish_remote: Option<&'a str>,
-    /// Commits earlier writes put under the bookmark, as the ledger records
-    /// them. Each one that is a visible head nothing rests on — a replaced
-    /// commit once kept for a working copy that has since moved on — is
-    /// abandoned in the same operation, unless the written commit carries
-    /// conflicts. Unknown ones are skipped.
+    /// Every earlier write of the bookmark's name this repository holds
+    /// ([`crate::release_model::EarlierWrites`]). Each one that is a visible
+    /// head nothing rests on — a replaced commit once kept for a working copy
+    /// that has since moved on — is abandoned in the same operation, and so
+    /// is each one the write itself leaves a head nothing holds
+    /// ([`hide_exposed`]), unless the written commit carries conflicts.
+    /// Unknown ones are skipped.
     pub earlier: &'a [CommitId],
     /// The operation-log description, `knives: …` by convention.
     pub operation: &'a str,
@@ -2268,8 +2283,21 @@ pub struct ReleaseWritten {
     /// Earlier writes of the name ([`ReleaseWrite::earlier`]) abandoned here:
     /// visible heads nothing rests on any more.
     pub abandoned_earlier: Vec<CommitId>,
+    /// The heads this write exposed and hid in the same operation
+    /// ([`hide_exposed`]).
+    pub hidden: Vec<HiddenHead>,
     /// The release logs the write resolved itself, as the union of their sides.
     pub unions: Vec<UnionedFile>,
+}
+
+/// A commit a knives write abandoned because the write left it a visible
+/// head nothing holds ([`hide_exposed`]), and why it was the write's to hide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HiddenHead {
+    pub commit: CommitId,
+    /// The visible commit that rewrote it, or `None` when it is an earlier
+    /// write of the name.
+    pub superseded_by: Option<CommitId>,
 }
 
 /// A release log a release write resolved itself, as the union of its sides
@@ -2322,6 +2350,13 @@ pub struct ReplacedRelease {
 /// conflict is one ([`union_release_logs`]), so whether it still carries
 /// conflicts — which decides whether earlier writes are swept — is read after
 /// the union.
+///
+/// A source with carriers is duplicated from an in-between commit on its
+/// other parents ([`duplicated_without_carriers`]), which the same operation
+/// abandons, so the write still leaves one new visible commit. Abandoning the
+/// source can leave a carrier, or what sat behind one, a visible head nothing
+/// holds; the same operation hides each such head that is an earlier write of
+/// the name or superseded ([`hide_exposed`]).
 pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWritten, JjError> {
     validate_parents(write.source, write.parents)?;
     let repo = Repo::open_to_write(repo)?;
@@ -2329,7 +2364,12 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
     let mut tx = repo.repo.start_transaction();
     let (written, source, unions) = if let Some(source) = write.source {
         let source = repo.commit(source.as_str())?;
-        let (written, unions) = duplicated_release(&mut tx, (&source, write.message), &parent_ids)?;
+        let (written, unions) = duplicated_without_carriers(
+            &mut tx,
+            (&source, write.message),
+            write.carriers,
+            &parent_ids,
+        )?;
         (written, Some(source), unions)
     } else {
         let (written, unions) = merged_release(
@@ -2341,6 +2381,10 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
     };
     let mut replaced = None;
     let mut abandoned_earlier = Vec::new();
+    let moved = MovedName {
+        name: write.bookmark.unwrap_or_default(),
+        publish_remote: write.bookmark.and(write.publish_remote),
+    };
     if let Some(name) = write.bookmark {
         let ref_name = JjRefName::new(name);
         let source = source.filter(|source| {
@@ -2352,10 +2396,6 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
         });
         tx.repo_mut()
             .set_local_bookmark_target(ref_name, RefTarget::normal(written.id().clone()));
-        let moved = MovedName {
-            name,
-            publish_remote: write.publish_remote,
-        };
         if let Some(source) = source {
             let kept = what_keeps(&repo, tx.repo(), &source, &moved)?;
             if kept.is_none() {
@@ -2391,12 +2431,21 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
             }
         }
     }
+    let hidden = hide_exposed(
+        &mut tx,
+        &Exposure {
+            earlier: write.earlier,
+            moved,
+            conflicted: written.has_conflict(),
+        },
+    )?;
     commit_mutation(&repo, tx, write.operation)?;
     Ok(ReleaseWritten {
         commit: commit_id(written.id()),
         change: ChangeId::new(written.change_id().to_string()),
         replaced,
         abandoned_earlier,
+        hidden,
         unions,
     })
 }
@@ -2405,6 +2454,162 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
 struct MovedName<'a> {
     name: &'a str,
     publish_remote: Option<&'a str>,
+}
+
+/// What a transaction that records an abandon may hide of the heads it
+/// exposes ([`hide_exposed`]).
+struct Exposure<'a> {
+    /// Every earlier write of the names the transaction writes or retires
+    /// ([`crate::release_model::EarlierWrites`]).
+    earlier: &'a [CommitId],
+    /// The name the transaction moved: its tracked ref on its publish remote
+    /// is the position the next push replaces, so it holds nothing.
+    moved: MovedName<'a>,
+    /// Whether the release the call site names carries conflicts. While it
+    /// does, its earlier writes are the record of their last resolution, so
+    /// nothing is hidden: reap's rule.
+    conflicted: bool,
+}
+
+/// Abandon, in `tx` and until none is left, each visible head the
+/// transaction exposed — one that was no visible head when it began — that
+/// nothing holds in the transaction's own view ([`holds_in_view`]) and that
+/// is an earlier write of the name or superseded ([`successor_of`]). Returns
+/// what it abandoned, in order.
+///
+/// Abandoning a release makes each parent no other visible commit reaches a
+/// head: a carrier the write left out, or, once that carrier is hidden in
+/// turn, what sat behind it — an older carrier, or a member commit only the
+/// carriers still held. Left visible, each is a head no name reaches, which
+/// audit reports, and on a fixed branch it appears at the next push. A commit
+/// is hidden here only when it is knives' own earlier write or a newer
+/// version of it stays visible; anything else the write exposed (a member
+/// with no bookmark, an older version of a member nothing rewrote) stays for
+/// a person to decide about.
+fn hide_exposed(tx: &mut Transaction, exposure: &Exposure<'_>) -> Result<Vec<HiddenHead>, JjError> {
+    block_on(tx.repo_mut().rebase_descendants()).map_err(|error| store_error(&error))?;
+    if exposure.conflicted {
+        return Ok(Vec::new());
+    }
+    let begun: HashSet<JjCommitId> = tx.base_repo().view().heads().iter().cloned().collect();
+    let mut hidden: Vec<HiddenHead> = Vec::new();
+    loop {
+        let exposed: Vec<JjCommitId> = tx
+            .repo()
+            .view()
+            .heads()
+            .iter()
+            .filter(|head| !begun.contains(*head))
+            .cloned()
+            .collect();
+        let mut abandoned = Vec::new();
+        for id in exposed {
+            let hex = commit_id(&id);
+            // A commit already abandoned here is never visible again; the
+            // guard only makes the loop's end independent of jj-lib's heads.
+            if hidden.iter().any(|done| done.commit == hex) {
+                continue;
+            }
+            let commit = tx
+                .repo()
+                .store()
+                .get_commit(&id)
+                .map_err(|error| store_error(&error))?;
+            if holds_in_view(tx.repo(), &commit, &exposure.moved) {
+                continue;
+            }
+            let superseded_by = if exposure.earlier.contains(&hex) {
+                None
+            } else if let Some(successor) = successor_of(tx, &commit)? {
+                Some(commit_id(&successor))
+            } else {
+                continue;
+            };
+            hidden.push(HiddenHead {
+                commit: hex,
+                superseded_by,
+            });
+            abandoned.push(commit);
+        }
+        if abandoned.is_empty() {
+            return Ok(hidden);
+        }
+        for commit in &abandoned {
+            tx.repo_mut().record_abandoned_commit(commit);
+        }
+        block_on(tx.repo_mut().rebase_descendants()).map_err(|error| store_error(&error))?;
+    }
+}
+
+/// Whether anything holds `commit` in `view_repo`'s own view: a ref that
+/// names it ([`names_of`]), a workspace with it checked out, or jj's default
+/// pins ([`assert_mutable`]), which keep knives' own abandons off what a
+/// remote still names, as [`what_keeps`] does. A head has no descendant, so
+/// nothing rests on it.
+fn holds_in_view(
+    view_repo: &dyn jj_lib::repo::Repo,
+    commit: &jj_lib::commit::Commit,
+    moved: &MovedName<'_>,
+) -> bool {
+    let view = view_repo.view();
+    !names_of(view, commit.id(), moved).is_empty()
+        || view.wc_commit_ids().values().any(|id| id == commit.id())
+        || assert_mutable(view_repo, std::slice::from_ref(commit)).is_err()
+}
+
+/// The visible commit of `commit`'s change, other than `commit`, that
+/// rewrote it, or `None`: the commit is superseded when a newer version of it
+/// is still visible.
+///
+/// Sharing a change id is not enough: a member reworded after its release
+/// was pushed comes back under the next fast-forward rebase as an older
+/// version beside the newer one, and the newer one is the one that rewrote
+/// nothing. So each other visible commit of the change is walked back
+/// through the operation log ([`jj_lib::evolution::walk_predecessors`]),
+/// stopping at the first entry that lists `commit` as a predecessor. The walk
+/// reads the repository the transaction began from, so a rewrite made in
+/// this same transaction is not seen and its commit is kept.
+fn successor_of(
+    tx: &Transaction,
+    commit: &jj_lib::commit::Commit,
+) -> Result<Option<JjCommitId>, JjError> {
+    let walk_error = |detail: String| JjError::Revision {
+        revision: commit.id().to_string(),
+        detail,
+    };
+    let resolved = block_on(tx.repo().resolve_change_id(commit.change_id()))
+        .map_err(|error| walk_error(error.to_string()))?;
+    let siblings: Vec<JjCommitId> = resolved
+        .into_iter()
+        .flat_map(|targets| {
+            targets
+                .visible_with_offsets()
+                .map(|(_, id)| id.clone())
+                .collect::<Vec<_>>()
+        })
+        .filter(|id| id != commit.id())
+        .collect();
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    for sibling in siblings {
+        let mut walk = std::pin::pin!(jj_lib::evolution::walk_predecessors(
+            tx.base_repo(),
+            std::slice::from_ref(&sibling),
+        ));
+        loop {
+            match walk.as_mut().poll_next(&mut context) {
+                Poll::Ready(Some(entry)) => {
+                    let entry = entry.map_err(|error| walk_error(error.to_string()))?;
+                    if entry.predecessor_ids().contains(commit.id()) {
+                        return Ok(Some(sibling));
+                    }
+                }
+                Poll::Ready(None) => break,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Which of `candidates` are visible heads nothing rests on ([`what_keeps`]),
@@ -2433,16 +2638,29 @@ fn unheld_heads(
     Ok(unheld)
 }
 
+/// What [`abandon_unheld_writes`] abandoned.
+#[derive(Debug, Default)]
+pub struct UnheldWrites {
+    /// The candidates that were visible heads nothing rests on.
+    pub abandoned: Vec<CommitId>,
+    /// The heads abandoning them exposed, hidden in the same operation
+    /// ([`hide_exposed`]).
+    pub hidden: Vec<HiddenHead>,
+}
+
 /// Abandon the unheld heads among `candidates`, as ONE described operation.
 ///
-/// The candidates are commits the ledger says knives wrote under release
-/// names now forgotten; one is abandoned when it is a visible head nothing
-/// rests on ([`unheld_heads`]). Returns the abandoned ones.
+/// The candidates are commits the ledger says knives wrote under a release
+/// name; one is abandoned when it is a visible head nothing rests on
+/// ([`unheld_heads`]). What that exposes is hidden too when it is another of
+/// them or superseded ([`hide_exposed`]), unless `release`, the release
+/// whose conflicts count here, carries conflicts.
 pub fn abandon_unheld_writes(
     repo: &Path,
     candidates: &[CommitId],
+    release: Option<&CommitId>,
     operation: &str,
-) -> Result<Vec<CommitId>, JjError> {
+) -> Result<UnheldWrites, JjError> {
     let repo = Repo::open_to_write(repo)?;
     let moved = MovedName {
         name: "",
@@ -2451,35 +2669,61 @@ pub fn abandon_unheld_writes(
     let mut tx = repo.repo.start_transaction();
     let unheld = unheld_heads(&repo, tx.repo(), candidates, &moved)?;
     if unheld.is_empty() {
-        return Ok(Vec::new());
+        return Ok(UnheldWrites::default());
     }
     for commit in &unheld {
         tx.repo_mut().record_abandoned_commit(commit);
     }
+    let conflicted = match release {
+        Some(release) => repo.commit(release.as_str())?.has_conflict(),
+        None => false,
+    };
+    let hidden = hide_exposed(
+        &mut tx,
+        &Exposure {
+            earlier: candidates,
+            moved,
+            conflicted,
+        },
+    )?;
     commit_mutation(&repo, tx, operation)?;
-    Ok(unheld.iter().map(|commit| commit_id(commit.id())).collect())
+    Ok(UnheldWrites {
+        abandoned: unheld.iter().map(|commit| commit_id(commit.id())).collect(),
+        hidden,
+    })
 }
 
 /// Why a replaced release commit must stay, judged in `view_repo` — the
 /// write's transaction, the name already moved — or `None` when nothing else
 /// rests on it.
 ///
-/// It stays for a bookmark or tag on it, local or on any remote; for anything
-/// that rests on it ([`Repo::what_rests_on`]: a workspace with it checked out,
-/// or any visible descendant, a parked working copy included); or for anything
-/// jj's default rule pins ([`assert_mutable`]). A commit someone else can still
-/// reach by name is theirs to keep. Two refs do not count: the colocated git
-/// view (`@git`), which shows the moved name at the source until this
-/// operation exports refs, and the moved name's tracked ref on its publish
-/// remote, the published position the next push replaces.
+/// It stays for a bookmark or tag on it, local or on any remote
+/// ([`names_of`]); for anything that rests on it ([`Repo::what_rests_on`]: a
+/// workspace with it checked out, or any visible descendant, a parked working
+/// copy included); or for anything jj's default rule pins
+/// ([`assert_mutable`]). A commit someone else can still reach by name is
+/// theirs to keep.
 fn what_keeps(
     repo: &Repo,
     view_repo: &dyn jj_lib::repo::Repo,
     commit: &jj_lib::commit::Commit,
     moved: &MovedName<'_>,
 ) -> Result<Option<String>, JjError> {
-    let id = commit.id();
-    let view = view_repo.view();
+    let mut reasons = names_of(view_repo.view(), commit.id(), moved);
+    reasons.extend(repo.rests_on(commit.id())?);
+    if let Err(error) = assert_mutable(view_repo, std::slice::from_ref(commit)) {
+        reasons.push(error.to_string());
+    }
+    Ok((!reasons.is_empty()).then(|| reasons.join("; ")))
+}
+
+/// The refs in `view` that name `id`, as reasons to keep it: each local
+/// bookmark on it, then one sentence for every remote bookmark and tag, local
+/// or remote, that names it. Two refs do not count: the colocated git view
+/// (`@git`), which shows a moved name at its old commit until the operation
+/// exports refs, and the moved name's tracked ref on its publish remote, the
+/// published position the next push replaces.
+fn names_of(view: &jj_lib::view::View, id: &JjCommitId, moved: &MovedName<'_>) -> Vec<String> {
     let mut reasons = Vec::new();
     let mut named = Vec::new();
     for (name, targets) in view.bookmarks() {
@@ -2514,11 +2758,7 @@ fn what_keeps(
     if !named.is_empty() {
         reasons.push(format!("{} names it", named.join(", ")));
     }
-    reasons.extend(repo.rests_on(id)?);
-    if let Err(error) = assert_mutable(view_repo, std::slice::from_ref(commit)) {
-        reasons.push(error.to_string());
-    }
-    Ok((!reasons.is_empty()).then(|| reasons.join("; ")))
+    reasons
 }
 
 /// Refuse an empty or repeated parent set before anything is written.
@@ -2583,6 +2823,57 @@ fn merged_release(
     )
     .map_err(|error| store_error(&error))?;
     Ok((commit, unions))
+}
+
+/// [`duplicated_release`] of `source` with `carriers`, its parents that are
+/// earlier writes of its name, left out of what the duplicate measures it
+/// against.
+///
+/// A duplicate replays the source's own change, its tree against the merge
+/// of its parents, onto the new parents. With a carrier among those parents
+/// the merge already holds every resolution the carrier holds, so the
+/// source's own change is empty there and a duplicate onto the members alone
+/// loses them. So the source is first written again as an in-between commit
+/// on its other parents with its own tree, description and author, which
+/// makes those resolutions its own change; that commit is duplicated; and it
+/// is recorded abandoned in the same transaction, so the write still leaves
+/// one new visible commit. A new commit, never a rewrite of the source: a
+/// rewrite would record the source rewritten and move everything resting on
+/// it, a working copy included.
+fn duplicated_without_carriers(
+    tx: &mut Transaction,
+    (source, message): (&jj_lib::commit::Commit, Option<&str>),
+    carriers: &[CommitId],
+    parent_ids: &[JjCommitId],
+) -> Result<(jj_lib::commit::Commit, Vec<UnionedFile>), JjError> {
+    if carriers.is_empty() {
+        return duplicated_release(tx, (source, message), parent_ids);
+    }
+    let members: Vec<JjCommitId> = source
+        .parent_ids()
+        .iter()
+        .filter(|parent| !carriers.contains(&commit_id(parent)))
+        .cloned()
+        .collect();
+    if members.is_empty() {
+        return Err(JjError::Revision {
+            revision: source.id().to_string(),
+            detail: "every parent of the release is an earlier write of it, so there is no \
+                     member to write it on"
+                .to_owned(),
+        });
+    }
+    let in_between = block_on(
+        tx.repo_mut()
+            .new_commit(members, source.tree())
+            .set_description(source.description())
+            .set_author(source.author().clone())
+            .write(),
+    )
+    .map_err(|error| store_error(&error))?;
+    let written = duplicated_release(tx, (&in_between, message), parent_ids)?;
+    tx.repo_mut().record_abandoned_commit(&in_between);
+    Ok(written)
 }
 
 /// The duplicate of `source` onto `parent_ids`, message optionally replaced,
@@ -2811,6 +3102,10 @@ pub struct CutSpec {
     /// Duplicate this commit onto the parents; `None` builds a fresh flat merge.
     pub source: Option<CommitId>,
     pub parents: Vec<CommitId>,
+    /// The parents of `source` that are earlier writes of its name, left out
+    /// of what the duplicate measures it against
+    /// ([`duplicated_without_carriers`]).
+    pub carriers: Vec<CommitId>,
     pub message: String,
 }
 
@@ -2858,7 +3153,9 @@ pub fn candidate_release(repo: &Path, spec: CutSpec) -> Result<Candidate, JjErro
 }
 
 /// The release commit `spec` describes, written into `tx`, and the release
-/// logs it unioned.
+/// logs it unioned. A source with carriers goes through the in-between commit
+/// a release write uses ([`duplicated_without_carriers`]), in the audited
+/// candidate and in the published rebuild alike, so both hold the same tree.
 fn spec_commit(
     repo: &Repo,
     tx: &mut Transaction,
@@ -2867,7 +3164,12 @@ fn spec_commit(
     let (parent_commits, parent_ids) = resolved_parents(repo, &spec.parents)?;
     if let Some(source) = &spec.source {
         let source = repo.commit(source.as_str())?;
-        duplicated_release(tx, (&source, Some(&spec.message)), &parent_ids)
+        duplicated_without_carriers(
+            tx,
+            (&source, Some(&spec.message)),
+            &spec.carriers,
+            &parent_ids,
+        )
     } else {
         merged_release(tx, (&parent_commits, parent_ids), &spec.message)
     }
@@ -2962,11 +3264,17 @@ impl Candidate {
     /// and publish as ONE operation: creation, audit and naming never exist as
     /// separate published states. Refuses when the rebuilt tree differs from
     /// the audited tree, so the audit's verdict provably applies to what ships.
+    ///
+    /// `earlier` are the earlier writes of the release the cut duplicates and
+    /// `publish_remote` where `bookmark` publishes: what the cut leaves a head
+    /// nothing holds is hidden in the same operation when it is one of them or
+    /// superseded ([`hide_exposed`]), unless the cut carries conflicts.
     pub fn publish(
         self,
         (bookmark, motion): (&str, BookmarkMotion),
+        (earlier, publish_remote): (&[CommitId], Option<&str>),
         operation: &str,
-    ) -> Result<CommitId, JjError> {
+    ) -> Result<PublishedCut, JjError> {
         let Self {
             repo,
             tx,
@@ -2993,9 +3301,32 @@ impl Candidate {
             JjRefName::new(bookmark),
             RefTarget::normal(written.id().clone()),
         );
+        let hidden = hide_exposed(
+            &mut tx,
+            &Exposure {
+                earlier,
+                moved: MovedName {
+                    name: bookmark,
+                    publish_remote,
+                },
+                conflicted: written.has_conflict(),
+            },
+        )?;
         commit_mutation(&repo, tx, operation)?;
-        Ok(commit_id(written.id()))
+        Ok(PublishedCut {
+            commit: commit_id(written.id()),
+            hidden,
+        })
     }
+}
+
+/// What [`Candidate::publish`] wrote.
+#[derive(Debug)]
+pub struct PublishedCut {
+    pub commit: CommitId,
+    /// The heads the cut exposed, hidden in the same operation
+    /// ([`hide_exposed`]).
+    pub hidden: Vec<HiddenHead>,
 }
 
 /// Drain a jj-lib stream with the same noop-waker loop [`block_on`] uses.
@@ -3642,6 +3973,9 @@ pub fn commits_matching(repo: &Path, revset: &str) -> Result<Vec<CommitId>, JjEr
 pub struct ReapWrite {
     pub abandoned: Vec<String>,
     pub refused: Vec<(String, JjError)>,
+    /// The heads the reap exposed, hidden in the same operation
+    /// ([`hide_exposed`]).
+    pub hidden: Vec<HiddenHead>,
 }
 
 /// Forget every ref of each name and abandon its commits, as ONE operation.
@@ -3655,9 +3989,15 @@ pub struct ReapWrite {
 /// without stopping later names. The porcelain forget/abandon sequence this
 /// replaces refused an immutable commit the same way, in two operations per
 /// name; `jj abandon` does not refuse a commit a bookmark names.
+///
+/// `earlier` are the earlier writes of every reaped name: what abandoning a
+/// cut leaves a head nothing holds is hidden in the same operation when it is
+/// one of them or superseded ([`hide_exposed`]), unless `live`, the live cut,
+/// carries conflicts.
 pub fn forget_and_abandon(
     repo: &Path,
     entries: &[(String, Vec<CommitId>)],
+    (earlier, live): (&[CommitId], Option<&CommitId>),
     operation: &str,
 ) -> Result<ReapWrite, JjError> {
     let repo = Repo::open_to_write(repo)?;
@@ -3665,6 +4005,7 @@ pub fn forget_and_abandon(
     let mut outcome = ReapWrite {
         abandoned: Vec::new(),
         refused: Vec::new(),
+        hidden: Vec::new(),
     };
     for (name, targets) in entries {
         forget_refs(tx.repo_mut(), name);
@@ -3686,6 +4027,21 @@ pub fn forget_and_abandon(
             Err(error) => outcome.refused.push((name.clone(), error)),
         }
     }
+    let conflicted = match live {
+        Some(live) => repo.commit(live.as_str())?.has_conflict(),
+        None => false,
+    };
+    outcome.hidden = hide_exposed(
+        &mut tx,
+        &Exposure {
+            earlier,
+            moved: MovedName {
+                name: "",
+                publish_remote: None,
+            },
+            conflicted,
+        },
+    )?;
     commit_mutation(&repo, tx, operation)?;
     Ok(outcome)
 }
@@ -3845,6 +4201,27 @@ pub fn restore_local_bookmarks(
         .collect())
 }
 
+/// The release a rebase moved, as the cleanup of the copies it made reads
+/// it: what the cleanup may hide of what it exposes ([`hide_exposed`]).
+#[derive(Debug, Clone, Copy)]
+pub struct RebasedName<'a> {
+    pub name: &'a str,
+    pub publish_remote: &'a str,
+    /// The rebased release, whose conflicts stop the hiding.
+    pub commit: &'a CommitId,
+    /// Every earlier write of the name ([`crate::release_model::EarlierWrites`]).
+    pub earlier: &'a [CommitId],
+}
+
+/// What [`abandon_tagged_copies`] found and did.
+#[derive(Debug, Default)]
+pub struct TaggedCopies {
+    pub copies: Vec<TaggedCopy>,
+    /// The heads abandoning the copies exposed, hidden in the same operation
+    /// ([`hide_exposed`]).
+    pub hidden: Vec<HiddenHead>,
+}
+
 /// Abandon the copies a rebase onto `dest` made of `originals`, as ONE
 /// described operation.
 ///
@@ -3856,13 +4233,15 @@ pub fn restore_local_bookmarks(
 /// each other go together, children first. Otherwise the copy stays, and
 /// [`TaggedCopy::kept`] says why: a commit someone built on, or checked out, is
 /// theirs to decide about. The originals, their tags and every remote ref are
-/// untouched.
+/// untouched. What the abandons leave a head nothing holds is hidden in the
+/// same operation when it is an earlier write of `release` or superseded,
+/// unless the rebased release carries conflicts.
 pub fn abandon_tagged_copies(
     repo: &Path,
     originals: &[CommitId],
-    dest: &CommitId,
+    (dest, release): (&CommitId, RebasedName<'_>),
     operation: &str,
-) -> Result<Vec<TaggedCopy>, JjError> {
+) -> Result<TaggedCopies, JjError> {
     struct Found {
         original: CommitId,
         tags: Vec<String>,
@@ -3872,7 +4251,7 @@ pub fn abandon_tagged_copies(
         descendants: Vec<JjCommitId>,
     }
     if originals.is_empty() {
-        return Ok(Vec::new());
+        return Ok(TaggedCopies::default());
     }
     let repo = Repo::open_to_write(repo)?;
     let dest = repo.commit(dest.as_str())?.id().clone();
@@ -3948,17 +4327,44 @@ pub fn abandon_tagged_copies(
             kept,
         });
     }
-    if !abandoned.is_empty() {
-        let mut tx = repo.repo.start_transaction();
-        for copy in found
-            .iter()
-            .filter(|copy| abandoned.contains(copy.commit.id()))
-        {
-            tx.repo_mut().record_abandoned_commit(&copy.commit);
-        }
-        commit_mutation(&repo, tx, operation)?;
+    let abandoning: Vec<&jj_lib::commit::Commit> = found
+        .iter()
+        .filter(|copy| abandoned.contains(copy.commit.id()))
+        .map(|copy| &copy.commit)
+        .collect();
+    let hidden = abandon_copies(&repo, &abandoning, release, operation)?;
+    Ok(TaggedCopies { copies, hidden })
+}
+
+/// Abandon `copies` as ONE described operation, hiding what that leaves a
+/// head nothing holds when it is an earlier write of `release` or superseded
+/// ([`hide_exposed`]); what was hidden. No copies, no operation.
+fn abandon_copies(
+    repo: &Repo,
+    copies: &[&jj_lib::commit::Commit],
+    release: RebasedName<'_>,
+    operation: &str,
+) -> Result<Vec<HiddenHead>, JjError> {
+    if copies.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(copies)
+    let mut tx = repo.repo.start_transaction();
+    for copy in copies {
+        tx.repo_mut().record_abandoned_commit(copy);
+    }
+    let hidden = hide_exposed(
+        &mut tx,
+        &Exposure {
+            earlier: release.earlier,
+            moved: MovedName {
+                name: release.name,
+                publish_remote: Some(release.publish_remote),
+            },
+            conflicted: repo.commit(release.commit.as_str())?.has_conflict(),
+        },
+    )?;
+    commit_mutation(repo, tx, operation)?;
+    Ok(hidden)
 }
 
 /// The workspaces with `id` checked out.
