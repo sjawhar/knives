@@ -7,8 +7,11 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use futures_core::Stream as _;
-use jj_lib::backend::{BackendError, CommitId as JjCommitId};
+use jj_lib::backend::{
+    BackendError, CommitId as JjCommitId, CopyId, FileId, MergedTreeValue, TreeValue,
+};
 use jj_lib::config::{ConfigLayer, ConfigResolutionContext, ConfigSource, StackedConfig};
+use jj_lib::conflicts::extract_as_single_hunk;
 use jj_lib::default_backend_factories::{
     default_backend_factories, default_working_copy_factories,
 };
@@ -16,12 +19,14 @@ use jj_lib::local_working_copy::LocalWorkingCopy;
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
+use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_heads_store;
 use jj_lib::op_store::{RefTarget, RemoteRef};
 use jj_lib::operation::Operation;
 use jj_lib::ref_name::{RefName as JjRefName, RemoteName as JjRemoteName};
 use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _, RepoLoader, RepoLoaderError};
+use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 use jj_lib::revset::{ResolvedRevsetExpression, RevsetEvaluationError, SymbolResolver, walk_revs};
 use jj_lib::rewrite::{CommitRewriter, duplicate_commits, merge_commit_trees, rebase_commit};
 use jj_lib::settings::UserSettings;
@@ -31,6 +36,7 @@ use jj_lib::workspace::Workspace;
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _, WorkspaceStoreError};
 use thiserror::Error;
 
+use crate::changelog_union;
 use crate::detect::landed::RebaseOutcome;
 use crate::detect::stale_parents::{BookmarkTips, ReleaseParent};
 use crate::ids::{
@@ -1337,6 +1343,10 @@ pub fn carries_work_past(repo: &Path, base: &CommitId, tip: &CommitId) -> Result
 /// intermediate commit is applied to a tree that already has the range's final
 /// content.
 ///
+/// A release log whose block the target already holds as part of a union is
+/// left out of the synthetic commit ([`replayed_tree`]): the replay reads what
+/// the target lacks, and a union lacks nothing of the block it holds.
+///
 /// A read, not a mutation: the replay runs inside a jj-lib transaction that is
 /// dropped without ever becoming an operation (#18). No other reader of the
 /// shared repository can observe it at any point, so there are no synthetic
@@ -1356,9 +1366,10 @@ pub fn probe_net_diff(
         return Ok(RebaseOutcome::Empty);
     }
     let mut tx = repo.repo.start_transaction();
+    let tree = replayed_tree(&base.tree(), revision.tree(), &onto.tree())?;
     let synthetic = block_on(
         tx.repo_mut()
-            .new_commit(vec![base.id().clone()], revision.tree())
+            .new_commit(vec![base.id().clone()], tree)
             .write(),
     )
     .map_err(|error| store_error(&error))?;
@@ -1378,6 +1389,78 @@ pub fn probe_net_diff(
     // Dropped, never committed: the probe leaves no trace in the op log.
     drop(tx);
     Ok(outcome)
+}
+
+/// `revision`'s tree, as the synthetic commit of a replay of `base..revision`
+/// onto `target` carries it: every release log whose block `target` already
+/// holds keeps `base`'s content instead.
+///
+/// A union holds a member's block between other members' blocks, so the
+/// member's insertion replayed onto it conflicts where a neighbouring block
+/// ends, although nothing of the member is missing. Where
+/// [`changelog_union::masks`] reads the replay that way, the log carries no
+/// change, and the rest of the member is judged as it always was. Only a log
+/// that is one regular file in all three trees is read; anything else replays
+/// as it is, and a conflict there is the replay's own answer.
+fn replayed_tree(
+    base: &MergedTree,
+    revision: MergedTree,
+    target: &MergedTree,
+) -> Result<MergedTree, JjError> {
+    let store = revision.store();
+    let mut masked: Vec<(RepoPathBuf, MergedTreeValue)> = Vec::new();
+    for entry in collect_stream(base.diff_stream(&revision, &EverythingMatcher)) {
+        if !changelog_union::eligible(entry.path.as_internal_file_string()) {
+            continue;
+        }
+        let values = entry.values.map_err(|error| store_error(&error))?;
+        let Some(base_content) = regular_file_content(store, &entry.path, &values.before)? else {
+            continue;
+        };
+        let Some(member_content) = regular_file_content(store, &entry.path, &values.after)? else {
+            continue;
+        };
+        let target_value =
+            block_on(target.path_value(&entry.path)).map_err(|error| store_error(&error))?;
+        let Some(target_content) = regular_file_content(store, &entry.path, &target_value)? else {
+            continue;
+        };
+        if changelog_union::masks(
+            &target_content,
+            &base_content,
+            &member_content,
+            store.merge_options(),
+        ) {
+            masked.push((entry.path, values.before));
+        }
+    }
+    if masked.is_empty() {
+        return Ok(revision);
+    }
+    let mut builder = MergedTreeBuilder::new(revision);
+    for (path, value) in masked {
+        builder.set_or_remove(path, value);
+    }
+    block_on(builder.write_tree()).map_err(|error| store_error(&error))
+}
+
+/// The content `value` holds at `path` when it is one resolved regular file,
+/// or `None` for anything else: absent, a symlink, a directory, a conflict.
+fn regular_file_content(
+    store: &jj_lib::store::Store,
+    path: &RepoPath,
+    value: &MergedTreeValue,
+) -> Result<Option<Vec<u8>>, JjError> {
+    let Some(Some(TreeValue::File { id, .. })) = value.as_resolved() else {
+        return Ok(None);
+    };
+    let content = block_on(extract_as_single_hunk(
+        &Merge::normal(id.clone()),
+        store,
+        path,
+    ))
+    .map_err(|error| store_error(&error))?;
+    Ok(content.into_resolved().ok().map(Vec::from))
 }
 
 /// Replays `base..revision` onto a target and classifies the resulting content.
@@ -2137,6 +2220,20 @@ pub struct ReleaseWritten {
     /// Earlier writes of the name ([`ReleaseWrite::earlier`]) abandoned here:
     /// visible heads nothing rests on any more.
     pub abandoned_earlier: Vec<CommitId>,
+    /// The release logs the write resolved itself, as the union of their sides.
+    pub unions: Vec<UnionedFile>,
+}
+
+/// A release log a release write resolved itself, as the union of its sides
+/// ([`changelog_union`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnionedFile {
+    /// The repository-internal path, `/`-separated.
+    pub path: String,
+    /// The first line of each block the union wrote, in the order written.
+    /// Read as UTF-8 with replacement, because these only name the blocks to
+    /// a reader; the file holds the bytes verbatim.
+    pub first_lines: Vec<String>,
 }
 
 /// The commit a release write replaced under its name.
@@ -2172,22 +2269,27 @@ pub struct ReplacedRelease {
 /// abandoned in the same operation unless something else rests on it
 /// ([`what_keeps`]) — a working copy on it or above it among them, since
 /// rewriting that from here would leave the workspace stale.
+///
+/// The commit written already carries the union of every release log whose
+/// conflict is one ([`union_release_logs`]), so whether it still carries
+/// conflicts — which decides whether earlier writes are swept — is read after
+/// the union.
 pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWritten, JjError> {
     validate_parents(write.source, write.parents)?;
     let repo = Repo::open_to_write(repo)?;
     let (parent_commits, parent_ids) = resolved_parents(&repo, write.parents)?;
     let mut tx = repo.repo.start_transaction();
-    let (written, source) = if let Some(source) = write.source {
+    let (written, source, unions) = if let Some(source) = write.source {
         let source = repo.commit(source.as_str())?;
-        let written = duplicated_release(&mut tx, (&source, write.message), &parent_ids)?;
-        (written, Some(source))
+        let (written, unions) = duplicated_release(&mut tx, (&source, write.message), &parent_ids)?;
+        (written, Some(source), unions)
     } else {
-        let written = merged_release(
+        let (written, unions) = merged_release(
             &mut tx,
             (&parent_commits, parent_ids),
             write.message.unwrap_or_default(),
         )?;
-        (written, None)
+        (written, None, unions)
     };
     let mut replaced = None;
     let mut abandoned_earlier = Vec::new();
@@ -2247,6 +2349,7 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
         change: ChangeId::new(written.change_id().to_string()),
         replaced,
         abandoned_earlier,
+        unions,
     })
 }
 
@@ -2411,29 +2514,42 @@ fn resolved_parents(
     Ok((commits, ids))
 }
 
-/// A fresh flat merge of the parents, described.
+/// A fresh flat merge of the parents, described, with every release log whose
+/// conflict is a union written resolved, and those logs.
+///
+/// A fresh merge replaces no earlier release, so a union keeps the sides in
+/// the order jj's merge holds them: the parent order.
 fn merged_release(
     tx: &mut Transaction,
     (parent_commits, parent_ids): (&[jj_lib::commit::Commit], Vec<JjCommitId>),
     message: &str,
-) -> Result<jj_lib::commit::Commit, JjError> {
+) -> Result<(jj_lib::commit::Commit, Vec<UnionedFile>), JjError> {
     let tree = block_on(merge_commit_trees(tx.repo(), parent_commits))
         .map_err(|error| store_error(&error))?;
-    block_on(
+    let (tree, unions) = union_release_logs(tree, None)?;
+    let commit = block_on(
         tx.repo_mut()
             .new_commit(parent_ids, tree)
             .set_description(message)
             .write(),
     )
-    .map_err(|error| store_error(&error))
+    .map_err(|error| store_error(&error))?;
+    Ok((commit, unions))
 }
 
-/// The duplicate of `source` onto `parent_ids`, message optionally replaced.
+/// The duplicate of `source` onto `parent_ids`, message optionally replaced,
+/// with every release log whose conflict is a union written resolved, and
+/// those logs.
+///
+/// The union goes into the duplicate by rewriting it in the same
+/// transaction, so the write leaves one visible commit with the duplicate's
+/// change id. `source` is the earlier release: its content of a log goes
+/// under the blocks the new parents bring in.
 fn duplicated_release(
     tx: &mut Transaction,
     (source, message): (&jj_lib::commit::Commit, Option<&str>),
     parent_ids: &[JjCommitId],
-) -> Result<jj_lib::commit::Commit, JjError> {
+) -> Result<(jj_lib::commit::Commit, Vec<UnionedFile>), JjError> {
     let mut descriptions = HashMap::new();
     if let Some(message) = message {
         descriptions.insert(source.id().clone(), message.to_owned());
@@ -2446,14 +2562,136 @@ fn duplicated_release(
         &[],
     ))
     .map_err(|error| store_error(&error))?;
-    stats
+    let duplicate = stats
         .duplicated_commits
         .into_values()
         .next()
         .ok_or_else(|| JjError::Revision {
             revision: source.id().to_string(),
             detail: "the duplicate produced no commit".to_owned(),
+        })?;
+    let (tree, unions) = union_release_logs(duplicate.tree(), Some(&source.tree()))?;
+    if unions.is_empty() {
+        return Ok((duplicate, unions));
+    }
+    let unioned = block_on(
+        tx.repo_mut()
+            .rewrite_commit(&duplicate)
+            .set_tree(tree)
+            .write(),
+    )
+    .map_err(|error| store_error(&error))?;
+    Ok((unioned, unions))
+}
+
+/// `tree` with every release log whose conflict is a union
+/// ([`changelog_union::union_of`]) written resolved, and those logs.
+///
+/// A log is unioned only when every term of its conflict is a regular file
+/// with one executable bit. A side that deleted the file, a symlink, a
+/// directory, a mode change, or two sides adding the file with no base is a
+/// disagreement about more than the text, and stays a person's.
+/// `earlier_release` is the tree of the release this write replaces, where
+/// there is one; its content of a log goes under the blocks the write brings
+/// in, as a person writing the resolution by hand puts it.
+fn union_release_logs(
+    tree: MergedTree,
+    earlier_release: Option<&MergedTree>,
+) -> Result<(MergedTree, Vec<UnionedFile>), JjError> {
+    if !tree.has_conflict() {
+        return Ok((tree, Vec::new()));
+    }
+    let store = tree.store().clone();
+    let mut resolutions: Vec<(RepoPathBuf, MergedTreeValue)> = Vec::new();
+    let mut unions = Vec::new();
+    for (path, value) in tree.conflicts() {
+        let value = value.map_err(|error| store_error(&error))?;
+        if !changelog_union::eligible(path.as_internal_file_string()) {
+            continue;
+        }
+        // The terms the union reads are the conflict's own: a side and the
+        // base it is measured from cancel when they are equal.
+        let Some(files) = regular_files(&value.simplify()) else {
+            continue;
+        };
+        let contents = block_on(extract_as_single_hunk(&files.ids, &store, &path))
+            .map_err(|error| store_error(&error))?;
+        let earlier = match earlier_release {
+            Some(earlier) => {
+                let value =
+                    block_on(earlier.path_value(&path)).map_err(|error| store_error(&error))?;
+                regular_file_content(&store, &path, &value)?
+            }
+            None => None,
+        };
+        let Some(union) =
+            changelog_union::union_of(&contents, earlier.as_deref(), store.merge_options())
+        else {
+            continue;
+        };
+        let id = block_on(store.write_file(&path, &mut union.content.as_slice()))
+            .map_err(|error| store_error(&error))?;
+        unions.push(UnionedFile {
+            path: path.as_internal_file_string().to_owned(),
+            first_lines: union
+                .first_lines
+                .iter()
+                .map(|line| String::from_utf8_lossy(line).into_owned())
+                .collect(),
+        });
+        let resolved = TreeValue::File {
+            id,
+            executable: files.executable,
+            copy_id: files.copy_id,
+        };
+        resolutions.push((path, Merge::normal(resolved)));
+    }
+    if resolutions.is_empty() {
+        return Ok((tree, unions));
+    }
+    let mut builder = MergedTreeBuilder::new(tree);
+    for (path, value) in resolutions {
+        builder.set_or_remove(path, value);
+    }
+    let tree = block_on(builder.write_tree()).map_err(|error| store_error(&error))?;
+    Ok((tree, unions))
+}
+
+/// A conflict whose every term is a regular file of one mode: the terms'
+/// file ids, the executable bit they share, and a side's copy id for the
+/// resolution to keep.
+struct RegularFiles {
+    ids: Merge<Option<FileId>>,
+    executable: bool,
+    copy_id: CopyId,
+}
+
+/// The conflict `value` as [`RegularFiles`], or `None` when any term is not a
+/// regular file or the terms disagree about the executable bit.
+fn regular_files(value: &MergedTreeValue) -> Option<RegularFiles> {
+    let Some(TreeValue::File {
+        executable,
+        copy_id,
+        ..
+    }) = value.first()
+    else {
+        return None;
+    };
+    let ids = value
+        .try_map(|term| match term {
+            Some(TreeValue::File {
+                id,
+                executable: term_executable,
+                ..
+            }) if term_executable == executable => Ok(Some(id.clone())),
+            _ => Err(()),
         })
+        .ok()?;
+    Some(RegularFiles {
+        ids,
+        executable: *executable,
+        copy_id: copy_id.clone(),
+    })
 }
 
 /// What one cut is made of, owned so a candidate can be rebuilt verbatim.
@@ -2480,6 +2718,7 @@ pub struct Candidate {
     tx: Transaction,
     spec: CutSpec,
     commit: jj_lib::commit::Commit,
+    unions: Vec<UnionedFile>,
 }
 
 impl std::fmt::Debug for Candidate {
@@ -2497,21 +2736,23 @@ pub fn candidate_release(repo: &Path, spec: CutSpec) -> Result<Candidate, JjErro
     validate_parents(spec.source.as_ref(), &spec.parents)?;
     let repo = Repo::open(repo)?;
     let mut tx = repo.repo.start_transaction();
-    let commit = spec_commit(&repo, &mut tx, &spec)?;
+    let (commit, unions) = spec_commit(&repo, &mut tx, &spec)?;
     Ok(Candidate {
         repo,
         tx,
         spec,
         commit,
+        unions,
     })
 }
 
-/// The release commit `spec` describes, written into `tx`.
+/// The release commit `spec` describes, written into `tx`, and the release
+/// logs it unioned.
 fn spec_commit(
     repo: &Repo,
     tx: &mut Transaction,
     spec: &CutSpec,
-) -> Result<jj_lib::commit::Commit, JjError> {
+) -> Result<(jj_lib::commit::Commit, Vec<UnionedFile>), JjError> {
     let (parent_commits, parent_ids) = resolved_parents(repo, &spec.parents)?;
     if let Some(source) = &spec.source {
         let source = repo.commit(source.as_str())?;
@@ -2540,6 +2781,12 @@ impl Candidate {
         self.commit.parent_ids().len()
     }
 
+    /// The release logs the candidate holds as the union of their sides; a
+    /// publish rebuilds the same tree, so they are what ships.
+    pub fn unions(&self) -> &[UnionedFile] {
+        &self.unions
+    }
+
     /// Files the candidate's tree leaves conflicted.
     pub fn conflicted_files(&self) -> Result<Vec<String>, JjError> {
         let mut files = Vec::new();
@@ -2552,7 +2799,8 @@ impl Candidate {
 
     /// [`probe_net_diff`] with the candidate as the target: the net effect of
     /// `base..revision`, replayed onto the candidate in its own scratch
-    /// transaction.
+    /// transaction, with a release log the candidate's union already holds
+    /// left out ([`replayed_tree`]).
     pub fn replay_outcome(&mut self, base: &str, revision: &str) -> Result<RebaseOutcome, JjError> {
         let base = self.repo.commit(base)?;
         let revision = self.repo.commit(revision)?;
@@ -2560,10 +2808,11 @@ impl Candidate {
         if self.repo.backend_is_ancestor(revision.id(), base.id())? {
             return Ok(RebaseOutcome::Empty);
         }
+        let tree = replayed_tree(&base.tree(), revision.tree(), &self.commit.tree())?;
         let synthetic = block_on(
             self.tx
                 .repo_mut()
-                .new_commit(vec![base.id().clone()], revision.tree())
+                .new_commit(vec![base.id().clone()], tree)
                 .write(),
         )
         .map_err(|error| store_error(&error))?;
@@ -2612,13 +2861,16 @@ impl Candidate {
             tx,
             spec,
             commit: audited,
+            unions: _,
         } = self;
         // The audited scratch — candidate and probe leftovers — evaporates
         // before anything real is written.
         drop(tx);
         let repo = repo.to_write()?;
         let mut tx = repo.repo.start_transaction();
-        let written = spec_commit(&repo, &mut tx, &spec)?;
+        // The rebuild unions what the candidate unioned: the tree check below
+        // holds it to that.
+        let (written, _) = spec_commit(&repo, &mut tx, &spec)?;
         if written.tree_ids() != audited.tree_ids() {
             return Err(JjError::Revision {
                 revision: commit_id(audited.id()).as_str().to_owned(),
@@ -3133,28 +3385,36 @@ pub fn rebase_branch_onto(repo: &Path, rev: &str, dest: &CommitId) -> Result<(),
     Ok(())
 }
 
-/// Rewrites a commit's message as ONE described operation and returns the
-/// replacement commit id. Descendants and bookmarks follow the rewrite, as
-/// they do under `jj describe`; immutable commits refuse.
-pub fn describe_commit(
+/// Rewrites a release's message as ONE described operation, writing in the
+/// same rewrite the union of every release log it leaves conflicted.
+///
+/// Returns the replacement commit id and the logs it unioned
+/// ([`union_release_logs`]). `before` is the release as it was before
+/// whatever moved it — a rebase — and its content of a log goes under the
+/// blocks the move brought in. Descendants and bookmarks follow the rewrite,
+/// as they do under `jj describe`; immutable commits refuse.
+pub fn describe_release(
     repo: &Path,
-    commit: &CommitId,
+    (commit, before): (&CommitId, &CommitId),
     message: &str,
     operation: &str,
-) -> Result<CommitId, JjError> {
+) -> Result<(CommitId, Vec<UnionedFile>), JjError> {
     let repo = Repo::open_to_write(repo)?;
     let target = repo.commit(commit.as_str())?;
+    let before = repo.commit(before.as_str())?;
     assert_mutable(repo.repo.as_ref(), std::slice::from_ref(&target))?;
+    let (tree, unions) = union_release_logs(target.tree(), Some(&before.tree()))?;
     let mut tx = repo.repo.start_transaction();
     let rewritten = block_on(
         tx.repo_mut()
             .rewrite_commit(&target)
+            .set_tree(tree)
             .set_description(message)
             .write(),
     )
     .map_err(|error| store_error(&error))?;
     commit_mutation(&repo, tx, operation)?;
-    Ok(commit_id(rewritten.id()))
+    Ok((commit_id(rewritten.id()), unions))
 }
 
 /// Point `name` at `revision` as ONE described operation, refusing backwards

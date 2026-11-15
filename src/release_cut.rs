@@ -18,7 +18,7 @@ use knives::release_model::{
     previous_release_for_cut, series_members, trunk_positions,
 };
 
-use super::release_edit::recorded_parents;
+use super::release_edit::{recorded_parents, union_event_text};
 use super::scribe_for;
 
 pub(crate) enum ReleaseInvocation {
@@ -258,6 +258,8 @@ pub(crate) fn run_release(
                         recorded: recorded.as_ref(),
                         check: &check,
                         stated_drop: None,
+                        // Recorded as published, not written: knives unioned nothing.
+                        unions: &[],
                     };
                     record_cut_event(fork, &completed, bound)?;
                     println!(
@@ -307,6 +309,9 @@ pub(crate) fn run_release(
                 Err(exit) => return Ok(exit),
             }
         };
+        // The publish rebuilds the audited tree, so the candidate's unions are
+        // what ships.
+        let unions = candidate.unions().to_vec();
         let created = release::publish_cut(candidate, &request.name, &scheme)?;
         let completed = CompletedCut {
             name: &name,
@@ -317,6 +322,7 @@ pub(crate) fn run_release(
             recorded: recorded.as_ref(),
             check: &check,
             stated_drop: orphaned.as_ref(),
+            unions: &unions,
         };
         record_cut_event(fork, &completed, bound)?;
         worst = worst.worst(report_completed_cut(fork, &opened, &completed, bound)?);
@@ -614,6 +620,8 @@ struct CompletedCut<'a> {
     check: &'a release::CompositionCheck,
     /// What `--allow-drop` let the cut go ahead without, said after the reap.
     stated_drop: Option<&'a OrphanedLineage>,
+    /// The release logs the cut wrote as the union of their sides.
+    unions: &'a [knives::jj::UnionedFile],
 }
 
 /// Record which branches and commits became a published release cut.
@@ -623,7 +631,8 @@ struct CompletedCut<'a> {
 /// names is not the commit the release remote ends up holding, while the
 /// change id survives the
 /// rewrite and still resolves to the release. Evidence keeps the commit first:
-/// the composition gate parses it from that position.
+/// the composition gate parses it from that position. The release logs the
+/// cut unioned close the text, after everything a reader of the event parses.
 fn record_cut_event(
     fork: &Fork<'_>,
     cut: &CompletedCut<'_>,
@@ -679,11 +688,12 @@ fn record_cut_event(
         ..Draft::event(
             Some(cut.name),
             format!(
-                "cut {} as {} (change {}) with {} parent(s): {members_text}{delta}",
+                "cut {} as {} (change {}) with {} parent(s): {members_text}{delta}{}",
                 cut.name,
                 cut.created.short(),
                 change.short(),
-                members.len()
+                members.len(),
+                union_event_text(cut.unions)
             ),
             None,
         )
@@ -712,7 +722,7 @@ fn report_completed_cut(
         cut.request.parents.len()
     );
     match knives::jj::conflicted_files(&fork.checkout.path, cut.created.as_str()) {
-        Ok(files) => println!("{}", release::conflict_guidance(&files)),
+        Ok(files) => println!("{}", release::conflict_guidance(&files, cut.unions)),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
     if let Some(first) = cut.request.parents.first() {

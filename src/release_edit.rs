@@ -632,6 +632,7 @@ fn apply_edit(
             created,
             change: &written.change,
             provenance: &provenance,
+            unions: &written.unions,
         },
         context.bound,
     )?;
@@ -645,7 +646,7 @@ fn apply_edit(
     );
     report_replaced(repo, &release.name, &written);
     match knives::jj::conflicted_files(&fork.checkout.path, created.as_str()) {
-        Ok(files) => println!("{}", release::conflict_guidance(&files)),
+        Ok(files) => println!("{}", release::conflict_guidance(&files, &written.unions)),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
     Ok(Exit::Ok)
@@ -734,20 +735,23 @@ pub(crate) fn earlier_writes(
 }
 
 /// What one release edit wrote: the name, the delta, the new merge with its
-/// change id, and its parent set with the branch each parent came from.
+/// change id, its parent set with the branch each parent came from, and the
+/// release logs it unioned.
 pub(crate) struct EditRecord<'a> {
     pub(crate) release: &'a str,
     pub(crate) delta: &'a str,
     pub(crate) created: &'a knives::ids::CommitId,
     pub(crate) change: &'a knives::ids::ChangeId,
     pub(crate) provenance: &'a [(String, knives::ids::CommitId)],
+    pub(crate) unions: &'a [knives::jj::UnionedFile],
 }
 
 /// The edit's parent set goes to the ledger the way a cut's does, so a later
 /// `advance` or `include` can still tell which parent is which branch after a
 /// rebase that left no ancestry or change id behind. Like a cut event, it names
 /// the written commit, its change id and its parents, and the commit leads the
-/// evidence: it is the position `audit` holds the release against.
+/// evidence: it is the position `audit` holds the release against. The release
+/// logs the edit unioned close the text ([`union_event_text`]).
 pub(crate) fn record_edit_event(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
@@ -767,18 +771,31 @@ pub(crate) fn record_edit_event(
         ..Draft::event(
             Some(record.release),
             format!(
-                "edited {} as {} (change {}) with {} parent(s): {}; parents: {}",
+                "edited {} as {} (change {}) with {} parent(s): {}; parents: {}{}",
                 record.release,
                 record.created.short(),
                 record.change.short(),
                 parents.len(),
                 record.delta,
-                members_event_text(record.provenance)
+                members_event_text(record.provenance),
+                union_event_text(record.unions)
             ),
             None,
         )
     })?;
     Ok(())
+}
+
+/// `; union: CHANGELOG.md, RELEASE_NOTES.md` for the release logs a write
+/// unioned, or nothing when it unioned none. A cut or edit event ends with
+/// it, because every reader of those events parses only how the text starts
+/// (`recorded_writes`, `last_recorded_cut`).
+pub(crate) fn union_event_text(unions: &[knives::jj::UnionedFile]) -> String {
+    if unions.is_empty() {
+        return String::new();
+    }
+    let paths: Vec<&str> = unions.iter().map(|union| union.path.as_str()).collect();
+    format!("; union: {}", paths.join(", "))
 }
 
 /// Each parent with every branch at it now, for a cut or edit event's record.
@@ -1378,6 +1395,7 @@ mod tests {
                 kept: Some("the working copy of workspace ws\u{1b}x\u{9b}y rests on it".to_owned()),
             }),
             abandoned_earlier: vec![CommitId::new("cccc")],
+            unions: Vec::new(),
         };
 
         let lines = replaced_lines(&RepoName::new("demo"), "release/x\u{9b}2J", &written);

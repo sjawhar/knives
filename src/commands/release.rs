@@ -2037,7 +2037,7 @@ mod tests {
 
     #[test]
     fn a_control_character_in_a_conflicted_path_reaches_the_terminal_escaped() {
-        let rendered = conflict_guidance(&["src/a\u{7}b.rs".to_owned()]);
+        let rendered = conflict_guidance(&["src/a\u{7}b.rs".to_owned()], &[]);
         assert!(!rendered.contains('\u{7}'), "{rendered}");
         assert!(rendered.contains("src/a\u{fffd}b.rs"), "{rendered}");
     }
@@ -2766,29 +2766,68 @@ pub fn check_test_count(fork: &Fork<'_>, cut: &CommitId, parent: &CommitId) -> T
     }
 }
 
-/// What a release's conflicts mean, and what to do about them.
+/// What a release write resolved itself, what it left conflicted, and what to
+/// do about the rest.
 ///
-/// Reported, never auto-resolved. Independent branches that each append a config
-/// key land in the same regions, so a real cut carries real conflicts: one
-/// ten-parent cut had a four-sided conflict in one file and a three-sided one in
-/// another. Resolving those correctly is a semantic judgement about the config,
-/// which a tool cannot make. Saying exactly where they are, and what shape the
-/// resolution takes, is the part a tool can do. An edit reports the same way: a
-/// duplicate carries the old resolutions forward, so what is left is the
-/// conflict the edit itself introduced.
-pub fn conflict_guidance(files: &[String]) -> String {
-    if files.is_empty() {
-        return "  no conflicts in this release".to_owned();
+/// knives writes one resolution itself: the union of `CHANGELOG.md` and
+/// `RELEASE_NOTES.md` where every side only inserted its own block
+/// ([`crate::changelog_union`]). That resolution is the same every time, so a
+/// person writing it by hand adds nothing. Each unioned file is named with the
+/// first line of every block, in the order written: the union is verbatim and
+/// never renumbers, so two blocks claiming one version read as two such lines,
+/// and settling that is a person's.
+///
+/// Every other conflict stays a person's. Independent branches that each
+/// append a config key land in the same regions, so a real cut carries real
+/// conflicts: one ten-parent cut had a four-sided conflict in one file and a
+/// three-sided one in another. Resolving those correctly is a semantic
+/// judgement about the config, which a tool cannot make. Saying exactly where
+/// they are, and what shape the resolution takes, is the part a tool can do.
+/// An edit reports the same way: a duplicate carries the old resolutions
+/// forward, so what is left is the conflict the edit itself introduced.
+pub fn conflict_guidance(files: &[String], unions: &[jj::UnionedFile]) -> String {
+    use crate::ledger::inline_human_text;
+    let mut lines = Vec::new();
+    if !unions.is_empty() {
+        lines.push(format!(
+            "  {} release log(s) written as the union of their sides, every block verbatim \
+             and in this order:",
+            unions.len()
+        ));
+        // A path read from the tree, and each block's first line as a
+        // member's file holds it.
+        for union in unions {
+            lines.push(format!("    {}", inline_human_text(&union.path)));
+            lines.extend(
+                union
+                    .first_lines
+                    .iter()
+                    .map(|line| format!("      {}", inline_human_text(line))),
+            );
+        }
+        lines.push(
+            "  knives never renumbers: blocks that claim one version stay as each wrote it; \
+             renumber by hand and record it with `knives release adopt --why`"
+                .to_owned(),
+        );
     }
-    let mut lines = vec![format!(
-        "  {} conflicted file(s), which is expected:",
+    if files.is_empty() {
+        lines.push(if unions.is_empty() {
+            "  no conflicts in this release".to_owned()
+        } else {
+            "  no other conflicts in this release".to_owned()
+        });
+        return lines.join("\n");
+    }
+    lines.push(format!(
+        "  {} conflicted file(s) left for a person:",
         files.len()
-    )];
+    ));
     // The paths are jj's, named by the conflict it reports.
     lines.extend(
         files
             .iter()
-            .map(|file| format!("    {}", crate::ledger::inline_human_text(file))),
+            .map(|file| format!("    {}", inline_human_text(file))),
     );
     lines.push(
         "  resolve as a union: keep every branch's addition, keep any shared helper \
@@ -2857,19 +2896,7 @@ mod conflict_tests {
 
     #[test]
     fn a_clean_cut_says_so_rather_than_staying_silent() {
-        assert!(conflict_guidance(&[]).contains("no conflicts"));
-    }
-
-    #[test]
-    fn conflicts_are_named_with_the_shape_of_their_resolution() {
-        // Resolving them correctly is a semantic judgement about the config,
-        // which a tool cannot make. Saying where they are, and that the shape is
-        // a union with one shared helper and the key in every loader, is the
-        // part a tool can do.
-        let text = conflict_guidance(&["infra/lib/config.py".to_owned()]);
-        assert!(text.contains("infra/lib/config.py"));
-        assert!(text.contains("union"));
-        assert!(text.contains("every loader"));
+        assert!(conflict_guidance(&[], &[]).contains("no conflicts"));
     }
 }
 

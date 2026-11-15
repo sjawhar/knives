@@ -159,7 +159,12 @@ pub(crate) fn run_rebase(
         println!("{repo}: {shown_release} has no member parents to move; nothing to rebase");
         return Ok(Exit::Incomplete);
     }
-    shed_stale_bases(fork, (&release_name, &release_commit), &members, shed)?;
+    let shed_write = shed_stale_bases(fork, (&release_name, &release_commit), &members, shed)?;
+    // The release the rebase moves: the shed write, when there was one.
+    let (before_rebase, shed_unions) = shed_write.map_or_else(
+        || (release_commit.clone(), Vec::new()),
+        |written| (written.commit, written.unions),
+    );
     // A pushed or published release name stays where it is: the rebase
     // rewrites each descendant of a moved member, earlier release merges among
     // them, and a push of the moved name would move what consumers were given.
@@ -223,11 +228,13 @@ pub(crate) fn run_rebase(
     }
     report_rebased_release(
         fork,
-        &RebasedRelease {
+        RebasedRelease {
             name: &release_name,
             reference: &reference,
             onto: &onto,
             shed,
+            before: &before_rebase,
+            shed_unions,
         },
         bound,
     )?;
@@ -302,15 +309,16 @@ fn stale_rule_exit(fork: &Fork<'_>) -> anyhow::Result<Option<Exit>> {
     Ok(Some(Exit::Incomplete))
 }
 
-/// Rewrite the release to its member parents only, shedding stale bases.
+/// Rewrite the release to its member parents only, shedding stale bases; what
+/// the write made, or `None` when there was nothing to shed.
 fn shed_stale_bases(
     fork: &Fork<'_>,
     (release_name, release_commit): (&str, &knives::ids::CommitId),
     members: &[knives::ids::CommitId],
     shed: usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<knives::jj::ReleaseWritten>> {
     if shed == 0 {
-        return Ok(());
+        return Ok(None);
     }
     let written = knives::jj::write_release(
         &fork.checkout.path,
@@ -325,7 +333,7 @@ fn shed_stale_bases(
         },
     )?;
     report_replaced(&fork.name, release_name, &written);
-    Ok(())
+    Ok(Some(written))
 }
 
 /// One repo mid-rebase: what parent classification needs to read and say.
@@ -764,6 +772,7 @@ fn drop_landed_members(
             created: &created,
             change: &written.change,
             provenance: &provenance,
+            unions: &written.unions,
         },
         bound,
     )?;
@@ -775,7 +784,7 @@ fn drop_landed_members(
     );
     report_replaced(repo, release_name, &written);
     match knives::jj::conflicted_files(path, created.as_str()) {
-        Ok(files) => println!("{}", release::conflict_guidance(&files)),
+        Ok(files) => println!("{}", release::conflict_guidance(&files, &written.unions)),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
     Ok(Exit::Ok)
@@ -787,13 +796,18 @@ struct RebasedRelease<'a> {
     reference: &'a str,
     onto: &'a knives::ids::CommitId,
     shed: usize,
+    /// The release commit the rebase moved: what the fork had before it.
+    before: &'a knives::ids::CommitId,
+    /// The release logs the shed write unioned before the rebase.
+    shed_unions: Vec<knives::jj::UnionedFile>,
 }
 
 /// Re-describe the rebased release so the recorded provenance names the
-/// rewritten parents, and report what moved.
+/// rewritten parents, writing in the same operation the union of each release
+/// log the rebase left conflicted, and report what moved.
 fn report_rebased_release(
     fork: &Fork<'_>,
-    rebased: &RebasedRelease<'_>,
+    rebased: RebasedRelease<'_>,
     bound: Bound<'_>,
 ) -> anyhow::Result<()> {
     let repo = &fork.name;
@@ -806,12 +820,18 @@ fn report_rebased_release(
         release::parent_sources(&reopened, entry, &entry.release_scheme(), &new_parents)?;
     let delta = format!("rebased onto {}", rebased.reference);
     let message = release::composition_message(rebased.name, &provenance, &delta);
-    let described = knives::jj::describe_commit(
+    let (described, described_unions) = knives::jj::describe_release(
         path,
-        &created,
+        (&created, rebased.before),
         &message,
         &format!("knives: {}: record rebased provenance", rebased.name),
     )?;
+    let conflicts = knives::jj::conflicted_files(path, described.as_str());
+    let unions = rebase_unions(
+        rebased.shed_unions,
+        described_unions,
+        conflicts.as_deref().unwrap_or_default(),
+    );
     // A rebase rewrites every member's commit id; without this the ledger's
     // last (branch, commit) pairing for the release would name commits no
     // longer among its parents, and the next edit could not tell a rebuilt
@@ -827,6 +847,7 @@ fn report_rebased_release(
             created: &described,
             change: &change,
             provenance: &provenance,
+            unions: &unions,
         },
         bound,
     )?;
@@ -844,11 +865,29 @@ fn report_rebased_release(
         rebased.onto.short(),
         new_parents.len()
     );
-    match knives::jj::conflicted_files(path, described.as_str()) {
-        Ok(files) => println!("{}", release::conflict_guidance(&files)),
+    match conflicts {
+        Ok(files) => println!("{}", release::conflict_guidance(&files, &unions)),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
     Ok(())
+}
+
+/// What a rebase unioned, said once for its two writes: every union the
+/// re-describe wrote, and each union the shed write made before the rebase
+/// that the rebase neither unioned again nor left conflicted. A log the rebase
+/// conflicted again and could not union is `conflicted`'s, and naming it as
+/// unioned too would say the opposite of the tree.
+fn rebase_unions(
+    mut shed: Vec<knives::jj::UnionedFile>,
+    mut described: Vec<knives::jj::UnionedFile>,
+    conflicted: &[String],
+) -> Vec<knives::jj::UnionedFile> {
+    shed.retain(|union| {
+        !conflicted.contains(&union.path) && !described.iter().any(|later| later.path == union.path)
+    });
+    described.append(&mut shed);
+    described.sort_by(|first, second| first.path.cmp(&second.path));
+    described
 }
 
 /// One line per copy the rebase made of an earlier release — tagged, or named
@@ -944,6 +983,40 @@ mod tests {
             [
                 "demo: note: kept bbbb, the rebased copy of aaaa (tag v1\u{fffd}2J, \
               release/2026-01-01\u{fffd}): the working copy of workspace ws\u{fffd}x rests on it"
+            ]
+        );
+    }
+
+    fn unioned(path: &str, first_line: &str) -> knives::jj::UnionedFile {
+        knives::jj::UnionedFile {
+            path: path.to_owned(),
+            first_lines: vec![first_line.to_owned()],
+        }
+    }
+
+    #[test]
+    fn a_rebase_names_each_union_once_and_never_one_it_left_conflicted() {
+        // Given: a shed write that unioned three logs, a re-describe that
+        // unioned one of them again, and a rebase that left another
+        // conflicted.
+        let shed = vec![
+            unioned("CHANGELOG.md", "## shed"),
+            unioned("RELEASE_NOTES.md", "## shed"),
+            unioned("docs/CHANGELOG.md", "## shed"),
+        ];
+        let described = vec![unioned("CHANGELOG.md", "## described")];
+        let conflicted = ["RELEASE_NOTES.md".to_owned()];
+
+        // When: the rebase says what it unioned.
+        let unions = rebase_unions(shed, described, &conflicted);
+
+        // Then: the re-describe's union stands for its path, the shed write's
+        // stands where the rebase kept it, and the conflicted log is not named.
+        assert_eq!(
+            unions,
+            [
+                unioned("CHANGELOG.md", "## described"),
+                unioned("docs/CHANGELOG.md", "## shed"),
             ]
         );
     }
