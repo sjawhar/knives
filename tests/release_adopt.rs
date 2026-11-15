@@ -531,7 +531,8 @@ fn adopt_refuses_a_resolution_made_as_a_child_of_the_release() {
     assert!(
         out.contains(&format!(
             "demo: every parent of {RELEASE} is an earlier write: squash the resolution into the \
-             release commit (`jj squash --from {} --into {}`), then adopt\n",
+             release commit (`jj squash --from {} --into {} --use-destination-message`), then \
+             adopt\n",
             child.short(),
             cut.short()
         )),

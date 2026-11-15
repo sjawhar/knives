@@ -1156,13 +1156,14 @@ pub fn no_match_refusal(
     let on_remote = publish_remote_holds(repo, into, published)?;
     let squash = if on_remote {
         format!(
-            "`jj squash --from {} --into {} --ignore-immutable`, as that commit is published",
+            "`jj squash --from {} --into {} --use-destination-message --ignore-immutable`, as \
+             that commit is published",
             commit.short(),
             into.short()
         )
     } else {
         format!(
-            "`jj squash --from {} --into {}`",
+            "`jj squash --from {} --into {} --use-destination-message`",
             commit.short(),
             into.short()
         )

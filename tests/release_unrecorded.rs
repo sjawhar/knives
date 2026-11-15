@@ -959,7 +959,7 @@ fn a_resolution_made_as_a_child_of_the_release_is_refused_naming_the_squash() {
     let child = commit_at(&lab, DATED);
     let squash = format!(
         "every parent of {DATED} is an earlier write: squash the resolution into the release \
-         commit (`jj squash --from {} --into {}`), then adopt",
+         commit (`jj squash --from {} --into {} --use-destination-message`), then adopt",
         child.short(),
         cut.short()
     );
@@ -974,7 +974,14 @@ fn a_resolution_made_as_a_child_of_the_release_is_refused_naming_the_squash() {
     assert!(stdout(&adopted).contains(&squash), "{}", text(&adopted));
 
     // When (control): the squash is done into the release, then adopted.
-    lab.jj_work(["squash", "--from", child.as_str(), "--into", cut.as_str()]);
+    lab.jj_work([
+        "squash",
+        "--from",
+        child.as_str(),
+        "--into",
+        cut.as_str(),
+        "--use-destination-message",
+    ]);
     release_ok(&lab, &home, &["adopt", DATED]);
 
     // Then: the write goes through, checked.
@@ -1040,8 +1047,9 @@ fn a_resolution_on_top_of_a_published_fixed_release_names_the_squash_past_immuta
     assert!(
         stdout(&included).contains(&format!(
             "every parent of {FIXED} is an earlier write: squash the resolution into the release \
-             commit (`jj squash --from {} --into {} --ignore-immutable`, as that commit is \
-             published), then adopt, and adopt again after the fast-forward rebase",
+             commit (`jj squash --from {} --into {} --use-destination-message \
+             --ignore-immutable`, as that commit is published), then adopt, and adopt again \
+             after the fast-forward rebase",
             child.short(),
             under.short()
         )),
@@ -1150,8 +1158,8 @@ fn a_resolution_on_top_of_a_release_with_no_recorded_write_is_refused_to_run_aga
     assert!(
         stdout(&included).contains(&format!(
             "every parent of {DATED} is an earlier write: squash the resolution into the release \
-             commit (`jj squash --from {} --into {} --ignore-immutable`, as that commit is \
-             published), then run the write again",
+             commit (`jj squash --from {} --into {} --use-destination-message \
+             --ignore-immutable`, as that commit is published), then run the write again",
             child.short(),
             under.short()
         )),
@@ -1204,7 +1212,8 @@ fn a_member_tip_squashed_into_its_parent_is_unchecked_in_a_fresh_clone() {
     // Given (q20): alpha's tip squashed into its parent, which makes jj
     // rebase the release onto a commit of another change id; the release
     // pushed alone; a fresh clone that holds no recorded write.
-    let (lab, home, second) = member_tip_rewritten_then_pushed_alone(&["squash", "-r"]);
+    let (lab, home, second) =
+        member_tip_rewritten_then_pushed_alone(&["squash", "--use-destination-message", "-r"]);
 
     // When/Then: an include there goes through, unchecked: no match.
     let out = ok_in(&lab, &home, &second, &["include", "feat/delta"]);
@@ -1236,7 +1245,7 @@ fn in_the_clone_that_made_it_a_member_tip_squashed_into_its_parent_is_unchecked(
     release_ok(&lab, &home, &["cut"]);
     lab.branch("feat/delta", "delta.txt", "delta\n");
     park(&lab);
-    lab.jj_work(["squash", "-r", "feat/alpha"]);
+    lab.jj_work(["squash", "--use-destination-message", "-r", "feat/alpha"]);
 
     // When/Then: an include goes through, unchecked: no match.
     let out = release_ok(&lab, &home, &["include", "feat/delta"]);
@@ -1906,7 +1915,8 @@ fn an_all_carrier_release_held_only_as_the_remote_ref_names_the_track_before_the
         stdout(&adopted).contains(&format!(
             "every parent of {FIXED} is an earlier write: track it (`jj bookmark track \
              {FIXED}@origin`), then squash the resolution into the release commit (`jj squash \
-             --from {} --into {} --ignore-immutable`, as that commit is published)",
+             --from {} --into {} --use-destination-message --ignore-immutable`, as that commit \
+             is published)",
             child.short(),
             under.short()
         )),
@@ -1923,7 +1933,8 @@ fn an_all_carrier_release_held_only_as_the_remote_ref_names_the_track_before_the
     assert!(
         stdout(&adopted).contains(&format!(
             "every parent of {FIXED} is an earlier write: squash the resolution into the release \
-             commit (`jj squash --from {} --into {} --ignore-immutable`",
+             commit (`jj squash --from {} --into {} --use-destination-message \
+             --ignore-immutable`",
             child.short(),
             under.short()
         )),
@@ -1943,6 +1954,7 @@ fn an_all_carrier_release_held_only_as_the_remote_ref_names_the_track_before_the
             child.as_str(),
             "--into",
             under.as_str(),
+            "--use-destination-message",
             "--ignore-immutable",
         ],
     );
@@ -2009,6 +2021,7 @@ fn squashed_resolution_fast_forwarded(
             child.as_str(),
             "--into",
             under.as_str(),
+            "--use-destination-message",
             "--ignore-immutable",
         ],
     );
