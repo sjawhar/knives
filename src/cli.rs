@@ -592,6 +592,27 @@ pub enum ReleaseAction {
         #[arg(long)]
         from: Option<String>,
     },
+    /// Record the commit a release name holds now as its newest knives write.
+    ///
+    /// For a release finished by hand: its conflicts resolved, a release log
+    /// renumbered, a repair made on the release commit itself. Until it is
+    /// recorded, audit reads that commit as drift from the write knives
+    /// recorded. The commit must have no conflicts, and the parents of the
+    /// write it replaces, plus any earlier write of the same name a
+    /// fast-forward push added. It is measured against that write (or, where
+    /// this repository lacks it, a fresh merge of its parents): the files it
+    /// resolved are reported, with the lines each member added that it no
+    /// longer holds, and a file changed outside the conflicts needs `--why`.
+    /// Writes no commit and moves no bookmark: the record is a ledger event,
+    /// and earlier writes of the name that nothing rests on are abandoned.
+    Adopt {
+        /// The release name. Defaults to the release in hand.
+        reference: Option<String>,
+        /// Why the commit changes files the conflicts did not touch. Recorded
+        /// on the release itself.
+        #[arg(long)]
+        why: Option<String>,
+    },
     /// The release's parents, or whether a revision's content is carried.
     ///
     /// Bare: count, commits, and who still holds each parent — the repository's
@@ -752,6 +773,15 @@ mod tests {
             vec!["knives", "release", "drop", "feat/y", "--why", "because"],
             vec!["knives", "release", "advance"],
             vec!["knives", "release", "advance", "feat/x"],
+            vec!["knives", "release", "adopt"],
+            vec![
+                "knives",
+                "release",
+                "adopt",
+                "release/2026-08-01",
+                "--why",
+                "renumbered",
+            ],
             vec!["knives", "release", "members"],
             vec!["knives", "release", "members", "--carries", "x"],
             vec!["knives", "release", "members", "r", "--carries", "x"],

@@ -209,6 +209,19 @@ pub fn published_release(
             return Ok(Some(format!("tag {tag} names {}", commit.short())));
         }
     }
+    Ok(published_note(ledger, release, &seen))
+}
+
+/// The `record: published …` note half of [`published_release`]: the newest
+/// such note on `release` that names one of `commits` in its evidence,
+/// rendered for a human, or `None`.
+///
+/// A note names a commit by its id as a string, so this reads no repository
+/// and answers for a commit this one does not hold: a write made on another
+/// machine is published by its note all the same. A tag can name only a
+/// commit the repository holds, which is why [`published_release`] needs
+/// them held.
+pub fn published_note(ledger: &[Entry], release: &str, commits: &[&CommitId]) -> Option<String> {
     let recorded = ledger.iter().rev().find_map(|entry| {
         let is_record = entry.kind == Kind::Note
             && entry.subject.as_deref() == Some(release)
@@ -220,7 +233,7 @@ pub fn published_release(
         if !is_record {
             return None;
         }
-        seen.iter().copied().find(|commit| {
+        commits.iter().copied().find(|commit| {
             entry.evidence.iter().any(|evidence| {
                 let evidence = evidence.trim();
                 evidence.len() >= 7
@@ -234,7 +247,7 @@ pub fn published_release(
             })
         })
     });
-    Ok(recorded.map(|commit| format!("a record: published note names {}", commit.short())))
+    recorded.map(|commit| format!("a record: published note names {}", commit.short()))
 }
 
 /// `name`, unless it is a series' own prefix, such as `release/9.2` on an entry

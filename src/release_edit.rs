@@ -427,20 +427,48 @@ pub(crate) fn published_refusal(
     opened: &knives::jj::Repo,
     ledger: &[knives::ledger::Entry],
     release: release::ReleaseAt<'_>,
-    (doing, todo): (&str, &str),
+    verb: (&str, &str),
 ) -> anyhow::Result<Option<String>> {
-    Ok(
-        release::published_release(opened, ledger, release)?.map(|evidence| {
-            // The release is a name read from the repository; the evidence
-            // quotes a tag or a ledger entry.
-            format!(
-                "{} is published ({}); {doing} it would move a published release: cut a \
-                 new dated release first, then {todo} that",
-                inline_human_text(release.name),
-                inline_human_text(&evidence)
-            )
-        }),
+    Ok(release::published_release(opened, ledger, release)?
+        .map(|evidence| published_refusal_text(release.name, &evidence, verb)))
+}
+
+/// [`published_refusal`]'s line for the release `name`, which `evidence` marks
+/// published.
+pub(crate) fn published_refusal_text(
+    name: &str,
+    evidence: &str,
+    (doing, todo): (&str, &str),
+) -> String {
+    // The release is a name read from the repository; the evidence quotes a
+    // tag or a ledger entry.
+    format!(
+        "{} is published ({}); {doing} it would move a published release: cut a new dated \
+         release first, then {todo} that",
+        inline_human_text(name),
+        inline_human_text(evidence)
     )
+}
+
+/// Refuse, saying so, a release write while the upstream trunk does not
+/// resolve: `true` after refusing.
+///
+/// Fail closed: parents are classified against the upstream trunk, and an
+/// unresolvable trunk would make every base look like a member.
+pub(crate) fn refuse_unresolved_trunk(
+    opened: &knives::jj::Repo,
+    repo: &RepoName,
+    entry: &knives::config::RepoEntry,
+) -> bool {
+    if opened.resolve_commit(&entry.trunk_ref()).is_ok() {
+        return false;
+    }
+    println!(
+        "{repo}: cannot resolve {}; release edits classify parents against the upstream \
+         trunk, so fetch upstream first",
+        entry.trunk_ref()
+    );
+    true
 }
 
 /// Refuse, saying so, an edit of a release every pin of which is frozen:
@@ -530,16 +558,9 @@ fn edit_release(
     if refuse_if_frozen(repo, &entry.release_scheme(), &plan, &release_name) {
         return Ok(Exit::Incomplete);
     }
-    // Fail closed: parents are classified against the upstream trunk, and an
-    // unresolvable trunk would make every base look like a member — include
-    // would refuse for the wrong reason, and drop or advance could touch the
-    // base, which is `rebase`'s domain.
-    if opened.resolve_commit(&entry.trunk_ref()).is_err() {
-        println!(
-            "{repo}: cannot resolve {}; release edits classify parents against the upstream \
-             trunk, so fetch upstream first",
-            entry.trunk_ref()
-        );
+    // An unresolvable trunk would let include refuse for the wrong reason,
+    // and drop or advance touch the base, which is `rebase`'s domain.
+    if refuse_unresolved_trunk(&opened, repo, entry) {
         return Ok(Exit::Incomplete);
     }
     if !release_is_locally_movable(&opened, repo, &release_name) {

@@ -919,6 +919,21 @@ impl Repo {
             && recorded.tree_ids() == current.tree_ids())
     }
 
+    /// The bytes `path` (repository-internal, `/`-separated) holds at
+    /// `revision`, or `None` where it holds no one resolved regular file:
+    /// absent, a symlink, a directory, a conflict. Read in-process, so a file
+    /// that is not UTF-8 is counted as it is rather than through a lossy
+    /// porcelain print.
+    pub fn file_bytes(&self, revision: &CommitId, path: &str) -> Result<Option<Vec<u8>>, JjError> {
+        let path = RepoPath::from_internal_string(path).map_err(|error| JjError::Revision {
+            revision: path.to_owned(),
+            detail: error.to_string(),
+        })?;
+        let tree = self.commit(revision.as_str())?.tree();
+        let value = block_on(tree.path_value(path)).map_err(|error| store_error(&error))?;
+        regular_file_content(self.repo.store(), path, &value)
+    }
+
     /// The visible commits that share `revision`'s change id, other than
     /// `revision` itself: what a `jj rebase` (or a resolved conflict) left in
     /// the commit's place. Empty for a commit whose change was never rewritten
@@ -2692,6 +2707,69 @@ fn regular_files(value: &MergedTreeValue) -> Option<RegularFiles> {
         executable: *executable,
         copy_id: copy_id.clone(),
     })
+}
+
+/// The release a hand resolution is measured against.
+#[derive(Debug, Clone, Copy)]
+pub enum ResolutionBaseline<'a> {
+    /// A write of the release this repository holds: the commit knives
+    /// itself wrote, conflicts and unions as it left them.
+    Written(&'a CommitId),
+    /// A fresh flat merge of these parents with the release-log union, as a
+    /// release write makes one ([`merged_release`]). A write made on another
+    /// machine before its resolution was pushed is not in this repository,
+    /// and this is the only stand-in for it here.
+    Automerge(&'a [CommitId]),
+}
+
+/// What a hand resolution changed against its baseline, each path once, in
+/// the order the trees list them.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ResolutionChanges {
+    /// Repository-internal paths the baseline left conflicted and the
+    /// resolution holds otherwise: what a person resolved.
+    pub resolved: Vec<String>,
+    /// Repository-internal paths the baseline held without a conflict and the
+    /// resolution changed: a repair or a renumber, never a resolution.
+    pub beyond: Vec<String>,
+}
+
+/// Every path whose content differs between `baseline` and `resolution`,
+/// sorted by whether the baseline held a conflict there.
+///
+/// The automerge is built in a scratch transaction that is dropped unwritten,
+/// so measuring a resolution writes nothing an operation names. Its union is
+/// the one every release write makes, so a release log the union resolves is
+/// no conflict of the baseline, and a log a person changed past it is a
+/// change beyond the conflicts.
+pub fn resolution_changes(
+    repo: &Path,
+    baseline: ResolutionBaseline<'_>,
+    resolution: &CommitId,
+) -> Result<ResolutionChanges, JjError> {
+    let repo = Repo::open(repo)?;
+    let resolution = repo.commit(resolution.as_str())?.tree();
+    let baseline = match baseline {
+        ResolutionBaseline::Written(commit) => repo.commit(commit.as_str())?.tree(),
+        ResolutionBaseline::Automerge(parents) => {
+            validate_parents(None, parents)?;
+            let (parent_commits, parent_ids) = resolved_parents(&repo, parents)?;
+            let mut scratch = repo.repo.start_transaction();
+            let (merged, _) = merged_release(&mut scratch, (&parent_commits, parent_ids), "")?;
+            merged.tree()
+        }
+    };
+    let mut changes = ResolutionChanges::default();
+    for entry in collect_stream(baseline.diff_stream(&resolution, &EverythingMatcher)) {
+        let values = entry.values.map_err(|error| store_error(&error))?;
+        let path = entry.path.as_internal_file_string().to_owned();
+        if values.before.is_resolved() {
+            changes.beyond.push(path);
+        } else {
+            changes.resolved.push(path);
+        }
+    }
+    Ok(changes)
 }
 
 /// What one cut is made of, owned so a candidate can be rebuilt verbatim.

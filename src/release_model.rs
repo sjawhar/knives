@@ -1039,25 +1039,77 @@ pub fn recorded_writes<'a>(
     entries: &'a [Entry],
     release: &'a str,
 ) -> impl Iterator<Item = RecordedWrite> + 'a {
+    recorded_write_events(entries, release).map(|(_, write)| write)
+}
+
+/// [`recorded_writes`], each beside the whole ledger event that records it.
+///
+/// A write that replaces the newest one copies its event's `parents`: each
+/// member with the branch names it carried when it was written, which is what
+/// `include` and `advance` match a member by once its bookmark has moved on.
+pub fn recorded_write_events<'a>(
+    entries: &'a [Entry],
+    release: &'a str,
+) -> impl Iterator<Item = (&'a Entry, RecordedWrite)> + 'a {
     entries.iter().rev().filter_map(move |entry| {
         if entry.kind != Kind::Event || entry.subject.as_deref() != Some(release) {
             return None;
         }
         if let Some(cut) = last_recorded_cut(std::slice::from_ref(entry), None) {
-            return Some(RecordedWrite {
-                kind: RecordedWriteKind::Cut,
-                commit: cut.commit,
-            });
+            return Some((
+                entry,
+                RecordedWrite {
+                    kind: RecordedWriteKind::Cut,
+                    commit: cut.commit,
+                },
+            ));
         }
         let rest = entry.text.strip_prefix("edited ")?.strip_prefix(release)?;
         if !(rest.starts_with(':') || rest.starts_with(' ')) {
             return None;
         }
-        Some(RecordedWrite {
-            kind: RecordedWriteKind::Edit,
-            commit: CommitId::new(entry.evidence.first()?.as_str()),
-        })
+        Some((
+            entry,
+            RecordedWrite {
+                kind: RecordedWriteKind::Edit,
+                commit: CommitId::new(entry.evidence.first()?.as_str()),
+            },
+        ))
     })
+}
+
+/// The parents of `release` that are fast-forward carriers: earlier writes of
+/// the same name, never members.
+///
+/// A push of a release that does not descend from its published position is
+/// made a fast-forward by giving it that position as one more parent, so the
+/// release then carries an older write of itself. Read as a member, the
+/// carrier accumulates: every later write would keep it, and each push would
+/// add one more. A parent is a carrier exactly when the ledger records it as
+/// a cut or an edit of `release` ([`recorded_writes`]) or it is `published`,
+/// the publish remote's commit of the name, as the caller reads that ref. No
+/// other parent is one, however it is named: a write recorded under another
+/// release name is that release's, and here it is a member like any other.
+pub fn carriers(
+    release: &str,
+    parents: &[CommitId],
+    entries: &[Entry],
+    published: Option<&CommitId>,
+) -> Vec<CommitId> {
+    let written: Vec<CommitId> = recorded_writes(entries, release)
+        .map(|write| write.commit)
+        .collect();
+    parents
+        .iter()
+        .filter(|parent| published == Some(*parent) || written.contains(parent))
+        .cloned()
+        .collect()
+}
+
+/// The branch label a carrier of `release` ([`carriers`]) takes where a
+/// recorded parent set names it, so no reader takes it for a member's branch.
+pub fn carrier_label(release: &str) -> String {
+    format!("{release} earlier write (carrier, not a member)")
 }
 
 /// The newest structural cut event of the series `entry` selects.
@@ -1080,4 +1132,104 @@ pub fn last_series_cut(entries: &[Entry], entry: &RepoEntry) -> Option<RecordedC
                 .is_some_and(|subject| scheme.owns(subject))
         })
         .find_map(|recorded| last_recorded_cut(std::slice::from_ref(recorded), None))
+}
+
+#[cfg(test)]
+mod carrier_tests {
+    use super::{CommitId, Entry, Kind, RecordedParent, carrier_label, carriers};
+
+    const RELEASE: &str = "integration";
+
+    /// A cut or edit event of `subject` that names `commit` first in its
+    /// evidence, as both writers record it.
+    fn event(subject: &str, text: String, commit: &str) -> Entry {
+        Entry {
+            ts: "2026-11-15T00:00:00Z".to_owned(),
+            owner: "test".to_owned(),
+            email: None,
+            subject: Some(subject.to_owned()),
+            kind: Kind::Event,
+            disposition: None,
+            statement: None,
+            text,
+            evidence: vec![commit.to_owned(), "member0000000".to_owned()],
+            anchor: None,
+            pr: None,
+            parents: vec![RecordedParent {
+                commit: "member0000000".to_owned(),
+                branches: vec!["feat/member".to_owned()],
+            }],
+            claim_change: None,
+            claim_change_why: None,
+            previous_owner: None,
+            previous_kind: None,
+            previous_started: None,
+            previous_last_seen: None,
+            previous_why: None,
+        }
+    }
+
+    #[test]
+    fn earlier_writes_of_the_name_and_its_published_commit_are_carriers() {
+        // Given: a recorded cut and a recorded edit of the release, and its
+        // publish remote at a third commit no event names.
+        let entries = [
+            event(
+                RELEASE,
+                format!("cut {RELEASE} as cut000000000 with 1 parent(s): feat/member"),
+                "cut000000000",
+            ),
+            event(
+                RELEASE,
+                format!("edited {RELEASE} as edit00000000 with 1 parent(s): included x"),
+                "edit00000000",
+            ),
+        ];
+        let (cut, edit) = (CommitId::new("cut000000000"), CommitId::new("edit00000000"));
+        let published = CommitId::new("published000");
+        let parents = [
+            CommitId::new("member0000000"),
+            cut.clone(),
+            edit.clone(),
+            published.clone(),
+        ];
+
+        // When: the release's parents are read for carriers.
+        let found = carriers(RELEASE, &parents, &entries, Some(&published));
+
+        // Then: each earlier write and the published commit is one, in the
+        // release's parent order; the member is not.
+        assert_eq!(found, [cut, edit, published]);
+    }
+
+    #[test]
+    fn a_member_a_bare_commit_and_another_releases_write_are_not_carriers() {
+        // Given: a write recorded under another release name, and a member
+        // and a bare commit no event names as a write.
+        let entries = [event(
+            "release/2026-08-04",
+            "cut release/2026-08-04 as other0000000 with 1 parent(s): feat/member".to_owned(),
+            "other0000000",
+        )];
+        let parents = [
+            CommitId::new("member0000000"),
+            CommitId::new("bare00000000"),
+            CommitId::new("other0000000"),
+        ];
+
+        // When: the release's parents are read for carriers, its publish
+        // remote holding no ref of the name.
+        let found = carriers(RELEASE, &parents, &entries, None);
+
+        // Then: none of them is a carrier.
+        assert_eq!(found, Vec::<CommitId>::new());
+    }
+
+    #[test]
+    fn a_carrier_is_labelled_as_an_earlier_write_of_its_release() {
+        assert_eq!(
+            carrier_label(RELEASE),
+            "integration earlier write (carrier, not a member)"
+        );
+    }
 }

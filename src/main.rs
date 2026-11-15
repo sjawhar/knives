@@ -3,10 +3,11 @@
 //! Dispatch, the repository selection every command shares, and the report
 //! verbs whose work is gather, exit code, render: `status`, `sync`, `audit`,
 //! `consumers`, `pushed`, `pr`, `preflight`. The verbs that write — a cut, a
-//! rebase, a membership edit, a branch handed back — each own a module here:
-//! [`release_cut`], [`release_rebase`], [`release_edit`], [`branch_verbs`];
-//! the release's content reports are [`release_carries`]. Every command
-//! returns an [`Exit`], so the match stays a table.
+//! rebase, a membership edit, a hand resolution adopted, a branch handed back
+//! — each own a module here: [`release_cut`], [`release_rebase`],
+//! [`release_edit`], [`release_adopt`], [`branch_verbs`]; the release's
+//! content reports are [`release_carries`]. Every command returns an
+//! [`Exit`], so the match stays a table.
 
 #![allow(
     clippy::redundant_pub_crate,
@@ -15,6 +16,7 @@
 
 mod branch_verbs;
 mod ground;
+mod release_adopt;
 mod release_carries;
 mod release_cut;
 mod release_edit;
@@ -39,6 +41,7 @@ use knives::ids::{BranchName, UpstreamName};
 use knives::ledger::{Ledger, Scribe};
 use knives::lock::LockError;
 use knives::store::{Store, StoreError, default_state_path};
+use release_adopt::run_release_adopt;
 use release_carries::{run_release_census, run_release_members, run_revision_carries};
 use release_cut::{ReleaseInvocation, run_reap, run_release};
 use release_edit::{ReleaseEdit, run_release_edit};
@@ -532,6 +535,12 @@ fn dispatch_release(
                 bound,
             )
         }
+        Some(ReleaseAction::Adopt { reference, why }) => run_release_adopt(
+            fork,
+            extra_consumers,
+            (reference.as_deref(), why.as_deref()),
+            bound,
+        ),
     }
 }
 
