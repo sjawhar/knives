@@ -230,10 +230,18 @@ struct Replaced {
     /// Whether this repository holds the write's commit. A write made on
     /// another machine and never pushed is not here.
     here: bool,
+    /// Whether the adopted commit is this write, or it re-signed or
+    /// metaedited: an older recorded write adopted as the newest.
+    equal: bool,
     /// Whether its event says knives could not check the release it was
     /// written over (`; unchecked:`): nothing measured that write, so a
     /// resolution is measured against an automerge instead.
     unchecked: bool,
+    /// The write's own parents, where this repository holds it: the earlier
+    /// writes of the name among them, which a rebuild of it leaves out
+    /// ([`ResolutionBaseline::Rebuilt`]), and the rest, its members.
+    carriers: Vec<CommitId>,
+    members: Vec<CommitId>,
     /// The parent set its event records, its own carriers left out, each
     /// parent with every branch at it then, which `include` and `advance`
     /// match a member by once its bookmark has moved on.
@@ -242,7 +250,7 @@ struct Replaced {
 
 impl Replaced {
     /// The write `held` replaces, or `None` when no recorded write has its
-    /// `members` ([`release::InHandWrite::NoMatch`], already refused).
+    /// `members` ([`release::Unchecked::NoMatch`], already refused).
     ///
     /// An event an older knives wrote has no `parents`; the set is then built
     /// as a write builds it, from the write's own parents where this
@@ -265,10 +273,10 @@ impl Replaced {
                 break;
             }
         }
-        let (event, write) = match equal {
-            Some(equal) => equal,
+        let (event, write, equal) = match equal {
+            Some((event, write)) => (event, write, true),
             None => match matched_write(opened, (ledger, &held.name), writes, members)? {
-                Some(matched) => (matched.event, matched.write),
+                Some(matched) => (matched.event, matched.write, false),
                 None => return Ok(None),
             },
         };
@@ -282,18 +290,85 @@ impl Replaced {
         } else {
             recorded
         };
+        let here = opened.resolve_commit(write.commit.as_str()).is_ok();
+        let (carriers, members) = if here {
+            let own = opened.parent_commits(write.commit.as_str())?;
+            let carriers = writes.recorded_carriers(opened, &own)?;
+            let members = own
+                .into_iter()
+                .filter(|parent| !carriers.contains(parent))
+                .collect();
+            (carriers, members)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         Ok(Some(Self {
-            here: opened.resolve_commit(write.commit.as_str()).is_ok(),
+            here,
+            equal,
             unchecked: knives::release_model::unchecked_mark(event).is_some(),
             write,
+            carriers,
+            members,
             parents,
         }))
     }
 
     /// Whether the write is the baseline a resolution is measured against
     /// (D7): it is here, and knives checked the release it was written over.
+    /// Otherwise the baseline is an automerge of the commit's members.
     const fn is_baseline(&self) -> bool {
         self.here && !self.unchecked
+    }
+
+    /// D7's baseline for a commit whose members are `members`, and how a
+    /// reader is told it: the write itself, when the commit is it or a copy
+    /// of it; the write rebuilt on `members`, the tree a write onto them
+    /// holds, when the write is the baseline ([`Self::is_baseline`]);
+    /// otherwise a fresh automerge of `members`, saying why.
+    fn baseline<'a>(&'a self, members: &'a [CommitId]) -> (ResolutionBaseline<'a>, String) {
+        if self.is_baseline() && self.equal {
+            return (
+                ResolutionBaseline::Written(&self.write.commit),
+                self.described(),
+            );
+        }
+        if self.is_baseline() {
+            // Rebuilt on its own members, a write is its own tree, so it is
+            // named as itself.
+            let described = if self.members == members {
+                self.described()
+            } else {
+                format!(
+                    "{} rebuilt on its {} member parent(s)",
+                    self.described(),
+                    members.len()
+                )
+            };
+            return (
+                ResolutionBaseline::Rebuilt {
+                    write: &self.write.commit,
+                    carriers: &self.carriers,
+                    members,
+                },
+                described,
+            );
+        }
+        let reason = if self.here {
+            format!(
+                "knives could not check the release {} was written over",
+                self.described()
+            )
+        } else {
+            format!("this repository does not hold {}", self.described())
+        };
+        (
+            ResolutionBaseline::Automerge(members),
+            format!(
+                "an automerge of its {} member parent(s) with the release-log union, because \
+                 {reason}",
+                members.len()
+            ),
+        )
     }
 
     /// `the recorded edit 0123456789ab`.
@@ -345,21 +420,30 @@ struct Adopting<'a, 'f> {
 
 impl Adopting<'_, '_> {
     /// Refuse, saying why, a commit that is not finished: one that still has
-    /// conflicts, one a workspace has checked out, and a hand edit of a
-    /// published release the publish remote does not hold. `true` after
-    /// refusing.
+    /// conflicts, or whose conflicts cannot be read, one a workspace has
+    /// checked out, and a hand edit of a published release the publish
+    /// remote does not hold. `true` after refusing.
     fn refuse_unfinished(&self) -> anyhow::Result<bool> {
         let (repo, held) = (&self.fork.name, self.held);
         let (shown, at) = (held.shown_name(), held.commit.short());
-        let conflicted =
-            knives::jj::conflicted_files(&self.fork.checkout.path, held.commit.as_str())?;
+        let conflicted = match held.opened.conflicted_files(held.commit.as_str()) {
+            Ok(conflicted) => conflicted,
+            Err(error) => {
+                println!(
+                    "{repo}: could not read whether {shown} at {at} still has conflicts ({}), \
+                     so it is not adopted",
+                    inline_human_text(&error.to_string())
+                );
+                return Ok(true);
+            }
+        };
         if !conflicted.is_empty() {
             println!(
                 "{repo}: {shown} at {at} still has {} conflicted file(s), so it is not resolved \
                  yet; resolve them, then adopt:",
                 conflicted.len()
             );
-            // The paths are jj's, named by the conflict it reports.
+            // The paths are the repository's, each whole.
             for file in &conflicted {
                 println!("    {}", inline_human_text(file));
             }
@@ -460,29 +544,7 @@ fn measure<'a>(
         .filter(|parent| !carriers.contains(parent))
         .cloned()
         .collect();
-    let (baseline, described) = if replaced.is_baseline() {
-        (
-            ResolutionBaseline::Written(&replaced.write.commit),
-            replaced.described(),
-        )
-    } else {
-        let reason = if replaced.here {
-            format!(
-                "knives could not check the release {} was written over",
-                replaced.described()
-            )
-        } else {
-            format!("this repository does not hold {}", replaced.described())
-        };
-        (
-            ResolutionBaseline::Automerge(&members),
-            format!(
-                "an automerge of its {} member parent(s) with the release-log union, because \
-                 {reason}",
-                members.len()
-            ),
-        )
-    };
+    let (baseline, described) = replaced.baseline(&members);
     let changes = knives::jj::resolution_changes(&fork.checkout.path, baseline, &held.commit)?;
     if !changes.beyond.is_empty() && why.is_none() {
         println!(

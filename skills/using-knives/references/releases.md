@@ -113,10 +113,10 @@ Records the commit a release name holds now as the name's newest knives write. U
 
 - It pulls the ledger and reads the plan, as the edit verbs do. The commit is the local bookmark's. With no local bookmark, it fetches, then reads the publish remote's ref of the name.
 - The write it replaces is the newest recorded write whose recorded parents, carriers left out, match the commit's parents, carriers left out. A parent matches when it is the recorded commit or a visible rewrite of it with the same change id. A recorded parent that this repository does not hold matches by commit id only.
-- The baseline is that write, where this repository holds it and its event carries no `; unchecked:` mark. Otherwise it is a fresh merge of the commit's member parents with the release-log union. The output names the baseline.
+- The baseline is that write rebuilt on the commit's member parents: the tree a knives write onto them holds, with the release-log union, the tree that decides whether the release in hand is recorded ([below](#adopt-a-hand-resolution-before-the-next-write)). So a member rewritten in place, which makes jj rebase the release, is no change of the commit's own. A commit equal to an older recorded write is measured against that write itself. Where this repository does not hold the write, or the write's event carries the `; unchecked:` mark, the baseline is a fresh merge of the commit's member parents with the release-log union. The output names the baseline.
 - When the commit is the newest recorded write, or a copy of it with the same change id, parents and tree, `adopt` writes nothing and exits `0`. The exception is a newest write whose event carries the `; unchecked:` mark: `adopt` records the commit again, with no mark, and so ends the mark ([unchecked](#when-knives-cannot-check-the-release-in-hand)). A commit equal to an older recorded write is recorded as the newest, so the audit clears.
 - Otherwise it abandons the earlier writes of the name that are visible heads nothing rests on, and records an `edited` event ([ledger](ledger.md)). Then it prints the adopted commit, the write it replaces and the baseline; the files resolved by hand; the files changed beyond the baseline's conflicts, with the reason; for each member and changed file, how many of the member's non-blank added lines, from its fork point with trunk, the commit does not hold; each carrier, labelled `<name> earlier write (carrier, not a member)`; and each commit it abandoned.
-- It exits `1` when it finds a member's added lines missing. It records first. Read the counts, and repair the release if the resolution lost a member's change. A heading line that you renumbered is expected in the counts.
+- It exits `1` only against a recorded write, never against a fresh merge, and only for one of two losses: any of a member's added lines lost from a file that the baseline left without a conflict and that is not a release log, or none of the blocks a member added left in a release log or in a file that the baseline left conflicted. A block cut down there is the normal shape of a resolution: the counts report it, and the exit stays `0`. It records first. Read the counts, and repair the release if the resolution lost a member's change. A heading line that you renumbered is expected in the counts.
 - A file that the commit changes and the baseline left without a conflict needs `--why`. Such a change is a repair, a restore or a renumber. Without `--why`, `adopt` refuses and names the files. The event keeps the reason.
 
 It refuses, exit `3`, and writes nothing in these cases:
@@ -166,7 +166,7 @@ In each of two states, the new cut of step 3 exits `1` once. The cut is still wr
 - The release in hand is **unrecorded** when its tree differs from the tree of its matched recorded write rebased onto the release's parents, carriers left out. A jj rebase of that write, a fast-forward carrier copy and a metadata rewrite are recorded. A hand edit is not.
 - A release equal to any recorded write of its name, or a copy of one with the same change id, parents and tree, is recorded.
 - While the release in hand is unrecorded, `cut`, `include`, `drop`, `advance` and `rebase` refuse, exit `3`, and write nothing. The cut refuses whatever its audit would say. Each refusal names the remedy as a command: `knives release adopt <name>`. `adopt` asks for `--why` only for a change outside the conflicts.
-- When knives cannot check the release in hand, the write goes ahead and says so ([below](#when-knives-cannot-check-the-release-in-hand)). `adopt` works in that case.
+- When knives cannot check the release in hand, the write goes ahead and says so ([below](#when-knives-cannot-check-the-release-in-hand)). `adopt` records such a release when this repository does not hold its matched write, or when that write's event carries the `; unchecked:` mark. It refuses one whose members match no recorded write: an `include`, `drop` or `advance` records that composition, and `adopt` then records the release ([adopt](#knives-release-adopt-name---why-text)).
 - A release whose every parent is a carrier makes every write refuse, with the remedy that `adopt` prints ([adopt](#knives-release-adopt-name---why-text)). An unrecorded published release that the publish remote does not hold gets [the published remedy](#the-published-remedy).
 - A release whose name has no recorded write at all is not refused, unless its every parent is a carrier. So a fork whose ledger predates knives is not blocked.
 - After a hand restore of a release (`jj restore --from <commit> --into <name> <path>...`), run `knives release adopt <name> --why '<what was restored and why>'`, then cut.
@@ -226,7 +226,7 @@ knives release members --census [--no-github]
 ```
 
 - Bare: direct parents, commits, holding bookmarks, and branch tips advanced past them. `REF` picks another release.
-- `--verify` replays each member into the release, one replay per member. Problems exit `3`, missing or unexplained content `1`, else `0`. A release that is a hand edit of its newest recorded write is held against that write where this repository holds it. A divergence that write already had is reported as the hand edit's, with `knives release adopt` as the remedy, and exits `1`.
+- `--verify` replays each member into the release, one replay per member. Problems exit `3`, missing or unexplained content `1`, else `0`.
 - `--carries REV` asks whether the net content of the revision is carried. With a target, it checks only that target. Without one, it checks live releases and upstream trunk, then superseded cuts.
 - `--census` asks the deletion-safety question for every maintained branch. `--no-github` is valid only with `--census`, and the orphan test is then unknown. It does not combine with `REF`, `--verify` or `--carries`.
 
@@ -244,7 +244,6 @@ old=$(jj log -r '<name>@<publish-remote>' --no-graph -T commit_id)     # the pub
 pre=$(jj log -r <name> --no-graph -T commit_id)                         # the write knives made
 jj rebase -r <name> -d <parent-1> -d <parent-2> -d "$old"               # each parent as its own -d, in the release's order, then the published head
 jj restore --from "$pre" --into <name>                                   # the rebase can add the published head's content; put the write's tree back
-jj diff --from "$pre" --to <name> --name-only                            # must print nothing
 JJ_USER='<author>' JJ_EMAIL='<email>' jj metaedit --update-author <name> # only when the author must change
 knives release adopt <name> --why "fast-forward of $pre onto the published head $old"
 git push <publish-remote> "$(jj log -r <name> --no-graph -T commit_id):refs/heads/<name>"

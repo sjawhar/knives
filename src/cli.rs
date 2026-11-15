@@ -601,8 +601,11 @@ pub enum ReleaseAction {
     /// to write over a hand change it carries. The commit must have no
     /// conflicts, and the parents of the write it replaces, plus any earlier
     /// write of the same name a fast-forward push added. It is measured
-    /// against that write (or, where this repository lacks it, a fresh merge
-    /// of its parents): the files it resolved are reported, with the lines
+    /// against that write rebuilt on the commit's member parents (the write
+    /// itself when the commit is an older recorded write), or, where this
+    /// repository lacks that write or the write's own record is marked
+    /// unchecked, against a fresh merge of its member parents with the
+    /// release-log union: the files it resolved are reported, with the lines
     /// each member added that it no longer holds, and a file changed outside
     /// the conflicts needs `--why`. Writes no commit and moves no bookmark:
     /// the record is a ledger event, and earlier writes of the name that
@@ -611,7 +614,7 @@ pub enum ReleaseAction {
         /// The release name. Defaults to the release in hand.
         reference: Option<String>,
         /// Why the commit changes files the conflicts did not touch. Recorded
-        /// on the release itself.
+        /// in adopt's ledger event.
         #[arg(long)]
         why: Option<String>,
     },

@@ -948,11 +948,12 @@ pub enum Unchecked {
 impl Unchecked {
     /// The mark the ledger event of a write over such a release ends with
     /// (`; unchecked: <mark>`), after every part `recorded_writes` parses: an
-    /// inherited one keeps the reason it was first marked with.
+    /// inherited one keeps the reason it was first marked with, which is one
+    /// of these two ([`crate::release_model::unchecked_mark`]).
     pub fn mark(&self) -> &str {
         match self {
-            Self::WriteAbsent(_) => "W absent",
-            Self::NoMatch(_) => "no match",
+            Self::WriteAbsent(_) => crate::release_model::UNCHECKED_WRITE_ABSENT,
+            Self::NoMatch(_) => crate::release_model::UNCHECKED_NO_MATCH,
             Self::Inherited { reason, .. } => reason,
         }
     }
@@ -975,7 +976,11 @@ pub enum NoMatch {
 /// ([`Unchecked::mark`]), nothing otherwise.
 pub fn unchecked_suffix(standing: &InHandWrite) -> String {
     match standing {
-        InHandWrite::Unchecked(unchecked) => format!("; unchecked: {}", unchecked.mark()),
+        InHandWrite::Unchecked(unchecked) => format!(
+            "{}{}",
+            crate::release_model::UNCHECKED_DELIMITER,
+            unchecked.mark()
+        ),
         InHandWrite::Recorded | InHandWrite::Unrecorded { .. } | InHandWrite::NoRecord => {
             String::new()
         }
@@ -1075,10 +1080,10 @@ fn unless_marked(event: &Entry, write: RecordedWrite, held: InHandWrite) -> InHa
 
 /// Whether the publish remote holds the release at `commit`.
 ///
-/// It does when its ref of the name is the commit or descends from it. A hand
-/// edit pushed is no hand edit consumers were never given, so it is
-/// `adopt`'s to record, and the published remedy never sends a person to a
-/// commit the publish remote already holds.
+/// It does when its ref of the name is the commit or descends from it. A
+/// pushed hand edit is one consumers were given, so it is `adopt`'s to
+/// record, and the published remedy never sends a person to a commit the
+/// publish remote already holds.
 pub fn publish_remote_holds(
     repo: &Repo,
     commit: &CommitId,

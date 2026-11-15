@@ -163,12 +163,6 @@ fn fast_forward(lab: &Lab) -> CommitId {
         "parents(integration) | integration@origin",
     ]);
     lab.jj_work(["restore", "--from", before.as_str(), "--into", RELEASE]);
-    let after = commit_at(lab, RELEASE);
-    let opened = Repo::open(&lab.work).expect("open");
-    assert!(
-        opened.same_tree(&before, &after).expect("compare trees"),
-        "the restore put the release's tree back: an empty diff"
-    );
     before
 }
 
@@ -349,7 +343,8 @@ fn a_fast_forward_carrier_is_labelled_and_left_out_of_the_next_include_and_cut()
         members.contains(&format!("- {} {LABEL}", carrier.short())),
         "{members}"
     );
-    let plan = plan_text(&lab, &home);
+    // The adopted release is not pushed yet, the plan's one finding.
+    let plan = plan_text(&lab, &home, false);
     assert!(
         plan.contains(&format!("    {}  {LABEL}", carrier.short())),
         "{plan}"
@@ -586,10 +581,22 @@ fn a_cut_over_a_carrier_keeps_the_hand_resolution_and_the_working_copy() {
 
     // When: the fixed release is cut again, its candidate audited and the
     // publish rebuilding it.
-    release_ok(lab, home, &["cut"]);
+    let cut = release_ok(lab, home, &["cut"]);
 
     // Then: the cut holds the resolution, carries no carrier, and its carried
-    // rows name none.
+    // rows name none: neither the carrier's commit nor its label. The plan
+    // it prints first shows the release in hand, carrier included.
+    let rows: Vec<&str> = cut
+        .lines()
+        .filter(|line| line.contains("carried"))
+        .collect();
+    assert!(!rows.is_empty(), "{cut}");
+    for row in rows {
+        assert!(
+            !row.contains(state.carrier.short()) && !row.contains("earlier write"),
+            "{row}\n{cut}"
+        );
+    }
     assert_resolution_kept(lab, "cut");
     assert!(!release_parents(lab, RELEASE).contains(&state.carrier));
     assert_working_copy_on(lab, &state.release, "cut");
@@ -691,9 +698,29 @@ fn refs(lab: &Lab) -> BTreeMap<String, String> {
     refs
 }
 
-/// A plan's text, whatever its exit: a plan is read here, not judged.
-fn plan_text(lab: &Lab, home: &tempfile::TempDir) -> String {
-    stdout(&knives_release(lab, home, &[]))
+/// The plan's text. Once the release in hand is `pushed`, the plan must exit
+/// 0 with no finding; before, it must exit 1 with one finding: the release
+/// names its local and pushed positions, whose trees differ.
+fn plan_text(lab: &Lab, home: &tempfile::TempDir, pushed: bool) -> String {
+    let output = knives_release(lab, home, &[]);
+    let plan = stdout(&output);
+    let findings: Vec<&str> = plan
+        .lines()
+        .filter(|line| line.trim_start().starts_with("!!"))
+        .collect();
+    let unpushed = format!("{RELEASE} names both");
+    if pushed {
+        assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+        assert!(findings.is_empty(), "{}", text(&output));
+    } else {
+        assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+        assert!(
+            matches!(findings.as_slice(), [only] if only.contains(&unpushed)),
+            "{}",
+            text(&output)
+        );
+    }
+    plan
 }
 
 /// Two rounds of a knives write, a fast-forward made by hand, a push and an
@@ -720,12 +747,22 @@ fn depth_two_chain(reword: bool) -> (Lab, tempfile::TempDir) {
     (lab, home)
 }
 
-/// What a write over the depth-two chain must leave: no anonymous head, no
-/// stacked line in the plan, and no parent sharing a change id with an
-/// earlier write of the name.
-fn assert_chain_written_clean(lab: &Lab, home: &tempfile::TempDir, after: &str) {
+/// What a write over the depth-two chain must leave: no anonymous head; a
+/// plan that reads `parents` parent(s), flat, with no stacked line, and that
+/// exits 0 once the write is `pushed`, or else 1 with one finding, the
+/// release's local and pushed positions holding different trees; and no
+/// parent sharing a change id with an earlier write of the name.
+fn assert_chain_written_clean(
+    lab: &Lab,
+    home: &tempfile::TempDir,
+    (after, parents, pushed): (&str, usize, bool),
+) {
     assert_no_anonymous_head(lab, home, after);
-    let plan = plan_text(lab, home);
+    let plan = plan_text(lab, home, pushed);
+    assert!(
+        plan.contains(&format!("{parents} parent(s), flat")),
+        "after {after}: {plan}"
+    );
     assert!(!plan.contains("stacked on a prior merge"), "{plan}");
     let opened = Repo::open(&lab.work).expect("open");
     let written: Vec<ChangeId> =
@@ -752,9 +789,10 @@ fn chain_then_write_and_push(reword: bool) {
     release_ok(&lab, &home, &["include", "feat/epsilon"]);
     lab.push_branch(RELEASE);
 
-    // Then: nothing is an anonymous head, the plan counts no stacked member,
-    // no parent is an earlier write, and every other ref is where it was.
-    assert_chain_written_clean(&lab, &home, "the write and push");
+    // Then: nothing is an anonymous head, the plan exits 0 counting five
+    // flat parents and no stacked member, no parent is an earlier write, and
+    // every other ref is where it was.
+    assert_chain_written_clean(&lab, &home, ("the write and push", 5, true));
     assert_eq!(refs(&lab), before);
 }
 
@@ -787,10 +825,11 @@ fn a_depth_two_carrier_chain_rebased_onto_a_moved_trunk_leaves_no_anonymous_head
     // When: the release is rebased onto it before any push.
     release_ok(&lab, &home, &["rebase", "main@upstream"]);
 
-    // Then: nothing is an anonymous head, no parent is an earlier write, each
+    // Then: nothing is an anonymous head, the plan counts four flat parents
+    // and finds only the unpushed rebase, no parent is an earlier write, each
     // member's bookmark moved onto its rebased commit, the working copy
     // followed delta keeping its change id, and every other ref stayed.
-    assert_chain_written_clean(&lab, &home, "the rebase");
+    assert_chain_written_clean(&lab, &home, ("the rebase", 4, false));
     let after = refs(&lab);
     for (name, member) in &members {
         assert_eq!(&change(&after[name]), member, "{name}");

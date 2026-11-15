@@ -1080,16 +1080,35 @@ pub fn recorded_write_events<'a>(
     })
 }
 
+/// What a cut or edit event's text puts before the mark of a write over a
+/// release in hand knives could not check: `; unchecked: <reason>` closes the
+/// text ([`unchecked_mark`]).
+pub const UNCHECKED_DELIMITER: &str = "; unchecked: ";
+
+/// The mark of a write whose matched recorded write this repository does
+/// not hold.
+pub const UNCHECKED_WRITE_ABSENT: &str = "W absent";
+
+/// The mark of a write over a release whose members match no recorded write.
+pub const UNCHECKED_NO_MATCH: &str = "no match";
+
 /// Why knives could not check the release in hand a cut or edit event wrote
 /// over.
 ///
-/// It is what follows the `; unchecked: ` its text ends with, after every
-/// part a reader parses. `None` for every other event.
-pub fn unchecked_mark(entry: &Entry) -> Option<&str> {
-    entry
-        .text
-        .rsplit_once("; unchecked: ")
-        .map(|(_, reason)| reason)
+/// It is the reason after the [`UNCHECKED_DELIMITER`] the text ends with,
+/// after every part a reader parses, and only one of the two reasons a write
+/// marks ([`UNCHECKED_WRITE_ABSENT`], [`UNCHECKED_NO_MATCH`]): a caller's
+/// reason inside the text that happens to hold the delimiter is no mark.
+/// `None` for every other event.
+pub fn unchecked_mark(entry: &Entry) -> Option<&'static str> {
+    [UNCHECKED_WRITE_ABSENT, UNCHECKED_NO_MATCH]
+        .into_iter()
+        .find(|reason| {
+            entry
+                .text
+                .strip_suffix(reason)
+                .is_some_and(|rest| rest.ends_with(UNCHECKED_DELIMITER))
+        })
 }
 
 /// The change id a cut or edit event of `release` records for its commit.
@@ -1445,7 +1464,7 @@ mod carrier_tests {
 
     /// A cut or edit event of `subject` that names `commit` first in its
     /// evidence, as both writers record it.
-    fn event(subject: &str, text: String, commit: &CommitId) -> Entry {
+    pub(super) fn event(subject: &str, text: String, commit: &CommitId) -> Entry {
         Entry {
             ts: "2026-11-15T00:00:00Z".to_owned(),
             owner: "test".to_owned(),
@@ -1712,5 +1731,73 @@ mod carrier_tests {
 
         // Then: it is a member.
         assert_eq!(found, Vec::<CommitId>::new());
+    }
+}
+
+#[cfg(test)]
+mod unchecked_mark_tests {
+    use super::{CommitId, RecordedWrite, RecordedWriteKind, carrier_tests::event, unchecked_mark};
+    use crate::commands::release::{InHandWrite, NoMatch, Unchecked, unchecked_suffix};
+
+    /// An edit event of `integration` whose text says `delta`, then its
+    /// parents, then `suffix`, as `record_edit_event` writes one.
+    fn edited(delta: &str, suffix: &str) -> crate::ledger::Entry {
+        let commit = CommitId::new("a".repeat(40));
+        event(
+            "integration",
+            format!(
+                "edited integration as {} (change kkkkkkkkkkkk) with 1 parent(s): {delta}; \
+                 parents: feat/x@bbbbbbbbbbbb{suffix}",
+                commit.short()
+            ),
+            &commit,
+        )
+    }
+
+    #[test]
+    fn a_reason_holding_the_delimiter_is_no_mark_and_a_written_mark_is() {
+        // Given: an include and an adopt whose caller's reason holds the
+        // delimiter, with a reason a write marks and with one it does not,
+        // and an event that ends with the delimiter and no written reason.
+        let unmarked = [
+            edited("included feat/x (x; unchecked: y)", ""),
+            edited("included feat/x (renumber; unchecked: W absent)", ""),
+            edited(
+                "adopted: replaces the recorded cut 0123456789ab; why: renumber; unchecked: \
+                 no match",
+                "",
+            ),
+            edited("included feat/x", "; unchecked: y"),
+        ];
+
+        // Then: none reads as marked.
+        for entry in &unmarked {
+            assert_eq!(unchecked_mark(entry), None, "{}", entry.text);
+        }
+
+        // Given: the same include written over each release knives could not
+        // check, its mark written as every write writes it.
+        let write = RecordedWrite {
+            kind: RecordedWriteKind::Cut,
+            commit: CommitId::new("c".repeat(40)),
+        };
+        let cases = [
+            (Unchecked::WriteAbsent(write.clone()), "W absent"),
+            (Unchecked::NoMatch(NoMatch::Members), "no match"),
+            (
+                Unchecked::Inherited {
+                    write,
+                    reason: "no match".to_owned(),
+                },
+                "no match",
+            ),
+        ];
+        for (unchecked, reason) in cases {
+            let suffix = unchecked_suffix(&InHandWrite::Unchecked(unchecked));
+            let marked = edited("included feat/x (x; unchecked: y)", &suffix);
+
+            // Then: it reads as marked, with the reason written.
+            assert_eq!(unchecked_mark(&marked), Some(reason), "{}", marked.text);
+        }
     }
 }

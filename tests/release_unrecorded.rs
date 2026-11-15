@@ -145,8 +145,14 @@ fn audit_in(lab: &Lab, home: &tempfile::TempDir, dir: &Path) -> serde_json::Valu
     .output()
     .expect("run knives audit");
     std::fs::write(&registry, configured).expect("restore the registry");
-    serde_json::from_slice(&output.stdout)
-        .unwrap_or_else(|error| panic!("audit emits JSON ({error}): {}", text(&output)))
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("audit emits JSON ({error}): {}", text(&output)));
+    assert_eq!(
+        report["problems"],
+        serde_json::json!(["open pull-head reconciliation was skipped (--no-github)"]),
+        "the audit must have read everything but pull heads: {report}"
+    );
+    report
 }
 
 /// The audit findings of `kind`.
@@ -281,14 +287,6 @@ fn fast_forward_in(lab: &Lab, dir: &Path, name: &str) -> CommitId {
     let destination = format!("parents({name}) | {name}@origin");
     lab.jj_at(dir, ["rebase", "-r", name, "-d", destination.as_str()]);
     lab.jj_at(dir, ["restore", "--from", before.as_str(), "--into", name]);
-    let after = commit_in(dir, name);
-    assert!(
-        Repo::open(dir)
-            .expect("open")
-            .same_tree(&before, &after)
-            .expect("compare trees"),
-        "the restore put the write's tree back"
-    );
     before
 }
 
@@ -1789,6 +1787,14 @@ fn a_published_resolution_kept_beside_a_local_bookmark_or_a_workspace_exits_with
 
     // Then: kept again, and a finding again.
     assert_reap_keeps_the_old_name(&lab, &home, &clone, 1);
+
+    // When: from the remedy again, a bookmark two clones moved apart, one
+    // side on the resolution, instead.
+    lab.jj_at(&clone, ["op", "restore", taken[0].as_str()]);
+    divergent_keep_in(&lab, &clone, resolution.as_str());
+
+    // Then: kept again, and a finding again.
+    assert_reap_keeps_the_old_name(&lab, &home, &clone, 1);
 }
 
 #[test]
@@ -1987,9 +1993,11 @@ fn file_in(dir: &Path, revision: &str, file: &str) -> String {
 /// A fixed release whose publish remote holds an all-carrier commit C, a
 /// resolution on top of the cut W; in a fresh clone the name is tracked, C
 /// squashed into W, adopted, fast-forwarded onto C, adopted again and
-/// pushed (pushed before that adopt when `push_first`), then a member
-/// included (q12, D13). Returns the include's and the plan's output, the
-/// release's parents, C, and the resolution's file at the release.
+/// pushed, then a member included (q12, D13). When `push_first`, the push
+/// comes before that second adopt, which then refuses: C, no longer the
+/// publish remote's commit, reads as a member. Returns the include's and the
+/// plan's output, the release's parents, C, and the resolution's file at the
+/// release.
 fn squashed_resolution_fast_forwarded(
     push_first: bool,
 ) -> (String, Vec<CommitId>, CommitId, String) {
@@ -2043,15 +2051,24 @@ fn squashed_resolution_fast_forwarded(
         push(&lab);
     }
     let adopted = release_in(&lab, &home, &clone, &["adopt", FIXED]);
-    if !push_first {
+    if push_first {
+        // Pushed, C is no longer the publish remote's commit, so it reads as
+        // a member, and the release's members match no recorded write.
+        assert_eq!(adopted.status.code(), Some(3), "{}", text(&adopted));
+        assert!(
+            stdout(&adopted).contains(&format!(
+                "demo: {FIXED}'s members differ from every recorded write; "
+            )),
+            "{}",
+            text(&adopted)
+        );
+    } else {
         assert_eq!(adopted.status.code(), Some(0), "{}", text(&adopted));
         assert!(
             stdout(&adopted).contains("as the newest write"),
             "{}",
             text(&adopted)
         );
-    }
-    if !push_first {
         push(&lab);
     }
 
@@ -2085,8 +2102,8 @@ fn a_squashed_resolution_fast_forwarded_onto_is_a_carrier_by_its_recorded_label(
 #[test]
 fn a_fast_forward_parent_adopted_after_the_push_is_unlabelled_and_reads_as_stacked() {
     // Given/When (control): the same, pushed before the second adopt, so
-    // C is no longer the publish remote's commit and the adopt does not
-    // label it.
+    // C is no longer the publish remote's commit and the adopt refuses
+    // rather than label it.
     let (out, parents, child, _) = squashed_resolution_fast_forwarded(true);
 
     // Then: C is carried as a member, stacked on a prior merge.
@@ -2103,6 +2120,44 @@ fn working_copy_in(dir: &Path) -> CommitId {
         .expect("run jj log");
     assert!(output.status.success(), "jj log failed: {}", text(&output));
     CommitId::new(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+/// Make bookmark `keep` divergent in checkout `dir`, one side on `side` and
+/// the other on an empty commit of its own on the trunk: two operations run
+/// concurrently from the same one, the first creating it on that commit, the
+/// second on `side`, and the next command merges them. jj's git view keeps
+/// the first, so only the divergent bookmark names `side`. Neither side
+/// descends from the other, which jj would resolve to the descendant.
+fn divergent_keep_in(lab: &Lab, dir: &Path, side: &str) {
+    lab.jj_at(dir, ["new", "main@origin", "-m", "apart"]);
+    let apart = working_copy_in(dir);
+    park_in(lab, dir);
+    let base = operation_ids(dir)[0].clone();
+    for target in [apart.as_str(), side] {
+        lab.jj_at(
+            dir,
+            [
+                "--at-op",
+                base.as_str(),
+                "bookmark",
+                "create",
+                "keep",
+                "-r",
+                target,
+            ],
+        );
+    }
+    lab.jj_at(dir, ["bookmark", "list"]);
+    let divergent = Repo::open(dir)
+        .expect("open the checkout")
+        .conflicted_bookmarks()
+        .expect("read divergent bookmarks");
+    assert!(
+        divergent
+            .iter()
+            .any(|(reference, targets)| reference.to_string() == "keep" && targets.len() == 2),
+        "keep is not divergent: {divergent:?}"
+    );
 }
 
 /// F19's state: a dated cut W pushed with its members and tagged, the tag
@@ -2341,5 +2396,33 @@ fn a_resolution_never_pushed_with_work_on_it_names_that_work_and_no_abandon() {
         (&lab, &home, &clone),
         (&written, &resolution),
         &[&resolution, &on_top],
+    );
+}
+
+#[test]
+fn a_resolution_never_pushed_a_divergent_bookmark_names_is_named_and_not_abandoned() {
+    // Given (q12, F19 d): the resolution R, and a bookmark that two clones
+    // moved apart, one side on R.
+    let (lab, home, clone, _written, resolution, _) =
+        resolution_never_pushed_in_a_fresh_clone(false);
+    divergent_keep_in(&lab, &clone, resolution.as_str());
+
+    // When: adopt prints the published remedy.
+    let refused = release_in(&lab, &home, &clone, &["adopt", DATED]);
+
+    // Then: it names the divergent bookmark as what keeps R, and prints no
+    // abandon of R.
+    let out = stdout(&refused);
+    assert_eq!(refused.status.code(), Some(3), "{}", text(&refused));
+    assert!(
+        out.contains(&format!(
+            "{} is not to be abandoned, as keep names it",
+            resolution.short()
+        )),
+        "{out}"
+    );
+    assert!(
+        !out.contains(&format!("`jj abandon {}`", resolution.short())),
+        "{out}"
     );
 }

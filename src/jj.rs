@@ -585,6 +585,31 @@ impl Repo {
         Ok(found)
     }
 
+    /// Every bookmark ref, local and on each remote (`@git` included), with
+    /// each commit it names: a divergent ref names every one of its sides,
+    /// which [`Self::bookmark_tips`] leaves out, so a check of what names a
+    /// commit reads it as `names_of` does.
+    fn bookmark_targets(&self) -> Vec<(BookmarkRef, Vec<JjCommitId>)> {
+        let mut found = Vec::new();
+        for (branch, targets) in self.repo.view().bookmarks() {
+            let name = BranchName::new(branch.as_str());
+            found.push((
+                BookmarkRef::Local(name.clone()),
+                targets.local_target.added_ids().cloned().collect(),
+            ));
+            for (remote, target) in targets.remote_refs {
+                found.push((
+                    BookmarkRef::Remote {
+                        branch: name.clone(),
+                        remote: RemoteName::new(remote.as_str()),
+                    },
+                    target.target.added_ids().cloned().collect(),
+                ));
+            }
+        }
+        found
+    }
+
     /// The parents of `revision`, each with the bookmarks that sit on it. The
     /// bookmark view is read once for every parent.
     pub fn parents_of(&self, revision: &str) -> Result<Vec<ReleaseParent>, JjError> {
@@ -1005,6 +1030,14 @@ impl Repo {
         Ok(self.commit(first.as_str())?.tree_ids() == self.commit(second.as_str())?.tree_ids())
     }
 
+    /// The files `revision`'s tree leaves conflicted, each path whole and
+    /// repository-internal, read in-process ([`conflicted_paths`]): a path
+    /// with a space is one path, and a tree that cannot be read is an error
+    /// rather than a tree with no conflicts.
+    pub fn conflicted_files(&self, revision: &str) -> Result<Vec<String>, JjError> {
+        conflicted_paths(&self.commit(revision)?.tree())
+    }
+
     /// The bytes `path` (repository-internal, `/`-separated) holds at
     /// `revision`, or `None` where it holds no one resolved regular file:
     /// absent, a symlink, a directory, a conflict. Read in-process, so a file
@@ -1078,25 +1111,55 @@ impl Repo {
     }
 
     /// Whether `release`'s tree is exactly `write`'s own change rebased onto
-    /// `members`: merge(`members`) + `write` - merge(`write`'s parents other
-    /// than `write_carriers`), the step a release write takes
-    /// ([`duplicated_without_carriers`]).
+    /// `members` ([`Self::rebased_write`]).
     ///
     /// That is the tree a release holds when nothing but knives and jj
     /// changed it since the write: jj's own rebase of the write over a
     /// rewritten member, and a knives write onto the same members, which also
     /// writes the release-log union ([`union_release_logs`]), so either tree
-    /// counts. A tree with conflicts compares by its ids like any other. Built
-    /// in a transaction that is dropped, never committed, so the probe leaves
-    /// nothing an operation names.
+    /// counts. A tree with conflicts compares by its ids like any other.
     pub fn holds_rebased_write(
         &self,
         (write, write_carriers): (&CommitId, &[CommitId]),
         members: &[CommitId],
         release: &CommitId,
     ) -> Result<bool, JjError> {
-        let write = self.commit(write.as_str())?;
         let release = self.commit(release.as_str())?;
+        let (rebased, written) = self.rebased_write((write, write_carriers), members)?;
+        if rebased.tree_ids() == release.tree_ids() {
+            return Ok(true);
+        }
+        let (unioned, _) = union_release_logs(rebased, Some(&written))?;
+        Ok(unioned.tree_ids() == release.tree_ids())
+    }
+
+    /// The tree a knives write of `write` onto `members` holds: its own
+    /// change rebased onto them ([`Self::rebased_write`]) with the
+    /// release-log union ([`union_release_logs`]).
+    fn rebuilt_write(
+        &self,
+        (write, write_carriers): (&CommitId, &[CommitId]),
+        members: &[CommitId],
+    ) -> Result<MergedTree, JjError> {
+        let (rebased, written) = self.rebased_write((write, write_carriers), members)?;
+        Ok(union_release_logs(rebased, Some(&written))?.0)
+    }
+
+    /// `write`'s own change rebased onto `members`: merge(`members`) +
+    /// `write` - merge(`write`'s parents other than `write_carriers`), the
+    /// step a release write takes ([`duplicated_without_carriers`]), and
+    /// `write`'s own tree, which a union puts under the blocks the members
+    /// bring in.
+    ///
+    /// Built in a transaction that is dropped, never committed, so it leaves
+    /// nothing an operation names; the trees it wrote stay readable from the
+    /// store.
+    fn rebased_write(
+        &self,
+        (write, write_carriers): (&CommitId, &[CommitId]),
+        members: &[CommitId],
+    ) -> Result<(MergedTree, MergedTree), JjError> {
+        let write = self.commit(write.as_str())?;
         let member_ids = members
             .iter()
             .map(|member| Ok(self.commit(member.as_str())?.id().clone()))
@@ -1138,15 +1201,9 @@ impl Repo {
                 revision: write.id().to_string(),
                 detail: "the duplicate produced no commit".to_owned(),
             })?;
-        let holds = if rebased.tree_ids() == release.tree_ids() {
-            true
-        } else {
-            let (unioned, _) = union_release_logs(rebased.tree(), Some(&write.tree()))?;
-            unioned.tree_ids() == release.tree_ids()
-        };
         // Dropped, never committed: the probe leaves no trace in the op log.
         drop(tx);
-        Ok(holds)
+        Ok((rebased.tree(), write.tree()))
     }
 
     /// Whether all that rests on `commits`, the refs and earlier writes of
@@ -1155,7 +1212,8 @@ impl Repo {
     /// or from a tagged commit among them and their descendants, and nothing
     /// else names any of those commits - no workspace has one checked out,
     /// and no ref but `name`'s own (local, on `publish_remote`, or jj's git
-    /// view of it) and tags points at one.
+    /// view of it) and tags points at one, a divergent ref by any of its
+    /// sides.
     ///
     /// A superseded cut kept only because its published resolution sits on
     /// it is kept on purpose: consumers were given that resolution, and the
@@ -1203,24 +1261,23 @@ impl Repo {
             }
         }
         let mut heads: Vec<JjCommitId> = Vec::new();
-        for (reference, tip) in &self.bookmark_tips()? {
-            let tip_id = self.commit(tip.as_str())?.id().clone();
-            let own = reference.branch().as_str() == name
-                && match reference {
-                    BookmarkRef::Local(_) => true,
-                    BookmarkRef::Remote { remote, .. } => {
-                        remote.as_str() == publish_remote || remote.as_str() == "git"
-                    }
-                };
-            if !own && held.contains(&tip_id) {
-                return Ok(false);
-            }
+        for (reference, targets) in self.bookmark_targets() {
             let published = matches!(
-                reference,
+                &reference,
                 BookmarkRef::Remote { remote, .. } if remote.as_str() == publish_remote
             );
-            if own && published {
-                heads.push(tip_id);
+            let own = reference.branch().as_str() == name
+                && (reference.is_local() || published || reference.is_git_view());
+            if !own && targets.iter().any(|target| held.contains(target)) {
+                return Ok(false);
+            }
+            // A divergent published ref names no one commit consumers were
+            // given, so it reaches nothing.
+            if own
+                && published
+                && let [tip] = targets.as_slice()
+            {
+                heads.push(tip.clone());
             }
         }
         for id in &held {
@@ -1252,11 +1309,13 @@ impl Repo {
         Ok(self.descendants_of(&id)?.iter().map(commit_id).collect())
     }
 
-    /// What keeps `commit` besides release `name`'s own local ref and the
-    /// working copy of this checkout's workspace while it is an empty,
-    /// undescribed child that `jj new` drops: another workspace's working
-    /// copy on it, a ref of anything else or a tag on it, or a descendant.
-    /// `None` when nothing does, so `jj abandon` of it loses no one's work.
+    /// What keeps `commit` besides release `name`'s own local ref and jj's
+    /// git view of it (`name@git`), and besides this checkout's workspace:
+    /// its working copy on the commit, or an empty, undescribed child of it
+    /// that `jj new` drops. Another workspace's working copy on it, any
+    /// other bookmark that names it (a divergent one included, by any of its
+    /// sides) or a tag on it, or a descendant, each keeps it. `None` when
+    /// nothing does, so `jj abandon` of it loses no one's work.
     pub fn what_else_keeps(
         &self,
         commit: &CommitId,
@@ -1274,13 +1333,10 @@ impl Repo {
             reasons.push(format!("it is the working copy of {}", others.join(", ")));
         }
         let mut names = Vec::new();
-        for (reference, tip) in &self.bookmark_tips()? {
+        for (reference, targets) in self.bookmark_targets() {
             let own = reference.branch().as_str() == name
-                && match reference {
-                    BookmarkRef::Local(_) => true,
-                    BookmarkRef::Remote { remote, .. } => remote.as_str() == "git",
-                };
-            if tip == commit && !own {
+                && (reference.is_local() || reference.is_git_view());
+            if !own && targets.contains(&id) {
                 names.push(reference.to_string());
             }
         }
@@ -2782,7 +2838,7 @@ fn hide_exposed(tx: &mut Transaction, exposure: &Exposure<'_>) -> Result<Vec<Hid
     let begun: HashSet<JjCommitId> = tx.base_repo().view().heads().iter().cloned().collect();
     let mut hidden: Vec<HiddenHead> = Vec::new();
     loop {
-        let exposed: Vec<JjCommitId> = tx
+        let mut exposed: Vec<JjCommitId> = tx
             .repo()
             .view()
             .heads()
@@ -2790,6 +2846,9 @@ fn hide_exposed(tx: &mut Transaction, exposure: &Exposure<'_>) -> Result<Vec<Hid
             .filter(|head| !begun.contains(*head))
             .cloned()
             .collect();
+        // The view's heads are a set: sorted, identical runs hide and report
+        // in the same order.
+        exposed.sort();
         let mut abandoned = Vec::new();
         for id in exposed {
             let hex = commit_id(&id);
@@ -3321,12 +3380,23 @@ fn regular_files(value: &MergedTreeValue) -> Option<RegularFiles> {
     })
 }
 
-/// The release a hand resolution is measured against.
+/// The release a hand resolution is measured against (D7).
 #[derive(Debug, Clone, Copy)]
 pub enum ResolutionBaseline<'a> {
-    /// A write of the release this repository holds: the commit knives
-    /// itself wrote, conflicts and unions as it left them.
+    /// The recorded write the resolution equals: the commit knives itself
+    /// wrote, conflicts and unions as it left them.
     Written(&'a CommitId),
+    /// A recorded write this repository holds, rebuilt on the resolution's
+    /// `members` as a knives write onto them builds it: `write`'s own change,
+    /// its `carriers` left out, rebased onto them with the release-log
+    /// union, the tree [`Repo::holds_rebased_write`] reads. A member
+    /// rewritten in place, which makes jj rebase the release, is then no
+    /// change of the resolution's.
+    Rebuilt {
+        write: &'a CommitId,
+        carriers: &'a [CommitId],
+        members: &'a [CommitId],
+    },
     /// A fresh flat merge of these parents with the release-log union, as a
     /// release write makes one ([`merged_release`]). A write made on another
     /// machine before its resolution was pushed is not in this repository,
@@ -3354,11 +3424,11 @@ pub struct ResolutionChanges {
 /// sorted by whether the baseline held a conflict there, with the content the
 /// baseline held at each.
 ///
-/// The automerge is built in a scratch transaction that is dropped unwritten,
-/// so measuring a resolution writes nothing an operation names. Its union is
-/// the one every release write makes, so a release log the union resolves is
-/// no conflict of the baseline, and a log a person changed past it is a
-/// change beyond the conflicts.
+/// A rebuilt write and the automerge are built in scratch transactions that
+/// are dropped unwritten, so measuring a resolution writes nothing an
+/// operation names. Their union is the one every release write makes, so a
+/// release log the union resolves is no conflict of the baseline, and a log a
+/// person changed past it is a change beyond the conflicts.
 pub fn resolution_changes(
     repo: &Path,
     baseline: ResolutionBaseline<'_>,
@@ -3368,6 +3438,11 @@ pub fn resolution_changes(
     let resolution = repo.commit(resolution.as_str())?.tree();
     let baseline = match baseline {
         ResolutionBaseline::Written(commit) => repo.commit(commit.as_str())?.tree(),
+        ResolutionBaseline::Rebuilt {
+            write,
+            carriers,
+            members,
+        } => repo.rebuilt_write((write, carriers), members)?,
         ResolutionBaseline::Automerge(parents) => {
             validate_parents(None, parents)?;
             let (parent_commits, parent_ids) = resolved_parents(&repo, parents)?;
@@ -3511,14 +3586,9 @@ impl Candidate {
         &self.unions
     }
 
-    /// Files the candidate's tree leaves conflicted.
+    /// Files the candidate's tree leaves conflicted ([`conflicted_paths`]).
     pub fn conflicted_files(&self) -> Result<Vec<String>, JjError> {
-        let mut files = Vec::new();
-        for (file, value) in self.commit.tree().conflicts() {
-            value.map_err(|error| store_error(&error))?;
-            files.push(file.as_internal_file_string().to_owned());
-        }
-        Ok(files)
+        conflicted_paths(&self.commit.tree())
     }
 
     /// [`probe_net_diff`] with the candidate as the target: the net effect of
@@ -4998,29 +5068,22 @@ pub fn output_at_revision(
     ))
 }
 
-/// Files left conflicted by a merge.
+/// Files `revision` leaves conflicted, in the repository at `repo` as it
+/// stands now ([`Repo::conflicted_files`]).
 pub fn conflicted_files(repo: &Path, revision: &str) -> Result<Vec<String>, JjError> {
-    // Run WITH the repo as the working directory, so jj prints repo-relative
-    // paths. Invoked via `--repository` from elsewhere it prints them relative
-    // to the caller's cwd, which produced paths like `../../../../tmp/...`.
-    let output = Command::new("jj")
-        .args(["--ignore-working-copy", "resolve", "--list", "-r", revision])
-        .current_dir(repo)
-        .output()
-        .map_err(|error| JjError::Process {
-            program: "jj resolve --list".to_owned(),
-            detail: error.to_string(),
-        })?;
-    // A non-zero exit means there is nothing to resolve, which is the common and
-    // healthy case rather than a failure.
-    if !output.status.success() {
-        return Ok(Vec::new());
+    Repo::open(repo)?.conflicted_files(revision)
+}
+
+/// Each path `tree` leaves conflicted, repository-internal and whole, in the
+/// order the tree lists them. A conflict the store cannot read is an error,
+/// never a clean path.
+fn conflicted_paths(tree: &MergedTree) -> Result<Vec<String>, JjError> {
+    let mut files = Vec::new();
+    for (file, value) in tree.conflicts() {
+        value.map_err(|error| store_error(&error))?;
+        files.push(file.as_internal_file_string().to_owned());
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .map(ToOwned::to_owned)
-        .collect())
+    Ok(files)
 }
 
 #[cfg(test)]

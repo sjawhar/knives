@@ -12,7 +12,9 @@
 //! working copy on the commit, a hand edit of a published release the publish
 //! remote does not hold, and a change beyond the conflicts with no reason. The
 //! newest write itself, or a re-signed copy, is nothing to adopt; an older one
-//! is recorded as the newest. A member's lost lines are counted against the
+//! is recorded as the newest. The resolution is measured against the replaced
+//! write rebuilt on its members (D7), so a member rewritten in place is no
+//! change beyond the conflicts. A member's lost lines are counted against the
 //! baseline (D8): exit 1 for any line lost from a plain file the baseline left
 //! without a conflict, or every line lost from a conflicted file or a release
 //! log.
@@ -566,6 +568,39 @@ fn adopt_refuses_a_release_that_still_has_conflicts_and_names_them() {
 }
 
 #[test]
+fn adopt_refuses_a_conflicted_file_whose_path_has_a_space_naming_it_whole() {
+    // Given: a cut that left `shared file.txt` conflicted, changed by hand
+    // elsewhere.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "shared file.txt", "alpha\n");
+    lab.branch("feat/beta", "shared file.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert!(
+        stdout(&cut).contains(&format!("cut {RELEASE} as")),
+        "the first cut was refused: {}",
+        text(&cut)
+    );
+    finish_in_place(&lab, &[("notes.txt", "unrelated\n")]);
+    let before = ledger_entries(&home);
+
+    // When: it is adopted.
+    let output = adopt(&lab, &home, &["--why", "a note"]);
+
+    // Then: refused, naming the conflicted file by its whole path.
+    assert_eq!(output.status.code(), Some(3), "{}", text(&output));
+    assert!(
+        stdout(&output).contains(
+            "still has 1 conflicted file(s), so it is not resolved yet; resolve them, then \
+             adopt:\n    shared file.txt\n"
+        ),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(ledger_entries(&home), before);
+}
+
+#[test]
 fn adopt_refuses_a_release_a_working_copy_has_checked_out() {
     // Given: the conflict resolved in the working copy, which is still the
     // release commit.
@@ -722,6 +757,65 @@ fn a_restore_beyond_the_conflicts_that_drops_a_members_line_is_recorded_with_fin
             .contains("added lines absent: feat/alpha 1 of 1 in alpha.txt"),
         "{}",
         event.text
+    );
+}
+
+/// The two-branch cut, then alpha rewritten in place to write `alpha.txt`
+/// anew, which makes jj rebase the release over it, then the release edited
+/// by hand to write `files`. Returns the lab, its home and the cut.
+fn hand_edit_over_a_rewritten_member(
+    files: &[(&str, &str)],
+) -> (Lab, tempfile::TempDir, knives::ids::CommitId) {
+    let (lab, home, _consumer) = two_branch_cut();
+    let cut = commit_at(&lab, RELEASE);
+    lab.jj_work(["edit", "feat/alpha"]);
+    std::fs::write(lab.work.join("alpha.txt"), "alpha, rewritten\n").expect("rewrite alpha");
+    lab.jj_work(["new"]);
+    assert_ne!(commit_at(&lab, RELEASE), cut, "jj rebased the release");
+    finish_in_place(&lab, files);
+    (lab, home, cut)
+}
+
+#[test]
+fn a_member_rewritten_in_place_is_no_change_beyond_the_conflicts_and_a_hand_edit_is() {
+    // Given: the cut, alpha rewritten in place (jj rebased the release over
+    // it), then a note added on the release by hand.
+    let (lab, home, cut) = hand_edit_over_a_rewritten_member(&[("notes.txt", "by hand\n")]);
+
+    // When: it is adopted with a reason.
+    let output = adopt(&lab, &home, &["--why", "a note"]);
+
+    // Then: measured against the cut rebuilt on the rewritten member, only
+    // the note is a change beyond the conflicts.
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        out.contains(&format!(
+            "  baseline: the recorded cut {} rebuilt on its 2 member parent(s)\n  no file \
+             resolved by hand\n  1 file(s) changed beyond the baseline's conflicts, because: a \
+             note\n    notes.txt\n",
+            cut.short()
+        )),
+        "{out}"
+    );
+
+    // When (control): the same state, with the rewritten member's own file
+    // edited by hand on the release too.
+    let (lab, home, _cut) = hand_edit_over_a_rewritten_member(&[
+        ("notes.txt", "by hand\n"),
+        ("alpha.txt", "alpha, rewritten\nby hand\n"),
+    ]);
+    let output = adopt(&lab, &home, &["--why", "a note"]);
+
+    // Then: that file is a change beyond the conflicts too.
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        out.contains(
+            "  2 file(s) changed beyond the baseline's conflicts, because: a note\n    \
+             alpha.txt\n    notes.txt\n"
+        ),
+        "{out}"
     );
 }
 
@@ -1389,8 +1483,8 @@ fn a_renumbered_ygo_changelog_exits_clean_and_one_losing_a_members_section_does_
     );
 }
 
-/// A trunk whose release log holds one section, and a member `name`
-/// inserting `sections` above it.
+/// A member `name` forked from the fork's trunk ([`log_lab`]), inserting
+/// `sections` above the trunk's release log ([`LOG_BASE`]).
 fn log_member(lab: &Lab, name: &str, sections: &str) {
     lab.jj_work(["new", "-r", "main@origin", "-m", name]);
     std::fs::write(
