@@ -1092,23 +1092,31 @@ pub const UNCHECKED_WRITE_ABSENT: &str = "W absent";
 /// The mark of a write over a release whose members match no recorded write.
 pub const UNCHECKED_NO_MATCH: &str = "no match";
 
+/// The mark of a write over a release whose name the ledger records no write
+/// of.
+pub const UNCHECKED_NO_RECORD: &str = "no record";
+
 /// Why knives could not check the release in hand a cut or edit event wrote
 /// over.
 ///
 /// It is the reason after the [`UNCHECKED_DELIMITER`] the text ends with,
-/// after every part a reader parses, and only one of the two reasons a write
-/// marks ([`UNCHECKED_WRITE_ABSENT`], [`UNCHECKED_NO_MATCH`]): a caller's
-/// reason inside the text that happens to hold the delimiter is no mark.
-/// `None` for every other event.
+/// after every part a reader parses, and only one of the three reasons a
+/// write marks ([`UNCHECKED_WRITE_ABSENT`], [`UNCHECKED_NO_MATCH`],
+/// [`UNCHECKED_NO_RECORD`]): a caller's reason inside the text that happens
+/// to hold the delimiter is no mark. `None` for every other event.
 pub fn unchecked_mark(entry: &Entry) -> Option<&'static str> {
-    [UNCHECKED_WRITE_ABSENT, UNCHECKED_NO_MATCH]
-        .into_iter()
-        .find(|reason| {
-            entry
-                .text
-                .strip_suffix(reason)
-                .is_some_and(|rest| rest.ends_with(UNCHECKED_DELIMITER))
-        })
+    [
+        UNCHECKED_WRITE_ABSENT,
+        UNCHECKED_NO_MATCH,
+        UNCHECKED_NO_RECORD,
+    ]
+    .into_iter()
+    .find(|reason| {
+        entry
+            .text
+            .strip_suffix(reason)
+            .is_some_and(|rest| rest.ends_with(UNCHECKED_DELIMITER))
+    })
 }
 
 /// The change id a cut or edit event of `release` records for its commit.
@@ -1751,6 +1759,7 @@ mod unchecked_mark_tests {
         let unmarked = [
             edited("included feat/x (x; unchecked: y)", ""),
             edited("included feat/x (renumber; unchecked: W absent)", ""),
+            edited("included feat/x (renumber; unchecked: no record)", ""),
             edited(
                 "adopted: replaces the recorded cut 0123456789ab; why: renumber; unchecked: \
                  no match",
@@ -1765,28 +1774,47 @@ mod unchecked_mark_tests {
         }
 
         // Given: the same include written over each release knives could not
-        // check, its mark written as every write writes it.
+        // check, a name the ledger records no write of included, its mark
+        // written as every write writes it.
         let write = RecordedWrite {
             kind: RecordedWriteKind::Cut,
             commit: CommitId::new("c".repeat(40)),
         };
         let cases = [
-            (Unchecked::WriteAbsent(write.clone()), "W absent"),
-            (Unchecked::NoMatch(NoMatch::Members), "no match"),
             (
-                Unchecked::Inherited {
-                    write,
-                    reason: "no match".to_owned(),
-                },
+                InHandWrite::Unchecked(Unchecked::WriteAbsent(write.clone())),
+                "W absent",
+            ),
+            (
+                InHandWrite::Unchecked(Unchecked::NoMatch(NoMatch::Members)),
                 "no match",
             ),
+            (InHandWrite::NoRecord, "no record"),
+            (
+                InHandWrite::Unchecked(Unchecked::Inherited {
+                    write: write.clone(),
+                    reason: "no match".to_owned(),
+                }),
+                "no match",
+            ),
+            (
+                InHandWrite::Unchecked(Unchecked::Inherited {
+                    write,
+                    reason: "no record".to_owned(),
+                }),
+                "no record",
+            ),
         ];
-        for (unchecked, reason) in cases {
-            let suffix = unchecked_suffix(&InHandWrite::Unchecked(unchecked));
+        for (standing, reason) in cases {
+            let suffix = unchecked_suffix(&standing);
             let marked = edited("included feat/x (x; unchecked: y)", &suffix);
 
             // Then: it reads as marked, with the reason written.
             assert_eq!(unchecked_mark(&marked), Some(reason), "{}", marked.text);
         }
+
+        // And: a write over a release knives checked carries no mark.
+        let checked = edited("included feat/x", &unchecked_suffix(&InHandWrite::Recorded));
+        assert_eq!(unchecked_mark(&checked), None, "{}", checked.text);
     }
 }

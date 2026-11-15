@@ -6,11 +6,12 @@
 //! them: `cut`, `include`, `drop`, `advance` and `rebase` then refuse before
 //! they write, naming `knives release adopt`, or the published remedy for a
 //! published release the publish remote does not hold. Where the matched
-//! write is absent, or no recorded write has the release's members, knives
-//! cannot check it: the write proceeds, says so, marks its ledger event
-//! `; unchecked: …`, and audit notes it. A member rewritten in place, a
-//! fast-forward carrier, a reset to an earlier recorded write and a name with
-//! no recorded write are not refused.
+//! write is absent, no recorded write has the release's members, or the
+//! ledger records no write of the name, knives cannot check it: the write
+//! proceeds, says so, marks its ledger event `; unchecked: …`, and audit
+//! notes it; every later write over it is marked too until `adopt` records
+//! it. A member rewritten in place, a fast-forward carrier, a reset to an
+//! earlier recorded write and a name with no recorded write are not refused.
 
 #![allow(
     clippy::expect_used,
@@ -318,6 +319,11 @@ enum Why {
     /// Unchecked since a marked write the release in hand is, or stands on,
     /// first marked because its matched write was absent.
     SinceWriteAbsent,
+    /// The ledger records no write of the name.
+    NoRecord,
+    /// Unchecked since a marked write the release in hand is, or stands on,
+    /// first marked because the ledger recorded no write of the name.
+    SinceNoRecord,
 }
 
 impl Why {
@@ -329,6 +335,12 @@ impl Why {
                  not fetch"
             }
             Self::SinceWriteAbsent => "the release in hand is unchecked since the recorded edit",
+            Self::NoRecord => {
+                "against its recorded writes: the ledger records no write of the name; knives \
+                 did not fetch; the write is marked unchecked until `knives release adopt` \
+                 records the name it writes"
+            }
+            Self::SinceNoRecord => "(no record); knives did not fetch; `knives release adopt",
         }
     }
 
@@ -336,6 +348,7 @@ impl Why {
         match self {
             Self::WriteAbsent | Self::SinceWriteAbsent => "W absent",
             Self::NoMatch => "no match",
+            Self::NoRecord | Self::SinceNoRecord => "no record",
         }
     }
 }
@@ -458,9 +471,10 @@ fn a_name_the_ledger_records_no_write_of_is_not_refused() {
     park(&lab);
     let before = operation_ids(&lab.work);
 
-    // When/Then: an edit over it is not refused, and says nothing unchecked.
+    // When/Then: an edit over it is not refused, says knives could not check
+    // it, and marks its event.
     let out = release_ran(&lab, &home, &["include", "feat/gamma"]);
-    assert!(!out.contains("could not check"), "{out}");
+    assert_unchecked(&out, (DATED, DATED), &home, Why::NoRecord);
 
     // When: from the same state, the composition is cut under a new name.
     lab.jj_work(["op", "restore", before[0].as_str()]);
@@ -469,10 +483,12 @@ fn a_name_the_ledger_records_no_write_of_is_not_refused() {
     let out = stdout(&cut);
 
     // Then: it is written, not refused, and exits 0, and the resolution is
-    // carried.
+    // carried; it says knives could not check the release in hand, and marks
+    // its event.
     assert!(out.contains(&format!("cut {NEXT} as")), "{}", text(&cut));
     assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
     assert_eq!(file_at_revision(&lab, NEXT, "shared.txt"), "merged\n");
+    assert_unchecked(&out, (DATED, NEXT), &home, Why::NoRecord);
     // And: nothing measured the divergence each member's row reports, so
     // the row says the ledger records no write of the release in hand and to
     // check it by hand, never that a recorded resolution was carried forward.
@@ -488,6 +504,175 @@ fn a_name_the_ledger_records_no_write_of_is_not_refused() {
     assert!(!out.contains("diverges where"), "{out}");
     assert!(!out.contains("carried forward"), "{out}");
     assert!(!out.contains("recorded resolution"), "{out}");
+}
+
+/// A dated release of alpha, beta and gamma cut, alpha and beta both writing
+/// `shared.txt`; then the ledger removed, so the name has no recorded write,
+/// and the conflict resolved by hand. Returns the lab and its home.
+fn a_release_with_no_recorded_write() -> (Lab, tempfile::TempDir) {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "shared.txt", "alpha\n");
+    lab.branch("feat/beta", "shared.txt", "beta\n");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let (home, _consumer) = release_test_home(&lab);
+    release_ran(&lab, &home, &["cut", DATED]);
+    std::fs::remove_dir_all(home.path().join("ledger").join("demo")).expect("remove the ledger");
+    edit_by_hand(&lab, DATED, &[("shared.txt", "merged\n")]);
+    (lab, home)
+}
+
+/// Assert each of alpha's and beta's carried rows in `out` says `row`.
+fn assert_carried_rows(out: &str, row: &str) {
+    for member in ["feat/alpha", "feat/beta"] {
+        assert!(
+            out.lines()
+                .any(|line| line.starts_with(&format!("  {member}")) && line.ends_with(row)),
+            "{member}: {out}"
+        );
+    }
+}
+
+/// Assert a write over [`DATED`], whose name the ledger records no write of,
+/// went through, printing `out`, and that what it wrote, `written`, stays
+/// unchecked until adopted: the write said knives could not check the
+/// release and marked its event; a cut over `written` stays marked and names
+/// no recorded write; `adopt` records that cut; the cut after it is checked.
+/// `cuts` names the two cuts.
+fn assert_marked_until_adopted(
+    (lab, home): (&Lab, &tempfile::TempDir),
+    out: &str,
+    written: &str,
+    cuts: [&str; 2],
+) {
+    // Then: the write says knives could not check the release in hand, why,
+    // and what records it, and its event carries the mark.
+    assert_unchecked(out, (DATED, written), home, Why::NoRecord);
+
+    // When: what it wrote is cut.
+    let sticky = release_ran(lab, home, &["cut", cuts[0]]);
+
+    // Then: it stays unchecked: the cut says so, its rows say the release in
+    // hand is unrecorded and never that it is a recorded write, and its
+    // event keeps the mark.
+    assert!(sticky.contains(&format!("cut {} as", cuts[0])), "{sticky}");
+    assert!(
+        sticky.contains("the release in hand is unchecked since the recorded"),
+        "{sticky}"
+    );
+    assert_unchecked(&sticky, (written, cuts[0]), home, Why::SinceNoRecord);
+    assert_carried_rows(
+        &sticky,
+        "diverges where the unrecorded in-hand release already does; record it with `knives \
+         release adopt` and cut again",
+    );
+    assert!(!sticky.contains("(a recorded write)"), "{sticky}");
+
+    // When: that cut is adopted.
+    let adopted = release_ran(lab, home, &["adopt", cuts[0]]);
+
+    // Then: it is recorded unmarked, measured against an automerge.
+    assert!(adopted.contains("as the newest write of"), "{adopted}");
+    assert!(
+        adopted.contains("baseline: an automerge of its")
+            && adopted.contains("because knives could not check the release the recorded cut"),
+        "{adopted}"
+    );
+    assert!(!newest_event(home, cuts[0]).text.contains("unchecked"));
+
+    // When: it is cut again.
+    let clean = release_ran(lab, home, &["cut", cuts[1]]);
+
+    // Then: that cut is checked, its rows carry a recorded write's
+    // divergence forward, and its event carries no mark.
+    assert!(clean.contains(&format!("cut {} as", cuts[1])), "{clean}");
+    assert!(!clean.contains("could not check"), "{clean}");
+    assert_carried_rows(
+        &clean,
+        "diverges where the release in hand (a recorded write) already does; carried forward",
+    );
+    assert!(!newest_event(home, cuts[1]).text.contains("unchecked"));
+}
+
+#[test]
+fn an_include_over_a_name_with_no_recorded_write_is_marked_until_adopted() {
+    // Given: a release whose name has no recorded write, and a branch.
+    let (lab, home) = a_release_with_no_recorded_write();
+    lab.branch("feat/delta", "delta.txt", "delta\n");
+    park(&lab);
+
+    // When: the branch is included.
+    let out = release_ran(&lab, &home, &["include", "feat/delta"]);
+
+    // Then: marked, and every write after it too, until adopt.
+    assert_marked_until_adopted((&lab, &home), &out, DATED, [NEXT, "release/2026-08-06"]);
+}
+
+#[test]
+fn a_drop_over_a_name_with_no_recorded_write_is_marked_until_adopted() {
+    // Given: a release whose name has no recorded write.
+    let (lab, home) = a_release_with_no_recorded_write();
+
+    // When: gamma, a member outside the resolved conflict, is dropped.
+    let out = release_ran(&lab, &home, &["drop", "feat/gamma", "--why", "not ready"]);
+
+    // Then: marked, and every write after it too, until adopt.
+    assert_marked_until_adopted((&lab, &home), &out, DATED, [NEXT, "release/2026-08-06"]);
+}
+
+#[test]
+fn an_advance_over_a_name_with_no_recorded_write_is_marked_until_adopted() {
+    // Given: a release whose name has no recorded write, and gamma grown.
+    let (lab, home) = a_release_with_no_recorded_write();
+    extend_branch(&lab, "feat/gamma", "gamma.txt", "gamma, grown\n");
+    park(&lab);
+
+    // When: gamma is advanced.
+    let out = release_ran(&lab, &home, &["advance", "feat/gamma"]);
+
+    // Then: marked, and every write after it too, until adopt.
+    assert!(out.contains("advanced feat/gamma"), "{out}");
+    assert_marked_until_adopted((&lab, &home), &out, DATED, [NEXT, "release/2026-08-06"]);
+}
+
+#[test]
+fn a_rebase_over_a_name_with_no_recorded_write_is_marked_until_adopted() {
+    // Given: a release whose name has no recorded write, and an upstream
+    // that moved.
+    let (lab, home) = a_release_with_no_recorded_write();
+    lab.advance_upstream("advance\n");
+
+    // When: the release is rebased onto it.
+    let out = release_ran(&lab, &home, &["rebase", "main@upstream"]);
+
+    // Then: marked, and every write after it too, until adopt.
+    assert_marked_until_adopted((&lab, &home), &out, DATED, [NEXT, "release/2026-08-06"]);
+}
+
+#[test]
+fn a_cut_over_a_name_with_no_recorded_write_is_marked_until_adopted() {
+    // Given: a release whose name has no recorded write.
+    let (lab, home) = a_release_with_no_recorded_write();
+
+    // When: it is cut under a new name.
+    let out = release_ran(&lab, &home, &["cut", NEXT]);
+
+    // Then: written, and nothing measured the divergence each member's row
+    // reports, so the row says to check it by hand.
+    assert!(out.contains(&format!("cut {NEXT} as")), "{out}");
+    assert_carried_rows(
+        &out,
+        "the ledger records no write of the release in hand, so nothing measured its divergence \
+         from this member; check that divergence by hand",
+    );
+    assert!(!out.contains("(a recorded write)"), "{out}");
+
+    // And: marked, and every write after it too, until adopt.
+    assert_marked_until_adopted(
+        (&lab, &home),
+        &out,
+        NEXT,
+        ["release/2026-08-06", "release/2026-08-07"],
+    );
 }
 
 #[test]
@@ -1189,8 +1374,9 @@ fn a_resolution_on_top_of_a_release_with_no_recorded_write_is_refused_to_run_aga
     one_member_beside_the_carrier(&lab, DATED, &under);
     let out = release_ran(&lab, &home, &["include", "feat/delta"]);
 
-    // Then: a name with no recorded write writes as it always has.
-    assert!(!out.contains("could not check"), "{out}");
+    // Then: a name with no recorded write is not refused: the write goes
+    // through, says knives could not check the release, and marks its event.
+    assert_unchecked(&out, (DATED, DATED), &home, Why::NoRecord);
 }
 
 /// A fixed release cut of alpha (grown to two commits) and beta, pushed

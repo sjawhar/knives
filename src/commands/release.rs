@@ -916,9 +916,12 @@ pub enum InHandWrite {
     /// the name), which every write and `adopt` refuse.
     Unchecked(Unchecked),
     /// The ledger records no write of the name: a release older than the
-    /// ledger, or one made with no knives at all. No write refuses it or marks
-    /// it unchecked, and `adopt` has no write for it to replace, so nothing
-    /// measures it: a cut's carried rows say the ledger records no write of
+    /// ledger, or one made with no knives at all. No write refuses it, and
+    /// nothing measured it, so a write over it proceeds, says so, and marks
+    /// its event unchecked ([`crate::release_model::UNCHECKED_NO_RECORD`]),
+    /// which every later write over it inherits ([`Unchecked::Inherited`])
+    /// until `adopt` records it. `adopt` has no write of the release itself
+    /// to replace, so a cut's carried rows say the ledger records no write of
     /// it and that a person must check each divergence by hand
     /// ([`CarriedFrom::Unledgered`]). A release whose every parent is an
     /// earlier write is [`Self::Unchecked`] instead.
@@ -948,7 +951,8 @@ impl Unchecked {
     /// The mark the ledger event of a write over such a release ends with
     /// (`; unchecked: <mark>`), after every part `recorded_writes` parses: an
     /// inherited one keeps the reason it was first marked with, which is one
-    /// of these two ([`crate::release_model::unchecked_mark`]).
+    /// of these two or the mark of a write over a release the ledger records
+    /// no write of ([`unchecked_suffix`], [`crate::release_model::unchecked_mark`]).
     pub fn mark(&self) -> &str {
         match self {
             Self::WriteAbsent(_) => crate::release_model::UNCHECKED_WRITE_ABSENT,
@@ -971,19 +975,18 @@ pub enum NoMatch {
 }
 
 /// The ledger event text's suffix for a write over the release in hand that
-/// `standing` describes: `; unchecked: <mark>` for an unchecked one
-/// ([`Unchecked::mark`]), nothing otherwise.
+/// `standing` describes.
+///
+/// It is `; unchecked: <mark>` for an unchecked one ([`Unchecked::mark`])
+/// and for one the ledger records no write of
+/// ([`crate::release_model::UNCHECKED_NO_RECORD`]), nothing otherwise.
 pub fn unchecked_suffix(standing: &InHandWrite) -> String {
-    match standing {
-        InHandWrite::Unchecked(unchecked) => format!(
-            "{}{}",
-            crate::release_model::UNCHECKED_DELIMITER,
-            unchecked.mark()
-        ),
-        InHandWrite::Recorded | InHandWrite::Unrecorded { .. } | InHandWrite::NoRecord => {
-            String::new()
-        }
-    }
+    let mark = match standing {
+        InHandWrite::Unchecked(unchecked) => unchecked.mark(),
+        InHandWrite::NoRecord => crate::release_model::UNCHECKED_NO_RECORD,
+        InHandWrite::Recorded | InHandWrite::Unrecorded { .. } => return String::new(),
+    };
+    format!("{}{mark}", crate::release_model::UNCHECKED_DELIMITER)
 }
 
 /// Whether `release`'s commit carries a change knives did not write or adopt.
@@ -1194,38 +1197,57 @@ pub fn no_match_refusal(
     ))
 }
 
-/// The one line a write over an unchecked release in hand prints before it
-/// writes ([`Unchecked`]): knives could not check it, why, that knives did not
-/// fetch, and what records it.
-pub fn unchecked_line(name: &str, commit: &CommitId, unchecked: &Unchecked) -> String {
+/// The remedy for a release whose name the ledger records no write of:
+/// `adopt` has nothing to replace until a write records the name, so it
+/// records the name the write writes, whose event the write marks.
+const NO_RECORD_REMEDY: &str =
+    "the write is marked unchecked until `knives release adopt` records the name it writes";
+
+/// The one line a write over a release in hand knives could not check
+/// prints before it writes ([`Unchecked`], [`InHandWrite::NoRecord`]).
+///
+/// It says knives could not check it, why, that knives did not fetch, and
+/// what records it. `None` for a release knives checked, and for an
+/// unrecorded one, which every write refuses before it gets here.
+pub fn unchecked_line(name: &str, commit: &CommitId, standing: &InHandWrite) -> Option<String> {
+    // `None` is a name the ledger records no write of.
+    let unchecked = match standing {
+        InHandWrite::Unchecked(unchecked) => Some(unchecked),
+        InHandWrite::NoRecord => None,
+        InHandWrite::Recorded | InHandWrite::Unrecorded { .. } => return None,
+    };
     // The release is a name read from the repository.
     let shown = crate::ledger::inline_human_text(name);
     let at = commit.short();
     let adopt = format!("`knives release adopt {shown}` records it");
     let (why, remedy) = match unchecked {
-        Unchecked::WriteAbsent(write) => (
+        Some(Unchecked::WriteAbsent(write)) => (
             format!(
                 "the recorded write its members match, {}, is not in this repository",
                 described_write(write)
             ),
             adopt,
         ),
-        Unchecked::NoMatch(_) => (
+        Some(Unchecked::NoMatch(_)) => (
             "its members match no recorded write, so they changed outside knives".to_owned(),
             NO_MATCH_REMEDY.to_owned(),
         ),
-        Unchecked::Inherited { write, reason } => (
+        Some(Unchecked::Inherited { write, reason }) => (
             format!(
                 "the release in hand is unchecked since {} ({reason})",
                 described_write(write)
             ),
             adopt,
         ),
+        None => (
+            "the ledger records no write of the name".to_owned(),
+            NO_RECORD_REMEDY.to_owned(),
+        ),
     };
-    format!(
+    Some(format!(
         "knives could not check {shown} at {at} against its recorded writes: {why}; knives did \
          not fetch; {remedy}"
-    )
+    ))
 }
 
 /// The one remedy for a hand edit of a published release.

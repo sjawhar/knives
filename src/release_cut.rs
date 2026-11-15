@@ -134,8 +134,8 @@ pub(crate) fn run_release(
         // it reads as recorded; so the tree decides before any audit does,
         // and the cut refuses whatever the audit's rows would say. The rows
         // name a release that is recorded as one; one knives could not check
-        // is cut, says so, and its event carries the mark; one the ledger
-        // records no write of is cut, and its rows say nothing measured it.
+        // is cut, says so, and its event carries the mark; so is one the
+        // ledger records no write of, and its rows say nothing measured it.
         let (carried_from, unchecked) = match &previous {
             Some((reference, commit)) => {
                 let in_hand = release::InHand {

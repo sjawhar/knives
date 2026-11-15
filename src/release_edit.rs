@@ -516,19 +516,17 @@ fn refuse_unrecorded(
 }
 
 /// Say so before a write over a release in hand knives could not check
-/// against its recorded writes ([`release::unchecked_line`]), and give the
-/// mark the write's ledger event ends with ([`release::unchecked_suffix`]):
-/// nothing for any other release.
+/// against its recorded writes, a name the ledger records no write of
+/// included ([`release::unchecked_line`]), and give the mark the write's
+/// ledger event ends with ([`release::unchecked_suffix`]): nothing for any
+/// other release.
 pub(crate) fn announce_unchecked(
     repo: &RepoName,
     release: &release::InHand<'_>,
     standing: &release::InHandWrite,
 ) -> String {
-    if let release::InHandWrite::Unchecked(unchecked) = standing {
-        println!(
-            "{repo}: {}",
-            release::unchecked_line(release.name, release.commit, unchecked)
-        );
+    if let Some(line) = release::unchecked_line(release.name, release.commit, standing) {
+        println!("{repo}: {line}");
     }
     release::unchecked_suffix(standing)
 }

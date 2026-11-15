@@ -630,7 +630,8 @@ fn a_rebase_unions_the_logs_it_leaves_conflicted_as_it_records_the_release() {
     let stdout = release_ok(&lab, &home, &["rebase", "main@upstream"]);
 
     // Then: the commit that records the rebased provenance carries the union
-    // of both logs, said once, and its event names the union.
+    // of both logs, said once, and its event names the union, then the mark
+    // of a write over a release the ledger records no write of.
     assert_eq!(conflicts(&lab), Vec::<String>::new(), "{stdout}");
     assert_release_file(&lab, "CHANGELOG.md", UNION_TWO_LOG);
     assert_release_file(&lab, "RELEASE_NOTES.md", UNION_TWO_NOTES);
@@ -651,7 +652,7 @@ fn a_rebase_unions_the_logs_it_leaves_conflicted_as_it_records_the_release() {
     assert!(
         event
             .text
-            .ends_with("; union: CHANGELOG.md, RELEASE_NOTES.md"),
+            .ends_with("; union: CHANGELOG.md, RELEASE_NOTES.md; unchecked: no record"),
         "{}",
         event.text
     );
@@ -674,7 +675,8 @@ fn a_rebase_that_sheds_a_stale_base_says_once_that_the_shed_write_unioned() {
     let stdout = release_ok(&lab, &home, &["rebase", "main@upstream"]);
 
     // Then: the write that shed the base unioned both logs, the rebase moved
-    // that union along, and the rebase's report and event say so once.
+    // that union along, and the rebase's report and event say so once; the
+    // event is marked, as no write of the release was recorded.
     assert!(stdout.contains("1 stale base parent(s) shed"), "{stdout}");
     assert_eq!(conflicts(&lab), Vec::<String>::new(), "{stdout}");
     assert_release_file(&lab, "CHANGELOG.md", UNION_TWO_LOG);
@@ -686,10 +688,12 @@ fn a_rebase_that_sheds_a_stale_base_says_once_that_the_shed_write_unioned() {
         1,
         "{stdout}"
     );
+    let event = rebase_event(&home);
     assert!(
-        rebase_event(&home)
+        event
             .text
-            .ends_with("; union: CHANGELOG.md, RELEASE_NOTES.md"),
-        "{stdout}"
+            .ends_with("; union: CHANGELOG.md, RELEASE_NOTES.md; unchecked: no record"),
+        "{stdout}\n{}",
+        event.text
     );
 }
