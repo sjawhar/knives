@@ -460,6 +460,79 @@ fn a_code_file_both_members_change_stays_conflicted_beside_the_union() {
     );
 }
 
+/// Each of `lines` is a line of its own in the release's `held` changelog,
+/// not part of a longer line.
+fn assert_whole_lines(held: &str, lines: &[&str], output: &str) {
+    for line in lines {
+        assert!(
+            held.lines().any(|held_line| held_line == *line),
+            "{line:?} is not a line of its own in CHANGELOG.md:\n{held:?}\n{output}"
+        );
+    }
+}
+
+// A trunk changelog, and two members that each append a block at its end
+// with no newline after the block's last line.
+const NO_FINAL_NEWLINE_TRUNK: &str = "# Changelog\n";
+const NO_FINAL_NEWLINE_A: &str = "# Changelog\n## a\n- a";
+const NO_FINAL_NEWLINE_B: &str = "# Changelog\n## b\n- b";
+/// Every line the trunk and the two members wrote.
+const NO_FINAL_NEWLINE_LINES: [&str; 5] = ["# Changelog", "## a", "- a", "## b", "- b"];
+
+#[test]
+fn an_include_never_runs_a_block_with_no_final_newline_into_the_next() {
+    // Given: a release of one member that appended its block at the end of
+    // the changelog with no final newline, and a second member that appended
+    // its own block the same way.
+    let lab = trunk_with(&[("CHANGELOG.md", NO_FINAL_NEWLINE_TRUNK)]);
+    member(&lab, "feat/a", &[("CHANGELOG.md", NO_FINAL_NEWLINE_A)]);
+    let (home, _consumer) = release_test_home(&lab);
+    release_ok(&lab, &home, &["cut", RELEASE]);
+    member(&lab, "feat/b", &[("CHANGELOG.md", NO_FINAL_NEWLINE_B)]);
+
+    // When: the second member is included.
+    let included = release_ok(&lab, &home, &["include", "feat/b"]);
+
+    // Then: the changelog is left to a person, or every line each member
+    // wrote is a line of its own in the release: the last line of one block
+    // and the first line of the next are never written as one line.
+    if conflicts(&lab).is_empty() {
+        let held = file_at_revision(&lab, RELEASE, "CHANGELOG.md");
+        assert_whole_lines(&held, &NO_FINAL_NEWLINE_LINES, &included);
+    } else {
+        assert_eq!(conflicts(&lab), ["CHANGELOG.md"], "{included}");
+    }
+}
+
+#[test]
+fn a_first_cut_of_blocks_with_no_final_newline_is_written() {
+    // Given: two members that each appended a block at the end of the
+    // changelog with no final newline.
+    let lab = trunk_with(&[("CHANGELOG.md", NO_FINAL_NEWLINE_TRUNK)]);
+    member(&lab, "feat/a", &[("CHANGELOG.md", NO_FINAL_NEWLINE_A)]);
+    member(&lab, "feat/b", &[("CHANGELOG.md", NO_FINAL_NEWLINE_B)]);
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: the first cut composes them.
+    let output = knives_release(&lab, &home, &["cut", RELEASE]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Then: the cut is written, as knives 3.2.6 writes it, and the changelog
+    // is left to a person or holds every line each member wrote as a line of
+    // its own.
+    assert!(
+        stdout.contains(&format!("cut {RELEASE} as")),
+        "the cut was not written:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if conflicts(&lab).is_empty() {
+        let held = file_at_revision(&lab, RELEASE, "CHANGELOG.md");
+        assert_whole_lines(&held, &NO_FINAL_NEWLINE_LINES, &stdout);
+    } else {
+        assert_eq!(conflicts(&lab), ["CHANGELOG.md"], "{stdout}");
+    }
+}
+
 #[test]
 fn dropping_a_member_whose_block_a_union_holds_unions_nothing_away() {
     // Given: the unioned cut of split-from-store and sami11.
