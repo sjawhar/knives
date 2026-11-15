@@ -20,8 +20,8 @@ use knives::release_model::{
 };
 
 use super::release_edit::{
-    EditRecord, published_refusal, record_edit_event, release_is_locally_movable, release_writes,
-    report_hidden, report_replaced,
+    EditRecord, published_refusal, record_edit_event, refuse_unrecorded,
+    release_is_locally_movable, release_writes, report_hidden, report_replaced, unchecked_mark,
 };
 
 /// Rebase the whole composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
@@ -115,6 +115,24 @@ pub(crate) fn run_rebase(
         return Ok(exit);
     }
     let ledger = knives::ledger::Ledger::for_fork(fork).read()?.entries;
+    // An earlier write of the release a fast-forward push gave it is no
+    // member: nothing classifies it, and the write before the rebase leaves
+    // it out, so the rebase moves the members and the release only.
+    let writes = EarlierWrites::read(&opened, &release_name, &ledger, plan.published.as_ref())?;
+    // A release that carries a change knives did not write or adopt would
+    // carry it onto the new base unmeasured, as every write would.
+    let in_hand = release::InHand {
+        repo: &opened,
+        ledger: &ledger,
+        name: &release_name,
+        commit: &release_commit,
+        writes: &writes,
+        published: plan.published.as_ref(),
+    };
+    let standing = match refuse_unrecorded((repo, "rebase"), entry, &in_hand)? {
+        Ok(standing) => standing,
+        Err(exit) => return Ok(exit),
+    };
     if let Some(refusal) = published_refusal(
         &opened,
         &ledger,
@@ -128,6 +146,7 @@ pub(crate) fn run_rebase(
         println!("{repo}: {refusal}");
         return Ok(Exit::Incomplete);
     }
+    let unchecked = unchecked_mark(repo, &in_hand, &standing);
     if let Some(exit) = existing_rebase_exit(ExistingRebaseInput {
         opened: &opened,
         fork,
@@ -136,13 +155,10 @@ pub(crate) fn run_rebase(
         destination: &destination,
         no_drop,
         bound,
+        unchecked: &unchecked,
     })? {
         return Ok(exit);
     }
-    // An earlier write of the release a fast-forward push gave it is no
-    // member: nothing classifies it, and the write before the rebase leaves
-    // it out, so the rebase moves the members and the release only.
-    let writes = EarlierWrites::read(&opened, &release_name, &ledger, plan.published.as_ref())?;
     let carriers = writes.carriers(&opened.parent_commits(release_commit.as_str())?);
     let context = RebaseContext {
         repo,
@@ -271,6 +287,7 @@ pub(crate) fn run_rebase(
             shed,
             before: &before_rebase,
             shed_unions,
+            unchecked: &unchecked,
         },
         bound,
     )?;
@@ -317,7 +334,9 @@ pub(crate) fn run_rebase(
     if no_drop {
         return Ok(Exit::Ok);
     }
-    drop_landed_members(fork, &release_name, &destination, bound)
+    // The rebase recorded the release it moved, so what it drops next is
+    // dropped from a recorded write.
+    drop_landed_members(fork, &release_name, &destination, (bound, ""))
 }
 
 fn frozen_rebase_exit(
@@ -525,6 +544,8 @@ struct ExistingRebaseInput<'a> {
     destination: &'a RebaseDestination,
     no_drop: bool,
     bound: Bound<'a>,
+    /// The mark the drop's event ends with ([`release::unchecked_suffix`]).
+    unchecked: &'a str,
 }
 
 fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option<Exit>> {
@@ -536,6 +557,7 @@ fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option
         destination,
         no_drop,
         bound,
+        unchecked,
     } = input;
     if !opened.is_ancestor(&destination.onto, release_commit)? {
         return Ok(None);
@@ -551,7 +573,7 @@ fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option
     let exit = if no_drop {
         Exit::Ok
     } else {
-        drop_landed_members(fork, release_name, destination, bound)?
+        drop_landed_members(fork, release_name, destination, (bound, unchecked))?
     };
     Ok(Some(exit))
 }
@@ -786,12 +808,13 @@ fn all_landed(
 /// that is said instead. The drop duplicates the release onto the kept parents,
 /// exactly as `drop` does, so recorded conflict resolutions carry forward, and
 /// leaves out the release's carriers, as every write composing from its
-/// parents does.
+/// parents does. `unchecked` is the mark its event ends with
+/// ([`release::unchecked_suffix`]).
 fn drop_landed_members(
     fork: &Fork<'_>,
     release_name: &str,
     destination: &RebaseDestination,
-    bound: Bound<'_>,
+    (bound, unchecked): (Bound<'_>, &str),
 ) -> anyhow::Result<Exit> {
     if destination.landed.is_empty() {
         return Ok(Exit::Ok);
@@ -868,6 +891,7 @@ fn drop_landed_members(
             change: &written.change,
             provenance: &provenance,
             unions: &written.unions,
+            unchecked,
         },
         bound,
     )?;
@@ -879,7 +903,10 @@ fn drop_landed_members(
     );
     report_replaced(repo, release_name, &written);
     match knives::jj::conflicted_files(path, created.as_str()) {
-        Ok(files) => println!("{}", release::conflict_guidance(&files, &written.unions)),
+        Ok(files) => println!(
+            "{}",
+            release::conflict_guidance(release_name, &files, &written.unions)
+        ),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
     Ok(Exit::Ok)
@@ -895,6 +922,8 @@ struct RebasedRelease<'a> {
     before: &'a knives::ids::CommitId,
     /// The release logs the shed write unioned before the rebase.
     shed_unions: Vec<knives::jj::UnionedFile>,
+    /// The mark the rebase's event ends with ([`release::unchecked_suffix`]).
+    unchecked: &'a str,
 }
 
 /// Re-describe the rebased release so the recorded provenance names the
@@ -943,6 +972,7 @@ fn report_rebased_release(
             change: &change,
             provenance: &provenance,
             unions: &unions,
+            unchecked: rebased.unchecked,
         },
         bound,
     )?;
@@ -961,7 +991,10 @@ fn report_rebased_release(
         new_parents.len()
     );
     match conflicts {
-        Ok(files) => println!("{}", release::conflict_guidance(&files, &unions)),
+        Ok(files) => println!(
+            "{}",
+            release::conflict_guidance(rebased.name, &files, &unions)
+        ),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
     Ok(())

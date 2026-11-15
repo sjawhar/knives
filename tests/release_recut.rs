@@ -621,20 +621,12 @@ fn cut_carrying_the_resolution(
     stdout
 }
 
-/// The cut's row for a member whose divergence the release it carries from,
-/// which nothing recorded, already has.
-fn unrecorded_row(member: &str) -> String {
-    format!(
-        "  {member}: diverges where the unrecorded in-hand release already does; record it \
-         with `knives release adopt` and cut again"
-    )
-}
-
-/// The cut's row for a member whose divergence a recorded release already has.
+/// The cut's row for a member whose divergence the recorded release in hand
+/// already has.
 fn recorded_row(member: &str) -> String {
     format!(
-        "  {member}: diverges where the previous release already did (a recorded \
-         resolution); carried forward"
+        "  {member}: diverges where the release in hand (a recorded write) already does; \
+         carried forward"
     )
 }
 
@@ -656,43 +648,58 @@ fn a_recut_carries_a_recorded_resolution_that_dropped_content() {
     std::fs::write(lab.work.join("shared.txt"), "merged\n").expect("resolve by hand");
     lab.jj_work(["new"]);
     let (alpha, beta) = (commit_at(&lab, "feat/alpha"), commit_at(&lab, "feat/beta"));
+    let missing_rows = |stdout: &str| {
+        for (member, tip) in [("feat/alpha", &alpha), ("feat/beta", &beta)] {
+            assert!(
+                stdout.contains(&format!(
+                    "  !! {member}@{}: the cut tree is missing or diverges from the member's \
+                     content",
+                    tip.short()
+                )),
+                "{stdout}"
+            );
+        }
+        assert!(!stdout.contains("diverges where"), "{stdout}");
+    };
 
     // When: the hand resolution, which nothing recorded, is verified.
     let verified = knives_release(&lab, &home, &["members", "release/2026-08-04", "--verify"]);
 
-    // Then: each member's divergence from the recorded cut is named as the
-    // unrecorded release's, with the command that records it, as a finding.
+    // Then: verify holds the release to its members alone, as it always has:
+    // the content neither member's tree holds reads as missing, a finding.
     let stdout = String::from_utf8_lossy(&verified.stdout);
     assert_eq!(verified.status.code(), Some(1), "{stdout}");
-    for (member, tip) in [("feat/alpha", &alpha), ("feat/beta", &beta)] {
-        assert!(
-            stdout.contains(&unrecorded_row(&format!("{member}@{}", tip.short()))),
-            "{stdout}"
-        );
-    }
+    missing_rows(&stdout);
 
     // When: the identical composition is re-cut under a new name, with no
     // adopt recording the resolution first. The working copy steps off the
     // release, or the reap after the cut keeps it for that, a finding of its
     // own.
     lab.jj_work(["new", "main@origin"]);
-    let before_cut = operation_ids(&lab.work)
-        .first()
-        .cloned()
-        .expect("the operation before the cut");
-    let rows = [unrecorded_row("feat/alpha"), unrecorded_row("feat/beta")];
+    let before_cut = operation_ids(&lab.work);
+    let refused = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
 
-    // Then: the resolution is carried and not refused — the audit charges a
-    // cut only with divergence it introduces — but the rows say the release
-    // it carries from is unrecorded and name `adopt`, and the cut exits 1.
-    let stdout = cut_carrying_the_resolution(&lab, &home, "release/2026-08-05", (&rows, 1));
-    assert!(!stdout.contains("a recorded resolution"), "{stdout}");
+    // Then: the cut is refused on the release's tree, whatever its audit
+    // would say: nothing is written, and the refusal names the command that
+    // records the resolution.
+    let stdout = String::from_utf8_lossy(&refused.stdout);
+    assert_eq!(refused.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains("`knives release adopt release/2026-08-04`"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("cut release/2026-08-05 as"), "{stdout}");
+    assert_eq!(operation_ids(&lab.work), before_cut, "the refusal wrote");
+    assert!(
+        Repo::open(&lab.work)
+            .expect("open")
+            .local_bookmark_tip("release/2026-08-05")
+            .is_none()
+    );
 
-    // Given: that cut, never pushed, taken back with the reap that followed
-    // it, and the hand resolution recorded as the first release's newest
+    // Given: the hand resolution recorded as the first release's newest
     // write. It kept no line either member added, so `adopt` records it and
     // says so with findings.
-    lab.jj_work(["op", "restore", before_cut.as_str()]);
     let adopted = knives_release(
         &lab,
         &home,
@@ -714,24 +721,19 @@ fn a_recut_carries_a_recorded_resolution_that_dropped_content() {
     // When: the recorded release is verified.
     let verified = knives_release(&lab, &home, &["members", "release/2026-08-04", "--verify"]);
 
-    // Then: verifying a release that is its recorded write reads as it always
-    // has: nothing is held against an earlier write, so nothing is carried.
+    // Then: verify is unchanged by the record: the content is still missing.
     let stdout = String::from_utf8_lossy(&verified.stdout);
-    assert!(!stdout.contains("diverges where"), "{stdout}");
-    assert!(
-        stdout.contains(&format!(
-            "  !! feat/alpha@{}: the cut tree is missing or diverges from the member's content",
-            alpha.short()
-        )),
-        "{stdout}"
-    );
+    assert_eq!(verified.status.code(), Some(1), "{stdout}");
+    missing_rows(&stdout);
 
     // When: the composition is re-cut.
     let rows = [recorded_row("feat/alpha"), recorded_row("feat/beta")];
 
-    // Then: the recut's rows read the resolution as recorded, and it exits 0.
-    let stdout = cut_carrying_the_resolution(&lab, &home, "release/2026-08-06", (&rows, 0));
+    // Then: the recut's rows read the release in hand as a recorded write,
+    // and it exits 0.
+    let stdout = cut_carrying_the_resolution(&lab, &home, "release/2026-08-05", (&rows, 0));
     assert!(!stdout.contains("unrecorded"), "{stdout}");
+    assert!(!stdout.contains("a recorded resolution"), "{stdout}");
 }
 
 #[test]

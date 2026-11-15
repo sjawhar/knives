@@ -2,11 +2,11 @@
 //! knives write.
 //!
 //! A person who resolves a release's conflicts, renumbers a release log or
-//! repairs the release commit leaves a commit knives did not write, and audit
-//! reads it as drift from the write the ledger records. Adopting it is one
-//! edit event, which every reader of knives' own writes already reads, after
-//! the checks that make it that release finished: the recorded write's
-//! parents plus any earlier write of the name a fast-forward push added, no
+//! repairs the release commit leaves a commit knives did not write, and every
+//! write over it refuses until it is recorded. Adopting it is one edit event,
+//! which every reader of knives' own writes already reads, after the checks
+//! that make it that release finished: its members are a recorded write's
+//! (beside any earlier write of the name a fast-forward push added), no
 //! conflicts, and a reason for any change beyond the conflicts the write left.
 
 use std::collections::BTreeMap;
@@ -16,18 +16,16 @@ use knives::cli::Exit;
 use knives::commands::claim::Bound;
 use knives::commands::release;
 use knives::forge::github::CliForge;
-use knives::ids::{
-    BookmarkRef, BranchName, ChangeId, CommitId, ReleaseScheme, RemoteName, RepoName,
-};
+use knives::ids::{BookmarkRef, BranchName, ChangeId, CommitId, RemoteName, RepoName};
 use knives::jj::{Repo, ResolutionBaseline, ResolutionChanges};
 use knives::ledger::{Draft, Entry, Ledger, RecordedParent, inline_human_text};
 use knives::release_model::{
-    EarlierWrites, RecordedWrite, carrier_label, members_event_text, recorded_write_events,
+    EarlierWrites, RecordedWrite, carrier_label, matched_write, members_event_text,
+    recorded_members, recorded_write_events,
 };
 
 use super::release_edit::{
-    published_refusal_text, recorded_parents, refuse_unresolved_trunk, report_abandoned_earlier,
-    report_hidden,
+    recorded_parents, refuse_unresolved_trunk, report_abandoned_earlier, report_hidden,
 };
 use super::scribe_for;
 
@@ -195,24 +193,56 @@ impl Held {
     fn shown_name(&self) -> String {
         inline_human_text(&self.name)
     }
+
+    /// The commit as the release in hand `in_hand_write` reads, `writes` read
+    /// with its publish remote's commit.
+    fn in_hand<'a>(
+        &'a self,
+        ledger: &'a [Entry],
+        writes: &'a EarlierWrites,
+    ) -> release::InHand<'a> {
+        release::InHand {
+            repo: &self.opened,
+            ledger,
+            name: &self.name,
+            commit: &self.commit,
+            writes,
+            published: self.published.as_ref(),
+        }
+    }
+
+    /// How the commit stands to the writes `ledger` records under its name
+    /// ([`release::in_hand_write`]).
+    fn standing(
+        &self,
+        ledger: &[Entry],
+        writes: &EarlierWrites,
+    ) -> anyhow::Result<release::InHandWrite> {
+        Ok(release::in_hand_write(&self.in_hand(ledger, writes))?)
+    }
 }
 
-/// The write the adopted commit replaces: the newest recorded write of the
-/// name.
+/// The write the adopted commit replaces: the recorded write it equals, when
+/// it equals an older one, and otherwise the newest recorded write whose
+/// members are its own ([`matched_write`]).
 struct Replaced {
     write: RecordedWrite,
     /// Whether this repository holds the write's commit. A write made on
     /// another machine and never pushed is not here.
     here: bool,
-    /// The parent set its event records, each parent with every branch at it
-    /// then, which `include` and `advance` match a member by once its
-    /// bookmark has moved on.
+    /// Whether its event says knives could not check the release it was
+    /// written over (`; unchecked:`): nothing measured that write, so a
+    /// resolution is measured against an automerge instead.
+    unchecked: bool,
+    /// The parent set its event records, its own carriers left out, each
+    /// parent with every branch at it then, which `include` and `advance`
+    /// match a member by once its bookmark has moved on.
     parents: Vec<RecordedParent>,
 }
 
 impl Replaced {
-    /// The newest recorded write of `held`'s name, or `None` when the ledger
-    /// records none.
+    /// The write `held` replaces, or `None` when no recorded write has its
+    /// `members` ([`release::InHandWrite::NoMatch`], already refused).
     ///
     /// An event an older knives wrote has no `parents`; the set is then built
     /// as a write builds it, from the write's own parents where this
@@ -220,75 +250,88 @@ impl Replaced {
     fn read(
         held: &Held,
         entry: &knives::config::RepoEntry,
-        ledger: &[Entry],
+        (ledger, writes): (&[Entry], &EarlierWrites),
+        members: &[CommitId],
     ) -> anyhow::Result<Option<Self>> {
-        let Some((event, write)) = recorded_write_events(ledger, &held.name).next() else {
-            return Ok(None);
+        let opened = &held.opened;
+        let mut equal = None;
+        for (event, write) in recorded_write_events(ledger, &held.name) {
+            let here = opened.resolve_commit(write.commit.as_str()).is_ok();
+            if write.commit == held.commit
+                || (here
+                    && opened.is_metadata_rewrite(write.commit.as_str(), held.commit.as_str())?)
+            {
+                equal = Some((event, write));
+                break;
+            }
+        }
+        let (event, write) = match equal {
+            Some(equal) => equal,
+            None => match matched_write(opened, (ledger, &held.name), writes, members)? {
+                Some(matched) => (matched.event, matched.write),
+                None => return Ok(None),
+            },
         };
-        let here = held.opened.resolve_commit(write.commit.as_str()).is_ok();
+        let recorded = recorded_members(opened, (&held.name, event, &write), writes)?;
         let parents = if event.parents.is_empty() {
-            let commits = if here {
-                held.opened.parent_commits(write.commit.as_str())?
-            } else {
-                event
-                    .evidence
-                    .iter()
-                    .skip(1)
-                    .map(|commit| CommitId::new(commit.as_str()))
-                    .collect()
-            };
-            recorded_parents(&held.opened, entry, &commits)?
+            let commits: Vec<CommitId> = recorded
+                .iter()
+                .map(|parent| CommitId::new(parent.commit.as_str()))
+                .collect();
+            recorded_parents(opened, entry, &commits)?
         } else {
-            event.parents.clone()
+            recorded
         };
         Ok(Some(Self {
+            here: opened.resolve_commit(write.commit.as_str()).is_ok(),
+            unchecked: knives::release_model::unchecked_mark(event).is_some(),
             write,
-            here,
             parents,
         }))
     }
 
-    fn commits(&self) -> Vec<CommitId> {
-        self.parents
-            .iter()
-            .map(|parent| CommitId::new(parent.commit.as_str()))
-            .collect()
+    /// Whether the write is the baseline a resolution is measured against
+    /// (D7): it is here, and knives checked the release it was written over.
+    const fn is_baseline(&self) -> bool {
+        self.here && !self.unchecked
     }
 
     /// `the recorded edit 0123456789ab`.
     fn described(&self) -> String {
-        format!(
-            "the recorded {} {}",
-            self.write.kind,
-            self.write.commit.short()
-        )
+        release::described_write(&self.write)
     }
+}
 
-    /// Whether `held` already is this write, saying so: the write itself, or
-    /// the write re-signed or metaedited, which audit already reads as it.
-    fn is_held(&self, repo: &RepoName, held: &Held) -> anyhow::Result<bool> {
-        let (shown, at) = (held.shown_name(), held.commit.short());
-        if held.commit == self.write.commit {
-            println!(
-                "{repo}: {shown} is at {at}, {}; nothing to adopt",
-                self.described()
-            );
-            return Ok(true);
-        }
-        if self.here
-            && held
-                .opened
-                .is_metadata_rewrite(self.write.commit.as_str(), held.commit.as_str())?
-        {
-            println!(
-                "{repo}: {shown} is at {at}, {} re-signed or metaedited (same change, parents \
-                 and tree); nothing to adopt",
-                self.described()
-            );
-            return Ok(true);
-        }
-        Ok(false)
+/// Whether `held` already is the newest recorded write of its name, saying
+/// so: the write itself, or the write re-signed or metaedited, which audit
+/// already reads as it. An older recorded write is recorded as the newest,
+/// and so is a newest one written over a release knives could not check
+/// (its event marked `; unchecked:`), which stays unchecked until adopted.
+fn is_newest(repo: &RepoName, held: &Held, ledger: &[Entry]) -> anyhow::Result<bool> {
+    let Some((event, newest)) = recorded_write_events(ledger, &held.name).next() else {
+        return Ok(false);
+    };
+    if knives::release_model::unchecked_mark(event).is_some() {
+        return Ok(false);
     }
+    let (shown, at) = (held.shown_name(), held.commit.short());
+    let described = release::described_write(&newest);
+    if held.commit == newest.commit {
+        println!("{repo}: {shown} is at {at}, {described}; nothing to adopt");
+        return Ok(true);
+    }
+    if held.opened.resolve_commit(newest.commit.as_str()).is_ok()
+        && held
+            .opened
+            .is_metadata_rewrite(newest.commit.as_str(), held.commit.as_str())?
+    {
+        println!(
+            "{repo}: {shown} is at {at}, {described} re-signed or metaedited (same change, parents \
+             and tree); nothing to adopt"
+        );
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// What every check reads: whose release, the commit to adopt, the ledger and
@@ -301,104 +344,9 @@ struct Adopting<'a, 'f> {
 }
 
 impl Adopting<'_, '_> {
-    /// The parents of the commit that are earlier writes of the name, or
-    /// `None` after refusing a parent set that is not the replaced write's
-    /// plus such carriers.
-    ///
-    /// The replaced write itself is no carrier here: a commit on top of it is
-    /// a resolution made as a child of the release, which the release commit
-    /// should hold instead.
-    fn carriers_or_refuse(&self) -> anyhow::Result<Option<Vec<CommitId>>> {
-        let (held, replaced) = (self.held, self.replaced);
-        let recorded = replaced.commits();
-        let extra: Vec<CommitId> = held
-            .parents
-            .iter()
-            .filter(|parent| !recorded.contains(parent))
-            .cloned()
-            .collect();
-        let writes = EarlierWrites::read(
-            &held.opened,
-            &held.name,
-            self.ledger,
-            held.published.as_ref(),
-        )?;
-        let found: Vec<CommitId> = writes
-            .carriers(&extra)
-            .into_iter()
-            .filter(|carrier| *carrier != replaced.write.commit)
-            .collect();
-        let child = held.parents.contains(&replaced.write.commit);
-        let strays: Vec<CommitId> = extra
-            .into_iter()
-            .filter(|parent| !found.contains(parent) && *parent != replaced.write.commit)
-            .collect();
-        let missing: Vec<&RecordedParent> = replaced
-            .parents
-            .iter()
-            .filter(|parent| {
-                !held
-                    .parents
-                    .contains(&CommitId::new(parent.commit.as_str()))
-            })
-            .collect();
-        if strays.is_empty() && missing.is_empty() && !child {
-            return Ok(Some(found));
-        }
-        self.refuse_parent_set(&strays, &missing, child)?;
-        Ok(None)
-    }
-
-    fn refuse_parent_set(
-        &self,
-        strays: &[CommitId],
-        missing: &[&RecordedParent],
-        child: bool,
-    ) -> anyhow::Result<()> {
-        let (repo, held, replaced) = (&self.fork.name, self.held, self.replaced);
-        let (shown, at) = (held.shown_name(), held.commit.short());
-        let entry = self.fork.entry;
-        println!(
-            "{repo}: {shown} at {at} does not have {}'s parents plus earlier writes of \
-             {shown}, so it is not that release finished by hand:",
-            replaced.described()
-        );
-        // Each source names a bookmark read from the repository.
-        for (source, commit) in
-            release::parent_sources(&held.opened, entry, &entry.release_scheme(), strays)?
-        {
-            println!(
-                "  extra parent {} ({}): no parent of the recorded write, and no earlier write \
-                 of {shown}",
-                commit.short(),
-                inline_human_text(&source)
-            );
-        }
-        for parent in missing {
-            let branches = if parent.branches.is_empty() {
-                "no branch recorded".to_owned()
-            } else {
-                parent.branches.join(", ")
-            };
-            println!(
-                "  missing parent {} ({}): a parent of the recorded write",
-                CommitId::new(parent.commit.as_str()).short(),
-                inline_human_text(&branches)
-            );
-        }
-        if child {
-            let release = replaced.write.commit.short();
-            println!(
-                "  {at} is a child of the release commit {release}: squash the resolution into \
-                 the release commit (`jj squash --from {at} --into {release}`), then adopt again"
-            );
-        }
-        Ok(())
-    }
-
     /// Refuse, saying why, a commit that is not finished: one that still has
-    /// conflicts, one a workspace has checked out, and one that would replace
-    /// a published write the publish remote does not hold. `true` after
+    /// conflicts, one a workspace has checked out, and a hand edit of a
+    /// published release the publish remote does not hold. `true` after
     /// refusing.
     fn refuse_unfinished(&self) -> anyhow::Result<bool> {
         let (repo, held) = (&self.fork.name, self.held);
@@ -436,45 +384,38 @@ impl Adopting<'_, '_> {
         self.refuse_published()
     }
 
-    /// Refuse adopting over a published write while the publish remote does
-    /// not hold the commit: consumers were given the write, and adopting would
-    /// record a release they were never given. `true` after refusing.
-    ///
-    /// A write this repository does not hold can carry no tag here, but a
-    /// `record: published` note names it by its id all the same, so that note
-    /// is read without the commit.
+    /// Refuse a hand edit of a published release while the publish remote
+    /// does not hold it: consumers were given the published commit, and
+    /// adopting would record under its name a release they were never given.
+    /// Published is read as the edit verbs read it, over the commit and the
+    /// publish remote's, so the cut and every write print the same remedy
+    /// ([`release::published_remedy_text`]). `true` after refusing.
     fn refuse_published(&self) -> anyhow::Result<bool> {
-        let (held, replaced) = (self.held, self.replaced);
-        if held.published.as_ref() == Some(&held.commit) {
+        let held = self.held;
+        if release::publish_remote_holds(&held.opened, &held.commit, held.published.as_ref())? {
             return Ok(false);
         }
-        let scheme = self.fork.entry.release_scheme();
-        let evidence = if replaced.here {
-            release::published_release(
-                &held.opened,
-                self.ledger,
-                release::ReleaseAt {
-                    scheme: &scheme,
-                    name: &held.name,
-                    commits: &[Some(&replaced.write.commit)],
-                },
-            )?
-        } else if matches!(scheme, ReleaseScheme::Fixed(_)) {
-            // A fixed branch moves forward by design: `published_release`
-            // marks none of its positions published.
-            None
-        } else {
-            release::published_note(self.ledger, &held.name, &[&replaced.write.commit])
-        };
-        let Some(evidence) = evidence else {
+        let Some(evidence) = release::published_release(
+            &held.opened,
+            self.ledger,
+            release::ReleaseAt {
+                scheme: &self.fork.entry.release_scheme(),
+                name: &held.name,
+                commits: &[Some(&held.commit), held.published.as_ref()],
+            },
+        )?
+        else {
             return Ok(false);
         };
         println!(
-            "{}: {}; {} does not hold {}",
+            "{}: {}",
             self.fork.name,
-            published_refusal_text(&held.name, &evidence, ("adopting", "adopt")),
-            self.fork.entry.publish_remote(),
-            held.commit.short()
+            release::published_remedy_text(
+                &held.opened,
+                (&held.name, &held.commit, &evidence),
+                (self.fork.entry, held.published.as_ref()),
+                None,
+            )?
         );
         Ok(true)
     }
@@ -491,15 +432,16 @@ struct Adoption<'a> {
     baseline: String,
     changes: ResolutionChanges,
     why: Option<&'a str>,
-    /// D8's counts, one per member and resolved file it added lines to.
+    /// D8's counts, one per member and changed file the baseline holds
+    /// lines of it added.
     lost: Vec<LostLines>,
 }
 
 impl Adoption<'_> {
-    /// A member every added line of whose file the resolution dropped: the
-    /// loss a reviewer missed, which makes `adopt` exit with findings.
+    /// A loss a reviewer missed, which makes `adopt` exit with findings
+    /// ([`LostLines::is_finding`]).
     fn loses_a_member(&self) -> bool {
-        self.lost.iter().any(|lost| lost.absent == lost.added)
+        self.lost.iter().any(LostLines::is_finding)
     }
 }
 
@@ -518,19 +460,26 @@ fn measure<'a>(
         .filter(|parent| !carriers.contains(parent))
         .cloned()
         .collect();
-    let (baseline, described) = if replaced.here {
+    let (baseline, described) = if replaced.is_baseline() {
         (
             ResolutionBaseline::Written(&replaced.write.commit),
             replaced.described(),
         )
     } else {
+        let reason = if replaced.here {
+            format!(
+                "knives could not check the release {} was written over",
+                replaced.described()
+            )
+        } else {
+            format!("this repository does not hold {}", replaced.described())
+        };
         (
             ResolutionBaseline::Automerge(&members),
             format!(
                 "an automerge of its {} member parent(s) with the release-log union, because \
-                 this repository does not hold {}",
-                members.len(),
-                replaced.described()
+                 {reason}",
+                members.len()
             ),
         )
     };
@@ -553,7 +502,12 @@ fn measure<'a>(
     let scheme = entry.release_scheme();
     let mut provenance = release::parent_sources(&held.opened, entry, &scheme, &held.parents)?;
     for (source, commit) in &mut provenance {
-        if carriers.contains(commit) {
+        if carriers.contains(commit)
+            && !replaced
+                .parents
+                .iter()
+                .any(|parent| parent.commit == commit.as_str())
+        {
             *source = carrier_label(&held.name);
         }
     }
@@ -564,20 +518,11 @@ fn measure<'a>(
         .filter(|(_, commit)| members.contains(commit))
         .cloned()
         .collect();
-    // Every file the commit changes against its baseline is counted, a file
-    // the baseline left without a conflict too: restoring such a file can
-    // drop a member's line as surely as resolving a conflict can.
-    let touched: Vec<String> = changes
-        .resolved
-        .iter()
-        .chain(&changes.beyond)
-        .cloned()
-        .collect();
     let lost = lost_lines(
         &held.opened,
-        &trunk,
-        &member_sources,
-        (&held.commit, &touched),
+        (&trunk, &member_sources),
+        (&held.commit, &changes),
+        replaced.is_baseline(),
     )?;
     Ok(Some(Adoption {
         change: held.opened.change_id_of(held.commit.as_str())?,
@@ -590,45 +535,98 @@ fn measure<'a>(
     }))
 }
 
-/// One member's added lines of one changed file, never none, and how many of
-/// them the resolution does not hold.
+/// One member's added lines of one changed file that the baseline holds,
+/// never none, and how many of them the resolution does not hold.
 struct LostLines {
     member: String,
     file: String,
-    added: usize,
-    absent: usize,
+    /// The member's added lines the baseline holds: the ones a resolution
+    /// can lose. A line an earlier recorded write already lost is no line
+    /// here, so a loss is never charged twice.
+    counted: usize,
+    /// Of those, the ones the resolution holds fewer times than the baseline.
+    lost: usize,
+    /// Whether the baseline left the file conflicted.
+    conflicted: bool,
+    /// Whether the baseline held one of the blocks the member added and the
+    /// resolution holds none of them ([`block_appears`]).
+    dropped: bool,
+    /// Whether the baseline is a recorded write. An automerge stands in for
+    /// a write this repository does not hold, so its counts are printed and
+    /// never make findings.
+    against_write: bool,
+}
+
+impl LostLines {
+    /// D8. A file the baseline left without a conflict is never part of a
+    /// resolution, so any lost line of it is a finding, except in a release
+    /// log ([`knives::changelog_union::eligible`]), where a renumber rewrites
+    /// a member's heading. In a release log or a conflicted file partial
+    /// loss is the normal shape of a resolution, so the finding is a member
+    /// none of whose blocks is left.
+    fn is_finding(&self) -> bool {
+        if !self.against_write {
+            false
+        } else if !self.conflicted && !knives::changelog_union::eligible(&self.file) {
+            self.lost > 0
+        } else {
+            self.dropped
+        }
+    }
 }
 
 /// D8's counts: for each file the commit changes against its baseline and
 /// each member that added lines to it, the member's added non-blank lines,
-/// from its fork point with the trunk to its tip, that the resolution holds
-/// fewer times than the member added them.
+/// from its fork point with the trunk to its tip, that the baseline holds
+/// and the resolution holds fewer times, and whether the resolution dropped
+/// every block of them the baseline held.
 ///
 /// The fork point is the member's own, so a trunk that moved on since is never
 /// charged to it. Counted as a multiset because a release log repeats lines
 /// (`### Added`) that one member adding and another keeping must not cancel.
+/// Every file the commit changes is counted, a file the baseline left without
+/// a conflict too: restoring such a file can drop a member's line as surely as
+/// resolving a conflict can. `against_write` says the baseline is a recorded
+/// write rather than an automerge.
 fn lost_lines(
     opened: &Repo,
-    trunk: &CommitId,
-    members: &[(String, CommitId)],
-    (resolution, files): (&CommitId, &[String]),
+    (trunk, members): (&CommitId, &[(String, CommitId)]),
+    (resolution, changes): (&CommitId, &ResolutionChanges),
+    against_write: bool,
 ) -> anyhow::Result<Vec<LostLines>> {
     let mut lost = Vec::new();
-    for file in files {
+    let files = changes
+        .resolved
+        .iter()
+        .map(|file| (file, true))
+        .chain(changes.beyond.iter().map(|file| (file, false)));
+    for (file, conflicted) in files {
         let resolved = opened.file_bytes(resolution, file)?.unwrap_or_default();
+        let baseline: Vec<&[u8]> = changes
+            .baseline
+            .get(file)
+            .map(|sides| sides.iter().map(Vec::as_slice).collect())
+            .unwrap_or_default();
         for (member, tip) in members {
             let fork = opened
                 .common_ancestor(std::slice::from_ref(tip), trunk)?
                 .unwrap_or_else(|| trunk.clone());
             let before = opened.file_bytes(&fork, file)?.unwrap_or_default();
             let after = opened.file_bytes(tip, file)?.unwrap_or_default();
-            let (added, absent) = added_and_absent(&before, &after, &resolved);
-            if added > 0 {
+            let (counted, absent) = counted_and_lost((&before, &after), &baseline, &resolved);
+            if counted > 0 {
                 lost.push(LostLines {
                     member: member.clone(),
                     file: file.clone(),
-                    added,
-                    absent,
+                    counted,
+                    lost: absent,
+                    conflicted,
+                    dropped: blocks_dropped(
+                        (&before, &after),
+                        (&baseline, &resolved),
+                        knives::changelog_union::eligible(file),
+                    ),
+                    against_write,
                 });
             }
         }
@@ -647,22 +645,114 @@ fn line_counts(text: &[u8]) -> BTreeMap<&[u8], usize> {
     counts
 }
 
-/// How many non-blank lines `after` adds to `before`, as a multiset, and how
-/// many of those `resolution` holds fewer times than they were added.
-fn added_and_absent(before: &[u8], after: &[u8], resolution: &[u8]) -> (usize, usize) {
+/// How many of the non-blank lines `after` adds to `before` (as a multiset)
+/// the baseline holds, and how many of those `resolution` holds fewer times
+/// than the baseline does, each line capped at the member's own count.
+///
+/// A baseline the file is conflicted in holds each side's lines: `baseline`
+/// is every side's file, never the markers a materialized conflict shows, and
+/// a line is held as often as the side holding it most.
+fn counted_and_lost(
+    (before, after): (&[u8], &[u8]),
+    baseline: &[&[u8]],
+    resolution: &[u8],
+) -> (usize, usize) {
     let (before, after, held) = (
         line_counts(before),
         line_counts(after),
         line_counts(resolution),
     );
-    let mut added = 0;
-    let mut absent = 0;
+    let mut kept: BTreeMap<&[u8], usize> = BTreeMap::new();
+    for side in baseline {
+        for (line, count) in line_counts(side) {
+            let most = kept.entry(line).or_insert(0);
+            *most = (*most).max(count);
+        }
+    }
+    let mut counted = 0;
+    let mut lost = 0;
     for (line, count) in after {
         let new = count.saturating_sub(before.get(line).copied().unwrap_or(0));
-        added += new;
-        absent += new.saturating_sub(held.get(line).copied().unwrap_or(0));
+        let in_baseline = kept.get(line).copied().unwrap_or(0);
+        counted += new.min(in_baseline);
+        lost += new.min(in_baseline.saturating_sub(held.get(line).copied().unwrap_or(0)));
     }
-    (added, absent)
+    (counted, lost)
+}
+
+/// The lines of `text`, without the empty one after its last newline.
+fn lines_of(text: &[u8]) -> Vec<&[u8]> {
+    let mut lines: Vec<&[u8]> = text.split(|byte| *byte == b'\n').collect();
+    if lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
+/// The blocks a member added to a file: each contiguous run of lines its
+/// change from `before` to `after` writes, a run of blank lines left out. In
+/// a release log (`release_log`) a run is split where a section begins (a
+/// line starting `## `): one member's change can add several sections, and
+/// a resolution can rightly put another member's section between them.
+fn added_blocks<'a>(before: &'a [u8], after: &'a [u8], release_log: bool) -> Vec<Vec<&'a [u8]>> {
+    use jj_lib::diff::{ContentDiff, DiffHunkKind};
+    let mut blocks = Vec::new();
+    for hunk in ContentDiff::by_line([before, after]).hunks() {
+        let Some(added) = hunk
+            .contents
+            .get(1)
+            .filter(|_| hunk.kind == DiffHunkKind::Different)
+        else {
+            continue;
+        };
+        let mut block: Vec<&[u8]> = Vec::new();
+        for line in lines_of(added) {
+            if release_log && line.starts_with(b"## ") && !block.is_empty() {
+                blocks.push(std::mem::take(&mut block));
+            }
+            block.push(line);
+        }
+        blocks.push(block);
+    }
+    blocks.retain(|block| {
+        block
+            .iter()
+            .any(|line| !line.iter().all(u8::is_ascii_whitespace))
+    });
+    blocks
+}
+
+/// Whether `text` holds `block`: a contiguous run of as many lines that
+/// differs from it in at most one line, so a block whose heading was
+/// renumbered is still there and one cut down or rewritten is not. A block
+/// of fewer than three lines must appear exactly, or a heading alone would
+/// hold a two-line section.
+fn block_appears(block: &[&[u8]], text: &[u8]) -> bool {
+    let tolerance = usize::from(block.len() >= 3);
+    lines_of(text).windows(block.len()).any(|window| {
+        window
+            .iter()
+            .zip(block)
+            .filter(|(line, wanted)| line != wanted)
+            .count()
+            <= tolerance
+    })
+}
+
+/// Whether the resolution dropped the member's change to a file: the
+/// baseline held one of the blocks it added ([`added_blocks`]) and the
+/// resolution holds none of them. A block an earlier recorded write already
+/// dropped is not charged again.
+fn blocks_dropped(
+    (before, after): (&[u8], &[u8]),
+    (baseline, resolution): (&[&[u8]], &[u8]),
+    release_log: bool,
+) -> bool {
+    let blocks = added_blocks(before, after, release_log);
+    let held = blocks
+        .iter()
+        .any(|block| baseline.iter().any(|side| block_appears(block, side)));
+    held && !blocks.iter().any(|block| block_appears(block, resolution))
 }
 
 /// Adopt the commit `held` holds: abandon the earlier writes nothing rests on,
@@ -676,26 +766,50 @@ fn adopt(
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let ledger = Ledger::for_fork(fork).read()?.entries;
-    let Some(replaced) = Replaced::read(held, fork.entry, &ledger)? else {
-        println!(
-            "{repo}: the ledger records no cut or edit of {}, so there is no write for {} to \
-             replace; cut the release first",
-            held.shown_name(),
-            held.commit.short()
-        );
-        return Ok(Exit::Incomplete);
-    };
-    if replaced.is_held(repo, held)? {
+    let writes = EarlierWrites::read(&held.opened, &held.name, &ledger, held.published.as_ref())?;
+    match held.standing(&ledger, &writes)? {
+        release::InHandWrite::NoRecord => {
+            println!(
+                "{repo}: the ledger records no cut or edit of {}, so there is no write for {} \
+                 to replace; cut the release first",
+                held.shown_name(),
+                held.commit.short()
+            );
+            return Ok(Exit::Incomplete);
+        }
+        release::InHandWrite::Unchecked(release::Unchecked::NoMatch(no_match)) => {
+            let entry = fork.entry;
+            let refusal =
+                release::no_match_refusal(&held.in_hand(&ledger, &writes), &no_match, entry)?;
+            println!("{repo}: {refusal}");
+            return Ok(Exit::Incomplete);
+        }
+        release::InHandWrite::Recorded
+        | release::InHandWrite::Unrecorded { .. }
+        | release::InHandWrite::Unchecked(
+            release::Unchecked::WriteAbsent(_) | release::Unchecked::Inherited { .. },
+        ) => {}
+    }
+    if is_newest(repo, held, &ledger)? {
         return Ok(Exit::Ok);
     }
+    let carriers = writes.carriers(&held.parents);
+    let members: Vec<CommitId> = held
+        .parents
+        .iter()
+        .filter(|parent| !carriers.contains(parent))
+        .cloned()
+        .collect();
+    // The standing found the write that equals the commit or matches its
+    // members, so there is one to replace.
+    let Some(replaced) = Replaced::read(held, fork.entry, (&ledger, &writes), &members)? else {
+        return Ok(Exit::Incomplete);
+    };
     let adopting = Adopting {
         fork,
         held,
         ledger: &ledger,
         replaced: &replaced,
-    };
-    let Some(carriers) = adopting.carriers_or_refuse()? else {
-        return Ok(Exit::Incomplete);
     };
     if adopting.refuse_unfinished()? {
         return Ok(Exit::Incomplete);
@@ -706,10 +820,9 @@ fn adopt(
     // Each earlier write that is now a visible head nothing rests on goes, as
     // after a cut: a resolution with its own change id leaves the write it
     // replaces as exactly such a head, which audit names as anonymous.
-    let earlier = EarlierWrites::read(&held.opened, &held.name, &ledger, held.published.as_ref())?;
     let abandoned = knives::jj::abandon_unheld_writes(
         &fork.checkout.path,
-        earlier.commits(),
+        writes.commits(),
         Some(&held.commit),
         &format!(
             "knives: {}: abandon earlier writes nothing rests on",
@@ -739,10 +852,22 @@ fn record(
 ) -> anyhow::Result<()> {
     let held = adopting.held;
     let mut parents = adopting.replaced.parents.clone();
-    parents.extend(adoption.carriers.iter().map(|carrier| RecordedParent {
-        commit: carrier.as_str().to_owned(),
-        branches: vec![carrier_label(&held.name)],
-    }));
+    // A carrier the replaced write recorded as a member keeps that record:
+    // the label would make every later write leave the member out.
+    let carriers: Vec<RecordedParent> = adoption
+        .carriers
+        .iter()
+        .filter(|carrier| {
+            !parents
+                .iter()
+                .any(|parent| parent.commit == carrier.as_str())
+        })
+        .map(|carrier| RecordedParent {
+            commit: carrier.as_str().to_owned(),
+            branches: vec![carrier_label(&held.name)],
+        })
+        .collect();
+    parents.extend(carriers);
     scribe_for(adopting.fork, bound)?.record(&Draft {
         evidence: std::iter::once(&held.commit)
             .chain(&held.parents)
@@ -798,7 +923,7 @@ fn adopted_text(replaced: &Replaced, adoption: &Adoption<'_>) -> String {
             .map(|lost| {
                 format!(
                     "{} {} of {} in {}",
-                    lost.member, lost.absent, lost.added, lost.file
+                    lost.member, lost.lost, lost.counted, lost.file
                 )
             })
             .collect();
@@ -848,15 +973,19 @@ fn report(adopting: &Adopting<'_, '_>, adoption: &Adoption<'_>) {
         let line = format!(
             "{}: {} of {} added line(s) of {} absent from the resolution",
             inline_human_text(&lost.member),
-            lost.absent,
-            lost.added,
+            lost.lost,
+            lost.counted,
             inline_human_text(&lost.file)
         );
-        // A member every added line of which is gone is flagged.
-        if lost.absent == lost.added {
-            println!("  !! {line}: every line it added is gone");
-        } else {
+        // A loss that makes the exit findings is flagged, saying which.
+        if !lost.is_finding() {
             println!("  {line}");
+        } else if lost.lost == lost.counted {
+            println!("  !! {line}: every line it added is gone");
+        } else if lost.conflicted || knives::changelog_union::eligible(&lost.file) {
+            println!("  !! {line}: none of the blocks it added is left");
+        } else {
+            println!("  !! {line}: a file the baseline left without a conflict");
         }
     }
     for carrier in &adoption.carriers {
@@ -870,16 +999,20 @@ fn report(adopting: &Adopting<'_, '_>, adoption: &Adoption<'_>) {
 
 #[cfg(test)]
 mod tests {
-    use super::added_and_absent;
+    use super::{LostLines, block_appears, blocks_dropped, counted_and_lost};
 
     #[test]
     fn a_line_the_resolution_holds_counts_as_held() {
-        // Given: a member that adds one line to a file, and a resolution that
-        // keeps it beside another member's.
+        // Given: a member that adds one line to a file the baseline holds,
+        // and a resolution that keeps it beside another member's.
         // When: the member's added lines are counted against the resolution.
-        // Then: one added, none absent.
+        // Then: one counted, none absent.
         assert_eq!(
-            added_and_absent(b"base\n", b"base\nalpha\n", b"base\nalpha\nbeta\n"),
+            counted_and_lost(
+                (b"base\n", b"base\nalpha\n"),
+                &[b"base\nalpha\n"],
+                b"base\nalpha\nbeta\n"
+            ),
             (1, 0)
         );
     }
@@ -887,7 +1020,11 @@ mod tests {
     #[test]
     fn a_resolution_restored_from_the_base_holds_none_of_the_members_lines() {
         assert_eq!(
-            added_and_absent(b"base\n", b"base\nbeta\nmore\n", b"base\n"),
+            counted_and_lost(
+                (b"base\n", b"base\nbeta\nmore\n"),
+                &[b"base\nbeta\nmore\n"],
+                b"base\n"
+            ),
             (2, 2)
         );
     }
@@ -895,13 +1032,167 @@ mod tests {
     #[test]
     fn added_lines_count_as_a_multiset_and_blank_lines_not_at_all() {
         // Given: a member that adds one line twice with a blank line between,
-        // and a resolution holding that line once.
+        // a baseline holding both, and a resolution holding that line once.
         // When: its added lines are counted.
         // Then: the line was added twice and is absent once; the blank line
         // is no line at all.
         assert_eq!(
-            added_and_absent(b"base\n", b"base\nx\n\nx\n", b"base\nx\n"),
+            counted_and_lost(
+                (b"base\n", b"base\nx\n\nx\n"),
+                &[b"base\nx\n\nx\n"],
+                b"base\nx\n"
+            ),
             (2, 1)
         );
+    }
+
+    #[test]
+    fn a_line_the_baseline_already_lost_is_not_charged_again() {
+        // Given: a member that added two lines, a baseline (an earlier
+        // recorded write) that already holds only one, and a resolution that
+        // holds neither.
+        // When: its added lines are counted.
+        // Then: only the line the baseline held is counted, and lost.
+        assert_eq!(
+            counted_and_lost(
+                (b"base\n", b"base\nkept\ngone\n"),
+                &[b"base\nkept\n"],
+                b"base\n"
+            ),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn a_conflicted_baseline_holds_each_sides_lines() {
+        // Given: a baseline whose file is conflicted between the member's side
+        // and another's, and a resolution keeping the other side only.
+        // When: the member's added lines are counted.
+        // Then: the member's line is held by the baseline through its side,
+        // so it is counted and lost.
+        assert_eq!(
+            counted_and_lost(
+                (b"base\n", b"base\nalpha\n"),
+                &[b"base\nalpha\n", b"base\nbeta\n"],
+                b"base\nbeta\n"
+            ),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn a_line_the_baseline_holds_more_often_than_the_resolution_is_lost() {
+        // Given: a member that added a line once, a baseline holding it twice
+        // (another member added it too), and a resolution holding it once.
+        // When: its added lines are counted.
+        // Then: the line is lost once, capped at the member's own count.
+        assert_eq!(
+            counted_and_lost((b"base\n", b"base\nx\n"), &[b"base\nx\nx\n"], b"base\nx\n"),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn a_block_with_one_line_changed_still_appears_and_a_cut_down_one_does_not() {
+        // Given: a member's three-line block.
+        let block: [&[u8]; 3] = [b"## [1.1.0]", b"- alpha", b"- more"];
+        // When/Then: renumbered, it appears; cut down to its heading, or with
+        // two lines rewritten, it does not.
+        assert!(block_appears(
+            &block,
+            b"top\n## [1.2.0]\n- alpha\n- more\nend\n"
+        ));
+        assert!(!block_appears(&block, b"top\n## [1.1.0]\nend\n"));
+        assert!(!block_appears(
+            &block,
+            b"## [1.2.0]\n- alpha, reworded\n- more\n"
+        ));
+        // And: a block of fewer than three lines appears only exactly.
+        assert!(block_appears(
+            &[b"## [1.1.0]", b"- alpha"],
+            b"x\n## [1.1.0]\n- alpha\n"
+        ));
+        assert!(!block_appears(
+            &[b"## [1.1.0]", b"- alpha"],
+            b"x\n## [1.2.0]\n- alpha\n"
+        ));
+        assert!(block_appears(&[b"- alpha"], b"x\n- alpha\n"));
+        assert!(!block_appears(&[b"- alpha"], b"x\n- beta\n"));
+    }
+
+    #[test]
+    fn a_member_is_dropped_only_when_the_baseline_held_a_block_the_resolution_lacks() {
+        let (before, after): (&[u8], &[u8]) = (b"base\n", b"base\n## [1.1.0]\n- alpha\n- more\n");
+        // Given/When/Then: a baseline holding the block, and a resolution
+        // holding none of it: dropped.
+        assert!(blocks_dropped(
+            (before, after),
+            (&[after], b"base\n"),
+            false
+        ));
+        // And: the resolution renumbered it: not dropped.
+        assert!(!blocks_dropped(
+            (before, after),
+            (&[after], b"base\n## [1.2.0]\n- alpha\n- more\n"),
+            false
+        ));
+        // And: a baseline that already lacked it charges nothing again.
+        assert!(!blocks_dropped(
+            (before, after),
+            (&[b"base\n"], b"base\n"),
+            false
+        ));
+    }
+
+    #[test]
+    fn a_release_logs_sections_are_blocks_another_members_section_can_split() {
+        // Given: a member whose one insert holds two sections, and a
+        // resolution that puts another member's section between them.
+        let before: &[u8] = b"# Log\n## [1.0.0]\n- base\n";
+        let after: &[u8] = b"# Log\n## [1.2.0]\n- two\n## [1.1.0]\n- one\n## [1.0.0]\n- base\n";
+        let resolution: &[u8] =
+            b"# Log\n## [1.2.0]\n- two\n## [1.1.5]\n- other\n## [1.1.0]\n- one\n## [1.0.0]\n- base\n";
+        // When/Then: read as a release log, each section is a block, so
+        // neither is dropped; read as code, the one insert no longer appears.
+        assert!(!blocks_dropped(
+            (before, after),
+            (&[after], resolution),
+            true
+        ));
+        assert!(blocks_dropped(
+            (before, after),
+            (&[after], resolution),
+            false
+        ));
+    }
+
+    #[test]
+    fn d8_findings_follow_the_file_the_loss_is_from_and_the_baseline() {
+        // Given: one of a member's two counted lines lost, from a plain file,
+        // a release log and a conflicted file, with or without its blocks.
+        let lost = |file: &str, (conflicted, lost, dropped): (bool, usize, bool)| LostLines {
+            member: "feat/alpha".to_owned(),
+            file: file.to_owned(),
+            counted: 2,
+            lost,
+            conflicted,
+            dropped,
+            against_write: true,
+        };
+        // When/Then: any lost line is a finding only in the plain file the
+        // baseline left without a conflict; in a release log or a conflicted
+        // file the finding is a member whose blocks are all gone.
+        assert!(lost("src/lib.rs", (false, 1, false)).is_finding());
+        assert!(!lost("src/lib.rs", (false, 0, false)).is_finding());
+        assert!(!lost("CHANGELOG.md", (false, 1, false)).is_finding());
+        assert!(lost("docs/RELEASE_NOTES.md", (false, 2, true)).is_finding());
+        assert!(!lost("src/lib.rs", (true, 1, false)).is_finding());
+        assert!(lost("src/lib.rs", (true, 2, true)).is_finding());
+        // And: measured against an automerge, nothing is a finding.
+        let automerge = LostLines {
+            against_write: false,
+            ..lost("src/lib.rs", (false, 2, true))
+        };
+        assert!(!automerge.is_finding());
     }
 }

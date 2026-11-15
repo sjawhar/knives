@@ -20,7 +20,7 @@ use jj_lib::matchers::EverythingMatcher;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
-use jj_lib::object_id::ObjectId as _;
+use jj_lib::object_id::{HexPrefix, ObjectId as _, PrefixResolution};
 use jj_lib::op_heads_store;
 use jj_lib::op_store::{RefTarget, RemoteRef};
 use jj_lib::operation::Operation;
@@ -1048,6 +1048,294 @@ impl Repo {
             .filter(|id| id != commit.id())
             .map(|id| commit_id(&id))
             .collect())
+    }
+
+    /// The visible commits whose change id begins with `change`, the
+    /// 12-character prefix a ledger event records (`ids::short_id`).
+    ///
+    /// A write pushed as a fast-forward copy keeps its change id, so a
+    /// repository that never held the recorded commit still holds the copy
+    /// under that id. A prefix two changes share names neither, and a prefix
+    /// that is no change id here names nothing: guessing would take a member
+    /// for an earlier write and drop it from the next composition.
+    pub fn visible_commits_of_change(&self, change: &str) -> Result<Vec<CommitId>, JjError> {
+        let Some(prefix) = HexPrefix::try_from_reverse_hex(change) else {
+            return Ok(Vec::new());
+        };
+        let resolved = block_on(self.repo.resolve_change_id_prefix(&prefix)).map_err(|error| {
+            JjError::Revision {
+                revision: change.to_owned(),
+                detail: error.to_string(),
+            }
+        })?;
+        Ok(match resolved {
+            PrefixResolution::SingleMatch(targets) => targets
+                .visible_with_offsets()
+                .map(|(_, id)| commit_id(id))
+                .collect(),
+            PrefixResolution::NoMatch | PrefixResolution::AmbiguousMatch => Vec::new(),
+        })
+    }
+
+    /// Whether `release`'s tree is exactly `write`'s own change rebased onto
+    /// `members`: merge(`members`) + `write` - merge(`write`'s parents other
+    /// than `write_carriers`), the step a release write takes
+    /// ([`duplicated_without_carriers`]).
+    ///
+    /// That is the tree a release holds when nothing but knives and jj
+    /// changed it since the write: jj's own rebase of the write over a
+    /// rewritten member, and a knives write onto the same members, which also
+    /// writes the release-log union ([`union_release_logs`]), so either tree
+    /// counts. A tree with conflicts compares by its ids like any other. Built
+    /// in a transaction that is dropped, never committed, so the probe leaves
+    /// nothing an operation names.
+    pub fn holds_rebased_write(
+        &self,
+        (write, write_carriers): (&CommitId, &[CommitId]),
+        members: &[CommitId],
+        release: &CommitId,
+    ) -> Result<bool, JjError> {
+        let write = self.commit(write.as_str())?;
+        let release = self.commit(release.as_str())?;
+        let member_ids = members
+            .iter()
+            .map(|member| Ok(self.commit(member.as_str())?.id().clone()))
+            .collect::<Result<Vec<_>, JjError>>()?;
+        let write_members: Vec<JjCommitId> = write
+            .parent_ids()
+            .iter()
+            .filter(|parent| !write_carriers.contains(&commit_id(parent)))
+            .cloned()
+            .collect();
+        let mut tx = self.repo.start_transaction();
+        // A write whose every parent is an earlier write of its name has no
+        // members to stand on; its own parents are then what it is measured
+        // from, as a duplicate of it would be.
+        let source = if write_members.is_empty() || write_members.len() == write.parent_ids().len()
+        {
+            write.clone()
+        } else {
+            block_on(
+                tx.repo_mut()
+                    .new_commit(write_members, write.tree())
+                    .write(),
+            )
+            .map_err(|error| store_error(&error))?
+        };
+        let stats = block_on(duplicate_commits(
+            tx.repo_mut(),
+            std::slice::from_ref(source.id()),
+            &HashMap::new(),
+            &member_ids,
+            &[],
+        ))
+        .map_err(|error| store_error(&error))?;
+        let rebased = stats
+            .duplicated_commits
+            .into_values()
+            .next()
+            .ok_or_else(|| JjError::Revision {
+                revision: write.id().to_string(),
+                detail: "the duplicate produced no commit".to_owned(),
+            })?;
+        let holds = if rebased.tree_ids() == release.tree_ids() {
+            true
+        } else {
+            let (unioned, _) = union_release_logs(rebased.tree(), Some(&write.tree()))?;
+            unioned.tree_ids() == release.tree_ids()
+        };
+        // Dropped, never committed: the probe leaves no trace in the op log.
+        drop(tx);
+        Ok(holds)
+    }
+
+    /// Whether all that rests on `commits`, the refs and earlier writes of
+    /// release `name`, is what that name published (D16): every visible
+    /// descendant of them is reachable from `name`'s ref on `publish_remote`
+    /// or from a tagged commit among them and their descendants, and nothing
+    /// else names any of those commits - no workspace has one checked out,
+    /// and no ref but `name`'s own (local, on `publish_remote`, or jj's git
+    /// view of it) and tags points at one.
+    ///
+    /// A superseded cut kept only because its published resolution sits on
+    /// it is kept on purpose: consumers were given that resolution, and the
+    /// next cut redoes it under a new name, so a reap that keeps it has
+    /// nothing for a person to act on.
+    pub fn rests_only_on_published(
+        &self,
+        commits: &[CommitId],
+        (name, publish_remote): (&str, &str),
+    ) -> Result<bool, JjError> {
+        let mut held: Vec<JjCommitId> = Vec::new();
+        let mut descendants: Vec<JjCommitId> = Vec::new();
+        for commit in commits {
+            let id = self.commit(commit.as_str())?.id().clone();
+            for descendant in self.descendants_of(&id)? {
+                if !descendants.contains(&descendant) {
+                    descendants.push(descendant);
+                }
+            }
+            if !held.contains(&id) {
+                held.push(id);
+            }
+        }
+        // An empty working copy of this checkout on one of them is what
+        // `jj new` leaves and jj drops when it moves on: it holds nothing.
+        let here = workspace_name_at(&self.path).ok();
+        let here = here.as_ref().map(WorkspaceName::as_str);
+        let mut all = held.clone();
+        all.extend(descendants.iter().cloned());
+        let mut resting = Vec::new();
+        for descendant in descendants {
+            if !self.is_empty_working_copy_on(&descendant, here, &all)? {
+                resting.push(descendant);
+            }
+        }
+        let descendants = resting;
+        // A keep for this checkout's working copy alone is no keep for what
+        // the name published: the person moves the working copy on.
+        if descendants.is_empty() {
+            return Ok(false);
+        }
+        for descendant in &descendants {
+            if !held.contains(descendant) {
+                held.push(descendant.clone());
+            }
+        }
+        let mut heads: Vec<JjCommitId> = Vec::new();
+        for (reference, tip) in &self.bookmark_tips()? {
+            let tip_id = self.commit(tip.as_str())?.id().clone();
+            let own = reference.branch().as_str() == name
+                && match reference {
+                    BookmarkRef::Local(_) => true,
+                    BookmarkRef::Remote { remote, .. } => {
+                        remote.as_str() == publish_remote || remote.as_str() == "git"
+                    }
+                };
+            if !own && held.contains(&tip_id) {
+                return Ok(false);
+            }
+            let published = matches!(
+                reference,
+                BookmarkRef::Remote { remote, .. } if remote.as_str() == publish_remote
+            );
+            if own && published {
+                heads.push(tip_id);
+            }
+        }
+        for id in &held {
+            if !checked_out_by(self, id).is_empty() {
+                return Ok(false);
+            }
+            if !self.tags_on(&commit_id(id))?.is_empty() {
+                heads.push(id.clone());
+            }
+        }
+        for descendant in &descendants {
+            let mut reached = false;
+            for head in &heads {
+                if self.backend_is_ancestor(descendant, head)? {
+                    reached = true;
+                    break;
+                }
+            }
+            if !reached {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The visible descendants of `commit`, itself excluded.
+    pub fn visible_descendants(&self, commit: &CommitId) -> Result<Vec<CommitId>, JjError> {
+        let id = self.commit(commit.as_str())?.id().clone();
+        Ok(self.descendants_of(&id)?.iter().map(commit_id).collect())
+    }
+
+    /// What keeps `commit` besides release `name`'s own local ref and the
+    /// working copy of this checkout's workspace while it is an empty,
+    /// undescribed child that `jj new` drops: another workspace's working
+    /// copy on it, a ref of anything else or a tag on it, or a descendant.
+    /// `None` when nothing does, so `jj abandon` of it loses no one's work.
+    pub fn what_else_keeps(
+        &self,
+        commit: &CommitId,
+        name: &str,
+    ) -> Result<Option<String>, JjError> {
+        let id = self.commit(commit.as_str())?.id().clone();
+        let here = workspace_name_at(&self.path).ok();
+        let here = here.as_ref().map(WorkspaceName::as_str);
+        let mut reasons = Vec::new();
+        let others: Vec<String> = checked_out_by(self, &id)
+            .into_iter()
+            .filter(|workspace| Some(workspace.as_str()) != here)
+            .collect();
+        if !others.is_empty() {
+            reasons.push(format!("it is the working copy of {}", others.join(", ")));
+        }
+        let mut names = Vec::new();
+        for (reference, tip) in &self.bookmark_tips()? {
+            let own = reference.branch().as_str() == name
+                && match reference {
+                    BookmarkRef::Local(_) => true,
+                    BookmarkRef::Remote { remote, .. } => remote.as_str() == "git",
+                };
+            if tip == commit && !own {
+                names.push(reference.to_string());
+            }
+        }
+        names.extend(
+            self.tags_on(commit)?
+                .into_iter()
+                .map(|tag| format!("tag {tag}")),
+        );
+        if !names.is_empty() {
+            reasons.push(format!("{} names it", names.join(", ")));
+        }
+        let mut staying = Vec::new();
+        for descendant in self.descendants_of(&id)? {
+            if !self.is_empty_working_copy_on(&descendant, here, std::slice::from_ref(&id))? {
+                staying.push(descendant);
+            }
+        }
+        if !staying.is_empty() {
+            reasons.push(descendants_that_stay(
+                self,
+                &staying.iter().collect::<Vec<_>>(),
+            )?);
+        }
+        Ok((!reasons.is_empty()).then(|| reasons.join("; ")))
+    }
+
+    /// Whether `id` is the working copy of workspace `here`, empty and
+    /// undescribed, whose only parent is one of `on`: what `jj new` run
+    /// there leaves behind and jj drops, so it rests on nothing.
+    fn is_empty_working_copy_on(
+        &self,
+        id: &JjCommitId,
+        here: Option<&str>,
+        on: &[JjCommitId],
+    ) -> Result<bool, JjError> {
+        let Some(here) = here else {
+            return Ok(false);
+        };
+        if !checked_out_by(self, id)
+            .iter()
+            .any(|workspace| workspace == here)
+        {
+            return Ok(false);
+        }
+        let commit = self
+            .repo
+            .store()
+            .get_commit(id)
+            .map_err(|error| store_error(&error))?;
+        Ok(
+            matches!(commit.parent_ids(), [parent] if on.contains(parent))
+                && commit.description().is_empty()
+                && block_on(commit.is_empty(self.repo.as_ref()))
+                    .map_err(|error| store_error(&error))?,
+        )
     }
 
     /// The visible descendants of `id`, itself excluded.
@@ -3056,10 +3344,15 @@ pub struct ResolutionChanges {
     /// Repository-internal paths the baseline held without a conflict and the
     /// resolution changed: a repair or a renumber, never a resolution.
     pub beyond: Vec<String>,
+    /// What the baseline held at each of those paths: the one file of a path
+    /// it held resolved, each side's file of a path it left conflicted, and
+    /// nothing where it held no regular file.
+    pub baseline: BTreeMap<String, Vec<Vec<u8>>>,
 }
 
 /// Every path whose content differs between `baseline` and `resolution`,
-/// sorted by whether the baseline held a conflict there.
+/// sorted by whether the baseline held a conflict there, with the content the
+/// baseline held at each.
 ///
 /// The automerge is built in a scratch transaction that is dropped unwritten,
 /// so measuring a resolution writes nothing an operation names. Its union is
@@ -3083,15 +3376,33 @@ pub fn resolution_changes(
             merged.tree()
         }
     };
+    let store = repo.repo.store();
     let mut changes = ResolutionChanges::default();
     for entry in collect_stream(baseline.diff_stream(&resolution, &EverythingMatcher)) {
         let values = entry.values.map_err(|error| store_error(&error))?;
         let path = entry.path.as_internal_file_string().to_owned();
-        if values.before.is_resolved() {
-            changes.beyond.push(path);
+        let sides = if values.before.is_resolved() {
+            changes.beyond.push(path.clone());
+            regular_file_content(store, &entry.path, &values.before)?
+                .into_iter()
+                .collect()
         } else {
-            changes.resolved.push(path);
-        }
+            changes.resolved.push(path.clone());
+            let mut sides = Vec::new();
+            for term in values.before.adds() {
+                if let Some(TreeValue::File { id, .. }) = term {
+                    let content = block_on(extract_as_single_hunk(
+                        &Merge::normal(id.clone()),
+                        store,
+                        &entry.path,
+                    ))
+                    .map_err(|error| store_error(&error))?;
+                    sides.extend(content.into_resolved().ok().map(Vec::from));
+                }
+            }
+            sides
+        };
+        changes.baseline.insert(path, sides);
     }
     Ok(changes)
 }

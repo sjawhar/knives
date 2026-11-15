@@ -1019,16 +1019,17 @@ impl std::fmt::Display for RecordedWriteKind {
 }
 
 /// The commit a cut or edit event says knives wrote under a release name.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedWrite {
     pub kind: RecordedWriteKind,
     pub commit: CommitId,
 }
 
-/// Every commit knives itself put under `release`, or took in as its own with
-/// `knives release adopt`, newest first: what each cut event or edit event
-/// (`include`, `drop`, `advance`, `rebase`, and `adopt`, which records an
-/// edit event) records first in its evidence.
+/// Every commit knives itself put under `release`, newest first.
+///
+/// That is what each cut event or edit event (`include`, `drop`, `advance`,
+/// `rebase`, and `adopt`, which takes a release finished by hand in as
+/// knives' own with an edit event) records first in its evidence.
 ///
 /// An edit writes a new commit under the same name, so a release that equals
 /// its last edit is knives' own work, not drift, and a publish remote at an
@@ -1079,65 +1080,168 @@ pub fn recorded_write_events<'a>(
     })
 }
 
-/// Every earlier write of one release name this repository holds.
+/// Why knives could not check the release in hand a cut or edit event wrote
+/// over.
+///
+/// It is what follows the `; unchecked: ` its text ends with, after every
+/// part a reader parses. `None` for every other event.
+pub fn unchecked_mark(entry: &Entry) -> Option<&str> {
+    entry
+        .text
+        .rsplit_once("; unchecked: ")
+        .map(|(_, reason)| reason)
+}
+
+/// The change id a cut or edit event of `release` records for its commit.
+///
+/// Both texts carry it: `cut <release> as <commit> (change <id>) …` and
+/// `edited <release> as <commit> (change <id>) …`, as the id's 12-character
+/// prefix ([`crate::ids::short_id`]). `None` for an event an older knives
+/// wrote without one.
+fn recorded_change<'a>(entry: &'a Entry, release: &str) -> Option<&'a str> {
+    let rest = entry
+        .text
+        .strip_prefix("cut ")
+        .or_else(|| entry.text.strip_prefix("edited "))?;
+    let (_, rest) = rest
+        .strip_prefix(release)?
+        .strip_prefix(" as ")?
+        .split_once(' ')?;
+    let (change, _) = rest.strip_prefix("(change ")?.split_once(')')?;
+    (!change.is_empty()).then_some(change)
+}
+
+/// Every earlier write of one release name.
 ///
 /// That is each commit the ledger records as a cut or an edit of the name
 /// ([`recorded_writes`]), the publish remote's commit of the name as the
-/// caller reads that ref, and every visible rewrite of either
-/// ([`Repo::rewrites_of`]).
+/// caller reads that ref, every visible rewrite of either
+/// ([`Repo::rewrites_of`]), every visible commit whose change id a
+/// recorded cut or edit event names, and every parent a recorded event lists
+/// with the carrier label ([`carrier_label`]).
 ///
 /// A `jj rebase` or `jj describe` that moves a recorded write leaves the
 /// recorded id hidden and the commit that matters under a new id with the
-/// same change id. A recorded write is a release merge and a member is a
-/// feature branch, so the two never share a change id, and the rewrite test
-/// cannot take a member for a write. A write this repository does not hold
-/// (another machine's, never fetched) can be no parent here and has no
-/// rewrite to read, so it is left out.
+/// same change id. A write pushed as a fast-forward copy keeps its change id
+/// too, so a repository that holds none of the recorded commits, a fresh
+/// clone of the fork, still reads the copies as earlier writes. A recorded
+/// write is a release merge and a member is a feature branch, so the two
+/// never share a change id, and neither test can take a member for a write.
+/// A recorded write this repository does not hold is no commit here; its id
+/// still marks it a write where a recorded parent set names it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EarlierWrites(Vec<CommitId>);
+pub struct EarlierWrites {
+    /// The writes this repository holds, each once: recorded writes newest
+    /// first, then the published commit, each followed by its rewrites, then
+    /// the copies found by a recorded change id.
+    held: Vec<CommitId>,
+    /// Every recorded write's commit, held here or not.
+    recorded: Vec<CommitId>,
+    /// Every change id a recorded event names, as the 12-character prefix.
+    changes: Vec<String>,
+    /// Every parent a recorded event lists with the carrier label
+    /// ([`carrier_label`]): only a recorded write's own record of its
+    /// fast-forward parent writes that label, so the commit is a carrier
+    /// though no event records it as a write (a resolution pushed on top of
+    /// a write, then squashed into it and fast-forwarded onto).
+    labelled: Vec<CommitId>,
+}
 
 impl EarlierWrites {
-    /// The earlier writes of `release`, each once, recorded writes newest
-    /// first, then the published commit, each followed by its rewrites.
+    /// The earlier writes of `release`.
     pub fn read(
         repo: &Repo,
         release: &str,
         entries: &[Entry],
         published: Option<&CommitId>,
     ) -> Result<Self, jj::JjError> {
-        let mut writes: Vec<CommitId> = Vec::new();
-        let written = recorded_writes(entries, release).map(|write| write.commit);
-        for commit in written.chain(published.cloned()) {
-            if writes.contains(&commit) || repo.resolve_commit(commit.as_str()).is_err() {
-                continue;
+        let mut writes = Self::default();
+        let label = carrier_label(release);
+        for (entry, write) in recorded_write_events(entries, release) {
+            if let Some(change) = recorded_change(entry, release)
+                && !writes.changes.iter().any(|known| known == change)
+            {
+                writes.changes.push(change.to_owned());
             }
-            let rewrites = repo.rewrites_of(commit.as_str())?;
-            writes.push(commit);
-            for rewrite in rewrites {
-                if !writes.contains(&rewrite) {
-                    writes.push(rewrite);
+            if !writes.recorded.contains(&write.commit) {
+                writes.recorded.push(write.commit);
+            }
+            for parent in &entry.parents {
+                let commit = CommitId::new(parent.commit.as_str());
+                if parent.branches.contains(&label) && !writes.labelled.contains(&commit) {
+                    writes.labelled.push(commit);
                 }
             }
         }
-        Ok(Self(writes))
+        for commit in writes
+            .recorded
+            .clone()
+            .into_iter()
+            .chain(published.cloned())
+        {
+            if writes.held.contains(&commit) || repo.resolve_commit(commit.as_str()).is_err() {
+                continue;
+            }
+            let rewrites = repo.rewrites_of(commit.as_str())?;
+            writes.held.push(commit);
+            writes.push_held(rewrites);
+        }
+        for change in writes.changes.clone() {
+            writes.push_held(repo.visible_commits_of_change(&change)?);
+        }
+        Ok(writes)
     }
 
+    fn push_held(&mut self, commits: Vec<CommitId>) {
+        for commit in commits {
+            if !self.held.contains(&commit) {
+                self.held.push(commit);
+            }
+        }
+    }
+
+    /// The earlier writes this repository holds.
     pub fn commits(&self) -> &[CommitId] {
-        &self.0
+        &self.held
     }
 
     pub fn contains(&self, commit: &CommitId) -> bool {
-        self.0.contains(commit)
+        self.held.contains(commit)
+            || self.recorded.contains(commit)
+            || self.labelled.contains(commit)
     }
 
     /// Which of a release's `parents` are among these writes, in parent
-    /// order: its carriers ([`carriers`]).
+    /// order: its carriers ([`carriers`]). A parent of a visible release is
+    /// visible, so a copy that keeps a recorded change id is among them.
     pub fn carriers(&self, parents: &[CommitId]) -> Vec<CommitId> {
         parents
             .iter()
             .filter(|parent| self.contains(parent))
             .cloned()
             .collect()
+    }
+
+    /// [`Self::carriers`] of a parent set a ledger event recorded, whose
+    /// commits may since have been abandoned: a hidden commit this repository
+    /// holds is a carrier when its change id is a recorded write's.
+    pub fn recorded_carriers(
+        &self,
+        repo: &Repo,
+        parents: &[CommitId],
+    ) -> Result<Vec<CommitId>, jj::JjError> {
+        let mut found = Vec::new();
+        for parent in parents {
+            let carrier = self.contains(parent)
+                || (repo.resolve_commit(parent.as_str()).is_ok() && {
+                    let change = repo.change_id_of(parent.as_str())?;
+                    self.changes.iter().any(|known| known == change.short())
+                });
+            if carrier {
+                found.push(parent.clone());
+            }
+        }
+        Ok(found)
     }
 }
 
@@ -1161,6 +1265,145 @@ pub fn carriers(
     (entries, published): (&[Entry], Option<&CommitId>),
 ) -> Result<Vec<CommitId>, jj::JjError> {
     Ok(EarlierWrites::read(repo, release, entries, published)?.carriers(parents))
+}
+
+/// The parent set a cut or edit event records for `write`.
+///
+/// That is its `parents`, or for an event an older knives wrote without them,
+/// the write's own parents where this repository holds it and the event's
+/// evidence after the write where it does not, with no branch recorded for
+/// any.
+pub fn recorded_parent_set(
+    repo: &Repo,
+    (event, write): (&Entry, &RecordedWrite),
+) -> Result<Vec<RecordedParent>, jj::JjError> {
+    if !event.parents.is_empty() {
+        return Ok(event.parents.clone());
+    }
+    let commits = if repo.resolve_commit(write.commit.as_str()).is_ok() {
+        repo.parent_commits(write.commit.as_str())?
+    } else {
+        event
+            .evidence
+            .iter()
+            .skip(1)
+            .map(|commit| CommitId::new(commit.as_str()))
+            .collect()
+    };
+    Ok(commits
+        .into_iter()
+        .map(|commit| RecordedParent {
+            commit: commit.as_str().to_owned(),
+            branches: Vec::new(),
+        })
+        .collect())
+}
+
+/// A recorded write's members: its recorded parent set, carriers left out.
+///
+/// The set is [`recorded_parent_set`]'s, and a carrier is one
+/// [`EarlierWrites::recorded_carriers`] finds or one recorded under the label
+/// `adopt` gives a carrier ([`carrier_label`]).
+pub fn recorded_members(
+    repo: &Repo,
+    (release, event, write): (&str, &Entry, &RecordedWrite),
+    writes: &EarlierWrites,
+) -> Result<Vec<RecordedParent>, jj::JjError> {
+    let recorded = recorded_parent_set(repo, (event, write))?;
+    let commits: Vec<CommitId> = recorded
+        .iter()
+        .map(|parent| CommitId::new(parent.commit.as_str()))
+        .collect();
+    let carriers = writes.recorded_carriers(repo, &commits)?;
+    let label = carrier_label(release);
+    Ok(recorded
+        .into_iter()
+        .filter(|parent| {
+            !carriers.contains(&CommitId::new(parent.commit.as_str()))
+                && !parent.branches.contains(&label)
+        })
+        .collect())
+}
+
+/// A recorded write of a release whose members match a release's
+/// ([`matched_write`]).
+#[derive(Debug)]
+pub struct MatchedWrite<'a> {
+    pub event: &'a Entry,
+    pub write: RecordedWrite,
+    /// The write's members ([`recorded_members`]).
+    pub members: Vec<RecordedParent>,
+}
+
+/// The newest recorded write of `release` whose members match `members`.
+///
+/// `members` are a release's parents with its carriers left out, and the
+/// write's are [`recorded_members`]'s ([`parents_match`]). `None` when no
+/// write matches: the membership changed outside knives.
+pub fn matched_write<'a>(
+    repo: &Repo,
+    (entries, release): (&'a [Entry], &'a str),
+    writes: &EarlierWrites,
+    members: &[CommitId],
+) -> Result<Option<MatchedWrite<'a>>, jj::JjError> {
+    for (event, write) in recorded_write_events(entries, release) {
+        let recorded = recorded_members(repo, (release, event, &write), writes)?;
+        if parents_match(repo, &recorded, members)? {
+            return Ok(Some(MatchedWrite {
+                event,
+                write,
+                members: recorded,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether the write's `recorded` members and `members` match one to one.
+///
+/// A recorded member matches the commit it names, or failing that a visible
+/// rewrite of it with the same change id, which is what jj leaves when a
+/// member is reworded or rebased in place. A recorded member this repository
+/// does not hold matches by its id alone.
+fn parents_match(
+    repo: &Repo,
+    recorded: &[RecordedParent],
+    members: &[CommitId],
+) -> Result<bool, jj::JjError> {
+    if recorded.len() != members.len() {
+        return Ok(false);
+    }
+    let mut open: Vec<&CommitId> = members.iter().collect();
+    let mut rewritten = Vec::new();
+    for parent in recorded {
+        match open
+            .iter()
+            .position(|member| member.as_str() == parent.commit)
+        {
+            Some(at) => {
+                open.swap_remove(at);
+            }
+            None => rewritten.push(parent),
+        }
+    }
+    for parent in rewritten {
+        if repo.resolve_commit(&parent.commit).is_err() {
+            return Ok(false);
+        }
+        let change = repo.change_id_of(&parent.commit)?;
+        let mut found = None;
+        for (at, member) in open.iter().enumerate() {
+            if repo.change_id_of(member.as_str())? == change {
+                found = Some(at);
+                break;
+            }
+        }
+        let Some(at) = found else {
+            return Ok(false);
+        };
+        open.swap_remove(at);
+    }
+    Ok(true)
 }
 
 /// The branch label a carrier of `release` ([`carriers`]) takes where a
@@ -1338,6 +1581,38 @@ mod carrier_tests {
     }
 
     #[test]
+    fn a_copy_that_keeps_a_recorded_change_id_is_a_carrier_where_the_write_is_absent() {
+        // Given: a cut this repository never held, recorded with the change
+        // id of a commit it does hold (a fast-forward copy of the cut, pushed
+        // from another clone), and a member no event names.
+        let _environment = crate::config::test_support::environment_lock();
+        let directory = tempfile::tempdir().expect("create test directory");
+        let path = repository(directory.path(), &["member", "copy"]);
+        let (member, copy) = (at(&path, "member"), at(&path, "copy"));
+        let opened = Repo::open(&path).expect("open test repository");
+        let change = opened.change_id_of(copy.as_str()).expect("read change id");
+        let absent = CommitId::new("f".repeat(40));
+        assert!(opened.resolve_commit(absent.as_str()).is_err());
+        let entries = [event(
+            RELEASE,
+            format!(
+                "cut {RELEASE} as {} (change {}) with 1 parent(s): feat/member",
+                absent.short(),
+                change.short()
+            ),
+            &absent,
+        )];
+
+        // When: the release's parents are read for carriers, the publish
+        // remote holding no ref of the name.
+        let found = carriers(&opened, RELEASE, &[member, copy.clone()], (&entries, None))
+            .expect("read carriers");
+
+        // Then: the copy is a carrier by its change id; the member is not.
+        assert_eq!(found, [copy]);
+    }
+
+    #[test]
     fn a_member_a_bare_commit_and_another_releases_write_are_not_carriers() {
         // Given: a write recorded under another release name, and a member
         // and a bare commit no event names as a write.
@@ -1375,5 +1650,67 @@ mod carrier_tests {
             carrier_label(RELEASE),
             "integration earlier write (carrier, not a member)"
         );
+    }
+
+    #[test]
+    fn a_parent_recorded_with_the_carrier_label_is_a_carrier_and_one_recorded_as_a_member_is_not() {
+        // Given: an adopt event of the release whose parent set lists a
+        // pushed resolution with the carrier label, and no event recording
+        // that resolution as a write.
+        let _environment = crate::config::test_support::environment_lock();
+        let directory = tempfile::tempdir().expect("create test directory");
+        let path = repository(directory.path(), &["member", "adopted", "pushed"]);
+        let (member, adopted, pushed) = (
+            at(&path, "member"),
+            at(&path, "adopted"),
+            at(&path, "pushed"),
+        );
+        let mut adopt = event(
+            RELEASE,
+            format!(
+                "edited {RELEASE} as {} with 2 parent(s): adopted: a resolution",
+                adopted.short()
+            ),
+            &adopted,
+        );
+        adopt.parents = vec![
+            RecordedParent {
+                commit: member.as_str().to_owned(),
+                branches: vec!["feat/member".to_owned()],
+            },
+            RecordedParent {
+                commit: pushed.as_str().to_owned(),
+                branches: vec![carrier_label(RELEASE)],
+            },
+        ];
+        let opened = Repo::open(&path).expect("open test repository");
+        let parents = [member, pushed.clone()];
+
+        // When: the release's parents are read for carriers.
+        let found = carriers(
+            &opened,
+            RELEASE,
+            &parents,
+            (std::slice::from_ref(&adopt), None),
+        )
+        .expect("read carriers");
+
+        // Then: the labelled parent is a carrier.
+        assert_eq!(found, vec![pushed]);
+
+        // When (control): the same parent is recorded under a member's branch.
+        if let Some(labelled) = adopt.parents.get_mut(1) {
+            labelled.branches = vec!["feat/pushed".to_owned()];
+        }
+        let found = carriers(
+            &opened,
+            RELEASE,
+            &parents,
+            (std::slice::from_ref(&adopt), None),
+        )
+        .expect("read carriers");
+
+        // Then: it is a member.
+        assert_eq!(found, Vec::<CommitId>::new());
     }
 }

@@ -7,14 +7,15 @@
 //! is the replaced write's, plus each earlier write of the name a
 //! fast-forward push added, labelled a carrier. Refused: a plan with
 //! problems, another series' name, an upstream trunk that does not resolve, a
-//! divergent or absent release, a name with no recorded write, a parent set
-//! that is not the write's plus carriers (a child of the release included),
-//! conflicts, a working copy on the commit, a published write the publish
-//! remote has not replaced (a `record: published` note names one this
-//! repository never held), and a change beyond the conflicts with no reason.
-//! The write itself, or a re-signed copy, is
-//! nothing to adopt. A resolution that drops every line a member added is
-//! recorded and exits with findings.
+//! divergent or absent release, a name with no recorded write, members that
+//! match no recorded write (a child of the release included), conflicts, a
+//! working copy on the commit, a hand edit of a published release the publish
+//! remote does not hold, and a change beyond the conflicts with no reason. The
+//! newest write itself, or a re-signed copy, is nothing to adopt; an older one
+//! is recorded as the newest. A member's lost lines are counted against the
+//! baseline (D8): exit 1 for any line lost from a plain file the baseline left
+//! without a conflict, or every line lost from a conflicted file or a release
+//! log.
 
 #![allow(
     clippy::expect_used,
@@ -471,9 +472,9 @@ fn adopt_refuses_a_release_with_no_recorded_write() {
 }
 
 #[test]
-fn adopt_refuses_an_extra_parent_that_is_no_earlier_write_and_names_it() {
+fn adopt_refuses_an_extra_parent_as_a_membership_change_and_names_the_knives_verbs() {
     // Given: the cut given one more parent by hand, a branch no write of the
-    // name ever was.
+    // name ever had: its members match no recorded write (T5 (s)).
     let (lab, home, _consumer) = two_branch_cut();
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
     let gamma = commit_at(&lab, "feat/gamma");
@@ -490,14 +491,16 @@ fn adopt_refuses_an_extra_parent_that_is_no_earlier_write_and_names_it() {
     // When: it is adopted.
     let output = adopt(&lab, &home, &[]);
 
-    // Then: refused, naming the extra parent.
+    // Then: refused as a membership change made outside knives, which
+    // belongs in the verbs that record a composition, and nothing is
+    // recorded.
     let out = stdout(&output);
     assert_eq!(output.status.code(), Some(3), "{}", text(&output));
     assert!(
         out.contains(&format!(
-            "  extra parent {} (feat/gamma): no parent of the recorded write, and no earlier \
-             write of {RELEASE}\n",
-            gamma.short()
+            "demo: {RELEASE}'s members differ from every recorded write; make the change with \
+             `knives release include`, `drop` or `advance` (a member added by hand: drop it, then \
+             include it); that write records the new composition, marked unchecked\n"
         )),
         "{out}"
     );
@@ -507,7 +510,8 @@ fn adopt_refuses_an_extra_parent_that_is_no_earlier_write_and_names_it() {
 #[test]
 fn adopt_refuses_a_resolution_made_as_a_child_of_the_release() {
     // Given: the conflict resolved in a new commit on top of the cut, the
-    // release name moved onto it.
+    // release name moved onto it: its only parent is an earlier write of the
+    // release, so its members match no recorded write (T5 (s)).
     let (lab, home) = conflicted_cut();
     let cut = commit_at(&lab, RELEASE);
     lab.jj_work(["new", RELEASE, "-m", "resolve shared.txt"]);
@@ -520,15 +524,14 @@ fn adopt_refuses_a_resolution_made_as_a_child_of_the_release() {
     // When: it is adopted.
     let output = adopt(&lab, &home, &[]);
 
-    // Then: refused, saying to squash the resolution into the release commit.
+    // Then: refused, saying to squash the resolution into the release commit
+    // and adopt that.
     let out = stdout(&output);
     assert_eq!(output.status.code(), Some(3), "{}", text(&output));
     assert!(
         out.contains(&format!(
-            "  {} is a child of the release commit {}: squash the resolution into the release \
-             commit (`jj squash --from {} --into {}`), then adopt again",
-            child.short(),
-            cut.short(),
+            "demo: every parent of {RELEASE} is an earlier write: squash the resolution into the \
+             release commit (`jj squash --from {} --into {}`), then adopt\n",
             child.short(),
             cut.short()
         )),
@@ -617,14 +620,25 @@ fn adopt_refuses_over_a_published_write_the_publish_remote_does_not_hold() {
     // When: it is adopted, with a reason for the repair.
     let output = adopt(&lab, &home, &["--why", "a repair"]);
 
-    // Then: refused: consumers were given the cut, and origin still holds it.
+    // Then: refused with the one published remedy: consumers were given the
+    // cut, and origin still holds it; the repair is redone on a new dated
+    // name, then abandoned, as nothing else rests on it.
     assert_eq!(output.status.code(), Some(3), "{}", text(&output));
     assert!(
         stdout(&output).contains(&format!(
-            "demo: {RELEASE} is published (a record: published note names {}); adopting it \
-             would move a published release: cut a new dated release first, then adopt that; \
-             origin does not hold {}",
+            "demo: {RELEASE} is published (a record: published note names {}), so a hand edit \
+             cannot be recorded under it: move {RELEASE} back to its published commit \
+             ({RELEASE}@origin, {}) (`jj bookmark set {RELEASE} -r {} --allow-backwards`), then \
+             if the working copy is on {} or on an empty commit on it, `jj new 'trunk()'`, then \
+             cut a new dated name, \
+             then `jj restore --from {} --into <new name>`, then adopt the new name, then `jj \
+             abandon {}`, then `jj bookmark forget {RELEASE}` (never `jj bookmark delete`, \
+             which a push would carry to the remote)\n",
             cut.short(),
+            cut.short(),
+            cut.short(),
+            repaired.short(),
+            repaired.short(),
             repaired.short()
         )),
         "{}",
@@ -930,12 +944,27 @@ fn the_ygo_rewritten_member_conflict_resolved_by_hand_is_adopted() {
 
 #[test]
 fn adopting_a_superseded_name_only_the_publish_remote_holds_clears_its_drift() {
-    // Given: a conflicted cut resolved by hand, pushed and marked published,
-    // then superseded by a cut of the same composition under a newer name,
-    // whose reap forgot the old name here; a fetch brings back the publish
-    // remote's ref of it, at the resolution no event records.
+    // Given: a conflicted cut superseded by a cut of the same composition
+    // under a newer name, whose reap forgot the old name here; then the old
+    // name resolved by hand from the members, pushed and marked published,
+    // and forgotten here again, so only the publish remote holds it, at the
+    // resolution no event records.
     let (lab, home) = conflicted_cut();
-    finish_in_place(&lab, &[("shared.txt", "alpha\nbeta\n")]);
+    // The working copy steps off the release, or the reap keeps it for that.
+    lab.jj_work(["new", "main@origin"]);
+    let newer = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(
+        stdout(&newer).contains("cut release/2026-08-05 as"),
+        "{}",
+        text(&newer)
+    );
+    // The newer cut carries the conflict, so its reap keeps the old name as
+    // the record of its last resolution; it is forgotten here by hand.
+    lab.jj_work(["bookmark", "forget", RELEASE]);
+    lab.jj_work(["new", "feat/alpha", "feat/beta", "-m", RELEASE]);
+    std::fs::write(lab.work.join("shared.txt"), "alpha\nbeta\n").expect("resolve");
+    lab.jj_work(["bookmark", "create", RELEASE, "-r", "@"]);
+    lab.jj_work(["new", "main@origin"]);
     let resolved = commit_at(&lab, RELEASE);
     lab.push_branch(RELEASE);
     let noted = lab::knives(
@@ -953,16 +982,7 @@ fn adopting_a_superseded_name_only_the_publish_remote_holds_clears_its_drift() {
         ],
     );
     assert!(noted.status.success(), "{}", text(&noted));
-    // The working copy steps off the release, or the reap keeps it for that.
-    lab.jj_work(["new", "main@origin"]);
-    let newer = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
-    assert!(
-        stdout(&newer).contains("cut release/2026-08-05 as"),
-        "{}",
-        text(&newer)
-    );
-    let opened = knives::jj::Repo::open(&lab.work).expect("open");
-    assert_eq!(opened.local_bookmark_tip(RELEASE), None, "{}", text(&newer));
+    lab.jj_work(["bookmark", "forget", RELEASE]);
     lab.fetch_work();
     assert_eq!(commit_at(&lab, &format!("{RELEASE}@origin")), resolved);
     let before = audit_report(&lab, &home);
@@ -1085,9 +1105,12 @@ fn adopting_where_the_recorded_write_is_missing_measures_against_an_automerge() 
 }
 
 #[test]
-fn adopt_refuses_over_a_published_write_this_repository_does_not_hold() {
-    // Given: a cut the work checkout made, which a `record: published` note
-    // names, resolved by hand in the second clone and not pushed.
+fn adopt_records_a_hand_edit_whose_only_published_mark_names_a_write_never_held_here() {
+    // Given: a cut the work checkout made and never pushed, which a `record:
+    // published` note names, resolved by hand in the second clone and not
+    // pushed. Published is read as the edit verbs read it, over the release
+    // and the publish remote's commit: the note names neither, since origin
+    // holds no commit of the name.
     let (lab, home, cut, resolved) = resolved_in_second_clone(false);
     let noted = lab::knives(
         &lab,
@@ -1104,27 +1127,31 @@ fn adopt_refuses_over_a_published_write_this_repository_does_not_hold() {
         ],
     );
     assert!(noted.status.success(), "{}", text(&noted));
-    let before = ledger_entries(&home);
 
     // When: the release is adopted in the second clone, which never held the
     // cut.
     let output = adopt_in_second_clone(&lab, &home);
 
-    // Then: refused from the note alone: consumers were given the cut, and
-    // origin does not hold the resolution.
-    assert_eq!(output.status.code(), Some(3), "{}", text(&output));
+    // Then: it is recorded against an automerge of its members, with no
+    // published remedy.
+    let out = stdout(&output);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(!out.contains("is published"), "{out}");
     assert!(
-        stdout(&output).contains(&format!(
-            "demo: {RELEASE} is published (a record: published note names {}); adopting it \
-             would move a published release: cut a new dated release first, then adopt that; \
-             origin does not hold {}",
-            cut.short(),
-            resolved.short()
+        out.contains(&format!(
+            "  baseline: an automerge of its 2 member parent(s) with the release-log union, \
+             because this repository does not hold the recorded cut {}\n",
+            cut.short()
         )),
-        "{}",
-        text(&output)
+        "{out}"
     );
-    assert_eq!(ledger_entries(&home), before);
+    assert_eq!(
+        newest_event(&home, RELEASE)
+            .evidence
+            .first()
+            .map(String::as_str),
+        Some(resolved.as_str())
+    );
 }
 
 #[test]
@@ -1239,6 +1266,252 @@ fn a_fast_forward_carrier_is_adopted_and_labelled_as_no_member() {
     assert_eq!(
         event.evidence.first().map(String::as_str),
         Some(commit_at(&lab, "integration").as_str())
+    );
+    let report = audit_report(&lab, &home);
+    assert!(findings(&report, "release-drift").is_empty(), "{report}");
+}
+
+#[test]
+fn a_plain_file_the_baseline_left_clean_losing_one_member_line_exits_with_findings() {
+    // Given (q17): a cut with no conflict, then one of the two lines alpha
+    // added to its own file removed by hand.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "one\ntwo\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    finish_in_place(&lab, &[("alpha.txt", "one\n")]);
+
+    // When: it is adopted with a reason.
+    let output = adopt(&lab, &home, &["--why", "dropped a line"]);
+
+    // Then: recorded, and the one lost line is flagged and exits 1.
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        out.contains(
+            "  !! feat/alpha: 1 of 2 added line(s) of alpha.txt absent from the resolution: a \
+             file the baseline left without a conflict\n"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("as the newest write of"), "{out}");
+}
+
+/// Alpha and beta each creating `shared.txt` with three lines of their own,
+/// cut, the conflict resolved by hand to `resolution`, then adopted.
+fn three_line_conflict_adopted(resolution: &str) -> std::process::Output {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "shared.txt", "a1\na2\na3\n");
+    lab.branch("feat/beta", "shared.txt", "b1\nb2\nb3\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert!(
+        stdout(&cut).contains(&format!("cut {RELEASE} as")),
+        "{}",
+        text(&cut)
+    );
+    finish_in_place(&lab, &[("shared.txt", resolution)]);
+    adopt(&lab, &home, &[])
+}
+
+#[test]
+fn a_conflicted_file_keeping_part_of_a_members_block_is_counted_and_exits_clean() {
+    // Given (q18): the conflict resolved with two of alpha's three lines.
+    // When: it is adopted.
+    let output = three_line_conflict_adopted("a1\na2\nb1\nb2\nb3\n");
+
+    // Then: the partial loss is counted and reported, and the exit is 0.
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        out.contains(
+            "  feat/alpha: 1 of 3 added line(s) of shared.txt absent from the resolution\n"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("!!"), "{out}");
+}
+
+#[test]
+fn a_conflicted_file_losing_every_block_of_a_member_exits_with_findings() {
+    // Given (q18): the conflict resolved to beta's side alone.
+    // When: it is adopted.
+    let output = three_line_conflict_adopted("b1\nb2\nb3\n");
+
+    // Then: alpha's loss is flagged and the exit is 1.
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        out.contains(
+            "  !! feat/alpha: 3 of 3 added line(s) of shared.txt absent from the resolution: \
+             every line it added is gone\n"
+        ),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_renumbered_ygo_changelog_exits_clean_and_one_losing_a_members_section_does_not() {
+    // Given (q19): the ygo history's unioned cut of split-from-store and
+    // sami11, sami11's heading renumbered by hand.
+    let (lab, home) = unioned_first_cut();
+    let renumbered = file_at_revision(&lab, RELEASE, "CHANGELOG.md").replacen(
+        "## [1.55.1-sami.11] — 2026-11-13",
+        "## [1.55.1-sami.12] — 2026-11-13",
+        1,
+    );
+    finish_in_place(&lab, &[("CHANGELOG.md", &renumbered)]);
+
+    // When: it is adopted with the reason.
+    let output = adopt(&lab, &home, &["--why", "renumbered sami11's section"]);
+
+    // Then: the renumber keeps sami11's block, so the exit is 0.
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(!stdout(&output).contains("!!"), "{}", text(&output));
+
+    // Given: the same cut in a new lab, sami11's whole section removed.
+    let (lab, home) = unioned_first_cut();
+    let (preamble, sections) = ygo_preamble_and_sections();
+    let without = format!("{preamble}{}{sections}", block(SPLIT_LOG));
+    finish_in_place(&lab, &[("CHANGELOG.md", &without)]);
+
+    // When: it is adopted with a reason.
+    let output = adopt(&lab, &home, &["--why", "dropped sami11's section"]);
+
+    // Then: sami11's change is gone from the release log, which exits 1.
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        out.lines().any(|line| line.starts_with("  !! sami11: ")
+            && line.contains("added line(s) of CHANGELOG.md absent from the resolution")),
+        "{out}"
+    );
+}
+
+/// A trunk whose release log holds one section, and a member `name`
+/// inserting `sections` above it.
+fn log_member(lab: &Lab, name: &str, sections: &str) {
+    lab.jj_work(["new", "-r", "main@origin", "-m", name]);
+    std::fs::write(
+        lab.work.join("CHANGELOG.md"),
+        format!("{sections}{LOG_BASE}"),
+    )
+    .expect("write the log");
+    lab.jj_work(["bookmark", "create", name, "-r", "@"]);
+    lab.jj_work(["new"]);
+}
+
+const LOG_BASE: &str = "## [1.0.0]\n- base\n";
+
+/// A lab whose trunk, upstream and on the fork, holds [`LOG_BASE`].
+fn log_lab() -> Lab {
+    let lab = Lab::new();
+    lab.upstream_trunk_file("CHANGELOG.md", LOG_BASE);
+    lab.mirror_upstream_trunk_to_origin();
+    lab
+}
+
+#[test]
+fn a_members_two_sections_split_by_another_members_section_exit_clean() {
+    // Given: alpha inserting two sections in one change, beta one, unioned
+    // by the cut; then beta's section moved between alpha's two by hand, the
+    // shape ygo's split-one-path left.
+    let lab = log_lab();
+    log_member(&lab, "feat/alpha", "## [1.2.0]\n- two\n## [1.1.0]\n- one\n");
+    log_member(&lab, "feat/beta", "## [1.1.5]\n- other\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert!(
+        stdout(&cut).contains(&format!("cut {RELEASE} as")),
+        "{}",
+        text(&cut)
+    );
+    finish_in_place(
+        &lab,
+        &[(
+            "CHANGELOG.md",
+            &format!("## [1.2.0]\n- two\n## [1.1.5]\n- other\n## [1.1.0]\n- one\n{LOG_BASE}"),
+        )],
+    );
+
+    // When: it is adopted with a reason.
+    let output = adopt(&lab, &home, &["--why", "ordered the sections"]);
+
+    // Then: each of alpha's sections is a block still there, so the exit is
+    // 0.
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(!stdout(&output).contains("!!"), "{}", text(&output));
+}
+
+#[test]
+fn a_one_line_section_dropped_from_the_release_log_exits_with_findings() {
+    // Given: alpha inserting a section, delta a one-line one, unioned by the
+    // cut; then delta's line removed by hand.
+    let lab = log_lab();
+    log_member(&lab, "feat/alpha", "## [1.1.0]\n- one\n");
+    log_member(&lab, "feat/delta", "## [1.4.0] delta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert!(
+        stdout(&cut).contains(&format!("cut {RELEASE} as")),
+        "{}",
+        text(&cut)
+    );
+    finish_in_place(
+        &lab,
+        &[("CHANGELOG.md", &format!("## [1.1.0]\n- one\n{LOG_BASE}"))],
+    );
+
+    // When: it is adopted with a reason.
+    let output = adopt(&lab, &home, &["--why", "dropped delta's section"]);
+
+    // Then: delta's only block is gone, which exits 1.
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        out.contains("  !! feat/delta: 1 of 1 added line(s) of CHANGELOG.md absent"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_release_moved_back_to_an_older_recorded_write_is_adopted_as_the_newest() {
+    // Given (k): a cut, then an include, then the name moved back to the cut.
+    let (lab, home, _consumer) = two_branch_cut();
+    let cut = commit_at(&lab, RELEASE);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    assert!(included.status.success(), "{}", text(&included));
+    lab.jj_work([
+        "bookmark",
+        "set",
+        RELEASE,
+        "-r",
+        cut.as_str(),
+        "--allow-backwards",
+    ]);
+
+    // When: it is adopted.
+    let output = adopt(&lab, &home, &[]);
+
+    // Then: the cut is recorded as the newest write, and audit finds no
+    // drift.
+    let out = stdout(&output);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        out.contains(&format!(
+            "demo: adopted {} as the newest write of {RELEASE}, replacing the recorded cut {}",
+            cut.short(),
+            cut.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(
+        newest_event(&home, RELEASE)
+            .evidence
+            .first()
+            .map(String::as_str),
+        Some(cut.as_str())
     );
     let report = audit_report(&lab, &home);
     assert!(findings(&report, "release-drift").is_empty(), "{report}");

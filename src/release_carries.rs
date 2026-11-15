@@ -23,14 +23,12 @@ use super::parallelism;
 /// Inspect a release's direct parents and, on request, replay their content:
 /// the release `reference` names, or the one in hand.
 ///
-/// The ledger is pulled first, as every release command's is, when the
-/// answer reads it beyond labelling the release's earlier writes: with no
-/// `reference` the release in hand is the plan's, and `verify` holds the
-/// release against its newest recorded write when it is not that write. A
-/// pull that failed is one of the report's problems. The plan's other
-/// problems (a consumer whose pins could not be read) are not: they are
-/// about the next cut, not about which release this is. A named release read
-/// without `verify` labels its carriers from the ledger this machine has.
+/// With no `reference`, the release in hand is the plan's, from a ledger
+/// pulled first as every release command's is; a pull that failed is one of
+/// the report's problems. The plan's other problems (a consumer whose pins
+/// could not be read) are not: they are about the next cut, not about which
+/// release this is. A named release labels its carriers from the ledger this
+/// machine has.
 #[allow(
     clippy::too_many_arguments,
     reason = "the fork, the registry its ledger is pulled through, the reference, the replay request and the output format are independent inputs"
@@ -48,7 +46,7 @@ pub(crate) fn run_release_members(
     let forge = CliForge;
     let cache_root = knives::forge_cache::cache_root();
     let heads = knives::consumer_pins::ConsumerHeadMemo::default();
-    let (entries, pull_problems) = if reference.is_none() || verify {
+    let (entries, pull_problems) = if reference.is_none() {
         release::pulled_ledger(fork, registry)?
     } else {
         (
@@ -83,24 +81,14 @@ pub(crate) fn run_release_members(
     Ok(exit)
 }
 
-/// Findings for a release that lost content, and for one that carries a
-/// divergence from its recorded write that no `adopt` recorded.
 fn members_exit(report: &release::MembersReport, verify: bool) -> Exit {
     if !report.problems.is_empty() {
-        return Exit::Incomplete;
-    }
-    let Some(audit) = report.audit.as_ref().filter(|_| verify) else {
-        return Exit::Ok;
-    };
-    let lost = if audit.passed() {
-        Exit::Ok
-    } else {
+        Exit::Incomplete
+    } else if verify && report.audit.as_ref().is_some_and(|audit| !audit.passed()) {
         Exit::Findings
-    };
-    lost.worst(release::carried_exit(
-        audit,
-        report.unrecorded == Some(true),
-    ))
+    } else {
+        Exit::Ok
+    }
 }
 
 fn print_members(report: &release::MembersReport, output: Output) -> anyhow::Result<()> {

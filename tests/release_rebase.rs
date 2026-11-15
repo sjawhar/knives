@@ -322,6 +322,16 @@ fn a_rebase_moves_the_whole_composition_onto_the_target() {
     lab.jj_work(["new", "release/2026-08-04"]);
     std::fs::write(lab.work.join("shared.txt"), "resolved\n").expect("resolve conflict");
     lab.jj_work(["squash"]);
+    // The hand resolution is recorded before the rebase: every write refuses
+    // a release carrying a change knives did not write or adopt.
+    let adopted = knives_release(&lab, &home, &["adopt", "release/2026-08-04"]);
+    assert!(
+        String::from_utf8_lossy(&adopted.stdout)
+            .contains("as the newest write of release/2026-08-04"),
+        "adopt did not record the resolution: {}\n{}",
+        String::from_utf8_lossy(&adopted.stdout),
+        String::from_utf8_lossy(&adopted.stderr)
+    );
     let old_alpha = commit_at(&lab, "feat/alpha");
     lab.advance_upstream("advance\n");
 

@@ -151,9 +151,6 @@ fn members_verify_reports_a_dropped_members_content() {
     let output = knives_release(&lab, &home, &["members", "--verify"]);
 
     // Then: the lost member is a finding, rather than a successful inspection.
-    // The release is no recorded write, so it is held against the cut it
-    // replaced and the row sends the operator to `adopt`, whose count of each
-    // member's added lines absent from the resolution (D8) measures the loss.
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         output.status.code(),
@@ -163,11 +160,10 @@ fn members_verify_reports_a_dropped_members_content() {
     );
     assert!(
         stdout.contains(&format!(
-            "  feat/beta@{}: diverges where the unrecorded in-hand release already does; \
-             record it with `knives release adopt` and cut again",
+            "!! feat/beta@{}: the cut tree is missing or diverges from the member's content",
             dropped_beta.as_str().chars().take(12).collect::<String>()
         )),
-        "the dropped member must be named as the unrecorded release's to adopt: {stdout}"
+        "the dropped member must be named under missing: {stdout}"
     );
 }
 

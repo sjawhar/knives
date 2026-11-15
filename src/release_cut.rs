@@ -112,6 +112,50 @@ pub(crate) fn run_release(
             Some((_, commit)) => previous_writes.carriers(&opened.parent_commits(commit.as_str())?),
             None => Vec::new(),
         };
+        // A cut built over a release that carries a change knives did not
+        // write or adopt would carry it forward under a new name, after which
+        // it reads as recorded; so the tree decides before any audit does,
+        // and the cut refuses whatever the audit's rows would say. The rows
+        // name a release that is recorded as one; one knives could not check
+        // is cut, says so, and its event carries the mark.
+        let (carried_from, unchecked) = match &previous {
+            Some((reference, commit)) => {
+                let entries = Ledger::for_fork(fork).read()?.entries;
+                let published = tips.get(&BookmarkRef::Remote {
+                    branch: reference.branch().clone(),
+                    remote: RemoteName::new(entry.publish_remote()),
+                });
+                let in_hand = release::InHand {
+                    repo: &opened,
+                    ledger: &entries,
+                    name: reference.branch().as_str(),
+                    commit,
+                    writes: &previous_writes,
+                    published,
+                };
+                let standing = release::in_hand_write(&in_hand)?;
+                if let Some(refusal) = release::in_hand_refusal(&in_hand, &standing, entry)? {
+                    println!("{repo}: refusing to cut {name}: {refusal}");
+                    println!("{repo}: cut discarded; nothing was written at all.");
+                    return Ok(Exit::Incomplete);
+                }
+                let from = match &standing {
+                    release::InHandWrite::Recorded => release::CarriedFrom::Recorded,
+                    release::InHandWrite::Unchecked(unchecked) => {
+                        println!(
+                            "{repo}: {}",
+                            release::unchecked_line(in_hand.name, commit, unchecked)
+                        );
+                        release::CarriedFrom::Unchecked
+                    }
+                    release::InHandWrite::Unrecorded { .. } | release::InHandWrite::NoRecord => {
+                        release::CarriedFrom::Unledgered
+                    }
+                };
+                (from, release::unchecked_suffix(&standing))
+            }
+            None => (release::CarriedFrom::Unledgered, String::new()),
+        };
         let (carried, members, audit_base) = if let Some((_, previous)) = &previous {
             let parents: Vec<knives::ids::CommitId> = opened
                 .parent_commits(previous.as_str())?
@@ -191,22 +235,6 @@ pub(crate) fn run_release(
             trunk: &trunk,
             tips: &tips,
         };
-        // A divergence the previous release already has is a recorded
-        // resolution only when that release is knives' own write. A hand edit
-        // of a recorded write that nothing recorded may have dropped a
-        // member's change, so its carried rows send the operator to `adopt`,
-        // which measures the resolution. A release the ledger records no
-        // write of has nothing for `adopt` to replace and reads as it did.
-        let previous_unrecorded = match &previous {
-            Some((reference, commit)) => release::in_hand_write(
-                &opened,
-                &gate.ledger.read()?.entries,
-                reference.branch().as_str(),
-                commit,
-            )?
-            .is_unrecorded(),
-            None => false,
-        };
         // A cut names a composition consumers can pin. When the publish remote
         // already holds the previous cut with exactly this tree on exactly these
         // parents, a new name ships nothing and only burns a dated name and a
@@ -276,12 +304,9 @@ pub(crate) fn run_release(
                             trunk: &audit_base,
                         },
                     )?;
-                    if let Some(exit) = report_cut_audit(repo, &audit, previous_unrecorded) {
+                    if let Some(exit) = report_cut_audit(repo, &audit, carried_from) {
                         return Ok(exit);
                     }
-                    // Beside the refusal, never through it: the cut is
-                    // recorded and the exit says what it carried.
-                    worst = worst.worst(release::carried_exit(&audit, previous_unrecorded));
                     let mut subject = release::CutSubject::Committed(published);
                     let (recorded, check) =
                         match recorded_composition_check(repo, &mut subject, &gate, allow_drop)? {
@@ -299,6 +324,7 @@ pub(crate) fn run_release(
                         stated_drop: None,
                         // Recorded as published, not written: knives unioned nothing.
                         unions: &[],
+                        unchecked: &unchecked,
                     };
                     record_cut_event(fork, &completed, bound)?;
                     println!(
@@ -338,12 +364,9 @@ pub(crate) fn run_release(
                 trunk: &audit_base,
             },
         )?;
-        if let Some(exit) = report_cut_audit(repo, &audit, previous_unrecorded) {
+        if let Some(exit) = report_cut_audit(repo, &audit, carried_from) {
             return Ok(exit);
         }
-        // Beside the refusal, never through it: the cut is written and the
-        // exit says what it carried.
-        worst = worst.worst(release::carried_exit(&audit, previous_unrecorded));
         let (recorded, check) = {
             let mut subject = release::CutSubject::Candidate(&mut candidate);
             match recorded_composition_check(repo, &mut subject, &gate, allow_drop)? {
@@ -371,6 +394,7 @@ pub(crate) fn run_release(
             check: &check,
             stated_drop: orphaned.as_ref(),
             unions: &unions,
+            unchecked: &unchecked,
         };
         record_cut_event(fork, &completed, bound)?;
         worst = worst.worst(report_completed_cut(fork, &opened, &completed, bound)?);
@@ -449,15 +473,15 @@ fn release_plan_exit(
 /// unexplained content refuses the cut, because naming it would look exactly
 /// like success while work is gone. The refused candidate was never a
 /// published operation, so nothing is abandoned and nothing needs cleanup.
-/// A divergence carried from a previous release no event records is named
-/// as such (`previous_unrecorded`); the caller turns it into findings.
+/// A divergence carried from the release in hand reads as that release's
+/// recorded resolution when it is knives' own write (`previous_recorded`).
 fn report_cut_audit(
     repo: &RepoName,
     audit: &release::CutAudit,
-    previous_unrecorded: bool,
+    previous_recorded: release::CarriedFrom,
 ) -> Option<Exit> {
     for name in &audit.carried {
-        println!("{}", release::carried_row(name, previous_unrecorded));
+        println!("{}", release::carried_row(name, previous_recorded));
     }
     // Each name is a member's bookmark, read from the repository.
     for name in &audit.inconclusive {
@@ -679,6 +703,9 @@ struct CompletedCut<'a> {
     stated_drop: Option<&'a OrphanedLineage>,
     /// The release logs the cut wrote as the union of their sides.
     unions: &'a [knives::jj::UnionedFile],
+    /// The mark the event ends with when knives could not check the release
+    /// the cut duplicates ([`release::unchecked_suffix`]); empty otherwise.
+    unchecked: &'a str,
 }
 
 /// Record which branches and commits became a published release cut.
@@ -745,12 +772,13 @@ fn record_cut_event(
         ..Draft::event(
             Some(cut.name),
             format!(
-                "cut {} as {} (change {}) with {} parent(s): {members_text}{delta}{}",
+                "cut {} as {} (change {}) with {} parent(s): {members_text}{delta}{}{}",
                 cut.name,
                 cut.created.short(),
                 change.short(),
                 members.len(),
-                union_event_text(cut.unions)
+                union_event_text(cut.unions),
+                cut.unchecked
             ),
             None,
         )
@@ -779,7 +807,10 @@ fn report_completed_cut(
         cut.request.parents.len()
     );
     match knives::jj::conflicted_files(&fork.checkout.path, cut.created.as_str()) {
-        Ok(files) => println!("{}", release::conflict_guidance(&files, cut.unions)),
+        Ok(files) => println!(
+            "{}",
+            release::conflict_guidance(cut.name, &files, cut.unions)
+        ),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
     if let Some(first) = cut.request.parents.first() {
@@ -1222,9 +1253,15 @@ impl ReapPayload {
 /// finish. A commit kept because a tag or another bookmark still pins it is
 /// neither: every ref knives owns is gone and the commit stays on purpose, so
 /// there is nothing to act on, and a cut whose reap met one must not exit
-/// non-zero for as long as the pin exists.
-const fn reap_exit(report: &knives::commands::release::ReapReport) -> Exit {
-    if report.kept.is_empty() && report.notes.is_empty() {
+/// non-zero for as long as the pin exists. Neither is a cut kept only for
+/// what its own name published on it (D16): consumers were given that, and
+/// the newer cut redoes it.
+fn reap_exit(report: &knives::commands::release::ReapReport) -> Exit {
+    let acted_on = report
+        .kept
+        .iter()
+        .any(|(name, _)| !report.kept_published.contains(name));
+    if !acted_on && report.notes.is_empty() {
         Exit::Ok
     } else {
         Exit::Findings
@@ -1399,6 +1436,7 @@ mod tests {
                 "release/2026-01-02".to_owned(),
                 format!("the working copy of workspace ws{HOSTILE} rests on it"),
             )],
+            kept_published: Vec::new(),
             notes: vec![format!(
                 "release/2026-01-03: refs forgotten: jj said\nError: {HOSTILE}"
             )],

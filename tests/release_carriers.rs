@@ -403,9 +403,9 @@ fn a_fast_forward_carrier_is_labelled_and_left_out_of_the_next_include_and_cut()
 }
 
 #[test]
-fn an_extra_parent_beside_a_carrier_that_is_no_earlier_write_is_refused_by_name() {
+fn an_extra_parent_beside_a_carrier_is_refused_as_a_membership_change_outside_knives() {
     // Given: the fast-forward shape with one more parent, a branch no write
-    // of the release ever was.
+    // of the release ever had: its members match no recorded write.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     park(&lab);
@@ -420,7 +420,6 @@ fn an_extra_parent_beside_a_carrier_that_is_no_earlier_write_is_refused_by_name(
     std::fs::write(lab.work.join("stranger.txt"), "stranger\n").expect("write");
     lab.jj_work(["bookmark", "create", "feat/stranger", "-r", "@"]);
     park(&lab);
-    let stranger = commit_at(&lab, "feat/stranger");
     lab.jj_work([
         "rebase",
         "-r",
@@ -433,21 +432,19 @@ fn an_extra_parent_beside_a_carrier_that_is_no_earlier_write_is_refused_by_name(
     // When: it is adopted.
     let output = knives_release(&lab, &home, &["adopt"]);
 
-    // Then: refused, naming the stranger and not the carrier.
+    // Then: refused as a membership change made outside knives, which belongs
+    // in the verbs that record a composition; the carrier is named nowhere.
     let out = stdout(&output);
     assert_eq!(output.status.code(), Some(3), "{}", text(&output));
     assert!(
         out.contains(&format!(
-            "  extra parent {} (feat/stranger): no parent of the recorded write, and no earlier \
-             write of {RELEASE}\n",
-            stranger.short()
+            "demo: {RELEASE}'s members differ from every recorded write; make the change with \
+             `knives release include`, `drop` or `advance` (a member added by hand: drop it, then \
+             include it); that write records the new composition, marked unchecked\n"
         )),
         "{out}"
     );
-    assert!(
-        !out.contains(&format!("extra parent {}", carrier.short())),
-        "{out}"
-    );
+    assert!(!out.contains(carrier.short()), "{out}");
     assert_eq!(ledger_entries(&home), before);
 }
 
@@ -970,6 +967,18 @@ fn a_member_reworded_under_a_tagged_release_stays_when_its_rewrite_is_dropped() 
     assert!(!is_visible(&lab, &member), "the describe hid m");
     fast_forward(&lab);
     assert!(is_visible(&lab, &member), "the fast-forward brings m back");
+    // Control: a rule that reads a shared change id in either direction
+    // (`Repo::rewrites_of`) names the visible m as a rewrite of the reworded
+    // m, so it would take the reworded m for superseded. Only the walk from
+    // the newer version back tells which one rewrote the other.
+    assert_eq!(
+        Repo::open(&lab.work)
+            .expect("open")
+            .rewrites_of(reworded.as_str())
+            .expect("read the change"),
+        vec![member.clone()],
+        "the reworded m and m share a change id, both visible"
+    );
 
     // When: the reworded m is dropped by its id.
     release_ok(

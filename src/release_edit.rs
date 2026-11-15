@@ -127,6 +127,10 @@ struct EditContext<'a> {
     /// The fork the current directory is inside, by the name its claims are
     /// kept under; the ledger event's author is derived from it.
     bound: Bound<'a>,
+    /// The mark the edit's ledger event ends with when knives could not check
+    /// the release in hand against its recorded writes
+    /// ([`release::unchecked_suffix`]); empty otherwise.
+    unchecked: &'a str,
     /// The release's last recorded parent set, from this repository's ledger.
     ///
     /// Ancestry and change ids cover a branch that grew or was rebased by jj. A
@@ -496,6 +500,85 @@ pub(crate) fn refuse_unresolved_trunk(
     true
 }
 
+/// Refuse, saying what to do, a write over a release in hand that carries a
+/// change knives did not write or adopt ([`release::in_hand_refusal`]):
+/// `Err` after refusing, otherwise how the release stands. `verb` names the
+/// write refused.
+///
+/// Written over such a release, the write would carry the change forward,
+/// and the next write would read it as knives' own, though nothing measured
+/// what it kept of each member. So it refuses before it writes, naming the
+/// `adopt` that measures and records it, or the remedy `adopt` itself gives.
+pub(crate) fn refuse_unrecorded(
+    (repo, verb): (&RepoName, &str),
+    entry: &knives::config::RepoEntry,
+    release: &release::InHand<'_>,
+) -> anyhow::Result<Result<release::InHandWrite, Exit>> {
+    let standing = release::in_hand_write(release)?;
+    let Some(refusal) = release::in_hand_refusal(release, &standing, entry)? else {
+        return Ok(Ok(standing));
+    };
+    println!("{repo}: {verb} refused, nothing written: {refusal}");
+    Ok(Err(Exit::Incomplete))
+}
+
+/// Say so before a write over a release in hand knives could not check
+/// against its recorded writes ([`release::unchecked_line`]), and give the
+/// mark the write's ledger event ends with ([`release::unchecked_suffix`]):
+/// nothing for any other release.
+pub(crate) fn unchecked_mark(
+    repo: &RepoName,
+    release: &release::InHand<'_>,
+    standing: &release::InHandWrite,
+) -> String {
+    if let release::InHandWrite::Unchecked(unchecked) = standing {
+        println!(
+            "{repo}: {}",
+            release::unchecked_line(release.name, release.commit, unchecked)
+        );
+    }
+    release::unchecked_suffix(standing)
+}
+
+/// Refuse, saying why, an edit of the release in hand that carries a change
+/// knives did not write or adopt ([`refuse_unrecorded`]), or one that is
+/// published ([`published_refusal`]): `Err` after refusing, otherwise the
+/// mark the edit's event ends with ([`unchecked_mark`]). `published` is the
+/// publish remote's commit of the release in jj's view.
+fn refuse_edit_in_hand(
+    (repo, verb): (&RepoName, &str),
+    entry: &knives::config::RepoEntry,
+    (opened, ledger): (&knives::jj::Repo, &[knives::ledger::Entry]),
+    (release, published): (&ReleaseInHand, Option<&knives::ids::CommitId>),
+) -> anyhow::Result<Result<String, Exit>> {
+    let in_hand = release::InHand {
+        repo: opened,
+        ledger,
+        name: &release.name,
+        commit: &release.commit,
+        writes: &release.writes,
+        published,
+    };
+    let standing = match refuse_unrecorded((repo, verb), entry, &in_hand)? {
+        Ok(standing) => standing,
+        Err(exit) => return Ok(Err(exit)),
+    };
+    if let Some(refusal) = published_refusal(
+        opened,
+        ledger,
+        release::ReleaseAt {
+            scheme: &entry.release_scheme(),
+            name: &release.name,
+            commits: &[Some(&release.commit), published],
+        },
+        ("editing", "edit"),
+    )? {
+        println!("{repo}: {refusal}");
+        return Ok(Err(Exit::Incomplete));
+    }
+    Ok(Ok(unchecked_mark(repo, &in_hand, &standing)))
+}
+
 /// Refuse, saying so, an edit of a release every pin of which is frozen:
 /// `true` after refusing. Follows from who pins it, exactly as for a rebase: a
 /// consumer that follows the branch sees the edit, one frozen on a revision
@@ -599,19 +682,15 @@ fn edit_release(
         release_name,
         (&ledger, plan.published.as_ref()),
     )?;
-    if let Some(refusal) = published_refusal(
-        &opened,
-        &ledger,
-        release::ReleaseAt {
-            scheme: &entry.release_scheme(),
-            name: &release.name,
-            commits: &[Some(&release.commit), plan.published.as_ref()],
-        },
-        ("editing", "edit"),
+    let unchecked = match refuse_edit_in_hand(
+        (repo, change.verb()),
+        entry,
+        (&opened, &ledger),
+        (&release, plan.published.as_ref()),
     )? {
-        println!("{repo}: {refusal}");
-        return Ok(Exit::Incomplete);
-    }
+        Ok(unchecked) => unchecked,
+        Err(exit) => return Ok(exit),
+    };
     let releases = knives::release_model::release_refs_by_commit(
         &opened.bookmark_tips()?,
         &entry.release_scheme(),
@@ -626,6 +705,7 @@ fn edit_release(
         entry,
         recorded: last_recorded_parents(&ledger, &release.name),
         bound,
+        unchecked: &unchecked,
         stacked: StackedHistoryContext {
             repo: &opened,
             trunks: &release.trunk_tips,
@@ -693,6 +773,7 @@ fn apply_edit(
             change: &written.change,
             provenance: &provenance,
             unions: &written.unions,
+            unchecked: context.unchecked,
         },
         context.bound,
     )?;
@@ -722,7 +803,10 @@ fn apply_edit(
     );
     report_replaced(repo, &release.name, &written);
     match knives::jj::conflicted_files(&fork.checkout.path, created.as_str()) {
-        Ok(files) => println!("{}", release::conflict_guidance(&files, &written.unions)),
+        Ok(files) => println!(
+            "{}",
+            release::conflict_guidance(&release.name, &files, &written.unions)
+        ),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
     Ok(Exit::Ok)
@@ -857,8 +941,9 @@ pub(crate) fn release_writes(
 }
 
 /// What one release edit wrote: the name, the delta, the new merge with its
-/// change id, its parent set with the branch each parent came from, and the
-/// release logs it unioned.
+/// change id, its parent set with the branch each parent came from, the
+/// release logs it unioned, and the mark of a release in hand knives could
+/// not check ([`release::unchecked_suffix`]).
 pub(crate) struct EditRecord<'a> {
     pub(crate) release: &'a str,
     pub(crate) delta: &'a str,
@@ -866,6 +951,7 @@ pub(crate) struct EditRecord<'a> {
     pub(crate) change: &'a knives::ids::ChangeId,
     pub(crate) provenance: &'a [(String, knives::ids::CommitId)],
     pub(crate) unions: &'a [knives::jj::UnionedFile],
+    pub(crate) unchecked: &'a str,
 }
 
 /// The edit's parent set goes to the ledger the way a cut's does, so a later
@@ -893,14 +979,15 @@ pub(crate) fn record_edit_event(
         ..Draft::event(
             Some(record.release),
             format!(
-                "edited {} as {} (change {}) with {} parent(s): {}; parents: {}{}",
+                "edited {} as {} (change {}) with {} parent(s): {}; parents: {}{}{}",
                 record.release,
                 record.created.short(),
                 record.change.short(),
                 parents.len(),
                 record.delta,
                 members_event_text(record.provenance),
-                union_event_text(record.unions)
+                union_event_text(record.unions),
+                record.unchecked
             ),
             None,
         )
