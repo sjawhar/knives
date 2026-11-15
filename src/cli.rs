@@ -597,14 +597,16 @@ pub enum ReleaseAction {
     /// For a release finished by hand: its conflicts resolved, a release log
     /// renumbered, a repair made on the release commit itself. Until it is
     /// recorded, audit reads that commit as drift from the write knives
-    /// recorded. The commit must have no conflicts, and the parents of the
-    /// write it replaces, plus any earlier write of the same name a
-    /// fast-forward push added. It is measured against that write (or, where
-    /// this repository lacks it, a fresh merge of its parents): the files it
-    /// resolved are reported, with the lines each member added that it no
-    /// longer holds, and a file changed outside the conflicts needs `--why`.
-    /// Writes no commit and moves no bookmark: the record is a ledger event,
-    /// and earlier writes of the name that nothing rests on are abandoned.
+    /// recorded, and `cut`, `include`, `drop`, `advance` and `rebase` refuse
+    /// to write over a hand change it carries. The commit must have no
+    /// conflicts, and the parents of the write it replaces, plus any earlier
+    /// write of the same name a fast-forward push added. It is measured
+    /// against that write (or, where this repository lacks it, a fresh merge
+    /// of its parents): the files it resolved are reported, with the lines
+    /// each member added that it no longer holds, and a file changed outside
+    /// the conflicts needs `--why`. Writes no commit and moves no bookmark:
+    /// the record is a ledger event, and earlier writes of the name that
+    /// nothing rests on are abandoned.
     Adopt {
         /// The release name. Defaults to the release in hand.
         reference: Option<String>,

@@ -78,11 +78,13 @@ A command records an event that it sees. A failed ledger write fails the command
 | `finish` | `claim released`, with the supersession if given, also when unheld. It carries `claim_change` `released` where a claim was released, and no claim change where none was held. |
 | `track --pr/--fork-only/--forget` | The changed statement. |
 | `depends --on` | `requires <owner>/<name>#<number>`, by upstream name, however `--on` spelled it. |
-| `release cut` | The full parent set, the cut change id beside the commit id, and the carried-parent delta from the prior cut. |
-| `release include/drop/advance/rebase` | `edited <release> as <commit> (change <id>) with <n> parent(s): <delta>; parents: …`. `audit` holds the release against the commits its cut and edit events name. |
+| `release cut` | The full parent set, the cut change id beside the commit id, and the carried-parent delta from the prior cut. It ends with `; union: <files>` when the cut wrote release logs as a union. |
+| `release include/drop/advance/rebase` | `edited <release> as <commit> (change <id>) with <n> parent(s): <delta>; parents: …`, ending with `; union: <files>` when the write wrote release logs as a union. `audit` holds the release against the commits its cut and edit events name. |
+| `release adopt` | An `edited` event too: `edited <release> as <commit> (change <id>) with <n> parent(s): adopted: <what changed>; parents: …`. `<what changed>` names the write it replaces and the baseline, the files resolved by hand, the files changed beyond the baseline's conflicts with the `--why`, the carriers, and each member's count of absent added lines. The evidence is the commit, then its parents. `audit` and every reader of edit events, an older knives too, read it as the name's newest write. |
 | `sync` | Tracked PRs that merged, closed, reopened or advanced. First sightings are silent. So is a transition that the ledger already holds as the newest for that PR ([sharing](#sharing-between-machines)). |
 
-- Cut and edit events carry `parents` frontmatter: the full commit of each parent and **every** local bookmark on it. This lets a later `advance` or `include` find a member after a rebuild outside jj or an upstream merge. All names are kept, so the bookmark of another agent cannot hide the member name.
+- Cut, edit and adopt events carry `parents` frontmatter: the full commit of each parent and **every** local bookmark on it. This lets a later `advance` or `include` find a member after a rebuild outside jj or an upstream merge. All names are kept, so the bookmark of another agent cannot hide the member name.
+- An adopt event copies the `parents` of the write it replaces, so each member keeps the branch names it was recorded under. It adds one entry per carrier, whose branch is the label `<release> earlier write (carrier, not a member)`, so no reader takes it for a member. Where the replaced event has no `parents` (an older knives wrote it), adopt builds the list as a write does. A cut or edit leaves carriers out of the parent set, so its `parents` name none.
 - The cut change id survives conflict-resolution rewrites before push.
 - Unchanged PRs write nothing. knives never injects ledger contents into sessions. You read them on purpose.
 
@@ -215,8 +217,8 @@ destination: {git_dir, remote, forks, commits, pulled, pushes, discarded, skippe
 
 ### Which commands pull first
 
-- Pull first: `status`, `sync`, `audit`, `pushed`, `depends`, `track --forget`, and release commands that read the ledger. Those are the plan, `cut`, `rebase`, `include`, `drop`, `advance`, and `members` without `REF` (it reads the ledger to name the release in hand).
-- Read no ledger and pull nothing: `members <REF>`, `--carries`, `--census`.
+- Pull first: `status`, `sync`, `audit`, `pushed`, `depends`, `track --forget`, and release commands that read the ledger. Those are the plan, `cut`, `rebase`, `include`, `drop`, `advance`, `adopt`, `members` without `REF` (it reads the ledger to name the release in hand), and `members --verify` (it holds the release against its newest recorded write).
+- `members <REF>` without `--verify` pulls nothing. It reads the local ledger only to label carriers. `--carries` and `--census` read no ledger and pull nothing.
 - `reap` pulls nothing and reads the local ledger: the commits it records knives writing under each superseded name, and their rewrites, count for the keep rule and are cleaned up after it. A `cut` reads the ledger, too, to name the workspaces left from branches it records.
 - No pull: `notch`, `start`, `finish`, `track --pr`, `track --fork-only`. They build nothing from what they read. They read a statement only to stamp their entry with a PR number, and to stamp theirs after the live one.
 - A failed pull, a `ledger` that no local git directory reaches, and a refused setup are each a problem that names the cause. Reports still answer from local entries, and exit `3`.

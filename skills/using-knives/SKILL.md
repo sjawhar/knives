@@ -24,6 +24,7 @@ Run `knives ledger migrate` once on each machine. Until the migration moves the 
 - **Keep dependencies.** `depends <branch> --on <repo>#<number>` says the branch cannot merge before that PR. Never keep a dependent and drop its requirement: the release cannot work. A status report does not authorize discarding either.
 - **One branch is both release member and PR head.** It is linear past the shared release base. Never make a second "release-lineage" or sibling copy so that it composes. Moving the release base is an intentional release operation.
 - **Change releases explicitly.** Make release names only with `release cut`, never by hand. `--allow-drop` states an intended drop. It is not a way past a refusal. Before any release change, read the pin gates and cut evidence in [releases](references/releases.md). A fork with named release series (one per base, such as 9.3 and 9.2) needs `knives release --series <name>` to act on any series but the default.
+- **Adopt a hand resolution before the next write.** After you resolve, renumber or repair a release commit by hand, run `knives release adopt <name>`. Add `--why` for a change outside the conflicts. Until then, `cut`, `include`, `drop`, `advance` and `rebase` refuse. See [adopt](references/releases.md#knives-release-adopt-name---why-text).
 - **Before a raw branch rebase**, run fork-work's bidirectional gate (§7). Is the branch a parent of a release/keep merge, or does it descend from one? Bare `release members` sees only the release in hand. Keep published merge ids, because a broad `jj rebase -b` can rewrite them. Read the [rebase rules](references/releases.md) first.
 
 ## Commands
@@ -43,13 +44,13 @@ Open a reference when you run the command or read its output.
 | State a PR link or prerequisite | `track`, `depends` | [coordination](references/coordination.md) |
 | Read or record decisions and evidence | `notch [SUBJECT]` | [ledger](references/ledger.md) |
 | Share the ledger, or migrate an old one | `ledger sweep`, `ledger migrate` | [ledger](references/ledger.md) |
-| Plan, edit, cut, rebase, reap a release | `release ...` | [releases](references/releases.md) |
+| Plan, edit, cut, rebase, adopt, reap a release | `release ...` | [releases](references/releases.md) |
 | Identity, trust, plugin | `register`, registry, plugin | [configuration](references/configuration.md) |
 
 - These change local state: `sync`, `start`, `finish`, `track`, `depends`, ledger writes, release edits. A ledger write starts a background sweep that pushes it when the ledger is [shared](references/ledger.md#sharing-between-machines).
 - These pull a shared ledger first: `status`, `sync`, `audit`, `pushed`, and release commands that read the ledger.
 - `audit` and `pushed` never repair, remove, push or open PRs.
-- Release commands never push. Publish with `jj git push --remote <publish-remote> --bookmark <name>`.
+- Release commands never push. Publish a new release name with `jj git push --remote <publish-remote> --bookmark <name>`. Push a release that the publish remote moves only forward with plain `git push`, after the fast-forward rebase and `adopt`. Never use `jj git push` for it. See [publishing](references/releases.md#publishing).
 - `knives hook claude-code|opencode` is harness plumbing. Do not run it.
 
 ## Is this content carried?
@@ -63,10 +64,10 @@ Use the replay probe, never a source-text search. A symbol's presence does not s
 
 | Verdict | Evidence |
 |---|---|
-| `carried-exact` | The revision tip is an ancestor of the target. |
+| `carried-exact` | The revision tip is an ancestor of the target. Against a release, the release's tree also holds its change: its net change replays empty, and a release-log block that a union holds counts as held. |
 | `carried-rewritten` | Replay of its net change leaves the target unchanged. Equivalent content arrived differently, or it has no net change. |
 | `carried-rebased` | Replay differs, but a commit with its change id is an ancestor. Weaker than rewritten: divergent changes can name different trees. |
-| `NOT carried` | Replay leaves a clean non-empty diff, and no rewrite is in the target. |
+| `NOT carried` | Replay leaves a clean non-empty diff, and no rewrite is in the target. A member of a release reads this when the release's tree lost its change. |
 | `conflicted` | Replay conflicts, and no rewrite is in the target. Some content can be present, so this needs judgment. |
 
 ## Output and exit codes

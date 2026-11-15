@@ -1025,9 +1025,10 @@ pub struct RecordedWrite {
     pub commit: CommitId,
 }
 
-/// Every commit knives itself put under `release`, newest first: what each cut
-/// event or edit event (`include`, `drop`, `advance`, `rebase`) records first
-/// in its evidence.
+/// Every commit knives itself put under `release`, or took in as its own with
+/// `knives release adopt`, newest first: what each cut event or edit event
+/// (`include`, `drop`, `advance`, `rebase`, and `adopt`, which records an
+/// edit event) records first in its evidence.
 ///
 /// An edit writes a new commit under the same name, so a release that equals
 /// its last edit is knives' own work, not drift, and a publish remote at an

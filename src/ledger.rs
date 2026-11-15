@@ -277,11 +277,13 @@ pub struct Entry {
     /// only. Never a forge call: this is a write path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<u64>,
-    /// The parent set a release cut or edit left behind, one item per parent
-    /// with every local bookmark holding it at the time. Written by `cut`,
-    /// `include`, `drop`, `advance` and `rebase`; the record a later edit uses
-    /// to tell which parent is which branch once a rebase done outside jj has
-    /// left no ancestry or change id to say so.
+    /// The parent set a release cut, edit or adopt recorded, one item per
+    /// parent with every local bookmark holding it at the time. Written by
+    /// `cut`, `include`, `drop`, `advance` and `rebase`, and by `adopt`, which
+    /// copies the replaced write's list and adds each fast-forward carrier
+    /// under the label `<release> earlier write (carrier, not a member)`; the
+    /// record a later edit uses to tell which parent is which branch once a
+    /// rebase done outside jj has left no ancestry or change id to say so.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parents: Vec<RecordedParent>,
     /// What happened to the claim on the subject, as [`ClaimChange`] words it;
@@ -1073,7 +1075,7 @@ pub struct Draft<'a> {
     /// caller. Never a forge call: a round trip here would make every claim,
     /// track and sync pay for a network hop to record what it just did.
     pub pr: Option<u64>,
-    /// The parent set a release cut or edit leaves behind; empty for every
+    /// The parent set a release cut, edit or adopt records; empty for every
     /// other entry.
     pub parents: Vec<RecordedParent>,
     /// What the write this entry records did to the claim on its subject, as

@@ -2556,9 +2556,13 @@ pub fn audit_cut(
             RebaseOutcome::Empty => {}
             RebaseOutcome::Conflicted if cut_is_conflicted => audit.inconclusive.push(name.clone()),
             RebaseOutcome::CleanNonEmpty | RebaseOutcome::Conflicted => {
-                // Divergence the previous release already carried is a recorded
-                // resolution, not a loss: refusing it would make every release
-                // with a hand-resolved conflict fail its own re-cut forever.
+                // Divergence the release held against already carried is that
+                // release's resolution, carried forward, not a loss: refusing
+                // it would make every release with a hand-resolved conflict
+                // fail its own re-cut forever. Whether that resolution is
+                // recorded is the caller's question, not this audit's: a hand
+                // edit nothing recorded may have dropped a member's change, so
+                // it is `knives release adopt` that measures it before a cut.
                 let carried_before = match context.previous {
                     Some(previous) => !matches!(
                         crate::jj::probe_net_diff(
