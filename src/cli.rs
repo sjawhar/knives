@@ -342,7 +342,9 @@ pub enum Command {
         /// box. Requires a durable reason.
         #[arg(long, requires = "why")]
         force: bool,
-        /// Why this forced finish is safe.
+        /// Why you are finishing. The ledger records it every time: as the
+        /// released claim's reason, or, where no claim was held, in the text
+        /// of the entry this finish writes. `--force` requires it.
         #[arg(long)]
         why: Option<String>,
         /// Record that this branch was superseded by another.

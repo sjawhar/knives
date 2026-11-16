@@ -3,6 +3,11 @@
 //! [`current_identity`] records both the claimant's name and how it was resolved.
 //! The claim-lifecycle matrix introduced in Task 2 consumes that resolution kind.
 //!
+//! On a fork that shares its ledger, `start` and `finish` read a branch's
+//! claims the same way ([`SharedClaims`]), weigh them with the same rule
+//! ([`decide`], [`SharedClaims::readable`]), and say what became of a read or
+//! a change of the ledger's claim in the same words.
+//!
 //! Enforcement layer three. Advisory on purpose: layers one and two are
 //! default-correct paths and detectors, and hard refusal waits for evidence
 //! that advice was insufficient.
@@ -10,7 +15,10 @@
 
 use crate::commands::hook::owner_for;
 use crate::config::Registry;
-use crate::ids::UpstreamName;
+use crate::ids::{BranchName, BranchTarget, CommitId, UpstreamName};
+use crate::ledger::{Draft, Scribe, inline_human_text, problem_human_text};
+use crate::ledger_git::{ClaimRecord, ClaimRef, HeldClaim, Refusal};
+use crate::ledger_sweep::{self, ClaimOutcome, LedgerFailure, NotApplied, SharedFork};
 use crate::store::{Claim, OwnerKind};
 
 /// The registry the current directory was bound against, and the fork it is
@@ -359,6 +367,203 @@ fn os_user() -> Identity {
         owner: std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned()),
         kind: OwnerKind::OsUser,
     }
+}
+
+/// The claims of a branch of a fork that shares its ledger, as `start` and
+/// `finish` find them on the ledger's remote and in this machine's state
+/// file.
+#[derive(Debug)]
+pub struct SharedClaims {
+    /// The ledger's claim: its commit, and the claim it records, as the
+    /// state file keeps a copy of it, or why its record does not read.
+    pub ledger: Option<(CommitId, Result<Claim, String>)>,
+    /// What the state file holds for the branch: a local claim, or a copy
+    /// of a ledger claim.
+    pub recorded: Option<Claim>,
+}
+
+impl SharedClaims {
+    pub fn new(target: &BranchTarget, held: Option<HeldClaim>, recorded: Option<Claim>) -> Self {
+        let ledger = held.map(|held| {
+            let claim = held
+                .record
+                .map(|record| copy_of(target, &held.commit, record));
+            (held.commit, claim)
+        });
+        Self { ledger, recorded }
+    }
+
+    /// The ledger's claim, where its record reads.
+    pub fn on_ledger(&self) -> Option<&Claim> {
+        self.ledger
+            .as_ref()
+            .and_then(|(_, claim)| claim.as_ref().ok())
+    }
+
+    /// A local claim: what the state file holds, where that is not a copy of
+    /// a ledger claim, which decides nothing.
+    pub fn local(&self) -> Option<&Claim> {
+        self.recorded
+            .as_ref()
+            .filter(|claim| claim.ledger_commit.is_none())
+    }
+
+    /// Every claim present whose holder can be read: the ledger's, then a
+    /// local one.
+    pub fn present(&self) -> Vec<&Claim> {
+        self.on_ledger().into_iter().chain(self.local()).collect()
+    }
+
+    /// Whether any claim is present, one whose holder cannot be read
+    /// included.
+    pub fn any(&self) -> bool {
+        self.ledger.is_some() || self.local().is_some()
+    }
+
+    /// Whether `claim`'s activity, its sightings and the processes in its
+    /// workspace, can be read on this machine, `here`.
+    ///
+    /// A local claim's can. The ledger's can only where it was taken on this
+    /// machine and this config home recorded that same claim commit: another
+    /// machine's records are not here, and neither are those of another
+    /// config home under this machine's name.
+    pub fn readable(&self, claim: &Claim, here: &str) -> bool {
+        claim.ledger_commit.is_none()
+            || (claim.machine.as_deref() == Some(here)
+                && self
+                    .recorded
+                    .as_ref()
+                    .is_some_and(|recorded| recorded.ledger_commit == claim.ledger_commit))
+    }
+}
+
+/// The ledger's claim `record` at `commit`, as this machine's state file
+/// keeps a copy of it: under `target`, the branch the command is for,
+/// whatever its record says.
+pub fn copy_of(target: &BranchTarget, commit: &CommitId, record: ClaimRecord) -> Claim {
+    Claim {
+        repo: target.repo.to_string(),
+        branch: target.branch.to_string(),
+        owner: record.owner,
+        kind: record.kind,
+        why: record.why,
+        started: record.started,
+        files: Vec::new(),
+        place: record.place,
+        machine: Some(record.machine),
+        ledger_commit: Some(commit.as_str().to_owned()),
+    }
+}
+
+/// The machine `claim` was taken on: a ledger claim's own, and this one,
+/// `here`, for a local claim, which this machine took.
+pub fn claimed_on<'a>(claim: &'a Claim, here: &'a str) -> &'a str {
+    claim
+        .ledger_commit
+        .as_ref()
+        .and(claim.machine.as_deref())
+        .unwrap_or(here)
+}
+
+/// How an entry names the last sighting of a claim its write displaced.
+///
+/// The sighting's durable token where the claim's activity can be read here
+/// (`last_seen`), else the machine it was taken on, whose records hold it.
+pub fn sighting_provenance(last_seen: Option<crate::seen::LastSeen>, machine: &str) -> String {
+    last_seen.map_or_else(
+        || format!("on machine {machine}"),
+        |last_seen| format!("last seen {}", last_seen_provenance(last_seen)),
+    )
+}
+
+/// The git directory a shared fork's ledger travels through, as a terminal
+/// reads it: a path off disk.
+pub fn git_dir_of(shared: &SharedFork) -> String {
+    inline_human_text(
+        &shared
+            .destination
+            .repository
+            .git_dir()
+            .display()
+            .to_string(),
+    )
+}
+
+/// Why the claim of `branch` could not be read from the ledger: where it
+/// was read from, and git's account of why, which quotes the remote.
+pub fn unread_claim(branch: &BranchName, shared: &SharedFork, failure: &LedgerFailure) -> String {
+    format!(
+        "the claim of {branch} could not be read from the ledger {} ({}): {}",
+        failure.ledger,
+        git_dir_of(shared),
+        problem_human_text(&failure.cause)
+    )
+}
+
+/// Why a change of a claim reached nothing: the ledger, its git directory,
+/// and `cause`, git's account or this process's ([`unapplied_cause`]).
+pub fn unwritten(shared: &SharedFork, failure: &LedgerFailure, cause: &str) -> String {
+    format!(
+        "the ledger {} could not be written ({}): {}",
+        failure.ledger,
+        git_dir_of(shared),
+        problem_human_text(cause)
+    )
+}
+
+/// What a claim change the remote applied nothing of failed on.
+///
+/// git's own account, or, where git refused this machine's ref, that
+/// another machine may be committing under its name and how to rename it.
+pub fn unapplied_cause(shared: &SharedFork, why: &NotApplied, failure: &LedgerFailure) -> String {
+    match why {
+        NotApplied::Refused {
+            refusal: Refusal::MachineRef,
+            ..
+        } => format!(
+            "git refused this machine's ref refs/knives/{} on origin: another machine may be \
+             committing under the same name; give each machine a unique knives.machine with \
+             `git --git-dir={} config knives.machine <unique-name>` ({})",
+            shared.destination.machine,
+            shared.destination.repository.git_dir().display(),
+            failure.cause
+        ),
+        _ => failure.cause.clone(),
+    }
+}
+
+/// The holder of a claim commit whose record does not read, as far as it
+/// can be named.
+///
+/// By its ref and commit, and why its record does not read, which is the
+/// text of whoever wrote the commit, so it goes out escaped.
+pub fn unreadable_holder(
+    target: &BranchTarget,
+    claim: &ClaimRef,
+    commit: &CommitId,
+    cause: &str,
+) -> String {
+    format!(
+        "{} is claimed on the ledger by {claim} at {}, but the holder cannot be read: {}",
+        target.key(),
+        commit.as_str(),
+        problem_human_text(cause),
+    )
+}
+
+/// [`ledger_sweep::change_claim`] with the entry `draft`, written by
+/// `scribe`; the problems its commit passed over go to stderr, one line
+/// each, as a sweep's report shows them.
+pub fn change_on_ledger(
+    change: ledger_sweep::ClaimChange<'_>,
+    scribe: &Scribe,
+    draft: &Draft<'_>,
+) -> ClaimOutcome {
+    let changed = ledger_sweep::change_claim(change, || scribe.record_to(draft));
+    for problem in &changed.problems {
+        eprintln!("!! {}", problem_human_text(problem));
+    }
+    changed.outcome
 }
 
 #[cfg(test)]

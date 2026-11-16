@@ -3442,3 +3442,180 @@ fn a_claim_taken_on_another_machine_is_seized_with_force_and_why() {
     assert_eq!(taken_entry.previous_last_seen, None);
     assert_eq!(taken_entry.claim_change_why.as_deref(), Some("rescue it"));
 }
+
+/// The entry files of `acme/demo` in `home`'s ledger, as the remote's
+/// machine ref spells their paths, sorted.
+fn shared_entries(home: &Path) -> Vec<String> {
+    let mut entries: Vec<String> = std::fs::read_dir(home.join("ledger").join("acme/demo"))
+        .map(|listed| {
+            listed
+                .map(|dirent| {
+                    format!(
+                        "acme/demo/{}",
+                        dirent.expect("an entry").file_name().to_string_lossy()
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort();
+    entries
+}
+
+/// Owner one's start of `feat/gamma` on machine one, which must succeed;
+/// the workspace it made.
+fn start_gamma_on_the_ledger(lab: &Lab, home: &Path) -> std::path::PathBuf {
+    ran(
+        lab,
+        home,
+        "owner-one",
+        &[
+            "--text",
+            "start",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "port it",
+        ],
+    );
+    let workspace = lab.work.parent().expect("parent").join("feat-gamma");
+    assert!(workspace.join(".jj").is_dir(), "fixture: no workspace");
+    workspace
+}
+
+#[test]
+fn finish_on_a_fork_that_shares_its_ledger_removes_the_claim_ref_from_the_remote() {
+    // Given: owner one's claim of a branch on the ledger, taken on machine
+    // one.
+    let lab = Lab::new();
+    let (_remote_dir, remote) = lab::bare_remote();
+    let home = shared_home(&lab, &remote, "machine-one");
+    let workspace = start_gamma_on_the_ledger(&lab, home.path());
+    assert_ne!(
+        lab::git_output(&remote, ["for-each-ref", "refs/knives-claims/"]),
+        "",
+        "fixture: the start left no claim ref"
+    );
+
+    // When: owner one finishes it with a reason.
+    let finished = ran(
+        &lab,
+        home.path(),
+        "owner-one",
+        &[
+            "--text",
+            "finish",
+            "feat/gamma",
+            "--repo",
+            "demo",
+            "--why",
+            "the port landed",
+        ],
+    );
+
+    // Then: the remote holds no claim ref of the branch, and machine one's
+    // ref there carries the release's entry with the claim's, the release
+    // recording its reason.
+    let stdout = String::from_utf8_lossy(&finished.stdout);
+    assert!(
+        stdout.contains("demo/feat/gamma: claim released"),
+        "stdout: {stdout}"
+    );
+    assert_eq!(
+        lab::git_output(&remote, ["for-each-ref", "refs/knives-claims/"]),
+        ""
+    );
+    let entries = shared_entries(home.path());
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    let mut sent: Vec<String> = lab::git_output(
+        &remote,
+        ["ls-tree", "-r", "--name-only", "refs/knives/machine-one"],
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect();
+    sent.sort();
+    assert_eq!(sent, entries);
+    let released = knives::ledger::Ledger::at(home.path().join("ledger").join("acme/demo"))
+        .read()
+        .expect("read the fork's ledger")
+        .entries
+        .into_iter()
+        .find(|entry| entry.claim_change.as_deref() == Some("released"))
+        .expect("a released entry");
+    assert_eq!(
+        released.claim_change_why.as_deref(),
+        Some("the port landed")
+    );
+    // And: this machine's copy of the claim is gone, and so is the
+    // workspace.
+    assert_eq!(shared_gamma_claim(home.path()), Value::Null);
+    assert!(!workspace.exists(), "the workspace survived the finish");
+}
+
+#[test]
+fn a_finish_the_shared_ledger_refuses_releases_nothing_and_says_so() {
+    // Given: owner one's claim of a branch on the ledger, and then a remote
+    // that refuses every push.
+    let lab = Lab::new();
+    let (_remote_dir, remote) = lab::bare_remote();
+    let home = shared_home(&lab, &remote, "machine-one");
+    let workspace = start_gamma_on_the_ledger(&lab, home.path());
+    let (claimed, _) = gamma_claim_on(&remote);
+    let copy = shared_gamma_claim(home.path());
+    let entries = shared_entries(home.path());
+    let machine_ref = || {
+        lab::git_output(
+            &home.path().join("ledger"),
+            ["for-each-ref", "refs/knives/"],
+        )
+    };
+    let before = machine_ref();
+    let hook = remote.join("hooks").join("pre-receive");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\necho 'push refused by the test' >&2\nexit 1\n",
+    )
+    .expect("write the pre-receive hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    // When: owner one finishes the branch.
+    let refused = tried(
+        &lab,
+        home.path(),
+        "owner-one",
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    );
+
+    // Then: it exits 3, naming the ledger, its git directory and the
+    // remote's refusal, and says how to try again.
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(3), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "nothing was released: the ledger acme/ledger could not be written ({}): ",
+            home.path().join("ledger").join(".git").display()
+        )),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("push refused by the test"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("; run `knives finish feat/gamma` again"),
+        "stderr: {stderr}"
+    );
+    // And: the claim ref still holds the claim, this machine still holds
+    // its copy, the workspace is still there, and no entry of a release
+    // stayed behind.
+    assert_eq!(gamma_claim_on(&remote).0, claimed);
+    assert_eq!(shared_gamma_claim(home.path()), copy);
+    assert!(
+        workspace.join(".jj").is_dir(),
+        "the workspace was disposed of"
+    );
+    assert_eq!(shared_entries(home.path()), entries);
+    assert_eq!(machine_ref(), before);
+}

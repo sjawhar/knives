@@ -602,6 +602,108 @@ fn finishing_an_unheld_branch_still_records_the_supersession_it_did_record() {
 }
 
 #[test]
+fn finishing_a_held_branch_with_a_reason_and_no_force_records_the_reason_of_the_release() {
+    // Given: a branch its holder holds, on a fork that shares no ledger
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    hold_claim(&home, "feat/alpha", "ses_fff688");
+
+    // When: the holder finishes it with a reason and without `--force`
+    let finished = knives_finish(&lab, &home, &["feat/alpha", "--why", "the port landed"]);
+
+    // Then: the release's entry records the reason as the reason the claim
+    // changed, and its text is a plain release's
+    assert!(
+        finished.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    let entries = ledger_entries(&home);
+    assert_eq!(entries.len(), 1, "was: {entries:?}");
+    assert_eq!(entries[0].text, "claim released");
+    assert_eq!(entries[0].claim_change.as_deref(), Some("released"));
+    assert_eq!(
+        entries[0].claim_change_why.as_deref(),
+        Some("the port landed"),
+        "was: {entries:?}"
+    );
+}
+
+#[test]
+fn finishing_an_unheld_branch_as_superseded_with_a_reason_ends_its_entry_with_the_reason() {
+    // Given: a branch nobody holds, on a fork that shares no ledger
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: it is finished as superseded, with a reason
+    let finished = knives_finish(
+        &lab,
+        &home,
+        &[
+            "feat/alpha",
+            "--superseded-by",
+            "feat/replacement",
+            "--why",
+            "upstream took another approach",
+        ],
+    );
+
+    // Then: the one entry is the supersession, its text ending with the
+    // reason, and it changes no claim
+    assert!(
+        finished.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    let entries = ledger_entries(&home);
+    assert_eq!(entries.len(), 1, "was: {entries:?}");
+    assert_eq!(
+        entries[0].text,
+        "superseded by feat/replacement: upstream took another approach"
+    );
+    assert_eq!(
+        entries[0].statement,
+        Some(stating(StatementKind::Superseded, Some("feat/replacement")))
+    );
+    assert_eq!(entries[0].claim_change, None, "was: {entries:?}");
+}
+
+#[test]
+fn finishing_an_unheld_branch_with_a_reason_records_it_on_an_entry_that_changes_no_claim() {
+    // Given: a branch nobody holds, on a fork that shares no ledger
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: it is finished with a reason and nothing else
+    let finished = knives_finish(&lab, &home, &["feat/alpha", "--why", "nothing left to do"]);
+
+    // Then: one entry records the reason, and it states nothing and changes
+    // no claim
+    assert!(
+        finished.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&finished.stdout).contains("was not held"),
+        "was: {}",
+        String::from_utf8_lossy(&finished.stdout)
+    );
+    let entries = ledger_entries(&home);
+    assert_eq!(entries.len(), 1, "was: {entries:?}");
+    assert_eq!(
+        entries[0].text,
+        "finished with no claim held: nothing left to do"
+    );
+    assert_eq!(entries[0].statement, None);
+    assert_eq!(entries[0].claim_change, None, "was: {entries:?}");
+    assert_eq!(entries[0].claim_change_why, None, "was: {entries:?}");
+}
+
+#[test]
 fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger() {
     // Given: a managed fork with a branch, and a sibling repo to depend on
     let lab = lab::Lab::new();
