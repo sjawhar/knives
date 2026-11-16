@@ -36,9 +36,17 @@ pub struct Identity {
 /// The inputs relevant to taking or resuming a claim.
 #[derive(Debug)]
 pub struct ClaimContext<'a> {
-    pub held: Option<&'a Claim>,
+    /// Every claim present on the branch. On a fork that shares its ledger:
+    /// the ledger's claim, and a local claim, one in this machine's state
+    /// file with no [`Claim::ledger_commit`]. A copy of a ledger claim in
+    /// the state file is never one: it decides nothing. On any other fork:
+    /// the state file's claim.
+    pub held: Vec<&'a Claim>,
     pub identity: &'a Identity,
     pub in_claimed_workspace: bool,
+    /// This machine's name on the fork's ledger; `None` on a fork that
+    /// shares no ledger, where every claim is this machine's.
+    pub machine: Option<&'a str>,
 }
 
 /// The mutually exclusive outcomes for a claim attempt.
@@ -50,25 +58,64 @@ pub enum ClaimDecision {
     RefuseHeld,
 }
 
-/// Chooses the claim outcome from identity, possession, and the current claim.
+/// Chooses the claim outcome from identity, possession, and the claims
+/// present.
+///
+/// With no claim present the caller takes the branch. It resumes only when
+/// every claim present permits it, and is refused by the first one that
+/// does not ([`refusing`]), whichever kind of claim that is: a local claim
+/// an older knives took binds its own machine as it always did, and a
+/// ledger claim binds every machine that shares the ledger. `possession` is
+/// whether standing in the workspace is what permitted it.
 pub fn decide(context: &ClaimContext<'_>) -> ClaimDecision {
-    match context.held {
-        None => ClaimDecision::Take,
-        Some(_) if context.in_claimed_workspace => ClaimDecision::Resume { possession: true },
-        Some(claim)
-            if claim.kind == context.identity.kind
-                && claim.kind != OwnerKind::OsUser
-                && claim.owner == context.identity.owner =>
-        {
-            ClaimDecision::Resume { possession: false }
-        }
-        Some(claim)
-            if claim.kind == OwnerKind::OsUser && context.identity.kind == OwnerKind::OsUser =>
-        {
-            ClaimDecision::RefuseAnonymous
-        }
-        Some(_) => ClaimDecision::RefuseHeld,
+    if context.held.is_empty() {
+        return ClaimDecision::Take;
     }
+    if let Some(claim) = refusing(context) {
+        return if claim.kind == OwnerKind::OsUser && context.identity.kind == OwnerKind::OsUser {
+            ClaimDecision::RefuseAnonymous
+        } else {
+            ClaimDecision::RefuseHeld
+        };
+    }
+    ClaimDecision::Resume {
+        possession: context
+            .held
+            .iter()
+            .any(|claim| permits_by_possession(claim, context)),
+    }
+}
+
+/// The first claim present that does not permit the caller to resume, if
+/// one does not.
+///
+/// A claim permits its own owner: the same name resolved the same way,
+/// never two anonymous `os-user` callers, who cannot be told apart. It
+/// also permits a caller standing in the branch's workspace, as long as
+/// it was taken on this machine ([`taken_here`]): the directory is evidence
+/// of who works there only on the machine whose directory it is.
+pub fn refusing<'a>(context: &ClaimContext<'a>) -> Option<&'a Claim> {
+    context
+        .held
+        .iter()
+        .copied()
+        .find(|claim| !permits_by_possession(claim, context) && !names(claim, context.identity))
+}
+
+/// Whether `claim` was taken on this machine, the one named `machine` on
+/// the fork's ledger: every claim on a fork that shares no ledger (`None`),
+/// a local claim, and a ledger claim whose machine is this one.
+pub fn taken_here(claim: &Claim, machine: Option<&str>) -> bool {
+    machine.is_none() || claim.ledger_commit.is_none() || claim.machine.as_deref() == machine
+}
+
+fn permits_by_possession(claim: &Claim, context: &ClaimContext<'_>) -> bool {
+    context.in_claimed_workspace && taken_here(claim, context.machine)
+}
+
+/// Whether `claim` names `identity` as its holder.
+fn names(claim: &Claim, identity: &Identity) -> bool {
+    claim.kind == identity.kind && claim.kind != OwnerKind::OsUser && claim.owner == identity.owner
 }
 
 /// Whether standing in the claimed workspace lets this caller release the
@@ -114,6 +161,77 @@ pub fn render_claim_context(
         render_last_seen(last_seen, now),
         crate::ledger::inline_human_text(&claim.why),
     )
+}
+
+/// [`render_claim_context`] for a claim on a fork that shares its ledger,
+/// taken on machine `machine`.
+///
+/// `last_seen` is its sighting where its activity can be read here; where
+/// it cannot (`None`), the line says when the claim was taken instead, and
+/// nothing about a sighting: this machine's records of another machine's
+/// claim, or of one another config home recorded, are empty for want of
+/// looking, and "no activity observed" would say the work is idle. Every
+/// value but the age and the sighting was written by whichever session took
+/// the claim, on whichever machine, so each reaches the terminal escaped.
+pub fn render_shared_claim_context(
+    claim: &Claim,
+    machine: &str,
+    last_seen: Option<crate::seen::LastSeen>,
+    now: jiff::Timestamp,
+) -> String {
+    let claimed_age =
+        crate::ledger::age(&claim.started, now).unwrap_or_else(|| "unknown".to_owned());
+    let holder = format!(
+        "{} is claimed by {} ({}) on machine {}",
+        claim.key(),
+        crate::ledger::inline_human_text(&claim.owner),
+        owner_kind_label(claim.kind),
+        crate::ledger::inline_human_text(machine),
+    );
+    let why = crate::ledger::inline_human_text(&claim.why);
+    last_seen.map_or_else(
+        || {
+            format!(
+                "{holder}, taken {} ({claimed_age} ago): {why}",
+                crate::ledger::inline_human_text(&claim.started)
+            )
+        },
+        |last_seen| {
+            format!(
+                "{holder}, claimed {claimed_age} ago, {}: {why}",
+                render_last_seen(last_seen, now)
+            )
+        },
+    )
+}
+
+/// Why the activity of `claim`, taken on machine `machine`, cannot be read
+/// on this machine, `here`.
+///
+/// Its sightings and its process scan are records of the machine that took
+/// it, and of the config home that recorded it: on another machine there
+/// are none, and on this one a config home that did not record the claim
+/// (a new one under the same machine name) has none either. The place is
+/// where the claim says it was taken, which its holder wrote, so it goes
+/// out escaped, as the machine names do.
+pub fn unreadable_activity(claim: &Claim, machine: &str, here: &str) -> String {
+    if machine == here {
+        format!(
+            "its activity cannot be read here: this config home did not record that claim, \
+             which was taken in {}",
+            claim.place.as_deref().map_or_else(
+                || "a place it does not record".to_owned(),
+                crate::ledger::inline_human_text
+            )
+        )
+    } else {
+        format!(
+            "its activity cannot be read from this machine ({}): its sightings and its \
+             processes are on machine {}",
+            crate::ledger::inline_human_text(here),
+            crate::ledger::inline_human_text(machine)
+        )
+    }
 }
 
 /// Renders a compact claim row for an advisory surface.
@@ -265,6 +383,8 @@ mod tests {
             started: "2026-01-01T00:00:00Z".into(),
             files: Vec::new(),
             place: None,
+            machine: None,
+            ledger_commit: None,
         }
     }
 
@@ -272,6 +392,32 @@ mod tests {
         Identity {
             owner: owner.into(),
             kind,
+        }
+    }
+
+    /// `owner`'s claim on the ledger, taken on `machine`, as `start` reads
+    /// it: with its machine and its claim commit.
+    fn on_ledger(owner: &str, machine: &str) -> Claim {
+        Claim {
+            machine: Some(machine.into()),
+            ledger_commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            ..held(owner, OwnerKind::HarnessSession)
+        }
+    }
+
+    /// What `start` weighs on machine `here` of a fork that shares its
+    /// ledger, for `caller`, with the claims `held` present.
+    fn shared<'a>(
+        here: &'a str,
+        held: Vec<&'a Claim>,
+        caller: &'a Identity,
+        in_claimed_workspace: bool,
+    ) -> ClaimContext<'a> {
+        ClaimContext {
+            held,
+            identity: caller,
+            in_claimed_workspace,
+            machine: Some(here),
         }
     }
 
@@ -538,9 +684,10 @@ mod tests {
     fn an_unclaimed_branch_is_taken() {
         let identity = identity("agent-one", OwnerKind::HarnessSession);
         let context = ClaimContext {
-            held: None,
+            held: Vec::new(),
             identity: &identity,
             in_claimed_workspace: false,
+            machine: None,
         };
 
         assert_eq!(decide(&context), ClaimDecision::Take);
@@ -551,9 +698,10 @@ mod tests {
         let claim = held("agent-one", OwnerKind::HarnessSession);
         let identity = identity("agent-one", OwnerKind::HarnessSession);
         let context = ClaimContext {
-            held: Some(&claim),
+            held: vec![&claim],
             identity: &identity,
             in_claimed_workspace: false,
+            machine: None,
         };
 
         assert_eq!(
@@ -567,9 +715,10 @@ mod tests {
         let claim = held("agent-one", OwnerKind::HarnessSession);
         let identity = identity("agent-two", OwnerKind::HarnessSession);
         let context = ClaimContext {
-            held: Some(&claim),
+            held: vec![&claim],
             identity: &identity,
             in_claimed_workspace: false,
+            machine: None,
         };
 
         assert_eq!(decide(&context), ClaimDecision::RefuseHeld);
@@ -580,9 +729,10 @@ mod tests {
         let claim = held("terminal-user", OwnerKind::OsUser);
         let identity = identity("terminal-user", OwnerKind::OsUser);
         let context = ClaimContext {
-            held: Some(&claim),
+            held: vec![&claim],
             identity: &identity,
             in_claimed_workspace: false,
+            machine: None,
         };
 
         assert_eq!(decide(&context), ClaimDecision::RefuseAnonymous);
@@ -593,9 +743,10 @@ mod tests {
         let claim = held("someone-else", OwnerKind::HarnessSession);
         let identity = identity("terminal-user", OwnerKind::OsUser);
         let context = ClaimContext {
-            held: Some(&claim),
+            held: vec![&claim],
             identity: &identity,
             in_claimed_workspace: true,
+            machine: None,
         };
 
         assert_eq!(decide(&context), ClaimDecision::Resume { possession: true });
@@ -606,9 +757,10 @@ mod tests {
         let claim = held("abc", OwnerKind::HarnessSession);
         let identity = identity("abc", OwnerKind::WorkspaceDerived);
         let context = ClaimContext {
-            held: Some(&claim),
+            held: vec![&claim],
             identity: &identity,
             in_claimed_workspace: false,
+            machine: None,
         };
 
         assert_eq!(decide(&context), ClaimDecision::RefuseHeld);
@@ -619,9 +771,10 @@ mod tests {
         let claim = held("abc", OwnerKind::WorkspaceDerived);
         let identity = identity("abc", OwnerKind::WorkspaceDerived);
         let context = ClaimContext {
-            held: Some(&claim),
+            held: vec![&claim],
             identity: &identity,
             in_claimed_workspace: false,
+            machine: None,
         };
 
         assert_eq!(
@@ -635,9 +788,10 @@ mod tests {
         let claim = held("abc", OwnerKind::HarnessSession);
         let identity = identity("ubuntu", OwnerKind::OsUser);
         let context = ClaimContext {
-            held: Some(&claim),
+            held: vec![&claim],
             identity: &identity,
             in_claimed_workspace: false,
+            machine: None,
         };
 
         assert_eq!(decide(&context), ClaimDecision::RefuseHeld);
@@ -672,5 +826,227 @@ mod tests {
             &held("agent-one", OwnerKind::HarnessSession),
             &identity("agent-one", OwnerKind::WorkspaceDerived)
         ));
+    }
+
+    #[test]
+    fn a_ledger_claim_of_another_owner_refuses_on_every_machine() {
+        // Given: owner one's claim on the ledger, taken on machine one.
+        let theirs = on_ledger("owner-one", "machine-one");
+        let caller = identity("owner-two", OwnerKind::HarnessSession);
+
+        // When/Then: owner two is refused by it on machine one and on
+        // machine two alike.
+        for here in ["machine-one", "machine-two"] {
+            let context = shared(here, vec![&theirs], &caller, false);
+            assert_eq!(decide(&context), ClaimDecision::RefuseHeld, "on {here}");
+            assert_eq!(refusing(&context), Some(&theirs), "on {here}");
+        }
+    }
+
+    #[test]
+    fn a_ledger_claim_resumes_its_owner_on_any_machine() {
+        // Given: owner one's claim on the ledger, taken on machine one.
+        let mine = on_ledger("owner-one", "machine-one");
+        let caller = identity("owner-one", OwnerKind::HarnessSession);
+
+        // When/Then: owner one resumes it by name on either machine.
+        for here in ["machine-one", "machine-two"] {
+            assert_eq!(
+                decide(&shared(here, vec![&mine], &caller, false)),
+                ClaimDecision::Resume { possession: false },
+                "on {here}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_worked_case_of_a_local_claim_and_a_ledger_claim_of_two_owners() {
+        // Given: X's local claim on machine A, which an older knives took,
+        // and Y's claim on the ledger, taken on machine B; Z owns neither.
+        let x_local = held("owner-x", OwnerKind::HarnessSession);
+        let y_ledger = on_ledger("owner-y", "machine-b");
+        let (x, y, z) = (
+            identity("owner-x", OwnerKind::HarnessSession),
+            identity("owner-y", OwnerKind::HarnessSession),
+            identity("owner-z", OwnerKind::HarnessSession),
+        );
+        // Machine A weighs both claims; machine B has only the ledger's.
+        let on_a = vec![&y_ledger, &x_local];
+        let on_b = vec![&y_ledger];
+
+        // X on A is refused by Y's claim: the refusal a `--force --why`
+        // seizes, which replaces X's local claim by a ledger claim.
+        let x_on_a = shared("machine-a", on_a.clone(), &x, false);
+        assert_eq!(decide(&x_on_a), ClaimDecision::RefuseHeld);
+        assert_eq!(refusing(&x_on_a), Some(&y_ledger));
+        // Y on A is refused by X's local claim.
+        let y_on_a = shared("machine-a", on_a.clone(), &y, false);
+        assert_eq!(decide(&y_on_a), ClaimDecision::RefuseHeld);
+        assert_eq!(refusing(&y_on_a), Some(&x_local));
+        // Y on B resumes.
+        assert_eq!(
+            decide(&shared("machine-b", on_b.clone(), &y, false)),
+            ClaimDecision::Resume { possession: false }
+        );
+        // Z is refused everywhere.
+        assert_eq!(
+            decide(&shared("machine-a", on_a, &z, false)),
+            ClaimDecision::RefuseHeld
+        );
+        assert_eq!(
+            decide(&shared("machine-b", on_b, &z, false)),
+            ClaimDecision::RefuseHeld
+        );
+    }
+
+    #[test]
+    fn standing_in_the_workspace_resumes_a_ledger_claim_only_on_the_machine_that_took_it() {
+        // Given: owner one's claim on the ledger, taken on machine one, and
+        // owner two standing in the branch's workspace.
+        let theirs = on_ledger("owner-one", "machine-one");
+        let caller = identity("owner-two", OwnerKind::HarnessSession);
+
+        // When/Then: on machine one the workspace is the claim's own, and
+        // resumes it; on machine two a workspace at the same path is
+        // another directory, and resumes nothing.
+        assert_eq!(
+            decide(&shared("machine-one", vec![&theirs], &caller, true)),
+            ClaimDecision::Resume { possession: true }
+        );
+        let elsewhere = shared("machine-two", vec![&theirs], &caller, true);
+        assert_eq!(decide(&elsewhere), ClaimDecision::RefuseHeld);
+        assert_eq!(refusing(&elsewhere), Some(&theirs));
+    }
+
+    #[test]
+    fn standing_in_the_workspace_resumes_a_local_claim_on_a_fork_that_shares_its_ledger() {
+        // Given: another owner's local claim, which counts as this
+        // machine's, and the caller standing in its workspace.
+        let theirs = held("owner-one", OwnerKind::HarnessSession);
+        let caller = identity("owner-two", OwnerKind::HarnessSession);
+
+        // When/Then: it resumes by possession.
+        assert_eq!(
+            decide(&shared("machine-one", vec![&theirs], &caller, true)),
+            ClaimDecision::Resume { possession: true }
+        );
+    }
+
+    #[test]
+    fn a_resume_any_claim_permits_only_by_the_workspace_is_a_resume_by_possession() {
+        // Given: the caller's own claim on the ledger, and another owner's
+        // local claim, with the caller standing in the workspace.
+        let mine = on_ledger("owner-one", "machine-two");
+        let theirs = held("owner-two", OwnerKind::HarnessSession);
+        let caller = identity("owner-one", OwnerKind::HarnessSession);
+
+        // When/Then: each permits, the local one only by possession.
+        assert_eq!(
+            decide(&shared("machine-one", vec![&mine, &theirs], &caller, true)),
+            ClaimDecision::Resume { possession: true }
+        );
+        // And: away from the workspace, the local claim refuses.
+        assert_eq!(
+            decide(&shared("machine-one", vec![&mine, &theirs], &caller, false)),
+            ClaimDecision::RefuseHeld
+        );
+    }
+
+    #[test]
+    fn two_anonymous_callers_are_refused_as_such_by_a_ledger_claim() {
+        let theirs = Claim {
+            kind: OwnerKind::OsUser,
+            ..on_ledger("terminal-user", "machine-one")
+        };
+        let caller = identity("terminal-user", OwnerKind::OsUser);
+
+        assert_eq!(
+            decide(&shared("machine-two", vec![&theirs], &caller, false)),
+            ClaimDecision::RefuseAnonymous
+        );
+    }
+
+    #[test]
+    fn on_a_fork_that_shares_no_ledger_every_claim_is_this_machines() {
+        // A copy of a ledger claim left behind by a registry that named a
+        // ledger once is still the one claim the state file holds.
+        let left = on_ledger("owner-one", "machine-one");
+
+        assert!(taken_here(&left, None));
+        assert!(taken_here(&left, Some("machine-one")));
+        assert!(!taken_here(&left, Some("machine-two")));
+        assert!(taken_here(
+            &held("owner-one", OwnerKind::HarnessSession),
+            Some("machine-two")
+        ));
+    }
+
+    #[test]
+    fn a_claim_whose_activity_cannot_be_read_shows_when_it_was_taken_and_no_sighting() {
+        let claim = on_ledger("owner-two", "machine-two");
+        let now = "2026-01-03T00:00:00Z".parse().unwrap();
+
+        assert_eq!(
+            render_shared_claim_context(&claim, "machine-two", None, now),
+            "a-repo/feat/alpha is claimed by owner-two (harness-session) on machine machine-two, \
+             taken 2026-01-01T00:00:00Z (2d ago): w"
+        );
+        // Where it can be read, the sighting is today's.
+        assert_eq!(
+            render_shared_claim_context(
+                &claim,
+                "machine-two",
+                Some(crate::seen::LastSeen::NoneSinceClaim),
+                now
+            ),
+            "a-repo/feat/alpha is claimed by owner-two (harness-session) on machine machine-two, \
+             claimed 2d ago, no activity observed since claimed: w"
+        );
+    }
+
+    #[test]
+    fn the_activity_line_names_both_machines_or_the_place_this_config_home_did_not_record() {
+        let claim = Claim {
+            place: Some("box-two 4026531836".into()),
+            ..on_ledger("owner-two", "machine-two")
+        };
+
+        assert_eq!(
+            unreadable_activity(&claim, "machine-two", "machine-one"),
+            "its activity cannot be read from this machine (machine-one): its sightings and its \
+             processes are on machine machine-two"
+        );
+        assert_eq!(
+            unreadable_activity(&claim, "machine-two", "machine-two"),
+            "its activity cannot be read here: this config home did not record that claim, which \
+             was taken in box-two 4026531836"
+        );
+    }
+
+    #[test]
+    fn a_shared_claims_values_reach_the_terminal_escaped() {
+        // The owner, the reason, the time, the place and the machine are
+        // the text of whichever session took the claim, on whichever
+        // machine.
+        let claim = Claim {
+            why: "fix \u{1b}]0;pwned\u{7}".into(),
+            started: "2026-01-01\u{1b}[2J".into(),
+            place: Some("box\u{9b}two".into()),
+            ..on_ledger("owner\u{1b}[31m", "machine\u{7}two")
+        };
+        let now = "2026-01-03T00:00:00Z".parse().unwrap();
+
+        let lines = [
+            render_shared_claim_context(&claim, "machine\u{7}two", None, now),
+            unreadable_activity(&claim, "machine\u{7}two", "machine-one"),
+            unreadable_activity(&claim, "machine\u{7}two", "machine\u{7}two"),
+        ];
+
+        for line in lines {
+            assert!(
+                !line.contains(['\u{1b}', '\u{7}', '\u{9b}']),
+                "a control character reached the terminal: {line:?}"
+            );
+        }
     }
 }

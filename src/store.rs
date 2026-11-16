@@ -63,6 +63,22 @@ pub struct Claim {
     /// workspace is still in use. Absent on claims taken before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub place: Option<String>,
+    /// The `knives.machine` of the ledger git directory the claim was taken
+    /// through, on a fork that shares its ledger; absent on a claim this
+    /// machine keeps to itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    /// The claim commit on the ledger's remote that this is a copy of.
+    ///
+    /// On a fork that shares its ledger, the ledger's claim ref says who
+    /// holds the branch, on every machine; this machine keeps a copy here so
+    /// that `status`, the session hook and preflight, which read this file
+    /// alone, still list it. A copy is right only while the claim ref holds
+    /// this commit, so it decides nothing. A claim with no commit is a local
+    /// claim: one an older knives took, or one taken before the registry
+    /// named a ledger, which binds this machine alone, as it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_commit: Option<String>,
 }
 
 impl Claim {
@@ -415,6 +431,8 @@ impl Store {
         Ok(())
     }
 
+    /// Take a local claim of `target` for `identity`: one this machine keeps
+    /// to itself, as on a fork that shares no ledger.
     pub fn claim(&mut self, target: &BranchTarget, identity: &Identity, why: &str) -> Claim {
         let record = Claim {
             repo: target.repo.to_string(),
@@ -425,9 +443,22 @@ impl Store {
             started: jiff::Timestamp::now().to_string(),
             files: Vec::new(),
             place: Some(crate::liveness::this_place()),
+            machine: None,
+            ledger_commit: None,
         };
         self.set_claim(record.key(), Some(record.clone()));
         record
+    }
+
+    /// Put `copy`, this machine's copy of the ledger's claim of its branch
+    /// ([`Claim::ledger_commit`]), in place of whatever this store holds for
+    /// that branch: a local claim, an older copy, or nothing.
+    ///
+    /// The ledger's claim ref decides who holds the branch, so what this
+    /// file held for it is replaced whole, its `started` and `place`
+    /// included: they are the ledger claim's, wherever it was taken.
+    pub fn copy_ledger_claim(&mut self, copy: Claim) {
+        self.set_claim(copy.key(), Some(copy));
     }
 
     /// Put `why` in place of the reason the claim on `target` carries, and
@@ -954,6 +985,51 @@ mod tests {
 
         assert_eq!(subject.restate_claim(&target(), "port it"), None);
         assert_eq!(subject.claims(None), Vec::<&Claim>::new());
+    }
+
+    #[test]
+    fn a_local_claim_writes_no_machine_and_no_ledger_commit() {
+        // Given: a claim taken on a fork that shares no ledger.
+        let dir = tempfile::tempdir().unwrap();
+        let mut subject = store(dir.path());
+        let _ = subject.claim(&target(), &os_user("someone"), "port it");
+
+        // When: it is saved.
+        subject.save().unwrap();
+
+        // Then: the state file holds neither key, as a knives before them
+        // wrote it.
+        let text = std::fs::read_to_string(dir.path().join("state.json")).unwrap();
+        assert!(!text.contains("\"machine\""), "state was: {text}");
+        assert!(!text.contains("\"ledger_commit\""), "state was: {text}");
+    }
+
+    #[test]
+    fn a_copy_of_a_ledger_claim_replaces_the_claim_held_and_round_trips() {
+        // Given: a local claim of the branch.
+        let dir = tempfile::tempdir().unwrap();
+        let mut subject = store(dir.path());
+        let local = subject.claim(&target(), &os_user("someone"), "port it");
+        subject.save().unwrap();
+        let mut copying = store(dir.path());
+
+        // When: a copy of the ledger's claim of it is put in its place.
+        let copy = Claim {
+            owner: "owner-two".to_owned(),
+            kind: OwnerKind::HarnessSession,
+            started: "2026-11-16T08:00:00Z".to_owned(),
+            place: Some("box-two 4026531836".to_owned()),
+            machine: Some("machine-two".to_owned()),
+            ledger_commit: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            ..local
+        };
+        copying.copy_ledger_claim(copy.clone());
+        copying.save().unwrap();
+
+        // Then: the state file holds the copy whole, its machine and its
+        // claim commit with it.
+        let reloaded = store(dir.path());
+        assert_eq!(reloaded.claims(None), vec![&copy]);
     }
 
     #[test]

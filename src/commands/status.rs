@@ -1196,6 +1196,8 @@ mod tests {
             started: "2026-08-01T00:00:00Z".to_owned(),
             files: Vec::new(),
             place: None,
+            machine: None,
+            ledger_commit: None,
         };
 
         assert_eq!(

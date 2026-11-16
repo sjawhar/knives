@@ -694,9 +694,10 @@ fn finish_claim_gate(
     let cwd = std::env::current_dir()?;
     let identity = current_identity(bound)?;
     let decision = match decide(&ClaimContext {
-        held: Some(&claim),
+        held: vec![&claim],
         identity: &identity,
         in_claimed_workspace: possesses(&cwd, fork, &target.branch),
+        machine: None,
     }) {
         // Standing in the directory is evidence enough to take work up again,
         // never to hand back a claim taken under another name: after a takeover
