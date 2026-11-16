@@ -29,8 +29,14 @@ use std::time::Duration;
 
 use crate::ids::{CommitId, UpstreamName};
 
+mod claims;
 mod run;
 mod tree;
+
+pub use claims::{
+    ClaimError, ClaimPush, ClaimPushed, ClaimRecord, ClaimRef, ClaimSeen, HeldClaim, Refusal,
+    push_claim, read_claim, restore_machine_ref, write_claim,
+};
 
 use run::{invocation, output_error, run, run_with_input, succeeded, transport};
 use tree::{
