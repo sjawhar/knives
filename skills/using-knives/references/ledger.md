@@ -191,7 +191,7 @@ Routing:
   <fork>: <n> ledger entries this command wrote did not reach the ledger <ledger> (<git dir>): <cause>; `knives ledger sweep` sends them
   ```
 
-- A send prints only the entries it could not send. Its other problems, such as a peer entry that does not parse, go to `ledger-sweep.log` and do not change the exit.
+- A send prints the entries it could not send. Its other problems, such as a peer entry that does not parse, go to `ledger-sweep.log` and do not change the exit. When `ledger-sweep.log` itself cannot be written, the send says so in one line that starts with `!!`, and the exit does not change.
 - A sweep run by hand waits up to a minute for the holder of `ledger.lock`: another sweep, or a write's send. Then it runs its own pass and reports its own result.
 - For each git directory, under its `knives-transport.lock`, a pass does this:
   1. Fetch every machine ref into `refs/knives-remotes/origin/<machine>`.

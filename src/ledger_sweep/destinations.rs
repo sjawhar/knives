@@ -129,13 +129,15 @@ impl Destinations {
     }
 }
 
-/// The destination that carries one shared fork ([`shared_fork`]), and the
-/// ledger that fork's registry entry names.
+/// The destination that carries one shared fork ([`shared_fork`]), the
+/// ledger that fork's registry entry names, and the ledger root.
 #[derive(Debug, Clone)]
 pub struct SharedFork {
     /// The `<owner>/<name>` of the repository the fork's ledger belongs to.
     pub ledger: String,
     pub destination: Destination,
+    /// The ledger root, beside which the ledger's lock is.
+    pub root: PathBuf,
 }
 
 /// The directory beside the ledger root holding a git directory for each
@@ -285,7 +287,12 @@ pub(super) fn destinations_telling(
     let mut failed = BTreeMap::new();
     if !reached.unreached.is_empty() {
         failed = join_unreached(root, registry, &reached.unreached, said);
-        reached = reach(root, registry)?;
+        // Only a join that made a git directory, or found one another
+        // command made, gives the candidates another to read.
+        let ledgers = reached.unreached.values().collect::<BTreeSet<_>>().len();
+        if failed.len() < ledgers {
+            reached = reach(root, registry)?;
+        }
     }
     // A ledger still unreached once joined is one whose directory was
     // already there, its origin another repository's.
@@ -377,6 +384,7 @@ pub fn shared_fork(
         return Ok(Some(SharedFork {
             ledger,
             destination: reached.found.swap_remove(index),
+            root: root.to_owned(),
         }));
     }
     Err(SweepError::Unreached {
@@ -386,12 +394,10 @@ pub fn shared_fork(
 
 /// The `<owner>/<name>` of the ledger `fork`'s registry entry names; `None`
 /// when it names none, or `registry` has no entry for `fork`.
-pub(super) fn ledger_of<'r>(registry: &'r Registry, fork: &UpstreamName) -> Option<&'r str> {
+pub fn ledger_of<'r>(registry: &'r Registry, fork: &UpstreamName) -> Option<&'r str> {
     registry
-        .repos
-        .iter()
-        .find(|(key, entry)| entry.upstream_name(key) == *fork)
-        .and_then(|(_, entry)| entry.ledger.as_deref())
+        .kept_under(fork)
+        .and_then(|entry| entry.ledger.as_deref())
 }
 
 /// Refuse the ledger at `root` while a fork's registry key's directory

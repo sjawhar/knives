@@ -528,6 +528,14 @@ impl Store {
             .collect()
     }
 
+    /// What this store holds for the branch `target`, if anything: a claim
+    /// this machine took, or its copy of a ledger's claim.
+    pub fn claim_of(&self, target: &BranchTarget) -> Option<&Claim> {
+        self.state.claims.values().find(|claim| {
+            claim.repo == target.repo.as_str() && claim.branch == target.branch.as_str()
+        })
+    }
+
     pub fn current_agent(&self) -> Option<&str> {
         self.state
             .extra

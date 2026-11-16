@@ -32,6 +32,8 @@ mod claim;
 mod destinations;
 mod join;
 mod kept;
+#[cfg(test)]
+mod lab;
 mod pulled;
 mod sent;
 
@@ -39,7 +41,7 @@ pub use claim::{
     ClaimChange, ClaimChanged, ClaimOutcome, LedgerFailure, NotApplied, change_claim, read_claim,
 };
 pub use destinations::{
-    Destination, Destinations, SharedFork, Unreached, destinations, ledger_repositories,
+    Destination, Destinations, SharedFork, Unreached, destinations, ledger_of, ledger_repositories,
     shared_fork, unpullable,
 };
 use kept::keep;

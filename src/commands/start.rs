@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use crate::bind::Fork;
 use crate::cli::Exit;
 use crate::commands::claim::{
-    Bound, ClaimContext, ClaimDecision, Identity, SharedClaims, change_on_ledger, claimed_on,
-    copy_of, current_identity, decide, git_dir_of, last_seen_provenance, owner_kind_label,
+    Bound, ClaimContext, ClaimDecision, Identity, SharedClaims, Sighting, both_anonymous,
+    change_on_ledger, claimed_on, copy_of, current_identity, decide, git_dir_of, owner_kind_label,
     refusing, render_claim_context, render_shared_claim_context, sighting_provenance,
     unapplied_cause, unread_claim, unreadable_activity, unreadable_holder, unwritten,
 };
@@ -37,7 +37,7 @@ use crate::ledger_git::{ClaimError, ClaimRecord, ClaimRef, ClaimSeen, HeldClaim}
 use crate::ledger_sweep::{self, ClaimOutcome, LedgerFailure, NotApplied, SharedFork};
 use crate::release_model::newest_release;
 use crate::seen;
-use crate::store::{Claim, OwnerKind, Store, default_state_path};
+use crate::store::{Claim, Store, default_state_path};
 
 /// Where `start` creates a new workspace for a branch: under the entry's
 /// workspace root, named for the branch with slashes flattened.
@@ -211,38 +211,23 @@ pub fn run(
         &[&fork.upstream],
     )?;
     // A fork that shares its ledger is decided from the ledger's claim, on
-    // every machine that shares it. A ledger no git directory here reaches
-    // is joined first; one that cannot be joined is no ledger to decide
-    // from, so nothing is claimed.
-    match ledger_sweep::shared_fork(&default_ledger_root(), bound.registry, &fork.upstream) {
-        Ok(Some(shared)) => {
-            let request = Request {
-                fork,
-                branch,
-                why,
-                force,
-                bound,
-            };
-            return shared_start(&request, &mut store, &shared);
-        }
-        Ok(None) => {}
-        Err(error) => {
-            eprintln!(
-                "nothing was claimed: {}",
-                problem_human_text(&error.to_string())
-            );
-            return Ok(Exit::Incomplete);
-        }
+    // every machine that shares it.
+    let request = Request {
+        fork,
+        branch,
+        why,
+        force,
+        bound,
+    };
+    if let Some(exit) = start_on_ledger(&request, &mut store)? {
+        return Ok(exit);
     }
     let cwd = std::env::current_dir()?;
     let destination = workspace_path(fork, branch);
     let in_claimed_workspace = possesses(&cwd, fork, branch);
     let identity = current_identity(bound)?;
-    let held = store
-        .claims(Some(&fork.upstream))
-        .into_iter()
-        .find(|claim| claim.branch == branch.as_str())
-        .cloned();
+    let target = BranchTarget::new(fork.upstream.clone(), branch.clone());
+    let held = store.claim_of(&target).cloned();
     // On a fork that shares no ledger, who holds the branch is in the state
     // file alone, so the decision is made before the repository is opened: a
     // checkout whose operation log cannot be read must still say who holds
@@ -482,7 +467,7 @@ fn force_claim(
     let reason = context
         .why
         .ok_or_else(|| anyhow::anyhow!("--force requires --why"))?;
-    let workspace_notice = match workspace_notice(context, true)? {
+    let workspace_notice = match workspace_notice(context)? {
         Ok(notice) => notice,
         // Refused before seizing, as `take_claim` refuses before claiming: a
         // seized claim with no workspace would leave the branch held and the
@@ -492,17 +477,11 @@ fn force_claim(
             return Ok(Exit::Usage);
         }
     };
-    let displaced = Displaced::over(previous, &context.identity, last_seen);
+    let displaced = Displaced::over(previous, &context.identity, Some(last_seen));
     record_claim(
         context,
         reason,
-        format!(
-            "seized from {} ({}, claimed {}, last seen {}): {reason}",
-            previous.owner,
-            crate::commands::claim::owner_kind_label(previous.kind),
-            previous.started,
-            last_seen_provenance(last_seen),
-        ),
+        seized_from(previous, Sighting::Seen(last_seen), reason),
         displaced.as_ref(),
     )?;
     println!(
@@ -541,14 +520,11 @@ fn resume_claim(
     let claim = restated.as_ref().unwrap_or(claim);
     // The immutable explanation before the mutable claim state, as a release
     // records it: a failed append leaves the reason the claim already held.
-    scribe_for(context).record(
-        &Draft::event(
-            Some(context.branch.as_str()),
-            event.to_owned(),
-            context.store.tracked_pull(&target),
-        )
-        .about_claim(Some(ClaimChange::Resumed), Some(claim.why.as_str()), None),
-    )?;
+    scribe_for(context).record(&event_draft(context, event.to_owned()).about_claim(
+        Some(ClaimChange::Resumed),
+        Some(claim.why.as_str()),
+        None,
+    ))?;
     context.store.save()?;
     println!(
         "{event}\n{}\n{workspace_notice}",
@@ -588,33 +564,26 @@ fn take_claim(context: &mut StartContext<'_>) -> anyhow::Result<Exit> {
             None,
         )?;
         println!(
-            "adopted existing workspace {} at {change}; left as-is\nclaimed {}/{} for {owner}",
-            crate::ledger::inline_human_text(&context.destination.display().to_string()),
+            "adopted existing {}\nclaimed {}/{} for {owner}",
+            kept_line(context, &change),
             context.fork.name,
             context.branch,
         );
         return Ok(Exit::Ok);
     }
 
-    let (base_revision, base_label) = match create_workspace(context, Leftovers::Keep)? {
-        WorkspaceBase::At { revision, label } => (revision, label),
-        WorkspaceBase::Divergent(tips) => {
-            // Nothing was claimed: the agent picks a tip and starts again.
-            eprintln!("{}", divergent_refusal_line(context.branch, &tips));
+    let line = match create_workspace(context, Leftovers::Keep)? {
+        Ok(line) => line,
+        // Nothing was claimed: the agent picks a tip and starts again.
+        Err(refusal) => {
+            eprintln!("{refusal}");
             return Ok(Exit::Usage);
         }
     };
-    let change = workspace_change(
-        &Repo::open(&context.fork.checkout.path)?,
-        &context.workspace,
-    )?;
     record_claim(context, reason, format!("claimed: {reason}"), None)?;
     println!(
-        "workspace {} at {change} based on {base_revision} ({base_label})\nclaimed {}/{} for \
-         {owner}",
-        crate::ledger::inline_human_text(&context.destination.display().to_string()),
-        context.fork.name,
-        context.branch,
+        "{line}\nclaimed {}/{} for {owner}",
+        context.fork.name, context.branch,
     );
     Ok(Exit::Ok)
 }
@@ -622,32 +591,48 @@ fn take_claim(context: &mut StartContext<'_>) -> anyhow::Result<Exit> {
 /// Write the claim and the entry that explains it.
 ///
 /// `displaced` is the holder this write took the claim from, where another
-/// owner name held it. That, and only that, makes the entry a `taken` one:
-/// a forced start over the caller's own claim displaced nobody, however its
-/// prose reads.
+/// owner name held it. That, and only that, makes the entry a `taken` one
+/// ([`claimed_or_taken`]): a forced start over the caller's own claim
+/// displaced nobody, however its prose reads.
 fn record_claim(
     context: &mut StartContext<'_>,
     reason: &str,
     event: String,
     displaced: Option<&Displaced>,
 ) -> anyhow::Result<()> {
+    let draft = event_draft(context, event).about_claim(
+        Some(claimed_or_taken(displaced)),
+        Some(reason),
+        displaced,
+    );
     let target = BranchTarget::new(context.fork.upstream.clone(), context.branch.clone());
-    let pull = context.store.tracked_pull(&target);
     let _ = context.store.claim(&target, &context.identity, reason);
-    let change = if displaced.is_some() {
+    scribe_for(context).record(&draft)?;
+    context.store.save()?;
+    Ok(())
+}
+
+/// The change an entry that claims the branch records: `taken` where the
+/// write displaced another owner's claim, else `claimed`.
+const fn claimed_or_taken(displaced: Option<&Displaced>) -> ClaimChange {
+    if displaced.is_some() {
         ClaimChange::Taken
     } else {
         ClaimChange::Claimed
-    };
-    scribe_for(context).record(
-        &Draft::event(Some(context.branch.as_str()), event, pull).about_claim(
-            Some(change),
-            Some(reason),
-            displaced,
-        ),
-    )?;
-    context.store.save()?;
-    Ok(())
+    }
+}
+
+/// The text of the entry a seize of `claim` writes: whose claim it
+/// replaced, how its owner was named, when it was taken, and its last
+/// `sighting` ([`sighting_provenance`]).
+fn seized_from(claim: &Claim, sighting: Sighting<'_>, reason: &str) -> String {
+    format!(
+        "seized from {} ({}, claimed {}, {}): {reason}",
+        claim.owner,
+        owner_kind_label(claim.kind),
+        claim.started,
+        sighting_provenance(sighting),
+    )
 }
 
 /// The writer of this `start`'s entries: the fork's ledger, anchored in its
@@ -770,13 +755,10 @@ fn adoption_refusal(destination: &Path, checkout: &Path, name: &WorkspaceName) -
 /// so a plain `start` afterwards is the way back.
 ///
 /// The path is the one jj recorded for the workspace when it has one
-/// ([`workspace_path`]), so both lines print it escaped
-/// ([`crate::ledger::inline_human_text`]); the refusal escapes its own values
+/// ([`workspace_path`]), so both lines print it escaped ([`kept_line`],
+/// [`made_line`]); the refusal escapes its own values
 /// ([`adoption_refusal`]).
-fn workspace_notice(
-    context: &StartContext<'_>,
-    left_as_is: bool,
-) -> anyhow::Result<Result<String, String>> {
+fn workspace_notice(context: &StartContext<'_>) -> anyhow::Result<Result<String, String>> {
     if context.destination.exists() {
         if let Some(line) = adoption_refusal(
             &context.destination,
@@ -785,24 +767,12 @@ fn workspace_notice(
         ) {
             return Ok(Err(line));
         }
-        let retained = if left_as_is { "; left as-is" } else { "" };
-        return Ok(Ok(format!(
-            "workspace {} at {}{retained}",
-            crate::ledger::inline_human_text(&context.destination.display().to_string()),
-            workspace_change(&context.opened, &context.workspace)?,
+        return Ok(Ok(kept_line(
+            context,
+            &workspace_change(&context.opened, &context.workspace)?,
         )));
     }
-    Ok(match create_workspace(context, Leftovers::Clear)? {
-        WorkspaceBase::At { revision, label } => Ok(format!(
-            "created missing workspace {} at {} based on {revision} ({label})",
-            crate::ledger::inline_human_text(&context.destination.display().to_string()),
-            workspace_change(
-                &Repo::open(&context.fork.checkout.path)?,
-                &context.workspace
-            )?,
-        )),
-        WorkspaceBase::Divergent(tips) => Err(divergent_refusal_line(context.branch, &tips)),
-    })
+    Ok(create_workspace(context, Leftovers::Clear)?.map(|line| format!("created missing {line}")))
 }
 
 /// What [`create_workspace`] does with what a workspace whose directory vanished
@@ -914,22 +884,57 @@ fn divergent_refusal_line(branch: &BranchName, tips: &[CommitId]) -> String {
 
 /// Create the branch's workspace with its working copy on the right commit
 /// ([`workspace_base`]), clearing first what a vanished one left at its
-/// name and path as `leftovers` says; the commit it was put on.
+/// name and path as `leftovers` says; the line that says so
+/// ([`made_line`]), or, for a divergent branch, the refusal, with nothing
+/// made ([`divergent_refusal_line`]).
 fn create_workspace(
     context: &StartContext<'_>,
     leftovers: Leftovers,
-) -> anyhow::Result<WorkspaceBase> {
-    let base = workspace_base(context)?;
-    if let WorkspaceBase::At { revision, .. } = &base {
-        clear_leftovers(context, leftovers)?;
-        add_workspace(
-            &context.fork.checkout.path,
-            context.workspace.as_str(),
-            &context.destination,
-            revision,
-        )?;
-    }
-    Ok(base)
+) -> anyhow::Result<Result<String, String>> {
+    Ok(match workspace_base(context)? {
+        WorkspaceBase::At { revision, label } => {
+            clear_leftovers(context, leftovers)?;
+            let change = add_on(context, &revision)?;
+            Ok(made_line(context, &change, &revision, &label))
+        }
+        WorkspaceBase::Divergent(tips) => Err(divergent_refusal_line(context.branch, &tips)),
+    })
+}
+
+/// Add the branch's workspace at its path, its working copy on `revision`;
+/// the change that working copy is at.
+fn add_on(context: &StartContext<'_>, revision: &str) -> anyhow::Result<String> {
+    add_workspace(
+        &context.fork.checkout.path,
+        context.workspace.as_str(),
+        &context.destination,
+        revision,
+    )?;
+    workspace_change(
+        &Repo::open(&context.fork.checkout.path)?,
+        &context.workspace,
+    )
+}
+
+/// The line for the directory at the branch's workspace path, its working
+/// copy at `change`, left as it was found. The path is the one jj recorded
+/// for the workspace when it has one ([`workspace_path`]), so it goes out
+/// escaped ([`crate::ledger::inline_human_text`]).
+fn kept_line(context: &StartContext<'_>, change: &str) -> String {
+    format!(
+        "workspace {} at {change}; left as-is",
+        inline_human_text(&context.destination.display().to_string())
+    )
+}
+
+/// The line for a workspace just made at the branch's workspace path, its
+/// working copy at `change` on `revision`, which `label` names; its path
+/// escaped, as [`kept_line`]'s is.
+fn made_line(context: &StartContext<'_>, change: &str, revision: &str, label: &str) -> String {
+    format!(
+        "workspace {} at {change} based on {revision} ({label})",
+        inline_human_text(&context.destination.display().to_string())
+    )
 }
 
 /// The commit a new workspace of the branch goes on, after a fetch.
@@ -1082,8 +1087,6 @@ struct Request<'a> {
 /// Where the branch's claim is on a fork that shares its ledger, and the
 /// claim commit this `start` read there.
 struct OnLedger<'a> {
-    /// The ledger root.
-    root: PathBuf,
     shared: &'a SharedFork,
     claim: ClaimRef,
     /// The ledger's claim commit as this `start` read it; `None` where it
@@ -1100,13 +1103,12 @@ impl OnLedger<'_> {
 
     /// A change of the claim from `expected` to `becomes`, `None` releasing
     /// it.
-    fn change<'b>(
+    const fn change<'b>(
         &'b self,
         expected: Option<&'b CommitId>,
         becomes: Option<ClaimRecord>,
     ) -> ledger_sweep::ClaimChange<'b> {
         ledger_sweep::ClaimChange {
-            root: &self.root,
             shared: self.shared,
             claim: &self.claim,
             expected,
@@ -1167,7 +1169,47 @@ fn released_meanwhile(branch: &BranchName, on: &OnLedger<'_>) -> String {
     )
 }
 
-/// `start` on a fork that shares its ledger.
+/// `start` on a fork whose registry entry names a ledger
+/// ([`shared_start`]): the exit, or `None` where it names none, for the
+/// start of a fork that shares no ledger.
+///
+/// A branch no claim ref can name is refused first (exit 2), since routing
+/// the ledger can join it and a refused branch writes nothing. A ledger no
+/// git directory here reaches is joined; one that cannot be joined is no
+/// ledger to decide from, so nothing is claimed (exit 3).
+fn start_on_ledger(request: &Request<'_>, store: &mut Store) -> anyhow::Result<Option<Exit>> {
+    let Request {
+        fork,
+        branch,
+        bound,
+        ..
+    } = *request;
+    if ledger_sweep::ledger_of(bound.registry, &fork.upstream).is_none() {
+        return Ok(None);
+    }
+    let claim = match ClaimRef::new(&fork.upstream, branch) {
+        Ok(claim) => claim,
+        Err(error @ (ClaimError::TooLong { .. } | ClaimError::Refused { .. })) => {
+            eprintln!("{}: {}", fork.name, inline_human_text(&error.to_string()));
+            return Ok(Some(Exit::Usage));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    match ledger_sweep::shared_fork(&default_ledger_root(), bound.registry, &fork.upstream) {
+        Ok(Some(shared)) => shared_start(request, store, &shared, claim).map(Some),
+        Ok(None) => Ok(None),
+        Err(error) => {
+            eprintln!(
+                "nothing was claimed: {}",
+                problem_human_text(&error.to_string())
+            );
+            Ok(Some(Exit::Incomplete))
+        }
+    }
+}
+
+/// `start` on a fork that shares its ledger, for the branch's claim ref
+/// `claim`.
 ///
 /// The ledger's claim ref decides who holds the branch, on every machine
 /// that shares the ledger. It is read under the fork's lock and weighed
@@ -1182,6 +1224,7 @@ fn shared_start(
     request: &Request<'_>,
     store: &mut Store,
     shared: &SharedFork,
+    claim: ClaimRef,
 ) -> anyhow::Result<Exit> {
     let Request {
         fork,
@@ -1190,14 +1233,6 @@ fn shared_start(
         force,
         bound,
     } = *request;
-    let claim = match ClaimRef::new(&fork.upstream, branch) {
-        Ok(claim) => claim,
-        Err(error @ (ClaimError::TooLong { .. } | ClaimError::Refused { .. })) => {
-            eprintln!("{}: {}", fork.name, inline_human_text(&error.to_string()));
-            return Ok(Exit::Usage);
-        }
-        Err(error) => return Err(error.into()),
-    };
     let held = match ledger_sweep::read_claim(shared, &claim) {
         Ok(held) => held,
         Err(failure) => {
@@ -1206,17 +1241,11 @@ fn shared_start(
         }
     };
     let target = BranchTarget::new(fork.upstream.clone(), branch.clone());
-    let recorded = store
-        .claims(Some(&fork.upstream))
-        .into_iter()
-        .find(|claim| claim.branch == branch.as_str())
-        .cloned();
-    let claims = SharedClaims::new(&target, held, recorded);
+    let claims = SharedClaims::new(&target, held, store.claim_of(&target).cloned());
     let on = OnLedger {
-        root: default_ledger_root(),
         shared,
         claim,
-        read: claims.ledger.as_ref().map(|(commit, _)| commit.clone()),
+        read: claims.commit().cloned(),
     };
     let cwd = std::env::current_dir()?;
     let destination = workspace_path(fork, branch);
@@ -1397,26 +1426,13 @@ fn prepare_workspace(
 /// The adopted directory, or the new workspace, of a take whose claim the
 /// ledger holds, and the line that says which, as [`take_claim`] says it.
 fn take_workspace(context: &StartContext<'_>, prepared: &Prepared) -> anyhow::Result<String> {
-    let shown = inline_human_text(&context.destination.display().to_string());
     Ok(match prepared {
         Prepared::Adopt => format!(
-            "adopted existing workspace {shown} at {}; left as-is",
-            adopted_change(context)?
+            "adopted existing {}",
+            kept_line(context, &adopted_change(context)?)
         ),
         Prepared::Create { revision, label } => {
-            add_workspace(
-                &context.fork.checkout.path,
-                context.workspace.as_str(),
-                &context.destination,
-                revision,
-            )?;
-            format!(
-                "workspace {shown} at {} based on {revision} ({label})",
-                workspace_change(
-                    &Repo::open(&context.fork.checkout.path)?,
-                    &context.workspace
-                )?
-            )
+            made_line(context, &add_on(context, revision)?, revision, label)
         }
     })
 }
@@ -1425,26 +1441,17 @@ fn take_workspace(context: &StartContext<'_>, prepared: &Prepared) -> anyhow::Re
 /// vanished, of a seize whose claim the ledger holds, and the line that
 /// says which, as [`workspace_notice`] says it.
 fn seize_workspace(context: &StartContext<'_>, prepared: &Prepared) -> anyhow::Result<String> {
-    let shown = inline_human_text(&context.destination.display().to_string());
     Ok(match prepared {
-        Prepared::Adopt => format!(
-            "workspace {shown} at {}; left as-is",
-            workspace_change(&context.opened, &context.workspace)?
+        Prepared::Adopt => kept_line(
+            context,
+            &workspace_change(&context.opened, &context.workspace)?,
         ),
         Prepared::Create { revision, label } => {
             clear_vanished_workspace(context)?;
-            add_workspace(
-                &context.fork.checkout.path,
-                context.workspace.as_str(),
-                &context.destination,
-                revision,
-            )?;
+            let change = add_on(context, revision)?;
             format!(
-                "created missing workspace {shown} at {} based on {revision} ({label})",
-                workspace_change(
-                    &Repo::open(&context.fork.checkout.path)?,
-                    &context.workspace
-                )?
+                "created missing {}",
+                made_line(context, &change, revision, label)
             )
         }
     })
@@ -1547,23 +1554,12 @@ fn seize_shared(
         .filter(|claim| claims.readable(claim, on.machine()))
         .map(|claim| sighting(context, claim))
         .transpose()?;
-    let displaced = previous.and_then(|claim| {
-        Displaced::over(
-            claim,
-            &context.identity,
-            last_seen.unwrap_or(seen::LastSeen::NoneWithinWindow),
-        )
-    });
-    let change = if displaced.is_some() {
-        ClaimChange::Taken
-    } else {
-        ClaimChange::Claimed
-    };
-    let mut draft = event_draft(context, seized_event(previous, last_seen, on, reason))
-        .about_claim(Some(change), Some(reason), displaced.as_ref());
-    if last_seen.is_none() {
-        draft.previous_last_seen = None;
-    }
+    let displaced = previous.and_then(|claim| Displaced::over(claim, &context.identity, last_seen));
+    let draft = event_draft(context, seized_event(previous, last_seen, on, reason)).about_claim(
+        Some(claimed_or_taken(displaced.as_ref())),
+        Some(reason),
+        displaced.as_ref(),
+    );
     let (commit, copy) = match land(context, on, new_record(context, on, reason), &draft)? {
         Ok(landed) => landed,
         Err(exit) => return Ok(exit),
@@ -1616,13 +1612,11 @@ fn seized_event(
             on.read.as_ref().map_or("", CommitId::as_str)
         );
     };
-    let seen = sighting_provenance(last_seen, claimed_on(claim, on.machine()));
-    format!(
-        "seized from {} ({}, claimed {}, {seen}): {reason}",
-        claim.owner,
-        owner_kind_label(claim.kind),
-        claim.started,
-    )
+    let sighting = last_seen.map_or_else(
+        || Sighting::Elsewhere(claimed_on(claim, on.machine())),
+        Sighting::Seen,
+    );
+    seized_from(claim, sighting, reason)
 }
 
 /// [`resume_claim`] on a fork that shares its ledger.
@@ -1726,20 +1720,13 @@ fn land(
                     "the ledger took the claim of {branch} and holds no claim commit for it"
                 )
             }
-            ClaimOutcome::NotApplied { why, failure } => Err(lost(context, on, &why, &failure)
-                .unwrap_or_else(|cause| {
-                    eprintln!(
-                        "nothing was claimed: {}",
-                        unwritten(on.shared, &failure, &cause)
-                    );
-                    Exit::Incomplete
-                })),
+            ClaimOutcome::NotApplied { why, failure } => Err(lost(context, on, &why, &failure)),
             ClaimOutcome::Unknown { failure, .. } => {
                 eprintln!(
                     "the claim of {branch} was pushed to the ledger {} ({}), and whether it landed \
                  is unknown: {}; nothing is recorded on this machine, and `knives start \
                  {branch}` reads the claim again",
-                    failure.ledger,
+                    on.shared.ledger,
                     git_dir_of(on.shared),
                     problem_human_text(&failure.cause)
                 );
@@ -1749,30 +1736,37 @@ fn land(
     )
 }
 
-/// What a claim push that applied nothing comes to.
+/// What a claim push that applied nothing comes to: the exit after saying
+/// so.
 ///
 /// Where the ledger's claim ref now holds another commit than this `start`
 /// read, another machine took or changed the claim meanwhile
 /// ([`taken_meanwhile`]); where it holds none though one was read, the claim
-/// was released meanwhile: the exit after saying so. Otherwise why the push
-/// applied nothing, for the caller to say that nothing was claimed.
+/// was released meanwhile. Otherwise nothing was claimed, for why the push
+/// applied nothing ([`unapplied_cause`]): exit 3.
 fn lost(
     context: &StartContext<'_>,
     on: &OnLedger<'_>,
     why: &NotApplied,
     failure: &LedgerFailure,
-) -> Result<Exit, String> {
-    let NotApplied::Refused { claim, .. } = why else {
-        return Err(unapplied_cause(on.shared, why, failure));
-    };
-    match claim {
-        ClaimSeen::At(now) if Some(now) != on.read.as_ref() => Ok(taken_meanwhile(context, on)),
-        ClaimSeen::Absent if on.read.is_some() => {
-            eprintln!("{}", released_meanwhile(context.branch, on));
-            Ok(Exit::Incomplete)
+) -> Exit {
+    if let NotApplied::Refused { claim, .. } = why {
+        match claim {
+            ClaimSeen::At(now) if Some(now) != on.read.as_ref() => {
+                return taken_meanwhile(context, on);
+            }
+            ClaimSeen::Absent if on.read.is_some() => {
+                eprintln!("{}", released_meanwhile(context.branch, on));
+                return Exit::Incomplete;
+            }
+            _ => {}
         }
-        _ => Err(unapplied_cause(on.shared, why, failure)),
     }
+    eprintln!(
+        "nothing was claimed: {}",
+        unwritten(on.shared, &unapplied_cause(on.shared, why, failure))
+    );
+    Exit::Incomplete
 }
 
 /// A lost lease: another machine took or changed the claim between this
@@ -1814,8 +1808,7 @@ fn taken_meanwhile(context: &StartContext<'_>, on: &OnLedger<'_>) -> Exit {
                     machine,
                     here: on.machine(),
                     activity: None,
-                    anonymous: claim.kind == OwnerKind::OsUser
-                        && context.identity.kind == OwnerKind::OsUser,
+                    anonymous: both_anonymous(&claim, &context.identity),
                 },
                 jiff::Timestamp::now(),
             );
@@ -1863,7 +1856,7 @@ fn release_unopened(
             eprintln!(
                 "the claim of {branch} is held on the ledger {} with no workspace, since its \
                  release could not be sent ({}): {}; `knives finish {branch}` releases it",
-                failure.ledger,
+                on.shared.ledger,
                 git_dir_of(on.shared),
                 problem_human_text(&failure.cause)
             );
@@ -1880,6 +1873,7 @@ mod tests {
     )]
     use super::*;
     use crate::config::RepoEntry;
+    use crate::store::OwnerKind;
 
     fn entry(workspaces: Option<&str>) -> RepoEntry {
         RepoEntry {

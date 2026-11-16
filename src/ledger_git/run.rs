@@ -24,7 +24,11 @@ const LOW_SPEED_BYTES: &str = "1000";
 const LOW_SPEED_SECONDS: &str = "15";
 
 /// Run `command` to completion, returning its stdout when it exits zero.
-pub(super) fn run(command: &mut Command) -> Result<Vec<u8>, GitError> {
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "re-exported through `ledger_git` for git commands run elsewhere in the crate"
+)]
+pub(crate) fn run(command: &mut Command) -> Result<Vec<u8>, GitError> {
     let output = command
         .stdin(Stdio::null())
         .output()

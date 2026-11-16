@@ -72,13 +72,10 @@ pub struct SentNow {
     /// Each fork with an entry this command wrote that did not reach its
     /// ledger, in fork order.
     pub unsent: Vec<Unsent>,
-    /// Each problem the send found that concerns no entry this command
-    /// wrote: a fork it wrote nothing about whose ledger could not be
-    /// joined, a directory of entries no fork is kept under, a peer's entry
-    /// the pull did not write, a pass's failure that still sent every entry
-    /// of this command's. Each is in the [`sweep_log`](super::sweep_log) too,
-    /// as a sweep's problems are, but for a failure to write that log.
-    pub problems: Vec<String>,
+    /// Why the [`sweep_log`](super::sweep_log) could not be written, when a
+    /// pass ran and it could not: every other problem of the send is in that
+    /// log, as a sweep's problems are, and this one would be nowhere.
+    pub unlogged: Option<String>,
 }
 
 /// The entries this command wrote about one fork that shares its ledger.
@@ -88,6 +85,20 @@ struct Shared<'a> {
     /// The `<owner>/<name>` of the repository its ledger belongs to.
     ledger: &'a str,
     paths: Vec<&'a Path>,
+}
+
+impl Shared<'_> {
+    /// `entries` of these that did not reach the ledger through `git_dir`,
+    /// for `cause`.
+    fn unsent(&self, entries: usize, git_dir: String, cause: String) -> Unsent {
+        Unsent {
+            fork: self.fork.clone(),
+            entries,
+            ledger: self.ledger.to_owned(),
+            git_dir,
+            cause,
+        }
+    }
 }
 
 /// [`Shared`] entries, as the destination carrying their fork reads them.
@@ -101,13 +112,11 @@ struct Written<'a> {
 
 impl Written<'_> {
     fn unsent(&self, entries: usize, through: &Destination, cause: String) -> Unsent {
-        Unsent {
-            fork: self.shared.fork.clone(),
+        self.shared.unsent(
             entries,
-            ledger: self.shared.ledger.to_owned(),
-            git_dir: through.repository.git_dir().display().to_string(),
+            through.repository.git_dir().display().to_string(),
             cause,
-        }
+        )
     }
 }
 
@@ -118,18 +127,20 @@ impl Written<'_> {
 /// An entry of a fork with no `ledger` is not shared: nothing is read or
 /// sent for it. A ledger that no git directory here reaches is joined first
 /// ([`destinations`]). A destination whose remote copy already holds every
-/// entry of `appended` it carries, as after a claim's push, is asked
-/// nothing: when every one is held, nothing goes over the network and the
-/// ledger's lock is not taken. Otherwise the lock is waited for as a sweep
-/// waits for it, and each destination still lacking one of them, looked at
-/// again under the lock since a command that held it meanwhile may have
-/// carried them, gets one [`pass`] of its own: the pull, the discard of
-/// each repeated transition, the commit and the push. An entry the pass
-/// discarded as a repeat counts as sent, since a peer's ref carries it; one
-/// this command removed again is not in `appended`
-/// ([`crate::ledger::forget_appended`]). What the passes discarded and left
-/// unread goes to the [`sweep_record`](super::sweep_record), and their
-/// problems replace the [`sweep_log`](super::sweep_log), as a sweep's do.
+/// entry of `appended` it carries, as when another command's send carried
+/// them meanwhile, is asked nothing: when every one is held, nothing goes
+/// over the network and the ledger's lock is not taken. An entry a claim's
+/// push carried is not in `appended` at all
+/// ([`crate::ledger::forget_appended`]). Otherwise the lock is waited for
+/// as a sweep waits for it, and each destination still lacking one of
+/// them, looked at again under the lock since a command that held it
+/// meanwhile may have carried them, gets one [`pass`] of its own: the pull,
+/// the discard of each repeated transition, the commit and the push. An
+/// entry the pass discarded as a repeat counts as sent, since a peer's ref
+/// carries it; one this command removed again is not in `appended`. What
+/// the passes discarded and left unread goes to the
+/// [`sweep_record`](super::sweep_record), and their problems replace the
+/// [`sweep_log`](super::sweep_log), as a sweep's do.
 pub fn send_now(root: &Path, registry: &Registry, appended: &[Appended]) -> SentNow {
     let shared = shared_of(registry, appended);
     if shared.is_empty() {
@@ -146,13 +157,11 @@ pub fn send_now(root: &Path, registry: &Registry, appended: &[Appended]) -> Sent
             .iter()
             .any(|destination| destination.carries(each.fork))
         {
-            sent.unsent.push(Unsent {
-                fork: each.fork.clone(),
-                entries: each.paths.len(),
-                ledger: each.ledger.to_owned(),
-                git_dir: joined_git_dir(root, each.ledger).display().to_string(),
-                cause: reached.uncarried_problem(root, each.fork, each.ledger),
-            });
+            sent.unsent.push(each.unsent(
+                each.paths.len(),
+                joined_git_dir(root, each.ledger).display().to_string(),
+                reached.uncarried_problem(root, each.fork, each.ledger),
+            ));
         }
     }
     let carried: Vec<Vec<Written<'_>>> = reached
@@ -176,19 +185,15 @@ pub fn send_now(root: &Path, registry: &Registry, appended: &[Appended]) -> Sent
     match FileLock::acquire(root, LockWait::TRANSPORT) {
         Ok(_lock) => {
             if let Some(passed) = pass_each(root, &reached, &carried, &mut sent) {
-                let mut logged = Vec::new();
-                for (fork, unreached) in &reached.unreached {
-                    let problem = Destinations::unreached_problem(root, fork, unreached);
-                    if !shared.iter().any(|each| each.fork == fork) {
-                        sent.problems.push(problem.clone());
-                    }
-                    logged.push(problem);
-                }
-                sent.problems.extend(reached.unclaimed.iter().cloned());
+                let mut logged: Vec<String> = reached
+                    .unreached
+                    .iter()
+                    .map(|(fork, unreached)| Destinations::unreached_problem(root, fork, unreached))
+                    .collect();
                 logged.extend(reached.unclaimed.iter().cloned());
                 logged.extend(passed);
                 if let Err(error) = record(root, &logged) {
-                    sent.problems.push(error.to_string());
+                    sent.unlogged = Some(error.to_string());
                 }
             }
         }
@@ -244,21 +249,14 @@ fn unread(root: &Path, shared: &[Shared<'_>], cause: &str) -> SentNow {
     SentNow {
         unsent: shared
             .iter()
-            .map(|each| Unsent {
-                fork: each.fork.clone(),
-                entries: each.paths.len(),
-                ledger: each.ledger.to_owned(),
-                git_dir: anywhere.clone(),
-                cause: cause.to_owned(),
-            })
+            .map(|each| each.unsent(each.paths.len(), anywhere.clone(), cause.to_owned()))
             .collect(),
-        problems: Vec::new(),
+        unlogged: None,
     }
 }
 
 /// Each of `shared` whose fork `destination` carries, as it reads them.
 fn written_through<'a>(destination: &Destination, shared: &'a [Shared<'a>]) -> Vec<Written<'a>> {
-    let root = destination.repository.work_tree();
     shared
         .iter()
         .filter(|each| destination.carries(each.fork))
@@ -267,13 +265,7 @@ fn written_through<'a>(destination: &Destination, shared: &'a [Shared<'a>]) -> V
             entries: each
                 .paths
                 .iter()
-                .map(|path| {
-                    std::path::absolute(path)
-                        .ok()?
-                        .strip_prefix(root)
-                        .ok()
-                        .map(Path::to_path_buf)
-                })
+                .map(|path| destination.repository.relative(path))
                 .collect(),
         })
         .collect()
@@ -307,10 +299,9 @@ fn lacked<'w, 'a>(
 
 /// One [`pass`] through each destination of `reached` that still lacks an
 /// entry of `carried`, under the ledger's lock, which the caller holds; each
-/// entry still lacking goes to `sent` as unsent, and each problem
-/// concerning none of them to its problems. Every problem of the passes is
-/// returned, for the sweep log; `None` when no destination lacked one, so
-/// that nothing passed and nothing is to be recorded.
+/// entry still lacking goes to `sent` as unsent. Every problem of the
+/// passes is returned, for the sweep log; `None` when no destination lacked
+/// one, so that nothing passed and nothing is to be recorded.
 fn pass_each(
     root: &Path,
     reached: &Destinations,
@@ -327,7 +318,7 @@ fn pass_each(
         passed = true;
         let mut failures = pass(destination, tally);
         match lacked(destination, written) {
-            Ok(left) if left.is_empty() => sent.problems.extend(failures.iter().cloned()),
+            Ok(left) if left.is_empty() => {}
             Ok(left) => {
                 let cause = cause_of(destination, &failures);
                 sent.unsent.extend(
@@ -351,11 +342,9 @@ fn pass_each(
         return None;
     }
     if let Err(error) = keep(root, &reached.found, &mut tallies) {
-        sent.problems.push(error.to_string());
         logged.push(error.to_string());
     }
     for tally in &tallies {
-        sent.problems.extend(tally.unwritten.iter().cloned());
         logged.extend(tally.unwritten.iter().cloned());
     }
     Some(logged)
@@ -377,99 +366,17 @@ fn cause_of(destination: &Destination, failures: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Stdio;
-
     use super::*;
     use crate::ids::BranchName;
     use crate::ledger::{Draft, Ledger, Scribe};
     use crate::ledger_git::{ClaimRecord, ClaimRef};
     use crate::ledger_sweep::kept::Kept;
+    use crate::ledger_sweep::lab::{FORK, LEDGER_URL, Lab, git, init};
     use crate::ledger_sweep::{ClaimChange, ClaimOutcome, change_claim, shared_fork, sweep_log};
     use crate::store::OwnerKind;
 
-    const FORK: &str = "acme/a-repo";
-    /// The ledger's URL as the git directory's `origin` spells it; git
-    /// reaches it at the lab's bare remote through `insteadOf`.
-    const LEDGER_URL: &str = "https://forge.invalid/acme/ledger";
-
-    /// `git --git-dir <git_dir> <args>`, which must succeed; its stdout,
-    /// trimmed.
-    fn git(git_dir: &Path, args: &[&str]) -> String {
-        let output = crate::bind::git_command()
-            .arg("--git-dir")
-            .arg(git_dir)
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "lab")
-            .env("GIT_AUTHOR_EMAIL", "lab@example.invalid")
-            .env("GIT_COMMITTER_NAME", "lab")
-            .env("GIT_COMMITTER_EMAIL", "lab@example.invalid")
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    }
-
-    fn init(path: &Path, bare: bool) {
-        let status = crate::bind::git_command()
-            .args(["init", "--quiet"])
-            .args(bare.then_some("--bare"))
-            .arg(path)
-            .status()
-            .unwrap();
-        assert!(status.success(), "git init {}", path.display());
-    }
-
-    /// A machine sharing [`FORK`]'s ledger with acme/ledger through a git
-    /// directory in `ledger-repositories`, committing as `machine-one`, and
-    /// the bare remote git reaches as [`LEDGER_URL`].
-    struct Lab {
-        _home: tempfile::TempDir,
-        root: PathBuf,
-        remote: PathBuf,
-        git_dir: PathBuf,
-        registry: Registry,
-    }
-
+    /// What a send's tests do on the lab's machine and its remote.
     impl Lab {
-        fn new() -> Self {
-            let home = tempfile::tempdir().unwrap();
-            let root = home.path().join("ledger");
-            let registry = home.path().join("repos.toml");
-            std::fs::write(
-                &registry,
-                "[repos.a-repo]\nupstream = \"https://forge.invalid/acme/a-repo\"\n\
-                 origin = \"https://forge.invalid/ours/a-repo\"\nledger = \"acme/ledger\"\n",
-            )
-            .unwrap();
-            let registry = crate::config::load(&registry).unwrap();
-            let remote = home.path().join("remote.git");
-            init(&remote, true);
-            let git_dir = ledger_repositories(&root).join("acme--ledger.git");
-            init(&git_dir, true);
-            let instead_of = format!("url.{}.insteadOf", remote.display());
-            for args in [
-                ["config", "core.bare", "false"].as_slice(),
-                &["config", "core.worktree", root.to_str().unwrap()],
-                &["remote", "add", "origin", LEDGER_URL],
-                &["config", &instead_of, LEDGER_URL],
-                &["config", "knives.machine", "machine-one"],
-            ] {
-                git(&git_dir, args);
-            }
-            Self {
-                _home: home,
-                root,
-                remote,
-                git_dir,
-                registry,
-            }
-        }
-
         fn scribe(&self) -> Scribe {
             Scribe::unanchored(
                 Ledger::at(self.root.join(FORK)),
@@ -549,9 +456,10 @@ mod tests {
     }
 
     #[test]
-    fn entries_a_claims_push_carried_are_sent_without_asking_the_remote() {
+    fn entries_a_claims_push_or_a_sweep_carried_are_sent_without_asking_the_remote() {
         // Given: a take of a branch whose push landed, carrying the entry
-        // that records it, and then a remote nothing can reach.
+        // that records it, a note a sweep then carried, and then a remote
+        // nothing can reach.
         let lab = Lab::new();
         let fork = UpstreamName::new(FORK);
         let shared = shared_fork(&lab.root, &lab.registry, &fork)
@@ -561,7 +469,6 @@ mod tests {
         let scribe = lab.scribe();
         let changed = change_claim(
             ClaimChange {
-                root: &lab.root,
                 shared: &shared,
                 claim: &claim,
                 expected: None,
@@ -577,22 +484,37 @@ mod tests {
                     entry: String::new(),
                 }),
             },
-            || scribe.record_to(&Draft::event(Some("feat/a"), "claimed".into(), None)),
+            || {
+                scribe
+                    .record_to(&Draft::event(Some("feat/a"), "claimed".into(), None))
+                    .map(|(_, path)| path)
+            },
         );
         assert!(
             matches!(changed.outcome, ClaimOutcome::Landed { .. }),
             "{:?}",
             changed.outcome
         );
+        let (_, note) = scribe
+            .record_to(&Draft::event(Some("feat/a"), "noted".into(), None))
+            .unwrap();
+        crate::ledger_sweep::run(&lab.root, Ok(lab.registry.clone())).unwrap();
         lab.cut_off();
 
         // When: the command's entries are sent as it exits.
         let sent = lab.send();
 
-        // Then: every one is sent, and nothing asked the remote, since a
-        // fetch or a push through it would have failed.
+        // Then: the claim's entry was no longer the command's to send, the
+        // note is sent, and nothing asked the remote, since a fetch or a
+        // push through it would have failed.
+        let appended: Vec<PathBuf> = lab
+            .appended()
+            .into_iter()
+            .map(|appended| appended.path)
+            .collect();
+        assert_eq!(appended, [note]);
         assert_eq!(sent.unsent, Vec::new());
-        assert_eq!(sent.problems, Vec::<String>::new());
+        assert_eq!(sent.unlogged, None);
         assert!(!sweep_log(&lab.root).exists());
     }
 
@@ -619,7 +541,7 @@ mod tests {
         // Then: it counts as sent, the peer's ref carrying the merge, and
         // this machine's repeat is gone rather than pushed.
         assert_eq!(sent.unsent, Vec::new());
-        assert_eq!(sent.problems, Vec::<String>::new());
+        assert_eq!(sent.unlogged, None);
         assert!(!mine.exists(), "{}", mine.display());
         assert_eq!(
             git(&lab.remote, &["for-each-ref", "refs/knives/machine-one"]),
@@ -668,7 +590,7 @@ mod tests {
             unsent.cause
         );
         assert!(mine.is_file());
-        assert_eq!(sent.problems, Vec::<String>::new());
+        assert_eq!(sent.unlogged, None);
         let log = std::fs::read_to_string(sweep_log(&lab.root)).unwrap();
         assert!(log.contains("/nonexistent/remote.git"), "{log}");
     }

@@ -35,7 +35,8 @@
 //!   `a_seize_that_loses_to_a_finish_takes_nothing`,
 //!   `a_claim_push_the_remote_applied_before_it_hung_up_is_held_and_resumed`,
 //!   `a_claim_push_the_remote_hung_up_on_before_applying_it_leaves_the_branch_to_the_next_start`,
-//!   `a_new_config_home_finishes_a_claim_taken_in_another_place_only_with_force_and_why`;
+//!   `a_new_config_home_finishes_a_claim_taken_in_another_place_only_with_force_and_why`,
+//!   `a_branch_no_claim_ref_can_name_is_refused_before_the_ledger_is_joined`;
 //! - these pass at both: the two controls,
 //!   R2 `a_push_that_does_not_compare_the_old_value_lets_two_machines_hold_one_branch`
 //!   and R5 `a_claim_shaped_ref_under_refs_knives_fails_the_whole_sweep_naming_its_path`,
@@ -807,6 +808,28 @@ fn start_refuses_a_branch_another_machine_holds() {
     assert_eq!(two.claim(BRANCH), Value::Null);
     assert_eq!(
         shared.claim(BRANCH).map(|held| held.commit),
+        Some(taken.commit.clone())
+    );
+
+    // When: owner one starts the branch on machine two.
+    let resumed = two.ran("owner-one", &["--text", "start", BRANCH, "--repo", "demo"]);
+
+    // Then: it resumes the claim, and machine two's state file holds a copy
+    // of it as the ledger has it: taken on machine one, when and for what it
+    // was, at the same claim commit, which the claim ref still holds.
+    assert!(
+        stdout_of(&resumed).starts_with("resumed\n"),
+        "{}",
+        stdout_of(&resumed)
+    );
+    let copy = two.claim(BRANCH);
+    assert_eq!(copy["owner"], "owner-one", "{copy}");
+    assert_eq!(copy["machine"], "machine-one", "{copy}");
+    assert_eq!(copy["ledger_commit"], taken.commit.as_str(), "{copy}");
+    assert_eq!(copy["started"], taken.get("started"), "{copy}");
+    assert_eq!(copy["why"], "port it", "{copy}");
+    assert_eq!(
+        shared.claim(BRANCH).map(|held| held.commit),
         Some(taken.commit)
     );
 }
@@ -1272,7 +1295,7 @@ fn a_claim_taken_on_another_machine_is_seized_with_force_and_why() {
     let shared = Shared::new();
     let two = shared.two();
     shared.one.start("owner-one");
-    let before = shared.claim(BRANCH).map(|held| held.commit);
+    let before = shared.claim(BRANCH);
 
     // When: owner two seizes it on machine two.
     let seized = two.ran(
@@ -1289,31 +1312,42 @@ fn a_claim_taken_on_another_machine_is_seized_with_force_and_why() {
         ],
     );
 
-    // Then: it names the claim it seized, on a line of its own after
-    // whatever it said of the checkout first; the claim ref holds owner
-    // two's claim, taken on machine two, and machine two holds its copy.
+    // Then: it names the claim it seized, as taken when that claim's record
+    // says, on a line of its own after whatever it said of the checkout
+    // first; the claim ref holds owner two's claim, taken on machine two,
+    // and machine two holds its copy.
     let stdout = stdout_of(&seized);
     let seized_line = format!(
         "seized {FORK}/{BRANCH} is claimed by owner-one (harness-session) on machine machine-one, \
-         taken "
+         taken {} (",
+        before.as_ref().map_or("", |held| held.get("started"))
     );
     assert!(
         stdout.lines().any(|line| line.starts_with(&seized_line)),
         "{stdout}"
     );
     let held = shared.claim(BRANCH).expect("owner two's claim");
-    assert_ne!(Some(&held.commit), before.as_ref());
+    assert_ne!(
+        Some(&held.commit),
+        before.as_ref().map(|before| &before.commit)
+    );
     assert_eq!(held.get("owner"), "owner-two");
     assert_eq!(held.get("machine"), "machine-two");
     assert_eq!(held.get("why"), "rescue it");
-    assert_eq!(two.claim(BRANCH)["ledger_commit"], held.commit.as_str());
-    // And: the `taken` entry on machine two's ref names the claim it ended.
+    let copy = two.claim(BRANCH);
+    assert_eq!(copy["owner"], "owner-two", "{copy}");
+    assert_eq!(copy["ledger_commit"], held.commit.as_str(), "{copy}");
+    // And: the `taken` entry on machine two's ref names the claim it ended
+    // and how its owner was named, with no sighting, which machine two
+    // cannot read.
     let taken = shared
         .recorded_on("machine-two")
         .into_iter()
         .find(|entry| entry.get("claim_change") == Some("taken"))
         .expect("a taken entry on machine two's ref");
     assert_eq!(taken.get("previous_owner"), Some("owner-one"));
+    assert_eq!(taken.get("previous_kind"), Some("harness-session"));
+    assert_eq!(taken.get("previous_last_seen"), None);
     assert_eq!(taken.get("claim_change_why"), Some("rescue it"));
 
     // When: owner one starts the branch again on machine one.
@@ -1504,6 +1538,23 @@ fn a_ledger_with_no_git_directory_is_joined_and_the_claim_reaches_it() {
         listed_on(&remote, &machine),
         [format!("{FORK}/{}", held.get("entry"))]
     );
+    // And: it said so; the claim records the reason given, machine one's
+    // state file holds a copy of it as taken when the record says, the
+    // entry the record names is the one entry here, and the workspace is
+    // there.
+    assert!(
+        stdout_of(&started).contains(&format!("claimed demo/{BRANCH} for owner-one")),
+        "{}",
+        stdout_of(&started)
+    );
+    assert_eq!(held.get("why"), "port it");
+    let copy = one.claim(BRANCH);
+    assert_eq!(copy["owner"], "owner-one", "{copy}");
+    assert_eq!(copy["machine"], machine.as_str(), "{copy}");
+    assert_eq!(copy["ledger_commit"], held.commit.as_str(), "{copy}");
+    assert_eq!(copy["started"], held.get("started"), "{copy}");
+    assert_eq!(one.entries(), [format!("{FORK}/{}", held.get("entry"))]);
+    assert!(one.workspace(BRANCH).join(".jj").is_dir());
 }
 
 #[test]
@@ -1606,6 +1657,37 @@ fn a_ledger_that_cannot_be_reached_refuses_start_by_name() {
     assert_eq!(one.claim(BRANCH), Value::Null);
     assert_eq!(one.entries(), Vec::<String>::new());
     assert!(!one.workspace(BRANCH).exists());
+}
+
+#[test]
+fn a_branch_no_claim_ref_can_name_is_refused_before_the_ledger_is_joined() {
+    // Given: a machine whose registry shares the lab fork's ledger, with no
+    // ledger git directory, and a branch whose claim ref's last component,
+    // `feat%2F` and 249 bytes more, would be 256 bytes long.
+    let lab = forge_lab();
+    let one = Machine::on_lab(&lab, "machine-one", Ledger::Unjoined);
+    let branch = format!("feat/{}", "a".repeat(249));
+
+    // When: owner one starts it.
+    let refused = one.tried(
+        "owner-one",
+        &[
+            "--text", "start", &branch, "--repo", "demo", "--why", "port it",
+        ],
+    );
+
+    // Then: it is refused with exit 2, saying why, and wrote nothing: no
+    // git directory joining the ledger, no claim, no entry, no workspace.
+    let stderr = stderr_of(&refused);
+    assert_eq!(refused.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("would be 256 bytes"), "{stderr}");
+    assert!(
+        !one.home.path().join("ledger-repositories").exists(),
+        "{stderr}"
+    );
+    assert_eq!(one.claim(&branch), Value::Null);
+    assert_eq!(one.entries(), Vec::<String>::new());
+    assert!(!one.workspace(&branch).exists());
 }
 
 #[test]
@@ -1773,6 +1855,15 @@ fn finish_records_its_why_without_force() {
         // Then: the release records that reason as why the claim ended.
         assert_eq!(released.get("claim_change"), Some("released"));
         assert_eq!(released.get("claim_change_why"), Some("the port landed"));
+        // And: the claim is gone from this machine, with its workspace, and
+        // on a fork that shares its ledger from the ledger too, machine
+        // one's ref there carrying every entry this machine wrote.
+        assert_eq!(one.claim(BRANCH), Value::Null);
+        assert!(!one.workspace(BRANCH).exists());
+        if shares {
+            assert!(claim_on(&remote, BRANCH).is_none());
+            assert_eq!(listed_on(&remote, "machine-one"), one.entries());
+        }
 
         // When: with no claim held, it is finished as superseded, with a
         // reason.
@@ -1805,63 +1896,75 @@ fn finish_records_its_why_without_force() {
 
 #[test]
 fn a_finish_whose_release_cannot_be_sent_releases_nothing() {
-    // Given: owner one's claim of a branch on the ledger, taken on machine
-    // one, whose pushes then go nowhere while its reads still reach the
-    // remote.
-    let shared = Shared::new();
-    let one = &shared.one;
-    one.start("owner-one");
-    let before = (
-        shared.claim(BRANCH).map(|held| held.commit),
-        one.claim(BRANCH),
-        one.entries(),
-        one.machine_ref(),
-    );
-    let finish = [
-        "--text",
-        "finish",
-        BRANCH,
-        "--repo",
-        "demo",
-        "--why",
-        "the port landed",
-    ];
+    for refusing in [true, false] {
+        // Given: owner one's claim of a branch on the ledger, taken on
+        // machine one, whose remote then refuses every push, or whose
+        // pushes alone go nowhere while its reads still reach the remote.
+        let shared = Shared::new();
+        let one = &shared.one;
+        one.start("owner-one");
+        let before = (
+            shared.claim(BRANCH).map(|held| held.commit),
+            one.claim(BRANCH),
+            one.entries(),
+            one.machine_ref(),
+        );
+        let finish = [
+            "--text",
+            "finish",
+            BRANCH,
+            "--repo",
+            "demo",
+            "--why",
+            "the port landed",
+        ];
+        let mut command = one.command("owner-one", &finish);
+        let cause = if refusing {
+            shared.hook("pre-receive", REFUSE);
+            "push refused by the test"
+        } else {
+            shared.push_nowhere(&mut command);
+            "does not appear to be a git repository"
+        };
 
-    // When: owner one finishes it.
-    let refused = shared
-        .push_nowhere(&mut one.command("owner-one", &finish))
-        .output()
-        .expect("run knives finish");
+        // When: owner one finishes it.
+        let refused = command.output().expect("run knives finish");
 
-    // Then: it exits 3, naming the ledger, its git directory and git's
-    // cause, and says how to try again.
-    let stderr = stderr_of(&refused);
-    assert_eq!(refused.status.code(), Some(3), "{stderr}");
-    assert!(
-        stderr.contains(&format!(
-            "nothing was released: the ledger {LEDGER} could not be written ({}): ",
-            one.root().join(".git").display()
-        )) && stderr.contains("does not appear to be a git repository")
-            && stderr.contains(&format!("; run `knives finish {BRANCH}` again")),
-        "{stderr}"
-    );
-    // And: nothing was released: the claim ref, this machine's copy, its
-    // entries and its ref are as they were, and so is the workspace.
-    let after = (
-        shared.claim(BRANCH).map(|held| held.commit),
-        one.claim(BRANCH),
-        one.entries(),
-        one.machine_ref(),
-    );
-    assert_eq!(after, before);
-    assert!(one.workspace(BRANCH).join(".jj").is_dir());
+        // Then: it exits 3, naming the ledger, its git directory and why,
+        // and says how to try again.
+        let stderr = stderr_of(&refused);
+        assert_eq!(refused.status.code(), Some(3), "{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "nothing was released: the ledger {LEDGER} could not be written ({}): ",
+                one.root().join(".git").display()
+            )) && stderr.contains(cause)
+                && stderr.contains(&format!("; run `knives finish {BRANCH}` again")),
+            "{stderr}"
+        );
+        // And: nothing was released: the claim ref, this machine's copy,
+        // its entries and its ref are as they were, and so is the
+        // workspace.
+        let after = (
+            shared.claim(BRANCH).map(|held| held.commit),
+            one.claim(BRANCH),
+            one.entries(),
+            one.machine_ref(),
+        );
+        assert_eq!(after, before);
+        assert!(one.workspace(BRANCH).join(".jj").is_dir());
 
-    // When: the pushes reach the remote again, and the finish runs again.
-    one.ran("owner-one", &finish);
+        // When: the pushes reach the remote again, and the finish runs
+        // again.
+        if refusing {
+            shared.unhook("pre-receive");
+        }
+        one.ran("owner-one", &finish);
 
-    // Then: the claim is released on the ledger.
-    assert!(shared.claim(BRANCH).is_none());
-    assert_eq!(one.claim(BRANCH), Value::Null);
+        // Then: the claim is released on the ledger.
+        assert!(shared.claim(BRANCH).is_none());
+        assert_eq!(one.claim(BRANCH), Value::Null);
+    }
 }
 
 #[test]

@@ -61,7 +61,10 @@ fn main() -> ExitCode {
 /// Send every entry the command appended to the ledger its fork shares,
 /// once, after whatever the command did, however it ended; `exit`, or 3
 /// when an entry did not reach its ledger, after a line on stderr for each
-/// fork it stayed behind for ([`knives::ledger_sweep::Unsent`]).
+/// fork it stayed behind for ([`knives::ledger_sweep::Unsent`]). A sweep
+/// log the send could not write is said in one `!!` line, as a claim's
+/// change says its problems, since it is the one problem of the send that
+/// log cannot hold; it changes no exit.
 ///
 /// Every writer appends through a [`Scribe`], which lists the entry
 /// ([`knives::ledger::appended`]), so every write path reaches this; an
@@ -101,6 +104,9 @@ fn send_what_was_written(exit: Exit) -> Exit {
     };
     for unsent in &sent.unsent {
         eprintln!("{unsent}");
+    }
+    if let Some(unlogged) = &sent.unlogged {
+        eprintln!("!! {}", knives::ledger::problem_human_text(unlogged));
     }
     if knives::timing::enabled() {
         eprintln!("timing ledger send {}us", started.elapsed().as_micros());

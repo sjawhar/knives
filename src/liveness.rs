@@ -136,14 +136,19 @@ fn comm_of(pid: u32) -> String {
         .unwrap_or_default()
 }
 
+/// This machine's host name, as the kernel gives it.
+pub(crate) fn host_name() -> String {
+    rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// This process's place: the host name and the PID namespace it runs in. Two
 /// processes in one place can see each other in `/proc`; an agent box is a
 /// place of its own.
 pub fn this_place() -> String {
-    let host = rustix::system::uname()
-        .nodename()
-        .to_string_lossy()
-        .into_owned();
+    let host = host_name();
     let namespace = std::fs::read_link("/proc/self/ns/pid").map_or_else(
         |_| "pid:[unknown]".to_owned(),
         |link| link.display().to_string(),

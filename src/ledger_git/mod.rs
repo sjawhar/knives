@@ -38,7 +38,8 @@ pub use claims::{
     push_claim, read_claim, restore_machine_ref, write_claim,
 };
 
-use run::{invocation, output_error, run, run_with_input, succeeded, transport};
+pub(crate) use run::run;
+use run::{invocation, output_error, run_with_input, succeeded, transport};
 use tree::{
     Mode, ObjectId, TreeItem, batch_blobs, check_entry, commit_tree, hash_objects, references,
     tree_items, write_tree,
@@ -228,6 +229,16 @@ impl Repository {
         })
     }
 
+    /// `path`, made absolute, relative to the ledger root; `None` for a
+    /// path outside the root, or one that cannot be made absolute.
+    pub fn relative(&self, path: &Path) -> Option<PathBuf> {
+        std::path::absolute(path)
+            .ok()?
+            .strip_prefix(&self.work_tree)
+            .ok()
+            .map(Path::to_path_buf)
+    }
+
     /// `git` on this repository.
     ///
     /// `--git-dir` and `--work-tree` leave nothing to discovery, and
@@ -295,11 +306,9 @@ pub enum GitError {
     #[error("{invocation} failed: {stderr}")]
     Failed { invocation: String, stderr: String },
     #[error(
-        "git rejected this machine's ref {machine} on {remote} as non-fast-forward: another \
-         machine may be committing under the same name; give each machine a unique \
-         knives.machine with `git --git-dir={} config knives.machine <unique-name>` \
+        "git rejected this machine's ref {machine} on {remote} as non-fast-forward: {} \
          ({invocation} failed: {stderr})",
-        git_dir.display()
+        machine_collision_remedy(git_dir)
     )]
     MachineNameCollision {
         machine: String,
@@ -335,6 +344,17 @@ pub enum GitError {
         "refusing to write as {machine}: {remote} has its ref but this checkout never committed as it, so the name is another machine's"
     )]
     NotOwn { machine: String, remote: String },
+}
+
+/// What to do when git refuses this machine's ref through `git_dir` as
+/// another writer's: the remote holds a history this checkout did not
+/// commit, so another machine may be committing under the same name.
+pub(crate) fn machine_collision_remedy(git_dir: &Path) -> String {
+    format!(
+        "another machine may be committing under the same name; give each machine a unique \
+         knives.machine with `git --git-dir={} config knives.machine <unique-name>`",
+        git_dir.display()
+    )
 }
 
 /// Commit what `pending` found as `machine` to `refs/knives/<machine>`, as
@@ -591,10 +611,25 @@ pub fn push(repository: &Repository, remote: &str, machine: &str) -> Result<bool
         }
         Err(error) => return Err(error),
     }
-    run(repository
-        .git()
-        .args(["update-ref", &fetched, commit.as_str()]))?;
+    record_sent(repository, remote, machine, commit)?;
     Ok(true)
+}
+
+/// Record `commit` as `remote`'s copy of `machine`'s ref, where [`fetch`]
+/// leaves copies: what a push `remote` took leaves, so the next call knows
+/// it was sent without asking the remote again.
+fn record_sent(
+    repository: &Repository,
+    remote: &str,
+    machine: &str,
+    commit: &CommitId,
+) -> Result<(), GitError> {
+    run(repository.git().args([
+        "update-ref",
+        &format!("{FETCHED}{remote}/{machine}"),
+        commit.as_str(),
+    ]))?;
+    Ok(())
 }
 
 /// Whether `git push` rejected its only ref because the remote had already

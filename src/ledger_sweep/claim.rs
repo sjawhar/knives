@@ -6,11 +6,12 @@
 //! entry that records it, commits that entry to this machine's ref as a
 //! sweep would ([`filtered_pending`]), and pushes the claim and this
 //! machine's ref together. It holds the ledger's lock and then the
-//! destination's transport lock, the order a sweep takes them in, so a
-//! claim's change and a sweep never wait on each other. Where the push
-//! applied nothing, everything here goes back as it was; where its outcome
-//! is unknown, nothing does, since the remote may yet apply it and only the
-//! new commit keeps this machine's ref a fast-forward of what it applies.
+//! destination's transport lock, the order a sweep takes them in: either
+//! may wait for the other, up to a minute for the ledger's lock, and the
+//! one order means the two never deadlock. Where the push applied nothing,
+//! everything here goes back as it was; where its outcome is unknown,
+//! nothing does, since the remote may yet apply it and only the new commit
+//! keeps this machine's ref a fast-forward of what it applies.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -18,34 +19,21 @@ use std::path::{Path, PathBuf};
 use super::kept::keep_discards;
 use super::{Destination, REMOTE, SharedFork, SweepError, Tally, filtered_pending};
 use crate::ids::CommitId;
-use crate::ledger::{Entry, LedgerError};
+use crate::ledger::LedgerError;
 use crate::ledger_git::{
     self, ClaimPush, ClaimPushed, ClaimRecord, ClaimRef, ClaimSeen, GitError, HeldClaim, Refusal,
 };
 use crate::lock::{FileLock, LockWait};
 
-/// Why a claim could not be read or changed, and where: the ledger and the
-/// git directory a command names with git's own text.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("the ledger {ledger} through {through}: {cause}")]
+/// Why a claim could not be read or changed.
+///
+/// git's own account, which quotes the remote, or what failed here. A
+/// command names the ledger and the git directory from the [`SharedFork`]
+/// it read or changed through.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerFailure {
-    /// The `<owner>/<name>` of the ledger's repository.
-    pub ledger: String,
-    /// The destination, `origin (<git dir>)` ([`Destination::describe`]).
-    pub through: String,
-    /// What failed: git's own account, which quotes the remote, or what
-    /// failed here. To show escaped.
+    /// What failed. To show escaped.
     pub cause: String,
-}
-
-impl SharedFork {
-    fn failure(&self, cause: String) -> LedgerFailure {
-        LedgerFailure {
-            ledger: self.ledger.clone(),
-            through: self.destination.describe(),
-            cause,
-        }
-    }
 }
 
 /// The claim the ledger's remote holds at `claim`: none, a claim with its
@@ -59,7 +47,9 @@ pub fn read_claim(
     shared: &SharedFork,
     claim: &ClaimRef,
 ) -> Result<Option<HeldClaim>, LedgerFailure> {
-    let failed = |error: &dyn std::fmt::Display| shared.failure(error.to_string());
+    let failed = |error: &dyn std::fmt::Display| LedgerFailure {
+        cause: error.to_string(),
+    };
     let _transport = FileLock::acquire(shared.destination.transport_lock(), LockWait::TRANSPORT)
         .map_err(|error| failed(&error))?;
     ledger_git::read_claim(&shared.destination.repository, REMOTE, claim)
@@ -70,8 +60,6 @@ pub fn read_claim(
 /// release.
 #[derive(Debug)]
 pub struct ClaimChange<'a> {
-    /// The ledger root.
-    pub root: &'a Path,
     pub shared: &'a SharedFork,
     pub claim: &'a ClaimRef,
     /// The claim commit the remote must hold for the change to land, as the
@@ -96,16 +84,16 @@ pub struct ClaimChanged {
 #[derive(Debug)]
 pub enum ClaimOutcome {
     /// The claim ref holds `claim`, or is gone when `claim` is `None`, and
-    /// this machine's ref on the remote carries the entry at `path`.
+    /// this machine's ref on the remote carries the entry at `path`, which
+    /// is out of [`crate::ledger::appended`]: no send has it to carry.
     Landed {
         claim: Option<CommitId>,
-        entry: Box<Entry>,
         path: PathBuf,
     },
     /// The remote applied nothing, and everything here is as before the
     /// change: this machine's ref holds what it held, and the entry is gone
-    /// from disk and from [`crate::ledger::appended`]. `problems` says what
-    /// of that could not be put back.
+    /// from disk and from [`crate::ledger::appended`].
+    /// [`ClaimChanged::problems`] says what of that could not be put back.
     NotApplied {
         why: NotApplied,
         failure: LedgerFailure,
@@ -115,7 +103,6 @@ pub enum ClaimOutcome {
     /// pushes either way. `claim` is the claim ref as read just after.
     Unknown {
         claim: ClaimSeen,
-        entry: Box<Entry>,
         path: PathBuf,
         failure: LedgerFailure,
     },
@@ -144,8 +131,7 @@ pub enum NotApplied {
 /// the other order:
 ///
 /// 1. `record` appends the entry (with [`crate::ledger::Scribe::record_to`],
-///    so it is listed in [`crate::ledger::appended`]) and returns it with
-///    its path;
+///    so it is listed in [`crate::ledger::appended`]) and returns its path;
 /// 2. what is pending is committed to this machine's ref as a sweep commits
 ///    it ([`filtered_pending`]), moving it from P to a new commit N that
 ///    carries the entry;
@@ -154,34 +140,36 @@ pub enum NotApplied {
 /// 4. the claim and this machine's ref go in one atomic push, leased on
 ///    `expected` ([`ledger_git::push_claim`]).
 ///
-/// Where nothing was applied, this machine's ref goes back to P and the
-/// entry goes ([`ClaimOutcome::NotApplied`]); where the outcome is unknown,
-/// both stay ([`ClaimOutcome::Unknown`]). Whatever the outcome, the repeated
-/// transitions the commit discarded go to the sweep record, as a sweep's do,
-/// so `knives status` still names them.
+/// Where the push landed, the entry is on the remote, and it leaves
+/// [`crate::ledger::appended`], so the send before the command exits has
+/// nothing of it to look for. Where nothing was applied, this machine's ref
+/// goes back to P and the entry goes ([`ClaimOutcome::NotApplied`]); where
+/// the outcome is unknown, both stay ([`ClaimOutcome::Unknown`]). Whatever
+/// the outcome, the repeated transitions the commit discarded go to the
+/// sweep record, as a sweep's do, so `knives status` still names them.
 pub fn change_claim(
     change: ClaimChange<'_>,
-    record: impl FnOnce() -> Result<(Entry, PathBuf), LedgerError>,
+    record: impl FnOnce() -> Result<PathBuf, LedgerError>,
 ) -> ClaimChanged {
-    let (root, shared) = (change.root, change.shared);
+    let shared = change.shared;
+    let root = shared.root.as_path();
     let unsent = |cause: String| ClaimChanged {
         outcome: ClaimOutcome::NotApplied {
             why: NotApplied::Unsent,
-            failure: shared.failure(cause),
+            failure: LedgerFailure { cause },
         },
         problems: Vec::new(),
     };
-    let locks =
-        FileLock::acquire_noting_holder(root, LockWait::TRANSPORT).and_then(|(ledger, _)| {
-            FileLock::acquire(shared.destination.transport_lock(), LockWait::TRANSPORT)
-                .map(|transport| (ledger, transport))
-        });
+    let locks = FileLock::acquire(root, LockWait::TRANSPORT).and_then(|ledger| {
+        FileLock::acquire(shared.destination.transport_lock(), LockWait::TRANSPORT)
+            .map(|transport| (ledger, transport))
+    });
     let _locks = match locks {
         Ok(locks) => locks,
         Err(error) => return unsent(error.to_string()),
     };
-    let (entry, path) = match record() {
-        Ok(written) => written,
+    let path = match record() {
+        Ok(path) => path,
         Err(error) => {
             return unsent(format!(
                 "the entry recording the change was not written: {error}"
@@ -191,22 +179,20 @@ pub fn change_claim(
     let mut tally = Tally::of(&shared.destination);
     let mut problems = Vec::new();
     let outcome = match send(change, &path, &mut tally, &mut problems) {
-        Sent::Landed(claim) => ClaimOutcome::Landed {
-            claim,
-            entry: Box::new(entry),
-            path,
-        },
+        Sent::Landed(claim) => {
+            crate::ledger::forget_appended(&path);
+            ClaimOutcome::Landed { claim, path }
+        }
         Sent::Unknown { claim, cause } => ClaimOutcome::Unknown {
             claim,
-            entry: Box::new(entry),
             path,
-            failure: shared.failure(cause),
+            failure: LedgerFailure { cause },
         },
         Sent::NotApplied { why, cause, moved } => {
             problems.extend(roll_back(&shared.destination, moved.as_ref(), &path));
             ClaimOutcome::NotApplied {
                 why,
-                failure: shared.failure(cause),
+                failure: LedgerFailure { cause },
             }
         }
     };
@@ -340,13 +326,8 @@ fn commit(
             .into_iter()
             .map(|line| format!("{}: {line}", destination.describe())),
     );
-    let committed = std::path::absolute(path)
-        .ok()
-        .and_then(|path| {
-            path.strip_prefix(repository.work_tree())
-                .ok()
-                .map(Path::to_path_buf)
-        })
+    let committed = repository
+        .relative(path)
         .is_some_and(|relative| pending.added().contains(&relative));
     if !committed {
         return Err(unsent(format!(
@@ -399,51 +380,16 @@ fn roll_back(destination: &Destination, moved: Option<&Moved>, path: &Path) -> V
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
-    use std::process::Stdio;
 
     use super::*;
     use crate::ids::{BranchName, UpstreamName};
     use crate::ledger::{Draft, Ledger, Scribe};
     use crate::ledger_git::Repository;
-    use crate::ledger_sweep::{ledger_repositories, shared_fork};
+    use crate::ledger_sweep::lab::{self, FORK, git};
+    use crate::ledger_sweep::shared_fork;
     use crate::store::OwnerKind;
 
-    const FORK: &str = "acme/a-repo";
-    /// The ledger's URL as the git directory's `origin` spells it; git
-    /// reaches it at the lab's bare remote through `insteadOf`.
-    const LEDGER_URL: &str = "https://forge.invalid/acme/ledger";
     const MACHINE: &str = "refs/knives/machine-one";
-
-    /// `git --git-dir <git_dir> <args>`, which must succeed; its stdout,
-    /// trimmed.
-    fn git(git_dir: &Path, args: &[&str]) -> String {
-        let output = crate::bind::git_command()
-            .arg("--git-dir")
-            .arg(git_dir)
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "lab")
-            .env("GIT_AUTHOR_EMAIL", "lab@example.invalid")
-            .env("GIT_COMMITTER_NAME", "lab")
-            .env("GIT_COMMITTER_EMAIL", "lab@example.invalid")
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    }
-
-    fn init_bare(git_dir: &Path) {
-        let status = crate::bind::git_command()
-            .args(["init", "--quiet", "--bare"])
-            .arg(git_dir)
-            .status()
-            .unwrap();
-        assert!(status.success(), "git init --bare {}", git_dir.display());
-    }
 
     /// The commit `reference` holds in `git_dir`, if it exists.
     fn at(git_dir: &Path, reference: &str) -> Option<CommitId> {
@@ -488,10 +434,8 @@ mod tests {
             .collect()
     }
 
-    /// A machine sharing [`FORK`]'s ledger with acme/ledger through a git
-    /// directory in `ledger-repositories`, as one set up by hand to share it
-    /// has, committing as `machine-one`, and the bare remote git reaches as
-    /// [`LEDGER_URL`].
+    /// The machine of [`lab::Lab`], sharing [`FORK`]'s ledger, and the
+    /// destination that carries the fork there.
     struct Lab {
         home: tempfile::TempDir,
         root: PathBuf,
@@ -501,31 +445,13 @@ mod tests {
 
     impl Lab {
         fn new() -> Self {
-            let home = tempfile::tempdir().unwrap();
-            let root = home.path().join("ledger");
-            let registry = home.path().join("repos.toml");
-            std::fs::write(
-                &registry,
-                "[repos.a-repo]\nupstream = \"https://forge.invalid/acme/a-repo\"\n\
-                 origin = \"https://forge.invalid/ours/a-repo\"\nledger = \"acme/ledger\"\n",
-            )
-            .unwrap();
-            let registry = crate::config::load(&registry).unwrap();
-            let remote = home.path().join("remote.git");
-            init_bare(&remote);
-            let git_dir = ledger_repositories(&root).join("acme--ledger.git");
-            init_bare(&git_dir);
-            let work_tree = root.to_str().unwrap();
-            let instead_of = format!("url.{}.insteadOf", remote.display());
-            for args in [
-                ["config", "core.bare", "false"].as_slice(),
-                &["config", "core.worktree", work_tree],
-                &["remote", "add", "origin", LEDGER_URL],
-                &["config", &instead_of, LEDGER_URL],
-                &["config", "knives.machine", "machine-one"],
-            ] {
-                git(&git_dir, args);
-            }
+            let lab::Lab {
+                home,
+                root,
+                remote,
+                registry,
+                ..
+            } = lab::Lab::new();
             let shared = shared_fork(&root, &registry, &UpstreamName::new(FORK))
                 .unwrap()
                 .unwrap();
@@ -556,18 +482,19 @@ mod tests {
             );
             change_claim(
                 ClaimChange {
-                    root: &self.root,
                     shared: &self.shared,
                     claim,
                     expected,
                     becomes,
                 },
                 || {
-                    scribe.record_to(&Draft::event(
-                        Some("feat/a"),
-                        "a claim's change".into(),
-                        None,
-                    ))
+                    scribe
+                        .record_to(&Draft::event(
+                            Some("feat/a"),
+                            "a claim's change".into(),
+                            None,
+                        ))
+                        .map(|(_, path)| path)
                 },
             )
         }
@@ -622,12 +549,12 @@ mod tests {
     }
 
     /// The why and the claim seen of a change that must have been refused.
-    fn refused(changed: ClaimChanged) -> (Refusal, ClaimSeen, LedgerFailure) {
+    fn refused(changed: ClaimChanged) -> (Refusal, ClaimSeen) {
         match changed.outcome {
             ClaimOutcome::NotApplied {
                 why: NotApplied::Refused { refusal, claim },
-                failure,
-            } => (refusal, claim, failure),
+                ..
+            } => (refusal, claim),
             other => panic!("not refused: {other:?}"),
         }
     }
@@ -650,18 +577,22 @@ mod tests {
         let ClaimOutcome::Landed {
             claim: Some(taken),
             path,
-            entry,
         } = changed.outcome
         else {
             panic!("{:?}", changed.outcome);
         };
         assert_eq!(at(&lab.remote, claim.as_str()), Some(taken.clone()));
         // And: this machine's ref is on the remote, carrying the entry, which
-        // is on disk here and listed as this process's.
+        // is on disk here and no longer listed as this process's, since no
+        // send has it to carry.
         assert_eq!(at(&lab.remote, MACHINE), at(lab.git_dir(), MACHINE));
         assert!(lab.sent(&path), "{}", path.display());
         assert!(path.is_file());
-        assert!(listed(&path));
+        assert!(!listed(&path));
+        let entries = Ledger::at(lab.root.join(FORK)).read().unwrap().entries;
+        let [entry] = entries.as_slice() else {
+            panic!("{entries:?}");
+        };
         assert_eq!(entry.text, "a claim's change");
         // And: the claim commit names that entry, and reads back.
         let held = read_claim(&lab.shared, &claim).unwrap().unwrap();
@@ -690,22 +621,19 @@ mod tests {
         );
 
         // Then: it was refused on the lease, and names the claim there now.
-        let (refusal, seen, failure) = refused(changed);
+        let (refusal, seen) = refused(changed);
         assert_eq!(refusal, Refusal::Lease);
         assert_eq!(seen, ClaimSeen::At(theirs.clone()));
-        assert_eq!(failure.ledger, "acme/ledger");
-        assert_eq!(
-            failure.through,
-            format!("origin ({})", lab.git_dir().display())
-        );
         // And: the remote is as it was, this machine's ref is back at P, and
-        // the entry is gone from disk and from the list.
+        // the entry is gone from disk and from the list, the earlier one
+        // staying on disk.
         assert_eq!(at(&lab.remote, claim.as_str()), Some(theirs));
         assert_eq!(at(&lab.remote, MACHINE), Some(before.clone()));
         assert_eq!(at(lab.git_dir(), MACHINE), Some(before));
         let entries = Ledger::at(lab.root.join(FORK)).read().unwrap().entries;
         assert_eq!(entries.len(), 1, "{entries:?}");
-        assert_eq!(listed_under(&lab.root), [earlier]);
+        assert!(earlier.is_file());
+        assert_eq!(listed_under(&lab.root), Vec::<PathBuf>::new());
     }
 
     #[test]
@@ -820,7 +748,7 @@ mod tests {
         let changed = lab.change(&claim, Some(&taken), None);
 
         // Then: the release is refused on the lease, naming the claim there.
-        let (refusal, seen, _) = refused(changed);
+        let (refusal, seen) = refused(changed);
         assert_eq!(refusal, Refusal::Lease);
         assert_eq!(seen, ClaimSeen::At(theirs.clone()));
         // And: nothing was removed on the remote, and here everything is back.
@@ -972,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_that_fails_names_the_ledger_the_git_directory_and_gits_words() {
+    fn a_read_that_fails_says_what_git_said() {
         // Given: a ledger remote that is gone.
         let lab = Lab::new();
         std::fs::remove_dir_all(&lab.remote).unwrap();
@@ -980,12 +908,7 @@ mod tests {
         // When: a claim is read.
         let failure = read_claim(&lab.shared, &claim_of("feat/a")).unwrap_err();
 
-        // Then: it names the ledger, the git directory, and what git said.
-        assert_eq!(failure.ledger, "acme/ledger");
-        assert_eq!(
-            failure.through,
-            format!("origin ({})", lab.git_dir().display())
-        );
+        // Then: it carries git's own account of the failure.
         assert!(
             failure
                 .cause

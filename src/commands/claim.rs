@@ -80,7 +80,7 @@ pub fn decide(context: &ClaimContext<'_>) -> ClaimDecision {
         return ClaimDecision::Take;
     }
     if let Some(claim) = refusing(context) {
-        return if claim.kind == OwnerKind::OsUser && context.identity.kind == OwnerKind::OsUser {
+        return if both_anonymous(claim, context.identity) {
             ClaimDecision::RefuseAnonymous
         } else {
             ClaimDecision::RefuseHeld
@@ -113,8 +113,14 @@ pub fn refusing<'a>(context: &ClaimContext<'a>) -> Option<&'a Claim> {
 /// Whether `claim` was taken on this machine, the one named `machine` on
 /// the fork's ledger: every claim on a fork that shares no ledger (`None`),
 /// a local claim, and a ledger claim whose machine is this one.
-pub fn taken_here(claim: &Claim, machine: Option<&str>) -> bool {
+fn taken_here(claim: &Claim, machine: Option<&str>) -> bool {
     machine.is_none() || claim.ledger_commit.is_none() || claim.machine.as_deref() == machine
+}
+
+/// Whether `claim` and `identity` are both anonymous `os-user` names, which
+/// cannot be told apart, so that equal names prove nothing between them.
+pub fn both_anonymous(claim: &Claim, identity: &Identity) -> bool {
+    claim.kind == OwnerKind::OsUser && identity.kind == OwnerKind::OsUser
 }
 
 fn permits_by_possession(claim: &Claim, context: &ClaimContext<'_>) -> bool {
@@ -393,6 +399,12 @@ impl SharedClaims {
         Self { ledger, recorded }
     }
 
+    /// The commit of the ledger's claim, as it was read: what a change of
+    /// it is leased on.
+    pub fn commit(&self) -> Option<&CommitId> {
+        self.ledger.as_ref().map(|(commit, _)| commit)
+    }
+
     /// The ledger's claim, where its record reads.
     pub fn on_ledger(&self) -> Option<&Claim> {
         self.ledger
@@ -465,15 +477,35 @@ pub fn claimed_on<'a>(claim: &'a Claim, here: &'a str) -> &'a str {
         .unwrap_or(here)
 }
 
-/// How an entry names the last sighting of a claim its write displaced.
-///
-/// The sighting's durable token where the claim's activity can be read here
-/// (`last_seen`), else the machine it was taken on, whose records hold it.
-pub fn sighting_provenance(last_seen: Option<crate::seen::LastSeen>, machine: &str) -> String {
-    last_seen.map_or_else(
-        || format!("on machine {machine}"),
-        |last_seen| format!("last seen {}", last_seen_provenance(last_seen)),
-    )
+/// The last sighting of a claim a write displaced, as this machine can
+/// tell it.
+#[derive(Debug, Clone, Copy)]
+pub enum Sighting<'a> {
+    /// Its activity can be read here, and was last seen so.
+    Seen(crate::seen::LastSeen),
+    /// Its activity cannot be read here: its records are on the machine it
+    /// was taken on, which this names.
+    Elsewhere(&'a str),
+}
+
+impl Sighting<'_> {
+    /// The sighting, where its activity can be read here.
+    pub const fn last_seen(self) -> Option<crate::seen::LastSeen> {
+        match self {
+            Self::Seen(last_seen) => Some(last_seen),
+            Self::Elsewhere(_) => None,
+        }
+    }
+}
+
+/// How an entry names the last sighting of a claim its write displaced:
+/// the sighting's durable token where the claim's activity can be read
+/// here, else the machine it was taken on, whose records hold it.
+pub fn sighting_provenance(sighting: Sighting<'_>) -> String {
+    match sighting {
+        Sighting::Seen(last_seen) => format!("last seen {}", last_seen_provenance(last_seen)),
+        Sighting::Elsewhere(machine) => format!("on machine {machine}"),
+    }
 }
 
 /// The git directory a shared fork's ledger travels through, as a terminal
@@ -494,7 +526,7 @@ pub fn git_dir_of(shared: &SharedFork) -> String {
 pub fn unread_claim(branch: &BranchName, shared: &SharedFork, failure: &LedgerFailure) -> String {
     format!(
         "the claim of {branch} could not be read from the ledger {} ({}): {}",
-        failure.ledger,
+        shared.ledger,
         git_dir_of(shared),
         problem_human_text(&failure.cause)
     )
@@ -502,10 +534,10 @@ pub fn unread_claim(branch: &BranchName, shared: &SharedFork, failure: &LedgerFa
 
 /// Why a change of a claim reached nothing: the ledger, its git directory,
 /// and `cause`, git's account or this process's ([`unapplied_cause`]).
-pub fn unwritten(shared: &SharedFork, failure: &LedgerFailure, cause: &str) -> String {
+pub fn unwritten(shared: &SharedFork, cause: &str) -> String {
     format!(
         "the ledger {} could not be written ({}): {}",
-        failure.ledger,
+        shared.ledger,
         git_dir_of(shared),
         problem_human_text(cause)
     )
@@ -521,11 +553,9 @@ pub fn unapplied_cause(shared: &SharedFork, why: &NotApplied, failure: &LedgerFa
             refusal: Refusal::MachineRef,
             ..
         } => format!(
-            "git refused this machine's ref refs/knives/{} on origin: another machine may be \
-             committing under the same name; give each machine a unique knives.machine with \
-             `git --git-dir={} config knives.machine <unique-name>` ({})",
+            "git refused this machine's ref refs/knives/{} on origin: {} ({})",
             shared.destination.machine,
-            shared.destination.repository.git_dir().display(),
+            crate::ledger_git::machine_collision_remedy(shared.destination.repository.git_dir()),
             failure.cause
         ),
         _ => failure.cause.clone(),
@@ -559,7 +589,8 @@ pub fn change_on_ledger(
     scribe: &Scribe,
     draft: &Draft<'_>,
 ) -> ClaimOutcome {
-    let changed = ledger_sweep::change_claim(change, || scribe.record_to(draft));
+    let changed =
+        ledger_sweep::change_claim(change, || scribe.record_to(draft).map(|(_, path)| path));
     for problem in &changed.problems {
         eprintln!("!! {}", problem_human_text(problem));
     }

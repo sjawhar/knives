@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use super::run::{invocation, output_error, run, run_with_input, succeeded, transport_transcript};
 use super::tree::{Mode, ObjectId, tree_item};
-use super::{FETCHED, GitError, Repository, fork_directory, own_ref, ref_component};
+use super::{GitError, Repository, fork_directory, own_ref, record_sent, ref_component};
 use crate::ids::{BranchName, CommitId, UpstreamName};
 use crate::store::OwnerKind;
 
@@ -460,14 +460,8 @@ pub fn push_claim(repository: &Repository, push: &ClaimPush<'_>) -> Result<Claim
         stderr: &stderr,
     };
     let verdict = verdict(said, claim, &machine);
-    let sent = || {
-        run(repository.git().args([
-            "update-ref",
-            &format!("{FETCHED}{remote}/{}", push.machine),
-            push.after.as_str(),
-        ]))
-        .map(|_| ClaimPushed::Landed)
-    };
+    let sent =
+        || record_sent(repository, remote, push.machine, push.after).map(|()| ClaimPushed::Landed);
     if verdict == Verdict::Accepted {
         return sent();
     }

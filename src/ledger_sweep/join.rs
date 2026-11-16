@@ -13,7 +13,6 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use super::destinations::ledger_repositories;
 use crate::config::Registry;
@@ -156,26 +155,9 @@ fn make(root: &Path, git_dir: &Path, url: &str, machine: &str) -> Result<bool, S
 
 /// Run `git <args>`; git's own words when it fails.
 fn git(args: &[&OsStr]) -> Result<(), String> {
-    let spelled = || {
-        args.iter()
-            .map(|arg| arg.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let output = crate::bind::git_command()
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("running git {}: {error}", spelled()))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "git {} failed: {}",
-            spelled(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
+    crate::ledger_git::run(crate::bind::git_command().args(args))
+        .map(drop)
+        .map_err(|error| error.to_string())
 }
 
 /// `fork_url` with its repository path replaced by `ledger`, its
@@ -209,10 +191,7 @@ fn ledger_url(fork_url: &str, ledger: &str) -> Option<String> {
 /// This machine's name on a ledger it joins: [`machine_name`] of its host
 /// name, its `/etc/machine-id` and a random number.
 fn this_machine() -> String {
-    let host = rustix::system::uname()
-        .nodename()
-        .to_string_lossy()
-        .into_owned();
+    let host = crate::liveness::host_name();
     let id = std::fs::read_to_string("/etc/machine-id").ok();
     machine_name(&host, id.as_deref(), crate::lock::random_u64())
 }

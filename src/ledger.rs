@@ -115,8 +115,10 @@ pub fn appended() -> Vec<Appended> {
 
 /// Take the entry at `path` out of [`appended`], once; whether it was there.
 ///
-/// For an entry its writer removed again: the one a claim's change wrote
-/// before a push that applied nothing, which no send is to report as unsent.
+/// For an entry no send is to report or carry: the one a claim's change
+/// wrote before a push that applied nothing, which its writer removed
+/// again, and the one a claim's push already put on the ledger's remote,
+/// which no send has to look for there.
 pub fn forget_appended(path: &Path) -> bool {
     let mut list = appended_list();
     list.iter()
@@ -227,19 +229,20 @@ pub struct Displaced {
     pub kind: String,
     pub started: String,
     /// The last sighting of its work
-    /// ([`crate::commands::claim::last_seen_provenance`]).
-    pub last_seen: String,
+    /// ([`crate::commands::claim::last_seen_provenance`]); `None` where its
+    /// activity cannot be read here, so this machine has no sighting of it.
+    pub last_seen: Option<String>,
     /// The displaced owner's own reason for the claim.
     pub why: String,
 }
 
 impl Displaced {
-    pub fn of(claim: &crate::store::Claim, last_seen: crate::seen::LastSeen) -> Self {
+    pub fn of(claim: &crate::store::Claim, last_seen: Option<crate::seen::LastSeen>) -> Self {
         Self {
             owner: claim.owner.clone(),
             kind: crate::commands::claim::owner_kind_label(claim.kind).to_owned(),
             started: claim.started.clone(),
-            last_seen: crate::commands::claim::last_seen_provenance(last_seen),
+            last_seen: last_seen.map(crate::commands::claim::last_seen_provenance),
             why: claim.why.clone(),
         }
     }
@@ -249,7 +252,7 @@ impl Displaced {
     pub fn over(
         claim: &crate::store::Claim,
         identity: &crate::commands::claim::Identity,
-        last_seen: crate::seen::LastSeen,
+        last_seen: Option<crate::seen::LastSeen>,
     ) -> Option<Self> {
         (claim.owner != identity.owner).then(|| Self::of(claim, last_seen))
     }
@@ -1176,7 +1179,7 @@ impl<'a> Draft<'a> {
             previous_owner: displaced.map(|previous| previous.owner.clone()),
             previous_kind: displaced.map(|previous| previous.kind.clone()),
             previous_started: displaced.map(|previous| previous.started.clone()),
-            previous_last_seen: displaced.map(|previous| previous.last_seen.clone()),
+            previous_last_seen: displaced.and_then(|previous| previous.last_seen.clone()),
             previous_why: displaced.map(|previous| previous.why.clone()),
             ..self
         }
