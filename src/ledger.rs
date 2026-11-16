@@ -22,7 +22,8 @@ use std::ffi::OsStr;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
@@ -86,13 +87,41 @@ pub fn is_fork_directory(name: &str) -> bool {
     })
 }
 
-/// Set once this process has appended an entry; see [`appended`].
-static APPENDED: AtomicBool = AtomicBool::new(false);
+/// One entry this process appended: the fork it is about, and its file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Appended {
+    pub fork: UpstreamName,
+    pub path: PathBuf,
+}
 
-/// Whether this process has appended an entry to any ledger, so that it has
-/// something to hand to [`crate::ledger_sweep::hand_off`] before it exits.
-pub fn appended() -> bool {
-    APPENDED.load(Ordering::Relaxed)
+/// Every entry this process has appended through a [`Scribe`], in order;
+/// see [`appended`].
+static APPENDED: Mutex<Vec<Appended>> = Mutex::new(Vec::new());
+
+/// [`APPENDED`], held. A writer that panicked holding it left a whole list
+/// behind, since each change is one push or one removal, so a poisoned lock
+/// is taken as it is.
+fn appended_list() -> MutexGuard<'static, Vec<Appended>> {
+    APPENDED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Every entry this process has appended, in the order it appended them:
+/// what it has to hand to [`crate::ledger_sweep::hand_off`] before it exits.
+/// A copy, so the list goes on growing behind it.
+pub fn appended() -> Vec<Appended> {
+    appended_list().clone()
+}
+
+/// Take the entry at `path` out of [`appended`], once; whether it was there.
+///
+/// For an entry its writer removed again: the one a claim's change wrote
+/// before a push that applied nothing, which no send is to report as unsent.
+pub fn forget_appended(path: &Path) -> bool {
+    let mut list = appended_list();
+    list.iter()
+        .position(|appended| appended.path == path)
+        .map(|index| list.remove(index))
+        .is_some()
 }
 
 /// Who put an entry there.
@@ -717,7 +746,6 @@ impl Ledger {
                 reason,
             })?;
         persist_entry(temporary, path.clone())?;
-        APPENDED.store(true, Ordering::Relaxed);
         Ok(path)
     }
 
@@ -1202,7 +1230,8 @@ impl Scribe {
         &self.ledger
     }
 
-    /// Append `draft`, stamping the fields no caller supplies.
+    /// Append `draft`, stamping the fields no caller supplies, and list it
+    /// among what this process appended ([`appended`]).
     pub fn record(&self, draft: &Draft<'_>) -> Result<Entry, LedgerError> {
         self.record_to(draft).map(|(entry, _)| entry)
     }
@@ -1238,6 +1267,10 @@ impl Scribe {
             previous_why: draft.previous_why.clone(),
         };
         let path = self.ledger.append(&entry)?;
+        appended_list().push(Appended {
+            fork: self.repo.clone(),
+            path: path.clone(),
+        });
         Ok((entry, path))
     }
 
@@ -1553,6 +1586,49 @@ mod tests {
         assert_eq!(read[0].subject.as_deref(), Some("feat/alpha"));
         assert_eq!(read[0].kind, Kind::Note);
         assert_eq!(read[0].anchor.as_deref(), Some("6c42fe71"));
+    }
+
+    #[test]
+    fn each_entry_a_scribe_appends_is_listed_in_order_and_one_can_be_taken_out() {
+        // Given: writers for two forks, appending three entries between them.
+        let dir = tempfile::tempdir().unwrap();
+        let scribe = |name: &str| {
+            Scribe::unanchored(
+                Ledger::at(dir.path().join(name)),
+                UpstreamName::new(name),
+                "ses_fff688".to_owned(),
+            )
+        };
+        let (one, two) = (scribe("acme/one"), scribe("acme/two"));
+        let mut wrote = Vec::new();
+        for (scribe, text) in [(&one, "first"), (&two, "second"), (&one, "third")] {
+            let (_, path) = scribe
+                .record_to(&Draft::event(None, text.to_owned(), None))
+                .unwrap();
+            wrote.push(Appended {
+                fork: scribe.repo().clone(),
+                path,
+            });
+        }
+        // Other tests in this process may append too: only this one's
+        // entries are looked at.
+        let mine = || -> Vec<Appended> {
+            appended()
+                .into_iter()
+                .filter(|appended| appended.path.starts_with(dir.path()))
+                .collect()
+        };
+
+        // Then: the list holds each, with its fork, in the order appended.
+        assert_eq!(mine(), wrote);
+
+        // When: the second is taken out.
+        assert!(forget_appended(&wrote[1].path));
+
+        // Then: it alone went, and a second removal finds nothing to take.
+        assert_eq!(mine(), [wrote[0].clone(), wrote[2].clone()]);
+        assert!(!forget_appended(&wrote[1].path));
+        assert!(wrote[1].path.is_file(), "the list is not the file");
     }
 
     #[test]

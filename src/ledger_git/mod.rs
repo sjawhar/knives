@@ -404,6 +404,12 @@ impl Pending {
         &self.added
     }
 
+    /// What this machine's ref holds before the commit, the commit's
+    /// parent: `None` when this checkout never committed as the machine.
+    pub const fn previous(&self) -> Option<&CommitId> {
+        self.previous.as_ref()
+    }
+
     /// Leave out an entry that is no longer on disk.
     pub fn forget(&mut self, path: &Path) {
         let _ = self.added.remove(path);

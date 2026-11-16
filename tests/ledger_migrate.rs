@@ -794,37 +794,72 @@ fn a_dry_run_reports_what_a_migration_would_do_and_changes_nothing() {
     .output()
     .expect("run knives ledger migrate --dry-run");
 
-    // Then: not one file under the config home changed, appeared or went.
+    // Then: not one file under the config home changed, appeared or went,
+    // and no git directory was made for the third fork's ledger.
     assert_eq!(
         snapshot(home.path()),
         before,
         "{}",
         String::from_utf8_lossy(&dry.stdout)
     );
+    assert!(!home.path().join("ledger-repositories").exists());
     assert_eq!(dry.status.code(), Some(3), "{dry:?}");
     let would: serde_json::Value = serde_json::from_slice(&dry.stdout).expect("JSON report");
     assert_eq!(would["dry_run"], true, "{would}");
+    // And: it holds back the third fork's statement, saying that the run
+    // would join that fork's ledger first, since no git directory reaches it
+    // yet.
+    let joined = home
+        .path()
+        .join("ledger-repositories")
+        .join("acme--ledger.git");
+    let about = |report: &serde_json::Value, fork: bool| -> Vec<String> {
+        report["problems"]
+            .as_array()
+            .expect("problems")
+            .iter()
+            .map(|problem| problem.as_str().expect("a problem line").to_owned())
+            .filter(|problem| problem.starts_with("acme/tool: ") == fork)
+            .collect()
+    };
+    let would_hold = about(&would, true);
+    assert!(
+        matches!(would_hold.as_slice(), [line] if line.starts_with("acme/tool: 1 statement(s) not migrated")
+        && line.contains(&format!(
+            "has acme/ledger as its origin yet; a run that is not a dry run joins it first, \
+             making {}",
+            joined.display()
+        ))),
+        "{would}"
+    );
 
-    // And: the real run then does exactly what the dry run said it would,
-    // holding back the third fork's statement for the same reason.
+    // And: the real run joins that ledger and says so, then does what the
+    // dry run said it would, and holds back the third fork's statement
+    // because the ledger it joined could not be pulled.
     let real = migrate(home.path());
     assert_eq!(real.status.code(), Some(3), "{real:?}");
+    let stderr = String::from_utf8_lossy(&real.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "joined the ledger acme/ledger: made {} as machine ",
+            joined.display()
+        )) && stderr.contains(", carrying acme/tool\n"),
+        "{stderr}"
+    );
+    assert!(joined.join("config").is_file());
     let did: serde_json::Value = serde_json::from_slice(&real.stdout).expect("JSON report");
-    for field in [
-        "moved",
-        "renamed",
-        "sightings",
-        "wrote",
-        "already",
-        "problems",
-    ] {
+    for field in ["moved", "renamed", "sightings", "wrote", "already"] {
         assert_eq!(would[field], did[field], "{field}: {would} vs {did}");
     }
+    assert_eq!(about(&would, false), about(&did, false), "{would} vs {did}");
     assert_eq!(did["wrote"], 2, "{did}");
+    let did_hold = about(&did, true);
     assert!(
-        did["problems"]
-            .to_string()
-            .contains("acme/tool: 1 statement(s) not migrated"),
+        matches!(did_hold.as_slice(), [line] if line.starts_with("acme/tool: 1 statement(s) not migrated")
+        && line.contains(&format!(
+            "could not pull the ledger from origin ({})",
+            joined.display()
+        ))),
         "{did}"
     );
     assert!(did.get("dry_run").is_none(), "{did}");

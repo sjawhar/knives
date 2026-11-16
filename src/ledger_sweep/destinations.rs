@@ -2,8 +2,10 @@
 //! own config says, and which forks the registry sends through which.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use super::join::{join_unreached, joined_git_dir, occupied};
 use super::{REMOTE, SweepError, setup_problems};
 use crate::config::Registry;
 use crate::ids::UpstreamName;
@@ -45,9 +47,10 @@ pub struct Destinations {
     /// The repositories it travels through.
     pub found: Vec<Destination>,
     /// Each fork whose registry entry names a repository its ledger belongs
-    /// to that no destination here is, with that `<owner>/<name>`: its
-    /// entries travel to and from no other machine from this one.
-    pub unreached: BTreeMap<UpstreamName, String>,
+    /// to that no destination here is: its entries travel to and from no
+    /// other machine from this one. Outside a dry run, only a fork whose
+    /// ledger could not be joined.
+    pub unreached: BTreeMap<UpstreamName, Unreached>,
     /// A problem for each directory under the root holding entries that no
     /// fork is kept under ([`crate::ledger::unclaimed_problems`]): nothing
     /// reads or carries them, so every sweep and every pull says so.
@@ -58,17 +61,59 @@ pub struct Destinations {
     pub ignored: Vec<String>,
 }
 
+/// A fork in [`Destinations::unreached`]: the ledger its registry entry
+/// names, and why no git directory here carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreached {
+    /// The `<owner>/<name>` of the repository its ledger belongs to.
+    pub ledger: String,
+    /// Why joining that ledger failed; `None` where nothing tried to join
+    /// it, as under a dry run, which writes nothing.
+    pub join_failed: Option<String>,
+}
+
 impl Destinations {
     /// What a fork in [`Destinations::unreached`] is a problem for.
-    pub(super) fn unreached_problem(root: &Path, fork: &UpstreamName, ledger: &str) -> String {
-        format!(
+    pub(super) fn unreached_problem(
+        root: &Path,
+        fork: &UpstreamName,
+        unreached: &Unreached,
+    ) -> String {
+        let Unreached {
+            ledger,
+            join_failed,
+        } = unreached;
+        let unreached = format!(
             "{fork}: repos.toml says its ledger belongs to {ledger}, but no git directory \
-             knives reads ({} and each one in {}) has {ledger} as its origin, so its entries \
-             travel to and from no other machine here",
+             knives reads ({} and each one in {}) has {ledger} as its origin",
             root.join(".git").display(),
             ledger_repositories(root).display()
+        );
+        join_failed.as_ref().map_or_else(
+            || {
+                format!(
+                    "{unreached} yet; a run that is not a dry run joins it first, making {}, \
+                     and then pulls",
+                    joined_git_dir(root, ledger).display()
+                )
+            },
+            |why| {
+                format!(
+                    "{unreached}, and joining it failed: {why}. Until it is joined, its \
+                     entries travel to and from no other machine here"
+                )
+            },
         )
     }
+}
+
+/// The destination that carries one shared fork ([`shared_fork`]), and the
+/// ledger that fork's registry entry names.
+#[derive(Debug, Clone)]
+pub struct SharedFork {
+    /// The `<owner>/<name>` of the repository the fork's ledger belongs to.
+    pub ledger: String,
+    pub destination: Destination,
 }
 
 /// The directory beside the ledger root holding a git directory for each
@@ -189,8 +234,11 @@ fn identity(git_dir: &Path) -> Result<Identity, SweepError> {
 /// that remote. The registry is the one source of which forks travel where;
 /// a repository's git config says only who this machine is there.
 ///
-/// A fork with no `ledger` is not shared. One whose `ledger` no candidate's
-/// `origin` names is [`Destinations::unreached`]. No fork shared and no
+/// A fork with no `ledger` is not shared. A ledger no candidate's `origin`
+/// names is joined first ([`super::join`]): its git directory is made in
+/// [`ledger_repositories`], said in one line on stderr, and the candidates
+/// are read again, so that it is one of them. A fork whose ledger could not
+/// be joined is [`Destinations::unreached`], with why. No fork shared and no
 /// machine named is a ledger nobody set up to share: no destination, and
 /// nothing to report. A candidate naming a machine and carrying no fork is a
 /// destination that carries nothing. Refused, each with what fixes it: a
@@ -201,18 +249,54 @@ fn identity(git_dir: &Path) -> Result<Identity, SweepError> {
 /// there ([`crate::ledger::LedgerError::FormerName`]), which no sweep would
 /// carry until `knives ledger migrate` moves them.
 pub fn destinations(root: &Path, registry: &Registry) -> Result<Destinations, SweepError> {
-    destinations_moving(root, registry, &[])
+    destinations_telling(root, registry, &mut std::io::stderr())
 }
 
-/// [`destinations`], but not refusing the unmigrated directories in `moved`,
-/// which the caller is about to move.
+/// [`destinations`], saying each ledger it joins on `said`.
+pub(super) fn destinations_telling(
+    root: &Path,
+    registry: &Registry,
+    said: &mut dyn Write,
+) -> Result<Destinations, SweepError> {
+    refuse_unmigrated(root, registry, &[])?;
+    let mut reached = reach(root, registry)?;
+    let mut failed = BTreeMap::new();
+    if !reached.unreached.is_empty() {
+        failed = join_unreached(root, registry, &reached.unreached, said);
+        reached = reach(root, registry)?;
+    }
+    // A ledger still unreached once joined is one whose directory was
+    // already there, its origin another repository's.
+    assemble(root, registry, reached, |ledger| {
+        Some(
+            failed
+                .get(ledger)
+                .cloned()
+                .unwrap_or_else(|| occupied(root, ledger)),
+        )
+    })
+}
+
+/// [`destinations`], but joining no ledger and not refusing the unmigrated
+/// directories in `moved`, which the caller is about to move: for a dry
+/// run, which writes nothing.
 pub(super) fn destinations_moving(
     root: &Path,
     registry: &Registry,
     moved: &[&Path],
 ) -> Result<Destinations, SweepError> {
     refuse_unmigrated(root, registry, moved)?;
-    let reached = reach(root, registry)?;
+    assemble(root, registry, reach(root, registry)?, |_| None)
+}
+
+/// The [`Destinations`] `reached` gives, each unreached fork with why its
+/// ledger was not joined, as `join_failed` says of that ledger.
+fn assemble(
+    root: &Path,
+    registry: &Registry,
+    reached: Reached,
+    join_failed: impl Fn(&str) -> Option<String>,
+) -> Result<Destinations, SweepError> {
     let found = reached
         .carriers
         .into_iter()
@@ -225,11 +309,66 @@ pub(super) fn destinations_moving(
             })
         })
         .collect::<Result<_, SweepError>>()?;
+    let unreached = reached
+        .unreached
+        .into_iter()
+        .map(|(fork, ledger)| {
+            let join_failed = join_failed(&ledger);
+            (
+                fork,
+                Unreached {
+                    ledger,
+                    join_failed,
+                },
+            )
+        })
+        .collect();
     Ok(Destinations {
         found,
-        unreached: reached.unreached,
+        unreached,
         unclaimed: crate::ledger::unclaimed_problems(root, registry),
         ignored: reached.ignored,
+    })
+}
+
+/// The destination that carries `fork`, as [`destinations`] finds it, a
+/// ledger no git directory reaches joined first; `None` when `fork`'s
+/// registry entry names no ledger, so nothing of it is shared.
+///
+/// Refused as [`destinations`] refuses, and with [`SweepError::Unreached`]
+/// when `fork`'s ledger could not be joined: a command about to decide
+/// from, or write to, a shared fork's ledger cannot go on without it.
+pub fn shared_fork(
+    root: &Path,
+    registry: &Registry,
+    fork: &UpstreamName,
+) -> Result<Option<SharedFork>, SweepError> {
+    let Some(ledger) = registry
+        .repos
+        .iter()
+        .find(|(key, entry)| entry.upstream_name(key) == *fork)
+        .and_then(|(_, entry)| entry.ledger.clone())
+    else {
+        return Ok(None);
+    };
+    let Destinations {
+        found, unreached, ..
+    } = destinations(root, registry)?;
+    if let Some(destination) = found
+        .into_iter()
+        .find(|destination| destination.carries(fork))
+    {
+        return Ok(Some(SharedFork {
+            ledger,
+            destination,
+        }));
+    }
+    let unreached = unreached.get(fork).cloned().unwrap_or_else(|| Unreached {
+        join_failed: Some(occupied(root, &ledger)),
+        ledger,
+    });
+    Err(SweepError::Unreached {
+        problem: Destinations::unreached_problem(root, fork, &unreached),
     })
 }
 
@@ -261,7 +400,8 @@ struct Carrier {
 /// What [`reach`] found.
 struct Reached {
     carriers: Vec<Carrier>,
-    /// [`Destinations::unreached`].
+    /// Each fork with a ledger no candidate carries, with the `<owner>/<name>`
+    /// of that ledger: [`Destinations::unreached`] before any join.
     unreached: BTreeMap<UpstreamName, String>,
     /// [`Destinations::ignored`].
     ignored: Vec<String>,
@@ -350,8 +490,9 @@ fn reach(root: &Path, registry: &Registry) -> Result<Reached, SweepError> {
 /// What [`pull_at`] would find wrong with `forks` before it fetched.
 ///
 /// For each of them, the problem [`Pulled::failed_for`] would give for a
-/// setup [`destinations`] refuses, or for a fork no git directory here
-/// reaches.
+/// setup [`destinations`] refuses; and for a fork no git directory here
+/// reaches, that a pull would join its ledger first, which a dry run cannot
+/// do and so cannot pull it either.
 ///
 /// Read from `registry` and each git directory's own config alone, with no
 /// fetch and nothing written, for a dry run that must say what a pull would

@@ -578,7 +578,7 @@ fn a_destination_with_forks_but_no_machine_name_fails_naming_the_fix() {
 }
 
 #[test]
-fn a_fork_whose_ledger_belongs_elsewhere_is_carried_nowhere_and_said_so() {
+fn a_fork_whose_ledger_no_git_directory_reaches_is_joined_and_its_sweep_names_that_ledger() {
     // Given: a registry sharing a fork's ledger with one repository, a root
     // whose origin is another, and an entry of that fork's on disk.
     let home = tempfile::tempdir().expect("config home");
@@ -595,15 +595,45 @@ fn a_fork_whose_ledger_belongs_elsewhere_is_carried_nowhere_and_said_so() {
     // When: a sweep runs.
     let swept = sweep(home.path());
 
-    // Then: it fails naming the repository the registry says, carries the
-    // entry nowhere, and leaves the reason in the log.
+    // Then: it joined the ledger the registry names, with a git directory
+    // over the root whose origin is that ledger on the fork's forge and
+    // which names this machine, and said so in one line.
+    let joined = home
+        .path()
+        .join("ledger-repositories")
+        .join("acme--elsewhere.git");
+    let config = |key: &str| git_in(&joined, &["config", "--get", key]);
+    let machine = config("knives.machine").expect("the joined git directory names a machine");
+    let stderr = String::from_utf8_lossy(&swept.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "joined the ledger acme/elsewhere: made {} as machine {machine}, carrying \
+             acme/a-repo\n",
+            joined.display()
+        )),
+        "{stderr}"
+    );
+    assert_eq!(
+        config("remote.origin.url").as_deref(),
+        Some("https://forge.invalid/acme/elsewhere")
+    );
+    assert_eq!(config("core.bare").as_deref(), Some("false"));
+    assert_eq!(config("core.worktree"), Some(root.display().to_string()));
+    // And: the sweep fails through it, since no machine here reaches that
+    // ledger, naming the git directory and the ledger; it carries the entry
+    // to the root's remote no more than before, and leaves the reason in the
+    // log.
     assert_eq!(swept.status.code(), Some(3), "{swept:?}");
     let report: serde_json::Value = serde_json::from_slice(&swept.stdout).expect("JSON");
-    let said = "repos.toml says its ledger belongs to acme/elsewhere";
-    assert!(report["problems"].to_string().contains(said), "{report}");
+    let problems = report["problems"].to_string();
+    let through = format!("origin ({})", joined.display());
+    assert!(
+        problems.contains(&through) && problems.contains("forge.invalid/acme/elsewhere"),
+        "{report}"
+    );
     assert_eq!(entries_on(&remote, "alpha"), 0);
     let log = std::fs::read_to_string(home.path().join("ledger-sweep.log")).expect("a log");
-    assert!(log.contains(said), "{log}");
+    assert!(log.contains(&through), "{log}");
 }
 
 #[test]

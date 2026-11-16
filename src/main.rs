@@ -57,7 +57,7 @@ fn main() -> ExitCode {
     };
     // Once, after whatever the command wrote, however it ended: one hand-off
     // per process rather than per entry, and every write path reaches it.
-    if knives::ledger::appended() {
+    if !knives::ledger::appended().is_empty() {
         knives::ledger_sweep::hand_off();
     }
     exit

@@ -29,11 +29,19 @@ use crate::ledger::Ledger;
 use crate::ledger_git::{self, GitError};
 use crate::lock::{FileLock, LockError, LockHolder, LockWait};
 
+mod claim;
 mod destinations;
+mod join;
 mod kept;
 mod pulled;
 
-pub use destinations::{Destination, Destinations, destinations, ledger_repositories, unpullable};
+pub use claim::{
+    ClaimChange, ClaimChanged, ClaimOutcome, LedgerFailure, NotApplied, change_claim, read_claim,
+};
+pub use destinations::{
+    Destination, Destinations, SharedFork, Unreached, destinations, ledger_repositories,
+    shared_fork, unpullable,
+};
 use kept::keep;
 pub use pulled::{Backlog, Pulled, pull, pull_at};
 
@@ -70,6 +78,10 @@ pub enum SweepError {
         path: PathBuf,
         source: serde_json::Error,
     },
+    /// A shared fork's ledger that no git directory here reaches and that
+    /// could not be joined ([`Destinations::unreached_problem`]).
+    #[error("{problem}")]
+    Unreached { problem: String },
 }
 
 /// The problem each of `forks` has from where the ledger at `root` travels:
@@ -78,7 +90,7 @@ pub enum SweepError {
 fn setup_problems(
     root: &Path,
     forks: &[&UpstreamName],
-    unreached: Result<&BTreeMap<UpstreamName, String>, &SweepError>,
+    unreached: Result<&BTreeMap<UpstreamName, Unreached>, &SweepError>,
 ) -> BTreeMap<UpstreamName, Vec<String>> {
     forks
         .iter()
@@ -289,7 +301,7 @@ pub fn sweep(
     }
     let mut problems: Vec<String> = unreached
         .iter()
-        .map(|(fork, ledger)| Destinations::unreached_problem(root, fork, ledger))
+        .map(|(fork, unreached)| Destinations::unreached_problem(root, fork, unreached))
         .chain(unclaimed.iter().cloned())
         .collect();
     let mut tallies: Vec<Tally> = found.iter().map(Tally::of).collect();
@@ -442,72 +454,10 @@ fn pull_held(destination: &Destination) -> (Option<ledger_git::Materialised>, Ve
 /// Commit what is new and push what the remote lacks; what kept the
 /// repeated-transition check from reading something, each as a line.
 ///
-/// Before the commit, each transition event this machine wrote that repeats
-/// one a ref already carries goes
-/// ([`crate::ledger::transitions::repeated_transitions`]): two machines that
-/// both synced after one merge each wrote `#N merged`, and the one that
-/// sweeps second commits none. Only an entry no ref carries is removed, so
-/// what any machine committed stays.
-///
-/// That check reads every entry of each fork it carries, and what it cannot
-/// read holds back nothing else. A fork whose directory cannot be listed is
-/// left unchecked, and an entry that does not parse is left out of the
-/// check; either is a problem, and the rest is committed and pushed. An
-/// entry of this machine's own that does not parse is also left out of the
-/// commit: a peer that took it would fail every read of that fork, and a
-/// committed entry is never rewritten, while here it can still be fixed.
+/// What is committed is what [`filtered_pending`] leaves.
 fn send(destination: &Destination, tally: &mut Tally) -> Result<Vec<String>, SweepError> {
     let repository = &destination.repository;
-    let mut problems = Vec::new();
-    let mut pending = ledger_git::pending(repository, &destination.machine)?;
-    if !pending.added().is_empty() {
-        let uncommitted: BTreeSet<PathBuf> = pending
-            .added()
-            .iter()
-            .map(|path| repository.work_tree().join(path))
-            .collect();
-        for fork in repository.forks() {
-            let reads = match Ledger::at(repository.work_tree().join(fork.as_str())).entry_reads() {
-                Ok(reads) => reads,
-                Err(error) => {
-                    problems.push(format!("{fork}: repeated transitions not checked: {error}"));
-                    continue;
-                }
-            };
-            let mut entries = Vec::with_capacity(reads.len());
-            for (path, read) in reads {
-                match read {
-                    Ok(entry) => entries.push((path, entry)),
-                    Err(error) if uncommitted.contains(&path) => {
-                        if let Ok(relative) = path.strip_prefix(repository.work_tree()) {
-                            pending.forget(relative);
-                        }
-                        problems.push(format!(
-                            "{error}; not sent until it is fixed or removed, since every \
-                             machine that took it would fail to read {fork}'s ledger"
-                        ));
-                    }
-                    Err(error) => problems.push(format!(
-                        "{error}; left out of the check for repeated transitions"
-                    )),
-                }
-            }
-            for path in crate::ledger::transitions::repeated_transitions(&entries, &uncommitted) {
-                if let Err(source) = std::fs::remove_file(path) {
-                    problems.push(format!(
-                        "{}: a repeated transition, not discarded: {source}",
-                        path.display()
-                    ));
-                    continue;
-                }
-                if let Ok(relative) = path.strip_prefix(repository.work_tree()) {
-                    pending.forget(relative);
-                }
-                tally.discarded += 1;
-                *tally.unkept.entry(fork.to_string()).or_default() += 1;
-            }
-        }
-    }
+    let (pending, problems) = filtered_pending(destination, tally)?;
     if ledger_git::commit_pending(repository, &destination.machine, pending)?.is_some() {
         tally.commits += 1;
     }
@@ -515,6 +465,84 @@ fn send(destination: &Destination, tally: &mut Tally) -> Result<Vec<String>, Swe
         tally.pushes += 1;
     }
     Ok(problems)
+}
+
+/// What a commit as this machine through `destination` would add, once the
+/// entries no commit should carry are out of it; what kept the
+/// repeated-transition check from reading something, each as a line. Every
+/// commit of this machine's ref starts here: a sweep's ([`send`]) and a
+/// claim's change ([`change_claim`]).
+///
+/// First, each transition event this machine wrote that repeats one a ref
+/// already carries goes ([`crate::ledger::transitions::repeated_transitions`]),
+/// counted in `tally`: two machines that both synced after one merge each
+/// wrote `#N merged`, and the one that commits second commits none. Only an
+/// entry no ref carries is removed, so what any machine committed stays.
+///
+/// That check reads every entry of each fork it carries, and what it cannot
+/// read holds back nothing else. A fork whose directory cannot be listed is
+/// left unchecked, and an entry that does not parse is left out of the
+/// check; either is a problem, and the rest is committed. An entry of this
+/// machine's own that does not parse is also left out of the commit: a peer
+/// that took it would fail every read of that fork, and a committed entry is
+/// never rewritten, while here it can still be fixed.
+fn filtered_pending(
+    destination: &Destination,
+    tally: &mut Tally,
+) -> Result<(ledger_git::Pending, Vec<String>), SweepError> {
+    let repository = &destination.repository;
+    let mut problems = Vec::new();
+    let mut pending = ledger_git::pending(repository, &destination.machine)?;
+    if pending.added().is_empty() {
+        return Ok((pending, problems));
+    }
+    let uncommitted: BTreeSet<PathBuf> = pending
+        .added()
+        .iter()
+        .map(|path| repository.work_tree().join(path))
+        .collect();
+    for fork in repository.forks() {
+        let reads = match Ledger::at(repository.work_tree().join(fork.as_str())).entry_reads() {
+            Ok(reads) => reads,
+            Err(error) => {
+                problems.push(format!("{fork}: repeated transitions not checked: {error}"));
+                continue;
+            }
+        };
+        let mut entries = Vec::with_capacity(reads.len());
+        for (path, read) in reads {
+            match read {
+                Ok(entry) => entries.push((path, entry)),
+                Err(error) if uncommitted.contains(&path) => {
+                    if let Ok(relative) = path.strip_prefix(repository.work_tree()) {
+                        pending.forget(relative);
+                    }
+                    problems.push(format!(
+                        "{error}; not sent until it is fixed or removed, since every \
+                         machine that took it would fail to read {fork}'s ledger"
+                    ));
+                }
+                Err(error) => problems.push(format!(
+                    "{error}; left out of the check for repeated transitions"
+                )),
+            }
+        }
+        for path in crate::ledger::transitions::repeated_transitions(&entries, &uncommitted) {
+            if let Err(source) = std::fs::remove_file(path) {
+                problems.push(format!(
+                    "{}: a repeated transition, not discarded: {source}",
+                    path.display()
+                ));
+                continue;
+            }
+            if let Ok(relative) = path.strip_prefix(repository.work_tree()) {
+                pending.forget(relative);
+            }
+            tally.discarded += 1;
+            *tally.unkept.entry(fork.to_string()).or_default() += 1;
+        }
+    }
+    Ok((pending, problems))
 }
 
 /// Whether any destination still being swept has an entry no ref carries.
@@ -895,9 +923,10 @@ mod tests {
     }
 
     #[test]
-    fn a_fork_whose_ledger_is_no_repository_here_is_unreached_and_a_pull_says_so() {
-        // Given: a fork sharing its ledger with a repository the root's
-        // origin is not, and a second machine whose root is no repository.
+    fn a_fork_whose_ledger_could_not_be_joined_is_unreached_and_a_pull_and_a_lookup_say_why() {
+        // Given: a fork sharing its ledger with a repository no git directory
+        // here has as its origin, and where joining it would make one, a git
+        // directory whose origin is another repository.
         let (_home, root) = ledger_root();
         registry(
             &root,
@@ -905,33 +934,86 @@ mod tests {
         );
         origin_at(&root, "/nonexistent/remote.git");
         git(&root.join(".git"), &["config", "knives.machine", "alpha"]);
-        let bare = tempfile::tempdir().unwrap();
-        let unrepo = bare.path().join("ledger");
-        registry(&unrepo, &[("a-repo", Some("acme/ledger"))]);
-
-        // Then: the root carries neither fork, and names the one it should.
+        let occupant = second_repository(
+            &root,
+            "acme--elsewhere.git",
+            "https://forge.invalid/acme/other",
+            "alpha-other",
+        );
+        let config_before = std::fs::read(occupant.join("config")).unwrap();
         let a_repo = UpstreamName::new("acme/a-repo");
-        for (root, ledger) in [(&root, "acme/elsewhere"), (&unrepo, "acme/ledger")] {
-            let found = destinations(root, &loaded(root)).unwrap();
-            assert!(
-                found
-                    .found
-                    .iter()
-                    .all(|destination| destination.repository.forks().is_empty()),
-                "{found:?}"
-            );
-            assert_eq!(
-                found.unreached,
-                BTreeMap::from([(a_repo.clone(), ledger.to_owned())])
-            );
 
-            // And: a pull about it reports that its entries reach no machine.
-            let problems = pull_at(root, &loaded(root), &[&a_repo]).problems_for(&a_repo);
-            assert_eq!(problems.len(), 1, "{problems:?}");
-            let problem = problems.first().unwrap();
+        // When: where the ledger travels is read.
+        let found = destinations(&root, &loaded(&root)).unwrap();
+
+        // Then: no destination carries the fork, it is unreached with why its
+        // ledger could not be joined, and the git directory there is as it was.
+        assert!(
+            found
+                .found
+                .iter()
+                .all(|destination| destination.repository.forks().is_empty()),
+            "{found:?}"
+        );
+        let unreached = found.unreached.get(&a_repo).unwrap();
+        assert_eq!(unreached.ledger, "acme/elsewhere");
+        let why = unreached.join_failed.as_deref().unwrap();
+        assert!(
+            why.starts_with(&format!(
+                "{} is there already, and its origin is not acme/elsewhere",
+                occupant.display()
+            )),
+            "{why}"
+        );
+        assert_eq!(
+            std::fs::read(occupant.join("config")).unwrap(),
+            config_before
+        );
+
+        // And: a pull about it says the join failed, and why.
+        let problems = pull_at(&root, &loaded(&root), &[&a_repo]).problems_for(&a_repo);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        let problem = problems.first().unwrap();
+        assert!(
+            problem.contains("its ledger belongs to acme/elsewhere")
+                && problem.contains(&format!("and joining it failed: {why}")),
+            "{problem}"
+        );
+
+        // And: the lookup of its destination refuses with the same problem.
+        let refused = shared_fork(&root, &loaded(&root), &a_repo).unwrap_err();
+        assert_eq!(refused.to_string(), *problem);
+    }
+
+    #[test]
+    fn a_shared_forks_destination_is_the_git_directory_carrying_it_and_other_forks_have_none() {
+        // Given: one fork sharing its ledger through the root's repository,
+        // and one sharing none.
+        let (_home, root) = ledger_root();
+        registry(&root, &[("a-repo", Some("acme/ledger")), ("c-repo", None)]);
+        origin_at(&root, "/nonexistent/remote.git");
+        git(&root.join(".git"), &["config", "knives.machine", "alpha"]);
+        let registry = loaded(&root);
+
+        // When / Then: the shared fork's destination is that repository, as
+        // this machine.
+        let shared = shared_fork(&root, &registry, &UpstreamName::new("acme/a-repo"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(shared.ledger, "acme/ledger");
+        assert_eq!(
+            shared.destination.repository.git_dir(),
+            std::path::absolute(root.join(".git")).unwrap()
+        );
+        assert_eq!(shared.destination.machine, "alpha");
+        // And: a fork sharing no ledger, and one the registry does not name,
+        // have no destination.
+        for fork in ["acme/c-repo", "acme/unnamed"] {
             assert!(
-                problem.contains(&format!("its ledger belongs to {ledger}")),
-                "{problem}"
+                shared_fork(&root, &registry, &UpstreamName::new(fork))
+                    .unwrap()
+                    .is_none(),
+                "{fork}"
             );
         }
     }
