@@ -18,7 +18,7 @@ Do this before you read code too: a conclusion from the wrong copy is wrong, and
 
 ## 2. Read the status and the notches
 
-- Run `knives status` in the repository, with no argument. It shows each branch, its PR and PR state, whether it is in the upstream trunk, and the claims of other agents. It shows facts. The judgment is yours.
+- Run `knives status` in the repository, with no argument. It shows each branch, its PR and PR state, whether it is in the upstream trunk, and the claims of other agents that this machine records. A claim held only on another machine does not show there: on a fork that shares its ledger, `knives start` reads it and refuses. It shows facts. The judgment is yours.
 - Read the claims before you touch anything. Another agent holds your branch: that is a collision. Find it now, not after one of you loses work.
 - `knives notch` shows recent claims, stated PRs, dependencies, releases and notes. Before you touch a branch you do not understand, run `knives notch <branch>`. The reason for an odd branch is usually one line there.
 - Each entry carries the branch tip of its time. An entry at a commit that the branch moved past is a reason to check again, not a conclusion.
@@ -75,8 +75,10 @@ Do this before you read code too: a conclusion from the wrong copy is wrong, and
 ## 5. Get your workspace with `knives start`
 
 - `knives start <branch> --why "what you are doing"` claims the branch and makes a jj workspace. An existing branch: on its tip, with `@` an empty child. A new branch: on the release's shared base (the upstream trunk when no release exists), so it composes without a rebase.
+- On a fork whose registry entry sets `ledger`, the claim is held on that ledger's repository, for every machine that shares it. A refusal can name a holder on another machine. A `start` that cannot read or write the ledger exits `3`, names the ledger, records no claim and opens no workspace.
 - A `start` that pauses waits for another agent's claim lock. Let it. A refusal names the holder. `using-knives` has the messages.
 - As soon as your active work stops, also to wait for something external such as PR review, run `knives finish <branch>`. It returns the claim and removes the workspace. A forced finish over a claim another owner name holds returns that claim and leaves the workspace and its registration as they are: that directory is the other owner's. Nothing is lost either way: jj keeps the work as a commit by change id, and the branch, bookmark and open PR stay.
+- On a fork that shares its ledger, a `finish` that cannot read or write the ledger exits `3` and leaves `state.json` and the workspace as they were: run it again. The ledger records the `--why` of every `finish`, with `--force` or without.
 - An unforced `knives finish` after another agent took or released your claim names who ended it. Where another owner holds the branch, nothing was changed, the finish exits `1`, and `knives start <branch> --force --why "…"` takes it back. Where nobody holds it, the finish disposes of your own workspace as any finish does, and exits with the worse of `1` and what that disposal gives: `2` where a live process refuses it, `3` where jj cannot snapshot the working copy or read its state. In those two cases the workspace stays. Either way, `knives start <branch>` claims the branch again.
 
 ## 6. Never improvise

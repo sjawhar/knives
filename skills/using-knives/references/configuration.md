@@ -69,7 +69,7 @@ roots = ["~/projects/company"]
 | `consumers` | Forge `owner/repo` slugs whose trunks pin releases, cached by consumer commit. Local paths go in `--consumer PATH`. |
 | `workspaces` | Parent directory of `start` workspaces and of `finish` cleanup. Default: beside the checkout, which fits `<name>/default`. Set it for a checkout at `~/<name>`. `~` expands. A relative value resolves from the config directory, so write `~/…`. `start` and `finish` refuse a value inside the checkout. |
 | `forbidden` | Terms that an upstream-bound diff must not add (our org, product, hosts). Audit scans added lines since the upstream fork point for case-insensitive substrings. Fork-only branches are exempt. Blank terms and case-insensitive duplicates are refused, with the entry named. Absent or empty: no scan and no field. Audit reports hits and never blocks. Nothing else reads it. |
-| `ledger` | `<owner>/<name>` of the repository the fork's ledger travels through. The name can start with a dot (`someone/.knives-ledger`), the owner cannot. Case and `.git` do not matter. knives keeps it lowercase without the suffix, as `knives repos` shows. Absent: the ledger stays on each machine. Refused when it is not `<owner>/<name>`, or when `upstream` is a filesystem path. Setup: [sharing](ledger.md#sharing-between-machines). |
+| `ledger` | `<owner>/<name>` of the repository the fork's ledger travels through. The name can start with a dot (`someone/.knives-ledger`), the owner cannot. Case and `.git` do not matter. knives keeps it lowercase without the suffix, as `knives repos` shows. Absent: the ledger and the fork's claims stay on each machine. Set: the fork's claims are refs on that repository too, and hold on every machine that shares it ([claim refs](ledger.md#claim-refs)). Where no git directory reaches that repository, knives makes one the first time it needs one ([sharing](ledger.md#sharing-between-machines)). A write whose entries do not reach the repository exits `3`. When `start` and `finish` cannot read the claim or push its change, `start` records no claim, `finish` leaves `state.json` and the workspace as they were, and each exits `3`. Refused when it is not `<owner>/<name>`, or when `upstream` is a filesystem path. Setup: [sharing](ledger.md#sharing-between-machines). |
 
 Every entry refuses unknown fields. Thus an older knives refuses a file that sets `ledger`. Upgrade knives on every machine that reads the file before you add it.
 
@@ -110,7 +110,7 @@ A fork entry grants no trust. Add a trust rule separately:
 
 ## OpenCode plugin
 
-Ships with the CLI. A call can first name a file in a registered repository. Then, once per repository per session, the plugin says that the fork is managed and shared, and names claims.
+Ships with the CLI. A call can first name a file in a registered repository. Then, once per repository per session, the plugin says that the fork is managed and shared, and names the claims that this machine's `state.json` holds.
 
 - It appends trusted repository instructions as **data**. A fork entry alone gives the notice, not guidance.
 - It skips an instruction file that the session already holds, until compaction. That is a file in its system prompt (under oh-my-pi, also the session's own `AGENTS.md`). It is also a file injected earlier in the session from any checkout.

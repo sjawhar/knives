@@ -18,7 +18,7 @@ Run `knives ledger migrate` once on each machine. Until the migration moves the 
 - **Bind the right repository.** Commands use the checkout you are in. A named repository is found by a scan of home, not taken from the current directory. `repos` always scans. Scan scope, ambiguous checkouts, registry: [configuration](references/configuration.md).
 - **Keep remote roles separate.** `upstream` takes our work only through a PR. `origin` is our fork, with ordinary branches and PR heads. The optional `release` remote is where releases are consumed. When it is absent or equal to `origin`, publish to `origin`. A matching name on the wrong remote proves nothing.
 - **Registration is not trust.** Trust injects guidance as data and never authorizes fork commands. Repo and owner trust match self-declared remote URLs, not forge authentication. Read [configuration](references/configuration.md) before you grant it.
-- **Respect ownership.** A claim names an active worker, not an important branch. Harness session identities tell apart agents under one OS user. Another holder's claim is not yours. Sightings do not prove liveness. Before `start` or `finish`, read [coordination](references/coordination.md). Never remove `state.lock` or a lock in `fork-locks/`.
+- **Respect ownership.** A claim names an active worker, not an important branch. Harness session identities tell apart agents under one OS user. Another holder's claim is not yours. Sightings do not prove liveness. On a fork whose registry entry sets `ledger`, a claim holds on every machine that shares that ledger, and `status` lists only this machine's claims. Before `start` or `finish`, read [coordination](references/coordination.md). Never remove `state.lock` or a lock in `fork-locks/`.
 - **Release a claim when active work stops**, also while a PR waits for review. First record in the ledger why the branch exists and any supersession. `finish` removes the workspace, not the branch or PR. To keep files jj never tracked, use `--no-cleanup`. Check this before cleanup.
 - **A missing observation is not clearance.** Missing, `null`, zero and `UNKNOWN` differ. Read `problems` and the field definitions: [audit](references/reports.md), [status](references/status.md).
 - **Keep dependencies.** `depends <branch> --on <repo>#<number>` says the branch cannot merge before that PR. Never keep a dependent and drop its requirement: the release cannot work. A status report does not authorize discarding either.
@@ -47,8 +47,8 @@ Open a reference when you run the command or read its output.
 | Plan, edit, cut, rebase, adopt, reap a release | `release ...` | [releases](references/releases.md) |
 | Identity, trust, plugin | `register`, registry, plugin | [configuration](references/configuration.md) |
 
-- These change local state: `sync`, `start`, `finish`, `track`, `depends`, ledger writes, release edits. A ledger write starts a background sweep that pushes it when the ledger is [shared](references/ledger.md#sharing-between-machines).
-- These pull a shared ledger first: `status`, `sync`, `audit`, `pushed`, and release commands that read the ledger.
+- These change local state: `sync`, `start`, `finish`, `track`, `depends`, ledger writes, release edits. When the ledger is [shared](references/ledger.md#sharing-between-machines), a write sends its entries to it before the command exits. A write whose entries did not arrive exits `3`, and a `knives ledger sweep` that you run sends them.
+- These pull a shared ledger first: `status`, `sync`, `audit`, `pushed`, and release commands that read the ledger. On a shared fork, `start` and `finish` read the branch's claim from the ledger's repository first. When they cannot read or write that claim, each exits `3`, and `state.json` and the workspace stay as they were.
 - `audit` and `pushed` never repair, remove, push or open PRs.
 - Release commands never push. Publish a new release name with `jj git push --remote <publish-remote> --bookmark <name>`. Push a release that the publish remote moves only forward with plain `git push`, after the fast-forward rebase and `adopt`. Never use `jj git push` for it. See [publishing](references/releases.md#publishing).
 - `knives hook claude-code|opencode` is harness plumbing. Do not run it.
@@ -79,6 +79,6 @@ Reports use TOON when an agent is detected or stdout is not a terminal. `--json`
 | `0` | No findings. Not a readiness verdict. |
 | `1` | Findings. |
 | `2` | Usage error. |
-| `3` | Incomplete: something could not be answered. |
+| `3` | Incomplete: something could not be answered, or a write did not reach a shared ledger. |
 
 An incomplete report can still hold useful observations. Audit branch rows do not change the exit, but findings and problems do. A `null` thread count is not zero, even at exit `0`.

@@ -20,6 +20,7 @@ notch:  {ts, kind, text, disposition?, anchor?, count}
 ```
 
 - `activity_at` is the newest review or comment time.
+- `claim` comes from this machine's `state.json`: the claims that this machine took or resumed. On a fork that shares its ledger, `status` reads no claim ref. So a claim held only on another machine has no `claim` here, and a record can be out of date: another machine may have seized or released that claim since. `knives start <branch>` reads the ledger's claim ([coordination](coordination.md#claim-identity-and-locking)).
 - A notch `anchor` is the subject tip at write time. It tells an old note from a note about the current tip.
 - `--all` returns one array. One named repository returns an object.
 - An entry that cannot be gathered, or an ambiguous checkout, becomes a `problems` report. A definitely absent checkout is left out with a stderr notice. If scan errors could hide it, it stays as a problem report. Scan rules: [configuration](configuration.md).

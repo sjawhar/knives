@@ -25,7 +25,7 @@ Lists every entry: where its checkout is on this machine, its newest release, an
 
 - `name` is the registry key that you type.
 - `upstream_name` is where the fork's ledger, claims and state are kept: the lowercase upstream `<owner>/<name>`, or the key when upstream is a path. Every row has it.
-- A claim `repo` in `state.json` is an `upstream_name`. To find the checkout of a claim, match it against `upstream_name`, never `name`.
+- A claim `repo` in `state.json` is an `upstream_name`. To find the checkout of a claim, match it against `upstream_name`, never `name`. `state.json` holds this machine's claims only. On a fork with `ledger`, the claim that decides is `refs/knives-claims/<upstream_name>/<branch>` on the ledger's repository, with the branch encoded as one ref component ([claim refs](ledger.md#claim-refs)).
 - `ledger` is the shared ledger repository, lowercase, with no `.git`. It is absent when the ledger is not shared.
 - `repos` reads only the registry and checkouts, never the ledger or state file. Thus it works before `knives ledger migrate`.
 
