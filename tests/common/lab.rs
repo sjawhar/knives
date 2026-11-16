@@ -38,6 +38,11 @@ use tempfile::TempDir;
 /// identity on what it commits must get the identity it stated, whoever runs
 /// it — a developer, CI, or an agent session whose harness exports its bot
 /// account.
+///
+/// `JJ_EDITOR` is set to `false` because jj reads it before `$VISUAL` and
+/// `$EDITOR`, so a lab jj that would open an editor fails the same way in
+/// every environment instead of passing where the caller happens to export a
+/// no-op editor.
 #[ctor::ctor(unsafe)]
 fn isolate_jj_config() {
     let xdg = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("xdg");
@@ -48,6 +53,7 @@ fn isolate_jj_config() {
         std::env::set_var("JJ_CONFIG", "/dev/null");
         std::env::remove_var("JJ_USER");
         std::env::remove_var("JJ_EMAIL");
+        std::env::set_var("JJ_EDITOR", "false");
     }
 }
 

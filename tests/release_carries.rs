@@ -3,9 +3,11 @@
 //! Members counts the repository's parents and names who holds each; `--verify`
 //! reports a dropped member's content. Carries compares a revision's net content
 //! with each target, stops before superseded releases when a live one carries,
-//! and answers against the trunk when no release exists. The census finds
-//! orphan branches, respects an open pull, excludes anonymous heads, and says
-//! unanswered when the forge withholds a fact or is unavailable.
+//! and answers against the trunk when no release exists. A release that names a
+//! member as a parent carries it only when its tree holds the member's change;
+//! the trunk carries any ancestor. The census finds orphan branches, respects
+//! an open pull, excludes anonymous heads, and says unanswered when the forge
+//! withholds a fact or is unavailable.
 
 #![allow(
     clippy::expect_used,
@@ -25,7 +27,7 @@ use forge_shim::{install_failing_gh, path_with_gh_shim, pull_record};
 use knives::jj::Repo;
 use lab::{
     Lab, ReleaseOutput, commit_at, extend_branch, home_after_first_cut, knives_release,
-    release_command, release_test_home,
+    release_command, release_parents, release_test_home,
 };
 use release_forge::{ReleaseWithSnapshotForgeInput, release_with_snapshot_forge};
 use std::process::Command;
@@ -246,6 +248,116 @@ fn release_carries_answers_carried_for_a_member() {
     assert!(output.status.success(), "{stdout}");
     assert!(
         stdout.contains("carried-exact      release/2026-08-04"),
+        "{stdout}"
+    );
+}
+
+/// Alpha and beta on files of their own, cut as `release/2026-08-04`, then
+/// the release edited by hand to drop beta's file: a resolution that lost a
+/// member's change while the member stays a parent.
+fn release_that_dropped_beta() -> (Lab, tempfile::TempDir) {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    lab.jj_work(["edit", "release/2026-08-04"]);
+    std::fs::remove_file(lab.work.join("beta.txt")).expect("drop beta's file by hand");
+    lab.jj_work(["new"]);
+    assert!(
+        release_parents(&lab, "release/2026-08-04").contains(&commit_at(&lab, "feat/beta")),
+        "beta must stay a parent of the release"
+    );
+    (lab, home)
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_parent_whose_change_the_release_dropped() {
+    // Given: a release that names beta as a parent but whose tree, edited by
+    // hand, no longer holds beta's file; alpha's file it still holds.
+    let (lab, home) = release_that_dropped_beta();
+    let release = commit_at(&lab, "release/2026-08-04");
+    let alpha = commit_at(&lab, "feat/alpha");
+
+    // When: carries asks of each member.
+    let beta_output = knives_release(&lab, &home, &["members", "--carries", "feat/beta"]);
+    let alpha_output = knives_release(&lab, &home, &["members", "--carries", "feat/alpha"]);
+
+    // Then: beta's ancestry does not make it carried; the release is the
+    // evidence its replay was judged against, and nothing makes it safe.
+    let beta = String::from_utf8_lossy(&beta_output.stdout);
+    assert_eq!(beta_output.status.code(), Some(1), "{beta}");
+    assert!(
+        beta.contains(&format!(
+            "NOT carried        release/2026-08-04 @ {}  (evidence {}: replay leaves real diffs)",
+            release.short(),
+            release.short()
+        )),
+        "{beta}"
+    );
+    // And: alpha, whose change the release's tree holds, is carried exactly,
+    // and the reason says the tree was read, not only the ancestry.
+    let alpha_stdout = String::from_utf8_lossy(&alpha_output.stdout);
+    assert!(alpha_output.status.success(), "{alpha_stdout}");
+    assert!(
+        alpha_stdout.contains(&format!(
+            "carried-exact      release/2026-08-04 @ {}  (evidence {}: tip is an ancestor and \
+             the release's tree holds its change)",
+            release.short(),
+            alpha.short()
+        )),
+        "{alpha_stdout}"
+    );
+}
+
+#[test]
+fn census_answers_not_carried_for_a_parent_whose_change_the_release_dropped() {
+    // Given: the same release, beta a parent whose file its tree dropped.
+    let (lab, home) = release_that_dropped_beta();
+
+    // When: the census checks every maintained branch.
+    let output = knives_release(&lab, &home, &["members", "--census", "--no-github"]);
+
+    // Then: beta is not carried by the release that names it, so it is
+    // checked against the trunk too, and alpha is carried exactly.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let beta = census_block(&stdout, "feat/beta");
+    assert!(
+        beta.contains("NOT carried        release/2026-08-04"),
+        "{beta}"
+    );
+    assert!(beta.contains("NOT carried        main@upstream"), "{beta}");
+    let alpha = census_block(&stdout, "feat/alpha");
+    assert!(
+        alpha.contains("carried-exact      release/2026-08-04"),
+        "{alpha}"
+    );
+}
+
+#[test]
+fn release_carries_answers_carried_exact_against_the_trunk_for_a_merged_branch() {
+    // Given: alpha merged upstream with a merge commit, so its tip is an
+    // ancestor of the trunk, and no release exists.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.publish_pull("feat/alpha", 7);
+    lab.merge_pull_with_merge_commit(7);
+    let alpha = commit_at(&lab, "feat/alpha");
+    let trunk = commit_at(&lab, "main@upstream");
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: alpha is checked.
+    let output = knives_release(&lab, &home, &["members", "--carries", "feat/alpha"]);
+
+    // Then: the trunk, which knives does not compose, carries it by ancestry
+    // alone, with the tip as the evidence.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "carried-exact      main@upstream @ {}  (evidence {}: tip is an ancestor)",
+            trunk.short(),
+            alpha.short()
+        )),
         "{stdout}"
     );
 }

@@ -13,7 +13,7 @@ use knives::forge::github::CliForge;
 use knives::ids::{BranchName, CommitId, ReleaseScheme, RepoName};
 use knives::ledger::{Draft, Ledger, inline_human_text};
 use knives::release_model::{
-    MemberEvidence, MemberHistory, MemberLookup, MemberSuccession, SeriesFit,
+    EarlierWrites, MemberEvidence, MemberHistory, MemberLookup, MemberSuccession, SeriesFit,
     StackedHistoryContext, carried_from_tips, carries_member_line, last_recorded_parents,
     member_history, member_parents, members_event_text, series_fit, trunk_positions,
 };
@@ -49,37 +49,59 @@ impl ReleaseEdit {
 /// What an edit decided: a new parent set to write with the delta that describes
 /// it, or an already-reported end.
 enum EditOutcome {
-    Done(Vec<knives::ids::CommitId>, String),
+    Done {
+        parents: Vec<knives::ids::CommitId>,
+        delta: String,
+        /// The target of a drop whose parent no remaining member's history
+        /// carries: whether the release loses its content is read from the
+        /// written tree ([`apply_edit`]).
+        uncarried: Option<String>,
+    },
     Settled(Exit),
 }
 
 /// The release in hand: a flat merge of feature and fix branches.
 ///
-/// Every parent is a member. The upstream base is never a direct parent — it
-/// is reachable through every member, because members fork from it — so there
-/// is no role to classify and nothing for a landed member to be mistaken for.
+/// Every parent is a member, except an earlier write of the release a
+/// fast-forward push gave it, a carrier, which no new composition keeps. The
+/// upstream base is never a direct parent — it is reachable through every
+/// member, because members fork from it — so there is no role to classify
+/// and nothing for a landed member to be mistaken for.
 struct ReleaseInHand {
     name: String,
     commit: knives::ids::CommitId,
+    /// The members: the release's parents, its carriers left out.
     parents: Vec<knives::ids::CommitId>,
+    /// The parents that are earlier writes of the release
+    /// ([`knives::release_model::carriers`]).
+    carriers: Vec<knives::ids::CommitId>,
+    /// Every earlier write of the name, which the write hides once it leaves
+    /// one a head nothing holds.
+    writes: EarlierWrites,
     /// Where the trunk sits, upstream and locally. The trunk is not a feature
     /// branch, so neither position is ever a member.
     trunk_tips: Vec<knives::ids::CommitId>,
 }
 
 impl ReleaseInHand {
-    /// Read the release's parents: the members.
+    /// Read the release's parents: the members and the carriers, the latter
+    /// from the ledger's writes of the name and `published`, the publish
+    /// remote's commit of it in jj's view.
     fn read(
         opened: &knives::jj::Repo,
         entry: &knives::config::RepoEntry,
         name: String,
+        (ledger, published): (&[knives::ledger::Entry], Option<&knives::ids::CommitId>),
     ) -> anyhow::Result<Self> {
         let commit = opened.resolve_commit(&name)?;
-        let parents = opened.parent_commits(&name)?;
+        let writes = EarlierWrites::read(opened, &name, ledger, published)?;
+        let (carriers, parents) = writes.partition(&opened.parent_commits(&name)?);
         Ok(Self {
             name,
             commit,
             parents,
+            carriers,
+            writes,
             trunk_tips: trunk_positions(opened, entry)?,
         })
     }
@@ -102,6 +124,10 @@ struct EditContext<'a> {
     /// The fork the current directory is inside, by the name its claims are
     /// kept under; the ledger event's author is derived from it.
     bound: Bound<'a>,
+    /// The mark the edit's ledger event ends with when knives could not check
+    /// the release in hand against its recorded writes
+    /// ([`release::unchecked_suffix`]); empty otherwise.
+    unchecked: &'a str,
     /// The release's last recorded parent set, from this repository's ledger.
     ///
     /// Ancestry and change ids cover a branch that grew or was rebased by jj. A
@@ -423,24 +449,139 @@ pub(crate) fn run_release_edit(
 /// Why a published dated release must not move ([`release::published_release`]),
 /// as the line to print after the repo name, or `None`. `verb` is the gerund
 /// and the imperative of the move refused.
-pub(crate) fn published_refusal(
+fn published_refusal(
     opened: &knives::jj::Repo,
     ledger: &[knives::ledger::Entry],
     release: release::ReleaseAt<'_>,
-    (doing, todo): (&str, &str),
+    verb: (&str, &str),
 ) -> anyhow::Result<Option<String>> {
-    Ok(
-        release::published_release(opened, ledger, release)?.map(|evidence| {
-            // The release is a name read from the repository; the evidence
-            // quotes a tag or a ledger entry.
-            format!(
-                "{} is published ({}); {doing} it would move a published release: cut a \
-                 new dated release first, then {todo} that",
-                inline_human_text(release.name),
-                inline_human_text(&evidence)
-            )
-        }),
+    Ok(release::published_release(opened, ledger, release)?
+        .map(|evidence| published_refusal_text(release.name, &evidence, verb)))
+}
+
+/// [`published_refusal`]'s line for the release `name`, which `evidence` marks
+/// published.
+fn published_refusal_text(name: &str, evidence: &str, (doing, todo): (&str, &str)) -> String {
+    // The release is a name read from the repository; the evidence quotes a
+    // tag or a ledger entry.
+    format!(
+        "{} is published ({}); {doing} it would move a published release: cut a new dated \
+         release first, then {todo} that",
+        inline_human_text(name),
+        inline_human_text(evidence)
     )
+}
+
+/// Refuse, saying so, a release write while the upstream trunk does not
+/// resolve: `true` after refusing.
+///
+/// Fail closed: parents are classified against the upstream trunk, and an
+/// unresolvable trunk would make every base look like a member.
+pub(crate) fn refuse_unresolved_trunk(
+    opened: &knives::jj::Repo,
+    repo: &RepoName,
+    entry: &knives::config::RepoEntry,
+) -> bool {
+    if opened.resolve_commit(&entry.trunk_ref()).is_ok() {
+        return false;
+    }
+    println!(
+        "{repo}: cannot resolve {}; release edits classify parents against the upstream \
+         trunk, so fetch upstream first",
+        entry.trunk_ref()
+    );
+    true
+}
+
+/// Refuse, saying what to do, a write over a release in hand that carries a
+/// change knives did not write or adopt ([`release::in_hand_refusal`]):
+/// `Err` after refusing, otherwise how the release stands. `verb` names the
+/// write refused.
+///
+/// Written over such a release, the write would carry the change forward,
+/// and the next write would read it as knives' own, though nothing measured
+/// what it kept of each member. So it refuses before it writes, naming the
+/// `adopt` that measures and records it, or the remedy `adopt` itself gives.
+fn refuse_unrecorded(
+    (repo, verb): (&RepoName, &str),
+    entry: &knives::config::RepoEntry,
+    release: &release::InHand<'_>,
+) -> anyhow::Result<Result<release::InHandWrite, Exit>> {
+    let standing = release::in_hand_write(release)?;
+    let Some(refusal) = release::in_hand_refusal(release, &standing, entry)? else {
+        return Ok(Ok(standing));
+    };
+    println!("{repo}: {verb} refused, nothing written: {refusal}");
+    Ok(Err(Exit::Incomplete))
+}
+
+/// Say so before a write over a release in hand knives could not check
+/// against its recorded writes, a name the ledger records no write of
+/// included ([`release::unchecked_line`]), and give the mark the write's
+/// ledger event ends with ([`release::unchecked_suffix`]): nothing for any
+/// other release.
+pub(crate) fn announce_unchecked(
+    repo: &RepoName,
+    release: &release::InHand<'_>,
+    standing: &release::InHandWrite,
+) -> String {
+    if let Some(line) = release::unchecked_line(release.name, release.commit, standing) {
+        println!("{repo}: {line}");
+    }
+    release::unchecked_suffix(standing)
+}
+
+/// Refuse, saying why, an edit or a rebase of the release in hand that
+/// carries a change knives did not write or adopt ([`refuse_unrecorded`]),
+/// or one that is published ([`published_refusal`]): `Err` after refusing,
+/// otherwise the mark the write's event ends with ([`announce_unchecked`]).
+/// `verb` names the write refused, and `moving` is the gerund and the
+/// imperative of the move a published release refuses.
+pub(crate) fn refuse_edit_in_hand(
+    (repo, verb): (&RepoName, &str),
+    entry: &knives::config::RepoEntry,
+    in_hand: &release::InHand<'_>,
+    moving: (&str, &str),
+) -> anyhow::Result<Result<String, Exit>> {
+    let standing = match refuse_unrecorded((repo, verb), entry, in_hand)? {
+        Ok(standing) => standing,
+        Err(exit) => return Ok(Err(exit)),
+    };
+    if let Some(refusal) = published_refusal(
+        in_hand.repo,
+        in_hand.ledger,
+        release::ReleaseAt {
+            scheme: &entry.release_scheme(),
+            name: in_hand.name,
+            commits: &[Some(in_hand.commit), in_hand.published],
+        },
+        moving,
+    )? {
+        println!("{repo}: {refusal}");
+        return Ok(Err(Exit::Incomplete));
+    }
+    Ok(Ok(announce_unchecked(repo, in_hand, &standing)))
+}
+
+/// Refuse, saying what the plan could not answer, a write from a plan with
+/// problems: `true` after refusing. `verb` names the write.
+pub(crate) fn refuse_plan_problems(repo: &RepoName, plan: &release::Plan, verb: &str) -> bool {
+    if plan.problems.is_empty() {
+        return false;
+    }
+    println!("{}", release::render(plan));
+    // The plan's own render escaped these one line above; this summary
+    // quotes the same jj, forge and consumer text, so it escapes each
+    // problem too ([`knives::ledger::problem_human_text`]).
+    println!(
+        "{repo}: {verb} not applied; the plan could not answer: {}",
+        plan.problems
+            .iter()
+            .map(|problem| knives::ledger::problem_human_text(problem))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    true
 }
 
 /// Refuse, saying so, an edit of a release every pin of which is frozen:
@@ -507,20 +648,7 @@ fn edit_release(
         heads,
     };
     let plan = release::pulled_plan(fork, bound.registry, &consumers)?;
-    if !plan.problems.is_empty() {
-        println!("{}", release::render(&plan));
-        // The plan's own render escaped these one line above; this summary
-        // quotes the same jj, forge and consumer text, so it escapes each
-        // problem too ([`knives::ledger::problem_human_text`]).
-        println!(
-            "{repo}: {} not applied; the plan could not answer: {}",
-            change.verb(),
-            plan.problems
-                .iter()
-                .map(|problem| knives::ledger::problem_human_text(problem))
-                .collect::<Vec<_>>()
-                .join("; ")
-        );
+    if refuse_plan_problems(repo, &plan, change.verb()) {
         return Ok(Exit::Incomplete);
     }
     let Some(release_name) = plan.release.clone() else {
@@ -530,37 +658,35 @@ fn edit_release(
     if refuse_if_frozen(repo, &entry.release_scheme(), &plan, &release_name) {
         return Ok(Exit::Incomplete);
     }
-    // Fail closed: parents are classified against the upstream trunk, and an
-    // unresolvable trunk would make every base look like a member — include
-    // would refuse for the wrong reason, and drop or advance could touch the
-    // base, which is `rebase`'s domain.
-    if opened.resolve_commit(&entry.trunk_ref()).is_err() {
-        println!(
-            "{repo}: cannot resolve {}; release edits classify parents against the upstream \
-             trunk, so fetch upstream first",
-            entry.trunk_ref()
-        );
+    // An unresolvable trunk would let include refuse for the wrong reason,
+    // and drop or advance touch the base, which is `rebase`'s domain.
+    if refuse_unresolved_trunk(&opened, repo, entry) {
         return Ok(Exit::Incomplete);
     }
     if !release_is_locally_movable(&opened, repo, &release_name) {
         return Ok(Exit::Incomplete);
     }
-    let release = ReleaseInHand::read(&opened, entry, release_name)?;
     // The pulled plan refused on any problem this read finds.
     let ledger = Ledger::for_fork(fork).read()?.entries;
-    if let Some(refusal) = published_refusal(
+    let release = ReleaseInHand::read(
         &opened,
-        &ledger,
-        release::ReleaseAt {
-            scheme: &entry.release_scheme(),
-            name: &release.name,
-            commits: &[Some(&release.commit), plan.published.as_ref()],
-        },
-        ("editing", "edit"),
-    )? {
-        println!("{repo}: {refusal}");
-        return Ok(Exit::Incomplete);
-    }
+        entry,
+        release_name,
+        (&ledger, plan.published.as_ref()),
+    )?;
+    let in_hand = release::InHand {
+        repo: &opened,
+        ledger: &ledger,
+        name: &release.name,
+        commit: &release.commit,
+        writes: &release.writes,
+        published: plan.published.as_ref(),
+    };
+    let unchecked =
+        match refuse_edit_in_hand((repo, change.verb()), entry, &in_hand, ("editing", "edit"))? {
+            Ok(unchecked) => unchecked,
+            Err(exit) => return Ok(exit),
+        };
     let releases = knives::release_model::release_refs_by_commit(
         &opened.bookmark_tips()?,
         &entry.release_scheme(),
@@ -575,6 +701,7 @@ fn edit_release(
         entry,
         recorded: last_recorded_parents(&ledger, &release.name),
         bound,
+        unchecked: &unchecked,
         stacked: StackedHistoryContext {
             repo: &opened,
             trunks: &release.trunk_tips,
@@ -591,20 +718,28 @@ fn edit_release(
             advance_edit(&context, entry, branches, from.as_deref())?
         }
     };
-    let (new_parents, delta) = match outcome {
+    let (parents, delta, uncarried) = match outcome {
         EditOutcome::Settled(exit) => return Ok(exit),
-        EditOutcome::Done(parents, delta) => (parents, delta),
+        EditOutcome::Done {
+            parents,
+            delta,
+            uncarried,
+        } => (parents, delta, uncarried),
     };
-    apply_edit(&context, fork, &new_parents, &delta)
+    apply_edit(&context, fork, (&parents, &delta, uncarried.as_deref()))
 }
 
 /// Write the edited release — duplicated onto its new parent set, described,
 /// its name moved — record the parent set in the ledger, and report.
+///
+/// `uncarried` is the target of a drop whose parent no remaining member's
+/// history carries. Whether the release lost that content is read from the
+/// written tree: jj merges the remaining parents over their real merge base,
+/// so the content can survive, and then the drop says so instead of a loss.
 fn apply_edit(
     context: &EditContext<'_>,
     fork: &Fork<'_>,
-    new_parents: &[knives::ids::CommitId],
-    delta: &str,
+    (new_parents, delta, uncarried): (&[knives::ids::CommitId], &str, Option<&str>),
 ) -> anyhow::Result<Exit> {
     let (repo, opened, release) = (context.repo, context.opened, context.release);
     let entry = fork.entry;
@@ -615,10 +750,11 @@ fn apply_edit(
         &knives::jj::ReleaseWrite {
             source: Some(&release.commit),
             parents: new_parents,
+            carriers: &release.carriers,
             message: Some(&message),
             bookmark: Some(&release.name),
             publish_remote: Some(entry.publish_remote()),
-            earlier: &earlier_writes(fork, &release.name)?,
+            earlier: release.writes.commits(),
             operation: &format!("knives: {}: {delta}", release.name),
         },
     )?;
@@ -632,9 +768,26 @@ fn apply_edit(
             created,
             change: &written.change,
             provenance: &provenance,
+            unions: &written.unions,
+            unchecked: context.unchecked,
         },
         context.bound,
     )?;
+    if let Some(target) = uncarried {
+        let shown_target = inline_human_text(target);
+        if written.same_tree_as_source {
+            println!(
+                "{repo}: {shown_target} left the parent set of {}, and the release's content did \
+                 not change",
+                release.shown_name()
+            );
+        } else {
+            println!(
+                "{repo}: no remaining member carries {shown_target}'s content; the release loses \
+                 it"
+            );
+        }
+    }
     // The delta names branches read from the repository, and the reason the
     // caller gave; the ledger keeps it raw.
     println!(
@@ -645,7 +798,10 @@ fn apply_edit(
     );
     report_replaced(repo, &release.name, &written);
     match knives::jj::conflicted_files(&fork.checkout.path, created.as_str()) {
-        Ok(files) => println!("{}", release::conflict_guidance(&files)),
+        Ok(files) => println!(
+            "{}",
+            release::conflict_guidance(&release.name, &files, &written.unions)
+        ),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
     Ok(Exit::Ok)
@@ -690,6 +846,7 @@ fn replaced_lines(
         release,
         &written.abandoned_earlier,
     ));
+    lines.extend(hidden_lines(repo, release, &written.hidden));
     lines
 }
 
@@ -722,32 +879,82 @@ fn abandoned_earlier_lines(
         .collect()
 }
 
-/// The commits the fork's ledger records knives writing under `release`.
-pub(crate) fn earlier_writes(
+/// One line per head a write left that nothing held, and abandoned in the
+/// same operation (`hide_exposed`, src/jj.rs).
+pub(crate) fn report_hidden(repo: &RepoName, release: &str, hidden: &[knives::jj::HiddenHead]) {
+    for line in hidden_lines(repo, release, hidden) {
+        println!("{line}");
+    }
+}
+
+fn hidden_lines(repo: &RepoName, release: &str, hidden: &[knives::jj::HiddenHead]) -> Vec<String> {
+    let shown_release = inline_human_text(release);
+    hidden
+        .iter()
+        .map(|head| {
+            let commit = head.commit.short();
+            head.superseded_by.as_ref().map_or_else(
+                || {
+                    format!(
+                        "{repo}: abandoned {commit}, an earlier {shown_release} commit this write \
+                         left a head nothing holds"
+                    )
+                },
+                |by| {
+                    format!(
+                        "{repo}: abandoned {commit}, which this write left a head nothing holds; \
+                         its rewrite {} is visible",
+                        by.short()
+                    )
+                },
+            )
+        })
+        .collect()
+}
+
+/// Every earlier write of `release` ([`EarlierWrites`]): the fork's ledger's
+/// writes of the name, and the publish remote's commit of it in `opened`'s
+/// view.
+pub(crate) fn release_writes(
     fork: &Fork<'_>,
+    opened: &knives::jj::Repo,
     release: &str,
-) -> anyhow::Result<Vec<knives::ids::CommitId>> {
+) -> anyhow::Result<EarlierWrites> {
     let entries = Ledger::for_fork(fork).read()?.entries;
-    Ok(knives::release_model::recorded_writes(&entries, release)
-        .map(|write| write.commit)
-        .collect())
+    let published = opened
+        .bookmark_tips()?
+        .remove(&knives::ids::BookmarkRef::Remote {
+            branch: BranchName::new(release),
+            remote: knives::ids::RemoteName::new(fork.entry.publish_remote()),
+        });
+    Ok(EarlierWrites::read(
+        opened,
+        release,
+        &entries,
+        published.as_ref(),
+    )?)
 }
 
 /// What one release edit wrote: the name, the delta, the new merge with its
-/// change id, and its parent set with the branch each parent came from.
+/// change id, its parent set with the branch each parent came from, the
+/// release logs it unioned, and the mark of a release in hand knives could
+/// not check ([`release::unchecked_suffix`]).
 pub(crate) struct EditRecord<'a> {
     pub(crate) release: &'a str,
     pub(crate) delta: &'a str,
     pub(crate) created: &'a knives::ids::CommitId,
     pub(crate) change: &'a knives::ids::ChangeId,
     pub(crate) provenance: &'a [(String, knives::ids::CommitId)],
+    pub(crate) unions: &'a [knives::jj::UnionedFile],
+    pub(crate) unchecked: &'a str,
 }
 
 /// The edit's parent set goes to the ledger the way a cut's does, so a later
 /// `advance` or `include` can still tell which parent is which branch after a
 /// rebase that left no ancestry or change id behind. Like a cut event, it names
 /// the written commit, its change id and its parents, and the commit leads the
-/// evidence: it is the position `audit` holds the release against.
+/// evidence: it is the position `audit` holds the release against. The release
+/// logs the edit unioned close the text ([`union_event_text`]).
 pub(crate) fn record_edit_event(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
@@ -767,18 +974,50 @@ pub(crate) fn record_edit_event(
         ..Draft::event(
             Some(record.release),
             format!(
-                "edited {} as {} (change {}) with {} parent(s): {}; parents: {}",
-                record.release,
-                record.created.short(),
-                record.change.short(),
-                parents.len(),
-                record.delta,
-                members_event_text(record.provenance)
+                "{}{}{}",
+                edit_event_text(
+                    record.release,
+                    (record.created, record.change),
+                    record.provenance,
+                    record.delta
+                ),
+                union_event_text(record.unions),
+                record.unchecked
             ),
             None,
         )
     })?;
     Ok(())
+}
+
+/// An edit event's text through its parents: `edited <release> as <commit>
+/// (change <id>) with <n> parent(s): <delta>; parents: <provenance>`. A
+/// write's unions and its unchecked mark close the text after it.
+pub(crate) fn edit_event_text(
+    release: &str,
+    (created, change): (&knives::ids::CommitId, &knives::ids::ChangeId),
+    provenance: &[(String, knives::ids::CommitId)],
+    delta: &str,
+) -> String {
+    format!(
+        "edited {release} as {} (change {}) with {} parent(s): {delta}; parents: {}",
+        created.short(),
+        change.short(),
+        provenance.len(),
+        members_event_text(provenance)
+    )
+}
+
+/// `; union: CHANGELOG.md, RELEASE_NOTES.md` for the release logs a write
+/// unioned, or nothing when it unioned none. A cut or edit event ends with
+/// it, because every reader of those events parses only how the text starts
+/// (`recorded_writes`, `last_recorded_cut`).
+pub(crate) fn union_event_text(unions: &[knives::jj::UnionedFile]) -> String {
+    if unions.is_empty() {
+        return String::new();
+    }
+    let paths: Vec<&str> = unions.iter().map(|union| union.path.as_str()).collect();
+    format!("; union: {}", paths.join(", "))
 }
 
 /// Each parent with every branch at it now, for a cut or edit event's record.
@@ -948,7 +1187,11 @@ fn include_edit(
     parents.push(tip);
     let why = why.map_or_else(String::new, |why| format!(" ({why})"));
     let delta = format!("included {target}{why}");
-    Ok(EditOutcome::Done(parents, delta))
+    Ok(EditOutcome::Done {
+        parents,
+        delta,
+        uncarried: None,
+    })
 }
 
 /// Remove one member parent. The branch and its bookmark are untouched.
@@ -968,7 +1211,9 @@ fn drop_edit(context: &EditContext<'_>, target: &str, why: &str) -> anyhow::Resu
             candidates.extend(context.member_parents(target, &tip)?.parents);
         }
     } else if let Ok(commit) = opened.resolve_commit(target) {
-        if release.parents.contains(&commit) {
+        // A carrier is no member, but dropping it by its id is what a person
+        // who read it in the parent list asks for: the write leaves it out.
+        if release.parents.contains(&commit) || release.carriers.contains(&commit) {
             candidates.push(commit);
         }
     } else {
@@ -987,10 +1232,10 @@ fn drop_edit(context: &EditContext<'_>, target: &str, why: &str) -> anyhow::Resu
             let mut parents = release.parents.clone();
             parents.retain(|kept| kept != parent);
             // A drop only removes the parent; whether the content survives
-            // depends on the remaining members' ancestry. Losing it is often
-            // the point (a bad fix) and sometimes a surprise (a landed pull
-            // the members' bases do not reach yet), so the fact is stated
-            // rather than judged.
+            // depends on the remaining members. Losing it is often the point
+            // (a bad fix) and sometimes a surprise (a landed pull the
+            // members' bases do not reach yet), so the fact is stated rather
+            // than judged, once the written tree says which it is.
             let mut carried_elsewhere = false;
             for kept in &parents {
                 if opened.is_ancestor(parent, kept)? {
@@ -998,14 +1243,12 @@ fn drop_edit(context: &EditContext<'_>, target: &str, why: &str) -> anyhow::Resu
                     break;
                 }
             }
-            if !carried_elsewhere {
-                println!(
-                    "{repo}: no remaining member carries {shown_target}'s content; the release \
-                     loses it"
-                );
-            }
             let delta = format!("dropped {target}: {why}");
-            Ok(EditOutcome::Done(parents, delta))
+            Ok(EditOutcome::Done {
+                parents,
+                delta,
+                uncarried: (!carried_elsewhere).then(|| target.to_owned()),
+            })
         }
         many => {
             let listed: Vec<&str> = many.iter().map(CommitId::short).collect();
@@ -1085,7 +1328,11 @@ fn advance_edit(
         }
     }
     let delta = format!("advanced {}", moved.join(", "));
-    Ok(EditOutcome::Done(deduped, delta))
+    Ok(EditOutcome::Done {
+        parents: deduped,
+        delta,
+        uncarried: None,
+    })
 }
 
 /// Advance every member whose branch has moved on. `None` is a refusal that
@@ -1378,6 +1625,9 @@ mod tests {
                 kept: Some("the working copy of workspace ws\u{1b}x\u{9b}y rests on it".to_owned()),
             }),
             abandoned_earlier: vec![CommitId::new("cccc")],
+            hidden: Vec::new(),
+            unions: Vec::new(),
+            same_tree_as_source: false,
         };
 
         let lines = replaced_lines(&RepoName::new("demo"), "release/x\u{9b}2J", &written);
@@ -1392,6 +1642,36 @@ mod tests {
                  working copy of workspace ws\u{fffd}x\u{fffd}y rests on it",
                 "demo: abandoned cccc, an earlier release/x\u{fffd}2J commit nothing rests on any \
                  more",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hidden_head_is_named_as_an_earlier_write_or_with_its_rewrite() {
+        // Given: a write that hid an earlier write of the release and a
+        // member commit a visible rewrite supersedes.
+        let hidden = [
+            knives::jj::HiddenHead {
+                commit: CommitId::new("dddd"),
+                superseded_by: None,
+            },
+            knives::jj::HiddenHead {
+                commit: CommitId::new("eeee"),
+                superseded_by: Some(CommitId::new("ffff")),
+            },
+        ];
+
+        // When: the write reports them.
+        let lines = hidden_lines(&RepoName::new("demo"), "sami\u{9b}2J", &hidden);
+
+        // Then: each says why it was the write's to hide, the name escaped.
+        assert_eq!(
+            lines,
+            [
+                "demo: abandoned dddd, an earlier sami\u{fffd}2J commit this write left a head \
+                 nothing holds",
+                "demo: abandoned eeee, which this write left a head nothing holds; its rewrite \
+                 ffff is visible",
             ]
         );
     }

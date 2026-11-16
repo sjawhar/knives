@@ -65,7 +65,7 @@ Thus approval does not override held checks. The state does not show every obser
 | seen | age of the latest sighting, `none-since-claim`, `none-within-window`, `-` |
 | notch | newest human note, else newest event: token, age, anchor (`(3d @1a2b3c4d5e6f)`), and `+N` hidden siblings |
 
-About `landed`: a merged PR whose landing commit is in upstream trunk reads `in-trunk` from forge evidence, when the branch holds nothing past what merged. A branch with later commits keeps its replay verdict, with a note. A squash can conflict with its own squash. Divergent bookmarks are never replayed.
+About `landed`: a merged PR whose landing commit is in upstream trunk reads `in-trunk` from forge evidence, when the branch holds nothing past what merged. A branch with later commits keeps its replay verdict, with a note. A squash can conflict with its own squash. Divergent bookmarks are never replayed. The probe replays a branch onto `<trunk>@<trunk remote>`, the upstream trunk (`<trunk>@upstream`), and never reads a release. So a member that a release carries can read `conflicts-with-trunk`. Whether a release carries it is `knives release members --carries <branch>`.
 
 ## Claim sightings
 

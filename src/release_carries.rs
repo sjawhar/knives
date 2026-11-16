@@ -27,7 +27,8 @@ use super::parallelism;
 /// pulled first as every release command's is; a pull that failed is one of
 /// the report's problems. The plan's other problems (a consumer whose pins
 /// could not be read) are not: they are about the next cut, not about which
-/// release this is.
+/// release this is. A named release labels its carriers from the ledger this
+/// machine has.
 #[allow(
     clippy::too_many_arguments,
     reason = "the fork, the registry its ledger is pulled through, the reference, the replay request and the output format are independent inputs"
@@ -45,7 +46,14 @@ pub(crate) fn run_release_members(
     let forge = CliForge;
     let cache_root = knives::forge_cache::cache_root();
     let heads = knives::consumer_pins::ConsumerHeadMemo::default();
-    let mut pull_problems = Vec::new();
+    let (entries, pull_problems) = if reference.is_none() {
+        release::pulled_ledger(fork, registry)?
+    } else {
+        (
+            knives::ledger::Ledger::for_fork(fork).read()?.entries,
+            Vec::new(),
+        )
+    };
     let reference = if let Some(reference) = reference {
         std::borrow::Cow::Borrowed(reference)
     } else {
@@ -56,19 +64,17 @@ pub(crate) fn run_release_members(
             cache_root: cache_root.as_deref(),
             heads: &heads,
         };
-        let (entries, problems) = release::pulled_ledger(fork, registry)?;
         let plan = release::plan(fork, &consumers, &entries)?;
         let Some(reference) = plan.release else {
             println!("{repo}: no release to inspect; cut one first");
-            for problem in &problems {
+            for problem in &pull_problems {
                 println!("!! {}", knives::ledger::problem_human_text(problem));
             }
             return Ok(Exit::Incomplete);
         };
-        pull_problems = problems;
         std::borrow::Cow::Owned(reference)
     };
-    let mut report = release::gather_members(&opened, fork, &reference, verify)?;
+    let mut report = release::gather_members(&opened, fork, &reference, (&entries, verify))?;
     report.problems.extend(pull_problems);
     let exit = members_exit(&report, verify);
     print_members(&report, output)?;
@@ -78,12 +84,7 @@ pub(crate) fn run_release_members(
 fn members_exit(report: &release::MembersReport, verify: bool) -> Exit {
     if !report.problems.is_empty() {
         Exit::Incomplete
-    } else if verify
-        && report
-            .audit
-            .as_ref()
-            .is_some_and(|audit| !audit.missing.is_empty() || !audit.unexplained.is_empty())
-    {
+    } else if verify && report.audit.as_ref().is_some_and(|audit| !audit.passed()) {
         Exit::Findings
     } else {
         Exit::Ok
@@ -161,7 +162,7 @@ pub(crate) fn run_revision_carries(
     let all_targets = carriage::targets(
         &tips,
         &entry.release_scheme(),
-        (trunk_name.as_str(), trunk),
+        (trunk_name.as_str(), trunk.clone()),
         entry.publish_remote(),
     );
     let (mut selected, superseded) = match target {
@@ -187,11 +188,7 @@ pub(crate) fn run_revision_carries(
         selected_target.role = TargetRole::UpstreamTrunk;
     }
     let checks = CarriesChecks {
-        input: CheckInput {
-            repo: &opened,
-            revision,
-            tip: &tip,
-        },
+        input: CheckInput::new(&opened, revision, &tip, &trunk),
         fallback: target.unwrap_or(trunk_name.as_str()),
     };
     let mut report = CarriesReport {

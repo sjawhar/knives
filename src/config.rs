@@ -36,6 +36,28 @@ pub(crate) mod test_support {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// `jj` in `path`, which must succeed. Identity comes from the
+    /// environment, not `config set --repo`: a repo-level write mints a
+    /// `config-id` and a directory under `$XDG_CONFIG_HOME/jj/repos/` that
+    /// outlives the temporary repository.
+    pub(crate) fn run_jj(path: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("jj")
+            .current_dir(path)
+            .args(args)
+            .env("JJ_CONFIG", "/dev/null")
+            .env("JJ_USER", "knives tests")
+            .env("JJ_EMAIL", "tests@example.invalid")
+            .output()
+            .expect("run jj test fixture command");
+        assert!(
+            output.status.success(),
+            "jj {} failed:\nstdout:\n{}\nstderr:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
     #[derive(Debug)]
     pub(crate) struct EnvironmentGuard {
         values: Vec<(&'static str, Option<OsString>)>,

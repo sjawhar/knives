@@ -426,10 +426,12 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
         entries,
         is_metadata_rewrite,
     } = *scan;
+    let mut names: BTreeSet<String> = BTreeSet::new();
     for (branch, current) in local
         .iter()
         .filter(|(branch, _)| schemes.iter().any(|scheme| is_release_name(branch, scheme)))
     {
+        names.insert(branch.as_str().to_owned());
         add_release_drift(
             report,
             ReleaseDrift {
@@ -452,6 +454,7 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
         {
             continue;
         }
+        names.insert(branch.as_str().to_owned());
         add_release_drift(
             report,
             ReleaseDrift {
@@ -466,6 +469,30 @@ fn add_release_drifts(report: &mut Report, scan: &ReleaseDriftScan<'_>) {
             },
         );
     }
+    for name in &names {
+        add_unchecked_note(report, entries, name);
+    }
+}
+
+/// A note naming the newest recorded write of release `name` when knives
+/// wrote it over a release in hand it could not check against its recorded
+/// writes: its event ends with `; unchecked: <reason>`. Nothing measured what
+/// that release kept of each member, so a person reads the note and runs
+/// `knives release adopt` on such a release before the next write.
+fn add_unchecked_note(report: &mut Report, entries: &[Entry], name: &str) {
+    let Some((event, write)) = crate::release_model::recorded_write_events(entries, name).next()
+    else {
+        return;
+    };
+    let Some(reason) = crate::release_model::unchecked_mark(event) else {
+        return;
+    };
+    report.notes.push(format!(
+        "{name}: its newest recorded {} {} was written over a release in hand knives could not \
+         check against its recorded writes ({reason})",
+        write.kind,
+        write.commit.short()
+    ));
 }
 
 /// Hold one release ref against the commits knives wrote under its name.

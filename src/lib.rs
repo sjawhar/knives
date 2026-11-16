@@ -25,6 +25,7 @@
 
 pub mod bind;
 pub mod carriage;
+pub mod changelog_union;
 pub mod cli;
 pub mod commands;
 pub mod config;

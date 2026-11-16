@@ -832,6 +832,7 @@ fn cutting_a_release_does_not_move_another_agents_working_copy() {
         &knives::jj::ReleaseWrite {
             source: None,
             parents: &[alpha, beta],
+            carriers: &[],
             message: Some("release: test"),
             bookmark: None,
             publish_remote: None,
@@ -868,6 +869,7 @@ fn a_release_write_with_no_parents_is_refused_rather_than_done_in_place() {
         &knives::jj::ReleaseWrite {
             source: Some(&source),
             parents: &[],
+            carriers: &[],
             message: None,
             bookmark: None,
             publish_remote: None,
