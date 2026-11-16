@@ -179,7 +179,7 @@ knives cannot check the release in hand against its recorded writes in three cas
 ```text
 knives could not check <name> at <commit> against its recorded writes: the recorded write its members match, the recorded <cut|edit> <id>, is not in this repository; knives did not fetch; `knives release adopt <name>` records it
 knives could not check <name> at <commit> against its recorded writes: its members match no recorded write, so they changed outside knives; knives did not fetch; make the change with `knives release include`, `drop` or `advance` (a member added by hand: drop it, then include it); that write records the new composition, marked unchecked
-knives could not check <name> at <commit> against its recorded writes: the ledger records no write of the name; knives did not fetch; the write is marked unchecked until `knives release adopt` records the name it writes
+knives could not check <name> at <commit> against its recorded writes: the ledger records no write of the name; knives did not fetch; a write over it is marked unchecked until `knives release adopt` records the name it writes
 ```
 
 - The write's ledger event ends with `; unchecked: W absent`, `; unchecked: no match` or `; unchecked: no record` ([ledger](ledger.md#automatic-entries)). `audit` shows a note while that write is the newest write of the name ([reports](reports.md#knives-audit-repo---all---no-github)). So no later pod reads the release as measured.

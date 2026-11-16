@@ -337,8 +337,8 @@ impl Why {
             Self::SinceWriteAbsent => "the release in hand is unchecked since the recorded edit",
             Self::NoRecord => {
                 "against its recorded writes: the ledger records no write of the name; knives \
-                 did not fetch; the write is marked unchecked until `knives release adopt` \
-                 records the name it writes"
+                 did not fetch; a write over it is marked unchecked until `knives release \
+                 adopt` records the name it writes"
             }
             Self::SinceNoRecord => "(no record); knives did not fetch; `knives release adopt",
         }
@@ -605,6 +605,40 @@ fn an_include_over_a_name_with_no_recorded_write_is_marked_until_adopted() {
 
     // Then: marked, and every write after it too, until adopt.
     assert_marked_until_adopted((&lab, &home), &out, DATED, [NEXT, "release/2026-08-06"]);
+}
+
+#[test]
+fn an_include_of_a_member_over_a_name_with_no_recorded_write_states_the_rule_and_records_nothing() {
+    // Given: a release whose name has no recorded write, gamma among its
+    // members.
+    let (lab, home) = a_release_with_no_recorded_write();
+    let (ledger, commit) = (ledger_entries(&home), commit_at(&lab, DATED));
+
+    // When: gamma is included again.
+    let output = release_in(&lab, &home, &lab.work, &["include", "feat/gamma"]);
+    let out = stdout(&output);
+
+    // Then: the line saying knives could not check the release states the
+    // rule for a write over it, never that this include's write is marked;
+    // the include says the release already carries gamma, exits 0, and
+    // writes nothing, so the ledger holds no new event.
+    assert!(
+        out.contains(&format!(
+            "demo: knives could not check {DATED} at {} {}\n",
+            commit.short(),
+            Why::NoRecord.line()
+        )),
+        "{}",
+        text(&output)
+    );
+    assert!(!out.contains("the write is marked"), "{out}");
+    assert!(
+        out.contains(&format!("demo: {DATED} already carries feat/gamma\n")),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert_eq!(ledger_entries(&home), ledger);
 }
 
 #[test]

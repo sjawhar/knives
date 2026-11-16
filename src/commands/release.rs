@@ -1199,9 +1199,10 @@ pub fn no_match_refusal(
 
 /// The remedy for a release whose name the ledger records no write of:
 /// `adopt` has nothing to replace until a write records the name, so it
-/// records the name the write writes, whose event the write marks.
+/// records the name a write over the release writes, whose event that write
+/// marks. It states a rule, true whether or not the verb then writes.
 const NO_RECORD_REMEDY: &str =
-    "the write is marked unchecked until `knives release adopt` records the name it writes";
+    "a write over it is marked unchecked until `knives release adopt` records the name it writes";
 
 /// The one line a write over a release in hand knives could not check
 /// prints before it writes ([`Unchecked`], [`InHandWrite::NoRecord`]).
