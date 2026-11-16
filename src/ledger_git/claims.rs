@@ -420,9 +420,11 @@ pub enum ClaimPushed {
 ///    remote that applied the push and then hung up or reported a failure.
 ///    The test needs N to be new: when `before` is N, it is skipped.
 /// 3. A porcelain line marked `!` is a refusal, since under `--atomic` one
-///    refused ref means none was applied; so is git stopping before the
-///    remote's receive-pack took any command, as its stderr says with
-///    nothing on stdout. The machine ref is then moved back to P
+///    refused ref means none was applied, unless it is `[remote failure]`:
+///    the remote took the commands and did not say what it did with them,
+///    which step 4 covers. So is git stopping before the remote's
+///    receive-pack took any command, as its stderr says with nothing on
+///    stdout. The machine ref is then moved back to P
 ///    ([`restore_machine_ref`]), and the claim ref as step 2 read it goes
 ///    with the answer.
 /// 4. Anything else, the deadline included, is an unknown outcome, and the
@@ -598,6 +600,12 @@ const UNREACHED: &[&str] = &[
 /// What a claim push's own output says of it.
 fn verdict(said: Said<'_>, claim: &str, machine: &str) -> Verdict {
     let statuses = statuses(said.stdout);
+    if statuses
+        .iter()
+        .any(|status| status.flag == '!' && status.summary.starts_with("[remote failure]"))
+    {
+        return Verdict::Unknown;
+    }
     if statuses.iter().any(|status| status.flag == '!') {
         return Verdict::Refused(refusal(&statuses, said.stderr, claim, machine));
     }
@@ -1474,9 +1482,21 @@ mod tests {
             verdict: Verdict::Refused(Refusal::Other),
         },
     ];
-    /// Two reasons a receive-pack gives that the races did not meet: each line
-    /// as git prints a remote rejection.
+    /// Three reasons a receive-pack gives that the races did not meet: each
+    /// line as git prints it.
     const REASONS: &[Case] = &[
+        Case {
+            shape: "a remote that did not report on the refs `[remote failure]`",
+            code: Some(1),
+            stdout: concat!(
+                "To https://example.invalid/example/ledger.git\n",
+                "!\trefs/knives/machine-one:refs/knives/machine-one\t[remote failure] (remote failed to report status)\n",
+                "!\t8a9ad30d31256c6c7b56b1bf7671d1206a353fd6:refs/knives-claims/example/fork/feat%2Fa\t[remote failure] (remote failed to report status)\n",
+                "Done\n",
+            ),
+            stderr: "error: failed to push some refs to 'https://example.invalid/example/ledger.git'\n",
+            verdict: Verdict::Unknown,
+        },
         Case {
             shape: "a remote rejection `(failed)`",
             code: Some(1),
