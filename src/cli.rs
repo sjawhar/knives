@@ -480,10 +480,11 @@ pub enum HookHarness {
 pub enum LedgerAction {
     /// Commit new entries, pull every peer's, and push this machine's.
     ///
-    /// Every command that writes an entry starts one in the background as it
-    /// exits, so this rarely needs typing. One sweep runs at a time: run by
-    /// hand, a sweep that finds another running waits for it, up to a minute,
-    /// then runs its own pass and reports that, with the sweep it waited for.
+    /// Every command that writes an entry sends it before it exits, and exits
+    /// 3 naming the ledger when it could not, so this is typed to send what a
+    /// write could not, or to pull. One sweep or send runs at a time: a sweep
+    /// that finds another running waits for it, up to a minute, then runs its
+    /// own pass and reports that, with the command it waited for.
     /// A fork's ledger travels when its `repos.toml` entry names, as
     /// `ledger`, the repository its ledger belongs to, and the ledger root is
     /// a git repository with that repository as `origin` and this machine's

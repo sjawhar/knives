@@ -238,9 +238,9 @@ impl Repository {
     /// `include.path` of credential and URL rules), and without it a fetch or
     /// push falls back to whatever credential the user's own configuration
     /// names, acting on the forge as that user. No terminal prompt: a ledger
-    /// command has nobody to answer one, whether it is a sweep running
-    /// detached or a pull a report is waiting on, and a credential prompt
-    /// would hold the ledger's lock until someone noticed.
+    /// command has nobody to answer one, whether it is a write sending its
+    /// entries as it exits or a pull a report is waiting on, and a credential
+    /// prompt would hold the ledger's lock until someone noticed.
     fn git(&self) -> Command {
         let mut command = crate::bind::git_command();
         for (name, value) in std::env::vars_os() {

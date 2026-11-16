@@ -105,6 +105,28 @@ impl Destinations {
             },
         )
     }
+
+    /// Why no destination here carries `fork`, whose registry entry names
+    /// `ledger`: as [`Destinations::unreached`] says, or, where it says
+    /// nothing, that the git directory joining that ledger would make is
+    /// another repository's.
+    pub(super) fn uncarried_problem(
+        &self,
+        root: &Path,
+        fork: &UpstreamName,
+        ledger: &str,
+    ) -> String {
+        let unreached = self.unreached.get(fork).map_or_else(
+            || {
+                std::borrow::Cow::Owned(Unreached {
+                    ledger: ledger.to_owned(),
+                    join_failed: Some(occupied(root, ledger)),
+                })
+            },
+            std::borrow::Cow::Borrowed,
+        );
+        Self::unreached_problem(root, fork, &unreached)
+    }
 }
 
 /// The destination that carries one shared fork ([`shared_fork`]), and the
@@ -343,33 +365,33 @@ pub fn shared_fork(
     registry: &Registry,
     fork: &UpstreamName,
 ) -> Result<Option<SharedFork>, SweepError> {
-    let Some(ledger) = registry
-        .repos
-        .iter()
-        .find(|(key, entry)| entry.upstream_name(key) == *fork)
-        .and_then(|(_, entry)| entry.ledger.clone())
-    else {
+    let Some(ledger) = ledger_of(registry, fork).map(str::to_owned) else {
         return Ok(None);
     };
-    let Destinations {
-        found, unreached, ..
-    } = destinations(root, registry)?;
-    if let Some(destination) = found
-        .into_iter()
-        .find(|destination| destination.carries(fork))
+    let mut reached = destinations(root, registry)?;
+    if let Some(index) = reached
+        .found
+        .iter()
+        .position(|destination| destination.carries(fork))
     {
         return Ok(Some(SharedFork {
             ledger,
-            destination,
+            destination: reached.found.swap_remove(index),
         }));
     }
-    let unreached = unreached.get(fork).cloned().unwrap_or_else(|| Unreached {
-        join_failed: Some(occupied(root, &ledger)),
-        ledger,
-    });
     Err(SweepError::Unreached {
-        problem: Destinations::unreached_problem(root, fork, &unreached),
+        problem: reached.uncarried_problem(root, fork, &ledger),
     })
+}
+
+/// The `<owner>/<name>` of the ledger `fork`'s registry entry names; `None`
+/// when it names none, or `registry` has no entry for `fork`.
+pub(super) fn ledger_of<'r>(registry: &'r Registry, fork: &UpstreamName) -> Option<&'r str> {
+    registry
+        .repos
+        .iter()
+        .find(|(key, entry)| entry.upstream_name(key) == *fork)
+        .and_then(|(_, entry)| entry.ledger.as_deref())
 }
 
 /// Refuse the ledger at `root` while a fork's registry key's directory

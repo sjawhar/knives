@@ -106,8 +106,9 @@ fn appended_list() -> MutexGuard<'static, Vec<Appended>> {
 }
 
 /// Every entry this process has appended, in the order it appended them:
-/// what it has to hand to [`crate::ledger_sweep::hand_off`] before it exits.
-/// A copy, so the list goes on growing behind it.
+/// what the process sends before it exits
+/// ([`crate::ledger_sweep::send_now`]). A copy, so the list goes on growing
+/// behind it.
 pub fn appended() -> Vec<Appended> {
     appended_list().clone()
 }

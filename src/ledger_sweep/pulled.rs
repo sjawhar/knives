@@ -106,8 +106,8 @@ pub struct Backlog<'a> {
 impl Backlog<'_> {
     /// What `status` notes about `fork`'s ledger beyond its problems: how
     /// many of its entries its remote does not have yet, and where the last
-    /// sweep's failures are when it failed, as one line; then what no one
-    /// running a handed-off sweep sees, kept in the [`sweep_record`] and
+    /// sweep's failures are when it failed, as one line; then what a write's
+    /// send never says, kept in the [`sweep_record`] and
     /// brought up to date by this pull: entries other machines sent through
     /// a repository this machine does not send the fork through, and
     /// repeated transitions discarded; then each `knives.*` key a git

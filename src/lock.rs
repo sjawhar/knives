@@ -43,7 +43,8 @@ impl LockWait {
     /// One minute, for a ledger repository's transport lock: a sweep's pass
     /// holds it across a fetch and a push, so a command pulling before it
     /// decides waits out one network round trip rather than failing on it.
-    /// A sweep run by hand waits as long for the ledger's own lock.
+    /// A sweep, and a write sending what it wrote, wait as long for the
+    /// ledger's own lock.
     pub(crate) const TRANSPORT: Self = Self {
         deadline: Duration::from_secs(60),
         floor: Duration::from_millis(20),

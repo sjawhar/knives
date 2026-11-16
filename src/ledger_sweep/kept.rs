@@ -7,8 +7,8 @@ use std::path::Path;
 use super::{Destination, SweepError, Tally, remove_if_present, sweep_record};
 use crate::ids::UpstreamName;
 
-/// What sweeps did to this machine's ledger that `status` reports, since a
-/// sweep a write hands off has nowhere to say it ([`Pulled::backlog`]).
+/// What sweeps and sends did to this machine's ledger that `status` reports,
+/// since a write's send ([`super::send_now`]) says none of it.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Kept {
