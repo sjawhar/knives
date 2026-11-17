@@ -444,8 +444,10 @@ pub enum Command {
         consumer: Vec<PathBuf>,
         /// The release series to act on, one of the entry's `[repos.<name>.series]`.
         /// Omitted, the default series: the entry's own `base` and its
-        /// `release/YYYY-MM-DD[.N]` cuts. Every subcommand sees only that
-        /// series' cuts and the branches that fork from its base.
+        /// `release/YYYY-MM-DD[.N|-<label>]` cuts. Every subcommand sees only
+        /// that series' cuts and the branches that fork from its base. Each
+        /// series has one order: by date, then by the rest of the name in
+        /// version order, so a later name on a date supersedes an earlier one.
         #[arg(long, global = true)]
         series: Option<String>,
     },
@@ -519,7 +521,9 @@ pub enum LedgerAction {
 pub enum ReleaseAction {
     /// Name a new cut of the composition in hand, verbatim. Never pushes.
     Cut {
-        /// The dated release name. Omit it for a configured fixed release branch.
+        /// The dated release name, `release/[<series>/]YYYY-MM-DD[.N|-<label>]`.
+        /// It must sort after the newest release of the series. Omit it for a
+        /// configured fixed release branch.
         name: Option<String>,
         /// Proceed even when the cut would drop something: commits reachable
         /// only from the previous release lineage, or members the previous

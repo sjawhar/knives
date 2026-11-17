@@ -82,13 +82,14 @@ pub(crate) fn run_release(
         let tips = opened.bookmark_tips()?;
         let previous = previous_release_for_cut(entry, &tips);
         let previous_commit = previous.as_ref().map(|(_, commit)| commit.clone());
-        // A dated cut takes a name that sorts after the newest release: the reap
-        // that follows every dated cut keeps only the newest name, so any other
-        // name would be created and taken straight back as superseded in the
-        // same command, reported as a success that left nothing behind.
+        // A dated cut takes a name that sorts after the newest release in the
+        // series' one order: the reap that follows every dated cut keeps only
+        // the newest name, so any other name would be created and taken
+        // straight back as superseded in the same command, reported as a
+        // success that left nothing behind.
         if let Some((previous_ref, _)) = &previous
             && matches!(scheme, ReleaseScheme::Dated | ReleaseScheme::Series(_))
-            && scheme.cut_order(&name) <= scheme.cut_order(previous_ref.branch().as_str())
+            && scheme.cut_key(&name) <= scheme.cut_key(previous_ref.branch().as_str())
         {
             println!(
                 "{repo}: refusing to cut {name}: {} is the newest release, so a dated cut takes a name that sorts after it (the reap after a cut keeps only the newest name)",
@@ -423,8 +424,14 @@ fn requested_cut(
     match invocation {
         ReleaseInvocation::Plan => Ok((None, false)),
         ReleaseInvocation::Cut { name, allow_drop } => {
-            match release::cut_name(scheme, name.as_deref())
-                .and_then(|name| release::clear_of_series_prefixes(entry, name))
+            // A series' own prefix is refused first, with its own reason: the
+            // grammar would refuse it too, as a name with no date.
+            match name
+                .as_deref()
+                .map_or(Ok(()), |name| {
+                    release::clear_of_series_prefixes(entry, name)
+                })
+                .and_then(|()| release::cut_name(scheme, name.as_deref()))
             {
                 Ok(name) => Ok((Some(name), *allow_drop)),
                 Err(message) => {

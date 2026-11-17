@@ -617,3 +617,175 @@ fn a_fixed_entry_still_reports_a_branch_its_leftover_dated_cuts_carry() {
         "{out}"
     );
 }
+
+/// Series `old` with one branch, its first cut `name` pushed to origin and
+/// marked published by a `record: published` note. A published release in
+/// hand lets the next name start identical, so the next cut reads the name
+/// order and not the identical-composition refusal.
+fn published_series_cut(name: &str) -> (Lab, tempfile::TempDir) {
+    let lab = two_base_lab();
+    branch_on(&lab, "old@upstream", "fix/old", "old-fix.txt");
+    let home = series_home(&lab, "");
+    let cut = knives_release(&lab, &home, &["--series", "old", "cut", name]);
+    assert!(cut.status.success(), "{}", text(&cut));
+    lab.push_branch(name);
+    lab.fetch_work();
+    let commit = commit_at(&lab, name);
+    let noted = lab::knives(
+        &lab,
+        &home,
+        &[
+            "notch",
+            name,
+            "-m",
+            "record: published as v1.0.0",
+            "--evidence",
+            commit.as_str(),
+            "--repo",
+            "demo",
+        ],
+    );
+    assert!(noted.status.success(), "{}", text(&noted));
+    (lab, home)
+}
+
+/// Cut `name` in series `old` of `lab`, and assert that it is written.
+fn assert_cut_accepted(lab: &Lab, home: &tempfile::TempDir, name: &str) {
+    let cut = knives_release(lab, home, &["--series", "old", "cut", name]);
+    let out = text(&cut);
+    assert_eq!(cut.status.code(), Some(0), "{out}");
+    assert!(resolves(lab, name), "{name} was not written: {out}");
+}
+
+#[test]
+fn a_second_cut_on_one_date_with_a_longer_version_is_accepted() {
+    // Given: a published cut whose label ends in a version, the shape the
+    // prover fork's 9.2 line uses.
+    let (lab, home) = published_series_cut("release/old/2026-08-04-speed-8.0.9");
+
+    // When: a second cut of that date takes the next version.
+    // Then: 8.0.10 sorts after 8.0.9, so the cut is written.
+    assert_cut_accepted(&lab, &home, "release/old/2026-08-04-speed-8.0.10");
+}
+
+#[test]
+fn a_cut_with_one_more_version_part_is_accepted() {
+    // Given: a published cut labelled with a two-part version.
+    let (lab, home) = published_series_cut("release/old/2026-08-04-speed-8.1");
+
+    // When: a second cut of that date adds a version part.
+    // Then: a name is sorted by every part, so 8.1.1 sorts after 8.1.
+    assert_cut_accepted(&lab, &home, "release/old/2026-08-04-speed-8.1.1");
+}
+
+#[test]
+fn the_plan_names_the_highest_version_on_a_date_as_the_release_in_hand() {
+    // Given: two cuts of one date, made as bookmarks, so the plan reads the
+    // order of the names and not the gate of a cut.
+    let lab = two_base_lab();
+    branch_on(&lab, "old@upstream", "fix/old", "old-fix.txt");
+    branch_on(&lab, "old@upstream", "fix/other", "other-fix.txt");
+    lab.octopus("release/old/2026-08-04-speed-7.1.9", "fix/old", "fix/other");
+    lab.octopus(
+        "release/old/2026-08-04-speed-7.1.10",
+        "fix/old",
+        "fix/other",
+    );
+    let home = series_home(&lab, "");
+
+    // When: the series plans.
+    let plan = knives_release(&lab, &home, &["--series", "old"]);
+
+    // Then: the release in hand is 7.1.10: 10 is a number, not the text "10".
+    let out = text(&plan);
+    assert!(
+        out.contains("demo: release/old/2026-08-04-speed-7.1.10"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("demo: release/old/2026-08-04-speed-7.1.9"),
+        "{out}"
+    );
+}
+
+#[test]
+fn repos_reports_the_highest_version_on_a_date_as_newest() {
+    // Given: the same two names of one date, in the default series.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04-speed-7.1.9", "feat/alpha", "feat/beta");
+    lab.octopus("release/2026-08-04-speed-7.1.10", "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: the listing runs.
+    let output = lab::knives(&lab, &home, &["--json", "repos"]);
+
+    // Then: it names 7.1.10 as the newest release, by the one order of the
+    // series and not by the order of the tip map.
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{out}");
+    let report: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("json document");
+    assert_eq!(
+        report["repos"][0]["newest_release"], "release/2026-08-04-speed-7.1.10",
+        "{report}"
+    );
+}
+
+#[test]
+fn a_cut_reaps_a_superseded_suffixed_name() {
+    // Given: a series whose first cut carries a label, cut by knives, with
+    // the working copy moved off it (a working copy on a cut keeps it).
+    let lab = two_base_lab();
+    branch_on(&lab, "old@upstream", "fix/old", "old-fix.txt");
+    let home = series_home(&lab, "");
+    let first = knives_release(
+        &lab,
+        &home,
+        &["--series", "old", "cut", "release/old/2026-08-04-speed-1"],
+    );
+    assert!(first.status.success(), "{}", text(&first));
+    lab.jj_work(["new", "main"]);
+
+    // When: the next name of that date is cut.
+    let second = knives_release(
+        &lab,
+        &home,
+        &["--series", "old", "cut", "release/old/2026-08-04-speed-2"],
+    );
+
+    // Then: the reap sees the suffixed name and forgets the superseded one.
+    let out = text(&second);
+    assert_eq!(second.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains("reaped release/old/2026-08-04-speed-1"),
+        "{out}"
+    );
+    assert!(
+        !resolves(&lab, "release/old/2026-08-04-speed-1"),
+        "the superseded name survived: {out}"
+    );
+    assert!(resolves(&lab, "release/old/2026-08-04-speed-2"), "{out}");
+}
+
+#[test]
+fn a_name_without_a_date_is_refused_with_the_grammar() {
+    // Given: a series with one branch to compose.
+    let lab = two_base_lab();
+    branch_on(&lab, "old@upstream", "fix/old", "old-fix.txt");
+    let home = series_home(&lab, "");
+
+    // When: a cut is asked for under a name with no date.
+    let cut = knives_release(&lab, &home, &["--series", "old", "cut", "release/old/foo"]);
+
+    // Then: a usage error that gives the grammar, and nothing is written: the
+    // series could not sort the name, so it would never be the newest cut.
+    let out = text(&cut);
+    assert_eq!(cut.status.code(), Some(2), "{out}");
+    assert!(
+        out.contains("release/old/YYYY-MM-DD[.N|-<label>]") && out.contains("`-<label>`"),
+        "{out}"
+    );
+    assert!(!resolves(&lab, "release/old/foo"), "{out}");
+}

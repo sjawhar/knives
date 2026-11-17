@@ -22,7 +22,7 @@ use crate::bind::Fork;
 use crate::config::Role;
 use crate::detect::{BookmarkTips, RebaseOutcome};
 use crate::forge::{Forge, index_pulls};
-use crate::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, is_our_release};
+use crate::ids::{BookmarkRef, BranchName, CommitId, CutKey, ReleaseScheme, is_our_release};
 use crate::jj::Repo;
 use crate::release_model;
 use crate::snapshot::{self, SnapshotConfig};
@@ -680,7 +680,7 @@ fn render_check(check: &TargetCheck, indent: &str) -> String {
 /// release refs (grouped, so one name at two commits is two targets), plus the
 /// upstream trunk.
 ///
-/// Live/superseded comes from [`ReleaseScheme::dated_cut`] ordering within the
+/// Live/superseded comes from [`ReleaseScheme::cut_key`] ordering within the
 /// scheme's series; under a fixed scheme every release ref of the configured
 /// name is Live.
 pub fn targets(
@@ -693,22 +693,22 @@ pub fn targets(
         ReleaseScheme::Dated | ReleaseScheme::Series(_) => tips
             .keys()
             .filter(|reference| is_our_release(reference, scheme, publish_remote))
-            .filter_map(|reference| scheme.dated_cut(reference.branch().as_str()))
+            .filter_map(|reference| scheme.cut_key(reference.branch().as_str()))
             .max(),
         ReleaseScheme::Fixed(_) => None,
     };
     let mut grouped =
-        BTreeMap::<CommitId, (Vec<BookmarkRef>, TargetRole, Option<(String, u32)>)>::new();
+        BTreeMap::<CommitId, (Vec<BookmarkRef>, TargetRole, Option<CutKey<'_>>)>::new();
 
     for (reference, commit) in tips
         .iter()
         .filter(|(reference, _)| is_our_release(reference, scheme, publish_remote))
     {
-        let dated_name = scheme.dated_cut(reference.branch().as_str());
+        let dated_name = scheme.cut_key(reference.branch().as_str());
         let role = match scheme {
             ReleaseScheme::Dated | ReleaseScheme::Series(_)
                 if matches!(
-                    (dated_name.as_ref(), newest_release.as_ref()),
+                    (dated_name, newest_release),
                     (Some(dated_name), Some(newest_release)) if dated_name == newest_release
                 ) =>
             {
@@ -717,13 +717,11 @@ pub fn targets(
             ReleaseScheme::Dated | ReleaseScheme::Series(_) => TargetRole::SupersededRelease,
             ReleaseScheme::Fixed(_) => TargetRole::LiveRelease,
         };
-        let entry = grouped.entry(commit.clone()).or_insert_with(|| {
-            (
-                Vec::new(),
-                TargetRole::SupersededRelease,
-                dated_name.clone(),
-            )
-        });
+        let entry = grouped.entry(commit.clone()).or_insert((
+            Vec::new(),
+            TargetRole::SupersededRelease,
+            dated_name,
+        ));
         entry.0.push(reference.clone());
         if role == TargetRole::LiveRelease {
             entry.1 = TargetRole::LiveRelease;

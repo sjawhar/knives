@@ -284,6 +284,10 @@ pub fn trunk_positions(repo: &Repo, entry: &RepoEntry) -> Result<Vec<CommitId>, 
 }
 
 /// The newest release under the configured scheme and publish remote.
+///
+/// A dated series reads [`ReleaseScheme::cut_key`], the one order of its
+/// cuts: a name the series owns but the order cannot read, such as
+/// `release/9.2/foo`, has no key and is never the newest.
 pub fn newest_release(
     tips: &BookmarkTips,
     scheme: &ReleaseScheme,
@@ -293,13 +297,13 @@ pub fn newest_release(
         ReleaseScheme::Dated | ReleaseScheme::Series(_) => tips
             .iter()
             .filter(|(reference, _)| is_our_release(reference, scheme, publish_remote))
-            .max_by_key(|(reference, _)| {
-                (
-                    scheme.cut_order(reference.branch().as_str()),
-                    u8::from(reference.is_local()),
-                )
+            .filter_map(|(reference, commit)| {
+                scheme
+                    .cut_key(reference.branch().as_str())
+                    .map(|key| (key, reference, commit))
             })
-            .map(|(reference, commit)| (reference.clone(), commit.clone())),
+            .max_by_key(|(key, reference, _)| (*key, u8::from(reference.is_local())))
+            .map(|(_, reference, commit)| (reference.clone(), commit.clone())),
         ReleaseScheme::Fixed(fixed) => tips
             .iter()
             .filter(|(reference, _)| match reference {

@@ -30,16 +30,26 @@ pub struct ReleaseState {
 
 /// Selects the release reference that represents a repository's newest publishable state.
 ///
-/// Fixed releases use only their local bookmark and publish-remote counterpart because
-/// treating origin and release as interchangeable reported a non-publish position as newest.
+/// A dated series reads [`ReleaseScheme::cut_key`], the one order of its cuts,
+/// so two names of one date are ordered by the rest of the name and not by the
+/// tip map. A name with no key is never the newest. Fixed releases use only
+/// their local bookmark and publish-remote counterpart because treating origin
+/// and release as interchangeable reported a non-publish position as newest.
 fn newest_release(tips: &crate::detect::BookmarkTips, entry: &RepoEntry) -> Option<String> {
     let scheme = entry.release_scheme();
     match &scheme {
         ReleaseScheme::Dated | ReleaseScheme::Series(_) => tips
             .keys()
             .filter(|reference| is_our_release(reference, &scheme, entry.publish_remote()))
-            .max_by_key(|reference| scheme.cut_order(reference.branch().as_str()))
-            .map(ToString::to_string),
+            .filter_map(|reference| {
+                scheme
+                    .cut_key(reference.branch().as_str())
+                    .map(|key| (key, reference))
+            })
+            // One name's local and remote refs share a key; the reference
+            // breaks that tie, so the map's order decides nothing.
+            .max()
+            .map(|(_, reference)| reference.to_string()),
         ReleaseScheme::Fixed(branch) => {
             let local = BookmarkRef::Local(branch.clone());
             let published = BookmarkRef::Remote {

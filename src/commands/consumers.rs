@@ -251,9 +251,9 @@ fn newest_live(
             .iter()
             .filter_map(|(full, commit)| {
                 let name = full.strip_prefix("refs/heads/")?;
-                scheme.dated_cut(name).map(|order| (order, name, commit))
+                scheme.cut_key(name).map(|key| (key, name, commit))
             })
-            .max_by_key(|(order, _, _)| order.clone())
+            .max_by_key(|&(key, _, _)| key)
             .map(|(_, name, commit)| (name.to_owned(), commit.clone())),
         ReleaseScheme::Fixed(name) => refs
             .get(&format!("refs/heads/{name}"))

@@ -16,9 +16,12 @@ use crate::release_model::{
 ///
 /// The rule: every local release bookmark, because those are the ones we can
 /// re-cut, plus the newest remote one, because that is what a consumer is
-/// plausibly pinning. Dated names sort correctly as strings. `@git` refs are
-/// excluded outright: they are jj's internal git-tracking view, not a remote.
-/// The count of what was skipped is reported rather than silently dropped.
+/// plausibly pinning. The newest is by [`ReleaseScheme::cut_key`], the
+/// series' one order, so two names of one date are ordered by the rest of
+/// the name, and a name with no key is never the newest. `@git` refs are
+/// excluded outright: they are jj's internal git-tracking view, not a
+/// remote. The count of what was skipped is reported rather than silently
+/// dropped.
 /// Under `Fixed` this is instead exactly the local branch and its publish-remote counterpart: there is no accumulated history to skip, so nothing is superseded.
 pub(super) fn releases_to_scan(
     tips: &BookmarkTips,
@@ -35,8 +38,13 @@ pub(super) fn releases_to_scan(
             let newest = |local: bool| {
                 all.iter()
                     .filter(|(reference, _)| reference.is_local() == local)
-                    .max_by_key(|(reference, _)| scheme.cut_order(reference.branch().as_str()))
-                    .map(|(reference, _)| (*reference).clone())
+                    .filter_map(|(reference, _)| {
+                        scheme
+                            .cut_key(reference.branch().as_str())
+                            .map(|key| (key, *reference))
+                    })
+                    .max()
+                    .map(|(_, reference)| reference.clone())
             };
             // Only the newest cut on each side. Every local release a fork ever cut used to
             // be scanned, and their parents have all moved on by definition, so the report

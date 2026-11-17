@@ -7,6 +7,7 @@
 //! what divergence is. Likewise a local bookmark and its remote-tracking
 //! counterpart share a name but point at different commits.
 
+use std::cmp::Ordering;
 use std::fmt;
 
 macro_rules! string_id {
@@ -161,6 +162,11 @@ pub enum BookmarkRef {
 
 pub const RELEASE_PREFIX: &str = "release/";
 
+/// What follows a dated series' prefix in the name of one of its cuts, for a
+/// message: a date, then nothing, a same-day counter `.N`, or a `-<label>`
+/// ([`CutKey`]).
+pub const CUT_GRAMMAR: &str = "YYYY-MM-DD[.N|-<label>]";
+
 /// Whether a release reference is one of ours for the configured publishing role.
 ///
 /// Local releases are always ours. Remote releases are ours only when their
@@ -193,11 +199,12 @@ pub fn is_our_release(
 /// "what does this mean for a named series?".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseScheme {
-    /// Dated `release/YYYY-MM-DD[.n]` cuts of the entry's default series. The
-    /// default, and the historical behavior.
+    /// Dated `release/YYYY-MM-DD[.N|-<label>]` cuts of the entry's default
+    /// series. The default, and the historical behavior.
     Dated,
-    /// Dated `release/<series>/YYYY-MM-DD[.n]` cuts of a named series, which
-    /// has its own base. Every dated rule applies; only the names differ.
+    /// Dated `release/<series>/YYYY-MM-DD[.N|-<label>]` cuts of a named
+    /// series, which has its own base. Every dated rule applies; only the
+    /// names differ.
     Series(SeriesName),
     /// One integration branch that is rebuilt and advanced in place. The branch's
     /// previous position plays the role of the previous release.
@@ -235,52 +242,111 @@ impl ReleaseScheme {
         }
     }
 
-    /// The ordering key of one of this series' dated cuts, numeric suffixes
-    /// compared numerically. Lenient: any name the series owns has one.
-    /// `None` for a name the series does not own, and always under `Fixed`.
-    pub fn cut_order(&self, name: &str) -> Option<(String, u32)> {
-        let rest = self.dated_suffix(name)?;
-        Some(match rest.split_once('.') {
-            Some((date, suffix)) => (date.to_owned(), suffix.parse().unwrap_or(0)),
-            None => (rest.to_owned(), 0),
-        })
-    }
-
-    /// Parse `release/[<series>/]YYYY-MM-DD[.N]`, the one shape this series'
-    /// dated cuts take.
+    /// Where `name` sorts among this series' dated cuts ([`CutKey`]): the one
+    /// parser of `release/[<series>/]YYYY-MM-DD[.N|-<label>]`.
     ///
-    /// Stricter than [`Self::cut_order`] on purpose: the reaper enumerates
-    /// release refs on any remote, where upstream's own `release/0.3.190` style
-    /// branches also live, and a prefix test would hand those to `bookmark
-    /// forget`. Returns the `(date, suffix)` ordering key so "newest" is one
-    /// `max_by_key` away. The suffix follows `u32::from_str` semantics rather
-    /// than strict digits, so leading `+` signs and zeroes parse; every such
-    /// name is still ours by shape, leaving the reap safety property unaffected.
-    pub fn dated_cut(&self, name: &str) -> Option<(String, u32)> {
-        let bare = self.dated_suffix(name)?;
-        let (date, suffix) = match bare.split_once('.') {
-            Some((date, suffix)) => (date, suffix.parse::<u32>().ok()?),
-            None => (bare, 0),
-        };
-        let bytes = date.as_bytes();
-        let dated = bytes.len() == 10
-            && bytes.get(4) == Some(&b'-')
-            && bytes.get(7) == Some(&b'-')
-            && date
-                .bytes()
-                .enumerate()
-                .all(|(i, b)| matches!(i, 4 | 7) || b.is_ascii_digit());
-        dated.then(|| (date.to_owned(), suffix))
+    /// `None` for a name the series does not own, for one it owns but cannot
+    /// read, such as `release/9.2/foo`, and always under `Fixed`. Such a name
+    /// is never the newest cut, and the reap never takes it: the reaper
+    /// enumerates release refs on any remote, where upstream's own
+    /// `release/0.3.190` style branches also live, and a prefix test would
+    /// hand those to `bookmark forget`.
+    pub fn cut_key<'a>(&self, name: &'a str) -> Option<CutKey<'a>> {
+        CutKey::parse(self.dated_suffix(name)?)
     }
 
     /// The name shape this scheme's cuts take, for a message.
     pub fn cut_shape(&self) -> String {
         match self {
-            Self::Dated => format!("{RELEASE_PREFIX}YYYY-MM-DD[.N]"),
-            Self::Series(series) => format!("{RELEASE_PREFIX}{series}/YYYY-MM-DD[.N]"),
+            Self::Dated => format!("{RELEASE_PREFIX}{CUT_GRAMMAR}"),
+            Self::Series(series) => format!("{RELEASE_PREFIX}{series}/{CUT_GRAMMAR}"),
             Self::Fixed(fixed) => fixed.to_string(),
         }
     }
+}
+
+/// Where one of a series' dated cuts sorts: by its date, then by the rest of
+/// its name in version order, then by that rest as bytes.
+///
+/// The rest is empty, a same-day counter `.N` (one or more digits), or a
+/// `-<label>` (one or more characters, no `/`): `2026-11-15-speed-8.0.9`
+/// has the rest `-speed-8.0.9`. So `.1.2`, a bare `.` and `.x` do not parse.
+/// Version order reads the rest run by run: a run of digits compares as a
+/// number, any other run as bytes, and a digit run sorts before any other run,
+/// as `sort -V` does. A rest that is a prefix of another sorts first. So
+/// `-speed-8.0.9` < `-speed-8.0.10` < `-speed-8.1` < `-speed-8.1.1`, and a
+/// `.N` sorts after each `-<label>` of its date, because `-` sorts before `.`.
+/// The bytes last make the order total: `-v08` and `-v8` are one version and
+/// still two names.
+///
+/// Each series has this one order. The reap keeps only the newest cut, so a
+/// later name on the same date supersedes an earlier one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CutKey<'a> {
+    date: &'a str,
+    rest: &'a str,
+}
+
+impl<'a> CutKey<'a> {
+    /// The key of `tail`, what follows the series' prefix in a cut's name.
+    fn parse(tail: &'a str) -> Option<Self> {
+        let (date, rest) = tail.split_at_checked(10)?;
+        let dated = date.bytes().enumerate().all(|(index, byte)| match index {
+            4 | 7 => byte == b'-',
+            _ => byte.is_ascii_digit(),
+        });
+        let readable = match rest.as_bytes().split_first() {
+            None => true,
+            Some((b'.', counter)) => !counter.is_empty() && counter.iter().all(u8::is_ascii_digit),
+            Some((b'-', label)) => !label.is_empty() && !label.contains(&b'/'),
+            Some(_) => false,
+        };
+        (dated && readable).then_some(Self { date, rest })
+    }
+}
+
+impl Ord for CutKey<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.date
+            .cmp(other.date)
+            .then_with(|| version_runs(self.rest).cmp(version_runs(other.rest)))
+            .then_with(|| self.rest.cmp(other.rest))
+    }
+}
+
+impl PartialOrd for CutKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// One run of a cut's rest, as version order compares it: the variants'
+/// order puts a number before text.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum VersionRun<'a> {
+    /// A run of digits, its leading zeros dropped: a longer number is the
+    /// larger, and two of one length compare as bytes, so no length overflows.
+    Number { length: usize, digits: &'a [u8] },
+    /// Any other run, compared as bytes.
+    Text(&'a [u8]),
+}
+
+/// The runs of `rest`: each maximal stretch of digits or of other bytes.
+fn version_runs(rest: &str) -> impl Iterator<Item = VersionRun<'_>> {
+    rest.as_bytes()
+        .chunk_by(|left, right| left.is_ascii_digit() == right.is_ascii_digit())
+        .map(|run| {
+            if run.first().is_some_and(u8::is_ascii_digit) {
+                let zeros = run.iter().take_while(|&&byte| byte == b'0').count();
+                let digits = run.get(zeros..).unwrap_or_default();
+                VersionRun::Number {
+                    length: digits.len(),
+                    digits,
+                }
+            } else {
+                VersionRun::Text(run)
+            }
+        })
 }
 
 /// Whether a branch name is a release under this scheme: the dated prefix, or the
@@ -298,27 +364,21 @@ pub fn is_release_name(branch: &BranchName, scheme: &ReleaseScheme) -> bool {
     }
 }
 
-/// Whether `name` is a dated cut of any series of a fork.
+/// Whether `reference` is a dated cut of any series of a fork, behind the
+/// trust boundary [`is_our_release`] draws.
 ///
-/// That is the default series' `release/YYYY-MM-DD[.N]` or a named series'
-/// `release/<series>/YYYY-MM-DD[.N]`. Every series' cut is a release commit,
-/// never an orphan of another's.
-pub fn any_dated_cut(name: &str) -> bool {
-    ReleaseScheme::Dated.dated_cut(name).is_some()
-        || name
-            .strip_prefix(RELEASE_PREFIX)
-            .and_then(|rest| rest.split_once('/'))
-            .is_some_and(|(series, _)| {
-                ReleaseScheme::Series(SeriesName::new(series))
-                    .dated_cut(name)
-                    .is_some()
-            })
-}
-
-/// Whether `reference` is one of our dated cuts, of any series: [`any_dated_cut`]
-/// behind the trust boundary [`is_our_release`] draws.
+/// That is the default series' `release/<cut>` or a named series'
+/// `release/<series>/<cut>`, where `<cut>` reads as a [`CutKey`]. Every
+/// series' cut is a release commit, never an orphan of another's.
 pub fn is_our_dated_cut(reference: &BookmarkRef, publish_remote: &str) -> bool {
-    any_dated_cut(reference.branch().as_str())
+    let dated = reference
+        .branch()
+        .as_str()
+        .strip_prefix(RELEASE_PREFIX)
+        .map(|rest| rest.split_once('/').map_or(rest, |(_, cut)| cut))
+        .and_then(CutKey::parse)
+        .is_some();
+    dated
         && match reference {
             BookmarkRef::Local(_) => true,
             BookmarkRef::Remote { remote, .. } => remote.as_str() == publish_remote,
@@ -489,59 +549,269 @@ mod tests {
         );
     }
 
+    /// The key of `name`, which must be one of `scheme`'s dated cuts.
+    fn key<'a>(scheme: &ReleaseScheme, name: &'a str) -> CutKey<'a> {
+        scheme
+            .cut_key(name)
+            .unwrap_or_else(|| panic!("{name} has no key"))
+    }
+
     #[test]
     fn only_our_dated_shape_parses_as_a_dated_release() {
         let dated = ReleaseScheme::Dated;
-        // Ours, with and without a same-day suffix.
+        // Ours: a date, then nothing, a same-day counter, or a label.
         assert_eq!(
-            dated.dated_cut("release/2026-08-05"),
-            Some(("2026-08-05".to_owned(), 0))
+            dated.cut_key("release/2026-08-05"),
+            Some(CutKey {
+                date: "2026-08-05",
+                rest: ""
+            })
         );
         assert_eq!(
-            dated.dated_cut("release/2026-08-05.2"),
-            Some(("2026-08-05".to_owned(), 2))
+            dated.cut_key("release/2026-08-05.2"),
+            Some(CutKey {
+                date: "2026-08-05",
+                rest: ".2"
+            })
         );
-        // Upstream's semver release branches are NOT ours to reap.
-        assert_eq!(dated.dated_cut("release/0.3.190"), None);
-        // Shape violations.
-        assert_eq!(dated.dated_cut("release/"), None);
-        assert_eq!(dated.dated_cut("release/2026-8-5"), None);
-        assert_eq!(dated.dated_cut("release/2026-08-05."), None);
-        assert_eq!(dated.dated_cut("release/2026-08-05.x"), None);
-        assert_eq!(dated.dated_cut("release/2026-08-05.1.2"), None);
-        assert_eq!(dated.dated_cut("feat/2026-08-05"), None);
+        assert_eq!(
+            dated.cut_key("release/2026-08-05-speed-8.0.9"),
+            Some(CutKey {
+                date: "2026-08-05",
+                rest: "-speed-8.0.9"
+            })
+        );
+        for name in [
+            "release/2026-08-05-speed.1",
+            "release/2026-08-05-speed-7.1.1.2-baseline",
+            "release/2026-08-05-x",
+        ] {
+            assert!(dated.cut_key(name).is_some(), "{name} has no key");
+        }
+        // Upstream's semver release branches are NOT ours to reap, and a
+        // counter has one part: `.1.2`, a bare `.` and `.x` stay unparsed.
+        for name in [
+            "release/0.3.190",
+            "release/",
+            "release/foo",
+            "release/2026-8-5",
+            "release/2026-08-05.",
+            "release/2026-08-05.x",
+            "release/2026-08-05.1.2",
+            "release/2026-08-05.+1",
+            "release/2026-08-05-",
+            "release/2026-08-05_x",
+            "release/2026-08-05x",
+            "feat/2026-08-05",
+        ] {
+            assert_eq!(dated.cut_key(name), None, "{name} has a key");
+        }
+        // And: a name the series owns but cannot read is still its own.
+        assert!(dated.owns("release/foo"));
     }
 
     #[test]
     fn each_series_owns_only_its_own_cuts() {
         let dated = ReleaseScheme::Dated;
         let old = ReleaseScheme::Series(SeriesName::new("9.2"));
-        // Given: a cut of the default series and one of series 9.2.
+        // Given: a cut of the default series and two of series 9.2.
         let default_cut = "release/2026-10-20";
         let series_cut = "release/9.2/2026-10-21.1";
-        // Then: each series parses its own cut and never the other's, so a
+        let labelled_cut = "release/9.2/2026-11-15-speed-8.0.9";
+        // Then: each series parses its own cuts and never the other's, so a
         // 9.2 cut is never the default series' newest, nor the reverse.
         assert_eq!(
-            dated.dated_cut(default_cut),
-            Some(("2026-10-20".to_owned(), 0))
+            dated.cut_key(default_cut),
+            Some(CutKey {
+                date: "2026-10-20",
+                rest: ""
+            })
         );
-        assert_eq!(dated.dated_cut(series_cut), None);
-        assert_eq!(dated.cut_order(series_cut), None);
+        assert_eq!(dated.cut_key(series_cut), None);
+        assert_eq!(dated.cut_key(labelled_cut), None);
         assert!(!dated.owns(series_cut));
         assert_eq!(
-            old.dated_cut(series_cut),
-            Some(("2026-10-21".to_owned(), 1))
+            old.cut_key(series_cut),
+            Some(CutKey {
+                date: "2026-10-21",
+                rest: ".1"
+            })
         );
-        assert_eq!(old.dated_cut(default_cut), None);
+        assert_eq!(
+            old.cut_key(labelled_cut),
+            Some(CutKey {
+                date: "2026-11-15",
+                rest: "-speed-8.0.9"
+            })
+        );
+        assert_eq!(old.cut_key(default_cut), None);
         assert!(!old.owns(default_cut));
         assert!(!old.owns("release/9.20/2026-10-21"));
         assert!(!old.owns("release/9.2/x/2026-10-21"));
+        assert!(old.owns("release/9.2/foo") && old.cut_key("release/9.2/foo").is_none());
         // And: both are releases of the fork, so neither is ever a member branch.
         assert!(is_release_name(&BranchName::new(series_cut), &dated));
         assert!(is_release_name(&BranchName::new(default_cut), &old));
-        assert!(any_dated_cut(default_cut) && any_dated_cut(series_cut));
-        assert!(!any_dated_cut("release/0.3.190") && !any_dated_cut("release/9.2/0.3.190"));
-        assert_eq!(old.cut_shape(), "release/9.2/YYYY-MM-DD[.N]");
+        let local = |name: &str| BookmarkRef::Local(BranchName::new(name));
+        for name in [default_cut, series_cut, labelled_cut] {
+            assert!(is_our_dated_cut(&local(name), "origin"), "{name}");
+        }
+        for name in [
+            "release/0.3.190",
+            "release/9.2/0.3.190",
+            "release/9.2/foo",
+            "release/9.2/2026-10-21.1.2",
+            "release/9.2/x/2026-10-21",
+        ] {
+            assert!(!is_our_dated_cut(&local(name), "origin"), "{name}");
+        }
+        let upstream = BookmarkRef::Remote {
+            branch: BranchName::new(labelled_cut),
+            remote: RemoteName::new("upstream"),
+        };
+        assert!(!is_our_dated_cut(&upstream, "origin"));
+        assert_eq!(old.cut_shape(), "release/9.2/YYYY-MM-DD[.N|-<label>]");
+    }
+
+    #[test]
+    fn cuts_sort_by_date_then_by_the_rest_in_version_order() {
+        let old = ReleaseScheme::Series(SeriesName::new("9.2"));
+        // Given: names of one series, each meant to sort before the next: a
+        // number before text, a prefix first, `-` before `.`, then a later date.
+        let ascending = [
+            "release/9.2/2026-11-15",
+            "release/9.2/2026-11-15-speed-3",
+            "release/9.2/2026-11-15-speed-7.1.1.2-baseline",
+            "release/9.2/2026-11-15-speed-7.1.9",
+            "release/9.2/2026-11-15-speed-7.1.10",
+            "release/9.2/2026-11-15-speed-8.0.9",
+            "release/9.2/2026-11-15-speed-8.0.10",
+            "release/9.2/2026-11-15-speed-8.1",
+            "release/9.2/2026-11-15-speed-8.1.1",
+            "release/9.2/2026-11-15-speed-sr",
+            "release/9.2/2026-11-15-speed.1",
+            "release/9.2/2026-11-15-v08",
+            "release/9.2/2026-11-15-v8",
+            "release/9.2/2026-11-15-v9",
+            "release/9.2/2026-11-15-x-0000000000000000000000000000001",
+            "release/9.2/2026-11-15-x-99999999999999999999999999999999",
+            "release/9.2/2026-11-15-x-100000000000000000000000000000000",
+            "release/9.2/2026-11-15.1",
+            "release/9.2/2026-11-15.2",
+            "release/9.2/2026-11-15.10",
+            "release/9.2/2026-11-16",
+            "release/9.2/2026-11-16-a",
+        ];
+        // Then: each pair is in order, and no two names tie.
+        for pair in ascending.windows(2) {
+            assert!(
+                key(&old, pair[0]) < key(&old, pair[1]),
+                "{} does not sort before {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn the_forks_9_2_release_names_sort_by_date_then_version() {
+        let old = ReleaseScheme::Series(SeriesName::new("9.2"));
+        // Given: every name series 9.2 of the prover fork had on 2026-11-17,
+        // read with `git ls-remote`: the 59 its release remote holds and the
+        // 9 only its origin holds (8.0 and 8.0.1 to 8.0.8), in the order the
+        // rules give.
+        let expected = [
+            "release/9.2/2026-10-21",
+            "release/9.2/2026-10-22",
+            "release/9.2/2026-10-23",
+            "release/9.2/2026-10-24",
+            "release/9.2/2026-10-24.1",
+            "release/9.2/2026-10-25",
+            "release/9.2/2026-10-25.1",
+            "release/9.2/2026-10-25.2",
+            "release/9.2/2026-10-25.3",
+            "release/9.2/2026-10-25.4",
+            "release/9.2/2026-10-25.5",
+            "release/9.2/2026-10-25.6",
+            "release/9.2/2026-10-25.7",
+            "release/9.2/2026-10-26-guard-candidate",
+            "release/9.2/2026-10-26-speed",
+            "release/9.2/2026-10-26-speed-3",
+            "release/9.2/2026-10-26-speed-4",
+            "release/9.2/2026-10-26-speed-sr",
+            "release/9.2/2026-10-26-speed.1",
+            "release/9.2/2026-10-26-speed.2",
+            "release/9.2/2026-10-27-guard-let-candidate",
+            "release/9.2/2026-10-27-speed-5",
+            "release/9.2/2026-10-27-speed-5.1",
+            "release/9.2/2026-10-27-speed-5.2",
+            "release/9.2/2026-10-29-speed-6",
+            "release/9.2/2026-10-30-speed-7",
+            "release/9.2/2026-10-31-speed-7.1",
+            "release/9.2/2026-10-31-speed-7.2",
+            "release/9.2/2026-11-02-speed-7.3",
+            "release/9.2/2026-11-02-speed-7.4",
+            "release/9.2/2026-11-02-speed-7.5",
+            "release/9.2/2026-11-02-speed-7.6",
+            "release/9.2/2026-11-02-speed-7.7",
+            "release/9.2/2026-11-03-label-v4",
+            "release/9.2/2026-11-03-label-v4.1",
+            "release/9.2/2026-11-03-speed-7.8",
+            "release/9.2/2026-11-03-v-label-v4.2",
+            "release/9.2/2026-11-03-v-label-v4.3",
+            "release/9.2/2026-11-04-speed-7.1.1",
+            "release/9.2/2026-11-04-speed-7.1.2",
+            "release/9.2/2026-11-04-speed-7.5.1",
+            "release/9.2/2026-11-04-speed-7.9",
+            "release/9.2/2026-11-04-speed-7.9.1",
+            "release/9.2/2026-11-04-v-label-v4.4",
+            "release/9.2/2026-11-04-v-label-v4.5",
+            "release/9.2/2026-11-05-speed-7.9.2",
+            "release/9.2/2026-11-08-speed-7.9.3",
+            "release/9.2/2026-11-09-speed-7.1.3",
+            "release/9.2/2026-11-10-speed-7.1.1.1",
+            "release/9.2/2026-11-10-speed-7.1.4",
+            "release/9.2/2026-11-10-speed-7.1.5",
+            "release/9.2/2026-11-10-speed-7.1.6",
+            "release/9.2/2026-11-10-speed-7.1.7",
+            "release/9.2/2026-11-10-speed-7.1.8",
+            "release/9.2/2026-11-11-speed-7.1.1.2-baseline",
+            "release/9.2/2026-11-11-speed-7.1.9",
+            "release/9.2/2026-11-11-speed-7.1.10",
+            "release/9.2/2026-11-12-speed-7.1.11",
+            "release/9.2/2026-11-12-speed-8.0",
+            "release/9.2/2026-11-13-speed-8.0.1",
+            "release/9.2/2026-11-13-speed-8.0.2",
+            "release/9.2/2026-11-13-speed-8.0.3",
+            "release/9.2/2026-11-13-speed-8.0.4",
+            "release/9.2/2026-11-14-speed-8.0.5",
+            "release/9.2/2026-11-14-speed-8.0.6",
+            "release/9.2/2026-11-14-speed-8.0.7",
+            "release/9.2/2026-11-14-speed-8.0.8",
+            "release/9.2/2026-11-15-speed-8.0.9",
+        ];
+        let in_order = |mut names: Vec<&'static str>| {
+            names.sort_by_key(|&name| key(&old, name));
+            names
+        };
+
+        // When: they are sorted from `git ls-remote`'s byte order, and from
+        // the reverse of the expected order.
+        let mut bytewise = expected.to_vec();
+        bytewise.sort_unstable();
+        let mut reversed = expected.to_vec();
+        reversed.reverse();
+
+        // Then: both give the expected order, and no name is the default
+        // series'.
+        assert_eq!(expected.len(), 68);
+        assert_eq!(in_order(bytewise), expected);
+        assert_eq!(in_order(reversed), expected);
+        assert!(
+            expected
+                .iter()
+                .all(|name| ReleaseScheme::Dated.cut_key(name).is_none())
+        );
     }
 
     use super::*;

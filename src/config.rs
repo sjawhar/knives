@@ -189,9 +189,9 @@ pub struct RepoEntry {
     pub ledger: Option<String>,
     /// Named release series beside the default one, keyed by series name. The
     /// entry's own `base` is the default series; each named series has its own
-    /// base and its own dated cuts, `release/<series>/YYYY-MM-DD[.N]`, so one
-    /// fork can carry releases on two bases at once. Absent, the fork has the
-    /// default series only.
+    /// base and its own dated cuts, `release/<series>/YYYY-MM-DD[.N|-<label>]`,
+    /// so one fork can carry releases on two bases at once. Absent, the fork
+    /// has the default series only.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub series: BTreeMap<String, SeriesEntry>,
     /// The series the release verbs act on: set by [`RepoEntry::for_series`]
@@ -368,8 +368,9 @@ impl RepoEntry {
 
     /// The dated cuts the selected series owns, which the reaper and the
     /// superseded-cut readers enumerate. A fixed entry's default series still
-    /// owns `release/YYYY-MM-DD[.N]`: those are its leftover dated cuts from
-    /// before it moved to a fixed branch, and they are reaped as on any entry.
+    /// owns `release/YYYY-MM-DD[.N|-<label>]`: those are its leftover dated
+    /// cuts from before it moved to a fixed branch, and they are reaped as on
+    /// any entry.
     pub fn dated_scheme(&self) -> ReleaseScheme {
         match self.release_scheme() {
             ReleaseScheme::Fixed(_) => ReleaseScheme::Dated,
@@ -1055,19 +1056,21 @@ fn checked_series(entry: &RepoEntry, path: &Path) -> Result<(), ConfigError> {
         if name.contains('/') || crate::ids::BranchName::parse(name).is_err() {
             return Err(invalid(format!(
                 "series {name:?} is not one branch-name segment; its cuts are named \
-                 {}{name}/YYYY-MM-DD[.N]",
-                crate::ids::RELEASE_PREFIX
+                 {}{name}/{}",
+                crate::ids::RELEASE_PREFIX,
+                crate::ids::CUT_GRAMMAR
             )));
         }
         if let Some(why) = ref_segment_flaw(name) {
             return Err(invalid(format!(
                 "series {name:?} cannot name a git ref ({why}); its cuts are named \
-                 {}{name}/YYYY-MM-DD[.N]",
-                crate::ids::RELEASE_PREFIX
+                 {}{name}/{}",
+                crate::ids::RELEASE_PREFIX,
+                crate::ids::CUT_GRAMMAR
             )));
         }
         if crate::ids::ReleaseScheme::Dated
-            .dated_cut(&format!("{}{name}", crate::ids::RELEASE_PREFIX))
+            .cut_key(&format!("{}{name}", crate::ids::RELEASE_PREFIX))
             .is_some()
         {
             return Err(invalid(format!(

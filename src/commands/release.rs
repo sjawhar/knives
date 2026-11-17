@@ -249,40 +249,58 @@ fn published_note(ledger: &[Entry], release: &str, commits: &[&CommitId]) -> Opt
     recorded.map(|commit| format!("a record: published note names {}", commit.short()))
 }
 
-/// `name`, unless it is a series' own prefix, such as `release/9.2` on an entry
-/// with series 9.2: git cannot hold that ref beside `release/9.2/<date>`.
-pub fn clear_of_series_prefixes(entry: &RepoEntry, name: String) -> Result<String, String> {
-    match entry
+/// Refuse `name` when it is a series' own prefix, such as `release/9.2` on an
+/// entry with series 9.2: git cannot hold that ref beside `release/9.2/<date>`.
+pub fn clear_of_series_prefixes(entry: &RepoEntry, name: &str) -> Result<(), String> {
+    entry
         .series
         .keys()
         .find(|series| name == format!("{}{series}", crate::ids::RELEASE_PREFIX))
-    {
-        Some(series) => Err(format!(
-            "{name} is the prefix of series {series}'s cuts ({name}/YYYY-MM-DD[.N]); git cannot \
-             hold both, so name the cut by date"
-        )),
-        None => Ok(name),
-    }
+        .map_or(Ok(()), |series| {
+            Err(format!(
+                "{name} is the prefix of series {series}'s cuts ({name}/{}); git cannot \
+                 hold both, so name the cut by date",
+                crate::ids::CUT_GRAMMAR
+            ))
+        })
 }
 
 /// The name a cut takes.
 ///
-/// A dated name must be one this series owns: a name another series owns,
-/// such as `release/9.2/<date>` cut from the default series, would be that
-/// series' newest cut, carrying this series' members.
+/// A dated name must be one this series owns and one the series' order can
+/// read ([`ReleaseScheme::cut_key`]). A name another series owns, such as
+/// `release/9.2/<date>` cut from the default series, would be that series'
+/// newest cut, carrying this series' members. A name the series owns but the
+/// order cannot read, such as `release/9.2/foo`, has no place in the order:
+/// it would never be the newest cut, and the reap would never take it.
 pub fn cut_name(scheme: &ReleaseScheme, requested: Option<&str>) -> Result<String, String> {
+    let example = || {
+        scheme
+            .cut_shape()
+            .replace(crate::ids::CUT_GRAMMAR, "2026-08-03")
+    };
     match (scheme, requested) {
-        (ReleaseScheme::Dated | ReleaseScheme::Series(_), Some(name)) if scheme.owns(name) => {
+        (ReleaseScheme::Dated | ReleaseScheme::Series(_), Some(name))
+            if scheme.cut_key(name).is_some() =>
+        {
             Ok(name.to_owned())
+        }
+        (ReleaseScheme::Dated | ReleaseScheme::Series(_), Some(name)) if scheme.owns(name) => {
+            Err(format!(
+                "{name} is not a name this series can sort; its cuts are named {}, where the \
+                 date is followed by nothing, by `.N` or by `-<label>`, e.g. {}",
+                scheme.cut_shape(),
+                example()
+            ))
         }
         (ReleaseScheme::Dated | ReleaseScheme::Series(_), Some(name)) => Err(format!(
             "{name} is not a cut of this series; its cuts are named {}, e.g. {}",
             scheme.cut_shape(),
-            scheme.cut_shape().replace("YYYY-MM-DD[.N]", "2026-08-03")
+            example()
         )),
         (ReleaseScheme::Dated | ReleaseScheme::Series(_), None) => Err(format!(
             "a dated release cut needs a name, e.g. {}",
-            scheme.cut_shape().replace("YYYY-MM-DD[.N]", "2026-08-03")
+            example()
         )),
         (ReleaseScheme::Fixed(fixed), Some(name)) if name != fixed.as_str() => Err(format!(
             "this repo cuts the fixed release branch {fixed}; drop the name or use {fixed}"
@@ -347,6 +365,21 @@ mod scheme_tests {
         assert!(cut_name(&dated, Some("release/9.2/2026-10-21")).is_err());
         let error = cut_name(&old, None).unwrap_err();
         assert!(error.contains("release/9.2/2026-08-03"), "{error}");
+        // A name the series owns but its order cannot read is refused with
+        // the grammar: it would never be the newest cut, nor ever be reaped.
+        for name in ["release/9.2/foo", "release/9.2/2026-10-21.1.2"] {
+            let error = cut_name(&old, Some(name)).unwrap_err();
+            assert!(
+                error.contains("release/9.2/YYYY-MM-DD[.N|-<label>]")
+                    && error.contains("`-<label>`"),
+                "{name}: {error}"
+            );
+        }
+        // A label is a name of the series: the 9.2 line of the prover fork.
+        assert_eq!(
+            cut_name(&old, Some("release/9.2/2026-11-15-speed-8.0.9")).unwrap(),
+            "release/9.2/2026-11-15-speed-8.0.9"
+        );
     }
 }
 
@@ -631,9 +664,11 @@ pub fn superseded_cuts_of_every_series(
 /// Superseded means "not the newest dated name of this series voted by a
 /// local, `origin`, or `release` ref". The broader output excludes `upstream`
 /// and jj's `git` tracking view, but keeps historical refs on every other
-/// remote for cleanup. [`ReleaseScheme::dated_cut`] keeps upstream-style
+/// remote for cleanup. [`ReleaseScheme::cut_key`] keeps upstream-style
 /// semver names out even on our remotes, and keeps every other series' cuts
-/// out: each series' newest cut is live whatever the others' dates.
+/// out: each series' newest cut is live whatever the others' dates. A name
+/// this series owns but its order cannot read has no key, so the reap never
+/// takes it.
 pub fn superseded_dated_releases(
     tips: &BookmarkTips,
     scheme: &ReleaseScheme,
@@ -644,7 +679,7 @@ pub fn superseded_dated_releases(
         // The vote is an allowlist, so someone else's cut cannot reap ours;
         // output remains broader to clean up our historical odd-remote refs.
         .filter(|reference| is_our_release(reference, scheme, publish_remote))
-        .filter_map(|reference| scheme.dated_cut(reference.branch().as_str()))
+        .filter_map(|reference| scheme.cut_key(reference.branch().as_str()))
         .max();
     let Some(newest) = newest else {
         return Vec::new();
@@ -654,7 +689,7 @@ pub fn superseded_dated_releases(
         .filter(|(reference, _)| {
             ours_to_reap(reference)
                 && scheme
-                    .dated_cut(reference.branch().as_str())
+                    .cut_key(reference.branch().as_str())
                     .is_some_and(|parsed| parsed != newest)
         })
         .map(|(reference, commit)| (reference.clone(), commit.clone()))
@@ -1493,23 +1528,21 @@ pub fn carried_row(name: &str, from: CarriedFrom) -> String {
 /// The newest dated cut's branch name — unqualified, unlike
 /// [`previous_release_for_cut`]'s — and its live commit: the local ref when
 /// present, otherwise whichever of our remotes carries it.
+///
+/// One selection, one order: [`newest_release`] reads the same key. A fixed
+/// release has no dated cut, so it has none of these.
 pub fn live_dated_release(
     tips: &BookmarkTips,
     scheme: &ReleaseScheme,
     publish_remote: &str,
 ) -> Option<(BranchName, CommitId)> {
-    let newest = tips
-        .keys()
-        .filter(|reference| is_our_release(reference, scheme, publish_remote))
-        .filter_map(|reference| scheme.dated_cut(reference.branch().as_str()))
-        .max()?;
-    tips.iter()
-        .filter(|(reference, _)| {
-            is_our_release(reference, scheme, publish_remote)
-                && scheme.dated_cut(reference.branch().as_str()).as_ref() == Some(&newest)
-        })
-        .max_by_key(|(reference, _)| u8::from(reference.is_local()))
-        .map(|(reference, commit)| (reference.branch().clone(), commit.clone()))
+    match scheme {
+        ReleaseScheme::Dated | ReleaseScheme::Series(_) => {
+            newest_release(tips, scheme, publish_remote)
+                .map(|(reference, commit)| (reference.branch().clone(), commit))
+        }
+        ReleaseScheme::Fixed(_) => None,
+    }
 }
 
 /// Each member's history measured against the others: a merge whose side
