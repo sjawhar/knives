@@ -311,9 +311,10 @@ consumers = ["an-org/a-consumer"]
 carries its entries between machines. A repository name may start with a dot
 (`someone/.knives-ledger`). Without it the fork's ledger stays on each machine that writes it. A
 fork whose `upstream` is a filesystem path names no repository another machine could share, so
-`ledger` is refused on it. An older knives refuses a `repos.toml` that sets `ledger`, because
-every entry refuses a field it does not know: upgrade knives on every machine that reads the file
-before adding it.
+`ledger` is refused on it. knives 4.0.1 and older refuse an entry key that they do not know, so
+an older knives refuses a `repos.toml` that sets a key it predates, such as `ledger` or `stacked`.
+A newer knives names an unknown key of an entry or a series table in a warning on stderr and
+ignores it. Upgrade knives on every machine that reads the file before adding a new key.
 
 Every command takes its repo from the directory you are standing in, wherever that checkout
 lives. Name one only when you are somewhere else; knives then scans `~` three directories deep
