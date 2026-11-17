@@ -1453,7 +1453,7 @@ impl Repo {
 
     /// Why `commit` must not be abandoned because something rests on it, or
     /// `None` when nothing does: a workspace has it checked out, or it has any
-    /// visible descendant, a working copy that sits on it included whether it is
+    /// visible descendant, including a working copy that sits on it, whether it is
     /// empty or not. Abandoning a commit rebases whatever rests on it onto its
     /// parents. For a working copy that is a rewrite from outside its
     /// workspace, which can leave the workspace stale, and on a release merge's
@@ -3105,8 +3105,8 @@ pub fn abandon_unheld_writes(
 ///
 /// It stays for a bookmark or tag on it, local or on any remote
 /// ([`names_of`]); for anything that rests on it ([`Repo::what_rests_on`]: a
-/// workspace with it checked out, or any visible descendant, a working
-/// copy that sits on it included); or for anything jj's default rule pins
+/// workspace with it checked out, or any visible descendant, including a
+/// working copy that sits on it); or for anything jj's default rule pins
 /// ([`assert_mutable`]). A commit someone else can still reach by name is
 /// theirs to keep.
 fn what_keeps(
