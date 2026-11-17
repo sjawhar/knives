@@ -84,7 +84,7 @@ fn a_fixed_pin_locked_to_an_ancestor_is_behind() {
 }
 
 #[test]
-fn a_consumer_checkout_parked_behind_its_origin_does_not_produce_a_false_behind() {
+fn a_consumer_checkout_behind_its_origin_does_not_produce_a_false_behind() {
     // Given: a consumer repo whose origin trunk pins the newest release while
     // the checkout's working copy still shows an older pin — the exact state
     // that produced false BEHIND findings twice.

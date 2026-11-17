@@ -1104,8 +1104,8 @@ fn jj_in_work(lab: &Lab, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn a_working_copy_parked_on_the_release_keeps_the_replaced_cut_and_stays_fresh() {
-    // Given: the work checkout's working copy parked, empty, on the cut, with
+fn a_working_copy_that_sits_on_the_release_keeps_the_replaced_cut_and_stays_fresh() {
+    // Given: the work checkout's working copy sitting, empty, on the cut, with
     // a file jj has not snapshotted yet.
     let (lab, home, _consumer) = two_branch_cut();
     let cut = commit_at(&lab, "release/2026-08-04");
@@ -1117,7 +1117,10 @@ fn a_working_copy_parked_on_the_release_keeps_the_replaced_cut_and_stays_fresh()
 
     // Then: the cut stays under the working copy, the drop says why, and the
     // workspace is not stale: the next jj command snapshots the file in place.
-    assert!(is_visible(&lab, &cut), "the parked cut was abandoned");
+    assert!(
+        is_visible(&lab, &cut),
+        "the cut the working copy sits on was abandoned"
+    );
     assert!(
         dropped.contains(&format!(
             "demo: note: kept {}, the release/2026-08-04",
@@ -1149,16 +1152,20 @@ fn a_working_copy_parked_on_the_release_keeps_the_replaced_cut_and_stays_fresh()
     assert!(findings(&report, "orphan-commit").is_empty(), "{report}");
 }
 
-/// A cut kept by a parked working copy at the drop, then left behind when the
+/// A cut kept by a working copy that sits on it at the drop, then left behind when the
 /// working copy moves onto the new release: an anonymous head until the next
 /// release write. Returns the lab, its home and the kept cut.
-fn cut_left_behind_by_a_parked_working_copy() -> (Lab, tempfile::TempDir, knives::ids::CommitId) {
+fn cut_left_behind_by_a_working_copy_that_moved_on()
+-> (Lab, tempfile::TempDir, knives::ids::CommitId) {
     let (lab, home, _consumer) = two_branch_cut();
     let cut = commit_at(&lab, "release/2026-08-04");
     lab.jj_work(["new", "release/2026-08-04"]);
     drop_beta(&lab, &home);
     lab.jj_work(["new", "release/2026-08-04"]);
-    assert!(is_visible(&lab, &cut), "the parked cut was not kept");
+    assert!(
+        is_visible(&lab, &cut),
+        "the cut the working copy sat on was not kept"
+    );
     let report = audit_report(&lab, &home);
     assert_eq!(
         findings(&report, "orphan-commit").len(),
@@ -1173,7 +1180,7 @@ fn the_sweep_keeps_a_left_behind_cut_a_bookmark_or_another_remote_ref_names() {
     for named_by in ["bookmark", "remote ref"] {
         // Given: a left-behind cut named by another bookmark, or by a remote
         // ref of another name.
-        let (lab, home, cut) = cut_left_behind_by_a_parked_working_copy();
+        let (lab, home, cut) = cut_left_behind_by_a_working_copy_that_moved_on();
         lab.jj_work(["bookmark", "create", "keep/cut", "-r", cut.as_str()]);
         if named_by == "remote ref" {
             lab.push_branch("keep/cut");
@@ -1197,8 +1204,8 @@ fn the_sweep_keeps_a_left_behind_cut_a_bookmark_or_another_remote_ref_names() {
 
 #[test]
 fn the_next_edit_abandons_a_cut_a_working_copy_left_behind() {
-    // Given: a cut kept for a parked working copy that has since moved on.
-    let (lab, home, cut) = cut_left_behind_by_a_parked_working_copy();
+    // Given: a cut kept for a working copy that sat on it and has since moved on.
+    let (lab, home, cut) = cut_left_behind_by_a_working_copy_that_moved_on();
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
 
     // When: the release is edited again.
@@ -1224,8 +1231,8 @@ fn the_next_edit_abandons_a_cut_a_working_copy_left_behind() {
 
 #[test]
 fn the_next_cut_abandons_a_cut_a_working_copy_left_behind() {
-    // Given: a cut kept for a parked working copy that has since moved on.
-    let (lab, home, cut) = cut_left_behind_by_a_parked_working_copy();
+    // Given: a cut kept for a working copy that sat on it and has since moved on.
+    let (lab, home, cut) = cut_left_behind_by_a_working_copy_that_moved_on();
     lab.jj_work(["new", "main"]);
 
     // When: the next cut reaps the old name.

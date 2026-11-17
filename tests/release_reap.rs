@@ -180,7 +180,7 @@ fn reap_refuses_a_cut_that_has_local_descendants() {
     lab.branch("feat/beta", "beta.txt", "beta\n");
     lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
     lab.jj_work(["new", "release/2026-08-04", "-m", "stacked work"]);
-    lab.jj_work(["new"]); // park the working copy elsewhere
+    lab.jj_work(["new"]); // step the working copy off the stacked work onto an empty child
     lab.octopus("release/2026-08-05", "feat/alpha", "feat/beta");
 
     let repo = Repo::open(&lab.work).expect("open");
@@ -352,8 +352,8 @@ fn release_reap_keeps_a_commit_an_untracked_remote_pin_holds_and_exits_clean() {
 }
 
 #[test]
-fn a_second_workspaces_parked_working_copy_keeps_the_superseded_cut() {
-    // Given: another workspace parked (empty, undescribed) on the superseded
+fn reaping_keeps_a_superseded_cut_a_second_workspaces_empty_working_copy_sits_on() {
+    // Given: another workspace whose working copy sits (empty, undescribed) on the superseded
     // cut — knives' normal multi-workspace state. jj only auto-discards the
     // CURRENT workspace's @ when it moves; a second workspace's stays.
     let lab = lab::Lab::new();
@@ -361,21 +361,21 @@ fn a_second_workspaces_parked_working_copy_keeps_the_superseded_cut() {
     lab.branch("feat/beta", "beta.txt", "beta\n");
     lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
     let cut = commit_at(&lab, "release/2026-08-04");
-    let parked_workspace = lab
+    let other_workspace = lab
         .work
         .parent()
         .expect("workspace has parent")
-        .join("parked-ws");
+        .join("other-ws");
     lab.jj_work([
         "workspace",
         "add",
         "--name",
-        "parked",
+        "other",
         "--revision",
         "release/2026-08-04",
-        parked_workspace.to_str().expect("utf-8 path"),
+        other_workspace.to_str().expect("utf-8 path"),
     ]);
-    let parked = lab.revision(&lab.work, "parked@", "commit_id");
+    let working_copy = lab.revision(&lab.work, "other@", "commit_id");
     lab.octopus("release/2026-08-05", "feat/alpha", "feat/beta");
 
     // When: reaped.
@@ -388,7 +388,7 @@ fn a_second_workspaces_parked_working_copy_keeps_the_superseded_cut() {
     )
     .expect("reap");
 
-    // Then: the parked working copy keeps the cut, its refs and itself as they
+    // Then: the other workspace's working copy keeps the cut, its refs and itself as they
     // were, and the reason names the workspace. Abandoning the cut would
     // rebase that working copy onto the merge's parents from outside its
     // workspace.
@@ -396,14 +396,17 @@ fn a_second_workspaces_parked_working_copy_keeps_the_superseded_cut() {
     assert_eq!(report.kept.len(), 1, "{report:?}");
     assert_eq!(report.kept[0].0, "release/2026-08-04", "{report:?}");
     assert!(
-        report.kept[0].1.contains("the working copy of parked"),
+        report.kept[0].1.contains("the working copy of other"),
         "{report:?}"
     );
-    assert!(is_visible(&lab, &cut), "the parked cut was abandoned");
+    assert!(
+        is_visible(&lab, &cut),
+        "the cut the working copy sits on was abandoned"
+    );
     assert_eq!(
-        lab.revision(&lab.work, "parked@", "commit_id"),
-        parked,
-        "the parked working copy was rewritten"
+        lab.revision(&lab.work, "other@", "commit_id"),
+        working_copy,
+        "the other workspace's working copy was rewritten"
     );
     assert_eq!(commit_at(&lab, "release/2026-08-04"), cut);
 }
@@ -433,7 +436,7 @@ fn a_cut_keeps_the_superseded_cut_another_workspaces_empty_working_copy_sits_on(
         "release/2026-08-04",
         other_workspace.to_str().expect("utf-8 path"),
     ]);
-    let parked = lab.revision(&lab.work, "other@", "commit_id");
+    let working_copy = lab.revision(&lab.work, "other@", "commit_id");
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
     let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
     assert!(included.status.success(), "{included:?}");
@@ -458,7 +461,7 @@ fn a_cut_keeps_the_superseded_cut_another_workspaces_empty_working_copy_sits_on(
     assert!(
         stdout.contains(&format!(
             "demo: kept release/2026-08-04: it has descendants, whose heads are {}, the working copy of other\n",
-            knives::ids::CommitId::new(parked.as_str()).short()
+            knives::ids::CommitId::new(working_copy.as_str()).short()
         )),
         "{stdout}"
     );
@@ -470,7 +473,7 @@ fn a_cut_keeps_the_superseded_cut_another_workspaces_empty_working_copy_sits_on(
     );
     assert_eq!(
         lab.revision(&lab.work, "other@", "commit_id"),
-        parked,
+        working_copy,
         "another workspace's working copy was rewritten"
     );
     let tips = Repo::open(&lab.work)
@@ -489,7 +492,7 @@ fn a_cut_keeps_the_superseded_cut_another_workspaces_empty_working_copy_sits_on(
 
 #[test]
 fn a_cut_keeps_the_superseded_cut_its_own_working_copy_sits_on_until_that_moves() {
-    // Given: the cutting workspace's own working copy parked, empty, on the
+    // Given: the cutting workspace's own working copy sitting, empty, on the
     // release in hand, where `knives start` puts the agent holding it.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
@@ -499,7 +502,7 @@ fn a_cut_keeps_the_superseded_cut_its_own_working_copy_sits_on_until_that_moves(
     assert!(first.status.success(), "{first:?}");
     let cut = commit_at(&lab, "release/2026-08-04");
     lab.jj_work(["new", "release/2026-08-04"]);
-    let parked = lab.revision(&lab.work, "@", "commit_id");
+    let working_copy = lab.revision(&lab.work, "@", "commit_id");
 
     // When: the next cut runs from that workspace.
     let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
@@ -511,7 +514,7 @@ fn a_cut_keeps_the_superseded_cut_its_own_working_copy_sits_on_until_that_moves(
         stdout.contains("cut release/2026-08-05 as ")
             && stdout.contains(&format!(
                 "demo: kept release/2026-08-04: it has descendants, whose heads are {}, the working copy of default\n",
-                knives::ids::CommitId::new(parked.as_str()).short()
+                knives::ids::CommitId::new(working_copy.as_str()).short()
             )),
         "{stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
@@ -521,7 +524,7 @@ fn a_cut_keeps_the_superseded_cut_its_own_working_copy_sits_on_until_that_moves(
         is_visible(&lab, &cut),
         "the cut under the working copy was abandoned"
     );
-    assert_eq!(lab.revision(&lab.work, "@", "commit_id"), parked);
+    assert_eq!(lab.revision(&lab.work, "@", "commit_id"), working_copy);
     lab.jj_work(["status"]);
 
     // And: once the working copy moves onto the new cut, the reap takes the
@@ -676,7 +679,7 @@ fn a_cut_keeps_a_superseded_cut_a_retention_bookmark_names_and_exits_clean() {
 
 #[test]
 fn a_cut_keeps_a_superseded_name_whose_earlier_write_a_working_copy_rests_on() {
-    // Given: an unpushed cut, a second workspace parked on it, and an include
+    // Given: an unpushed cut, a second workspace whose working copy sits on it, and an include
     // that writes a new commit under the name and keeps the first one for that
     // working copy. No ref names the first commit any more; the ledger does.
     let lab = Lab::new();
@@ -696,7 +699,7 @@ fn a_cut_keeps_a_superseded_name_whose_earlier_write_a_working_copy_rests_on() {
         "release/2026-08-04",
         other_workspace.to_str().expect("utf-8 path"),
     ]);
-    let parked = lab.revision(&lab.work, "other@", "commit_id");
+    let working_copy = lab.revision(&lab.work, "other@", "commit_id");
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
     let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
     assert!(included.status.success(), "{included:?}");
@@ -713,7 +716,7 @@ fn a_cut_keeps_a_superseded_name_whose_earlier_write_a_working_copy_rests_on() {
         stdout.contains(&format!(
             "demo: kept release/2026-08-04: {}, an earlier release/2026-08-04 commit: it has descendants, whose heads are {}, the working copy of other\n",
             first_write.short(),
-            knives::ids::CommitId::new(parked.as_str()).short()
+            knives::ids::CommitId::new(working_copy.as_str()).short()
         )),
         "{stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
@@ -723,7 +726,7 @@ fn a_cut_keeps_a_superseded_name_whose_earlier_write_a_working_copy_rests_on() {
         is_visible(&lab, &first_write),
         "the earlier write was abandoned"
     );
-    assert_eq!(lab.revision(&lab.work, "other@", "commit_id"), parked);
+    assert_eq!(lab.revision(&lab.work, "other@", "commit_id"), working_copy);
 
     // And: once the workspace is forgotten, the reap retires the name and both
     // of its commits.
@@ -780,7 +783,7 @@ fn a_cut_keeps_a_superseded_name_whose_rewritten_earlier_write_a_working_copy_re
     ]);
     let rewrite = knives::ids::CommitId::new(lab.revision(&lab.work, "other@-", "commit_id"));
     assert_ne!(rewrite, first_write, "the describe did not rewrite it");
-    let parked = lab.revision(&lab.work, "other@", "commit_id");
+    let working_copy = lab.revision(&lab.work, "other@", "commit_id");
 
     // When: the next cut reaps the superseded name.
     let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
@@ -797,7 +800,7 @@ fn a_cut_keeps_a_superseded_name_whose_rewritten_earlier_write_a_working_copy_re
     );
     assert_eq!(output.status.code(), Some(1), "{stdout}");
     assert!(is_visible(&lab, &rewrite), "the rewrite was abandoned");
-    assert_eq!(lab.revision(&lab.work, "other@", "commit_id"), parked);
+    assert_eq!(lab.revision(&lab.work, "other@", "commit_id"), working_copy);
 
     // And: once the workspace is forgotten, the reap retires the name and
     // abandons the rewrite, and its JSON names it.

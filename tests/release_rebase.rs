@@ -1161,7 +1161,7 @@ fn a_rebase_moves_members_beneath_an_old_tagged_release_and_abandons_its_stray_c
 
 #[test]
 fn a_rebase_keeps_and_reports_a_stray_copy_something_rests_on() {
-    // Given: the checkout's working copy parked on the old tagged release, as a
+    // Given: the checkout's working copy sitting on the old tagged release, as a
     // workspace left on a previous release tip is
     let lab = Lab::new();
     let (home, tagged) = fork_with_an_old_tagged_release(&lab);

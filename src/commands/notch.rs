@@ -470,7 +470,7 @@ mod tests {
                 subject: Some("feat/\u{1b}queue".to_owned()),
                 evidence: vec!["review\u{1b}link\rnext".to_owned()],
                 anchor: Some("6c42\u{1b}anchor\r".to_owned()),
-                ..entry(Some("feat/ignored"), Kind::Note, "parked\u{1b}now\ragain")
+                ..entry(Some("feat/ignored"), Kind::Note, "stopped\u{1b}now\ragain")
             }],
             matched: 1,
             events: None,

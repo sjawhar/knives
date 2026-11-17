@@ -178,12 +178,12 @@ fn notes_hold(report: &serde_json::Value, parts: &[&str]) -> bool {
 }
 
 /// Step the working copy of `dir` off every release and member.
-fn park_in(lab: &Lab, dir: &Path) {
+fn step_off_onto_trunk_in(lab: &Lab, dir: &Path) {
     lab.jj_at(dir, ["new", "main@origin"]);
 }
 
-fn park(lab: &Lab) {
-    park_in(lab, &lab.work);
+fn step_off_onto_trunk(lab: &Lab) {
+    step_off_onto_trunk_in(lab, &lab.work);
 }
 
 /// The commit `revision` resolves to in checkout `dir`.
@@ -201,7 +201,7 @@ fn edit_in(lab: &Lab, dir: &Path, name: &str, files: &[(&str, &str)]) {
     for (file, content) in files {
         std::fs::write(dir.join(file), content).expect("write the edit");
     }
-    park_in(lab, dir);
+    step_off_onto_trunk_in(lab, dir);
 }
 
 fn edit_by_hand(lab: &Lab, name: &str, files: &[(&str, &str)]) {
@@ -216,7 +216,7 @@ fn branch_in(lab: &Lab, dir: &Path, name: &str) {
     std::fs::write(dir.join(format!("{short}.txt")), format!("{short}\n"))
         .expect("write the branch");
     lab.jj_at(dir, ["bookmark", "create", name, "-r", "@"]);
-    park_in(lab, dir);
+    step_off_onto_trunk_in(lab, dir);
 }
 
 /// `release/2026-08-04` cut from the lab's branches, which conflict: the cut
@@ -384,17 +384,17 @@ fn every_write_over_an_unrecorded_fixed_release_refuses_until_it_is_adopted() {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ran(&lab, &home, &["cut"]);
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     release_ran(&lab, &home, &["include", "feat/gamma"]);
     edit_by_hand(&lab, FIXED, &[("notes.txt", "by hand\n")]);
     let edited = commit_at(&lab, FIXED);
     lab.branch("feat/delta", "delta.txt", "delta\n");
     extend_branch(&lab, "feat/alpha", "alpha.txt", "alpha, grown\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     lab.advance_upstream("advance\n");
     let (ledger, operations) = (ledger_entries(&home), operation_ids(&lab.work));
 
@@ -430,7 +430,7 @@ fn a_fixed_cut_over_a_hand_edit_of_a_held_write_is_refused_until_adopted() {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ran(&lab, &home, &["cut"]);
     edit_by_hand(&lab, FIXED, &[("alpha.txt", "alpha, repaired\n")]);
@@ -468,7 +468,7 @@ fn a_name_the_ledger_records_no_write_of_is_not_refused() {
     std::fs::remove_dir_all(&ledger).expect("remove the ledger");
     edit_by_hand(&lab, DATED, &[("shared.txt", "merged\n")]);
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let before = operation_ids(&lab.work);
 
     // When/Then: an edit over it is not refused, says knives could not check
@@ -598,7 +598,7 @@ fn an_include_over_a_name_with_no_recorded_write_is_marked_until_adopted() {
     // Given: a release whose name has no recorded write, and a branch.
     let (lab, home) = a_release_with_no_recorded_write();
     lab.branch("feat/delta", "delta.txt", "delta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
 
     // When: the branch is included.
     let out = release_ran(&lab, &home, &["include", "feat/delta"]);
@@ -658,7 +658,7 @@ fn an_advance_over_a_name_with_no_recorded_write_is_marked_until_adopted() {
     // Given: a release whose name has no recorded write, and gamma grown.
     let (lab, home) = a_release_with_no_recorded_write();
     extend_branch(&lab, "feat/gamma", "gamma.txt", "gamma, grown\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
 
     // When: gamma is advanced.
     let out = release_ran(&lab, &home, &["advance", "feat/gamma"]);
@@ -721,7 +721,7 @@ fn a_member_rewritten_in_place_is_not_refused() {
     lab.jj_work(["describe", "-r", "feat/alpha", "-m", "alpha, reworded"]);
     assert_ne!(commit_at(&lab, DATED), cut, "jj rebased the release");
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
 
     // When/Then: an include and then a cut go through, checked.
     let out = release_ran(&lab, &home, &["include", "feat/gamma"]);
@@ -737,19 +737,19 @@ fn a_fast_forward_pushed_without_adopt_is_not_refused_and_its_carrier_is_left_ou
     // no adopt.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ran(&lab, &home, &["cut"]);
     let carrier = commit_at(&lab, FIXED);
     lab.push_branch(FIXED);
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     release_ran(&lab, &home, &["include", "feat/gamma"]);
     fast_forward(&lab, FIXED);
     lab.push_branch(FIXED);
     assert!(release_parents(&lab, FIXED).contains(&carrier));
     lab.branch("feat/delta", "delta.txt", "delta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
 
     // When/Then: an include goes through, checked, and leaves the carrier
     // out.
@@ -787,7 +787,7 @@ fn made_again_in_second_clone(
         std::fs::write(second.join(file), content).expect("write by hand");
     }
     lab.jj_at(&second, ["bookmark", "create", DATED, "-r", "@"]);
-    park_in(&lab, &second);
+    step_off_onto_trunk_in(&lab, &second);
     assert!(
         Repo::open(&second)
             .expect("open")
@@ -848,13 +848,13 @@ fn the_live_shape_with_an_absent_write_and_a_carrier_is_unchecked_and_leaves_the
     // made by hand from the include's members and the pushed cut, a carrier.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ran(&lab, &home, &["cut"]);
     let carrier = commit_at(&lab, FIXED);
     lab.push_branch(FIXED);
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     release_ran(&lab, &home, &["include", "feat/gamma"]);
     lab.push_branch("feat/alpha");
     lab.push_branch("feat/gamma");
@@ -871,7 +871,7 @@ fn the_live_shape_with_an_absent_write_and_a_carrier_is_unchecked_and_leaves_the
         ],
     );
     lab.jj_at(&second, ["bookmark", "create", FIXED, "-r", "@"]);
-    park_in(&lab, &second);
+    step_off_onto_trunk_in(&lab, &second);
     branch_in(&lab, &second, "feat/delta");
 
     // When: an include runs over it.
@@ -900,12 +900,12 @@ fn the_live_shape_with_an_absent_write_and_a_carrier_is_unchecked_and_leaves_the
 fn recipe(adopt: bool) -> (Lab, tempfile::TempDir, PathBuf) {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ran(&lab, &home, &["cut"]);
     lab.push_branch(FIXED);
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     release_ran(&lab, &home, &["include", "feat/gamma"]);
     let pre = fast_forward(&lab, FIXED);
     if adopt {
@@ -958,12 +958,12 @@ fn second_clone_write_never_pushed(same_members: bool) -> (Lab, tempfile::TempDi
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ran(&lab, &home, &["cut"]);
     lab.push_branch(FIXED);
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     lab.push_branch("feat/gamma");
     let second = second_clone(&lab);
     lab.jj_at(&second, ["bookmark", "track", "integration@origin"]);
@@ -978,7 +978,7 @@ fn second_clone_write_never_pushed(same_members: bool) -> (Lab, tempfile::TempDi
         ok_in(&lab, &home, &second, &["include", "feat/delta"]);
     }
     lab.branch("feat/eps", "eps.txt", "eps\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     (lab, home)
 }
 
@@ -1016,7 +1016,7 @@ fn a_write_another_clone_recorded_on_the_same_members_leaves_the_head_unchecked(
 fn reset_to_the_published_cut(keep_parents: bool) -> (Lab, tempfile::TempDir, CommitId) {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ran(&lab, &home, &["cut"]);
     let cut = commit_at(&lab, FIXED);
@@ -1026,7 +1026,7 @@ fn reset_to_the_published_cut(keep_parents: bool) -> (Lab, tempfile::TempDir, Co
         release_ran(&lab, &home, &["adopt", "--why", "a note added by hand"]);
     } else {
         lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-        park(&lab);
+        step_off_onto_trunk(&lab);
         release_ran(&lab, &home, &["include", "feat/gamma"]);
     }
     assert_ne!(commit_at(&lab, FIXED), cut);
@@ -1040,7 +1040,7 @@ fn reset_to_the_published_cut(keep_parents: bool) -> (Lab, tempfile::TempDir, Co
     ]);
     assert_eq!(commit_at(&lab, FIXED), cut);
     lab.branch("feat/delta", "delta.txt", "delta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     (lab, home, cut)
 }
 
@@ -1099,12 +1099,12 @@ fn a_member_reworded_after_the_write_is_recorded_by_the_recipes_adopt() {
     // recipe's fast-forward onto the published position.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ran(&lab, &home, &["cut"]);
     lab.push_branch(FIXED);
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     release_ran(&lab, &home, &["include", "feat/gamma"]);
     lab.jj_work(["describe", "-r", "feat/gamma", "-m", "gamma, reworded"]);
     let pre = fast_forward(&lab, FIXED);
@@ -1137,7 +1137,7 @@ fn a_member_added_by_hand_is_unchecked_for_the_writes_and_refused_by_adopt() {
     let (home, _consumer) = home_after_first_cut(&lab);
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
     lab.branch("feat/delta", "delta.txt", "delta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let reset = operation_ids(&lab.work);
     lab.jj_work([
         "rebase",
@@ -1190,7 +1190,7 @@ fn a_resolution_made_as_a_child_of_the_release_is_refused_naming_the_squash() {
     lab.jj_work(["new", DATED, "-m", "resolve shared.txt"]);
     std::fs::write(lab.work.join("shared.txt"), "alpha\nbeta\n").expect("resolve");
     lab.jj_work(["bookmark", "set", DATED, "-r", "@"]);
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let child = commit_at(&lab, DATED);
     let squash = format!(
         "every parent of {DATED} is an earlier write: squash the resolution into the release \
@@ -1229,7 +1229,7 @@ fn a_resolution_made_as_a_child_of_the_release_is_refused_naming_the_squash() {
     let destination = format!("{} | feat/gamma", cut.as_str());
     lab.jj_work(["rebase", "-r", DATED, "-d", destination.as_str()]);
     lab.branch("feat/delta", "delta.txt", "delta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let out = release_ran(&lab, &home, &["include", "feat/delta"]);
 
     // Then: it has a member to compose from, so the write goes through,
@@ -1245,7 +1245,7 @@ fn resolution_on_top(lab: &Lab, name: &str) -> (CommitId, CommitId) {
     lab.jj_work(["new", name, "-m", "a resolution on top"]);
     std::fs::write(lab.work.join("notes.txt"), "by hand\n").expect("write the resolution");
     lab.jj_work(["bookmark", "set", name, "-r", "@"]);
-    park(lab);
+    step_off_onto_trunk(lab);
     (under, commit_at(lab, name))
 }
 
@@ -1254,7 +1254,7 @@ fn resolution_on_top(lab: &Lab, name: &str) -> (CommitId, CommitId) {
 fn one_member_beside_the_carrier(lab: &Lab, name: &str, under: &CommitId) {
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
     lab.branch("feat/delta", "delta.txt", "delta\n");
-    park(lab);
+    step_off_onto_trunk(lab);
     let destination = format!("{} | feat/gamma", under.as_str());
     lab.jj_work(["rebase", "-r", name, "-d", destination.as_str()]);
 }
@@ -1265,12 +1265,12 @@ fn a_resolution_on_top_of_a_published_fixed_release_names_the_squash_past_immuta
     // of it; the release commit it sits on is the publish remote's.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ran(&lab, &home, &["cut"]);
     lab.push_branch(FIXED);
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let (under, child) = resolution_on_top(&lab, FIXED);
     let before = operation_ids(&lab.work);
 
@@ -1381,7 +1381,7 @@ fn a_resolution_on_top_of_a_release_with_no_recorded_write_is_refused_to_run_aga
     let (home, _consumer) = release_test_home(&lab);
     lab.push_branch(DATED);
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let (under, child) = resolution_on_top(&lab, DATED);
     let before = operation_ids(&lab.work);
 
@@ -1425,7 +1425,7 @@ fn member_tip_rewritten_then_pushed_alone<const N: usize>(
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     extend_branch(&lab, "feat/alpha", "alpha-more.txt", "more\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ran(&lab, &home, &["cut"]);
     lab.jj_work(["git", "push", "--bookmark", FIXED]);
@@ -1474,11 +1474,11 @@ fn in_the_clone_that_made_it_a_member_tip_squashed_into_its_parent_is_unchecked(
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     extend_branch(&lab, "feat/alpha", "alpha-more.txt", "more\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ran(&lab, &home, &["cut"]);
     lab.branch("feat/delta", "delta.txt", "delta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     lab.jj_work(["squash", "--use-destination-message", "-r", "feat/alpha"]);
 
     // When/Then: an include goes through, unchecked: no match.
@@ -1494,11 +1494,11 @@ fn in_the_clone_holding_the_write_a_reworded_member_is_recorded_and_a_hand_edit_
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ran(&lab, &home, &["cut"]);
     lab.branch("feat/delta", "delta.txt", "delta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let cut = commit_at(&lab, FIXED);
     lab.jj_work(["describe", "-r", "feat/alpha", "-m", "alpha, reworded"]);
     assert_ne!(commit_at(&lab, FIXED), cut, "jj rebased the release");
@@ -1541,7 +1541,7 @@ fn tagged_release(pushed_edit: bool) -> (Lab, tempfile::TempDir, CommitId, Commi
         lab.jj_work(["restore", "--from", DATED]);
         std::fs::write(lab.work.join("alpha.txt"), "alpha, repaired\n").expect("repair");
         lab.jj_work(["bookmark", "set", DATED, "-r", "@", "--allow-backwards"]);
-        park(&lab);
+        step_off_onto_trunk(&lab);
     }
     let tagged = commit_at(&lab, "v1.0.0");
     let edited = commit_at(&lab, DATED);
@@ -1657,7 +1657,7 @@ fn a_fresh_clone_after_two_unadopted_pushes_is_unchecked_then_adopted_then_check
     // adopt; a fresh clone holding F1 and F2 but neither write.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ran(&lab, &home, &["cut"]);
     lab.jj_work([
@@ -1669,7 +1669,7 @@ fn a_fresh_clone_after_two_unadopted_pushes_is_unchecked_then_adopted_then_check
     ]);
     lab.push_branch(FIXED);
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     release_ran(&lab, &home, &["include", "feat/gamma"]);
     fast_forward(&lab, FIXED);
     lab.push_branch(FIXED);
@@ -1720,7 +1720,7 @@ fn an_unchecked_write_in_the_second_clone() -> (Lab, tempfile::TempDir, PathBuf)
     );
     std::fs::write(second.join("shared.txt"), "merged\n").expect("resolve by hand");
     lab.jj_at(&second, ["bookmark", "create", DATED, "-r", "@"]);
-    park_in(&lab, &second);
+    step_off_onto_trunk_in(&lab, &second);
     branch_in(&lab, &second, "feat/gamma");
     let out = ok_in(&lab, &home, &second, &["include", "feat/gamma"]);
     assert_unchecked(&out, (DATED, DATED), &home, Why::WriteAbsent);
@@ -2359,7 +2359,7 @@ fn working_copy_in(dir: &Path) -> CommitId {
 fn divergent_keep_in(lab: &Lab, dir: &Path, side: &str) {
     lab.jj_at(dir, ["new", "main@origin", "-m", "apart"]);
     let apart = working_copy_in(dir);
-    park_in(lab, dir);
+    step_off_onto_trunk_in(lab, dir);
     let base = operation_ids(dir)[0].clone();
     for target in [apart.as_str(), side] {
         lab.jj_at(

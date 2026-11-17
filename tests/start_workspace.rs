@@ -36,9 +36,9 @@ fn a_new_workspace_is_based_on_the_upstream_trunk_not_the_current_change() {
     // uses, proving nothing.
     lab.advance_upstream("moved on\n");
 
-    // Given: the working copy is parked on the release merge, the dangerous spot
-    let parked = lab.revision(&lab.work, "@", "change_id.short(8)");
-    assert_ne!(parked.trim(), "");
+    // Given: the working copy sits on the release merge, the dangerous spot
+    let working_copy = lab.revision(&lab.work, "@", "change_id.short(8)");
+    assert_ne!(working_copy.trim(), "");
 
     // When: a workspace is opened the way `knives start` opens one
     let destination = lab.work.parent().expect("parent").join("feat-gamma");

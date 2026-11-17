@@ -145,7 +145,7 @@ fn the_machine_default_is_toon_and_decodes_to_exactly_the_json_report() {
             "notch",
             "feat/alpha",
             "-m",
-            "parked until upstream answers",
+            "stopped until upstream answers",
             "--evidence",
             "06d778b9",
             "--repo",
