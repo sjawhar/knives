@@ -23,7 +23,7 @@ Do this before you read code too: a conclusion from the wrong copy is wrong, and
 - `knives notch` shows recent claims, stated PRs, dependencies, releases and notes. Before you touch a branch you do not understand, run `knives notch <branch>`. The reason for an odd branch is usually one line there.
 - Each entry carries the branch tip of its time. An entry at a commit that the branch moved past is a reason to check again, not a conclusion.
 - The workflow that wrote a note's prefixes defines them. A note that says it is open is open.
-- Record a decision worth keeping before you continue: superseded, parked by the owner, a promise to a reviewer, a PR moved to another branch. Cite a commit or `file:line`, because claims without one were the false ones:
+- Record a decision worth keeping before you continue: superseded, stopped by the owner until a named event, a promise to a reviewer, a PR moved to another branch. Cite a commit or `file:line`, because claims without one were the false ones:
   `knives notch <branch> -m "what you decided and why" --evidence <commit-or-ref>`
 
 ## 3. Challenge the placement before `knives start`
@@ -70,7 +70,7 @@ Do this before you read code too: a conclusion from the wrong copy is wrong, and
 - A member's PR on the fork remote is for review, never for shipping. Base it on the series base the member forks from (the `base` of its series in the registry), never on a dated `release/…` cut. Merging it into a cut fast-forwards that published ref, so the cut no longer names the tree the consumer's pinned digest was built from. Only `knives release` puts a member in a release.
 - The release owner's process opens the upstream PR after the notch records the verdict, from a signed commit with an `Omp-Session` trailer. It gates nothing: not the release, the pin or the deploy. Never wait for upstream review or "the next cut".
 - The include-time ownership test checks placement. It is not a review that the fix waits in.
-- After the upstream PR opens, its review rounds, body edits, rebases and close are the owning session's work. Never park them on a human. The one exception is text the user's own rules send to them first: batch it into one ask, which is approval, not parking.
+- After the upstream PR opens, its review rounds, body edits, rebases and close are the owning session's work. Never give them to a human to do. The one exception is text the user's own rules send to them first: batch it into one ask, in which the human approves the text and the session keeps the work.
 
 ## 5. Get your workspace with `knives start`
 
