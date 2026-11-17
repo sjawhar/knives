@@ -63,7 +63,7 @@ session:
   evidence.
 - **The hand-ledger's entries fell into two natural kinds**: mechanical
   events (pushed @SHA, cut with parents, PR merged) and judgments/notes
-  (superseded-by with the superseding SHA, parked-by-owner with the claim
+  (superseded-by with the superseding SHA, stopped-by-owner with the claim
   quote, promises made to reviewers). knives already witnesses the first
   kind in its own commands and throws them away.
 - **`status` is serial end to end** (`src/commands/status.rs`): per open PR,
@@ -104,10 +104,10 @@ One entry is one JSON line:
 
 `kind` is deliberately two values, not three. The read-time question the
 census evidence teaches is "did a machine observe this or did an agent assert
-it?" — supersessions and parking arrive as events via `finish
---superseded-by` and `start --why`; everything an agent asserts is a note.
-Asking writing agents to self-classify judgment-versus-note is a decision
-burden with no read-time payoff.
+it?" — supersessions and an owner's decisions to stop work arrive as events
+via `finish --superseded-by` and `start --why`; everything an agent asserts
+is a note. Asking writing agents to self-classify judgment-versus-note is a
+decision burden with no read-time payoff.
 
 `anchor` is the anti-rot mechanism and is never caller-supplied: a reader sees
 the entry was written when the branch was at `6c42fe71`, sees the tip has
@@ -205,7 +205,7 @@ adds no observable runtime.
 - `skills/fork-work/SKILL.md`: after "read the claims", add reading the
   notches — `knives notch <branch>` before touching a branch you do not
   understand — and writing one when you make a call worth remembering
-  (superseded, parked, promised, re-homed a PR).
+  (superseded, stopped by the owner, promised, re-homed a PR).
 - `skills/using-knives/SKILL.md`: full command reference section for `notch`,
   including the two-kinds semantics and the push for `--evidence` on notes.
 - `skills/pr-preflight/SKILL.md`: promises made to reviewers belong in

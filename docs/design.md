@@ -514,7 +514,7 @@ successful.
 Every hook invocation arms a watchdog thread that ends the process after 30 seconds
 (`KNIVES_HOOK_DEADLINE_MS` overrides; zero or absurd values fall back). Harnesses spawn the hook
 with a piped stdin and can abandon the handler that would write it — OMP times handlers out at
-30 seconds and keeps the session moving — which without the watchdog leaves the process parked in
+30 seconds and keeps the session moving — which without the watchdog leaves the process blocked in
 its stdin read forever. On 2026-08-25 that leaked one immortal process per agent tool call across
 ~22 sessions until ~13k concurrent `knives` processes exhausted a devbox. A response is worthless
 after the harness's own timeout anyway, so dying loses nothing. The watchdog exits `Incomplete`

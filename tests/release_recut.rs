@@ -829,7 +829,7 @@ fn a_cut_refuses_when_release_like_described_work_lives_only_in_the_release_line
         "chore(release): restore missing file",
     ]);
     std::fs::write(lab.work_path().join("hotfix.txt"), "fix\n").expect("write hotfix");
-    lab.jj_work(["new"]); // park @ off the hotfix so it snapshots as its own commit
+    lab.jj_work(["new"]); // step @ off the hotfix so it snapshots as its own commit
     // The working copy now sits on the hotfix, so the hotfix is `@-`.
     let stacked = lab.revision(lab.work_path(), "@-", "commit_id");
     assert_eq!(stacked.len(), 40, "{stacked:?}");

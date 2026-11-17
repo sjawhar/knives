@@ -253,7 +253,7 @@ async function hookResponse(
   });
   // The timer guarantees the child cannot outlive this handler: a harness that
   // times the handler out and abandons it would otherwise leave the child
-  // parked in its stdin read forever. SIGKILL, not SIGTERM: the response is
+  // blocked in its stdin read forever. SIGKILL, not SIGTERM: the response is
   // already discarded, and releasing the gate slot must not depend on the
   // child's cooperation. A timeout is load, not a broken binary, so it
   // degrades to null without condemning the candidate.

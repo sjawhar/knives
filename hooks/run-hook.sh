@@ -11,7 +11,7 @@ fi
 
 # Bound the stdin read where timeout(1) exists (35s > the binary's own 30s
 # watchdog): a harness that spawns this hook and abandons it before writing
-# stdin would otherwise park this shell in `cat` forever — the same immortal-
+# stdin would otherwise block this shell in `cat` forever — the same immortal-
 # process class that fork-bombed a devbox on 2026-08-25. Platforms without
 # timeout(1) rely on the harness's own hook timeout.
 if command -v timeout >/dev/null 2>&1; then

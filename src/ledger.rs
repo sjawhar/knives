@@ -98,8 +98,8 @@ pub fn appended() -> bool {
 /// Who put an entry there.
 ///
 /// Two values, not three. The question a reader asks is whether a machine
-/// observed this or an agent asserted it; a supersession or a parking arrives as
-/// an event through `finish --superseded-by` and `start --why`, and everything an
+/// observed this or an agent asserted it; a supersession or the owner's decision to stop the work
+/// arrives as an event through `finish --superseded-by` and `start --why`, and everything an
 /// agent asserts is a note. Asking a writing agent to grade its own entry as
 /// judgment-versus-note is a decision with no read-time payoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1632,7 +1632,7 @@ mod tests {
         // rather than truncate the body.
         let dir = tempfile::tempdir().unwrap();
         let ledger = Ledger::at(dir.path().join("a-repo"));
-        let text = "parked\nby the owner\n+++\nthat line is prose, not a fence";
+        let text = "stopped\nby the owner\n+++\nthat line is prose, not a fence";
         ledger.append(&entry(Some("feat/alpha"), text)).unwrap();
         assert_eq!(ledger.read().unwrap().entries[0].text, text);
     }
@@ -2683,8 +2683,8 @@ mod tests {
         let ledger = Ledger::at(dir.path().join("a-repo"));
         let later = Entry {
             kind: Kind::Event,
-            claim_change: Some("parked".to_owned()),
-            ..entry(Some("feat/alpha"), "parked the claim")
+            claim_change: Some("archived".to_owned()),
+            ..entry(Some("feat/alpha"), "archived the claim")
         };
         ledger.append(&later).unwrap();
 
