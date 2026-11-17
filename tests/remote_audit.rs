@@ -80,6 +80,62 @@ fn knives_audit(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::proc
     knives_cmd(lab, home, "audit", args)
 }
 
+/// A bare release remote beside the lab's origin, and a registry home whose
+/// `demo` entry publishes releases to it.
+fn split_release(lab: &Lab) -> (std::path::PathBuf, tempfile::TempDir) {
+    let release = lab.temp_path().join("release.git");
+    let path = release.to_str().expect("utf-8 path");
+    let status = Command::new("git")
+        .args(["init", "--bare", path])
+        .status()
+        .expect("create release remote");
+    assert!(status.success(), "create release remote");
+    let home = registry_home(lab, &format!("release = \"{path}\"\n"));
+    (release, home)
+}
+
+/// Copy origin's ref `name` to the bare release remote at `release`, at the
+/// same commit.
+fn copy_to_release(lab: &Lab, release: &std::path::Path, name: &str) {
+    let refspec = format!("refs/heads/{name}:refs/heads/{name}");
+    let status = Command::new("git")
+        .args([
+            "fetch",
+            "--quiet",
+            lab.temp_origin().to_str().expect("utf-8 path"),
+            refspec.as_str(),
+        ])
+        .current_dir(release)
+        .status()
+        .expect("copy origin's ref to release");
+    assert!(status.success(), "copy {name} from origin to release");
+}
+
+/// The JSON report of `knives --json audit demo --no-github`.
+fn audit_report(lab: &Lab, home: &tempfile::TempDir) -> serde_json::Value {
+    let output = knives_audit(lab, home, &["demo", "--no-github"]);
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "audit emits JSON ({error}): stdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+/// The `remote-drift` findings whose subject is a ref on origin.
+fn origin_remote_drifts(report: &serde_json::Value) -> Vec<&serde_json::Value> {
+    report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .filter(|finding| {
+            finding["kind"] == "remote-drift"
+                && finding["subject"]["bookmark"]["Remote"]["remote"] == "origin"
+        })
+        .collect()
+}
+
 /// The audit gathered over `entry` with `forge` and a store that states
 /// `fork_only` as fork-only and nothing else.
 fn gather_with(
@@ -631,6 +687,107 @@ fn audit_does_not_treat_a_shared_release_url_as_a_separate_zombie_remote() {
             .is_some_and(|detail| detail.starts_with("origin has feat/alpha")),
         "was: {zombies:?}"
     );
+}
+
+#[test]
+fn an_origin_copy_of_a_published_release_is_a_note_not_a_finding() {
+    // Given: releases publish to a separate remote, and origin holds the
+    // published release name at the same commit.
+    let lab = Lab::new();
+    lab.branch("release/2026-08-04", "release.txt", "release\n");
+    let (release, home) = split_release(&lab);
+    lab.push_branch("release/2026-08-04");
+    copy_to_release(&lab, &release, "release/2026-08-04");
+    let commit = commit_at(&lab, "release/2026-08-04");
+
+    // When: audit holds origin's release refs against the release remote.
+    let report = audit_report(&lab, &home);
+
+    // Then: origin's ref is a copy: a note, not a misplaced ref.
+    let misplaced = origin_remote_drifts(&report);
+    assert!(misplaced.is_empty(), "was: {misplaced:?}");
+    let copy = format!(
+        "origin has release ref release/2026-08-04 at {}, a copy of release's \
+         release/2026-08-04 at the same commit",
+        commit.short()
+    );
+    assert!(
+        report["notes"]
+            .as_array()
+            .is_some_and(|notes| notes.iter().any(|note| note == copy.as_str())),
+        "no note `{copy}`: {report}"
+    );
+}
+
+#[test]
+fn an_origin_only_release_is_still_misplaced() {
+    // Given: origin holds a copy of the published release, and a second
+    // release name that the release remote does not have.
+    let lab = Lab::new();
+    lab.branch("release/2026-08-04", "release.txt", "release\n");
+    lab.branch("release/2026-08-05", "later.txt", "later\n");
+    let (release, home) = split_release(&lab);
+    for name in ["release/2026-08-04", "release/2026-08-05"] {
+        lab.push_branch(name);
+    }
+    copy_to_release(&lab, &release, "release/2026-08-04");
+
+    // When: audit holds origin's release refs against the release remote.
+    let report = audit_report(&lab, &home);
+
+    // Then: the origin-only name is the one misplaced ref, and its detail
+    // says that the release remote has no such name.
+    let misplaced = origin_remote_drifts(&report);
+    let later = misplaced
+        .iter()
+        .find(|finding| finding["subject"]["bookmark"]["Remote"]["branch"] == "release/2026-08-05")
+        .unwrap_or_else(|| panic!("no misplaced release/2026-08-05: {report}"));
+    let expected = format!(
+        "origin has release ref release/2026-08-05 at {} but releases publish to release, \
+         which has no release/2026-08-05; this ref is misplaced",
+        commit_at(&lab, "release/2026-08-05").short()
+    );
+    assert_eq!(later["detail"], expected.as_str(), "was: {report}");
+    assert_eq!(misplaced.len(), 1, "was: {misplaced:?}");
+}
+
+#[test]
+fn an_origin_release_at_another_commit_is_misplaced_and_names_both() {
+    // Given: origin and the release remote hold one release name, and the
+    // release remote's ref then moves to another commit, the trunk.
+    let lab = Lab::new();
+    lab.branch("release/2026-08-04", "release.txt", "release\n");
+    let (release, home) = split_release(&lab);
+    lab.push_branch("release/2026-08-04");
+    copy_to_release(&lab, &release, "release/2026-08-04");
+    let trunk = commit_at(&lab, "main@origin");
+    let status = Command::new("git")
+        .args([
+            "update-ref",
+            "refs/heads/release/2026-08-04",
+            trunk.as_str(),
+        ])
+        .current_dir(&release)
+        .status()
+        .expect("move release ref");
+    assert!(status.success(), "move release ref");
+
+    // When: audit holds origin's release refs against the release remote.
+    let report = audit_report(&lab, &home);
+
+    // Then: origin's ref is misplaced, and the detail names origin's commit
+    // and the release remote's commit.
+    let misplaced = origin_remote_drifts(&report);
+    let [finding] = misplaced.as_slice() else {
+        panic!("one misplaced origin release ref: {report}");
+    };
+    let expected = format!(
+        "origin has release ref release/2026-08-04 at {} but release has release/2026-08-04 \
+         at {}; this ref is misplaced",
+        commit_at(&lab, "release/2026-08-04").short(),
+        trunk.short()
+    );
+    assert_eq!(finding["detail"], expected.as_str(), "was: {report}");
 }
 
 #[test]

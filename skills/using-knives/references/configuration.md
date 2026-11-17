@@ -8,7 +8,7 @@ For repository binding, `knives register`, scan failures, and registry, trust or
 - `origin` is our fork, with ordinary branches and PR heads.
 - `release` is an optional separate publish location. When it is absent or equal to origin, publish to `origin`.
 
-Roles do not substitute. A release ref on origin does not prove that a separate release remote has it.
+Roles do not substitute. A release ref on origin does not prove that a separate release remote has it. `knives audit` holds each release ref on origin against the release remote's ref of that name. At the same commit, origin's ref is a copy: a note. A name that the release remote does not have, or has at another commit, makes origin's ref misplaced: a `remote-drift` finding ([reports](reports.md#knives-audit-repo---all---no-github)).
 
 ## `knives register [DIR]`
 

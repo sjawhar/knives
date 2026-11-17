@@ -368,8 +368,12 @@ deleted locally while its remote ref remained. It changes neither remote nor loc
 against the commits its recorded cuts and edits name, and anonymous heads. Its findings identify the observed drift; it never
 repairs, deletes, pushes, or opens a pull request. A release finished by hand is drift until
 `knives release adopt` records it as the name's newest write; that record is an edit event, which
-the audit already reads. Per-pull history remains the separate,
-on-demand `knives pr <n> --timeline` read.
+the audit already reads. When releases publish to a separate remote, the audit also holds each
+release ref on origin against the publish remote's ref of that name. At the same commit, origin's
+ref is a copy, and the audit says so in a note. A name the publish remote does not have, or has at
+another commit, makes origin's ref misplaced: a `remote-drift` finding that says what the publish
+remote holds.
+Per-pull history remains the separate, on-demand `knives pr <n> --timeline` read.
 
 The report also carries `branches`, one row of facts per maintained branch (every local bookmark
 that is neither the trunk nor a release name), and `template`, the upstream trunk's pull-request

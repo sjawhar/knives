@@ -157,7 +157,7 @@ pub fn gather(input: &AuditInput<'_>) -> Report {
             is_metadata_rewrite: &|recorded, current| opened.is_metadata_rewrite(recorded, current),
         },
     );
-    add_misplaced_origin_release_refs(&mut report, live.origin(), &scheme, entry.publish_remote());
+    add_misplaced_origin_release_refs(&mut report, &live, &scheme, entry.publish_remote());
     add_unfit_branches(&mut report, &opened, entry, &carried);
     add_orphan_commits(&mut report, &opened, path);
     let template = template_for_pulls(&mut report, input);
@@ -591,16 +591,24 @@ fn add_release_drift(report: &mut Report, drift: ReleaseDrift<'_>) {
     ));
 }
 
+/// Hold each release-shaped ref on origin against the publish remote's ref of
+/// that name, when releases publish to another remote.
+///
+/// Both live maps come from `git ls-remote`, with full commit ids. Origin at
+/// the same commit as the publish remote is a copy: a note. A name the publish
+/// remote lacks, or holds at another commit, is a misplaced ref: a re-signed
+/// copy has another id, so it is misplaced too.
 fn add_misplaced_origin_release_refs(
     report: &mut Report,
-    origin: &BTreeMap<String, CommitId>,
+    live: &pushed::LiveRefs,
     scheme: &crate::ids::ReleaseScheme,
     publish_remote: &str,
 ) {
     if publish_remote == "origin" {
         return;
     }
-    for (reference, commit) in origin {
+    let published = live.release();
+    for (reference, commit) in live.origin() {
         let Some(name) = reference.strip_prefix("refs/heads/") else {
             continue;
         };
@@ -608,17 +616,30 @@ fn add_misplaced_origin_release_refs(
         if !is_release_name(&branch, scheme) {
             continue;
         }
+        let held = format!("origin has release ref {name} at {}", commit.short());
+        let detail = match published.get(reference) {
+            Some(copy) if copy == commit => {
+                report.notes.push(format!(
+                    "{held}, a copy of {publish_remote}'s {name} at the same commit"
+                ));
+                continue;
+            }
+            Some(other) => format!(
+                "{held} but {publish_remote} has {name} at {}; this ref is misplaced",
+                other.short()
+            ),
+            None => format!(
+                "{held} but releases publish to {publish_remote}, which has no {name}; \
+                 this ref is misplaced"
+            ),
+        };
         report.findings.push(Finding::new(
             FindingKind::RemoteDrift,
             Subject::Bookmark(BookmarkRef::Remote {
                 branch,
                 remote: crate::ids::RemoteName::new("origin"),
             }),
-            format!(
-                "origin has release ref {name} at {} but releases publish to {publish_remote}; \
-                 this ref is misplaced",
-                commit.short()
-            ),
+            detail,
         ));
     }
 }
@@ -849,6 +870,7 @@ mod tests {
     };
     use crate::bind::Fork;
     use crate::cli::Exit;
+    use crate::commands::pushed::LiveRefs;
     use crate::config::RepoEntry;
     use crate::detect::{FindingKind, Subject};
     use crate::forge::{
@@ -1381,10 +1403,13 @@ mod tests {
         let mut report = Report::new("demo");
         add_misplaced_origin_release_refs(
             &mut report,
-            &BTreeMap::from([(
-                "refs/heads/release/2026-08-15".to_owned(),
-                CommitId::new("aaaaaaaaaaaa"),
-            )]),
+            &LiveRefs::new(
+                BTreeMap::from([(
+                    "refs/heads/release/2026-08-15".to_owned(),
+                    CommitId::new("aaaaaaaaaaaa"),
+                )]),
+                Some(BTreeMap::new()),
+            ),
             &crate::ids::ReleaseScheme::Dated,
             "release",
         );
@@ -1413,19 +1438,105 @@ mod tests {
                 "https://forge.invalid/ours/demo.git",
             )
         };
+        // An equal release URL is read once: the publish remote's refs are origin's.
+        let live = LiveRefs::new(
+            BTreeMap::from([(
+                "refs/heads/release/2026-08-15".to_owned(),
+                CommitId::new("aaaaaaaaaaaa"),
+            )]),
+            None,
+        );
         let mut report = Report::new("demo");
 
         add_misplaced_origin_release_refs(
             &mut report,
-            &BTreeMap::from([(
-                "refs/heads/release/2026-08-15".to_owned(),
-                CommitId::new("aaaaaaaaaaaa"),
-            )]),
+            &live,
             &crate::ids::ReleaseScheme::Dated,
             entry.publish_remote(),
         );
 
         assert!(report.findings.is_empty(), "findings: {report:?}");
+        assert!(report.notes.is_empty(), "notes: {report:?}");
+    }
+
+    /// The audit of origin's `release/2026-08-15` at `origin` against a
+    /// publish remote named `release` that holds the name at `published`, or
+    /// has no such name.
+    fn origin_release_audit(origin: &str, published: Option<&str>) -> Report {
+        let reference = "refs/heads/release/2026-08-15";
+        let live = LiveRefs::new(
+            BTreeMap::from([(reference.to_owned(), CommitId::new(origin))]),
+            Some(
+                published
+                    .map(|commit| (reference.to_owned(), CommitId::new(commit)))
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        let mut report = Report::new("demo");
+        add_misplaced_origin_release_refs(
+            &mut report,
+            &live,
+            &crate::ids::ReleaseScheme::Dated,
+            "release",
+        );
+        report
+    }
+
+    #[test]
+    fn an_origin_release_ref_at_the_published_commit_is_a_copy_note() {
+        let commit = "a".repeat(40);
+
+        let report = origin_release_audit(&commit, Some(commit.as_str()));
+
+        assert!(report.findings.is_empty(), "findings: {report:?}");
+        assert_eq!(
+            report.notes,
+            [
+                "origin has release ref release/2026-08-15 at aaaaaaaaaaaa, a copy of release's \
+                 release/2026-08-15 at the same commit"
+            ]
+        );
+        assert_eq!(exit_for(&report), Exit::Ok);
+    }
+
+    #[test]
+    fn an_origin_release_ref_the_publish_remote_lacks_is_misplaced() {
+        let report = origin_release_audit(&"a".repeat(40), None);
+
+        assert!(report.notes.is_empty(), "notes: {report:?}");
+        let [finding] = report.findings.as_slice() else {
+            panic!("one misplaced-origin-release finding: {report:?}");
+        };
+        assert_eq!(finding.kind, FindingKind::RemoteDrift);
+        assert_eq!(
+            finding.detail,
+            "origin has release ref release/2026-08-15 at aaaaaaaaaaaa but releases publish to \
+             release, which has no release/2026-08-15; this ref is misplaced"
+        );
+    }
+
+    #[test]
+    fn an_origin_release_ref_at_another_published_commit_is_misplaced_and_names_both() {
+        let report = origin_release_audit(&"a".repeat(40), Some("b".repeat(40).as_str()));
+
+        assert!(report.notes.is_empty(), "notes: {report:?}");
+        let [finding] = report.findings.as_slice() else {
+            panic!("one misplaced-origin-release finding: {report:?}");
+        };
+        assert_eq!(finding.kind, FindingKind::RemoteDrift);
+        assert_eq!(
+            finding.subject,
+            Subject::Bookmark(BookmarkRef::Remote {
+                branch: BranchName::new("release/2026-08-15"),
+                remote: crate::ids::RemoteName::new("origin"),
+            })
+        );
+        assert_eq!(
+            finding.detail,
+            "origin has release ref release/2026-08-15 at aaaaaaaaaaaa but release has \
+             release/2026-08-15 at bbbbbbbbbbbb; this ref is misplaced"
+        );
     }
 
     #[test]
