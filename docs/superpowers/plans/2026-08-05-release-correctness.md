@@ -620,7 +620,7 @@ pub fn reap_superseded(repo_path: &Path, repo: &Repo) -> anyhow::Result<ReapRepo
 
 Behavior (spec §1.4): group `superseded_dated_releases` output by bookmark name. For each name, in order:
 
-1. **Local-descendants gate:** for each distinct target commit of that name's refs, `commits_matching(repo_path, &format!("(descendants({id}) ~ {id}) ~ (empty() & description(exact:\"\"))"))`. Non-empty → push `(name, "has local descendants: <first 3 ids, comma-joined>")` to `kept` and skip the name entirely. Empty undescribed commits are excluded because they are parked workspace working-copies, which sit on release merges routinely; jj rebases them harmlessly when the parent is abandoned, and blocking on them would mean never reaping anything.
+1. **Local-descendants gate:** for each distinct target commit of that name's refs, `commits_matching(repo_path, &format!("(descendants({id}) ~ {id}) ~ (empty() & description(exact:\"\"))"))`. Non-empty → push `(name, "has local descendants: <first 3 ids, comma-joined>")` to `kept` and skip the name entirely. Empty undescribed commits are excluded because they are workspace working-copies, which sit on release merges routinely; jj rebases them harmlessly when the parent is abandoned, and blocking on them would mean never reaping anything.
 2. **Forget:** `forget_bookmark_include_remotes(repo_path, name)` — one call per name covers local + all remotes.
 3. **Abandon:** collect the distinct target commits recorded in step 1, `abandon_commits(repo_path, &targets)`. An `Err` here (still-immutable via a ref outside our enumeration, e.g. a tag) goes to `notes`, not a failure: the forget already achieved the graph cleanup the log needs.
 
@@ -662,7 +662,7 @@ fn reap_refuses_a_cut_that_has_local_descendants() {
     lab.branch("feat/beta", "beta.txt", "beta\n");
     lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
     lab.jj_work(["new", "release/2026-08-04", "-m", "stacked work"]);
-    lab.jj_work(["new"]); // park the working copy elsewhere
+    lab.jj_work(["new"]); // step the working copy off the stacked work onto an empty child
     lab.octopus("release/2026-08-05", "feat/alpha", "feat/beta");
 
     let repo = Repo::open(&lab.work).expect("open");
@@ -721,8 +721,8 @@ fn reap_clears_a_ref_the_next_fetch_rematerialized() {
 /// `previous_position` seam is `Fixed`-scheme-only while dated names are the
 /// only thing enumerated, so neither needs a runtime gate here. What does:
 /// a cut with local descendants is someone's stacked work (#4's third loss
-/// mode) and is refused with the descendants named. Parked workspace working
-/// copies — empty, undescribed — do not block: they sit on release merges as a
+/// mode) and is refused with the descendants named. Empty, undescribed
+/// workspace working copies do not block: they sit on release merges as a
 /// matter of course and jj rebases them harmlessly.
 ///
 /// Never touches a remote. A later fetch re-materializes forgotten refs as
@@ -924,7 +924,7 @@ fn cutting_a_release_reaps_the_superseded_one() {
 
 Note the registry needs a `consumers` entry (the plan's central question is pinned-ness; without one the command exits `Incomplete` — see src/commands/release.rs:315). Pointing it at the work dir itself is the established dodge in this suite when pins are irrelevant... it is NOT: check `release_rebase_repairs_a_followed_dated_release_with_a_sideways_merge` — it builds a real consumer. For this test the exit code matters, so build the consumer the same way that test does (`lab.consumer_with_pin_history(...)` with a `branch = "release/2026-08-04"` pin) and put its path in `consumers`. Copy those four lines verbatim from that test.
 
-- [ ] **Step 5: Run:** `cargo test --test jj_integration cutting_a_release_reaps` — PASS. Then the whole file: `cargo test --test jj_integration` — no regressions (in particular `cutting_a_release_does_not_move_another_agents_working_copy` still passes; the reap excludes parked working copies by the empty-undescribed rule).
+- [ ] **Step 5: Run:** `cargo test --test jj_integration cutting_a_release_reaps` — PASS. Then the whole file: `cargo test --test jj_integration` — no regressions (in particular `cutting_a_release_does_not_move_another_agents_working_copy` still passes; the reap excludes workspace working copies by the empty-undescribed rule).
 
 ---
 
@@ -940,7 +940,7 @@ Note the registry needs a `consumers` entry (the plan's central question is pinn
 
 Semantics (spec §1.2): the protected lineage is the previous release *and its local descendants* (`::(P::)` — ancestors of descendants of P). Lost means not reachable from any keeper. Keepers are **every non-release local bookmark tip plus the upstream trunk tip** — not just release members, because a branch deliberately dropped from the release still holds its content through its own bookmark and must not trip the gate. Excluded from the report:
 
-- parked working copies: `empty() & description(exact:"")`
+- empty, undescribed working copies: `empty() & description(exact:"")`
 - the release lineage's own machinery: commits whose description starts `release:` (a cut's own message, see `Cut::message`) or `chore(release):` (a rebase's message) — superseded merges are what reaping abandons, not content.
 
 - [ ] **Step 1: Write the failing integration tests:**
@@ -956,7 +956,7 @@ fn a_cut_refuses_when_work_lives_only_in_the_release_lineage() {
     lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
     lab.jj_work(["new", "release/2026-08-04", "-m", "hotfix applied on the release"]);
     std::fs::write(lab.work_path().join("hotfix.txt"), "fix\n").expect("write hotfix");
-    lab.jj_work(["new"]); // park @ off the hotfix so it snapshots as its own commit
+    lab.jj_work(["new"]); // step @ off the hotfix so it snapshots as its own commit
     let stacked = lab.revision(lab.work_path(), "description(glob:\"hotfix*\")", "commit_id");
     let (home, _consumer) = release_test_home(&lab); // helper defined in Step 2
 
@@ -1085,8 +1085,8 @@ Thread the flag: `ReleaseInvocation::Cut(Option<String>)` in src/main.rs becomes
 ///
 /// Keepers are every non-release local bookmark tip plus the upstream trunk —
 /// not just release members, because a branch stated out of the release still
-/// holds its content through its own bookmark. Parked working copies (empty,
-/// undescribed) and the release lineage's own merges (`release:` /
+/// holds its content through its own bookmark. Empty, undescribed working
+/// copies and the release lineage's own merges (`release:` /
 /// `chore(release):` messages) are not content and are excluded.
 pub fn orphaned_commits(
     repo_path: &Path,
@@ -1539,7 +1539,7 @@ fn an_incremental_recut_preserves_the_previous_cuts_conflict_resolutions() {
     // Resolve the cut's conflict the way an operator does: edit the merge.
     lab.jj_work(["edit", "release/2026-08-04"]);
     std::fs::write(lab.work_path().join("shared.txt"), "resolved union\n").expect("resolve");
-    lab.jj_work(["new"]); // park @ off the merge; the resolution is snapshotted
+    lab.jj_work(["new"]); // step @ off the merge; the resolution is snapshotted
     let repo = Repo::open(&lab.work).expect("open");
     let previous = repo.resolve_commit("release/2026-08-04").expect("previous");
     let trunk = repo.resolve_commit("main@upstream").expect("trunk");
