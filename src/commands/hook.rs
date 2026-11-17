@@ -57,7 +57,7 @@ const WATCHDOG_DEADLINE_CEILING_MS: u64 = 600_000;
 /// End this process at a wall-clock deadline, whatever it is blocked on.
 ///
 /// Harnesses spawn `knives hook` with a piped stdin and can abandon the handler
-/// that would write it, leaving the process parked in its stdin read forever.
+/// that would write it, leaving the process blocked in its stdin read forever.
 /// On 2026-08-25 a loaded devbox leaked one such immortal process per agent
 /// tool call until ~13k concurrent `knives` processes took the machine down.
 /// Dying loudly bounds every invocation's lifetime no matter which harness

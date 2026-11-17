@@ -98,8 +98,8 @@ pub fn appended() -> bool {
 /// Who put an entry there.
 ///
 /// Two values, not three. The question a reader asks is whether a machine
-/// observed this or an agent asserted it; a supersession or a parking arrives as
-/// an event through `finish --superseded-by` and `start --why`, and everything an
+/// observed this or an agent asserted it; a supersession or the owner's decision to stop the work
+/// arrives as an event through `finish --superseded-by` and `start --why`, and everything an
 /// agent asserts is a note. Asking a writing agent to grade its own entry as
 /// judgment-versus-note is a decision with no read-time payoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

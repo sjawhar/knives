@@ -1453,7 +1453,7 @@ impl Repo {
 
     /// Why `commit` must not be abandoned because something rests on it, or
     /// `None` when nothing does: a workspace has it checked out, or it has any
-    /// visible descendant, a working copy parked on it included whether it is
+    /// visible descendant, a working copy that sits on it included whether it is
     /// empty or not. Abandoning a commit rebases whatever rests on it onto its
     /// parents. For a working copy that is a rewrite from outside its
     /// workspace, which can leave the workspace stale, and on a release merge's
@@ -2613,8 +2613,8 @@ fn command_or_none(result: Result<String, JjError>) -> Result<Option<String>, Jj
 /// Sound only because every future polled here resolves without suspending:
 /// jj-lib's default store, index and working-copy implementations are
 /// synchronous behind async signatures (as of 0.45.1, `Index::is_ancestor`
-/// and `common_ancestors` included). A future that genuinely parked on a
-/// wakeup would spin here forever, since the noop waker never fires. Re-check
+/// and `common_ancestors` included). A future that genuinely waited for a
+/// wakeup (returned `Pending`) would spin here forever, since the noop waker never fires. Re-check
 /// this on every jj-lib bump; the day it stops holding, replace with a real
 /// executor such as `pollster`.
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -2740,7 +2740,7 @@ pub struct ReplacedRelease {
 /// composition stayed exactly as it was.
 ///
 /// Never touches a working copy. The porcelain this replaces (`jj new
-/// --no-edit`, `jj duplicate`) parked whoever was working in the default
+/// --no-edit`, `jj duplicate`) moved the working copy of whoever was working in the default
 /// workspace on top of the release merge unless flagged off; a jj-lib write
 /// cannot make that mistake, and it reports the created commit directly
 /// instead of through parsed human-facing output.
@@ -3105,8 +3105,8 @@ pub fn abandon_unheld_writes(
 ///
 /// It stays for a bookmark or tag on it, local or on any remote
 /// ([`names_of`]); for anything that rests on it ([`Repo::what_rests_on`]: a
-/// workspace with it checked out, or any visible descendant, a parked working
-/// copy included); or for anything jj's default rule pins
+/// workspace with it checked out, or any visible descendant, a working
+/// copy that sits on it included); or for anything jj's default rule pins
 /// ([`assert_mutable`]). A commit someone else can still reach by name is
 /// theirs to keep.
 fn what_keeps(
@@ -3861,7 +3861,7 @@ fn assert_mutable(
 
 /// Publish one mutation as ONE described operation.
 ///
-/// Descendants are rebased first (bookmarks and parked working copies follow
+/// Descendants are rebased first (bookmarks and the working copies that sit on commits follow
 /// their rewritten commits, as under the CLI), the git refs are exported so
 /// `git` and `gh` in a colocated checkout see the result immediately rather
 /// than at someone's next jj command, and the transaction commits under

@@ -537,7 +537,7 @@ pub fn cut_keepers(
 /// Commits the recut would strand: reachable from the previous release or its
 /// local descendants, and from no keeper.
 ///
-/// Keepers are [`cut_keepers`]. The previous cut itself, parked working copies,
+/// Keepers are [`cut_keepers`]. The previous cut itself, empty, undescribed working copies,
 /// and commits identified by our strict dated release bookmarks are excluded as
 /// release machinery, not work. A legacy commit that only *describes* itself
 /// like release machinery is deliberately reported: refusing it is safer than
@@ -708,7 +708,7 @@ pub struct ReapReport {
 /// What rests on a cut is stacked work (#4's third loss mode), or a workspace's
 /// working copy on it or above it, empty or not. Abandoning the cut would
 /// rebase each of them onto the cut's parents: stacked work can come out
-/// conflicted, and a parked working copy becomes a fresh merge of the members,
+/// conflicted, and a working copy that sits on the cut becomes a fresh merge of the members,
 /// conflicted where the cut had resolved them, rewritten from outside its
 /// workspace, which can be left stale. The kept name keeps its refs, so a later
 /// reap retires it once nothing rests on it: jj drops an empty, undescribed
