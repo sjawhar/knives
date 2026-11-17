@@ -144,7 +144,7 @@ fn change_of(lab: &Lab, commit: &CommitId) -> ChangeId {
 }
 
 /// Step the working copy off every member and release onto an empty child
-/// of the trunk, so that no ref the lab's branch helper left keeps them.
+/// of the trunk, so that no working copy the lab's branch helper left sits on them.
 fn step_off_onto_trunk(lab: &Lab) {
     lab.jj_work(["new", "main@origin"]);
 }

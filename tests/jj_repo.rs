@@ -812,7 +812,7 @@ fn diff_git_reads_a_branch_adding_a_latin_1_file() {
 #[test]
 fn cutting_a_release_does_not_move_another_agents_working_copy() {
     // Reproduction of a defect found in review. `create_merge` used `jj new`,
-    // which moves `@`, so cutting a release moved whoever was working in the
+    // which moves `@`, so cutting a release moved the working copy of whoever was working in the
     // repo's default workspace on top of the release octopus with their
     // uncommitted edits pending against it. That is verbatim the accident
     // `knives start` exists to prevent, caused by `knives release`.

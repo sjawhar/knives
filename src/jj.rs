@@ -3861,7 +3861,7 @@ fn assert_mutable(
 
 /// Publish one mutation as ONE described operation.
 ///
-/// Descendants are rebased first (bookmarks and the working copies that sit on commits follow
+/// Descendants are rebased first (bookmarks and working copies follow
 /// their rewritten commits, as under the CLI), the git refs are exported so
 /// `git` and `gh` in a colocated checkout see the result immediately rather
 /// than at someone's next jj command, and the transaction commits under

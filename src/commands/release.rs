@@ -537,7 +537,7 @@ pub fn cut_keepers(
 /// Commits the recut would strand: reachable from the previous release or its
 /// local descendants, and from no keeper.
 ///
-/// Keepers are [`cut_keepers`]. The previous cut itself, empty, undescribed working copies,
+/// Keepers are [`cut_keepers`]. The previous cut itself, empty undescribed working copies,
 /// and commits identified by our strict dated release bookmarks are excluded as
 /// release machinery, not work. A legacy commit that only *describes* itself
 /// like release machinery is deliberately reported: refusing it is safer than
