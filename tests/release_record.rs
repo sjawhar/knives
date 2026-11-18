@@ -4,13 +4,16 @@
 //!
 //! The record is the cut event a knives cut writes, so `adopt`, the edit
 //! verbs and another machine's `audit` read the release as recorded. Refused,
-//! writing nothing: a conflicted commit, a name that sorts before a release
-//! the series already holds or records, and a release made as merges on its
-//! previous release outside a stacked series. The same commit recorded again
-//! writes nothing. In a stacked series a chain of merges, one member each,
-//! records its previous release and the side parents on its first-parent
-//! line, and an edit of it, or a member rewritten in place under it, keeps
-//! what its inner merges resolved.
+//! writing nothing: a conflicted commit, a commit that shares no history with
+//! the trunk, one that merges no member, a name that sorts before a release
+//! the series already holds or records, a change no member explains, and a
+//! release made as merges on its previous release outside a stacked series.
+//! A parent the trunk holds is never a member. The same commit recorded
+//! again writes nothing, and records of one name run at once take turns. In
+//! a stacked series a chain of merges, one member each, records its previous
+//! release and the side parents on its first-parent line, and an edit of it,
+//! or a member rewritten in place under it, keeps what its inner merges
+//! resolved.
 
 #![allow(
     clippy::expect_used,
@@ -24,7 +27,7 @@ mod lab;
 
 use std::fs::{File, TryLockError};
 use std::path::Path;
-use std::process::Output;
+use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
 
 use knives::ids::CommitId;
@@ -90,12 +93,15 @@ fn commit_of(lab: &Lab, revision: &str) -> CommitId {
 
 /// `feat/alpha` and `feat/beta` on the trunk, merged by hand as
 /// [`RELEASE`] and pushed to the publish remote: a release no knives cut
-/// wrote, which the ledger does not record.
+/// wrote, which the ledger does not record. It is what a release is, a flat
+/// merge of its members, with no trunk parent.
 fn hand_cut_lab() -> (Lab, tempfile::TempDir) {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
-    lab.octopus(RELEASE, "feat/alpha", "feat/beta");
+    lab.jj_work(["new", "-r", "feat/alpha", "-r", "feat/beta", "-m", RELEASE]);
+    lab.jj_work(["bookmark", "create", RELEASE, "-r", "@"]);
+    lab.jj_work(["new"]);
     lab.push_branch(RELEASE);
     let (home, _consumer) = release_test_home(&lab);
     (lab, home)
@@ -415,6 +421,253 @@ fn a_change_no_member_explains_is_refused_outside_a_stacked_series() {
     assert_eq!(bookmarks(&lab), refs, "{out}");
 }
 
+#[test]
+fn a_hand_merge_from_the_trunk_records_only_its_branches() {
+    // Given: a release merged by hand from the trunk, as `git merge` makes
+    // one there: its parents are the trunk, then two branches.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.jj_work([
+        "new",
+        "-r",
+        "main@upstream",
+        "-r",
+        "feat/alpha",
+        "-r",
+        "feat/beta",
+        "-m",
+        "merged by hand from the trunk",
+    ]);
+    lab.jj_work(["new"]);
+    let commit = commit_of(&lab, "@-");
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: it is recorded.
+    let recorded = record(&lab, &home, RELEASE, &commit);
+
+    // Then: it exits 0, and the cut event records exactly the two branches:
+    // a parent the trunk holds is never a member.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(0), "{out}");
+    let event = newest_event(&home, RELEASE);
+    let members = [commit_at(&lab, "feat/alpha"), commit_at(&lab, "feat/beta")];
+    let mut evidence = vec![commit.as_str().to_owned()];
+    evidence.extend(members.iter().map(|member| member.as_str().to_owned()));
+    assert_eq!(event.evidence, evidence, "{event:?}");
+    let parents: Vec<&str> = event
+        .parents
+        .iter()
+        .map(|parent| parent.commit.as_str())
+        .collect();
+    assert_eq!(
+        parents,
+        members.each_ref().map(CommitId::as_str),
+        "{event:?}"
+    );
+    assert!(event.text.contains(" with 2 parent(s): "), "{event:?}");
+}
+
+#[test]
+fn a_commit_that_merges_no_member_is_refused() {
+    // Given: a one-commit branch on the trunk, given as the release: its one
+    // parent is the trunk, which is never a member.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let commit = commit_at(&lab, "feat/alpha");
+    let (home, _consumer) = release_test_home(&lab);
+    let (entries, refs) = (ledger_entries(&home), bookmarks(&lab));
+
+    // When: it is recorded as the series' release.
+    let recorded = record(&lab, &home, RELEASE, &commit);
+
+    // Then: it is refused, saying it merges no member, and nothing is
+    // written.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "refusing to record {RELEASE} at {}: it merges no member",
+            commit.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+    assert_eq!(bookmarks(&lab), refs, "{out}");
+}
+
+#[test]
+fn a_hand_merge_on_the_previous_release_is_refused_outside_a_stacked_series() {
+    // Given: RELEASE recorded, then the next release merged by hand of
+    // RELEASE itself and one more branch.
+    let (lab, home) = hand_cut_lab();
+    let previous = commit_at(&lab, RELEASE);
+    let first = record(&lab, &home, RELEASE, &previous);
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first));
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    lab.jj_work([
+        "new",
+        "-r",
+        RELEASE,
+        "-r",
+        "feat/gamma",
+        "-m",
+        "the next release, made on the last",
+    ]);
+    lab.jj_work(["new"]);
+    let commit = commit_of(&lab, "@-");
+    let (entries, refs) = (ledger_entries(&home), bookmarks(&lab));
+
+    // When: it is recorded.
+    let recorded = record(&lab, &home, "release/2026-08-05", &commit);
+
+    // Then: it is refused, naming the previous release as never a member
+    // and the setting that reads a release made on it, and nothing is
+    // written.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "its parent {} is {RELEASE}, the series' previous release, which is never a member",
+            previous.short()
+        )),
+        "{out}"
+    );
+    assert!(out.contains("the default series has no table"), "{out}");
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+    assert_eq!(bookmarks(&lab), refs, "{out}");
+}
+
+/// The events the ledger records about `name`.
+fn events_about(home: &tempfile::TempDir, name: &str) -> Vec<Entry> {
+    ledger_entries(home)
+        .into_iter()
+        .filter(|entry| entry.kind == Kind::Event && entry.subject.as_deref() == Some(name))
+        .collect()
+}
+
+/// `knives release cut <name> --at <commit>` for each of `commits`, every
+/// one started before any is waited for, each run to its end.
+fn records_at_once(
+    lab: &Lab,
+    home: &tempfile::TempDir,
+    name: &str,
+    commits: &[&CommitId],
+) -> Vec<Output> {
+    // Every process starts before the first is waited for.
+    let mut running = Vec::with_capacity(commits.len());
+    for commit in commits {
+        running.push(
+            lab::release_command(
+                lab,
+                home,
+                lab::ReleaseOutput::Text,
+                &["cut", name, "--at", commit.as_str()],
+            )
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start knives release cut --at"),
+        );
+    }
+    running
+        .into_iter()
+        .map(|child| child.wait_with_output().expect("wait for knives release"))
+        .collect()
+}
+
+#[test]
+fn three_records_of_one_name_at_once_write_one_event() {
+    // Given: a release merged by hand and pushed, which the ledger does not
+    // record.
+    let (lab, home) = hand_cut_lab();
+    let commit = commit_at(&lab, RELEASE);
+    let entries = ledger_entries(&home);
+
+    // When: three processes record it under its name at once.
+    let outputs = records_at_once(&lab, &home, RELEASE, &[&commit, &commit, &commit]);
+
+    // Then: each exits 0, the ledger gains exactly one entry, the one cut
+    // event, and the other two say the name is already recorded: each
+    // record reads the ledger only once the one before it is done.
+    let out: String = outputs.iter().map(text).collect();
+    for output in &outputs {
+        assert_eq!(output.status.code(), Some(0), "{out}");
+    }
+    assert_eq!(ledger_entries(&home).len(), entries.len() + 1, "{out}");
+    let events = events_about(&home, RELEASE);
+    assert_eq!(events.len(), 1, "{out}");
+    assert_eq!(
+        events[0].evidence.first().map(String::as_str),
+        Some(commit.as_str()),
+        "{out}"
+    );
+    let repeats = outputs
+        .iter()
+        .filter(|output| text(output).contains("is already recorded"))
+        .count();
+    assert_eq!(repeats, 2, "{out}");
+}
+
+#[test]
+fn a_record_of_a_recorded_name_at_another_commit_is_refused_naming_the_recorded_one() {
+    // Given: two releases merged by hand, which no ref names: one of two
+    // branches, and one of those and a third.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    lab.jj_work(["new", "-r", "feat/alpha", "-r", "feat/beta", "-m", "two"]);
+    lab.jj_work(["new"]);
+    let two = commit_of(&lab, "@-");
+    lab.jj_work([
+        "new",
+        "-r",
+        "feat/alpha",
+        "-r",
+        "feat/beta",
+        "-r",
+        "feat/gamma",
+        "-m",
+        "three",
+    ]);
+    lab.jj_work(["new"]);
+    let three = commit_of(&lab, "@-");
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: each is recorded under one name, both at once.
+    let outputs = records_at_once(&lab, &home, RELEASE, &[&two, &three]);
+
+    // Then: the ledger records the name once, at the commit of the record
+    // that ran first, which exits 0.
+    let out: String = outputs.iter().map(text).collect();
+    let events = events_about(&home, RELEASE);
+    assert_eq!(events.len(), 1, "{out}");
+    let recorded = events[0]
+        .evidence
+        .first()
+        .cloned()
+        .expect("a recorded commit");
+    let (first, second) = if recorded == two.as_str() {
+        (&outputs[0], &outputs[1])
+    } else {
+        assert_eq!(recorded, three.as_str(), "{out}");
+        (&outputs[1], &outputs[0])
+    };
+    assert_eq!(first.status.code(), Some(0), "{out}");
+    assert_eq!(commit_at(&lab, RELEASE).as_str(), recorded, "{out}");
+
+    // And: the other is refused, exit 3, naming the recorded commit.
+    assert_eq!(second.status.code(), Some(3), "{out}");
+    assert!(
+        text(second).contains(&format!(
+            "the ledger already records {RELEASE}, newest as the recorded cut {}",
+            CommitId::new(recorded.as_str()).short()
+        )),
+        "{out}"
+    );
+}
+
 /// A lab whose upstream carries a second base, `old`, split from `main`.
 fn two_base_lab() -> Lab {
     let lab = Lab::new();
@@ -685,6 +938,39 @@ fn a_recorded_chain_whose_member_is_rewritten_in_place_reads_as_recorded() {
     let out = text(&include);
     assert_eq!(include.status.code(), Some(0), "{out}");
     assert_eq!(file_at_revision(&lab, NEXT, "lines.txt"), RESOLVED);
+}
+
+#[test]
+fn a_start_commit_on_the_previous_release_is_recorded_with_no_member() {
+    // Given: a stacked series' published first cut, and a commit made on it
+    // by hand with its tree, the start of the next release, which merges no
+    // member yet.
+    let (lab, home) = previous_release_lab(true);
+    lab.jj_work(["new", "-r", PREVIOUS, "-m", NEXT]);
+    lab.jj_work(["new"]);
+    let (commit, previous) = (commit_of(&lab, "@-"), commit_at(&lab, PREVIOUS));
+
+    // When: it is recorded as the next release.
+    let recorded = record_in_series(&lab, &home, NEXT, commit.as_str());
+
+    // Then: it exits 0, and the event records the previous release under
+    // its label and no member: a start commit is a release with none.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(0), "{out}");
+    let event = newest_event(&home, NEXT);
+    assert_eq!(
+        event.evidence,
+        vec![commit.as_str().to_owned(), previous.as_str().to_owned()],
+        "{event:?}"
+    );
+    assert_eq!(
+        event.parents,
+        vec![RecordedParent {
+            commit: previous.as_str().to_owned(),
+            branches: vec![format!("{PREVIOUS} previous release (not a member)")],
+        }],
+        "{event:?}"
+    );
 }
 
 /// The forge repository the lab fork's upstream is reached by in the

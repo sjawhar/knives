@@ -15,8 +15,8 @@ use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, 
 use knives::ledger::{Draft, Ledger, inline_human_text, problem_human_text};
 use knives::release_model::{
     EarlierWrites, PreviousRelease, RecordedCut, StackedHistoryContext, carried_branches,
-    last_series_cut, members_event_text, previous_release_for_cut, previous_release_label,
-    series_members, trunk_positions,
+    last_series_cut, members_event_text, previous_release_for_cut, previous_release_for_record,
+    previous_release_label, series_members, trunk_positions, trunk_positions_in, trunk_reaches,
 };
 
 use super::release_edit::{
@@ -337,6 +337,7 @@ pub(crate) fn run_release(
                             trunk: &audit_base,
                         },
                         stacked_on: None,
+                        drift_from: previous_commit.as_ref(),
                         carried_from,
                     };
                     let checked =
@@ -400,6 +401,7 @@ pub(crate) fn run_release(
                     trunk: &audit_base,
                 },
                 previous_commit.as_ref().filter(|_| entry.stacked()),
+                previous_commit.as_ref(),
             ),
         )?;
         if let Some(exit) = report_cut_audit(repo, &audit, carried_from) {
@@ -851,9 +853,9 @@ struct CompletedCut<'a> {
     /// --at` records: its event says so ([`RECORDED_OUTSIDE`]).
     outside: bool,
     /// What the event records as the cut's composition when the caller read
-    /// it already: a release of a stacked series cut outside knives
-    /// ([`hand_cut_composition`]). `None` reads it from the commit
-    /// ([`cut_composition`]).
+    /// it already: a release cut outside knives, whose reading leaves out
+    /// every parent the trunk holds ([`hand_cut_composition`]). `None` reads
+    /// it from the commit ([`cut_composition`]).
     composition: Option<&'a [(String, CommitId)]>,
 }
 
@@ -999,6 +1001,9 @@ struct CommittedCut<'a> {
     /// The previous release a release of a stacked series stacks on, which
     /// the audit measures each member from ([`release::audit_cut_from`]).
     stacked_on: Option<&'a CommitId>,
+    /// The release the commit follows, which the audit measures its drift
+    /// from; `None` runs no drift check ([`release::audit_cut_from`]).
+    drift_from: Option<&'a CommitId>,
     carried_from: release::CarriedFrom,
 }
 
@@ -1021,7 +1026,7 @@ fn checked_committed_cut(
         gate.path,
         cut.members,
         release::CutSubject::Committed(cut.commit),
-        (cut.context, cut.stacked_on),
+        (cut.context, cut.stacked_on, cut.drift_from),
     )?;
     if let Some(exit) = report_cut_audit(repo, &audit, cut.carried_from) {
         return Ok(Err(exit));
@@ -1046,9 +1051,15 @@ fn checked_committed_cut(
 /// [`release_plan_exit`]), and the commit and its name here
 /// ([`hand_cut_gates`]). Its members are its series' reading of it
 /// ([`hand_cut_composition`]), audited and held against the previous cut's
-/// record as every cut is ([`checked_committed_cut`]). Each refusal writes
-/// nothing. Only then is the local bookmark made, where no ref of the name
-/// exists, and the event recorded, which starts the background ledger sweep.
+/// record as every cut is ([`checked_committed_cut`]). The audit replays each
+/// member and each parent the trunk holds, and measures the drift from the
+/// release the record follows: the previous release a stacked one stacks
+/// on, else the newest other release of the series, as a cut's audit
+/// measures it ([`previous_release_for_record`]). A first record has none,
+/// and no drift check runs, as for a first cut: it is the release every
+/// later record's drift is measured from. Each refusal writes nothing. Only
+/// then is the local bookmark made, where no ref of the name exists, and the
+/// event recorded, which starts the background ledger sweep.
 fn record_hand_cut(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
@@ -1059,18 +1070,23 @@ fn record_hand_cut(
     // The pulled plan refused on any problem this read finds.
     let ledger = Ledger::for_fork(fork).read()?.entries;
     let tips = opened.bookmark_tips()?;
-    let held = match hand_cut_gates((fork, opened), (name, at), (&ledger, &tips))? {
+    let trunk = opened.resolve_commit(&entry.trunk_ref())?;
+    let held = match hand_cut_gates((fork, opened), (name, at), (&ledger, &tips), &trunk)? {
         Ok(held) => held,
         Err(exit) => return Ok(exit),
     };
     let commit = &held.commit;
     let writes = EarlierWrites::read(opened, name, &ledger, held.published.as_ref())?;
-    let trunk = opened.resolve_commit(&entry.trunk_ref())?;
-    let composed =
-        match hand_cut_composition((fork, opened), (name, commit), (&ledger, &writes), &trunk)? {
-            Ok(composed) => composed,
-            Err(exit) => return Ok(exit),
-        };
+    let follows = previous_release_for_record(entry, &tips, name);
+    let composed = match hand_cut_composition(
+        (fork, opened),
+        (name, commit),
+        (&ledger, &writes),
+        (&tips, &trunk, follows.as_ref()),
+    )? {
+        Ok(composed) => composed,
+        Err(exit) => return Ok(exit),
+    };
     let parents = opened.parent_commits(commit.as_str())?;
     let gate = CompositionGate {
         ledger: Ledger::for_fork(fork),
@@ -1082,16 +1098,26 @@ fn record_hand_cut(
         trunk: &trunk,
         tips: &tips,
     };
+    // A parent the trunk holds is no member, but the release holds its
+    // content: it is replayed, and its files explain drift, as a member's.
+    let audited: Vec<(String, CommitId)> = composed
+        .members
+        .iter()
+        .chain(&composed.bases)
+        .cloned()
+        .collect();
+    let stacked_on = composed.previous.as_ref().map(|previous| &previous.commit);
     let committed = CommittedCut {
         commit,
-        members: &composed.members,
-        // Measured against no earlier release: a member this commit lacks
-        // is missing, however the commit came to drop it.
+        members: &audited,
+        // Nothing is carried from an earlier release: a member this commit
+        // lacks is missing, however the commit came to drop it.
         context: release::AuditContext {
             previous: None,
             trunk: &composed.base,
         },
-        stacked_on: composed.previous.as_ref().map(|previous| &previous.commit),
+        stacked_on,
+        drift_from: stacked_on.or_else(|| follows.as_ref().map(|(_, previous)| previous)),
         carried_from: release::CarriedFrom::Unledgered,
     };
     let checked = match checked_committed_cut(repo, &committed, (&gate, allow_drop))? {
@@ -1101,23 +1127,20 @@ fn record_hand_cut(
     if !held.named {
         knives::jj::set_bookmark(&fork.checkout.path, name, commit.as_str())?;
     }
-    // A stacked series records the reading made above, its previous release
-    // first under its label ([`composition_sources`]); any other series
-    // records the commit's own parents, carriers included
-    // ([`cut_composition`]).
-    let composition: Option<Vec<(String, CommitId)>> = entry.stacked().then(|| {
-        composed
-            .previous
-            .iter()
-            .map(|previous| {
-                (
-                    previous_release_label(&previous.name),
-                    previous.commit.clone(),
-                )
-            })
-            .chain(composed.members.iter().cloned())
-            .collect()
-    });
+    // The event records the reading made above: a stacked release's
+    // previous release first, under its label ([`composition_sources`]),
+    // then the members, never a parent the trunk holds.
+    let composition: Vec<(String, CommitId)> = composed
+        .previous
+        .iter()
+        .map(|previous| {
+            (
+                previous_release_label(&previous.name),
+                previous.commit.clone(),
+            )
+        })
+        .chain(composed.members.iter().cloned())
+        .collect();
     record_cut_event(
         fork,
         &CompletedCut {
@@ -1133,7 +1156,7 @@ fn record_hand_cut(
             unions: &[],
             unchecked: "",
             outside: true,
-            composition: composition.as_deref(),
+            composition: Some(&composition),
         },
         bound,
     )?;
@@ -1162,18 +1185,22 @@ struct HandCutAt {
 }
 
 /// The gates of `cut NAME --at REV` after the name's and the plan's, in this
-/// order, each refusal writing nothing and exiting 3: REV is one commit,
-/// finished ([`super::release_adopt::refuse_unfinished_commit`]); a recorded
-/// write of the name is REV, which is already the record (exit 0), or
-/// `adopt`'s to replace ([`refuse_recorded_name`]); the name sorts after
-/// every other release of the series ([`newer_release`]); each ref of the
-/// name names REV ([`name_refs`]); a published name is one the publish
-/// remote holds ([`release::published_hand_edit_refusal`]). `Err` is the
-/// exit, after saying why.
+/// order, each refusal writing nothing and exiting 3: REV is one commit that
+/// shares history with `trunk` ([`knives::jj::Repo::shares_history`]: the
+/// root commit, or a commit made on it apart from the trunk, holds none of
+/// the series' base), finished
+/// ([`super::release_adopt::refuse_unfinished_commit`]); a recorded write of
+/// the name is REV, which is already the record (exit 0), or `adopt`'s to
+/// replace ([`refuse_recorded_name`]); the name sorts after every other
+/// release of the series ([`newer_release`]); each ref of the name names
+/// REV ([`name_refs`]); a published name is one the publish remote holds
+/// ([`release::published_hand_edit_refusal`]). `Err` is the exit, after
+/// saying why.
 fn hand_cut_gates(
     (fork, opened): (&Fork<'_>, &knives::jj::Repo),
     (name, at): (&str, &str),
     (ledger, tips): (&[knives::ledger::Entry], &knives::detect::BookmarkTips),
+    trunk: &CommitId,
 ) -> anyhow::Result<Result<HandCutAt, Exit>> {
     let (repo, entry) = (&fork.name, fork.entry);
     let shown = inline_human_text(name);
@@ -1188,6 +1215,16 @@ fn hand_cut_gates(
             return Ok(Err(Exit::Incomplete));
         }
     };
+    if !opened.shares_history(&commit, trunk)? {
+        // The trunk is a registry value, like every other, and not escaped.
+        println!(
+            "{repo}: refusing to record {shown} at {}: it shares no history with the trunk {}: \
+             no commit but the root is an ancestor of both, so it is no release of the series",
+            commit.short(),
+            entry.trunk_ref()
+        );
+        return Ok(Err(Exit::Incomplete));
+    }
     if super::release_adopt::refuse_unfinished_commit(
         repo,
         opened,
@@ -1375,6 +1412,10 @@ struct HandCut {
     previous: Option<PreviousRelease>,
     /// Each member with where it came from ([`release::parent_sources`]).
     members: Vec<(String, CommitId)>,
+    /// Each parent of the reading that the trunk holds, with where it came
+    /// from: never a member ([`trunk_reaches`]), but content the release
+    /// holds all the same.
+    bases: Vec<(String, CommitId)>,
     /// What the audit replays each member from and the composition gate's
     /// base: the previous release, or the trunk's fork point with the
     /// members, as for a first cut.
@@ -1384,17 +1425,25 @@ struct HandCut {
 /// The members of `commit`, a release cut outside knives, as its series
 /// reads it ([`release::release_reading`]), or the exit after refusing it.
 ///
-/// A stacked series that has a previous release reads it as that release
-/// and the side parents on its first-parent line, and refuses it when that
-/// line holds a one-parent commit. Otherwise its members are its parents,
-/// its carriers left out, and a member that carries a merge past the trunk
-/// refuses it: only a stacked series reads a release made as merges on its
-/// previous release ([`stacked_record_remedy`]).
+/// A parent the trunk holds, which a trunk position reaches, is never a
+/// member: it is one of the reading's bases. A stacked series that has a
+/// previous release reads `commit` as that release and the side parents on
+/// its first-parent line, and refuses it when that line holds a one-parent
+/// commit; a start commit on that release is a release with no member.
+/// Otherwise its members are its parents, its carriers left out, and it is
+/// refused when it merges no member, when a member is `follows`, the
+/// series' previous release, which is never a member either, or when a
+/// member carries a merge past the trunk: only a stacked series reads a
+/// release made on its previous release ([`stacked_record_remedy`]).
 fn hand_cut_composition(
     (fork, opened): (&Fork<'_>, &knives::jj::Repo),
     (name, commit): (&str, &CommitId),
     (ledger, writes): (&[knives::ledger::Entry], &EarlierWrites),
-    trunk: &CommitId,
+    (tips, trunk, follows): (
+        &knives::detect::BookmarkTips,
+        &CommitId,
+        Option<&(BookmarkRef, CommitId)>,
+    ),
 ) -> anyhow::Result<Result<HandCut, Exit>> {
     let (repo, entry) = (&fork.name, fork.entry);
     let (shown, at) = (inline_human_text(name), commit.short());
@@ -1409,14 +1458,45 @@ fn hand_cut_composition(
             return Ok(Err(Exit::Incomplete));
         }
     };
-    let members =
-        release::parent_sources(opened, entry, &entry.release_scheme(), &reading.members)?;
+    let trunks = trunk_positions_in(tips, entry);
+    let (mut members, mut bases) = (Vec::new(), Vec::new());
+    for sourced in
+        release::parent_sources(opened, entry, &entry.release_scheme(), &reading.members)?
+    {
+        if trunk_reaches(opened, &trunks, &sourced.1)? {
+            bases.push(sourced);
+        } else {
+            members.push(sourced);
+        }
+    }
     if let Some(previous) = reading.previous {
         return Ok(Ok(HandCut {
             base: previous.commit.clone(),
             previous: Some(previous),
             members,
+            bases,
         }));
+    }
+    if members.is_empty() {
+        println!(
+            "{repo}: refusing to record {shown} at {at}: it merges no member: a parent the trunk \
+             holds is never a member, and it has no other parent; a release merges the series' \
+             branches"
+        );
+        return Ok(Err(Exit::Incomplete));
+    }
+    if let Some((previous, previous_commit)) =
+        follows.filter(|(_, previous)| members.iter().any(|(_, member)| member == previous))
+    {
+        // The previous release is a ref read from the repository.
+        println!(
+            "{repo}: refusing to record {shown} at {at}: its parent {} is {}, the series' \
+             previous release, which is never a member; {}",
+            previous_commit.short(),
+            inline_human_text(previous.branch().as_str()),
+            previous_parent_remedy(fork)
+        );
+        return Ok(Err(Exit::Incomplete));
     }
     let stacked = stacked_branches(opened, entry, &members)?;
     if !stacked.is_empty() {
@@ -1429,11 +1509,12 @@ fn hand_cut_composition(
         );
         return Ok(Err(Exit::Incomplete));
     }
-    let tips: Vec<CommitId> = members.iter().map(|(_, tip)| tip.clone()).collect();
-    let base = opened.fork_point_of(&tips, trunk)?;
+    let member_tips: Vec<CommitId> = members.iter().map(|(_, tip)| tip.clone()).collect();
+    let base = opened.fork_point_of(&member_tips, trunk)?;
     Ok(Ok(HandCut {
         previous: None,
         members,
+        bases,
         base,
     }))
 }
@@ -1441,13 +1522,36 @@ fn hand_cut_composition(
 /// Why a release cut outside knives whose member carries a merge past the
 /// trunk is refused, and what records it.
 fn stacked_record_remedy(fork: &Fork<'_>) -> String {
-    let entry = fork.entry;
-    if entry.stacked() {
+    if fork.entry.stacked() {
         return "no previous release of the series is on its first-parent line, so it reads as \
                 the series' first cut, which is flat; rebase each member above off the trunk"
             .to_owned();
     }
-    let setting = entry.selected_series.as_ref().map_or_else(
+    format!(
+        "a member above stacks on an earlier merge, as a release made as merges on its previous \
+         release does; {}, or rebase each member off the trunk",
+        stacked_setting(fork)
+    )
+}
+
+/// Why a release cut outside knives that merges its series' previous
+/// release as a member is refused, and what records it.
+fn previous_parent_remedy(fork: &Fork<'_>) -> String {
+    if fork.entry.stacked() {
+        return "a release of a stacked series has its previous release as its first parent, so \
+                make it the first one"
+            .to_owned();
+    }
+    format!(
+        "such a release is made on its previous release, and {}",
+        stacked_setting(fork)
+    )
+}
+
+/// Which series reads a release made as merges on its previous release,
+/// for a series without the `stacked = true` setting: the setting to make.
+fn stacked_setting(fork: &Fork<'_>) -> String {
+    fork.entry.selected_series.as_ref().map_or_else(
         || {
             "only a named series whose table sets `stacked = true` reads one, and the default \
              series has no table; record it in such a series"
@@ -1460,10 +1564,6 @@ fn stacked_record_remedy(fork: &Fork<'_>) -> String {
                 fork.name
             )
         },
-    );
-    format!(
-        "a member above stacks on an earlier merge, as a release made as merges on its previous \
-         release does; {setting}, or rebase each member off the trunk"
     )
 }
 

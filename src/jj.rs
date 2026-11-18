@@ -946,6 +946,26 @@ impl Repo {
         }
     }
 
+    /// Whether `commit` and `tip` share history: some commit other than the
+    /// root commit, which every commit descends from, is an ancestor of both.
+    /// The root commit shares none with any commit, and neither does a
+    /// commit made on the root apart from `tip`'s line.
+    pub fn shares_history(&self, commit: &CommitId, tip: &CommitId) -> Result<bool, JjError> {
+        let commit = self.commit(commit.as_str())?.id().clone();
+        let tip = self.commit(tip.as_str())?.id().clone();
+        let common = block_on(
+            self.repo
+                .index()
+                .common_ancestors(std::slice::from_ref(&commit), std::slice::from_ref(&tip)),
+        )
+        .map_err(|error| JjError::Revision {
+            revision: commit.to_string(),
+            detail: error.to_string(),
+        })?;
+        let root = self.repo.store().root_commit_id();
+        Ok(common.iter().any(|ancestor| ancestor != root))
+    }
+
     /// Bookmarks whose history includes `commit`, excluding any pointing exactly at it.
     ///
     /// Answers where work went when it was not merged: a maintainer building their own

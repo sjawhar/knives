@@ -167,6 +167,45 @@ pub const RELEASE_PREFIX: &str = "release/";
 /// ([`CutKey`]).
 pub const CUT_GRAMMAR: &str = "YYYY-MM-DD[.N|-<label>]";
 
+/// Why `segment` cannot be one component of a git ref, by git's
+/// `check-ref-format` rules; `None` when it can.
+///
+/// The one rule for a name knives makes a ref of: a series name, and the
+/// date and label of a dated cut ([`CutKey`]).
+pub fn ref_segment_flaw(segment: &str) -> Option<&'static str> {
+    if segment.starts_with('.') {
+        return Some("it starts with '.'");
+    }
+    if segment.ends_with('.') {
+        return Some("it ends with '.'");
+    }
+    if segment.strip_suffix(".lock").is_some() {
+        return Some("it ends with '.lock'");
+    }
+    if segment.contains("..") {
+        return Some("it contains '..'");
+    }
+    if segment.contains("@{") {
+        return Some("it contains '@{'");
+    }
+    if segment == "@" {
+        return Some("it is '@'");
+    }
+    if segment
+        .chars()
+        .any(|c| c.is_ascii_control() || c == '\u{7f}')
+    {
+        return Some("it contains a control character");
+    }
+    if segment
+        .chars()
+        .any(|c| matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+    {
+        return Some("it contains one of space ~ ^ : ? * [ \\");
+    }
+    None
+}
+
 /// Whether a release reference is one of ours for the configured publishing role.
 ///
 /// Local releases are always ours. Remote releases are ours only when their
@@ -246,13 +285,21 @@ impl ReleaseScheme {
     /// parser of `release/[<series>/]YYYY-MM-DD[.N|-<label>]`.
     ///
     /// `None` for a name the series does not own, for one it owns but cannot
-    /// read, such as `release/9.2/foo`, and always under `Fixed`. Such a name
-    /// is never the newest cut, and the reap never takes it: the reaper
-    /// enumerates release refs on any remote, where upstream's own
-    /// `release/0.3.190` style branches also live, and a prefix test would
-    /// hand those to `bookmark forget`.
+    /// read, such as `release/9.2/foo` or a label git cannot hold in a ref
+    /// ([`Self::ref_flaw`]), and always under `Fixed`. Such a name is never
+    /// the newest cut, and the reap never takes it: the reaper enumerates
+    /// release refs on any remote, where upstream's own `release/0.3.190`
+    /// style branches also live, and a prefix test would hand those to
+    /// `bookmark forget`.
     pub fn cut_key<'a>(&self, name: &'a str) -> Option<CutKey<'a>> {
         CutKey::parse(self.dated_suffix(name)?)
+    }
+
+    /// Why git cannot hold `name`, one of this series' dated cuts in any
+    /// shape, as a ref ([`ref_segment_flaw`] of what follows the series'
+    /// prefix), or `None`.
+    pub fn ref_flaw(&self, name: &str) -> Option<&'static str> {
+        self.dated_suffix(name).and_then(ref_segment_flaw)
     }
 
     /// The name shape this scheme's cuts take, for a message.
@@ -271,6 +318,8 @@ impl ReleaseScheme {
 /// The rest is empty, a same-day counter `.N` (one or more digits), or a
 /// `-<label>` (one or more characters, no `/`): `2026-11-15-speed-8.0.9`
 /// has the rest `-speed-8.0.9`. So `.1.2`, a bare `.` and `.x` do not parse.
+/// Nor does a name git cannot hold as a ref ([`ref_segment_flaw`]), such as
+/// `-x~1`, `-a b` or `-x.lock`: no ref could ever publish it.
 /// Version order reads the rest run by run: a run of digits compares as a
 /// number, any other run as bytes, and a digit run sorts before any other run,
 /// as `sort -V` does. A rest that is a prefix of another sorts first. So
@@ -301,7 +350,7 @@ impl<'a> CutKey<'a> {
             Some((b'-', label)) => !label.is_empty() && !label.contains(&b'/'),
             Some(_) => false,
         };
-        (dated && readable).then_some(Self { date, rest })
+        (dated && readable && ref_segment_flaw(tail).is_none()).then_some(Self { date, rest })
     }
 }
 
@@ -606,6 +655,22 @@ mod tests {
         ] {
             assert_eq!(dated.cut_key(name), None, "{name} has a key");
         }
+        // And: a label git cannot hold in a ref has no key, and says why.
+        for name in [
+            "release/2026-08-05-x~1",
+            "release/2026-08-05-a b",
+            "release/2026-08-05-x.lock",
+            "release/2026-08-05-a..b",
+            "release/2026-08-05-x^",
+            "release/2026-08-05-x?",
+            "release/2026-08-05-x[1]",
+            "release/2026-08-05-x@{1}",
+            "release/2026-08-05-x.",
+        ] {
+            assert_eq!(dated.cut_key(name), None, "{name} has a key");
+            assert!(dated.ref_flaw(name).is_some(), "{name} has no flaw");
+        }
+        assert_eq!(dated.ref_flaw("release/2026-08-05-speed-8.0.9"), None);
         // And: a name the series owns but cannot read is still its own.
         assert!(dated.owns("release/foo"));
     }

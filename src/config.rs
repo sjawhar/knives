@@ -1059,7 +1059,7 @@ fn checked_series(entry: &RepoEntry, path: &Path) -> Result<(), ConfigError> {
                 crate::ids::CUT_GRAMMAR
             )));
         }
-        if let Some(why) = ref_segment_flaw(name) {
+        if let Some(why) = crate::ids::ref_segment_flaw(name) {
             return Err(invalid(format!(
                 "series {name:?} cannot name a git ref ({why}); its cuts are named \
                  {}{name}/{}",
@@ -1100,42 +1100,6 @@ fn checked_series(entry: &RepoEntry, path: &Path) -> Result<(), ConfigError> {
         }
     }
     Ok(())
-}
-
-/// Why `segment` cannot be one component of a git ref, by git's
-/// `check-ref-format` rules; `None` when it can.
-fn ref_segment_flaw(segment: &str) -> Option<&'static str> {
-    if segment.starts_with('.') {
-        return Some("it starts with '.'");
-    }
-    if segment.ends_with('.') {
-        return Some("it ends with '.'");
-    }
-    if segment.strip_suffix(".lock").is_some() {
-        return Some("it ends with '.lock'");
-    }
-    if segment.contains("..") {
-        return Some("it contains '..'");
-    }
-    if segment.contains("@{") {
-        return Some("it contains '@{'");
-    }
-    if segment == "@" {
-        return Some("it is '@'");
-    }
-    if segment
-        .chars()
-        .any(|c| c.is_ascii_control() || c == '\u{7f}')
-    {
-        return Some("it contains a control character");
-    }
-    if segment
-        .chars()
-        .any(|c| matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
-    {
-        return Some("it contains one of space ~ ^ : ? * [ \\");
-    }
-    None
 }
 
 /// A `ledger` names a repository, so it is `<owner>/<name>`, before and after

@@ -275,7 +275,9 @@ pub fn clear_of_series_prefixes(entry: &RepoEntry, name: &str) -> Result<(), Str
 /// `release/9.2/<date>` cut from the default series, would be that series'
 /// newest cut, carrying this series' members. A name the series owns but the
 /// order cannot read, such as `release/9.2/foo`, has no place in the order:
-/// it would never be the newest cut, and the reap would never take it.
+/// it would never be the newest cut, and the reap would never take it. A
+/// label git cannot hold in a ref, such as `-x~1`, is one of those, and the
+/// refusal says why ([`ReleaseScheme::ref_flaw`]): no ref could publish it.
 pub fn cut_name(scheme: &ReleaseScheme, requested: Option<&str>) -> Result<String, String> {
     let example = || {
         scheme
@@ -289,11 +291,23 @@ pub fn cut_name(scheme: &ReleaseScheme, requested: Option<&str>) -> Result<Strin
             Ok(name.to_owned())
         }
         (ReleaseScheme::Dated | ReleaseScheme::Series(_), Some(name)) if scheme.owns(name) => {
-            Err(format!(
-                "{name} is not a name this series can sort; its cuts are named {}, where the \
-                 date is followed by nothing, by `.N` or by `-<label>`, e.g. {}",
-                scheme.cut_shape(),
-                example()
+            Err(scheme.ref_flaw(name).map_or_else(
+                || {
+                    format!(
+                        "{name} is not a name this series can sort; its cuts are named {}, \
+                         where the date is followed by nothing, by `.N` or by `-<label>`, e.g. {}",
+                        scheme.cut_shape(),
+                        example()
+                    )
+                },
+                |why| {
+                    format!(
+                        "{name} cannot name a git ref ({why}); its cuts are named {}, where a \
+                         `-<label>` holds nothing git refuses in a ref name, e.g. {}",
+                        scheme.cut_shape(),
+                        example()
+                    )
+                },
             ))
         }
         (ReleaseScheme::Dated | ReleaseScheme::Series(_), Some(name)) => Err(format!(
@@ -378,6 +392,14 @@ mod scheme_tests {
                 "{name}: {error}"
             );
         }
+        // A label git cannot hold in a ref is refused with the grammar and
+        // the rule it breaks: no ref could ever publish it.
+        let error = cut_name(&old, Some("release/9.2/2026-10-21-x~1")).unwrap_err();
+        assert!(
+            error.contains("cannot name a git ref (it contains one of space ~ ^ : ? * [ \\)")
+                && error.contains("release/9.2/YYYY-MM-DD[.N|-<label>]"),
+            "{error}"
+        );
         // A label is a name of the series: the 9.2 line of the prover fork.
         assert_eq!(
             cut_name(&old, Some("release/9.2/2026-11-15-speed-8.0.9")).unwrap(),
@@ -2466,6 +2488,7 @@ pub fn gather_members(
                     .filter(|member| is_member(member))
                     .map(|member| (member_label(member), member.commit.clone()))
                     .collect();
+                let stacked_on = previous.as_ref().map(|previous| &previous.commit);
                 audit_cut_from(
                     &fork.checkout.path,
                     &members,
@@ -2475,7 +2498,8 @@ pub fn gather_members(
                             previous: None,
                             trunk,
                         },
-                        previous.as_ref().map(|previous| &previous.commit),
+                        stacked_on,
+                        stacked_on,
                     ),
                 )
             })
@@ -3467,8 +3491,8 @@ impl CutSubject<'_> {
 /// the cut silently lacks them. A conflicted replay is inconclusive only when
 /// the cut itself has unresolved conflicts; otherwise its tree diverges from the
 /// member and fails the audit.
-/// Changes from the previous release that no member or trunk explains are
-/// merge-invented drift.
+/// Changes from the previous release (`context.previous`) that no member or
+/// trunk explains are merge-invented drift.
 ///
 /// Auditing a [`CutSubject::Candidate`] reads a merge that no other observer
 /// can see and that a failure simply drops — nothing to compensate, nothing
@@ -3479,24 +3503,31 @@ pub fn audit_cut(
     subject: CutSubject<'_>,
     context: AuditContext<'_>,
 ) -> anyhow::Result<CutAudit> {
-    audit_cut_from(repo, members, subject, (context, None))
+    audit_cut_from(repo, members, subject, (context, None, context.previous))
 }
 
 /// [`audit_cut`], of a release of a stacked series when `stacked_on` is the
-/// previous release it stacks on ([`crate::release_model::read_release`]).
+/// previous release it stacks on ([`crate::release_model::read_release`]),
+/// with its drift measured from `drift_from`.
 ///
 /// Such a release carries its previous release whole, and a member may
 /// stack on it. So each member replays from its fork point with the previous
 /// release, the merge base of the two, not from `trunk`: the previous
-/// release's own content is never charged to a member. The drift is what
-/// changed since the previous release, not since `previous`. The previous
-/// release is no member, and the caller does not list it among `members`.
-/// `None` is [`audit_cut`].
+/// release's own content is never charged to a member. The previous release
+/// is no member, and the caller does not list it among `members`. `None` is
+/// [`audit_cut`].
+///
+/// The drift is what changed since `drift_from`, the release the audited one
+/// follows: a cut's `context.previous`, or the previous release a stacked one
+/// stacks on. It is apart from `context.previous`, what a member's divergence
+/// may be carried from, because a release cut outside knives has a release
+/// it follows but carries nothing forward: a member it lacks is missing.
+/// With no `drift_from` there is no drift check, as for a first cut.
 pub fn audit_cut_from(
     repo: &Path,
     members: &[(String, CommitId)],
     mut subject: CutSubject<'_>,
-    (context, stacked_on): (AuditContext<'_>, Option<&CommitId>),
+    (context, stacked_on, drift_from): (AuditContext<'_>, Option<&CommitId>, Option<&CommitId>),
 ) -> anyhow::Result<CutAudit> {
     let mut audit = CutAudit::default();
     let cut_is_conflicted = !subject.conflicted_files(repo)?.is_empty();
@@ -3540,7 +3571,7 @@ pub fn audit_cut_from(
             }
         }
     }
-    if let Some(previous) = stacked_on.or(context.previous) {
+    if let Some(previous) = drift_from {
         let drifted = subject.changed_files_since(repo, previous)?;
         let mut explained = BTreeSet::new();
         for (_, tip) in members {

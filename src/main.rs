@@ -40,7 +40,7 @@ use knives::forge::github::CliForge;
 use knives::ids::{BranchName, UpstreamName};
 use knives::ledger::{Ledger, Scribe};
 use knives::lock::LockError;
-use knives::store::{Store, StoreError, default_state_path};
+use knives::store::{ForkLock, Store, StoreError, default_state_path};
 use release_adopt::run_release_adopt;
 use release_carries::{run_release_census, run_release_members, run_revision_carries};
 use release_cut::{ReleaseInvocation, run_reap, run_release};
@@ -464,6 +464,12 @@ fn run_audit(
 /// `bound` is the registry and the entry the current directory is inside;
 /// every action pulls the ledger through the registry's destinations, and
 /// one that writes the ledger derives who is acting from both.
+///
+/// Every verb that writes holds its fork's lock ([`ForkLock`]) from before
+/// its first read until its last write, as the fork's claim writers do, so
+/// two writes about one fork take turns: concurrent records of one name
+/// write one event, and each later one reads it. A plan and `members` write
+/// nothing and take no lock.
 #[allow(
     clippy::too_many_arguments,
     reason = "the fork, the action, the extra consumers, the output format and the cwd binding are independent inputs"
@@ -475,6 +481,21 @@ fn dispatch_release(
     output: Output,
     bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
+    let writes = match &action {
+        None | Some(ReleaseAction::Members { .. }) => false,
+        Some(
+            ReleaseAction::Cut { .. }
+            | ReleaseAction::Rebase { .. }
+            | ReleaseAction::Include { .. }
+            | ReleaseAction::Drop { .. }
+            | ReleaseAction::Advance { .. }
+            | ReleaseAction::Adopt { .. }
+            | ReleaseAction::Reap,
+        ) => true,
+    };
+    let _lock = writes
+        .then(|| ForkLock::acquire(&fork.upstream))
+        .transpose()?;
     match action {
         None => run_release(fork, extra_consumers, &ReleaseInvocation::Plan, bound),
         Some(ReleaseAction::Cut {

@@ -721,8 +721,8 @@ impl Store {
 /// The lock of each fork in `repos`, taken in name order so that two writers
 /// about the same forks cannot each hold one the other waits for. A fork's
 /// lock is `fork-locks/<upstream>.lock` beside the state file: it guards the
-/// fork's records in the state file and its ledger statements, and nothing
-/// else.
+/// fork's records in the state file, its ledger statements and the release
+/// verbs' ledger events ([`ForkLock`]), and nothing else.
 pub(crate) fn lock_forks(path: &Path, repos: &[&UpstreamName]) -> Result<Vec<FileLock>, LockError> {
     let ordered: BTreeSet<&UpstreamName> = repos.iter().copied().collect();
     ordered
@@ -736,6 +736,38 @@ pub(crate) fn lock_forks(path: &Path, repos: &[&UpstreamName]) -> Result<Vec<Fil
             FileLock::acquire(&target, LockWait::CLAIM)
         })
         .collect()
+}
+
+/// One fork's lock ([`lock_forks`]), held by a writer that opens no store for
+/// update: a release verb, from before its first read of the fork's ledger
+/// until its last write.
+///
+/// The lock is the kernel's lock on one open file, so a second acquire in
+/// the same process waits for the first one like any other waiter, and then
+/// gives up. So a release verb takes it once, before it reads anything, and
+/// nothing it runs takes it again: it opens the store only to read
+/// ([`Store::open`], which takes no lock), and an append to the ledger takes
+/// none ([`Ledger::append`]).
+#[derive(Debug)]
+pub struct ForkLock {
+    /// Dropping it releases the lock.
+    _held: Vec<FileLock>,
+}
+
+impl ForkLock {
+    /// The lock of `repo` beside the state file at its default path, waited
+    /// for as a claim writer waits ([`LockWait::CLAIM`]).
+    ///
+    /// # Errors
+    ///
+    /// [`LockError::Held`] when another command still holds it after the
+    /// wait, naming the holder; [`LockError::Io`] when its file cannot be
+    /// opened.
+    pub fn acquire(repo: &UpstreamName) -> Result<Self, LockError> {
+        Ok(Self {
+            _held: lock_forks(&default_state_path(), &[repo])?,
+        })
+    }
 }
 
 /// The state file at `path`, or the empty state when there is none yet.

@@ -89,6 +89,18 @@ pub fn previous_release_for_cut(
     newest_release(tips, &scheme, entry.publish_remote())
 }
 
+/// The release a record of `name`, a release cut outside knives, follows:
+/// [`previous_release_for_cut`] among every release of the series but
+/// `name`, whose own refs name the commit recorded.
+pub fn previous_release_for_record(
+    entry: &RepoEntry,
+    tips: &BookmarkTips,
+    name: &str,
+) -> Option<(BookmarkRef, CommitId)> {
+    let scheme = entry.release_scheme();
+    newest_release_but(tips, (&scheme, entry.publish_remote()), Some(name))
+}
+
 /// Every locally held, non-release, non-trunk branch and its current tip.
 pub fn carried_branches(
     repo: &Repo,
@@ -299,10 +311,23 @@ pub fn newest_release(
     scheme: &ReleaseScheme,
     publish_remote: &str,
 ) -> Option<(BookmarkRef, CommitId)> {
+    newest_release_but(tips, (scheme, publish_remote), None)
+}
+
+/// [`newest_release`] among every release but `except`.
+fn newest_release_but(
+    tips: &BookmarkTips,
+    (scheme, publish_remote): (&ReleaseScheme, &str),
+    except: Option<&str>,
+) -> Option<(BookmarkRef, CommitId)> {
+    let ours = |reference: &BookmarkRef| {
+        except != Some(reference.branch().as_str())
+            && is_our_release(reference, scheme, publish_remote)
+    };
     match scheme {
         ReleaseScheme::Dated | ReleaseScheme::Series(_) => tips
             .iter()
-            .filter(|(reference, _)| is_our_release(reference, scheme, publish_remote))
+            .filter(|(reference, _)| ours(reference))
             .filter_map(|(reference, commit)| {
                 scheme
                     .cut_key(reference.branch().as_str())
@@ -310,14 +335,9 @@ pub fn newest_release(
             })
             .max_by_key(|(key, reference, _)| (*key, u8::from(reference.is_local())))
             .map(|(_, reference, commit)| (reference.clone(), commit.clone())),
-        ReleaseScheme::Fixed(fixed) => tips
+        ReleaseScheme::Fixed(_) => tips
             .iter()
-            .filter(|(reference, _)| match reference {
-                BookmarkRef::Local(branch) => branch == fixed,
-                BookmarkRef::Remote { branch, remote } => {
-                    branch == fixed && remote.as_str() == publish_remote
-                }
-            })
+            .filter(|(reference, _)| ours(reference))
             .max_by_key(|(reference, _)| u8::from(reference.is_local()))
             .map(|(reference, commit)| (reference.clone(), commit.clone())),
     }
