@@ -202,13 +202,16 @@ impl Held {
     }
 
     /// How the commit stands to the writes `ledger` records under its name
-    /// ([`release::in_hand_write`]).
+    /// ([`release::in_hand_write`]), read as `entry`'s series reads it.
     fn standing(
         &self,
-        ledger: &[Entry],
-        writes: &EarlierWrites,
+        entry: &knives::config::RepoEntry,
+        (ledger, writes): (&[Entry], &EarlierWrites),
     ) -> anyhow::Result<release::InHandWrite> {
-        Ok(release::in_hand_write(&self.in_hand(ledger, writes))?)
+        Ok(release::in_hand_write(
+            &self.in_hand(ledger, writes),
+            entry,
+        )?)
     }
 }
 
@@ -807,7 +810,7 @@ fn adopt(
     let repo = &fork.name;
     let ledger = Ledger::for_fork(fork).read()?.entries;
     let writes = EarlierWrites::read(&held.opened, &held.name, &ledger, held.published.as_ref())?;
-    match held.standing(&ledger, &writes)? {
+    match held.standing(fork.entry, (&ledger, &writes))? {
         release::InHandWrite::NoRecord => {
             println!(
                 "{repo}: the ledger records no cut or edit of {}, so there is no write for {} \

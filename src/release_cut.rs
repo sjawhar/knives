@@ -11,14 +11,17 @@ use knives::cli::Exit;
 use knives::commands::claim::Bound;
 use knives::commands::release;
 use knives::forge::github::CliForge;
-use knives::ids::{BookmarkRef, ReleaseScheme, RemoteName, RepoName};
+use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, RepoName};
 use knives::ledger::{Draft, Ledger, inline_human_text, problem_human_text};
 use knives::release_model::{
     EarlierWrites, RecordedCut, StackedHistoryContext, carried_branches, last_series_cut,
-    members_event_text, previous_release_for_cut, series_members, trunk_positions,
+    members_event_text, previous_release_for_cut, previous_release_label, series_members,
+    trunk_positions,
 };
 
-use super::release_edit::{announce_unchecked, recorded_parents, report_hidden, union_event_text};
+use super::release_edit::{
+    announce_unchecked, composition_sources, provenance_parents, report_hidden, union_event_text,
+};
 use super::scribe_for;
 
 pub(crate) enum ReleaseInvocation {
@@ -147,7 +150,7 @@ pub(crate) fn run_release(
                     writes: &previous_writes,
                     published: previous_published,
                 };
-                let standing = release::in_hand_write(&in_hand)?;
+                let standing = release::in_hand_write(&in_hand, entry)?;
                 if let Some(refusal) = release::in_hand_refusal(&in_hand, &standing, entry)? {
                     println!("{repo}: refusing to cut {name}: {refusal}");
                     println!("{repo}: cut discarded; nothing was written at all.");
@@ -168,12 +171,37 @@ pub(crate) fn run_release(
             }
             None => (release::CarriedFrom::Unledgered, String::new()),
         };
-        let (carried, members, audit_base) = if let Some((_, previous)) = &previous {
-            let carried = release::parent_sources(&opened, entry, &scheme, &previous_members)?;
-            let members = carried.clone();
-            let base =
-                release::shared_base(&opened, previous, &trunk)?.unwrap_or_else(|| trunk.clone());
-            (carried, members, base)
+        // A stacked cut starts as one commit on the previous release, with
+        // its tree: identical to it, so it is allowed only where a verbatim
+        // new name is (below), and that is decided before anything is built.
+        if entry.stacked()
+            && let Some((previous_ref, previous_tip)) = &previous
+            && let Some(exit) = stacked_start_gate(
+                &opened,
+                (repo, &name, &pins),
+                (&scheme, &previous_ledger),
+                (previous_ref, previous_tip, previous_published),
+            )?
+        {
+            return Ok(exit);
+        }
+        let (carried, members, audit_base) = if let Some((previous_ref, previous)) = &previous {
+            if entry.stacked() {
+                // The previous release is the stacked cut's one parent and
+                // never a member: nothing is replayed, and every member
+                // `include` adds later is measured from it.
+                let carried = vec![(
+                    previous_release_label(previous_ref.branch().as_str()),
+                    previous.clone(),
+                )];
+                (carried, Vec::new(), previous.clone())
+            } else {
+                let carried = release::parent_sources(&opened, entry, &scheme, &previous_members)?;
+                let members = carried.clone();
+                let base = release::shared_base(&opened, previous, &trunk)?
+                    .unwrap_or_else(|| trunk.clone());
+                (carried, members, base)
+            }
         } else {
             // The first cut of a series composes only that series' branches:
             // a branch on another series' base would carry that base in.
@@ -221,11 +249,14 @@ pub(crate) fn run_release(
             (carried, members, base)
         };
         let request = release::Cut::from_carried(name.clone(), &carried);
+        // A stacked cut is a fresh merge of its one parent, the previous
+        // release; any other duplicates the previous release onto its parents.
         let mut candidate = release::candidate_cut(
             path,
             &request,
             previous_commit
                 .as_ref()
+                .filter(|_| !entry.stacked())
                 .map(|previous| (previous, previous_carriers.as_slice())),
         )?;
         // The orphan gate protects unreachable commits; this protects the
@@ -361,15 +392,19 @@ pub(crate) fn run_release(
         }
         // An audit error or failure simply DROPS the candidate: the merge
         // was never a published operation, so there is nothing to abandon
-        // and no crash window that strands one.
-        let audit = release::audit_cut(
+        // and no crash window that strands one. A stacked cut measures from
+        // its previous release.
+        let audit = release::audit_cut_from(
             path,
             &members,
             release::CutSubject::Candidate(&mut candidate),
-            release::AuditContext {
-                previous: previous_commit.as_ref(),
-                trunk: &audit_base,
-            },
+            (
+                release::AuditContext {
+                    previous: previous_commit.as_ref(),
+                    trunk: &audit_base,
+                },
+                previous_commit.as_ref().filter(|_| entry.stacked()),
+            ),
         )?;
         if let Some(exit) = report_cut_audit(repo, &audit, carried_from) {
             return Ok(exit);
@@ -477,6 +512,63 @@ fn release_plan_exit(
         exit = exit.worst(Exit::Findings);
     }
     Ok((exit, plan.pins))
+}
+
+/// The gate of a cut in a stacked series that has a previous release, before
+/// anything is built: `Some` after refusing, `None` after saying why the cut
+/// may go ahead.
+///
+/// Such a cut starts as one commit on the previous release, with its tree,
+/// and becomes the next release as members are included into it. So it
+/// always starts identical to the previous release, and today's identical
+/// gate cannot see it: that gate compares parents too (`Candidate::matches`),
+/// and the start's one parent is the previous release itself. The start is
+/// allowed where a verbatim cut under a new dated name is: every pin of the
+/// previous release is frozen, or it is published (a tag or a `record:
+/// published` note names its commit), so it cannot be edited in place.
+/// Otherwise there is nothing to cut, and the previous release is the
+/// composition to edit.
+fn stacked_start_gate(
+    opened: &knives::jj::Repo,
+    (repo, name, pins): (&RepoName, &str, &[knives::pins::Pin]),
+    (scheme, ledger): (&ReleaseScheme, &[knives::ledger::Entry]),
+    (previous, at, published): (&BookmarkRef, &CommitId, Option<&CommitId>),
+) -> anyhow::Result<Option<Exit>> {
+    // The previous release is a name read from the repository, and the
+    // evidence names a tag on it or quotes a ledger note.
+    let shown = inline_human_text(previous.branch().as_str());
+    let frozen = release::repair_effect(pins, previous.branch(), published)
+        == release::RepairEffect::NewDatedName;
+    let why = if frozen {
+        Some(format!("every pin of {shown} is frozen"))
+    } else {
+        release::published_release(
+            opened,
+            ledger,
+            release::ReleaseAt {
+                scheme,
+                name: previous.branch().as_str(),
+                commits: &[published, Some(at)],
+            },
+        )?
+        .map(|evidence| format!("{shown} is published ({})", inline_human_text(&evidence)))
+    };
+    let Some(why) = why else {
+        println!(
+            "{repo}: refusing to cut {name}: it would start identical to {shown} ({}), as one \
+             commit on it; nothing to cut: {shown} is neither published (no tag or `record: \
+             published` note names it) nor frozen by every pin, so `knives release include \
+             <branch>` edits {shown} itself",
+            at.short()
+        );
+        return Ok(Some(Exit::Incomplete));
+    };
+    println!(
+        "{repo}: {name} starts identical to {shown} ({}), as one commit on it; {why}, so this \
+         new name is the composition to edit — `include`, `advance` or `drop` it before pushing",
+        at.short()
+    );
+    Ok(None)
 }
 
 /// Say what the audit found; refuse when it failed.
@@ -730,6 +822,7 @@ struct CompletedCut<'a> {
 /// rewrite and still resolves to the release. Evidence keeps the commit first:
 /// the composition gate parses it from that position. The release logs the
 /// cut unioned close the text, after everything a reader of the event parses.
+/// The parents recorded are the cut's composition ([`cut_composition`]).
 fn record_cut_event(
     fork: &Fork<'_>,
     cut: &CompletedCut<'_>,
@@ -737,9 +830,8 @@ fn record_cut_event(
 ) -> anyhow::Result<()> {
     let entry = fork.entry;
     let opened = knives::jj::Repo::open(&fork.checkout.path)?;
-    let parents = opened.parent_commits(cut.created.as_str())?;
     let change = opened.change_id_of(cut.created.as_str())?;
-    let members = release::parent_sources(&opened, entry, cut.scheme, &parents)?;
+    let members = cut_composition(fork, &opened, (cut.name, cut.created), cut.scheme)?;
     let members_text = members_event_text(&members);
     let mut evidence = vec![cut.created.as_str().to_owned()];
     evidence.extend(members.iter().map(|(_, commit)| commit.as_str().to_owned()));
@@ -781,7 +873,7 @@ fn record_cut_event(
     });
     scribe_for(fork, bound)?.record(&Draft {
         evidence,
-        parents: recorded_parents(&opened, entry, &parents)?,
+        parents: provenance_parents(&opened, entry, &members)?,
         ..Draft::event(
             Some(cut.name),
             format!(
@@ -797,6 +889,44 @@ fn record_cut_event(
         )
     })?;
     Ok(())
+}
+
+/// What a cut event records of `created`, the commit cut as `name`: each
+/// parent with where it came from ([`release::parent_sources`]), in parent
+/// order.
+///
+/// A release of a stacked series records its reading instead
+/// ([`release::release_reading`]): its previous release first when it has
+/// one, under its label ([`previous_release_label`]), then its members, the
+/// side parents on its first-parent line, never the commit's literal
+/// parents. A commit the reading refuses is no release to record.
+fn cut_composition(
+    fork: &Fork<'_>,
+    opened: &knives::jj::Repo,
+    (name, created): (&str, &CommitId),
+    scheme: &ReleaseScheme,
+) -> anyhow::Result<Vec<(String, CommitId)>> {
+    let entry = fork.entry;
+    if entry.stacked() {
+        let ledger = Ledger::for_fork(fork).read()?.entries;
+        let published = opened.bookmark_tips()?.remove(&BookmarkRef::Remote {
+            branch: BranchName::new(name),
+            remote: RemoteName::new(entry.publish_remote()),
+        });
+        let writes = EarlierWrites::read(opened, name, &ledger, published.as_ref())?;
+        return match release::release_reading(opened, entry, &ledger, (&writes, created))? {
+            Ok(reading) => {
+                composition_sources(opened, entry, (reading.previous.as_ref(), &reading.members))
+            }
+            Err(unexplained) => anyhow::bail!("{name}: {unexplained}"),
+        };
+    }
+    release::parent_sources(
+        opened,
+        entry,
+        scheme,
+        &opened.parent_commits(created.as_str())?,
+    )
 }
 
 fn report_completed_cut(
@@ -977,11 +1107,20 @@ fn report_orphaned_cut(
     Some(Exit::Incomplete)
 }
 
+/// The commits the cut would strand, reachable only from the previous
+/// release or its descendants, or `None`.
+///
+/// A stacked series strands none: its cut keeps the previous release as its
+/// first parent, and the reap after it abandons nothing the cut descends
+/// from, so that release and every descendant of it stay visible.
 fn check_orphan_commits_before_cut(
     opened: &knives::jj::Repo,
     fork: &Fork<'_>,
 ) -> anyhow::Result<Option<OrphanedLineage>> {
     let entry = fork.entry;
+    if entry.stacked() {
+        return Ok(None);
+    }
     let tips = opened.bookmark_tips()?;
     let Some(previous) = previous_release_for_cut(entry, &tips) else {
         return Ok(None);
@@ -1154,17 +1293,28 @@ struct Reaped {
 /// The reap both callers run, on the repository as it is now. The ledger's
 /// earlier writes of each name count for the keep rule and are cleaned up
 /// after it.
+///
+/// A stacked series first forgets each superseded name the live release
+/// descends from ([`release::forget_superseded_ancestors`]): it is reported
+/// with the names whose commit stays, and nothing of it is abandoned, its
+/// earlier writes included. Every other name keeps the rules below.
 fn reap(fork: &Fork<'_>) -> anyhow::Result<Reaped> {
     let path = &fork.checkout.path;
+    let (scheme, publish_remote) = (fork.entry.dated_scheme(), fork.entry.publish_remote());
+    let descended = if fork.entry.stacked() {
+        release::forget_superseded_ancestors(
+            &knives::jj::Repo::open(path)?,
+            &scheme,
+            publish_remote,
+        )?
+    } else {
+        Vec::new()
+    };
     let opened = knives::jj::Repo::open(path)?;
     let ledger = Ledger::for_fork(fork).read()?.entries;
-    let mut report = release::reap_superseded(
-        &opened,
-        &fork.entry.dated_scheme(),
-        fork.entry.publish_remote(),
-        &ledger,
-    )?;
+    let mut report = release::reap_superseded(&opened, &scheme, publish_remote, &ledger)?;
     let cleaned = abandon_reaped_writes(fork, &report, &ledger);
+    report.forgotten_only.extend(descended);
     report.notes.extend(cleaned.notes);
     // The reap's own abandons hid what they exposed in one operation over
     // every reaped name, so those heads are named with all of them.
@@ -1187,7 +1337,8 @@ struct ReapPayload {
     repo: String,
     /// Names whose refs were forgotten and commits abandoned.
     reaped: Vec<String>,
-    /// Names whose refs were forgotten while a pin kept the commit.
+    /// Names whose refs were forgotten while a pin kept the commit, or, in a
+    /// stacked series, while the live release descends from it.
     forgotten_only: Vec<NamedReason>,
     /// Names left untouched, with why.
     kept: Vec<NamedReason>,

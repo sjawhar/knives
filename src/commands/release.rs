@@ -33,9 +33,10 @@ use crate::pins::{Pin, PinKind};
 use crate::release_model::{
     BranchSuccessions, EarlierWrites, MemberEvidence, MemberHistory, MemberSuccession,
     PreviousRelease, RecordedCut, RecordedWrite, ReleaseReading, StackedHistoryContext,
-    carried_from_tips, double_cut_findings, last_recorded_parents, matched_write, member_history,
-    member_parents, newest_release, previous_release_label, recorded_release_changes,
-    release_parents, release_refs_by_commit, repo_slug, stacked_release, trunk_positions,
+    UnexplainedCommit, carried_from_tips, double_cut_findings, last_recorded_parents,
+    matched_write, member_history, member_parents, newest_release, previous_release_label,
+    read_release, recorded_release_changes, release_parents, release_refs_by_commit, repo_slug,
+    stacked_release, trunk_positions,
 };
 
 /// Registered forge consumers and explicitly requested local checkout scans.
@@ -779,8 +780,10 @@ pub struct ReapReport {
     /// outside the enumeration — a tag, an untracked remote bookmark, a local
     /// bookmark of another name — so it is not abandoned. The expected outcome
     /// for a tagged or retained release, not a failure: the name is gone and
-    /// the commit stays reachable by its pin. Nothing else lands here; an
-    /// abandon that failed for another reason is a note.
+    /// the commit stays reachable by its pin. In a stacked series the reap
+    /// also puts here each name the live release descends from
+    /// ([`forget_superseded_ancestors`]). Nothing else lands here; an abandon
+    /// that failed for another reason is a note.
     pub forgotten_only: Vec<(String, String)>,
     /// (name, reason) pairs that were deliberately left alone.
     pub kept: Vec<(String, String)>,
@@ -956,6 +959,55 @@ fn what_keeps_a_name(
     Ok(None)
 }
 
+/// Reap each superseded dated cut of a stacked series that the live release
+/// descends from, and abandon nothing.
+///
+/// Its refs are forgotten locally and on tracking remotes, as ONE operation.
+/// Each name comes back with why its commit stays: `<live> descends from it`.
+///
+/// Each release of a stacked series is one merge of the previous release
+/// and its new members, so the live release carries every earlier release
+/// on its first-parent line. Their commits stay reachable from it, and
+/// abandoning one would rewrite the live release itself; only the names go.
+/// A name with a ref at a commit the live release does not descend from is
+/// left to [`reap_superseded`], whose rules keep it when something rests on
+/// it. Like that reap, this touches no remote.
+pub fn forget_superseded_ancestors(
+    repo: &Repo,
+    scheme: &ReleaseScheme,
+    publish_remote: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let tips = repo.bookmark_tips()?;
+    let Some((live, live_commit)) = live_dated_release(&tips, scheme, publish_remote) else {
+        return Ok(Vec::new());
+    };
+    let mut by_name = std::collections::BTreeMap::<String, Vec<CommitId>>::default();
+    for (reference, commit) in superseded_dated_releases(&tips, scheme, publish_remote) {
+        by_name
+            .entry(reference.branch().to_string())
+            .or_default()
+            .push(commit);
+    }
+    let mut names = Vec::new();
+    'names: for (name, targets) in by_name {
+        for target in &targets {
+            if !repo.is_ancestor(target, &live_commit)? {
+                continue 'names;
+            }
+        }
+        names.push(name);
+    }
+    crate::jj::forget_bookmarks(
+        repo.path(),
+        &names,
+        &format!("knives: reap {}", names.join(", ")),
+    )?;
+    Ok(names
+        .into_iter()
+        .map(|name| (name, format!("{live} descends from it")))
+        .collect())
+}
+
 /// The commits the ledger records knives writing under `name` that this
 /// repository holds, with every visible rewrite of each.
 ///
@@ -1107,8 +1159,12 @@ pub fn unchecked_suffix(standing: &InHandWrite) -> String {
 /// `jj metaedit` re-signs it, none of which is a hand edit. Where the matched
 /// write is not here, or no recorded write has the release's members, there
 /// is nothing to build the tree from, so the release is unchecked and a write
-/// proceeds as it always has, saying so.
-pub fn in_hand_write(release: &InHand<'_>) -> Result<InHandWrite, crate::jj::JjError> {
+/// proceeds as it always has, saying so. The members a write is matched by
+/// are the release's reading in `entry`'s series ([`release_reading`]).
+pub fn in_hand_write(
+    release: &InHand<'_>,
+    entry: &RepoEntry,
+) -> Result<InHandWrite, crate::jj::JjError> {
     let InHand {
         repo,
         ledger,
@@ -1124,12 +1180,15 @@ pub fn in_hand_write(release: &InHand<'_>) -> Result<InHandWrite, crate::jj::JjE
             return Ok(unless_marked(event, write, InHandWrite::Recorded));
         }
     }
-    let parents = repo.parent_commits(commit.as_str())?;
-    let (_, members) = writes.partition(&parents);
     // A release whose every parent is a carrier has no member to compose
     // from, so the in-between commit a write builds never stands on no
-    // parent, whether or not the ledger records a write of the name.
-    if let (Some(into), true) = (parents.first(), members.is_empty()) {
+    // parent, whether or not the ledger records a write of the name. The
+    // parents are the commit's own: a stacked release that only starts on
+    // its previous release has that release as its one parent, no carrier.
+    let parents = repo.parent_commits(commit.as_str())?;
+    if let Some(into) = parents.first()
+        && writes.carriers(&parents).len() == parents.len()
+    {
         return Ok(InHandWrite::Unchecked(Unchecked::NoMatch(
             NoMatch::AllCarriers {
                 into: into.clone(),
@@ -1140,7 +1199,14 @@ pub fn in_hand_write(release: &InHand<'_>) -> Result<InHandWrite, crate::jj::JjE
     if !any {
         return Ok(InHandWrite::NoRecord);
     }
-    let Some(matched) = matched_write(repo, (ledger, name), writes, &members)? else {
+    // The members a recorded write is matched by are the release's reading:
+    // in a stacked series the side parents on its first-parent line, never
+    // its previous release. A release the reading refuses has no members to
+    // match.
+    let Ok(reading) = release_reading(repo, entry, ledger, (writes, commit))? else {
+        return Ok(InHandWrite::Unchecked(Unchecked::NoMatch(NoMatch::Members)));
+    };
+    let Some(matched) = matched_write(repo, (ledger, name), writes, &reading.members)? else {
         return Ok(InHandWrite::Unchecked(Unchecked::NoMatch(NoMatch::Members)));
     };
     // A write made on another machine and never fetched is not held here,
@@ -1160,8 +1226,14 @@ pub fn in_hand_write(release: &InHand<'_>) -> Result<InHandWrite, crate::jj::JjE
     }
     let write_carriers =
         writes.recorded_carriers(repo, &repo.parent_commits(matched.write.commit.as_str())?)?;
+    // A stacked release holds its previous release whole, so the write is
+    // rebased onto that release and the members, in parent order.
     Ok(
-        if repo.holds_rebased_write((&matched.write.commit, &write_carriers), &members, commit)? {
+        if repo.holds_rebased_write(
+            (&matched.write.commit, &write_carriers),
+            &reading.composition(),
+            commit,
+        )? {
             InHandWrite::Recorded
         } else {
             InHandWrite::Unrecorded {
@@ -1169,6 +1241,26 @@ pub fn in_hand_write(release: &InHand<'_>) -> Result<InHandWrite, crate::jj::JjE
             }
         },
     )
+}
+
+/// How `commit`, a release whose earlier writes are `writes`, reads
+/// ([`read_release`]).
+///
+/// The bookmark tips and the trunk positions the stacked reading walks with
+/// are read only for a stacked series; any other release reads from its own
+/// parents.
+pub fn release_reading(
+    repo: &Repo,
+    entry: &RepoEntry,
+    ledger: &[Entry],
+    (writes, commit): (&EarlierWrites, &CommitId),
+) -> Result<Result<ReleaseReading, UnexplainedCommit>, crate::jj::JjError> {
+    let (tips, trunks) = if entry.stacked() {
+        (repo.bookmark_tips()?, trunk_positions(repo, entry)?)
+    } else {
+        (BookmarkTips::default(), Vec::new())
+    };
+    read_release(repo, entry, (ledger, &tips, &trunks), (writes, commit))
 }
 
 /// How a release in hand measured against `write` stands (`held`), unless
@@ -1809,6 +1901,7 @@ pub fn plan(
         parents: &members,
         trunks: &trunks,
         stacked: stacked_context,
+        stacked_series: entry.stacked(),
         branches: &series_branches,
         recorded: last_recorded_parents(ledger, &reference.to_string()),
     })?);
@@ -1879,10 +1972,61 @@ struct LocalBranchNotes<'a> {
     parents: &'a [ReleaseParent],
     trunks: &'a [CommitId],
     stacked: Option<StackedHistoryContext<'a>>,
+    /// Whether the series is stacked ([`RepoEntry::stacked`]): its next cut
+    /// starts on the release in hand, so a branch built on that release is
+    /// that cut's to include.
+    stacked_series: bool,
     branches: &'a [(String, CommitId)],
     /// The release's last recorded parent set, for a branch the repository can
     /// no longer tie to its parent.
     recorded: &'a [RecordedParent],
+}
+
+/// The plan's note for `branch`, at `tip`, built on top of the release in
+/// hand.
+///
+/// Outside a stacked series it is neither a member nor includable as it
+/// stands: carrying it would put the cut in its own successor's ancestry. In
+/// a stacked series the release in hand is the previous release of the next
+/// cut, and such a branch is what that cut includes. So its history is
+/// measured as `include` measures it once the next release is cut: past the
+/// trunk, the release's own previous release and the release itself. A
+/// branch linear past them, or whose merges join only lines the release
+/// carries, is fit for the next release; one that carries more is refused
+/// as `include` refuses it.
+fn built_on_release_note(
+    input: &LocalBranchNotes<'_>,
+    branch: &str,
+    tip: &CommitId,
+) -> anyhow::Result<String> {
+    let reference = input.reference;
+    let Some(context) = input.stacked.filter(|_| input.stacked_series) else {
+        return Ok(format!(
+            "{branch} is stacked on {reference} rather than the trunk; rebase it off the \
+             trunk before including it"
+        ));
+    };
+    let bases: Vec<CommitId> = context
+        .trunks
+        .iter()
+        .chain(std::iter::once(input.release))
+        .cloned()
+        .collect();
+    let measured = StackedHistoryContext {
+        trunks: &bases,
+        ..context
+    };
+    Ok(match member_history(measured, branch, tip)? {
+        MemberHistory::Stacked(stacked) => format!(
+            "{}; rebase it off the trunk before including it",
+            stacked.detail
+        ),
+        MemberHistory::Linear | MemberHistory::CarriedMerges { .. } => format!(
+            "{branch} is built on {reference}, which the next cut of this stacked series starts \
+             on; `knives release cut <name>` makes that cut, and `knives release include \
+             {branch}` then adds it"
+        ),
+    })
 }
 
 /// Whether `branch`'s history carries merges the release in hand already
@@ -1960,6 +2104,7 @@ fn local_branch_notes(input: &LocalBranchNotes<'_>) -> anyhow::Result<Vec<String
         parents,
         trunks,
         stacked,
+        stacked_series: _,
         branches,
         recorded,
     } = *input;
@@ -1970,15 +2115,11 @@ fn local_branch_notes(input: &LocalBranchNotes<'_>) -> anyhow::Result<Vec<String
             continue;
         }
         // A branch built on top of the release descends from every member, which
-        // ancestry alone reads as "advanced". It is neither advanced nor
-        // includable as it stands: both verbs refuse it, because carrying it would
-        // put the cut in its own successor's ancestry. The same goes for a branch
-        // whose history carries any release merge.
+        // ancestry alone reads as "advanced". It is never advanced: carrying it
+        // would put the cut in its own successor's ancestry. Whether it is
+        // includable depends on the series ([`built_on_release_note`]).
         if repo.is_ancestor(release, tip)? {
-            notes.push(format!(
-                "{branch} is stacked on {reference} rather than the trunk; rebase it off the \
-                 trunk before including it"
-            ));
+            notes.push(built_on_release_note(input, branch, tip)?);
             continue;
         }
         let merged = match branch_history_note(stacked, branch, tip)? {
@@ -4245,17 +4386,21 @@ mod members_tests {
         run_jj(&repository, &["new"]);
         let edited = at(&repository, name);
         let opened = Repo::open(&repository).expect("open test repository");
+        let entry = RepoEntry::new("upstream", "origin");
         let ledger = [cut_event(name, written.as_str(), &[member.as_str()])];
         let standing = |ledger: &[Entry], commit: &CommitId| {
             let writes = EarlierWrites::read(&opened, name, ledger, None).expect("read writes");
-            in_hand_write(&InHand {
-                repo: &opened,
-                ledger,
-                name,
-                commit,
-                writes: &writes,
-                published: None,
-            })
+            in_hand_write(
+                &InHand {
+                    repo: &opened,
+                    ledger,
+                    name,
+                    commit,
+                    writes: &writes,
+                    published: None,
+                },
+                &entry,
+            )
             .expect("read the standing")
         };
         let recorded_cut = |commit: &CommitId| RecordedWrite {

@@ -4479,6 +4479,26 @@ pub fn forget_and_abandon(
     Ok(outcome)
 }
 
+/// Forget every ref of each of `names`, locally and on every remote, as ONE
+/// operation, and abandon nothing.
+///
+/// The reap of a stacked series retires a superseded name this way when the
+/// live release descends from its commit: the commit stays, reachable from
+/// the live release, and only the name goes. Nothing changes on any remote; a
+/// later fetch re-materializes whatever still exists there, as after
+/// [`forget_and_abandon`].
+pub fn forget_bookmarks(repo: &Path, names: &[String], operation: &str) -> Result<(), JjError> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let repo = Repo::open_to_write(repo)?;
+    let mut tx = repo.repo.start_transaction();
+    for name in names {
+        forget_refs(tx.repo_mut(), name);
+    }
+    commit_mutation(&repo, tx, operation)
+}
+
 /// Refuse to abandon a commit that a local bookmark still names, other than a
 /// bookmark of a name in `reaped`.
 ///
