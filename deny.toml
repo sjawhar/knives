@@ -2,7 +2,16 @@
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = []
+# RUSTSEC-2026-0543 says chrono is unmaintained. It is of the kind
+# `unmaintained`, it names every version of chrono, and it lists no patched
+# version, so no upgrade of chrono clears it. knives does not depend on chrono
+# itself: chrono comes into the build only through the exact jj-lib pin in
+# Cargo.toml, directly and through interim, which jj-lib pulls in. jj-lib 0.47
+# uses jiff in its place, so the move to jj-lib 0.47 removes chrono, and this
+# entry goes with it.
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained and the advisory lists no patched version; chrono comes in only through the exact jj-lib pin (directly and through interim); remove this entry with the move to jj-lib 0.47, which uses jiff" },
+]
 
 [licenses]
 allow = [
