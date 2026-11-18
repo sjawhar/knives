@@ -526,11 +526,14 @@ pub enum ReleaseAction {
     /// after every other release of the series, so record the older name
     /// first. REV must have no conflict and be no workspace's working copy,
     /// every ref of NAME here or on the publish remote must name it, and a
-    /// published NAME must be one the publish remote holds. A NAME no ref
-    /// names gets a local bookmark at REV. The commit is audited as a cut is,
-    /// and the ledger event records its members: in a stacked series the side
-    /// parents on its first-parent line, with its previous release labelled
-    /// as no member. No reap runs, and nothing is signed or pushed.
+    /// published NAME must be one the publish remote holds: the refusal
+    /// gives the push that records it. A NAME no ref names gets a local
+    /// bookmark at REV. The commit is audited as a cut is, and it must carry
+    /// each member of the newest write of the newest release the ledger
+    /// records in the series. The ledger event records its members: in a
+    /// stacked series the side parents on its first-parent line, with its
+    /// previous release labelled as no member. No reap runs, and nothing is
+    /// signed or pushed.
     Cut {
         /// The dated release name, `release/[<series>/]YYYY-MM-DD[.N|-<label>]`.
         /// It must sort after the newest release of the series. Omit it for a
@@ -539,6 +542,9 @@ pub enum ReleaseAction {
         /// Proceed even when the cut would drop something: commits reachable
         /// only from the previous release lineage, or members the previous
         /// cut's ledger event recorded. The refusal lists exactly what.
+        ///
+        /// With `--at`, the members are those of the newest write of the
+        /// newest release the ledger records in the series.
         #[arg(long)]
         allow_drop: bool,
         /// Record a release cut outside knives: the commit becomes NAME's

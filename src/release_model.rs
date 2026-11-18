@@ -883,11 +883,13 @@ pub fn double_cut_findings(
     Ok((findings, notes))
 }
 
-/// The composition a previous cut's ledger event recorded.
+/// The composition a recorded write's ledger event recorded: the previous
+/// cut's ([`last_recorded_cut`]), or the newest write of the series' newest
+/// recorded release ([`newest_release_write`]).
 #[derive(Debug, PartialEq, Eq)]
 pub struct RecordedCut {
     pub name: String,
-    /// The commit created by this cut, stored as the first evidence item.
+    /// The commit the write created, stored as the first evidence item.
     pub commit: CommitId,
     pub members: Vec<CommitId>,
 }
@@ -1098,10 +1100,11 @@ pub struct RecordedWrite {
 ///
 /// An edit writes a new commit under the same name, so a release that equals
 /// its last edit is knives' own work, not drift, and a publish remote at an
-/// earlier write is knives' own work an edit has not been pushed over. The
-/// composition gate does not read this: it holds a new cut against
+/// earlier write is knives' own work an edit has not been pushed over. A
+/// cut's composition gate does not read this: it holds a new cut against
 /// [`last_recorded_cut`], so a member an edit dropped is still restated at the
-/// next cut.
+/// next cut. A release cut outside knives is held against the newest write
+/// instead ([`newest_release_write`]).
 pub fn recorded_writes<'a>(
     entries: &'a [Entry],
     release: &'a str,
@@ -1142,6 +1145,50 @@ pub fn recorded_write_events<'a>(
                 commit: CommitId::new(entry.evidence.first()?.as_str()),
             },
         ))
+    })
+}
+
+/// The newest recorded write of the newest release that `entries` record in
+/// the series `scheme`, `except` aside: what a release cut outside knives is
+/// held against.
+///
+/// The release is the newest name, in the series' one order
+/// ([`ReleaseScheme::cut_key`]), that the ledger records a cut or edit of
+/// ([`recorded_release_names`]). Its newest write is its cut, its newest
+/// edit or an `adopt`, whichever the ledger records last
+/// ([`recorded_write_events`]). The members are that event's evidence after
+/// the commit, less each parent that its parent set labels as the previous
+/// release ([`previous_release_label`]) or as a carrier ([`carrier_label`]).
+/// So a member that `include` added after the cut is held, and so is each
+/// member of a stacked release, whose cut records none.
+pub fn newest_release_write(
+    entries: &[Entry],
+    scheme: &ReleaseScheme,
+    except: &str,
+) -> Option<RecordedCut> {
+    let (_, name) = recorded_release_names(entries, scheme)
+        .into_iter()
+        .filter(|name| *name != except)
+        .filter_map(|name| scheme.cut_key(name).map(|key| (key, name)))
+        .max_by_key(|(key, _)| *key)?;
+    let (event, write) = recorded_write_events(entries, name).next()?;
+    let carrier = carrier_label(name);
+    let labelled = |commit: &str| {
+        event.parents.iter().any(|parent| {
+            parent.commit == commit
+                && (labels_previous(parent) || parent.branches.contains(&carrier))
+        })
+    };
+    Some(RecordedCut {
+        name: name.to_owned(),
+        commit: write.commit,
+        members: event
+            .evidence
+            .iter()
+            .skip(1)
+            .filter(|commit| !labelled(commit.as_str()))
+            .map(|commit| CommitId::new(commit.as_str()))
+            .collect(),
     })
 }
 
@@ -1599,6 +1646,14 @@ pub struct PreviousRelease {
     pub commit: CommitId,
 }
 
+impl PreviousRelease {
+    /// The release with the label a recorded parent set gives it
+    /// ([`previous_release_label`]): what a write's composition lists first.
+    pub fn labelled(&self) -> (String, CommitId) {
+        (previous_release_label(&self.name), self.commit.clone())
+    }
+}
+
 /// How one release reads: the previous release it stacks on, its members and
 /// its carriers ([`read_release`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1868,30 +1923,6 @@ fn ref_previous_names<'a>(
         }
     }
     names
-}
-
-/// The stacked reading of a release that has a previous release
-/// ([`read_release`]), with the earlier writes of its name read from
-/// `entries` and `published`, the publish remote's commit of the name.
-///
-/// `None` reads the release as every release outside a stacked series reads:
-/// the series is not stacked, or the release is its first cut.
-pub fn stacked_release(
-    repo: &Repo,
-    entry: &RepoEntry,
-    (entries, tips, trunks): (&[Entry], &BookmarkTips, &[CommitId]),
-    (release, published, commit): (&str, Option<&CommitId>, &CommitId),
-) -> Result<Option<Result<ReleaseReading, UnexplainedCommit>>, jj::JjError> {
-    if !entry.stacked() {
-        return Ok(None);
-    }
-    let writes = EarlierWrites::read(repo, release, entries, published)?;
-    Ok(
-        match read_release(repo, entry, (entries, tips, trunks), (&writes, commit))? {
-            Ok(reading) if reading.previous.is_none() => None,
-            read => Some(read),
-        },
-    )
 }
 
 #[cfg(test)]

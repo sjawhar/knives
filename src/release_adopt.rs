@@ -21,7 +21,7 @@ use knives::jj::{Repo, ResolutionBaseline, ResolutionChanges};
 use knives::ledger::{Draft, Entry, Ledger, RecordedParent, inline_human_text};
 use knives::release_model::{
     EarlierWrites, PreviousRelease, RecordedWrite, ReleaseReading, carrier_label, matched_write,
-    previous_release_label, recorded_members, recorded_write_events,
+    recorded_members, recorded_write_events,
 };
 
 use super::release_edit::{
@@ -132,6 +132,9 @@ struct Held {
     parents: Vec<CommitId>,
     /// The publish remote's commit of the name, in jj's view.
     published: Option<CommitId>,
+    /// Every bookmark, read once the name is held here, which a stacked
+    /// series reads the commit with ([`release::release_reading`]).
+    tips: knives::detect::BookmarkTips,
 }
 
 impl Held {
@@ -163,10 +166,13 @@ impl Held {
             opened = Repo::open(path)?;
         }
         let remote = fork.entry.publish_remote();
-        let published = opened.bookmark_tips()?.remove(&BookmarkRef::Remote {
-            branch: BranchName::new(name.as_str()),
-            remote: RemoteName::new(remote),
-        });
+        let tips = opened.bookmark_tips()?;
+        let published = tips
+            .get(&BookmarkRef::Remote {
+                branch: BranchName::new(name.as_str()),
+                remote: RemoteName::new(remote),
+            })
+            .cloned();
         let Some(commit) = local.or_else(|| published.clone()) else {
             println!(
                 "{repo}: {shown} has no local bookmark, and {remote} holds no {shown} after a \
@@ -181,6 +187,7 @@ impl Held {
             commit,
             parents,
             published,
+            tips,
         }))
     }
 
@@ -202,6 +209,7 @@ impl Held {
             commit: &self.commit,
             writes,
             published: self.published.as_ref(),
+            tips: &self.tips,
         }
     }
 
@@ -229,8 +237,12 @@ impl Held {
         fork: &Fork<'_>,
         (ledger, writes): (&[Entry], &EarlierWrites),
     ) -> anyhow::Result<Option<ReleaseReading>> {
-        let reading =
-            release::release_reading(&self.opened, fork.entry, ledger, (writes, &self.commit))?;
+        let reading = release::release_reading(
+            &self.opened,
+            fork.entry,
+            (ledger, &self.tips),
+            (writes, &self.commit),
+        )?;
         if let Err(unexplained) = &reading {
             // The previous release's name is a ledger subject or a ref.
             println!(
@@ -320,7 +332,12 @@ impl Replaced {
         };
         let here = opened.resolve_commit(write.commit.as_str()).is_ok();
         let composed = if here {
-            release::write_composition(opened, entry, ledger, (writes, &write.commit))?
+            release::write_composition(
+                opened,
+                entry,
+                (ledger, &held.tips),
+                (writes, &write.commit),
+            )?
         } else {
             Vec::new()
         };
@@ -553,7 +570,7 @@ pub(crate) fn refuse_unfinished_commit(
 struct Adoption<'a> {
     change: ChangeId,
     /// The previous release a stacked release is built on, which the event
-    /// records under its label ([`previous_release_label`]), never a member.
+    /// records under its label ([`PreviousRelease::labelled`]), never a member.
     previous: Option<PreviousRelease>,
     /// The parents that are earlier writes of the name.
     carriers: Vec<CommitId>,
@@ -1000,9 +1017,12 @@ fn record(
     let mut parents: Vec<RecordedParent> = adoption
         .previous
         .iter()
-        .map(|previous| RecordedParent {
-            commit: previous.commit.as_str().to_owned(),
-            branches: vec![previous_release_label(&previous.name)],
+        .map(|previous| {
+            let (label, commit) = previous.labelled();
+            RecordedParent {
+                commit: commit.as_str().to_owned(),
+                branches: vec![label],
+            }
         })
         .collect();
     parents.extend(adopting.replaced.parents.iter().cloned());

@@ -18,7 +18,7 @@ use knives::release_model::{
     EarlierWrites, MemberEvidence, MemberHistory, MemberLookup, MemberSuccession, PreviousRelease,
     SeriesFit, StackedHistoryContext, carried_from_tips, carries_member_line, composition,
     is_previous_release_label, last_recorded_parents, member_history, member_parents,
-    members_event_text, previous_release_label, series_fit, trunk_positions, with_commit,
+    members_event_text, series_fit, trunk_positions_in, with_commit,
 };
 
 use super::scribe_for;
@@ -95,22 +95,28 @@ struct ReleaseInHand {
 
 impl ReleaseInHand {
     /// Read the release's members and carriers, and in a stacked series its
-    /// previous release; the carriers from the ledger's writes of the name
-    /// and `published`, the publish remote's commit of it in jj's view.
+    /// previous release, from `tips`, every bookmark the caller read; the
+    /// carriers from the ledger's writes of the name and `published`, the
+    /// publish remote's commit of it in jj's view.
     fn read(
         opened: &knives::jj::Repo,
         entry: &knives::config::RepoEntry,
         name: String,
-        (ledger, published): (&[knives::ledger::Entry], Option<&knives::ids::CommitId>),
+        (ledger, tips, published): (
+            &[knives::ledger::Entry],
+            &knives::detect::BookmarkTips,
+            Option<&knives::ids::CommitId>,
+        ),
     ) -> anyhow::Result<Self> {
         let commit = opened.resolve_commit(&name)?;
         let writes = EarlierWrites::read(opened, &name, ledger, published)?;
         // The plan reads the release this way too, and every edit refuses a
         // plan whose reading refused the release before it gets here.
-        let reading = match release::release_reading(opened, entry, ledger, (&writes, &commit))? {
-            Ok(reading) => reading,
-            Err(unexplained) => anyhow::bail!("{name}: {unexplained}"),
-        };
+        let reading =
+            match release::release_reading(opened, entry, (ledger, tips), (&writes, &commit))? {
+                Ok(reading) => reading,
+                Err(unexplained) => anyhow::bail!("{name}: {unexplained}"),
+            };
         Ok(Self {
             name,
             commit,
@@ -118,7 +124,7 @@ impl ReleaseInHand {
             carriers: reading.carriers,
             previous: reading.previous,
             writes,
-            trunk_tips: trunk_positions(opened, entry)?,
+            trunk_tips: trunk_positions_in(tips, entry),
         })
     }
 
@@ -707,11 +713,12 @@ fn edit_release(
     }
     // The pulled plan refused on any problem this read finds.
     let ledger = Ledger::for_fork(fork).read()?.entries;
+    let tips = opened.bookmark_tips()?;
     let release = ReleaseInHand::read(
         &opened,
         entry,
         release_name,
-        (&ledger, plan.published.as_ref()),
+        (&ledger, &tips, plan.published.as_ref()),
     )?;
     let in_hand = release::InHand {
         repo: &opened,
@@ -720,6 +727,7 @@ fn edit_release(
         commit: &release.commit,
         writes: &release.writes,
         published: plan.published.as_ref(),
+        tips: &tips,
     };
     let unchecked =
         match refuse_edit_in_hand((repo, change.verb()), entry, &in_hand, ("editing", "edit"))? {
@@ -727,7 +735,7 @@ fn edit_release(
             Err(exit) => return Ok(exit),
         };
     let releases = knives::release_model::release_refs_by_commit(
-        &opened.bookmark_tips()?,
+        &tips,
         &entry.release_scheme(),
         entry.publish_remote(),
     );
@@ -1107,7 +1115,7 @@ pub(crate) fn provenance_parents(
 }
 
 /// A release's parents, each with where it came from: a stacked release's
-/// `previous` release first, under its label ([`previous_release_label`]),
+/// `previous` release first, under its label ([`PreviousRelease::labelled`]),
 /// then each of `members` as [`release::parent_sources`] names it. What a
 /// cut's or an edit's message and ledger event list.
 pub(crate) fn composition_sources(
@@ -1116,12 +1124,7 @@ pub(crate) fn composition_sources(
     (previous, members): (Option<&PreviousRelease>, &[knives::ids::CommitId]),
 ) -> anyhow::Result<Vec<(String, knives::ids::CommitId)>> {
     let mut sources: Vec<(String, knives::ids::CommitId)> = previous
-        .map(|previous| {
-            (
-                previous_release_label(&previous.name),
-                previous.commit.clone(),
-            )
-        })
+        .map(PreviousRelease::labelled)
         .into_iter()
         .collect();
     sources.extend(release::parent_sources(

@@ -134,6 +134,7 @@ pub(crate) fn run_rebase(
     let writes = EarlierWrites::read(&opened, &release_name, &ledger, plan.published.as_ref())?;
     // A release that carries a change knives did not write or adopt would
     // carry it onto the new base unmeasured, as every write would.
+    let tips = opened.bookmark_tips()?;
     let in_hand = release::InHand {
         repo: &opened,
         ledger: &ledger,
@@ -141,6 +142,7 @@ pub(crate) fn run_rebase(
         commit: &release_commit,
         writes: &writes,
         published: plan.published.as_ref(),
+        tips: &tips,
     };
     let unchecked =
         match refuse_edit_in_hand((repo, "rebase"), entry, &in_hand, ("rebasing", "rebase"))? {

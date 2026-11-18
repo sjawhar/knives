@@ -36,8 +36,8 @@ use crate::release_model::{
     PreviousRelease, RecordedCut, RecordedWrite, ReleaseReading, StackedHistoryContext,
     UnexplainedCommit, carried_from_tips, double_cut_findings, last_recorded_parents,
     matched_write, member_history, member_parents, newest_release, previous_release_label,
-    read_release, recorded_release_changes, release_refs_by_commit, repo_slug, stacked_release,
-    trunk_positions, trunk_positions_in, with_commit,
+    read_release, recorded_release_changes, release_refs_by_commit, repo_slug, trunk_positions,
+    trunk_positions_in, with_commit,
 };
 
 /// Registered forge consumers and explicitly requested local checkout scans.
@@ -446,29 +446,34 @@ impl Plan {
     /// refuses the release: that is one of the plan's problems, and the
     /// list is the release's parents.
     ///
-    /// A release of a stacked series that has a previous release
-    /// ([`stacked_release`]) lists that release first ([`Plan::previous`]),
+    /// The release reads as its series reads it ([`release_reading`]), its
+    /// carriers read into [`Plan::carriers`] from `ledger` and
+    /// [`Plan::published`]. A carrier is an earlier write of the release a
+    /// fast-forward push gave it, never a member: no member check reads it,
+    /// and the parent list labels it. A release of a stacked series that has
+    /// a previous release lists that release first ([`Plan::previous`]),
     /// then its members and its carriers. Any other release lists its
-    /// parents, its carriers among them ([`Plan::read_carriers`]).
+    /// parents, its carriers among them.
     fn read_parents(
         &mut self,
         (repo, entry): (&Repo, &RepoEntry),
-        (ledger, tips, trunks): (&[Entry], &BookmarkTips, &[CommitId]),
+        (ledger, tips): (&[Entry], &BookmarkTips),
         (reference, commit): (&BookmarkRef, &CommitId),
     ) -> anyhow::Result<Option<(Vec<ReleaseParent>, Vec<ReleaseParent>)>> {
         let release = reference.branch().as_str();
-        match stacked_release(
-            repo,
-            entry,
-            (ledger, tips, trunks),
-            (release, self.published.as_ref(), commit),
-        )? {
-            None => {
+        let writes = EarlierWrites::read(repo, release, ledger, self.published.as_ref())?;
+        match release_reading(repo, entry, (ledger, tips), (&writes, commit))? {
+            Ok(reading) if reading.previous.is_none() => {
                 let parents = repo.parents_of(commit.as_str())?;
-                let members = self.read_carriers(repo, (release, &parents), ledger)?;
+                let members = parents
+                    .iter()
+                    .filter(|parent| reading.members.contains(&parent.commit))
+                    .cloned()
+                    .collect();
+                self.carriers = reading.carriers;
                 Ok(Some((parents, members)))
             }
-            Some(Ok(reading)) => {
+            Ok(reading) => {
                 let mut listed = reading.composition();
                 listed.extend(reading.carriers.iter().cloned());
                 let members = release_parents(tips, &reading.members);
@@ -476,7 +481,7 @@ impl Plan {
                 self.previous = reading.previous;
                 Ok(Some((release_parents(tips, &listed), members)))
             }
-            Some(Err(unexplained)) => {
+            Err(unexplained) => {
                 self.problems.push(format!("{reference}: {unexplained}"));
                 self.list_parents(repo.parents_of(commit.as_str())?);
                 Ok(None)
@@ -493,31 +498,6 @@ impl Plan {
                 (parent.commit, names)
             })
             .collect();
-    }
-
-    /// Read which of `release`'s `parents` are carriers into
-    /// [`Plan::carriers`], from `ledger` and [`Plan::published`]; the
-    /// parents without them, which every member check reads.
-    ///
-    /// A carrier is an earlier write of the release a fast-forward push gave
-    /// it, never a member: no member check reads it, and the parent list
-    /// labels it.
-    fn read_carriers(
-        &mut self,
-        repo: &Repo,
-        (release, parents): (&str, &[ReleaseParent]),
-        ledger: &[Entry],
-    ) -> anyhow::Result<Vec<ReleaseParent>> {
-        let commits: Vec<CommitId> = parents.iter().map(|parent| parent.commit.clone()).collect();
-        let (carriers, members) =
-            EarlierWrites::read(repo, release, ledger, self.published.as_ref())?
-                .partition(&commits);
-        self.carriers = carriers;
-        Ok(parents
-            .iter()
-            .filter(|parent| members.contains(&parent.commit))
-            .cloned()
-            .collect())
     }
 
     /// The plan's parent list, one line per parent with what holds it, a
@@ -1078,6 +1058,9 @@ pub struct InHand<'a> {
     pub writes: &'a EarlierWrites,
     /// The publish remote's commit of the name, as the caller reads that ref.
     pub published: Option<&'a CommitId>,
+    /// Every bookmark the caller read, which a stacked series reads the
+    /// release with ([`release_reading`]).
+    pub tips: &'a BookmarkTips,
 }
 
 /// How a release's commit in hand stands to the writes the ledger records
@@ -1199,6 +1182,7 @@ pub fn in_hand_write(
         name,
         commit,
         writes,
+        tips,
         ..
     } = *release;
     let mut any = false;
@@ -1231,7 +1215,7 @@ pub fn in_hand_write(
     // in a stacked series the side parents on its first-parent line, never
     // its previous release. A release the reading refuses has no members to
     // match.
-    let Ok(reading) = release_reading(repo, entry, ledger, (writes, commit))? else {
+    let Ok(reading) = release_reading(repo, entry, (ledger, tips), (writes, commit))? else {
         return Ok(InHandWrite::Unchecked(Unchecked::NoMatch(NoMatch::Members)));
     };
     let Some(matched) = matched_write(repo, (ledger, name), writes, &reading.members)? else {
@@ -1256,7 +1240,7 @@ pub fn in_hand_write(
     // rebased onto that release and the members, in parent order, its own
     // change measured against all it composes: a write made as a chain of
     // merges keeps what each inner merge resolved.
-    let composed = write_composition(repo, entry, ledger, (writes, &matched.write.commit))?;
+    let composed = write_composition(repo, entry, (ledger, tips), (writes, &matched.write.commit))?;
     Ok(
         if repo.holds_rebased_write(
             (&matched.write.commit, &composed),
@@ -1279,18 +1263,17 @@ pub fn in_hand_write(
 /// That is its own parents, its carriers left out
 /// ([`EarlierWrites::recorded_carriers`]). A write of a stacked series that
 /// has a previous release composes that release and its members
-/// ([`release_reading`]): made as a chain of merges, one member each, it
-/// holds what each inner merge resolved, and none of that is its own change
-/// against its own parents. A write the stacked reading refuses composes its
-/// own parents.
+/// ([`release_reading`], read with `tips`): made as a chain of merges, one
+/// member each, it holds what each inner merge resolved, and none of that is
+/// its own change against its own parents. A write the stacked reading
+/// refuses composes its own parents.
 pub fn write_composition(
     repo: &Repo,
     entry: &RepoEntry,
-    ledger: &[Entry],
+    (ledger, tips): (&[Entry], &BookmarkTips),
     (writes, write): (&EarlierWrites, &CommitId),
 ) -> Result<Vec<CommitId>, crate::jj::JjError> {
-    if entry.stacked()
-        && let Ok(reading) = release_reading(repo, entry, ledger, (writes, write))?
+    if let Ok(reading) = release_reading(repo, entry, (ledger, tips), (writes, write))?
         && reading.previous.is_some()
     {
         return Ok(reading.composition());
@@ -1303,27 +1286,26 @@ pub fn write_composition(
         .collect())
 }
 
-/// How `commit`, a release whose earlier writes are `writes`, reads
-/// ([`read_release`]).
+/// How `commit`, a release whose earlier writes are `writes`, reads in
+/// `entry`'s series ([`read_release`]), with `tips`, the caller's bookmarks.
 ///
-/// The bookmark tips and the trunk positions the stacked reading walks with
-/// are read only for a stacked series; any other release reads from its own
-/// parents.
+/// Every reader takes a release through this one wrapper. A release outside
+/// a stacked series, or one with no previous release, reads with `previous:
+/// None`, and a caller that reads such a release apart tests that. A stacked
+/// series walks the first-parent line past the trunk positions `tips` holds
+/// ([`trunk_positions_in`]); any other release reads from its own parents.
 pub fn release_reading(
     repo: &Repo,
     entry: &RepoEntry,
-    ledger: &[Entry],
+    (ledger, tips): (&[Entry], &BookmarkTips),
     (writes, commit): (&EarlierWrites, &CommitId),
 ) -> Result<Result<ReleaseReading, UnexplainedCommit>, crate::jj::JjError> {
-    // The bookmarks are listed once, and the trunk positions read from them.
-    let (tips, trunks) = if entry.stacked() {
-        let tips = repo.bookmark_tips()?;
-        let trunks = trunk_positions_in(&tips, entry);
-        (tips, trunks)
+    let trunks = if entry.stacked() {
+        trunk_positions_in(tips, entry)
     } else {
-        (BookmarkTips::default(), Vec::new())
+        Vec::new()
     };
-    read_release(repo, entry, (ledger, &tips, &trunks), (writes, commit))
+    read_release(repo, entry, (ledger, tips, &trunks), (writes, commit))
 }
 
 /// How a release in hand measured against `write` stands (`held`), unless
@@ -1933,16 +1915,13 @@ pub fn plan(
         })
         .cloned();
 
-    let trunks = trunk_positions(&repo, entry)?;
-    let Some((parents, members)) = plan.read_parents(
-        (&repo, entry),
-        (ledger, &tips, &trunks),
-        (&reference, &commit),
-    )?
+    let Some((parents, members)) =
+        plan.read_parents((&repo, entry), (ledger, &tips), (&reference, &commit))?
     else {
         add_consumer_pins(&mut plan, fork, consumers, &scheme);
         return Ok(plan);
     };
+    let trunks = trunk_positions(&repo, entry)?;
     let trunk_tip = repo.resolve_commit(&entry.trunk_ref()).ok();
     let member_parents =
         unlanded_members(&repo, (&commit, trunk_tip.as_ref()), &members, &mut plan)?;
@@ -2391,18 +2370,16 @@ fn stacked_rows(
     Ok(rows)
 }
 
-/// The rows of a release's direct parents, each carrier among them labelled
-/// from `ledger` and `published`, the publish remote's commit of `release`.
+/// The rows of a release's direct parents, each carrier among them
+/// ([`EarlierWrites::carriers`]) labelled.
 fn parent_rows(
     opened: &Repo,
-    parents: Vec<ReleaseParent>,
-    (release, ledger, published): (&str, &[Entry], Option<&CommitId>),
+    (parents, writes): (Vec<ReleaseParent>, &EarlierWrites),
     (trunk, successions): (Option<&CommitId>, &BranchSuccessions<'_>),
 ) -> anyhow::Result<Vec<MemberRow>> {
     let parent_commits: Vec<CommitId> =
         parents.iter().map(|parent| parent.commit.clone()).collect();
-    let carriers =
-        crate::release_model::carriers(opened, release, &parent_commits, (ledger, published))?;
+    let carriers = writes.carriers(&parent_commits);
     parents
         .into_iter()
         .map(|parent| {
@@ -2438,15 +2415,16 @@ fn member_label(member: &MemberRow) -> String {
 ///
 /// `ledger` is the fork's ledger: the writes it records under the name, with
 /// the publish remote's commit of it, are the carriers a row labels
-/// ([`crate::release_model::carriers`]). `verify` replays the content
-/// (`--verify`) against no previous release: a member whose change the tree
-/// does not hold reads as missing, however the release came to drop it.
+/// ([`EarlierWrites`]). `verify` replays the content (`--verify`) against no
+/// previous release: a member whose change the tree does not hold reads as
+/// missing, however the release came to drop it.
 ///
-/// A release of a stacked series that has a previous release reads as its
-/// previous release, on a row of its own, and its members
-/// ([`stacked_release`]); `verify` replays each member from its fork point
-/// with the previous release ([`audit_cut_from`]). A release the
-/// stacked reading refuses is a problem, and its rows are its parents.
+/// The release reads as its series reads it ([`release_reading`]). One of a
+/// stacked series that has a previous release reads as its previous
+/// release, on a row of its own, and its members; `verify` replays each
+/// member from its fork point with the previous release, and measures the
+/// drift from it ([`audit_cut`]). A release the stacked reading refuses is a
+/// problem, and its rows are its parents, as every other release's are.
 pub fn gather_members(
     opened: &Repo,
     fork: &Fork<'_>,
@@ -2478,34 +2456,27 @@ pub fn gather_members(
         branch: release.clone(),
         remote: RemoteName::new(entry.publish_remote()),
     });
-    let stacked = stacked_release(
-        opened,
-        entry,
-        (ledger, &tips, &trunks),
-        (release.as_str(), published, &commit),
-    )?;
-    // A release the stacked reading refuses is a problem, and its rows are its
-    // own parents, as every other release's are.
+    let writes = EarlierWrites::read(opened, release.as_str(), ledger, published)?;
     let literal_rows = || {
         parent_rows(
             opened,
-            release_parents(&tips, &parents),
-            (release.as_str(), ledger, published),
+            (release_parents(&tips, &parents), &writes),
             (trunk.as_ref(), &successions),
         )
     };
-    let (members, previous, refused) = match stacked {
-        Some(Ok(reading)) => (
-            stacked_rows(opened, &reading, (&tips, trunk.as_ref()), &successions)?,
-            reading.previous,
-            false,
-        ),
-        Some(Err(unexplained)) => {
-            problems.push(format!("{name}: {unexplained}"));
-            (literal_rows()?, None, true)
-        }
-        None => (literal_rows()?, None, false),
-    };
+    let (members, previous, refused) =
+        match release_reading(opened, entry, (ledger, &tips), (&writes, &commit))? {
+            Ok(reading) if reading.previous.is_none() => (literal_rows()?, None, false),
+            Ok(reading) => (
+                stacked_rows(opened, &reading, (&tips, trunk.as_ref()), &successions)?,
+                reading.previous,
+                false,
+            ),
+            Err(unexplained) => {
+                problems.push(format!("{name}: {unexplained}"));
+                (literal_rows()?, None, true)
+            }
+        };
     let audit = if verify && !refused {
         trunk
             .as_ref()
@@ -2516,18 +2487,16 @@ pub fn gather_members(
                     .map(|member| (member_label(member), member.commit.clone()))
                     .collect();
                 let stacked_on = previous.as_ref().map(|previous| &previous.commit);
-                audit_cut_from(
+                audit_cut(
                     &fork.checkout.path,
                     &members,
                     CutSubject::Committed(&commit),
-                    (
-                        AuditContext {
-                            previous: None,
-                            trunk,
-                        },
+                    AuditContext {
+                        previous: None,
+                        trunk,
                         stacked_on,
-                        stacked_on,
-                    ),
+                        drift_from: stacked_on.map(|from| (from, DriftBase::PreviousRelease)),
+                    },
                 )
             })
             .transpose()?
@@ -3357,11 +3326,24 @@ impl CutAudit {
     }
 }
 
-/// The baseline commits used to explain a cut audit's file-level drift.
+/// What a cut audit measures its members and its drift from ([`audit_cut`]).
 #[derive(Debug, Clone, Copy)]
 pub struct AuditContext<'a> {
+    /// The release a member's divergence may be carried from: a cut's
+    /// previous release. `None` carries nothing forward, so a member the
+    /// subject lacks is missing, however the subject came to drop it.
     pub previous: Option<&'a CommitId>,
+    /// What each member replays from: the members' fork point with the
+    /// trunk, or the previous release a stacked cut starts on.
     pub trunk: &'a CommitId,
+    /// The previous release a release of a stacked series stacks on
+    /// ([`crate::release_model::read_release`]): each member replays from
+    /// its fork point with it instead of from `trunk`.
+    pub stacked_on: Option<&'a CommitId>,
+    /// What the drift is measured from, and what that commit is, which the
+    /// row of a file no member explains names ([`unexplained_row`]). `None`
+    /// runs no drift check, as for a first cut.
+    pub drift_from: Option<(&'a CommitId, DriftBase)>,
 }
 
 /// Workspaces knives made for a branch that is gone and that nobody holds.
@@ -3511,15 +3493,32 @@ impl CutSubject<'_> {
 
 /// Verify the cut actually contains what it merged (spec 1.3).
 ///
-/// For each member, a scratch child of `trunk` carrying the member tip's tree
-/// — a synthetic commit whose diff is `trunk..member_tip` — is replayed onto
-/// the cut.
+/// For each member, a scratch child of `context.trunk` carrying the member
+/// tip's tree — a synthetic commit whose diff is `trunk..member_tip` — is
+/// replayed onto the cut.
 /// An empty replay means its hunks are present; a clean, non-empty replay means
 /// the cut silently lacks them. A conflicted replay is inconclusive only when
 /// the cut itself has unresolved conflicts; otherwise its tree diverges from the
-/// member and fails the audit.
-/// Changes from the previous release (`context.previous`) that no member or
-/// trunk explains are merge-invented drift.
+/// member and fails the audit, unless `context.previous` diverged from the
+/// member exactly so: that is carried forward.
+///
+/// A release of a stacked series carries its previous release whole
+/// (`context.stacked_on`), and a member may stack on it. So each member
+/// replays from its fork point with the previous release, the merge base of
+/// the two, not from `trunk`: the previous release's own content is never
+/// charged to a member. The previous release is no member, and the caller
+/// does not list it among `members`.
+///
+/// The drift is what changed since `context.drift_from`, the release the
+/// audited one follows, that no member or trunk explains: merge-invented
+/// drift. That release is a cut's `context.previous`, or the previous
+/// release a stacked one stacks on. It is apart from `context.previous`,
+/// what a member's divergence may be carried from, because a release cut
+/// outside knives has a release it follows but carries nothing forward: a
+/// member it lacks is missing. The series' first record outside knives
+/// follows no release, and its drift is measured from `context.trunk`, its
+/// members' fork point with the trunk. With no `drift_from` there is no
+/// drift check, as for a first cut.
 ///
 /// Auditing a [`CutSubject::Candidate`] reads a merge that no other observer
 /// can see and that a failure simply drops — nothing to compensate, nothing
@@ -3527,40 +3526,13 @@ impl CutSubject<'_> {
 pub fn audit_cut(
     repo: &Path,
     members: &[(String, CommitId)],
-    subject: CutSubject<'_>,
-    context: AuditContext<'_>,
-) -> anyhow::Result<CutAudit> {
-    audit_cut_from(repo, members, subject, (context, None, context.previous))
-}
-
-/// [`audit_cut`], of a release of a stacked series when `stacked_on` is the
-/// previous release it stacks on ([`crate::release_model::read_release`]),
-/// with its drift measured from `drift_from`.
-///
-/// Such a release carries its previous release whole, and a member may
-/// stack on it. So each member replays from its fork point with the previous
-/// release, the merge base of the two, not from `trunk`: the previous
-/// release's own content is never charged to a member. The previous release
-/// is no member, and the caller does not list it among `members`. `None` is
-/// [`audit_cut`].
-///
-/// The drift is what changed since `drift_from`, the release the audited one
-/// follows: a cut's `context.previous`, or the previous release a stacked one
-/// stacks on. It is apart from `context.previous`, what a member's divergence
-/// may be carried from, because a release cut outside knives has a release
-/// it follows but carries nothing forward: a member it lacks is missing. The
-/// series' first record outside knives follows no release, and its drift is
-/// measured from `context.trunk`, its members' fork point with the trunk.
-/// With no `drift_from` there is no drift check, as for a first cut.
-pub fn audit_cut_from(
-    repo: &Path,
-    members: &[(String, CommitId)],
     mut subject: CutSubject<'_>,
-    (context, stacked_on, drift_from): (AuditContext<'_>, Option<&CommitId>, Option<&CommitId>),
+    context: AuditContext<'_>,
 ) -> anyhow::Result<CutAudit> {
     let mut audit = CutAudit::default();
     let cut_is_conflicted = !subject.conflicted_files(repo)?.is_empty();
-    let stacked = stacked_on
+    let stacked = context
+        .stacked_on
         .map(|previous| Repo::open(repo).map(|opened| (opened, previous)))
         .transpose()?;
     for (name, tip) in members {
@@ -3600,7 +3572,7 @@ pub fn audit_cut_from(
             }
         }
     }
-    if let Some(previous) = drift_from {
+    if let Some((previous, _)) = context.drift_from {
         let drifted = subject.changed_files_since(repo, previous)?;
         let mut explained = BTreeSet::new();
         for (_, tip) in members {
@@ -4484,6 +4456,7 @@ mod members_tests {
         let opened = Repo::open(&repository).expect("open test repository");
         let entry = RepoEntry::new("upstream", "origin");
         let ledger = [cut_event(name, written.as_str(), &[member.as_str()])];
+        let tips = opened.bookmark_tips().expect("read bookmarks");
         let standing = |ledger: &[Entry], commit: &CommitId| {
             let writes = EarlierWrites::read(&opened, name, ledger, None).expect("read writes");
             in_hand_write(
@@ -4494,6 +4467,7 @@ mod members_tests {
                     commit,
                     writes: &writes,
                     published: None,
+                    tips: &tips,
                 },
                 &entry,
             )
