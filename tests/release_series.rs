@@ -789,3 +789,41 @@ fn a_name_without_a_date_is_refused_with_the_grammar() {
     );
     assert!(!resolves(&lab, "release/old/foo"), "{out}");
 }
+
+#[test]
+fn a_name_git_cannot_hold_as_a_ref_is_refused_with_the_grammar() {
+    // Given: a series with one branch to compose, and its ledger as it is.
+    let lab = two_base_lab();
+    branch_on(&lab, "old@upstream", "fix/old", "old-fix.txt");
+    let home = series_home(&lab, "");
+    let commit = commit_at(&lab, "fix/old");
+    let ledger = || {
+        knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+            .read()
+            .expect("read ledger")
+            .entries
+    };
+    let entries = ledger();
+
+    // When: a cut, and a record with `--at`, are asked for under dated names
+    // whose label git refuses in a ref.
+    for name in [
+        "release/old/2026-08-04-x~1",
+        "release/old/2026-08-04-a b",
+        "release/old/2026-08-04-x.lock",
+        "release/old/2026-08-04-a..b",
+    ] {
+        for args in [
+            vec!["--series", "old", "cut", name],
+            vec!["--series", "old", "cut", name, "--at", commit.as_str()],
+        ] {
+            let refused = knives_release(&lab, &home, &args);
+
+            // Then: a usage error, as for a name the grammar cannot read, and
+            // nothing is written: no ref could ever publish the name.
+            let out = text(&refused);
+            assert_eq!(refused.status.code(), Some(2), "{args:?}: {out}");
+            assert_eq!(ledger(), entries, "{args:?}: {out}");
+        }
+    }
+}
