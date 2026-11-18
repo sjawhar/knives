@@ -2,7 +2,14 @@
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = []
+ignore = [
+    # chrono reaches this tree only through jj-lib 0.45.1 (and its `interim`
+    # dependency), which Cargo.toml pins exactly to agree with the installed
+    # jj. The advisory is informational ("unmaintained"), names no patched
+    # version, and knives calls no chrono API. Drop this when a jj-lib release
+    # without chrono becomes the pin.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; it comes only through the exact jj-lib pin" },
+]
 
 [licenses]
 allow = [
