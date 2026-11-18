@@ -888,6 +888,8 @@ pub fn double_cut_findings(
 /// recorded release ([`newest_release_write`]).
 #[derive(Debug, PartialEq, Eq)]
 pub struct RecordedCut {
+    /// Whether the event records a cut or an edit.
+    pub kind: RecordedWriteKind,
     pub name: String,
     /// The commit the write created, stored as the first evidence item.
     pub commit: CommitId,
@@ -1058,6 +1060,7 @@ pub fn last_recorded_cut(entries: &[Entry], subject: Option<&str>) -> Option<Rec
             return None;
         }
         Some(RecordedCut {
+            kind: RecordedWriteKind::Cut,
             name: entry_subject.to_owned(),
             commit: CommitId::new(commit.as_str()),
             members: members
@@ -1101,10 +1104,10 @@ pub struct RecordedWrite {
 /// An edit writes a new commit under the same name, so a release that equals
 /// its last edit is knives' own work, not drift, and a publish remote at an
 /// earlier write is knives' own work an edit has not been pushed over. A
-/// cut's composition gate does not read this: it holds a new cut against
-/// [`last_recorded_cut`], so a member an edit dropped is still restated at the
-/// next cut. A release cut outside knives is held against the newest write
-/// instead ([`newest_release_write`]).
+/// cut's composition gate reads the newest write of the series' newest
+/// release ([`newest_release_write`]) beside the previous cut
+/// ([`last_recorded_cut`]), so a member an edit dropped is still restated at
+/// the next cut, and a member an edit added is held ([`CompositionBaseline`]).
 pub fn recorded_writes<'a>(
     entries: &'a [Entry],
     release: &'a str,
@@ -1149,13 +1152,14 @@ pub fn recorded_write_events<'a>(
 }
 
 /// The newest recorded write of the newest release that `entries` record in
-/// the series `scheme`, `except` aside: what a release cut outside knives is
-/// held against.
+/// the series `scheme`, `except` aside: what a cut is held against beside
+/// the series' previous cut ([`CompositionBaseline`]).
 ///
 /// The release is the newest name, in the series' one order
 /// ([`ReleaseScheme::cut_key`]), that the ledger records a cut or edit of
-/// ([`recorded_release_names`]). Its newest write is its cut, its newest
-/// edit or an `adopt`, whichever the ledger records last
+/// ([`recorded_release_names`]); under a fixed scheme it is the fixed
+/// branch, the one name that the scheme owns. Its newest write is its cut,
+/// its newest edit or an `adopt`, whichever the ledger records last
 /// ([`recorded_write_events`]). The members are that event's evidence after
 /// the commit, less each parent that its parent set labels as the previous
 /// release ([`previous_release_label`]) or as a carrier ([`carrier_label`]).
@@ -1164,13 +1168,20 @@ pub fn recorded_write_events<'a>(
 pub fn newest_release_write(
     entries: &[Entry],
     scheme: &ReleaseScheme,
-    except: &str,
+    except: Option<&str>,
 ) -> Option<RecordedCut> {
-    let (_, name) = recorded_release_names(entries, scheme)
+    let mut names = recorded_release_names(entries, scheme)
         .into_iter()
-        .filter(|name| *name != except)
-        .filter_map(|name| scheme.cut_key(name).map(|key| (key, name)))
-        .max_by_key(|(key, _)| *key)?;
+        .filter(|name| Some(*name) != except);
+    let name = match scheme {
+        ReleaseScheme::Fixed(_) => names.next()?,
+        ReleaseScheme::Dated | ReleaseScheme::Series(_) => {
+            names
+                .filter_map(|name| scheme.cut_key(name).map(|key| (key, name)))
+                .max_by_key(|(key, _)| *key)?
+                .1
+        }
+    };
     let (event, write) = recorded_write_events(entries, name).next()?;
     let carrier = carrier_label(name);
     let labelled = |commit: &str| {
@@ -1180,6 +1191,7 @@ pub fn newest_release_write(
         })
     };
     Some(RecordedCut {
+        kind: write.kind,
         name: name.to_owned(),
         commit: write.commit,
         members: event
@@ -1573,9 +1585,10 @@ pub fn carrier_label(release: &str) -> String {
 
 /// The newest structural cut event of the series `entry` selects.
 ///
-/// It is the baseline a cut of that series is held against. An entry without
-/// named series reads every cut event, as it always has; with them, another
-/// series' cut never stands in as this series' previous composition.
+/// It is the previous cut that a cut of that series is held against
+/// ([`CompositionBaseline`]). An entry without named series reads every cut
+/// event, as it always has; with them, another series' cut never stands in
+/// as this series' previous composition.
 pub fn last_series_cut(entries: &[Entry], entry: &RepoEntry) -> Option<RecordedCut> {
     if entry.series.is_empty() {
         return last_recorded_cut(entries, None);
@@ -1591,6 +1604,46 @@ pub fn last_series_cut(entries: &[Entry], entry: &RepoEntry) -> Option<RecordedC
                 .is_some_and(|subject| scheme.owns(subject))
         })
         .find_map(|recorded| last_recorded_cut(std::slice::from_ref(recorded), None))
+}
+
+/// What a cut's composition gate holds the cut subject against.
+///
+/// It is two records: the series' previous cut ([`last_series_cut`]), and
+/// the newest recorded write of the newest release the ledger records in the
+/// series ([`newest_release_write`]). The cut's event restates a member that
+/// a `drop` removed after that cut; the newest write holds a member that an
+/// `include` added after it.
+#[derive(Debug)]
+pub struct CompositionBaseline {
+    pub previous_cut: Option<RecordedCut>,
+    pub newest_write: Option<RecordedCut>,
+}
+
+impl CompositionBaseline {
+    /// The baseline of a cut of the series `entry` selects. `except` is the
+    /// name that `cut NAME --at` records: no write of it is its own
+    /// baseline.
+    pub fn read(entries: &[Entry], entry: &RepoEntry, except: Option<&str>) -> Self {
+        Self {
+            previous_cut: last_series_cut(entries, entry),
+            newest_write: newest_release_write(entries, &entry.release_scheme(), except),
+        }
+    }
+
+    /// Each member that either record holds, once: the previous cut's in its
+    /// order, then each one that only the newest write holds.
+    pub fn members(&self) -> impl Iterator<Item = &CommitId> {
+        let cut = self
+            .previous_cut
+            .as_ref()
+            .map_or(&[][..], |cut| cut.members.as_slice());
+        cut.iter().chain(
+            self.newest_write
+                .iter()
+                .flat_map(|write| &write.members)
+                .filter(move |member| !cut.contains(member)),
+        )
+    }
 }
 
 /// What the label of a stacked release's previous release says after its

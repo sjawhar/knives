@@ -32,8 +32,8 @@ use crate::jj::{self, Repo};
 use crate::ledger::{Entry, Kind, Ledger, RecordedParent};
 use crate::pins::{Pin, PinKind};
 use crate::release_model::{
-    BranchSuccessions, EarlierWrites, MemberEvidence, MemberHistory, MemberSuccession,
-    PreviousRelease, RecordedCut, RecordedWrite, ReleaseReading, StackedHistoryContext,
+    BranchSuccessions, CompositionBaseline, EarlierWrites, MemberEvidence, MemberHistory,
+    MemberSuccession, PreviousRelease, RecordedWrite, ReleaseReading, StackedHistoryContext,
     UnexplainedCommit, carried_from_tips, double_cut_findings, last_recorded_parents,
     matched_write, member_history, member_parents, newest_release, previous_release_label,
     read_release, recorded_release_changes, release_refs_by_commit, repo_slug, trunk_positions,
@@ -3606,34 +3606,35 @@ pub fn cut(repo: &Path, request: &Cut, scheme: &ReleaseScheme) -> anyhow::Result
     Ok(publish_cut(candidate, &request.name, scheme, (&[], None))?.commit)
 }
 
-/// A recorded member whose carry check answered nothing either way.
+/// A member the composition gate's baseline records, as the gate names it.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Unverified {
-    /// Carried into the new cut event's evidence, so the next gate rechecks it.
+pub struct RecordedMember {
+    /// The recorded commit. An unverified one is carried into the new cut
+    /// event's evidence, so the next gate rechecks it.
     pub commit: CommitId,
     /// Rendered for a human: the branch still holding the commit when one does.
     pub name: String,
 }
 
-/// How a candidate cut relates to the previous cut's recorded composition.
+/// How a candidate cut relates to the recorded composition it is held
+/// against.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CompositionCheck {
-    /// Recorded members whose content the candidate does not carry, rendered
-    /// for a human: the branch still holding the commit when one does.
-    pub dropped: Vec<String>,
+    /// Recorded members whose content the candidate does not carry.
+    pub dropped: Vec<RecordedMember>,
     /// Members whose replay conflicted while the candidate itself is
     /// conflicted: unanswerable either way, exactly as the audit reports it.
-    pub inconclusive: Vec<Unverified>,
+    pub inconclusive: Vec<RecordedMember>,
     /// Recorded members carried by another commit with exactly their tree,
     /// reachable from a parent: the member rendered for a human, and the twin.
     pub twins: Vec<(String, CommitId)>,
 }
 
 /// What the composition gate compares: the cut's parents against the members
-/// the previous cut's ledger event recorded.
+/// its baseline records, the previous cut's and the newest write's.
 #[derive(Debug)]
 pub struct CompositionDelta<'a> {
-    pub recorded: &'a RecordedCut,
+    pub baseline: &'a CompositionBaseline,
     /// The cut's parents, for the identity and ancestry fast paths.
     pub parents: &'a [CommitId],
     /// The audit's base: what every current member forks from. A recorded
@@ -3647,7 +3648,7 @@ pub struct CompositionDelta<'a> {
     pub tips: &'a BookmarkTips,
 }
 
-/// Recorded members of the previous cut that the cut subject does not carry.
+/// Members the baseline records that the cut subject does not carry.
 ///
 /// Identity and ancestry account for a member that is still a parent, was
 /// advanced past, or entered through the cut's base. A member whose change was
@@ -3673,14 +3674,15 @@ pub fn uncarried_recorded_members(
 ) -> anyhow::Result<CompositionCheck> {
     let mut check = CompositionCheck::default();
     let cut_is_conflicted = !subject.conflicted_files(path)?.is_empty();
-    for member in &delta.recorded.members {
+    for member in delta.baseline.members() {
         if delta.parents.contains(member) {
             continue;
         }
         if repo.resolve_commit(member.as_str()).is_err() {
-            check
-                .dropped
-                .push(format!("{} (not known to this repository)", member.short()));
+            check.dropped.push(RecordedMember {
+                commit: member.clone(),
+                name: format!("{} (not known to this repository)", member.short()),
+            });
             continue;
         }
         if reaches_any(repo, member, delta)? {
@@ -3704,24 +3706,29 @@ pub fn uncarried_recorded_members(
             continue;
         }
         if repo.is_ancestor(member, delta.trunk)? {
-            check.dropped.push(recorded_member_name(member, delta.tips));
+            check.dropped.push(recorded_member(member, delta.tips));
             continue;
         }
         let base = repo.fork_point(member, delta.trunk)?;
         match subject.replay_outcome(path, base.as_str(), member.as_str())? {
             RebaseOutcome::Empty => {}
             RebaseOutcome::Conflicted if cut_is_conflicted => {
-                check.inconclusive.push(Unverified {
-                    commit: member.clone(),
-                    name: recorded_member_name(member, delta.tips),
-                });
+                check.inconclusive.push(recorded_member(member, delta.tips));
             }
             RebaseOutcome::CleanNonEmpty | RebaseOutcome::Conflicted => {
-                check.dropped.push(recorded_member_name(member, delta.tips));
+                check.dropped.push(recorded_member(member, delta.tips));
             }
         }
     }
     Ok(check)
+}
+
+/// `commit` as the gate names it ([`recorded_member_name`]).
+fn recorded_member(commit: &CommitId, tips: &BookmarkTips) -> RecordedMember {
+    RecordedMember {
+        commit: commit.clone(),
+        name: recorded_member_name(commit, tips),
+    }
 }
 
 /// Whether the cut's base or any of its parents reaches `commit`.

@@ -529,22 +529,20 @@ pub enum ReleaseAction {
     /// published NAME must be one the publish remote holds: the refusal
     /// gives the push that records it. A NAME no ref names gets a local
     /// bookmark at REV. The commit is audited as a cut is, and it must carry
-    /// each member of the newest write of the newest release the ledger
-    /// records in the series. The ledger event records its members: in a
-    /// stacked series the side parents on its first-parent line, with its
-    /// previous release labelled as no member. No reap runs, and nothing is
-    /// signed or pushed.
+    /// each member of the previous cut and of the newest write of the newest
+    /// release the ledger records in the series. The ledger event records its
+    /// members: in a stacked series the side parents on its first-parent
+    /// line, with its previous release labelled as no member. No reap runs,
+    /// and nothing is signed or pushed.
     Cut {
         /// The dated release name, `release/[<series>/]YYYY-MM-DD[.N|-<label>]`.
         /// It must sort after the newest release of the series. Omit it for a
         /// configured fixed release branch.
         name: Option<String>,
         /// Proceed even when the cut would drop something: commits reachable
-        /// only from the previous release lineage, or members the previous
-        /// cut's ledger event recorded. The refusal lists exactly what.
-        ///
-        /// With `--at`, the members are those of the newest write of the
-        /// newest release the ledger records in the series.
+        /// only from the previous release lineage, or members that the
+        /// previous cut's ledger event or the newest recorded write of the
+        /// release in hand records. The refusal lists exactly what.
         #[arg(long)]
         allow_drop: bool,
         /// Record a release cut outside knives: the commit becomes NAME's
