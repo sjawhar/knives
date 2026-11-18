@@ -20,13 +20,13 @@ use knives::ids::{BookmarkRef, BranchName, ChangeId, CommitId, RemoteName, RepoN
 use knives::jj::{Repo, ResolutionBaseline, ResolutionChanges};
 use knives::ledger::{Draft, Entry, Ledger, RecordedParent, inline_human_text};
 use knives::release_model::{
-    EarlierWrites, RecordedWrite, carrier_label, matched_write, recorded_members,
-    recorded_write_events,
+    EarlierWrites, PreviousRelease, RecordedWrite, ReleaseReading, carrier_label, matched_write,
+    previous_release_label, recorded_members, recorded_write_events,
 };
 
 use super::release_edit::{
-    edit_event_text, recorded_parents, refuse_plan_problems, refuse_unresolved_trunk,
-    report_abandoned_earlier, report_hidden,
+    composition_sources, edit_event_text, recorded_parents, refuse_plan_problems,
+    refuse_unresolved_trunk, report_abandoned_earlier, report_hidden,
 };
 use super::scribe_for;
 
@@ -70,9 +70,11 @@ pub(crate) fn run_release_adopt(
     if let Some(exit) = refuse_other_series(fork, &name) {
         return Ok(exit);
     }
-    // Each member's lines are counted from its fork point with the trunk,
-    // the check that catches a resolution dropping a member's work, so no
-    // adopt is recorded without it.
+    // The trunk bounds what adopt measures: each member's lines are counted
+    // from its fork point with it (or with a stacked release's previous
+    // release), the check that catches a resolution dropping a member's work,
+    // and a stacked release is read along its first-parent line down to it.
+    // So no adopt is recorded without it.
     let opened = Repo::open(&fork.checkout.path)?;
     if refuse_unresolved_trunk(&opened, repo, fork.entry) {
         return Ok(Exit::Incomplete);
@@ -125,6 +127,8 @@ struct Held {
     /// The commit to adopt: the local bookmark's, or, where there is no local
     /// bookmark, the publish remote's.
     commit: CommitId,
+    /// The commit's own parents: what a release outside a stacked series
+    /// lists. A stacked release lists its reading instead ([`Self::reading`]).
     parents: Vec<CommitId>,
     /// The publish remote's commit of the name, in jj's view.
     published: Option<CommitId>,
@@ -213,6 +217,32 @@ impl Held {
             entry,
         )?)
     }
+
+    /// How the commit reads in `fork`'s series ([`release::release_reading`]):
+    /// a stacked release as its previous release and the members on its
+    /// first-parent line, never its literal parents; any other release as
+    /// its own parents, its carriers apart. `None` after saying why a stacked
+    /// release cannot be read: a commit with one parent between it and its
+    /// previous release, which no member explains.
+    fn reading(
+        &self,
+        fork: &Fork<'_>,
+        (ledger, writes): (&[Entry], &EarlierWrites),
+    ) -> anyhow::Result<Option<ReleaseReading>> {
+        let reading =
+            release::release_reading(&self.opened, fork.entry, ledger, (writes, &self.commit))?;
+        if let Err(unexplained) = &reading {
+            // The previous release's name is a ledger subject or a ref.
+            println!(
+                "{}: {} at {} is not adopted: {}",
+                fork.name,
+                self.shown_name(),
+                self.commit.short(),
+                inline_human_text(&unexplained.to_string())
+            );
+        }
+        Ok(reading.ok())
+    }
 }
 
 /// The write the adopted commit replaces: the recorded write it equals, when
@@ -232,7 +262,10 @@ struct Replaced {
     unchecked: bool,
     /// The write's own parents, where this repository holds it: the earlier
     /// writes of the name among them, which a rebuild of it leaves out
-    /// ([`ResolutionBaseline::Rebuilt`]), and the rest, its members.
+    /// ([`ResolutionBaseline::Rebuilt`]), and the rest, what it composes: its
+    /// members, after a stacked write's previous release. The rebuild reads
+    /// the write's own parents, so these are too: a write knives made is one
+    /// merge, whose own parents are its composition.
     carriers: Vec<CommitId>,
     members: Vec<CommitId>,
     /// The parent set its event records, its own carriers left out, each
@@ -244,6 +277,10 @@ struct Replaced {
 impl Replaced {
     /// The write `held` replaces, or `None` when no recorded write has its
     /// `members` ([`release::Unchecked::NoMatch`], already refused).
+    ///
+    /// `members` are the adopted commit's as its series reads them
+    /// ([`Held::reading`]): a stacked release's previous release is never
+    /// one, as it is no recorded write's member ([`recorded_members`]).
     ///
     /// An event an older knives wrote has no `parents`; the set is then built
     /// as a write builds it, from the write's own parents where this
@@ -306,40 +343,59 @@ impl Replaced {
 
     /// Whether the write is the baseline a resolution is measured against:
     /// it is here, and knives checked the release it was written over.
-    /// Otherwise the baseline is an automerge of the commit's members.
+    /// Otherwise the baseline is an automerge of what the commit composes.
     const fn is_baseline(&self) -> bool {
         self.here && !self.unchecked
     }
 
-    /// The baseline for a commit whose members are `members`, and how a
+    /// The baseline for a commit that composes `composition`, and how a
     /// reader is told it: the write itself, when the commit is it or a copy
-    /// of it; the write rebuilt on `members`, the tree a write onto them
+    /// of it; the write rebuilt on `composition`, the tree a write onto it
     /// holds, when the write is the baseline ([`Self::is_baseline`]);
-    /// otherwise a fresh automerge of `members`, saying why.
-    fn baseline<'a>(&'a self, members: &'a [CommitId]) -> (ResolutionBaseline<'a>, String) {
+    /// otherwise a fresh automerge of `composition`, saying why.
+    ///
+    /// `composition` is the commit's members, or for a stacked release its
+    /// `previous` release, then its members
+    /// ([`ReleaseReading::composition`]): a stacked release holds its
+    /// previous release whole, so its baseline merges that release and its
+    /// members.
+    fn baseline<'a>(
+        &'a self,
+        (previous, composition): (Option<&PreviousRelease>, &'a [CommitId]),
+    ) -> (ResolutionBaseline<'a>, String) {
         if self.is_baseline() && self.equal {
             return (
                 ResolutionBaseline::Written(&self.write.commit),
                 self.described(),
             );
         }
+        // What the commit composes, as a reader is told it: a previous
+        // release is never a member.
+        let composed = || {
+            previous.map_or_else(
+                || format!("its {} member parent(s)", composition.len()),
+                |previous| {
+                    format!(
+                        "its previous release {} and its {} member(s)",
+                        previous.commit.short(),
+                        composition.len().saturating_sub(1)
+                    )
+                },
+            )
+        };
         if self.is_baseline() {
-            // Rebuilt on its own members, a write is its own tree, so it is
-            // named as itself.
-            let described = if self.members == members {
+            // Rebuilt on its own composition, a write is its own tree, so it
+            // is named as itself.
+            let described = if self.members == composition {
                 self.described()
             } else {
-                format!(
-                    "{} rebuilt on its {} member parent(s)",
-                    self.described(),
-                    members.len()
-                )
+                format!("{} rebuilt on {}", self.described(), composed())
             };
             return (
                 ResolutionBaseline::Rebuilt {
                     write: &self.write.commit,
                     carriers: &self.carriers,
-                    members,
+                    members: composition,
                 },
                 described,
             );
@@ -353,11 +409,10 @@ impl Replaced {
             format!("this repository does not hold {}", self.described())
         };
         (
-            ResolutionBaseline::Automerge(members),
+            ResolutionBaseline::Automerge(composition),
             format!(
-                "an automerge of its {} member parent(s) with the release-log union, because \
-                 {reason}",
-                members.len()
+                "an automerge of {} with the release-log union, because {reason}",
+                composed()
             ),
         )
     }
@@ -482,9 +537,14 @@ impl Adopting<'_, '_> {
 /// What adopting measured: everything the event and the report say.
 struct Adoption<'a> {
     change: ChangeId,
+    /// The previous release a stacked release is built on, which the event
+    /// records under its label ([`previous_release_label`]), never a member.
+    previous: Option<PreviousRelease>,
     /// The parents that are earlier writes of the name.
     carriers: Vec<CommitId>,
-    /// Each parent with the name a reader knows it by.
+    /// Each parent with the name a reader knows it by: the commit's own
+    /// parents, or for a stacked release its previous release, its members,
+    /// then its carriers.
     provenance: Vec<(String, CommitId)>,
     /// What the commit was measured against, as a reader is told.
     baseline: String,
@@ -510,16 +570,23 @@ impl Adoption<'_> {
     }
 }
 
-/// Measure the commit against its baseline, or `None` after refusing a change
-/// beyond the baseline's conflicts that has no reason.
+/// Measure the commit, as its series reads it (`reading`), against its
+/// baseline, or `None` after refusing a change beyond the baseline's
+/// conflicts that has no reason.
 fn measure<'a>(
     adopting: &Adopting<'_, '_>,
-    (carriers, members): (Vec<CommitId>, Vec<CommitId>),
+    reading: ReleaseReading,
     why: Option<&'a str>,
 ) -> anyhow::Result<Option<Adoption<'a>>> {
     let (fork, held, replaced) = (adopting.fork, adopting.held, adopting.replaced);
     let entry = fork.entry;
-    let (baseline, described) = replaced.baseline(&members);
+    let composition = reading.composition();
+    let ReleaseReading {
+        previous,
+        members,
+        carriers,
+    } = reading;
+    let (baseline, described) = replaced.baseline((previous.as_ref(), &composition));
     let changes = knives::jj::resolution_changes(&held.opened, baseline, &held.commit)?;
     if !changes.beyond.is_empty() && why.is_none() {
         println!(
@@ -536,15 +603,32 @@ fn measure<'a>(
         }
         return Ok(None);
     }
-    let scheme = entry.release_scheme();
-    let mut provenance = release::parent_sources(&held.opened, entry, &scheme, &held.parents)?;
-    for (source, commit) in &mut provenance {
-        if carriers.contains(commit) {
-            *source = carrier_label(&held.name);
+    // A stacked release lists its previous release first, under its label,
+    // then its members, as its writes record them, then its carriers. Its
+    // members are measured from their fork point with the previous release:
+    // that release's own lines are no member's, so a member's deletion of
+    // them is no lost line.
+    let (provenance, base) = if let Some(previous) = &previous {
+        let mut provenance = composition_sources(&held.opened, entry, (Some(previous), &members))?;
+        provenance.extend(
+            carriers
+                .iter()
+                .map(|carrier| (carrier_label(&held.name), carrier.clone())),
+        );
+        (provenance, previous.commit.clone())
+    } else {
+        let scheme = entry.release_scheme();
+        let mut provenance = release::parent_sources(&held.opened, entry, &scheme, &held.parents)?;
+        for (source, commit) in &mut provenance {
+            if carriers.contains(commit) {
+                *source = carrier_label(&held.name);
+            }
         }
-    }
-    // The trunk resolved before the release was read (`refuse_unresolved_trunk`).
-    let trunk = held.opened.resolve_commit(&entry.trunk_ref())?;
+        // The trunk resolved before the release was read
+        // (`refuse_unresolved_trunk`).
+        let trunk = held.opened.resolve_commit(&entry.trunk_ref())?;
+        (provenance, trunk)
+    };
     let member_sources: Vec<(String, CommitId)> = provenance
         .iter()
         .filter(|(_, commit)| members.contains(commit))
@@ -552,11 +636,12 @@ fn measure<'a>(
         .collect();
     let lost = lost_lines(
         &held.opened,
-        (&trunk, &member_sources),
+        (&base, &member_sources),
         (&held.commit, &changes),
     )?;
     Ok(Some(Adoption {
         change: held.opened.change_id_of(held.commit.as_str())?,
+        previous,
         carriers,
         provenance,
         baseline: described,
@@ -606,24 +691,26 @@ impl LostLines {
 
 /// For each file the commit changes against its baseline and each member
 /// that added lines to it, the member's added non-blank lines, from its fork
-/// point with the trunk to its tip, that the baseline holds and the
-/// resolution holds fewer times, and whether the resolution dropped every
-/// block of them the baseline held.
+/// point with `base` to its tip, that the baseline holds and the resolution
+/// holds fewer times, and whether the resolution dropped every block of them
+/// the baseline held.
 ///
-/// The fork point is the member's own, so a trunk that moved on since is never
-/// charged to it. Counted as a multiset because a release log repeats lines
+/// `base` is the trunk, or a stacked release's previous release. The fork
+/// point is the member's own, so a trunk that moved on since is never charged
+/// to it, and neither is a previous release's own line that a member built on
+/// it holds. Counted as a multiset because a release log repeats lines
 /// (`### Added`) that one member adding and another keeping must not cancel.
 /// Every file the commit changes is counted, a file the baseline left without
 /// a conflict too: restoring such a file can drop a member's line as surely as
 /// resolving a conflict can.
 fn lost_lines(
     opened: &Repo,
-    (trunk, members): (&CommitId, &[(String, CommitId)]),
+    (base, members): (&CommitId, &[(String, CommitId)]),
     (resolution, changes): (&CommitId, &ResolutionChanges),
 ) -> anyhow::Result<Vec<LostLines>> {
     let mut forked = Vec::with_capacity(members.len());
     for (member, tip) in members {
-        forked.push((member, tip, opened.fork_point(tip, trunk)?));
+        forked.push((member, tip, opened.fork_point(tip, base)?));
     }
     let mut lost = Vec::new();
     let files = changes
@@ -836,10 +923,13 @@ fn adopt(
     if is_newest(repo, held, &ledger)? {
         return Ok(Exit::Ok);
     }
-    let (carriers, members) = writes.partition(&held.parents);
+    let Some(reading) = held.reading(fork, (&ledger, &writes))? else {
+        return Ok(Exit::Incomplete);
+    };
     // The standing found the write that equals the commit or matches its
     // members, so there is one to replace.
-    let Some(replaced) = Replaced::read(held, fork.entry, (&ledger, &writes), &members)? else {
+    let Some(replaced) = Replaced::read(held, fork.entry, (&ledger, &writes), &reading.members)?
+    else {
         return Ok(Exit::Incomplete);
     };
     let adopting = Adopting {
@@ -851,7 +941,7 @@ fn adopt(
     if adopting.refuse_unfinished()? {
         return Ok(Exit::Incomplete);
     }
-    let Some(adoption) = measure(&adopting, (carriers, members), why)? else {
+    let Some(adoption) = measure(&adopting, reading, why)? else {
         return Ok(Exit::Incomplete);
     };
     // Each earlier write that is now a visible head nothing rests on goes, as
@@ -879,23 +969,34 @@ fn adopt(
 
 /// Record the commit as the name's newest write: an edit event, which
 /// `recorded_writes`, audit and every knives that reads edit events take
-/// with no change. Its `parents` are the replaced write's, copied with the
-/// branches they were recorded under, then one per carrier, labelled so no
-/// reader takes it for a member.
+/// with no change. Its evidence is the commit, then each parent it lists
+/// ([`Adoption::provenance`]). Its `parents` are a stacked release's previous
+/// release, under its label, as every write of a stacked release records it;
+/// then the replaced write's, copied with the branches they were recorded
+/// under; then one per carrier, labelled. No reader takes a labelled parent
+/// for a member.
 fn record(
     adopting: &Adopting<'_, '_>,
     adoption: &Adoption<'_>,
     bound: Bound<'_>,
 ) -> anyhow::Result<()> {
     let held = adopting.held;
-    let mut parents = adopting.replaced.parents.clone();
+    let mut parents: Vec<RecordedParent> = adoption
+        .previous
+        .iter()
+        .map(|previous| RecordedParent {
+            commit: previous.commit.as_str().to_owned(),
+            branches: vec![previous_release_label(&previous.name)],
+        })
+        .collect();
+    parents.extend(adopting.replaced.parents.iter().cloned());
     parents.extend(adoption.carriers.iter().map(|carrier| RecordedParent {
         commit: carrier.as_str().to_owned(),
         branches: vec![carrier_label(&held.name)],
     }));
     scribe_for(adopting.fork, bound)?.record(&Draft {
         evidence: std::iter::once(&held.commit)
-            .chain(&held.parents)
+            .chain(adoption.provenance.iter().map(|(_, commit)| commit))
             .map(|commit| commit.as_str().to_owned())
             .collect(),
         parents,

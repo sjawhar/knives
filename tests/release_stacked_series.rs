@@ -8,8 +8,10 @@
 //! parents on its first-parent line. A cut starts the next release as one
 //! commit on the previous release, `include` adds each member, the ledger
 //! labels the previous release, and the reap keeps every release the live
-//! one descends from. A series without the key keeps today's rules: a branch
-//! built on the previous release is refused.
+//! one descends from. `adopt` measures a hand resolution against the merge
+//! of the previous release and the members, and counts only the members'
+//! lines. A series without the key keeps today's rules: a branch built on
+//! the previous release is refused.
 
 #![allow(
     clippy::expect_used,
@@ -22,7 +24,7 @@
 mod lab;
 
 use knives::ledger::{Entry, Kind, RecordedParent};
-use lab::{Lab, commit_at, knives_release, release_parents, release_test_home};
+use lab::{Lab, commit_at, extend_branch, knives_release, release_parents, release_test_home};
 
 /// The series' first cut: the previous release of the release in hand.
 const PREVIOUS: &str = "release/old/2026-08-04";
@@ -618,4 +620,98 @@ fn the_ledger_event_of_a_stacked_cut_labels_the_previous_release() {
         ],
         "{edit:?}"
     );
+}
+
+#[test]
+fn a_hand_resolution_on_a_stacked_release_is_adopted_and_names_its_files() {
+    // Given: the next release cut on the published previous release, with
+    // `del`, `m6` and `m5` included. `del` deletes a.txt, which the previous
+    // release carries; `m6` and `m5` each keep its one line and add a line of
+    // their own after it, so the includes leave a.txt conflicted. A person
+    // resolves the file on the release commit as `del` asks: the previous
+    // release's line goes, and each member's own line stays.
+    let (lab, home) = previous_release_lab(true);
+    let previous = commit_at(&lab, PREVIOUS);
+    extend_branch(&lab, "m6", "a.txt", "fix/a\nm6\n");
+    extend_branch(&lab, "m5", "a.txt", "fix/a\nm5\n");
+    release_ok(&lab, &home, &["cut", NEXT]);
+    for branch in ["del", "m6", "m5"] {
+        release_ok(&lab, &home, &["include", branch]);
+    }
+    assert_eq!(
+        knives::jj::conflicted_files(lab.work_path(), NEXT).expect("list conflicts"),
+        ["a.txt"]
+    );
+    lab.jj_work(["edit", NEXT]);
+    std::fs::write(lab.work_path().join("a.txt"), "m6\nm5\n").expect("write the resolution");
+    lab.jj_work(["new"]);
+    let resolved = commit_at(&lab, NEXT);
+
+    // When: the release is adopted, with a reason.
+    let adopted = release_ok(
+        &lab,
+        &home,
+        &[
+            "adopt",
+            "--why",
+            "kept each member's line of the file del deletes",
+        ],
+    );
+
+    // Then: it exits 0 and names the file resolved by hand. Each member's
+    // lines are counted from its fork point with the previous release, so
+    // the previous release's line that `del` deleted is no lost line of `m6`
+    // or `m5`, and `del` added no line to lose.
+    let out = text(&adopted);
+    assert!(
+        out.contains("1 file(s) resolved by hand:\n    a.txt\n"),
+        "{out}"
+    );
+    for member in ["m6", "m5"] {
+        assert!(
+            out.contains(&format!(
+                "\n  {member}: 0 of 1 added line(s) of a.txt absent from the resolution\n"
+            )),
+            "{out}"
+        );
+    }
+    assert_eq!(
+        out.matches("absent from the resolution").count(),
+        2,
+        "{out}"
+    );
+
+    // And: the event names the file, and records the previous release
+    // first, under its label, then the members, as every write of the
+    // release records them.
+    let event = newest_event(&home, NEXT);
+    assert!(
+        event
+            .text
+            .starts_with(&format!("edited {NEXT} as {} ", resolved.short())),
+        "{event:?}"
+    );
+    assert!(
+        event.text.contains("; resolved by hand: a.txt; "),
+        "{event:?}"
+    );
+    assert!(
+        event
+            .text
+            .contains("; added lines absent: m6 0 of 1 in a.txt, m5 0 of 1 in a.txt; "),
+        "{event:?}"
+    );
+    let members = ["del", "m6", "m5"].map(|branch| (branch, commit_at(&lab, branch)));
+    let mut evidence = vec![resolved.as_str().to_owned(), previous.as_str().to_owned()];
+    evidence.extend(members.iter().map(|(_, commit)| commit.as_str().to_owned()));
+    assert_eq!(event.evidence, evidence, "{event:?}");
+    let mut parents = vec![RecordedParent {
+        commit: previous.as_str().to_owned(),
+        branches: vec![format!("{PREVIOUS} previous release (not a member)")],
+    }];
+    parents.extend(members.iter().map(|(branch, commit)| RecordedParent {
+        commit: commit.as_str().to_owned(),
+        branches: vec![(*branch).to_owned()],
+    }));
+    assert_eq!(event.parents, parents, "{event:?}");
 }
