@@ -2240,3 +2240,66 @@ fn a_fixed_record_without_a_member_a_pushed_drop_removed_names_include_for_it() 
         "{out}"
     );
 }
+
+#[test]
+fn a_cut_refuses_to_drop_a_fix_an_adopt_recorded_after_the_previous_cut() {
+    // Given: a cut of `feat/alpha` and `feat/beta`, fixed by hand in place
+    // (`jj squash` into it, which keeps its change id) and adopted, which the
+    // ledger records as its newest write; then the release's bookmark back
+    // at the cut's commit, as a machine that never fetched the adopt has it.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stdout)
+    );
+    let cut = commit_at(&lab, "release/2026-08-04");
+    lab.jj_work(["new", "-r", "release/2026-08-04"]);
+    std::fs::write(lab.work_path().join("fix.txt"), "fixed by hand\n").expect("write fix.txt");
+    lab.jj_work(["squash", "--into", "release/2026-08-04"]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let adopted = knives_release(
+        &lab,
+        &home,
+        &["adopt", "release/2026-08-04", "--why", "a fix by hand"],
+    );
+    assert!(
+        adopted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&adopted.stdout)
+    );
+    let adopt = commit_at(&lab, "release/2026-08-04");
+    assert_ne!(adopt, cut, "the squash rewrote the release");
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "release/2026-08-04",
+        "-r",
+        cut.as_str(),
+        "--allow-backwards",
+    ]);
+
+    // When: the next release is cut.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: it is refused, naming the adopt's commit, and nothing is cut:
+    // the cut would duplicate the commit the adopt replaced and drop the fix.
+    let out = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    assert!(out.contains(adopt.short()), "{out}");
+    assert!(
+        Repo::open(&lab.work)
+            .expect("open work checkout")
+            .resolve_commit("release/2026-08-05")
+            .is_err(),
+        "{out}"
+    );
+}
