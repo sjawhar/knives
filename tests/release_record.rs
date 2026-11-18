@@ -2406,3 +2406,57 @@ fn a_record_that_holds_only_the_first_adopts_fix_is_refused_naming_the_second_ad
     );
     assert_eq!(ledger_entries(&home), entries, "{out}");
 }
+
+#[test]
+fn a_record_that_lacks_a_fix_an_earlier_release_adopted_is_refused() {
+    // Given: RELEASE, a knives cut of `feat/alpha` and `feat/beta`, fixed by
+    // hand in place and adopted; then the next release, a knives cut that
+    // carries the fix and records no adopt of its own; and the third release
+    // merged by hand of the same two branches, which lacks the fix.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    lab.jj_work(["new", "-r", RELEASE]);
+    std::fs::write(lab.work_path().join("fix.txt"), "fixed by hand\n").expect("write fix.txt");
+    lab.jj_work(["squash", "--into", RELEASE]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let adopted = knives_release(&lab, &home, &["adopt", RELEASE, "--why", "a fix by hand"]);
+    assert_eq!(adopted.status.code(), Some(0), "{}", text(&adopted));
+    let next = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(matches!(next.status.code(), Some(0 | 1)), "{}", text(&next));
+    assert_eq!(
+        file_at_revision(&lab, "release/2026-08-05", "fix.txt"),
+        "fixed by hand\n",
+        "the next cut carries the fix"
+    );
+    lab.jj_work([
+        "new",
+        "-r",
+        "feat/alpha",
+        "-r",
+        "feat/beta",
+        "-m",
+        "the third release, merged by hand",
+    ]);
+    lab.jj_work(["new"]);
+    let commit = commit_of(&lab, "@-");
+    let (entries, refs) = (ledger_entries(&home), bookmarks(&lab));
+
+    // When: it is recorded.
+    let recorded = record(&lab, &home, "release/2026-08-06", &commit);
+
+    // Then: it is refused, naming the fix it does not carry, and nothing is
+    // written: a fix an earlier release adopted, which the newest release
+    // carries, leaves no release in silence either.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!("the fix by hand of {RELEASE}'s adopt")),
+        "{out}"
+    );
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+    assert_eq!(bookmarks(&lab), refs, "{out}");
+}
