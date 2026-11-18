@@ -422,6 +422,43 @@ fn a_change_no_member_explains_is_refused_outside_a_stacked_series() {
 }
 
 #[test]
+fn a_first_record_with_a_change_no_member_explains_is_refused() {
+    // Given: the series' first release, merged by hand of two branches, with
+    // a file added in the merge itself that no member has. No release of the
+    // series is recorded or named before it.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.jj_work([
+        "new",
+        "-r",
+        "feat/alpha",
+        "-r",
+        "feat/beta",
+        "-m",
+        "the first release, merged by hand",
+    ]);
+    std::fs::write(lab.work_path().join("unexplained.txt"), "no member\n")
+        .expect("write unexplained.txt");
+    lab.jj_work(["new"]);
+    let commit = commit_of(&lab, "@-");
+    let (home, _consumer) = release_test_home(&lab);
+    let (entries, refs) = (ledger_entries(&home), bookmarks(&lab));
+
+    // When: it is recorded.
+    let recorded = record(&lab, &home, RELEASE, &commit);
+
+    // Then: it is refused as a later record is, naming the file no member or
+    // trunk explains, and nothing is written: the series' first record is
+    // the release every later record's drift is measured from.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert!(out.contains("unexplained.txt"), "{out}");
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+    assert_eq!(bookmarks(&lab), refs, "{out}");
+}
+
+#[test]
 fn a_hand_merge_from_the_trunk_records_only_its_branches() {
     // Given: a release merged by hand from the trunk, as `git merge` makes
     // one there: its parents are the trunk, then two branches.
