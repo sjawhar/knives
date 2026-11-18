@@ -18,7 +18,7 @@ use knives::commands::release;
 use knives::forge::github::CliForge;
 use knives::ids::{BookmarkRef, BranchName, ChangeId, CommitId, RemoteName, RepoName};
 use knives::jj::{Repo, ResolutionBaseline, ResolutionChanges};
-use knives::ledger::{Draft, Entry, Ledger, RecordedParent, inline_human_text};
+use knives::ledger::{Draft, Entry, FixChange, FixFile, Ledger, RecordedParent, inline_human_text};
 use knives::release_model::{
     ADOPTED_BEYOND, ADOPTED_RESOLVED, EarlierWrites, PreviousRelease, RecordedWrite,
     ReleaseReading, carrier_label, matched_write, previous_release_label, recorded_members,
@@ -1008,7 +1008,8 @@ fn adopt(
 /// release, under its label, as every write of a stacked release records it;
 /// then the replaced write's, copied with the branches they were recorded
 /// under; then one per carrier, labelled. No reader takes a labelled parent
-/// for a member.
+/// for a member. Its `fix_files` list the files of its fix by hand
+/// ([`fix_files`]).
 fn record(
     adopting: &Adopting<'_, '_>,
     adoption: &Adoption<'_>,
@@ -1034,6 +1035,7 @@ fn record(
             .map(|commit| commit.as_str().to_owned())
             .collect(),
         parents,
+        fix_files: fix_files(&adoption.changes),
         ..Draft::event(
             Some(&held.name),
             edit_event_text(
@@ -1046,6 +1048,25 @@ fn record(
         )
     })?;
     Ok(())
+}
+
+/// The adopt event's `fix_files`: the files `changes` resolved by hand,
+/// then those it changed beyond the conflicts, each path whole. Its text
+/// names them too, joined by `, `, as every knives reads them; a path that
+/// holds a separator reads back whole only from this list.
+fn fix_files(changes: &ResolutionChanges) -> Vec<FixFile> {
+    let resolved = changes
+        .resolved
+        .iter()
+        .map(|path| (path, FixChange::Resolved));
+    let beyond = changes.beyond.iter().map(|path| (path, FixChange::Beyond));
+    resolved
+        .chain(beyond)
+        .map(|(path, change)| FixFile {
+            path: path.clone(),
+            change,
+        })
+        .collect()
 }
 
 /// What the adopt event says changed, raw: the ledger keeps what the caller

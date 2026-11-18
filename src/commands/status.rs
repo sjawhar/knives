@@ -1234,6 +1234,7 @@ mod tests {
             anchor: None,
             pr: None,
             parents: Vec::new(),
+            fix_files: Vec::new(),
             claim_change: None,
             claim_change_why: None,
             previous_owner: None,

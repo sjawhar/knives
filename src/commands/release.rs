@@ -3545,6 +3545,15 @@ impl CutSubject<'_> {
         }
     }
 
+    /// Whether the subject holds anything at `path`, a repository-internal
+    /// path ([`jj::Repo::holds_path`]).
+    fn holds_path(&self, repo: &Repo, path: &str) -> anyhow::Result<bool> {
+        match self {
+            Self::Candidate(candidate) => Ok(candidate.holds_path(path)?),
+            Self::Committed(cut) => Ok(repo.holds_path(cut, path)?),
+        }
+    }
+
     fn changed_files_since(
         &mut self,
         repo: &Path,
@@ -3714,6 +3723,12 @@ pub struct CompositionCheck {
     /// The adopts whose fix by hand the subject lacks, by commit, among the
     /// fixes the series holds ([`CompositionDelta::fixes`]).
     pub dropped_fixes: Vec<CommitId>,
+    /// The adopts whose fix by hand nothing here can read, by commit, among
+    /// the fixes the series holds, each with the paths that its event's text
+    /// names and that neither the subject nor the newest recorded write
+    /// holds ([`unheld_text_paths`]). The subject is refused for each, as
+    /// for a fix it lacks.
+    pub unreadable_fixes: Vec<(CommitId, Vec<String>)>,
 }
 
 /// A fix by hand that the series holds: what an `adopt` of one of its
@@ -3733,10 +3748,15 @@ pub struct AdoptedFix {
     pub files: Vec<String>,
     /// Each file that the adopt event names and the change against the
     /// baseline here leaves out, as where this repository does not hold the
-    /// write the adopt replaced and measures against an automerge instead.
-    /// Nothing here measures such a file, so it is held by its content
-    /// alone ([`holds_fix`]).
+    /// write the adopt replaced and measures against an automerge instead
+    /// ([`crate::release_model::AdoptedFixFiles::unmeasured_by`]). Nothing
+    /// here measures such a file, so it is held by its content alone
+    /// ([`holds_fix`]).
     by_content: Vec<String>,
+    /// Whether the files that the adopt event names were read from its text,
+    /// where a path that holds a separator reads back in pieces
+    /// ([`crate::release_model::AdoptedFixFiles::from_text`]).
+    from_text: bool,
     /// What the fix is measured against, or why nothing here can measure
     /// it.
     measure: Result<FixBaseline, Unmeasured>,
@@ -3757,6 +3777,19 @@ impl AdoptedFix {
         match &self.measure {
             Ok(_) => None,
             Err(why) => Some(*why),
+        }
+    }
+
+    /// The paths of the fix that knives read from its adopt event's text and
+    /// nothing here measured: every file of a fix that nothing here can
+    /// measure, else [`Self::by_content`]. Empty where the event lists its
+    /// files whole. A path that nothing holds may be a piece of one that
+    /// holds a separator ([`unheld_text_paths`]).
+    const fn text_paths(&self) -> &[String] {
+        match (&self.measure, self.from_text) {
+            (_, false) => &[],
+            (Err(_), true) => self.files.as_slice(),
+            (Ok(_), true) => self.by_content.as_slice(),
         }
     }
 }
@@ -3830,6 +3863,12 @@ impl FixBaseline {
 /// ([`CompositionCheck::absent_write`]), and of the adopts only those of
 /// the newest release since its cut are held, as a later write of that
 /// release keeps each one.
+///
+/// A path that the adopt event names in its text alone may be a piece of a
+/// path that holds a separator ([`AdoptedFix::text_paths`]). Where neither
+/// `write` nor the adopt holds anything at such a path, the fix stays held,
+/// so the gate refuses for it as for a fix nothing here can read
+/// ([`unheld_text_paths`]).
 pub fn adopted_fixes(
     repo: &Repo,
     entry: &RepoEntry,
@@ -3891,7 +3930,9 @@ pub fn adopted_fixes(
             let held = match newest {
                 Some(newest) if fix.unmeasured().is_none() => {
                     let mut subject = CutSubject::Committed(newest);
-                    holds_fix(repo, (repo.path(), &mut subject), &fix, Some(&fix.commit))?
+                    let holder = Some(&fix.commit);
+                    !unheld_text_paths(repo, &subject, &fix, holder)?.is_empty()
+                        || holds_fix(repo, (repo.path(), &mut subject), &fix, holder)?
                 }
                 // Nothing here can measure the fix, so it is held by its
                 // content; or nothing here holds `write`, and the fix is an
@@ -3916,11 +3957,13 @@ pub fn adopted_fixes(
 /// that write or knives could not check the release it was written over. A
 /// file that `event` names and that change leaves out is one that nothing
 /// here measures, so it is held by its content
-/// ([`AdoptedFix::by_content`]). A fix that changes no file here and whose
-/// event names none beyond is `None`. An adopt that this repository does
-/// not hold, or whose reading its series refuses, is a fix that nothing
-/// here can measure ([`Unmeasured`]): its files are the ones that `event`
-/// names ([`crate::release_model::adopted_fix_files`]).
+/// ([`AdoptedFix::by_content`],
+/// [`crate::release_model::AdoptedFixFiles::unmeasured_by`]). A fix that
+/// changes no file here and whose event names none beyond is `None`. An
+/// adopt that this repository does not hold, or whose reading its series
+/// refuses, is a fix that nothing here can measure ([`Unmeasured`]): its
+/// files are the ones that `event` names
+/// ([`crate::release_model::adopted_fix_files`]).
 fn adopted_fix(
     repo: &Repo,
     (entry, (ledger, tips), writes): (&RepoEntry, (&[Entry], &BookmarkTips), &EarlierWrites),
@@ -3928,18 +3971,20 @@ fn adopted_fix(
     replaced: Option<&(&Entry, RecordedWrite)>,
 ) -> Result<Option<AdoptedFix>, jj::JjError> {
     let named = crate::release_model::adopted_fix_files(event, name);
+    let from_text = named.from_text;
     let unmeasured = |files, why| AdoptedFix {
         name: name.to_owned(),
         commit: adopt.clone(),
         files,
         by_content: Vec::new(),
+        from_text,
         measure: Err(why),
     };
     if repo.resolve_commit(adopt.as_str()).is_err() {
-        return Ok(Some(unmeasured(named, Unmeasured::Absent)));
+        return Ok(Some(unmeasured(named.files, Unmeasured::Absent)));
     }
     let Ok(reading) = release_reading(repo, entry, (ledger, tips), (writes, adopt))? else {
-        return Ok(Some(unmeasured(named, Unmeasured::Unread)));
+        return Ok(Some(unmeasured(named.files, Unmeasured::Unread)));
     };
     let replaced = match replaced {
         Some((event, older))
@@ -3957,10 +4002,7 @@ fn adopted_fix(
     };
     let changes = jj::resolution_changes(repo, measure.baseline(), adopt)?;
     let mut files: Vec<String> = changes.resolved.into_iter().chain(changes.beyond).collect();
-    let by_content: Vec<String> = named
-        .into_iter()
-        .filter(|file| !files.contains(file))
-        .collect();
+    let by_content = named.unmeasured_by(&files);
     if files.is_empty() && by_content.is_empty() {
         return Ok(None);
     }
@@ -3970,6 +4012,7 @@ fn adopted_fix(
         commit: adopt.clone(),
         files,
         by_content,
+        from_text,
         measure: Ok(measure),
     }))
 }
@@ -4040,7 +4083,9 @@ pub struct CompositionDelta<'a> {
 ///
 /// Each fix by hand that the series holds ([`CompositionDelta::fixes`]) is
 /// held as a member is ([`fix_carried`]). A fix the subject does not carry
-/// is named by its adopt's commit ([`CompositionCheck::dropped_fixes`]).
+/// is named by its adopt's commit ([`CompositionCheck::dropped_fixes`]), and
+/// so is one that nothing here can read
+/// ([`CompositionCheck::unreadable_fixes`]).
 pub fn uncarried_recorded_members(
     repo: &Repo,
     path: &Path,
@@ -4056,8 +4101,12 @@ pub fn uncarried_recorded_members(
         }
     }
     for fix in delta.fixes {
-        if !fix_carried(repo, (path, &mut *subject), delta, fix)? {
-            check.dropped_fixes.push(fix.commit.clone());
+        match fix_carried(repo, (path, &mut *subject), delta, fix)? {
+            FixCarried::Carried => {}
+            FixCarried::Lacked => check.dropped_fixes.push(fix.commit.clone()),
+            FixCarried::Unreadable(paths) => {
+                check.unreadable_fixes.push((fix.commit.clone(), paths));
+            }
         }
     }
     // The newest write's members, by change id where this repository holds
@@ -4126,6 +4175,18 @@ pub fn uncarried_recorded_members(
     Ok(check)
 }
 
+/// How the cut subject stands to one fix by hand that the series holds
+/// ([`fix_carried`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FixCarried {
+    Carried,
+    Lacked,
+    /// Nothing here can read the fix: these paths, which its adopt event's
+    /// text names, are held by neither the subject nor the newest recorded
+    /// write ([`unheld_text_paths`]).
+    Unreadable(Vec<String>),
+}
+
 /// Whether the cut subject carries `fix`, one of the fixes by hand that the
 /// series holds ([`AdoptedFix`]).
 ///
@@ -4137,12 +4198,18 @@ pub fn uncarried_recorded_members(
 /// replay conflicts: so the subject carries the fix too when it holds, at
 /// every file the fix changed, exactly what the newest recorded write holds
 /// there. A fix that nothing here can measure is held by that test alone.
+///
+/// Before that test, each path that the adopt event names in its text alone
+/// must be held by the subject or by the newest recorded write. A path that
+/// nothing holds may be a piece of a path that holds a separator, and it
+/// never counts as held: the fix is then unreadable here
+/// ([`unheld_text_paths`]).
 fn fix_carried(
     repo: &Repo,
     (path, subject): (&Path, &mut CutSubject<'_>),
     delta: &CompositionDelta<'_>,
     fix: &AdoptedFix,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<FixCarried> {
     if let Some(start) = delta.start
         && on_first_parent_line(
             repo,
@@ -4150,7 +4217,7 @@ fn fix_carried(
             (start, std::slice::from_ref(delta.trunk)),
         )?
     {
-        return Ok(true);
+        return Ok(FixCarried::Carried);
     }
     let newest = delta
         .baseline
@@ -4158,7 +4225,45 @@ fn fix_carried(
         .as_ref()
         .map(|newest| &newest.commit)
         .filter(|newest| repo.resolve_commit(newest.as_str()).is_ok());
-    holds_fix(repo, (path, subject), fix, newest)
+    let unheld = unheld_text_paths(repo, subject, fix, newest)?;
+    if !unheld.is_empty() {
+        return Ok(FixCarried::Unreadable(unheld));
+    }
+    Ok(if holds_fix(repo, (path, subject), fix, newest)? {
+        FixCarried::Carried
+    } else {
+        FixCarried::Lacked
+    })
+}
+
+/// The paths that `fix`'s adopt event names in its text alone
+/// ([`AdoptedFix::text_paths`]) at which neither `subject` nor `holder`, a
+/// commit this repository holds, holds anything.
+///
+/// The text joins a list's files with `, ` and ends the list at `; ` or
+/// ` (why: `, so a path that holds one of those reads back in pieces, and a
+/// piece is a path that nothing holds. A path that nothing holds never
+/// counts as held, so where there is one, nothing here can read the fix. An
+/// event that lists its files whole has no such path.
+fn unheld_text_paths(
+    repo: &Repo,
+    subject: &CutSubject<'_>,
+    fix: &AdoptedFix,
+    holder: Option<&CommitId>,
+) -> anyhow::Result<Vec<String>> {
+    let mut unheld = Vec::new();
+    for file in fix.text_paths() {
+        if subject.holds_path(repo, file)? {
+            continue;
+        }
+        if let Some(holder) = holder
+            && repo.holds_path(holder, file)?
+        {
+            continue;
+        }
+        unheld.push(file.clone());
+    }
+    Ok(unheld)
 }
 
 /// Whether `subject` holds `fix` by its content: the fix's change against
@@ -4324,6 +4429,7 @@ mod cut_tests {
             anchor: None,
             pr: None,
             parents: Vec::new(),
+            fix_files: Vec::new(),
             claim_change: None,
             claim_change_why: None,
             previous_owner: None,

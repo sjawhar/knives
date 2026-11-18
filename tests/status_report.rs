@@ -700,21 +700,8 @@ fn status_carries_each_branchs_newest_notch_in_json_and_in_text() {
     );
     scribe
         .record(&knives::ledger::Draft {
-            subject: Some("feat/alpha"),
             kind: knives::ledger::Kind::Note,
-            disposition: None,
-            statement: None,
-            text: "human conclusion".to_owned(),
-            evidence: Vec::new(),
-            pr: None,
-            parents: Vec::new(),
-            claim_change: None,
-            claim_change_why: None,
-            previous_owner: None,
-            previous_kind: None,
-            previous_started: None,
-            previous_last_seen: None,
-            previous_why: None,
+            ..knives::ledger::Draft::event(Some("feat/alpha"), "human conclusion".to_owned(), None)
         })
         .expect("human note");
     scribe

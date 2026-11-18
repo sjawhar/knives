@@ -104,29 +104,16 @@ fn stalled_remote() -> String {
 fn append(root: &Path, fork: &str, count: usize) {
     let ledger = Ledger::at(root.join(fork));
     for index in 0..count {
-        ledger
-            .append(&Entry {
-                ts: format!("2026-10-09T12:00:00.{index:09}Z"),
-                owner: "ses_sweep".to_owned(),
-                email: None,
-                subject: None,
-                kind: Kind::Note,
-                disposition: None,
-                statement: None,
-                text: format!("entry {index}"),
-                evidence: Vec::new(),
-                anchor: None,
-                pr: None,
-                parents: Vec::new(),
-                claim_change: None,
-                claim_change_why: None,
-                previous_owner: None,
-                previous_kind: None,
-                previous_started: None,
-                previous_last_seen: None,
-                previous_why: None,
-            })
-            .expect("append an entry");
+        // Built from its serialized form, so it names no field a later
+        // knives adds.
+        let entry: Entry = serde_json::from_value(serde_json::json!({
+            "ts": format!("2026-10-09T12:00:00.{index:09}Z"),
+            "owner": "ses_sweep",
+            "kind": Kind::Note,
+            "text": format!("entry {index}"),
+        }))
+        .expect("build an entry");
+        ledger.append(&entry).expect("append an entry");
     }
 }
 
@@ -1254,31 +1241,24 @@ fn a_track_from_a_machine_whose_clock_runs_behind_wins_over_the_statement_it_rep
     let alpha_root = share(alpha.path(), "alpha", &remote);
     share(beta.path(), "beta", &remote);
     let ahead = jiff::Timestamp::now() + jiff::SignedDuration::from_mins(5);
+    // Built from its serialized form, so it names no field a later knives
+    // adds.
+    let statement = knives::statement::Statement {
+        kind: knives::statement::StatementKind::Pull,
+        value: Some("12".to_owned()),
+    };
+    let stated: Entry = serde_json::from_value(serde_json::json!({
+        "ts": ahead.to_string(),
+        "owner": "ses_alpha",
+        "subject": "feat/alpha",
+        "kind": Kind::Event,
+        "statement": statement,
+        "text": "stated as #12",
+        "pr": 12,
+    }))
+    .expect("build alpha's statement");
     Ledger::at(alpha_root.join(FORK))
-        .append(&Entry {
-            ts: ahead.to_string(),
-            owner: "ses_alpha".to_owned(),
-            email: None,
-            subject: Some("feat/alpha".to_owned()),
-            kind: Kind::Event,
-            disposition: None,
-            statement: Some(knives::statement::Statement {
-                kind: knives::statement::StatementKind::Pull,
-                value: Some("12".to_owned()),
-            }),
-            text: "stated as #12".to_owned(),
-            evidence: Vec::new(),
-            anchor: None,
-            pr: Some(12),
-            parents: Vec::new(),
-            claim_change: None,
-            claim_change_why: None,
-            previous_owner: None,
-            previous_kind: None,
-            previous_started: None,
-            previous_last_seen: None,
-            previous_why: None,
-        })
+        .append(&stated)
         .expect("append alpha's statement");
     assert!(sweep(alpha.path()).status.success());
     let pr_on = |home: &Path| {

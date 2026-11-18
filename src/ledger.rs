@@ -286,6 +286,16 @@ pub struct Entry {
     /// rebase done outside jj has left no ancestry or change id to say so.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parents: Vec<RecordedParent>,
+    /// The files of an `adopt`'s fix by hand, each path whole, in the order
+    /// its text names them: those it resolved by hand, then those it changed
+    /// beyond its baseline's conflicts. `adopt` writes the list beside its
+    /// text, which names the same files joined by `, ` and so gives back a
+    /// path that holds a separator in pieces
+    /// ([`crate::release_model::adopted_fix_files`]). Empty on every other
+    /// entry, on an adopt that changed no file, and on every adopt an older
+    /// knives wrote: a reader then reads the files from the text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fix_files: Vec<FixFile>,
     /// What happened to the claim on the subject, as [`ClaimChange`] words it;
     /// absent on an entry that changed no claim.
     ///
@@ -336,6 +346,32 @@ pub struct RecordedParent {
     pub branches: Vec<String>,
 }
 
+/// One file of an `adopt`'s fix by hand, as the adopt recorded it
+/// ([`Entry::fix_files`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixFile {
+    /// The repository-internal path, `/`-separated, whole.
+    pub path: String,
+    /// How the adopt changed the file.
+    pub change: FixChange,
+}
+
+/// How an `adopt` changed one file of its fix by hand ([`FixFile`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FixChange {
+    /// Resolved by hand: the adopt's baseline left the file conflicted.
+    Resolved,
+    /// Changed beyond the baseline's conflicts: the baseline held the file
+    /// without a conflict.
+    Beyond,
+    /// A word a newer knives writes and this one does not know, so that
+    /// entry still reads here. Its path is a file of the fix all the same.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
+}
+
 /// The machine surface of an entry file: every 1.1 field except the text,
 /// which is the markdown body rather than a TOML value, so prose reads and
 /// writes as prose.
@@ -368,6 +404,8 @@ struct Frontmatter {
     pr: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     parents: Vec<RecordedParent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fix_files: Vec<FixFile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claim_change: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -398,6 +436,7 @@ impl Frontmatter {
             anchor: entry.anchor.clone(),
             pr: entry.pr,
             parents: entry.parents.clone(),
+            fix_files: entry.fix_files.clone(),
             claim_change: entry.claim_change.clone(),
             claim_change_why: entry.claim_change_why.clone(),
             previous_owner: entry.previous_owner.clone(),
@@ -438,6 +477,7 @@ impl Frontmatter {
             anchor: self.anchor,
             pr: self.pr,
             parents: self.parents,
+            fix_files: self.fix_files,
             claim_change: self.claim_change,
             claim_change_why: self.claim_change_why,
             previous_owner: self.previous_owner,
@@ -1096,6 +1136,9 @@ pub struct Draft<'a> {
     /// The parent set a release cut, edit or adopt records; empty for every
     /// other entry.
     pub parents: Vec<RecordedParent>,
+    /// The files of an `adopt`'s fix by hand, whole ([`Entry::fix_files`]);
+    /// empty for every other entry.
+    pub fix_files: Vec<FixFile>,
     /// What the write this entry records did to the claim on its subject, as
     /// [`Draft::about_claim`] sets it; `None` on every entry that changed no
     /// claim.
@@ -1133,6 +1176,7 @@ impl<'a> Draft<'a> {
             evidence: Vec::new(),
             pr,
             parents: Vec::new(),
+            fix_files: Vec::new(),
             claim_change: None,
             claim_change_why: None,
             previous_owner: None,
@@ -1247,6 +1291,7 @@ impl Scribe {
             anchor: self.anchor(draft.subject),
             pr: draft.pr,
             parents: draft.parents.clone(),
+            fix_files: draft.fix_files.clone(),
             claim_change: draft.claim_change.clone(),
             claim_change_why: draft.claim_change_why.clone(),
             previous_owner: draft.previous_owner.clone(),
@@ -1513,6 +1558,7 @@ mod tests {
             anchor: Some("6c42fe71".to_owned()),
             pr: None,
             parents: Vec::new(),
+            fix_files: Vec::new(),
             disposition: None,
             statement: None,
             claim_change: None,
@@ -1641,6 +1687,129 @@ mod tests {
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].kind, Kind::Event);
         assert_eq!(read[0].text, "claimed");
+    }
+
+    /// What an `adopt` event says that changed `x, y.txt` beyond its
+    /// baseline's conflicts: its list joins paths with that separator.
+    const ADOPT_TEXT: &str = "edited integration as 0123456789ab (change kkkkkkkkkkkk) with 1 \
+        parent(s): adopted: replaces the recorded cut 1123456789ab; measured against the \
+        recorded cut 1123456789ab; changed beyond the baseline's conflicts: x, y.txt (why: a \
+        fix); parents: feat/x@2123456789ab";
+
+    /// The `fix_files` list of an adopt of `x, y.txt`, as TOML.
+    const LISTED: &str = "[[fix_files]]\npath = \"x, y.txt\"\nchange = \"beyond\"\n";
+
+    /// The file of an `adopt` event that says [`ADOPT_TEXT`], with `list`
+    /// last in its frontmatter: empty for the event an older knives writes.
+    fn adopt_file(list: &str) -> String {
+        format!(
+            "+++\nts = \"2026-08-15T22:14:03Z\"\nowner = \"x\"\nsubject = \"integration\"\n\
+             kind = \"event\"\nevidence = [\"0123456789ab\", \"2123456789ab\"]\n{list}+++\n\
+             {ADOPT_TEXT}\n"
+        )
+    }
+
+    /// The one entry of a ledger whose one file holds `contents`, which
+    /// reads with no problem.
+    fn read_one(contents: &str) -> Entry {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a-repo");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("20260815T221403.000000000Z-0000.md"), contents).unwrap();
+        let read = Ledger::at(path).read().unwrap();
+        assert!(read.problems.is_empty(), "{:?}", read.problems);
+        assert_eq!(read.entries.len(), 1, "{:?}", read.entries);
+        read.entries.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn an_adopts_fix_files_round_trip_whole() {
+        // Given: an adopt event that lists the files of its fix, each a path
+        // that holds a separator its text joins or ends a list with.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(dir.path().join("a-repo"));
+        let adopt = Entry {
+            kind: Kind::Event,
+            fix_files: vec![
+                FixFile {
+                    path: "x, y.txt".to_owned(),
+                    change: FixChange::Resolved,
+                },
+                FixFile {
+                    path: "x (why: y.txt; z".to_owned(),
+                    change: FixChange::Beyond,
+                },
+            ],
+            ..entry(Some("integration"), ADOPT_TEXT)
+        };
+
+        // When: it is written and read back.
+        ledger.append(&adopt).unwrap();
+        let read = ledger.read().unwrap().entries;
+
+        // Then: each path reads back whole, with how the adopt changed it.
+        assert_eq!(read, vec![adopt]);
+    }
+
+    #[test]
+    fn an_adopt_event_without_its_fix_files_reads_as_an_older_knives_wrote_it() {
+        // Given: an adopt event as this knives writes it, with its
+        // `fix_files` list, and the same event with the list removed, as a
+        // knives from before the list writes it.
+        let listed = read_one(&adopt_file(LISTED));
+
+        // When: the event without the list is read.
+        let older = read_one(&adopt_file(""));
+
+        // Then: it reads as the same event with no list, and the event with
+        // the list reads its path whole.
+        assert_eq!(
+            older,
+            Entry {
+                fix_files: Vec::new(),
+                ..listed.clone()
+            }
+        );
+        assert_eq!(older.text, ADOPT_TEXT);
+        assert_eq!(
+            listed.fix_files,
+            vec![FixFile {
+                path: "x, y.txt".to_owned(),
+                change: FixChange::Beyond,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_adopt_event_with_keys_this_knives_does_not_know_still_reads() {
+        // Given: an adopt event as a newer knives may write it: one more
+        // list beside `fix_files`, one more key in a record of it, and a word
+        // for how the adopt changed a file that this knives does not know.
+        // An older knives sees the list this one writes the same way.
+        let newer = adopt_file(
+            "[[fix_files]]\npath = \"x, y.txt\"\nchange = \"beyond\"\nfrom_the_future = 1\n\
+             [[fix_files]]\npath = \"z.txt\"\nchange = \"renamed\"\n\
+             [[later_list]]\npath = \"w.txt\"\n",
+        );
+
+        // When: it is read.
+        let read = read_one(&newer);
+
+        // Then: it reads, with its text and each path of its fix whole.
+        assert_eq!(read.text, ADOPT_TEXT);
+        assert_eq!(
+            read.fix_files,
+            vec![
+                FixFile {
+                    path: "x, y.txt".to_owned(),
+                    change: FixChange::Beyond,
+                },
+                FixFile {
+                    path: "z.txt".to_owned(),
+                    change: FixChange::Unknown,
+                },
+            ]
+        );
     }
 
     #[test]

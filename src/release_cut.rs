@@ -889,6 +889,13 @@ impl<'a> HeldRecords<'a> {
         )
     }
 
+    /// The subject as a message names it after its verb: `this cut`, or the
+    /// commit a record names.
+    fn subject(self) -> String {
+        self.record
+            .map_or_else(|| "this cut".to_owned(), |(_, at)| at.short().to_owned())
+    }
+
     /// A refusal up to the subject's verb, escaped: `REPO: refusing to cut:
     /// this cut`, or `REPO: refusing to record NAME at COMMIT: it`.
     fn refusing(self, repo: &RepoName) -> String {
@@ -960,8 +967,8 @@ enum DropDisposition {
 /// Say what the recorded-composition check found; refuse when members are
 /// gone, when a stacked subject is not built on the newest write, when this
 /// repository does not hold that write, or when the subject lacks a fix by
-/// hand that the series holds: an `adopt` of any of its releases whose fix
-/// the newest write still carries.
+/// hand that the series holds, an `adopt` of any of its releases whose fix
+/// the newest write still carries, or nothing here can read that fix.
 ///
 /// Inconclusive members are reported without refusing, for the same reason the
 /// audit's are: a conflicted replay onto a conflicted cut subject answers
@@ -983,7 +990,8 @@ fn report_uncarried_cut(
     ((!check.dropped.is_empty()
         || check.off_line
         || check.absent_write
-        || !check.dropped_fixes.is_empty())
+        || !check.dropped_fixes.is_empty()
+        || !check.unreadable_fixes.is_empty())
         && !matches!(on_drop, DropDisposition::Allowed))
     .then_some(Exit::Incomplete)
 }
@@ -991,9 +999,10 @@ fn report_uncarried_cut(
 /// The lines [`report_uncarried_cut`] prints, which name each member with
 /// the record that names it ([`HeldRecords::holder`]), the newest write a
 /// stacked subject is not built on or that this repository does not hold,
-/// and each adopt whose fix the subject lacks ([`fix_title`]), with what
-/// held a fix by its content where nothing here can measure it
-/// ([`unmeasured_fix`]).
+/// each adopt whose fix the subject lacks ([`fix_title`]), with what held a
+/// fix by its content where nothing here can measure it
+/// ([`unmeasured_fix`]), and each adopt whose fix nothing here can read,
+/// with the paths that nothing here holds ([`unreadable_fix`]).
 ///
 /// The recorded release's name and its members are a ledger entry's subject
 /// and evidence, which a peer's pulled ledger can carry any text in; a member
@@ -1029,7 +1038,12 @@ fn uncarried_cut_lines(
         .iter()
         .filter(|fix| check.dropped_fixes.contains(&fix.commit))
         .collect();
-    if check.dropped.is_empty() && off_line.is_none() && absent.is_none() && fixes.is_empty() {
+    if check.dropped.is_empty()
+        && off_line.is_none()
+        && absent.is_none()
+        && fixes.is_empty()
+        && check.unreadable_fixes.is_empty()
+    {
         return lines;
     }
     let allowed = matches!(on_drop, DropDisposition::Allowed);
@@ -1072,10 +1086,36 @@ fn uncarried_cut_lines(
             )
         });
     }
-    // A fix nothing here can measure was held against the newest write's
-    // content, where this repository holds that write.
+    // A fix nothing here can measure or read was held against the newest
+    // write's content, where this repository holds that write.
     let holder = held.newest_write().filter(|_| !check.absent_write);
-    for fix in &fixes {
+    lines.extend(fix_lines(repo, held, (&fixes, check), (holder, allowed)));
+    if !allowed {
+        lines.push(refusal_remedy(
+            held,
+            (&sources, (off_line, absent), fixes.len()),
+            check.unreadable_fixes.len(),
+            on_drop,
+        ));
+    }
+    lines
+}
+
+/// The lines of [`uncarried_cut_lines`] that name each adopt of `fixes`,
+/// whose fix the subject lacks ([`fix_title`]), with what held a fix by its
+/// content where nothing here can measure it ([`unmeasured_fix`]), then
+/// each adopt whose fix nothing here can read, with the paths that nothing
+/// here holds ([`unreadable_fix`]). `holder` is the newest write where this
+/// repository holds it, and `allowed` says whether `--allow-drop` lets the
+/// subject go ahead.
+fn fix_lines(
+    repo: &RepoName,
+    held: HeldRecords<'_>,
+    (fixes, check): (&[&release::AdoptedFix], &release::CompositionCheck),
+    (holder, allowed): (Option<HeldRecord<'_>>, bool),
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for fix in fixes {
         let named = format!(
             "{}{}{}",
             fix_title((&fix.name, &fix.commit), inline_human_text),
@@ -1090,12 +1130,25 @@ fn uncarried_cut_lines(
             format!("{} does not carry {named}", held.refusing(repo))
         });
     }
-    if !allowed {
-        lines.push(refusal_remedy(
-            held,
-            (&sources, (off_line, absent), fixes.len()),
-            on_drop,
-        ));
+    for (commit, paths) in &check.unreadable_fixes {
+        let Some(fix) = held.fixes.iter().find(|fix| fix.commit == *commit) else {
+            continue;
+        };
+        let named = fix_title((&fix.name, &fix.commit), inline_human_text);
+        let why = unreadable_fix(paths, (&held.subject(), holder));
+        lines.push(if allowed {
+            format!(
+                "{repo}: --allow-drop: {} without {named}, which this repository cannot read: \
+                 {why}",
+                held.doing()
+            )
+        } else {
+            format!(
+                "{} cannot be held against {named}: {why}, so this repository cannot read which \
+                 files that fix changed",
+                held.refusing(repo)
+            )
+        });
     }
     lines
 }
@@ -1149,12 +1202,32 @@ fn unmeasured_fix(
     )
 }
 
+/// Why nothing here can read the fix by hand of an adopt, after a message
+/// names the adopt: its event names its files in its text alone, and
+/// `subject`, the commit the gate holds as a message names it
+/// ([`HeldRecords::subject`]), and `holder`, the newest write where this
+/// repository holds it, hold nothing at `paths`
+/// ([`release::CompositionCheck::unreadable_fixes`]). The paths are a
+/// ledger entry's text, so each is escaped.
+fn unreadable_fix(paths: &[String], (subject, holder): (&str, Option<HeldRecord<'_>>)) -> String {
+    let shown: Vec<String> = paths.iter().map(|path| inline_human_text(path)).collect();
+    let within = holder.map_or_else(
+        || subject.to_owned(),
+        |holder| format!("{subject} or in {}", holder.with_commit(inline_human_text)),
+    );
+    format!(
+        "its adopt event names its files in its text alone, and nothing is at {} in {within}",
+        shown.join(" or at ")
+    )
+}
+
 /// The line that closes a refusal of [`uncarried_cut_lines`]: what each
 /// refused finding asks for, or `--allow-drop`. `sources` are the records
 /// whose members the subject lacks, `off_line` the newest write a stacked
 /// subject is not built on, `absent` the newest write when this repository
-/// does not hold it, and `fixes` how many fixes by hand that the series
-/// holds the subject lacks.
+/// does not hold it, `fixes` how many fixes by hand that the series holds
+/// the subject lacks, and `unreadable` how many of them nothing here can
+/// read.
 ///
 /// A record is built again: on that write when it is off the line, which
 /// carries its fixes too, and after a fetch when this repository does not
@@ -1165,7 +1238,9 @@ fn unmeasured_fix(
 /// not fetched it: so the cut is made again once that write's release is
 /// moved to it, and an `include` on the older commit would write a second,
 /// divergent write. A write not held here may be one no fetch brings, so
-/// both refusals then name `adopt` too ([`adopt_remedy`]).
+/// both refusals then name `adopt` too ([`adopt_remedy`]). A fix that
+/// nothing here can read is measured here once this repository holds its
+/// adopt and the write that adopt replaced, so the refusal names the fetch.
 fn refusal_remedy(
     held: HeldRecords<'_>,
     (sources, (off_line, absent), fixes): (
@@ -1173,41 +1248,19 @@ fn refusal_remedy(
         (Option<HeldRecord<'_>>, Option<HeldRecord<'_>>),
         usize,
     ),
+    unreadable: usize,
     on_drop: DropDisposition,
 ) -> String {
     const ALLOW: &str = "or re-run with --allow-drop to state the drop is intended";
+    const UNREADABLE: &str = "fetch each adopt whose fix this repository cannot read, and the \
+                              write that adopt replaced, so that the fix is measured here";
+    let fetch_adopts = (unreadable > 0).then(|| UNREADABLE.to_owned());
     if held.record.is_some() {
-        let remedy = match (absent, off_line) {
-            (Some(write), _) if held.stacked => format!(
-                "fetch, then build the commit on {} and record that one; {}",
-                inline_human_text(write.recorded().commit.short()),
-                adopt_remedy(write)
-            ),
-            (Some(write), _) => format!(
-                "fetch, then record a commit that carries what {} carries; {}",
-                inline_human_text(write.recorded().commit.short()),
-                adopt_remedy(write)
-            ),
-            (None, Some(write)) if sources.is_empty() => format!(
-                "build the commit on {} and record that one",
-                inline_human_text(write.recorded().commit.short())
-            ),
-            (None, Some(write)) => format!(
-                "record a commit built on {} that carries each of them",
-                inline_human_text(write.recorded().commit.short())
-            ),
-            (None, None) if sources.is_empty() && fixes == 1 => {
-                "record a commit that carries that fix".to_owned()
-            }
-            (None, None) if sources.is_empty() => {
-                "record a commit that carries those fixes".to_owned()
-            }
-            (None, None) if fixes > 0 => {
-                "record a commit that carries each of them and each fix".to_owned()
-            }
-            (None, None) => "record a commit that carries each of them".to_owned(),
-        };
-        return format!("  nothing was recorded; {remedy}, {ALLOW}");
+        let remedies: Vec<String> = record_remedy(held, (sources, (off_line, absent), fixes))
+            .into_iter()
+            .chain(fetch_adopts)
+            .collect();
+        return format!("  nothing was recorded; {}, {ALLOW}", remedies.join("; "));
     }
     let outcome = match on_drop {
         DropDisposition::RefuseDiscardingCandidate => "the candidate was discarded",
@@ -1247,7 +1300,53 @@ fn refusal_remedy(
     if let Some(write) = absent {
         remedies.push(adopt_remedy(write));
     }
+    remedies.extend(fetch_adopts);
     format!("  {outcome}; {}, {ALLOW}", remedies.join("; "))
+}
+
+/// What a refused record asks for ([`refusal_remedy`]) about the members
+/// that `sources` hold, the newest write when it is `off_line` or `absent`,
+/// and `fixes`, how many fixes by hand it lacks; `None` where it lacks none
+/// of them.
+fn record_remedy(
+    held: HeldRecords<'_>,
+    (sources, (off_line, absent), fixes): (
+        &[HeldRecord<'_>],
+        (Option<HeldRecord<'_>>, Option<HeldRecord<'_>>),
+        usize,
+    ),
+) -> Option<String> {
+    if absent.is_none() && off_line.is_none() && sources.is_empty() && fixes == 0 {
+        return None;
+    }
+    Some(match (absent, off_line) {
+        (Some(write), _) if held.stacked => format!(
+            "fetch, then build the commit on {} and record that one; {}",
+            inline_human_text(write.recorded().commit.short()),
+            adopt_remedy(write)
+        ),
+        (Some(write), _) => format!(
+            "fetch, then record a commit that carries what {} carries; {}",
+            inline_human_text(write.recorded().commit.short()),
+            adopt_remedy(write)
+        ),
+        (None, Some(write)) if sources.is_empty() => format!(
+            "build the commit on {} and record that one",
+            inline_human_text(write.recorded().commit.short())
+        ),
+        (None, Some(write)) => format!(
+            "record a commit built on {} that carries each of them",
+            inline_human_text(write.recorded().commit.short())
+        ),
+        (None, None) if sources.is_empty() && fixes == 1 => {
+            "record a commit that carries that fix".to_owned()
+        }
+        (None, None) if sources.is_empty() => "record a commit that carries those fixes".to_owned(),
+        (None, None) if fixes > 0 => {
+            "record a commit that carries each of them and each fix".to_owned()
+        }
+        (None, None) => "record a commit that carries each of them".to_owned(),
+    })
 }
 
 /// What a refusal over `write`, a newest write this repository does not
@@ -1453,8 +1552,9 @@ fn record_cut_event(
 /// hold` for a subject that `--allow-drop` let go ahead without that write,
 /// then `; without the fix by hand of <release>'s adopt <commit>` for each
 /// fix by hand that `--allow-drop` let the subject go ahead without
-/// ([`fix_title`]), then the unverified members. Empty when the ledger
-/// records neither. The event keeps each name raw.
+/// ([`fix_title`]), with `, which this repository cannot read` after it for
+/// a fix that nothing here could read, then the unverified members. Empty
+/// when the ledger records neither. The event keeps each name raw.
 fn restated_delta(held: Option<HeldRecords<'_>>, check: &release::CompositionCheck) -> String {
     let Some(held) = held else {
         return String::new();
@@ -1493,15 +1593,20 @@ fn restated_delta(held: Option<HeldRecords<'_>>, check: &release::CompositionChe
                 write.with_commit(str::to_owned)
             )
         });
-    let fixes = held
-        .fixes
-        .iter()
-        .filter(|fix| check.dropped_fixes.contains(&fix.commit))
-        .fold(String::new(), |mut text, fix| {
+    let fixes = held.fixes.iter().fold(String::new(), |mut text, fix| {
+        let unreadable = check
+            .unreadable_fixes
+            .iter()
+            .any(|(commit, _)| *commit == fix.commit);
+        if unreadable || check.dropped_fixes.contains(&fix.commit) {
             text.push_str("; without ");
             text.push_str(&fix_title((&fix.name, &fix.commit), str::to_owned));
-            text
-        });
+        }
+        if unreadable {
+            text.push_str(", which this repository cannot read");
+        }
+        text
+    });
     let unverified = if check.inconclusive.is_empty() {
         String::new()
     } else {
@@ -2848,6 +2953,7 @@ mod tests {
             off_line: true,
             absent_write: true,
             dropped_fixes: Vec::new(),
+            unreadable_fixes: Vec::new(),
         };
 
         let published = recorded_published_line(
@@ -3034,6 +3140,46 @@ mod tests {
             format!(
                 " (this repository cannot read {} as a release of the series)",
                 ids_prefix(ESCAPED)
+            )
+        );
+    }
+
+    #[test]
+    fn the_paths_of_a_fix_nothing_here_can_read_reach_the_terminal_escaped() {
+        // Given: two paths that an adopt event's text names, which a peer's
+        // pulled ledger can carry any text in, and the newest write, whose
+        // name and commit are a ledger entry's too.
+        let paths = [format!("x{HOSTILE}"), "y.txt".to_owned()];
+        let write = RecordedCut {
+            kind: RecordedWriteKind::Cut,
+            name: format!("release/{HOSTILE}.2"),
+            commit: CommitId::new(HOSTILE),
+            members: Vec::new(),
+        };
+
+        // When: a message says why nothing here can read the fix, of a
+        // record held against that write and of a cut in a clone that does
+        // not hold it.
+        let held = unreadable_fix(&paths, ("eeee", Some(HeldRecord::NewestWrite(&write))));
+        let alone = unreadable_fix(&paths, ("this cut", None));
+
+        // Then: each path and the write are escaped and named, each path
+        // apart from the other.
+        assert_escaped(&[held.clone(), alone.clone()]);
+        assert_eq!(
+            held,
+            format!(
+                "its adopt event names its files in its text alone, and nothing is at \
+                 x{ESCAPED} or at y.txt in eeee or in release/{ESCAPED}.2's newest recorded \
+                 write (a cut) {}",
+                ids_prefix(ESCAPED)
+            )
+        );
+        assert_eq!(
+            alone,
+            format!(
+                "its adopt event names its files in its text alone, and nothing is at \
+                 x{ESCAPED} or at y.txt in this cut"
             )
         );
     }

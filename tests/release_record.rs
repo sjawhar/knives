@@ -20,9 +20,13 @@
 //! with `--allow-drop` recorded with the drop stated. A clone that does not
 //! hold that write is refused, naming it and the fetch, and a fix by hand
 //! that a clone cannot measure, as where it does not hold the adopt's
-//! commit, is held by its content. A published name that the publish remote
-//! lacks is not recorded until it is pushed, and the refusal gives the
-//! commands. A printed command quotes the name for the shell.
+//! commit, is held by its content. The adopt event lists the files of its
+//! fix whole, so a path that holds a separator reads back whole; an older
+//! adopt event names them in its text alone, and a clone where nothing holds
+//! a path read from it cannot read that fix and is refused. A published name
+//! that the publish remote lacks is not recorded until it is pushed, and the
+//! refusal gives the commands. A printed command quotes the name for the
+//! shell.
 
 #![allow(
     clippy::expect_used,
@@ -3388,4 +3392,289 @@ fn a_record_in_a_clone_without_the_adopts_commit_holds_a_fix_whose_path_holds_a_
         assert!(out.contains(adopt.short()), "{file}: {out}");
         assert_eq!(ledger_entries(&home), entries, "{file}: {out}");
     }
+}
+
+/// Each file of the fork's ledger that holds an `adopt` event of `name`:
+/// its path, its frontmatter and its text.
+fn adopt_event_files(
+    home: &tempfile::TempDir,
+    name: &str,
+) -> Vec<(std::path::PathBuf, toml::Table, String)> {
+    let mut files = Vec::new();
+    let ledger = home.path().join("ledger").join("demo");
+    for dirent in std::fs::read_dir(&ledger).expect("read the ledger directory") {
+        let path = dirent.expect("read a ledger file").path();
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some((frontmatter, text)) = contents
+            .strip_prefix("+++\n")
+            .and_then(|rest| rest.split_once("+++\n"))
+        else {
+            continue;
+        };
+        if text.starts_with(&format!("edited {name} as ")) && text.contains(" parent(s): adopted: ")
+        {
+            let frontmatter: toml::Table = frontmatter
+                .parse()
+                .expect("parse an adopt event's frontmatter");
+            files.push((path, frontmatter, text.to_owned()));
+        }
+    }
+    files
+}
+
+/// Remove the `fix_files` list from each `adopt` event of `name`, so the
+/// event reads as a knives from before that list writes it: its text alone
+/// names the files of its fix.
+fn without_fix_files(home: &tempfile::TempDir, name: &str) {
+    let events = adopt_event_files(home, name);
+    assert!(!events.is_empty(), "no adopt event of {name}");
+    for (path, mut frontmatter, text) in events {
+        frontmatter.remove("fix_files");
+        let frontmatter = toml::to_string(&frontmatter).expect("write the frontmatter");
+        std::fs::write(
+            &path,
+            format!("+++\n{}\n+++\n{text}", frontmatter.trim_end()),
+        )
+        .expect("rewrite the adopt event");
+    }
+}
+
+/// [`RELEASE`] cut of `feat/alpha` and `feat/beta`, fixed by hand in place
+/// with the new file `file` and adopted, then the next release cut on it,
+/// which carries the fix; the two branches and the next release pushed, the
+/// adopt's commit never; and the second clone fetched, which holds the next
+/// release and not the adopt's commit. With `older`, the adopt event loses
+/// its `fix_files` list before the next cut ([`without_fix_files`]).
+/// Returns the adopt's commit and the next release's.
+fn separator_fix_lab(file: &str, older: bool) -> (Lab, tempfile::TempDir, CommitId, CommitId) {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{file}: {}", text(&cut));
+    lab.jj_work(["new", "-r", RELEASE]);
+    std::fs::write(lab.work_path().join(file), "fixed by hand\n").expect("write the fix");
+    lab.jj_work(["squash", "--into", RELEASE]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let adopted = knives_release(&lab, &home, &["adopt", RELEASE, "--why", "a fix by hand"]);
+    assert_eq!(adopted.status.code(), Some(0), "{file}: {}", text(&adopted));
+    let adopt = commit_at(&lab, RELEASE);
+    if older {
+        without_fix_files(&home, RELEASE);
+    }
+    let cut = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(
+        matches!(cut.status.code(), Some(0 | 1)),
+        "{file}: {}",
+        text(&cut)
+    );
+    let next = commit_at(&lab, "release/2026-08-05");
+    for branch in ["feat/alpha", "feat/beta", "release/2026-08-05"] {
+        lab.push_branch(branch);
+    }
+    fetch_second_clone(&lab);
+    assert!(
+        !second_clone_holds(&lab, &adopt) && second_clone_holds(&lab, &next),
+        "the second clone holds the next release and not the adopt's commit"
+    );
+    (lab, home, adopt, next)
+}
+
+/// The third release merged by hand in the second clone of `feat/alpha`
+/// and `feat/beta` as origin holds them, with the fix at `file`, and no ref
+/// on it. Returns its commit.
+fn fixed_merge_in_second_clone(lab: &Lab, file: &str) -> CommitId {
+    lab.jj_at(
+        &lab.second,
+        [
+            "new",
+            "-r",
+            "feat/alpha@origin",
+            "-r",
+            "feat/beta@origin",
+            "-m",
+            "the third release, merged by hand",
+        ],
+    );
+    std::fs::write(lab.second.join(file), "fixed by hand\n").expect("write the fix");
+    lab.jj_at(&lab.second, ["new"]);
+    CommitId::new(lab.revision(&lab.second, "@-", "commit_id").trim())
+}
+
+#[test]
+fn a_record_in_a_clone_without_the_adopts_commit_reads_a_listed_path_with_a_separator_whole() {
+    for file in ["x, y.txt", "x (why: y.txt"] {
+        // Given: RELEASE fixed by hand with the new file `file` and adopted,
+        // whose event lists that file; the next release cut on it; a second
+        // clone that holds the next release and not the adopt's commit; and
+        // the third release merged by hand there, with the fix.
+        let (lab, home, _adopt, _next) = separator_fix_lab(file, false);
+        let listed: Vec<String> = adopt_event_files(&home, RELEASE)
+            .iter()
+            .filter_map(|(_, frontmatter, _)| frontmatter.get("fix_files")?.as_array().cloned())
+            .flatten()
+            .filter_map(|listed| Some(listed.get("path")?.as_str()?.to_owned()))
+            .collect();
+        assert_eq!(listed, [file], "the adopt event lists the file whole");
+        let commit = fixed_merge_in_second_clone(&lab, file);
+
+        // When: it is recorded in the second clone.
+        let recorded = cut_in_second_clone(
+            &lab,
+            &home,
+            &["release/2026-08-06", "--at", commit.as_str()],
+        );
+
+        // Then: it is recorded: the clone reads the path whole from the
+        // adopt event's list, and the commit holds there what the newest
+        // recorded write holds.
+        let out = text(&recorded);
+        assert_eq!(recorded.status.code(), Some(0), "{file}: {out}");
+        assert!(
+            out.contains(&recorded_line("release/2026-08-06", &commit)),
+            "{file}: {out}"
+        );
+    }
+}
+
+#[test]
+fn an_older_adopt_of_a_path_with_a_separator_is_unreadable_in_a_clone_without_its_commit() {
+    for file in ["x, y.txt", "x (why: y.txt"] {
+        // Given: RELEASE fixed by hand with the new file `file` and adopted,
+        // its event as a knives from before the `fix_files` list writes it,
+        // so its text alone names the file; the next release cut on it in
+        // the work checkout, which holds the adopt and reads the path whole
+        // from it; a second clone that holds the next release and not the
+        // adopt's commit; and the third release merged by hand there, with
+        // the fix.
+        let (lab, home, adopt, next) = separator_fix_lab(file, true);
+        let commit = fixed_merge_in_second_clone(&lab, file);
+        let entries = ledger_entries(&home);
+
+        // When: it is recorded in the second clone.
+        let recorded = cut_in_second_clone(
+            &lab,
+            &home,
+            &["release/2026-08-06", "--at", commit.as_str()],
+        );
+
+        // Then: it is refused, naming the adopt and the piece of the path
+        // that nothing here holds, and nothing is written: the clone cannot
+        // tell which files the fix changed, and a path that nothing holds
+        // never counts as held.
+        let out = text(&recorded);
+        assert_eq!(recorded.status.code(), Some(3), "{file}: {out}");
+        assert!(
+            out.contains(&format!(
+                "demo: refusing to record release/2026-08-06 at {}: it cannot be held against the \
+                 fix by hand of {RELEASE}'s adopt {}: its adopt event names its files in its text \
+                 alone, and nothing is at x",
+                commit.short(),
+                adopt.short()
+            )),
+            "{file}: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                " in {} or in release/2026-08-05's newest recorded write (a cut) {}, so this \
+                 repository cannot read which files that fix changed\n",
+                commit.short(),
+                next.short()
+            )),
+            "{file}: {out}"
+        );
+        assert_eq!(ledger_entries(&home), entries, "{file}: {out}");
+
+        // When: it is recorded again, the drop stated.
+        let allowed = cut_in_second_clone(
+            &lab,
+            &home,
+            &[
+                "release/2026-08-06",
+                "--at",
+                commit.as_str(),
+                "--allow-drop",
+            ],
+        );
+
+        // Then: it is recorded, and both its line and its event name the
+        // adopt as one this repository cannot read.
+        let out = text(&allowed);
+        assert_eq!(allowed.status.code(), Some(0), "{file}: {out}");
+        assert!(
+            out.contains(&format!(
+                "demo: --allow-drop: recording release/2026-08-06 at {} without the fix by hand of \
+                 {RELEASE}'s adopt {}, which this repository cannot read: its adopt event names \
+                 its files in its text alone",
+                commit.short(),
+                adopt.short()
+            )),
+            "{file}: {out}"
+        );
+        let event = newest_event(&home, "release/2026-08-06");
+        assert!(
+            event.text.contains(&format!(
+                "; without the fix by hand of {RELEASE}'s adopt {}, which this repository cannot \
+                 read",
+                adopt.short()
+            )),
+            "{file}: {event:?}"
+        );
+    }
+}
+
+#[test]
+fn an_adopt_event_that_lists_its_files_reads_in_a_knives_that_does_not_know_the_list() {
+    // Given: a ledger whose one file is an adopt event as this knives writes
+    // it, with its `fix_files` list, and one more list a later knives may
+    // add. Built against an older knives's library, this test is that
+    // knives reading the event.
+    let home = tempfile::tempdir().expect("a config home");
+    let ledger = home.path().join("ledger").join("demo");
+    std::fs::create_dir_all(&ledger).expect("create the ledger directory");
+    let said = "edited release/2026-08-04 as 0123456789ab (change kkkkkkkkkkkk) with 2 \
+                parent(s): adopted: replaces the recorded cut 1123456789ab; measured against \
+                the recorded cut 1123456789ab; changed beyond the baseline's conflicts: x, \
+                y.txt (why: a fix by hand); parents: feat/alpha@2123456789ab, \
+                feat/beta@3123456789ab";
+    std::fs::write(
+        ledger.join("20260815T221403.000000000Z-0000.md"),
+        format!(
+            "+++\nts = \"2026-08-15T22:14:03Z\"\nowner = \"ses_fff688\"\n\
+             subject = \"release/2026-08-04\"\nkind = \"event\"\n\
+             evidence = [\"0123456789ab\", \"2123456789ab\", \"3123456789ab\"]\n\
+             [[parents]]\ncommit = \"2123456789ab\"\nbranches = [\"feat/alpha\"]\n\
+             [[parents]]\ncommit = \"3123456789ab\"\nbranches = [\"feat/beta\"]\n\
+             [[fix_files]]\npath = \"x, y.txt\"\nchange = \"beyond\"\n\
+             [[later_list]]\npath = \"w.txt\"\n+++\n{said}\n"
+        ),
+    )
+    .expect("write the adopt event");
+
+    // When: the ledger is read.
+    let read = Ledger::at(ledger).read().expect("read the ledger");
+
+    // Then: the event reads, with its subject, its text and its parents,
+    // and no problem is named.
+    assert!(read.problems.is_empty(), "{:?}", read.problems);
+    assert_eq!(read.entries.len(), 1, "{:?}", read.entries);
+    let event = &read.entries[0];
+    assert_eq!(event.subject.as_deref(), Some("release/2026-08-04"));
+    assert_eq!(event.text, said);
+    assert_eq!(
+        event.parents,
+        [
+            RecordedParent {
+                commit: "2123456789ab".to_owned(),
+                branches: vec!["feat/alpha".to_owned()],
+            },
+            RecordedParent {
+                commit: "3123456789ab".to_owned(),
+                branches: vec!["feat/beta".to_owned()],
+            },
+        ]
+    );
 }

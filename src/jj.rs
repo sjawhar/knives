@@ -1108,6 +1108,13 @@ impl Repo {
         Ok(value(first)? == value(second)?)
     }
 
+    /// Whether `revision` holds anything at `path` (repository-internal,
+    /// `/`-separated): a file, symlink, directory or conflict
+    /// ([`tree_holds`]).
+    pub fn holds_path(&self, revision: &CommitId, path: &str) -> Result<bool, JjError> {
+        tree_holds(&self.commit(revision.as_str())?.tree(), path)
+    }
+
     /// The visible commits that share `revision`'s change id, other than
     /// `revision` itself: what a `jj rebase` (or a resolved conflict) left in
     /// the commit's place. Empty for a commit whose change was never rewritten
@@ -2065,6 +2072,21 @@ fn internal_path(path: &str) -> Result<&RepoPath, JjError> {
         revision: path.to_owned(),
         detail: error.to_string(),
     })
+}
+
+/// Whether `tree` holds anything at `path` (repository-internal,
+/// `/`-separated): a file, symlink, directory or conflict. A string that
+/// names no file, the empty one or one jj cannot read as a path, is held by
+/// nothing.
+fn tree_holds(tree: &MergedTree, path: &str) -> Result<bool, JjError> {
+    let Ok(path) = RepoPath::from_internal_string(path) else {
+        return Ok(false);
+    };
+    if path.is_root() {
+        return Ok(false);
+    }
+    let value = block_on(tree.path_value(path)).map_err(|error| store_error(&error))?;
+    Ok(!value.is_absent())
 }
 
 /// Replays `base..revision` onto a target and classifies the resulting content.
@@ -3887,6 +3909,11 @@ impl Candidate {
             }
         }
         Ok(true)
+    }
+
+    /// Whether the candidate holds anything at `path` ([`tree_holds`]).
+    pub fn holds_path(&self, path: &str) -> Result<bool, JjError> {
+        tree_holds(&self.commit.tree(), path)
     }
 
     /// Paths whose content differs between `previous` and the candidate.

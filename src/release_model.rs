@@ -1353,6 +1353,49 @@ pub fn adopted_fix_replaces<'a>(entry: &'a Entry, release: &str) -> Option<&'a s
     adopted_fix_parts(entry, release).map(|(commit, _)| commit)
 }
 
+/// The files that an `adopt` event names as its fix by hand
+/// ([`adopted_fix_files`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdoptedFixFiles {
+    /// The files resolved by hand, then those changed beyond the baseline's
+    /// conflicts.
+    pub files: Vec<String>,
+    /// Whether they were read from the event's text, as for an event without
+    /// a `fix_files` list ([`Entry::fix_files`]), which an older knives
+    /// writes. The text joins a list's files with `, ` and ends the list at
+    /// `; ` or ` (why: `, so a path that holds one of those reads back in
+    /// pieces, and a reader must not count a piece that nothing holds as
+    /// held.
+    pub from_text: bool,
+}
+
+impl AdoptedFixFiles {
+    /// The files named here that `measured`, the files a measurement of the
+    /// fix found, leaves out. A file read from the text that is a piece of a
+    /// measured path, as the text cuts that path ([`text_pieces`]), is part
+    /// of that path and no file of its own.
+    pub fn unmeasured_by(self, measured: &[String]) -> Vec<String> {
+        let from_text = self.from_text;
+        self.files
+            .into_iter()
+            .filter(|file| {
+                !measured.iter().any(|path| {
+                    path == file || (from_text && text_pieces(path).any(|piece| piece == file))
+                })
+            })
+            .collect()
+    }
+}
+
+/// The pieces an `adopt` event's text gives back of `path` where a reader
+/// reads its lists ([`adopted_fix_files`]): `path` cut at each `, `, `; `
+/// and ` (why: ` it holds.
+fn text_pieces(path: &str) -> impl Iterator<Item = &str> {
+    path.split(", ")
+        .flat_map(|piece| piece.split("; "))
+        .flat_map(|piece| piece.split(" (why: "))
+}
+
 /// The files that an `adopt` event of `release` names as its fix by hand.
 ///
 /// They are the files it resolved by hand ([`ADOPTED_RESOLVED`]), then the
@@ -1360,14 +1403,28 @@ pub fn adopted_fix_replaces<'a>(entry: &'a Entry, release: &str) -> Option<&'a s
 /// `adopt` measured them where it ran. Empty for every event that
 /// [`adopted_fix_replaces`] reads as no fix.
 ///
-/// The event names each list as its files joined by `, `. The resolved list
-/// ends at the next part, after `; `, and the other list ends where the
-/// reason begins, ` (why: `, or at the next part where no reason follows.
-/// A path that holds a separator does not read back whole.
-pub fn adopted_fix_files(entry: &Entry, release: &str) -> Vec<String> {
+/// The event's `fix_files` list holds each path whole
+/// ([`Entry::fix_files`]), and a reader takes it first. An event without
+/// the list, as an older knives writes one, names the files in its text
+/// alone ([`AdoptedFixFiles::from_text`]): each list as its files joined by
+/// `, `. The resolved list ends at the next part, after `; `, and the other
+/// list ends where the reason begins, ` (why: `, or at the next part where
+/// no reason follows. A path that holds a separator does not read back
+/// whole from the text.
+pub fn adopted_fix_files(entry: &Entry, release: &str) -> AdoptedFixFiles {
     let Some((_, mut parts)) = adopted_fix_parts(entry, release) else {
-        return Vec::new();
+        return AdoptedFixFiles::default();
     };
+    if !entry.fix_files.is_empty() {
+        return AdoptedFixFiles {
+            files: entry
+                .fix_files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect(),
+            from_text: false,
+        };
+    }
     let mut files = Vec::new();
     if let Some(resolved) = parts.strip_prefix(ADOPTED_RESOLVED) {
         let (list, rest) = resolved.split_once("; ").unwrap_or((resolved, ""));
@@ -1381,7 +1438,10 @@ pub fn adopted_fix_files(entry: &Entry, release: &str) -> Vec<String> {
             .map_or(beyond, |(list, _)| list);
         files.extend(list.split(", ").map(str::to_owned));
     }
-    files
+    AdoptedFixFiles {
+        files,
+        from_text: true,
+    }
 }
 
 /// The replaced write's commit prefix and the parts after the baseline of
@@ -2133,6 +2193,7 @@ mod carrier_tests {
                 commit: "member0000000".to_owned(),
                 branches: vec!["feat/member".to_owned()],
             }],
+            fix_files: Vec::new(),
             claim_change: None,
             claim_change_why: None,
             previous_owner: None,
@@ -2451,11 +2512,14 @@ mod unchecked_mark_tests {
 
 #[cfg(test)]
 mod adopted_fix_tests {
-    use super::{CommitId, adopted_fix_files, adopted_fix_replaces, carrier_tests::event};
+    use super::{
+        AdoptedFixFiles, CommitId, adopted_fix_files, adopted_fix_replaces, carrier_tests::event,
+    };
+    use crate::ledger::{Entry, FixChange, FixFile};
 
     /// An `adopt` event of `integration` whose delta after its baseline says
     /// `parts`, as `adopt` writes one.
-    fn adopted(parts: &str) -> crate::ledger::Entry {
+    fn adopted(parts: &str) -> Entry {
         let commit = CommitId::new("a".repeat(40));
         event(
             "integration",
@@ -2498,9 +2562,11 @@ mod adopted_fix_tests {
         for (parts, files) in cases {
             let entry = adopted(parts);
 
-            // Then: each names the files of its fix, and the write it
-            // replaced exactly when it names a file.
-            assert_eq!(adopted_fix_files(&entry, "integration"), files, "{parts}");
+            // Then: each names the files of its fix, read from its text, and
+            // the write it replaced exactly when it names a file.
+            let named = adopted_fix_files(&entry, "integration");
+            assert_eq!(named.files, files, "{parts}");
+            assert_eq!(named.from_text, !files.is_empty(), "{parts}");
             assert_eq!(
                 adopted_fix_replaces(&entry, "integration").is_some(),
                 !files.is_empty(),
@@ -2509,9 +2575,67 @@ mod adopted_fix_tests {
             // And: another release's name reads no fix in it.
             assert_eq!(
                 adopted_fix_files(&entry, "release/2026-08-04"),
-                Vec::<String>::new()
+                AdoptedFixFiles::default()
             );
         }
+    }
+
+    #[test]
+    fn an_adopt_events_list_names_each_path_whole_where_its_text_names_pieces() {
+        // Given: an adopt that resolved `x, y.txt` by hand and changed
+        // `x (why: y.txt` beyond its baseline's conflicts, whose text names
+        // both; once with its `fix_files` list, and once without it, as a
+        // knives from before the list writes the event.
+        let older = adopted(
+            "resolved by hand: x, y.txt; changed beyond the baseline's conflicts: x (why: y.txt \
+             (why: a fix)",
+        );
+        let listed = Entry {
+            fix_files: vec![
+                FixFile {
+                    path: "x, y.txt".to_owned(),
+                    change: FixChange::Resolved,
+                },
+                FixFile {
+                    path: "x (why: y.txt".to_owned(),
+                    change: FixChange::Beyond,
+                },
+            ],
+            ..older.clone()
+        };
+
+        // When: each event's files are read.
+        let whole = adopted_fix_files(&listed, "integration");
+        let pieces = adopted_fix_files(&older, "integration");
+
+        // Then: the list gives each path whole; the text gives pieces, and
+        // says that it read them from the text.
+        assert_eq!(whole.files, ["x, y.txt", "x (why: y.txt"]);
+        assert!(!whole.from_text);
+        assert_eq!(pieces.files, ["x", "y.txt", "x"]);
+        assert!(pieces.from_text);
+        assert_eq!(
+            adopted_fix_replaces(&listed, "integration"),
+            adopted_fix_replaces(&older, "integration")
+        );
+        // And: a measurement that finds a path whole leaves no piece of it
+        // as a file of its own, and leaves every other file named.
+        let measured = ["x, y.txt".to_owned()];
+        assert_eq!(
+            pieces.clone().unmeasured_by(&measured),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            pieces.unmeasured_by(&["a.txt".to_owned()]),
+            ["x", "y.txt", "x"]
+        );
+        assert_eq!(whole.unmeasured_by(&measured), ["x (why: y.txt"]);
+        // And: a path read whole is never taken for a piece of another.
+        let alone = AdoptedFixFiles {
+            files: vec!["x".to_owned()],
+            from_text: false,
+        };
+        assert_eq!(alone.unmeasured_by(&measured), ["x"]);
     }
 }
 
