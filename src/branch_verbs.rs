@@ -224,10 +224,11 @@ pub(crate) fn run_finish(
     if let Err(refused) = kept {
         eprintln!(
             "{}/{branch}: claim {claim}; jj could not snapshot all of the working copy at {}, \
-             so the workspace is kept exactly as it is and the next `knives start {branch}` \
+             so the workspace is kept exactly as it is and the next `knives start {}` \
              adopts that directory without touching what is in it\n{}",
             fork.name,
             inline_human_text(&refused.at.display().to_string()),
+            knives::ledger::shell_word(branch.as_str()),
             knives::ledger::problem_human_text(&refused.refused.to_string()),
         );
         return Ok(Exit::Incomplete);
@@ -565,9 +566,10 @@ fn live_users_gate(
     let shown = inline_human_text(&list);
     eprintln!(
         "{}/{branch}: {} is in use by {shown}; finishing would take the directory from under \
-         it\nuse `knives finish {branch} --force --why \"…\"` once it is done",
+         it\nuse `knives finish {} --force --why \"…\"` once it is done",
         fork.name,
-        inline_human_text(&directory.display().to_string())
+        inline_human_text(&directory.display().to_string()),
+        knives::ledger::shell_word(branch.as_str())
     );
     Err(Exit::Usage)
 }
@@ -776,7 +778,7 @@ fn unheld_gate(
         "{}\nnobody holds {} now\nuse `knives start {}` to claim it again",
         displacement(target, &identity.owner, change, lost),
         target.key(),
-        target.branch,
+        knives::ledger::shell_word(target.branch.as_str()),
     );
     Ok(FinishClaimGate::Lost)
 }
@@ -825,6 +827,8 @@ struct Refusal<'a> {
 fn refuse_held(refusal: &Refusal<'_>) -> FinishClaimGate {
     let context = render_claim_context(refusal.claim, refusal.last_seen, jiff::Timestamp::now());
     let branch = &refusal.target.branch;
+    // The branch is one shell word inside each command a person pastes.
+    let word = knives::ledger::shell_word(branch.as_str());
     // The notice belongs to a caller another owner name displaced. A caller
     // whose own name holds the claim lost it to nobody: it is refused because
     // two identities of that name cannot be told apart, and telling it that
@@ -835,7 +839,7 @@ fn refuse_held(refusal: &Refusal<'_>) -> FinishClaimGate {
     {
         eprintln!(
             "{}\n{context}\nnothing was changed here: the workspace and its registration are \
-             the holder's\nuse `knives start {branch} --force --why \"…\"` to take the branch back",
+             the holder's\nuse `knives start {word} --force --why \"…\"` to take the branch back",
             displacement(refusal.target, &refusal.identity.owner, change, lost),
         );
         return FinishClaimGate::Refuse(Exit::Findings);
@@ -853,7 +857,7 @@ fn refuse_held(refusal: &Refusal<'_>) -> FinishClaimGate {
         )
     });
     eprintln!(
-        "{anonymous_note}{context}\n{unread}use `knives finish {branch} --force --why \"…\"` to \
+        "{anonymous_note}{context}\n{unread}use `knives finish {word} --force --why \"…\"` to \
          release the claim"
     );
     FinishClaimGate::Refuse(Exit::Usage)
@@ -967,7 +971,7 @@ fn place_gate(
         claim.key(),
         inline_human_text(&claim.owner),
         inline_human_text(taken),
-        target.branch,
+        knives::ledger::shell_word(target.branch.as_str()),
     );
     FinishClaimGate::Refuse(Exit::Usage)
 }

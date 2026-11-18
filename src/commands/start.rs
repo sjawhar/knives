@@ -328,7 +328,7 @@ fn refuse_claim(
         "{anonymous_note}{}\n{}\nuse `knives start {} --force --why \"…\"` to seize the claim",
         render_claim_context(claim, last_seen, jiff::Timestamp::now()),
         claim_evidence(claim, workspace),
-        claim.branch,
+        crate::ledger::shell_word(&claim.branch),
     );
     Exit::Usage
 }
@@ -627,23 +627,22 @@ fn record_claim(
 /// the error is jj's own text, which prints more than one line, so both
 /// reach the terminal escaped ([`crate::ledger::inline_human_text`] and
 /// [`crate::ledger::problem_human_text`]). The branch and the workspace name
-/// are this process's own.
+/// are this process's own; the branch is one shell word inside the command.
 fn resume_workspace_notice(context: &StartContext<'_>) -> String {
     let shown = crate::ledger::inline_human_text(&context.destination.display().to_string());
+    let word = crate::ledger::shell_word(context.branch.as_str());
     if !context.destination.exists() {
         return format!(
-            "workspace missing at {shown}; `knives start {} --force --why \"…\"` rebuilds it",
-            context.branch
+            "workspace missing at {shown}; `knives start {word} --force --why \"…\"` rebuilds it"
         );
     }
     match workspace_change(&context.opened, &context.workspace) {
         Ok(change) => format!("workspace {shown} at {change}"),
         Err(error) => format!(
             "workspace {shown} is present but not registered as {} ({}); \
-             `knives start {} --force --why \"…\"` rebuilds it",
+             `knives start {word} --force --why \"…\"` rebuilds it",
             context.workspace,
-            crate::ledger::problem_human_text(&error.to_string()),
-            context.branch
+            crate::ledger::problem_human_text(&error.to_string())
         ),
     }
 }
@@ -829,11 +828,13 @@ enum WorkspaceBase {
 /// was claimed, so a plain `start` afterwards is the way back.
 fn divergent_refusal_line(branch: &BranchName, tips: &[CommitId]) -> String {
     let listed: Vec<&str> = tips.iter().map(CommitId::short).collect();
+    // The branch is one shell word inside the command a person pastes.
     format!(
-        "{branch} is divergent ({} tips: {}); `jj bookmark set {branch} -r <commit> \
+        "{branch} is divergent ({} tips: {}); `jj bookmark set {} -r <commit> \
          --allow-backwards` on the one to continue, then start again",
         tips.len(),
-        listed.join(", ")
+        listed.join(", "),
+        crate::ledger::shell_word(branch.as_str())
     )
 }
 
@@ -909,7 +910,7 @@ fn create_workspace(
                 "a locked Git worktree registration at {} has no directory there; if it is \
                  this branch's and no other machine has it open, `knives finish {}` clears it",
                 context.destination.display(),
-                context.branch
+                crate::ledger::shell_word(context.branch.as_str())
             ),
             StaleRegistration::Occupied => refuse_occupied(context)?,
         },

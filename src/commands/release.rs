@@ -1426,9 +1426,13 @@ pub fn no_match_refusal(
     };
     // A name held only as the publish remote's ref (a fresh clone of a
     // release another pod pushed) has no local bookmark for the squash to
-    // move or for adopt to read, so it is tracked first.
+    // move or for adopt to read, so it is tracked first. The name is one
+    // shell word inside the command; the remote is a registry value.
     let track = if repo.local_bookmark_tip(name).is_none() {
-        format!("track it (`jj bookmark track {shown}@{publish_remote}`), then ")
+        format!(
+            "track it (`jj bookmark track {}@{publish_remote}`), then ",
+            crate::ledger::shell_word(name)
+        )
     } else {
         String::new()
     };
@@ -1458,10 +1462,14 @@ pub fn unchecked_line(name: &str, commit: &CommitId, standing: &InHandWrite) -> 
         InHandWrite::NoRecord => None,
         InHandWrite::Recorded | InHandWrite::Unrecorded { .. } => return None,
     };
-    // The release is a name read from the repository.
+    // The release is a name read from the repository: escaped in prose, and
+    // one shell word inside the command.
     let shown = crate::ledger::inline_human_text(name);
     let at = commit.short();
-    let adopt = format!("`knives release adopt {shown}` records it");
+    let adopt = format!(
+        "`knives release adopt {}` records it",
+        crate::ledger::shell_word(name)
+    );
     let (why, remedy) = match unchecked {
         Some(Unchecked::WriteAbsent(write)) => (
             format!(
@@ -1523,7 +1531,8 @@ pub fn published_remedy_text(
     let target = on.or(published);
     let backwards = match target {
         Some(target) if repo.local_bookmark_tip(name).as_ref() == Some(commit) => format!(
-            " (`jj bookmark set {shown} -r {} --allow-backwards`)",
+            " (`jj bookmark set {} -r {} --allow-backwards`)",
+            crate::ledger::shell_word(name),
             target.short()
         ),
         _ => String::new(),
@@ -1595,8 +1604,9 @@ pub fn published_remedy_text(
         steps.push(format!("`jj abandon {}`", commit.short()));
     }
     steps.push(format!(
-        "`jj bookmark forget {shown}` (never `jj bookmark delete`, which a push would carry to \
-         the remote)"
+        "`jj bookmark forget {}` (never `jj bookmark delete`, which a push would carry to \
+         the remote)",
+        crate::ledger::shell_word(name)
     ));
     Ok(format!(
         "{shown} is published ({evidence}), so a hand edit cannot be recorded under it: {}",
@@ -1675,13 +1685,16 @@ pub fn in_hand_refusal(
     {
         return Ok(Some(remedy));
     }
+    // The release is a name read from the repository: escaped in prose, and
+    // one shell word inside the command.
     let shown = crate::ledger::inline_human_text(name);
     Ok(Some(format!(
         "{shown} at {} carries a change no knives write or adopt recorded: its tree is not {} \
-         rebased onto its members; record it with `knives release adopt {shown}` (adopt asks for \
+         rebased onto its members; record it with `knives release adopt {}` (adopt asks for \
          --why only for a change outside the conflicts)",
         commit.short(),
-        described_write(write)
+        described_write(write),
+        crate::ledger::shell_word(name)
     )))
 }
 
@@ -2080,7 +2093,8 @@ fn built_on_release_note(
         MemberHistory::Linear | MemberHistory::CarriedMerges { .. } => format!(
             "{branch} is built on {reference}, which the next cut of this stacked series starts \
              on; `knives release cut <name>` makes that cut, and `knives release include \
-             {branch}` then adds it"
+             {}` then adds it",
+            crate::ledger::shell_word(branch)
         ),
     })
 }
@@ -2218,27 +2232,29 @@ fn local_branch_notes(input: &LocalBranchNotes<'_>) -> anyhow::Result<Vec<String
             ));
             continue;
         }
+        // The branch is one shell word inside each command a person pastes.
+        let word = crate::ledger::shell_word(branch);
         notes.push(match (lookup.parents.first(), lookup.evidence) {
             (None, _) => {
-                format!("{branch} is not in {reference}; `knives release include {branch}` adds it")
+                format!("{branch} is not in {reference}; `knives release include {word}` adds it")
             }
             (Some(_), MemberEvidence::Succession) if integrates => format!(
                 "{branch} merges {} member(s) of {reference} and builds on them; `knives \
-                 release include {branch}` adds it beside them",
+                 release include {word}` adds it beside them",
                 lookup.parents.len()
             ),
             (Some(_), MemberEvidence::Succession) => format!(
                 "{branch} has advanced past its parent in {reference}; \
-                 `knives release advance {branch}` moves it"
+                 `knives release advance {word}` moves it"
             ),
             (Some(parent), MemberEvidence::Record) => format!(
                 "{branch} was released as {} in {reference} and has since been rebased outside \
-                 jj; `knives release advance {branch}` moves it through that record",
+                 jj; `knives release advance {word}` moves it through that record",
                 parent.short()
             ),
             (Some(parent), MemberEvidence::LandedRecord) => format!(
                 "{branch}'s released parent {} in {reference} has landed upstream and the \
-                 branch kept going; `knives release advance {branch}` moves it, \
+                 branch kept going; `knives release advance {word}` moves it, \
                  `knives release rebase` retires the landed parent",
                 parent.short()
             ),

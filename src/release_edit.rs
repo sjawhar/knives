@@ -13,7 +13,7 @@ use knives::commands::claim::Bound;
 use knives::commands::release;
 use knives::forge::github::CliForge;
 use knives::ids::{BranchName, CommitId, ReleaseScheme, RepoName};
-use knives::ledger::{Draft, Ledger, inline_human_text};
+use knives::ledger::{Draft, Ledger, inline_human_text, shell_word};
 use knives::release_model::{
     EarlierWrites, MemberEvidence, MemberHistory, MemberLookup, MemberSuccession, PreviousRelease,
     SeriesFit, StackedHistoryContext, carried_from_tips, carries_member_line, composition,
@@ -415,10 +415,11 @@ impl EditContext<'_> {
             let listed: Vec<&str> = lookup.parents.iter().map(CommitId::short).collect();
             println!(
                 "{repo}: {shown_branch} merges {} member(s) of {} ({}) and builds on them; \
-                 `knives release include {shown_branch}` adds it beside them",
+                 `knives release include {}` adds it beside them",
                 lookup.parents.len(),
                 release.shown_name(),
-                listed.join(", ")
+                listed.join(", "),
+                shell_word(branch)
             );
             return Ok(None);
         }
@@ -1155,10 +1156,12 @@ pub(crate) fn release_is_locally_movable(
     }
     let shown = inline_human_text(name);
     match knives::ids::BookmarkRef::parse(name) {
+        // The branch is one shell word inside the command; the remote is a
+        // name read from the repository, escaped beside it.
         knives::ids::BookmarkRef::Remote { branch, remote } => println!(
             "{repo}: {shown} is here only as a remote ref, so there is no local bookmark to \
              move; `jj bookmark track {}@{}` first",
-            inline_human_text(branch.as_str()),
+            shell_word(branch.as_str()),
             inline_human_text(remote.as_str())
         ),
         knives::ids::BookmarkRef::Local(_) => println!(
@@ -1264,22 +1267,24 @@ fn include_edit(
         // Moving a member is its own decision, and including it again would
         // carry it twice; say which situation the record describes.
         let parent = parent.short();
+        // The branch is one shell word inside each command a person pastes.
+        let word = shell_word(target);
         match lookup.evidence {
             MemberEvidence::Succession => println!(
                 "{repo}: {shown_release} carries {parent} of {shown_target}, and the branch has \
                  moved on (grown or rebased); moving a member is its own decision: `knives \
-                 release advance {shown_target}`"
+                 release advance {word}`"
             ),
             MemberEvidence::Record => println!(
                 "{repo}: {shown_release} carries {shown_target} as {parent} per its last cut or \
                  edit, and the branch has moved on without ancestry or change ids back to it \
                  (rebased outside jj?); including it again would carry it twice: `knives \
-                 release advance {shown_target}` moves it through that record"
+                 release advance {word}` moves it through that record"
             ),
             MemberEvidence::LandedRecord => println!(
                 "{repo}: {shown_release} carries {shown_target} as {parent} per its last cut or \
                  edit, and {parent} has landed upstream; including the branch again would carry \
-                 it twice: `knives release advance {shown_target}` moves the member to the \
+                 it twice: `knives release advance {word}` moves the member to the \
                  branch's tip, `knives release rebase` retires the landed parent"
             ),
         }
@@ -1617,7 +1622,8 @@ fn advance_named_members(
             ([], _) => {
                 println!(
                     "{repo}: {shown_release} carries no parent of {shown_branch}; `knives \
-                     release include {shown_branch}` adds it"
+                     release include {}` adds it",
+                    shell_word(branch.as_str())
                 );
                 return Ok(None);
             }
@@ -1732,8 +1738,9 @@ fn advance_named_member_from(
     let Some(index) = parents.iter().position(|parent| parent == old) else {
         println!(
             "{repo}: {} is not a parent of {shown_release}; `knives release include \
-             {shown_branch}` adds {shown_branch} instead",
-            old.short()
+             {}` adds {shown_branch} instead",
+            old.short(),
+            shell_word(branch.as_str())
         );
         return Ok(None);
     };

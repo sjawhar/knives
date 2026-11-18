@@ -135,9 +135,11 @@ fn scan_releases(
             let where_now = moved
                 .iter()
                 .map(|(branch, tip)| {
+                    // The branch is one shell word inside the command.
                     format!(
-                        "{branch} is now {}; `knives release advance {branch}` moves the member",
-                        tip.short()
+                        "{branch} is now {}; `knives release advance {}` moves the member",
+                        tip.short(),
+                        crate::ledger::shell_word(branch)
                     )
                 })
                 .collect::<Vec<_>>()
