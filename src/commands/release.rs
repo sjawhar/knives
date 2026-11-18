@@ -1749,6 +1749,33 @@ pub fn carried_row(name: &str, from: CarriedFrom) -> String {
     }
 }
 
+/// What a cut's drift is measured from, which its unexplained rows name
+/// ([`unexplained_row`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriftBase {
+    /// The release the cut follows: a cut's previous release, the previous
+    /// release a stacked one stacks on, or the release a record follows.
+    PreviousRelease,
+    /// The members' fork point with the trunk: the series' first record
+    /// outside knives follows no release.
+    ForkPoint,
+}
+
+/// The row for a file the audited release changed since `base` that no
+/// member or trunk explains ([`CutAudit::unexplained`]).
+pub fn unexplained_row(file: &str, base: DriftBase) -> String {
+    // A path jj's diff named, so it reaches the terminal escaped.
+    let file = crate::ledger::inline_human_text(file);
+    let base = match base {
+        DriftBase::PreviousRelease => "the previous release",
+        DriftBase::ForkPoint => "the members' fork point with the trunk",
+    };
+    format!(
+        "  !! {file}: changed between {base} and this cut with no member or trunk \
+         explaining it"
+    )
+}
+
 /// The newest dated cut's branch name — unqualified, unlike
 /// [`previous_release_for_cut`]'s — and its live commit: the local ref when
 /// present, otherwise whichever of our remotes carries it.
@@ -2592,14 +2619,14 @@ pub fn render_members(report: &MembersReport) -> String {
                 inline_human_text(name)
             ));
         }
-        // Paths jj's diff named, so each goes out escaped.
-        for file in &audit.unexplained {
-            lines.push(format!(
-                "  !! {}: changed between the previous release and this cut \
-                 with no member or trunk explaining it",
-                inline_human_text(file)
-            ));
-        }
+        // `members --verify` measures drift only from the previous release a
+        // stacked release stacks on.
+        lines.extend(
+            audit
+                .unexplained
+                .iter()
+                .map(|file| unexplained_row(file, DriftBase::PreviousRelease)),
+        );
     }
     // A note quotes jj, the forge or a consumer's pin files; the report keeps
     // the raw text for `--json`, and this line is the one a terminal reads.
@@ -3521,7 +3548,9 @@ pub fn audit_cut(
 /// follows: a cut's `context.previous`, or the previous release a stacked one
 /// stacks on. It is apart from `context.previous`, what a member's divergence
 /// may be carried from, because a release cut outside knives has a release
-/// it follows but carries nothing forward: a member it lacks is missing.
+/// it follows but carries nothing forward: a member it lacks is missing. The
+/// series' first record outside knives follows no release, and its drift is
+/// measured from `context.trunk`, its members' fork point with the trunk.
 /// With no `drift_from` there is no drift check, as for a first cut.
 pub fn audit_cut_from(
     repo: &Path,

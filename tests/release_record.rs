@@ -459,6 +459,38 @@ fn a_first_record_with_a_change_no_member_explains_is_refused() {
 }
 
 #[test]
+fn a_first_record_refusal_names_the_members_fork_point_with_the_trunk() {
+    // Given: the series' first release, merged by hand of two branches, with
+    // a file added in the merge itself that no member has.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.jj_work(["new", "-r", "feat/alpha", "-r", "feat/beta", "-m", RELEASE]);
+    std::fs::write(lab.work_path().join("unexplained.txt"), "no member\n")
+        .expect("write unexplained.txt");
+    lab.jj_work(["new"]);
+    let commit = commit_of(&lab, "@-");
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: it is recorded.
+    let recorded = record(&lab, &home, RELEASE, &commit);
+
+    // Then: the refusal names what the drift was measured from: no release
+    // precedes the first record, so it is the members' fork point with the
+    // trunk, never a previous release.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(
+            "  !! unexplained.txt: changed between the members' fork point with the trunk and \
+             this cut with no member or trunk explaining it"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("between the previous release"), "{out}");
+}
+
+#[test]
 fn a_hand_merge_from_the_trunk_records_only_its_branches() {
     // Given: a release merged by hand from the trunk, as `git merge` makes
     // one there: its parents are the trunk, then two branches.

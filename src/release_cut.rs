@@ -338,6 +338,7 @@ pub(crate) fn run_release(
                         },
                         stacked_on: None,
                         drift_from: previous_commit.as_ref(),
+                        drift_base: release::DriftBase::PreviousRelease,
                         carried_from,
                     };
                     let checked =
@@ -404,7 +405,12 @@ pub(crate) fn run_release(
                 previous_commit.as_ref(),
             ),
         )?;
-        if let Some(exit) = report_cut_audit(repo, &audit, carried_from) {
+        if let Some(exit) = report_cut_audit(
+            repo,
+            &audit,
+            carried_from,
+            release::DriftBase::PreviousRelease,
+        ) {
             return Ok(exit);
         }
         let (recorded, check) = {
@@ -617,11 +623,13 @@ fn verbatim_cut_reason(
 /// like success while work is gone. The refused candidate was never a
 /// published operation, so nothing is abandoned and nothing needs cleanup.
 /// A divergence carried from the release in hand reads by how that release
-/// stands to its recorded writes (`carried_from`).
+/// stands to its recorded writes (`carried_from`), and an unexplained file
+/// names what the drift is measured from (`drift_base`).
 fn report_cut_audit(
     repo: &RepoName,
     audit: &release::CutAudit,
     carried_from: release::CarriedFrom,
+    drift_base: release::DriftBase,
 ) -> Option<Exit> {
     for name in &audit.carried {
         println!("{}", release::carried_row(name, carried_from));
@@ -643,13 +651,8 @@ fn report_cut_audit(
             inline_human_text(name)
         );
     }
-    // Paths jj's diff named, so each reaches the terminal escaped.
     for file in &audit.unexplained {
-        println!(
-            "  !! {}: changed between the previous release and this cut \
-             with no member or trunk explaining it",
-            inline_human_text(file)
-        );
+        println!("{}", release::unexplained_row(file, drift_base));
     }
     println!("{repo}: cut discarded; nothing was written at all. Fix the inputs and re-cut.");
     Some(Exit::Incomplete)
@@ -1001,9 +1004,14 @@ struct CommittedCut<'a> {
     /// The previous release a release of a stacked series stacks on, which
     /// the audit measures each member from ([`release::audit_cut_from`]).
     stacked_on: Option<&'a CommitId>,
-    /// The release the commit follows, which the audit measures its drift
-    /// from; `None` runs no drift check ([`release::audit_cut_from`]).
+    /// What the audit measures the commit's drift from: the release it
+    /// follows, or for the series' first record outside knives its members'
+    /// fork point with the trunk; `None` runs no drift check
+    /// ([`release::audit_cut_from`]).
     drift_from: Option<&'a CommitId>,
+    /// What `drift_from` is, which the row of a file no member explains
+    /// names ([`release::unexplained_row`]).
+    drift_base: release::DriftBase,
     carried_from: release::CarriedFrom,
 }
 
@@ -1028,7 +1036,7 @@ fn checked_committed_cut(
         release::CutSubject::Committed(cut.commit),
         (cut.context, cut.stacked_on, cut.drift_from),
     )?;
-    if let Some(exit) = report_cut_audit(repo, &audit, cut.carried_from) {
+    if let Some(exit) = report_cut_audit(repo, &audit, cut.carried_from, cut.drift_base) {
         return Ok(Err(exit));
     }
     let mut subject = release::CutSubject::Committed(cut.commit);
@@ -1055,11 +1063,12 @@ fn checked_committed_cut(
 /// member and each parent the trunk holds, and measures the drift from the
 /// release the record follows: the previous release a stacked one stacks
 /// on, else the newest other release of the series, as a cut's audit
-/// measures it ([`previous_release_for_record`]). A first record has none,
-/// and no drift check runs, as for a first cut: it is the release every
-/// later record's drift is measured from. Each refusal writes nothing. Only
-/// then is the local bookmark made, where no ref of the name exists, and the
-/// event recorded, which starts the background ledger sweep.
+/// measures it ([`previous_release_for_record`]). A first record follows no
+/// release, and its drift is measured from its members' fork point with the
+/// trunk: it is the release every later record's drift is measured from, so
+/// a change no member explains is refused in it too. Each refusal writes
+/// nothing. Only then is the local bookmark made, where no ref of the name
+/// exists, and the event recorded, which starts the background ledger sweep.
 fn record_hand_cut(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
@@ -1107,6 +1116,8 @@ fn record_hand_cut(
         .cloned()
         .collect();
     let stacked_on = composed.previous.as_ref().map(|previous| &previous.commit);
+    let (drift_from, drift_base) =
+        composed.drift_from(follows.as_ref().map(|(_, previous)| previous));
     let committed = CommittedCut {
         commit,
         members: &audited,
@@ -1117,7 +1128,8 @@ fn record_hand_cut(
             trunk: &composed.base,
         },
         stacked_on,
-        drift_from: stacked_on.or_else(|| follows.as_ref().map(|(_, previous)| previous)),
+        drift_from: Some(drift_from),
+        drift_base,
         carried_from: release::CarriedFrom::Unledgered,
     };
     let checked = match checked_committed_cut(repo, &committed, (&gate, allow_drop))? {
@@ -1418,8 +1430,29 @@ struct HandCut {
     bases: Vec<(String, CommitId)>,
     /// What the audit replays each member from and the composition gate's
     /// base: the previous release, or the trunk's fork point with the
-    /// members, as for a first cut.
+    /// members, as for a first cut. With no release to follow, the series'
+    /// first record measures its drift from it too ([`Self::drift_from`]).
     base: CommitId,
+}
+
+impl HandCut {
+    /// What the record's drift is measured from: the previous release it
+    /// stacks on, else `follows`, the series' previous release. The series'
+    /// first record follows no release, so its drift is measured from
+    /// `base`, its members' fork point with the trunk, and a change no member
+    /// explains is refused as in a later record.
+    fn drift_from<'a>(
+        &'a self,
+        follows: Option<&'a CommitId>,
+    ) -> (&'a CommitId, release::DriftBase) {
+        self.previous
+            .as_ref()
+            .map(|previous| &previous.commit)
+            .or(follows)
+            .map_or((&self.base, release::DriftBase::ForkPoint), |previous| {
+                (previous, release::DriftBase::PreviousRelease)
+            })
+    }
 }
 
 /// The members of `commit`, a release cut outside knives, as its series
