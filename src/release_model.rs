@@ -1358,42 +1358,54 @@ pub fn adopted_fix_replaces<'a>(entry: &'a Entry, release: &str) -> Option<&'a s
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AdoptedFixFiles {
     /// The files resolved by hand, then those changed beyond the baseline's
-    /// conflicts.
+    /// conflicts. Read from the event's text, they are every path the text
+    /// may name ([`text_paths`]).
     pub files: Vec<String>,
     /// Whether they were read from the event's text, as for an event without
     /// a `fix_files` list ([`Entry::fix_files`]), which an older knives
     /// writes. The text joins a list's files with `, ` and ends the list at
-    /// `; ` or ` (why: `, so a path that holds one of those reads back in
-    /// pieces, and a reader must not count a piece that nothing holds as
-    /// held.
+    /// `; ` or ` (why: `, so it cannot tell a path that holds one of those
+    /// from two paths: a reader holds only those of [`Self::files`] that the
+    /// newest recorded write holds.
     pub from_text: bool,
 }
 
-impl AdoptedFixFiles {
-    /// The files named here that `measured`, the files a measurement of the
-    /// fix found, leaves out. A file read from the text that is a piece of a
-    /// measured path, as the text cuts that path ([`text_pieces`]), is part
-    /// of that path and no file of its own.
-    pub fn unmeasured_by(self, measured: &[String]) -> Vec<String> {
-        let from_text = self.from_text;
-        self.files
-            .into_iter()
-            .filter(|file| {
-                !measured.iter().any(|path| {
-                    path == file || (from_text && text_pieces(path).any(|piece| piece == file))
-                })
-            })
-            .collect()
-    }
-}
+/// What an `adopt` event's text joins the files of a list with, or cuts
+/// the list at, and so what a path that holds one reads back cut at.
+const TEXT_SEPARATORS: [&str; 3] = [", ", "; ", " (why: "];
 
-/// The pieces an `adopt` event's text gives back of `path` where a reader
-/// reads its lists ([`adopted_fix_files`]): `path` cut at each `, `, `; `
-/// and ` (why: ` it holds.
-fn text_pieces(path: &str) -> impl Iterator<Item = &str> {
-    path.split(", ")
-        .flat_map(|piece| piece.split("; "))
-        .flat_map(|piece| piece.split(" (why: "))
+/// Every path that `list`, one list of files in an `adopt` event's text,
+/// may name: each run of its pieces, as the text cuts it at each separator
+/// ([`TEXT_SEPARATORS`]), joined back with the separators the text holds
+/// between them. So `x, y.txt` gives `x`, `x, y.txt` and `y.txt`: two paths,
+/// or one path that holds `, `. Each path once, in the order the text
+/// names them.
+fn text_paths(list: &str) -> Vec<String> {
+    let (mut starts, mut ends) = (vec![0], Vec::new());
+    let mut at = 0;
+    while let Some((offset, separator)) = list.get(at..).and_then(|rest| {
+        TEXT_SEPARATORS
+            .iter()
+            .filter_map(|separator| rest.find(separator).map(|offset| (offset, *separator)))
+            .min_by_key(|(offset, _)| *offset)
+    }) {
+        ends.push(at + offset);
+        at += offset + separator.len();
+        starts.push(at);
+    }
+    ends.push(list.len());
+    let mut paths: Vec<String> = Vec::new();
+    for (piece, start) in starts.iter().enumerate() {
+        for end in ends.iter().skip(piece) {
+            if let Some(path) = list.get(*start..*end)
+                && !path.is_empty()
+                && !paths.iter().any(|named| named == path)
+            {
+                paths.push(path.to_owned());
+            }
+        }
+    }
+    paths
 }
 
 /// The files that an `adopt` event of `release` names as its fix by hand.
@@ -1407,12 +1419,15 @@ fn text_pieces(path: &str) -> impl Iterator<Item = &str> {
 /// ([`Entry::fix_files`]), and a reader takes it first. An event without
 /// the list, as an older knives writes one, names the files in its text
 /// alone ([`AdoptedFixFiles::from_text`]): each list as its files joined by
-/// `, `. The resolved list ends at the next part, after `; `, and the other
-/// list ends where the reason begins, ` (why: `, or at the next part where
-/// no reason follows. A path that holds a separator does not read back
-/// whole from the text.
+/// `, `, then the event's other parts after `; `, and its parents last,
+/// after `; parents: `. The resolved list ends where the other list begins,
+/// after `; `, or else at the next part that knives writes: `why: `,
+/// `carriers: ` or `added lines absent: `. The other list ends where its
+/// reason begins, at its last ` (why: `, or else at the next `; `. A path
+/// that holds a separator does not read back whole from a list, so each
+/// list gives every path it may name ([`text_paths`]).
 pub fn adopted_fix_files(entry: &Entry, release: &str) -> AdoptedFixFiles {
-    let Some((_, mut parts)) = adopted_fix_parts(entry, release) else {
+    let Some((_, parts)) = adopted_fix_parts(entry, release) else {
         return AdoptedFixFiles::default();
     };
     if !entry.fix_files.is_empty() {
@@ -1425,23 +1440,47 @@ pub fn adopted_fix_files(entry: &Entry, release: &str) -> AdoptedFixFiles {
             from_text: false,
         };
     }
-    let mut files = Vec::new();
-    if let Some(resolved) = parts.strip_prefix(ADOPTED_RESOLVED) {
-        let (list, rest) = resolved.split_once("; ").unwrap_or((resolved, ""));
-        files.extend(list.split(", ").map(str::to_owned));
-        parts = rest;
-    }
-    if let Some(beyond) = parts.strip_prefix(ADOPTED_BEYOND) {
+    let parts = parts
+        .rsplit_once("; parents: ")
+        .map_or(parts, |(parts, _)| parts);
+    let marker = format!("; {ADOPTED_BEYOND}");
+    let (resolved, beyond) = parts.strip_prefix(ADOPTED_RESOLVED).map_or_else(
+        || ("", parts.strip_prefix(ADOPTED_BEYOND)),
+        |resolved| {
+            resolved.split_once(marker.as_str()).map_or_else(
+                || (resolved_list(resolved), None),
+                |(list, beyond)| (list, Some(beyond)),
+            )
+        },
+    );
+    let mut files = text_paths(resolved);
+    if let Some(beyond) = beyond {
         let list = beyond
-            .split_once(" (why: ")
+            .rsplit_once(" (why: ")
             .or_else(|| beyond.split_once("; "))
             .map_or(beyond, |(list, _)| list);
-        files.extend(list.split(", ").map(str::to_owned));
+        for path in text_paths(list) {
+            if !files.contains(&path) {
+                files.push(path);
+            }
+        }
     }
     AdoptedFixFiles {
         files,
         from_text: true,
     }
+}
+
+/// The resolved list of an `adopt` event's text that no other list
+/// follows: `resolved`, the text after [`ADOPTED_RESOLVED`], up to the next
+/// part that knives writes, `why: `, `carriers: ` or `added lines absent: `.
+fn resolved_list(resolved: &str) -> &str {
+    ["; why: ", "; carriers: ", "; added lines absent: "]
+        .iter()
+        .filter_map(|part| resolved.find(part))
+        .min()
+        .and_then(|end| resolved.get(..end))
+        .unwrap_or(resolved)
 }
 
 /// The replaced write's commit prefix and the parts after the baseline of
@@ -2541,7 +2580,7 @@ mod adopted_fix_tests {
         let cases = [
             (
                 "resolved by hand: a.txt, dir/b.txt",
-                vec!["a.txt", "dir/b.txt"],
+                vec!["a.txt", "a.txt, dir/b.txt", "dir/b.txt"],
             ),
             (
                 "changed beyond the baseline's conflicts: fix.txt (why: a fix, by hand; again)",
@@ -2550,11 +2589,15 @@ mod adopted_fix_tests {
             (
                 "resolved by hand: a.txt; changed beyond the baseline's conflicts: c.txt, d.txt \
                  (why: both); carriers: 0123456789ab",
-                vec!["a.txt", "c.txt", "d.txt"],
+                vec!["a.txt", "c.txt", "c.txt, d.txt", "d.txt"],
             ),
             (
                 "changed beyond the baseline's conflicts: e.txt; carriers: 0123456789ab",
                 vec!["e.txt"],
+            ),
+            (
+                "resolved by hand: f.txt; why: a fix, g.txt; carriers: 0123456789ab",
+                vec!["f.txt"],
             ),
             ("why: nothing changed", Vec::new()),
         ];
@@ -2562,8 +2605,11 @@ mod adopted_fix_tests {
         for (parts, files) in cases {
             let entry = adopted(parts);
 
-            // Then: each names the files of its fix, read from its text, and
-            // the write it replaced exactly when it names a file.
+            // Then: each names every path that its text may name as a file
+            // of its fix, as two files joined by `, ` may be one path that
+            // holds it, and never a word of its reason, its carriers or its
+            // parents; and it names the write it replaced exactly when it
+            // names a file.
             let named = adopted_fix_files(&entry, "integration");
             assert_eq!(named.files, files, "{parts}");
             assert_eq!(named.from_text, !files.is_empty(), "{parts}");
@@ -2608,34 +2654,17 @@ mod adopted_fix_tests {
         let whole = adopted_fix_files(&listed, "integration");
         let pieces = adopted_fix_files(&older, "integration");
 
-        // Then: the list gives each path whole; the text gives pieces, and
-        // says that it read them from the text.
+        // Then: the list gives each path whole; the text gives every path
+        // that it may name, each whole path among them, and says that it
+        // read them from the text.
         assert_eq!(whole.files, ["x, y.txt", "x (why: y.txt"]);
         assert!(!whole.from_text);
-        assert_eq!(pieces.files, ["x", "y.txt", "x"]);
+        assert_eq!(pieces.files, ["x", "x, y.txt", "y.txt", "x (why: y.txt"]);
         assert!(pieces.from_text);
         assert_eq!(
             adopted_fix_replaces(&listed, "integration"),
             adopted_fix_replaces(&older, "integration")
         );
-        // And: a measurement that finds a path whole leaves no piece of it
-        // as a file of its own, and leaves every other file named.
-        let measured = ["x, y.txt".to_owned()];
-        assert_eq!(
-            pieces.clone().unmeasured_by(&measured),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            pieces.unmeasured_by(&["a.txt".to_owned()]),
-            ["x", "y.txt", "x"]
-        );
-        assert_eq!(whole.unmeasured_by(&measured), ["x (why: y.txt"]);
-        // And: a path read whole is never taken for a piece of another.
-        let alone = AdoptedFixFiles {
-            files: vec!["x".to_owned()],
-            from_text: false,
-        };
-        assert_eq!(alone.unmeasured_by(&measured), ["x"]);
     }
 }
 

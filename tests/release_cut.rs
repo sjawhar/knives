@@ -2420,7 +2420,8 @@ fn a_cut_without_a_conflict_an_adopt_resolved_says_to_move_the_release_to_it_and
     let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
 
     // Then: it is refused, naming the adopt and the file it resolved by hand,
-    // and the refusal says to fetch and move the release to the adopt.
+    // and the refusal says to fetch and move the release to the adopt, or
+    // to keep the new content by an adopt of it.
     let out = both_streams(&output);
     assert_eq!(output.status.code(), Some(3), "{out}");
     assert!(
@@ -2434,8 +2435,10 @@ fn a_cut_without_a_conflict_an_adopt_resolved_says_to_move_the_release_to_it_and
     assert!(
         out.contains(&format!(
             "  the candidate was discarded; fetch, then move release/2026-08-04 to {}, its newest \
-             recorded write: `jj bookmark set release/2026-08-04 -r {} --allow-backwards`, or \
-             re-run with --allow-drop to state the drop is intended\n",
+             recorded write: `jj bookmark set release/2026-08-04 -r {} --allow-backwards`; to \
+             keep the new content of those files, edit release/2026-08-04 by hand to hold it and \
+             run `knives release adopt release/2026-08-04`, or re-run with --allow-drop to state \
+             the drop is intended\n",
             adopt.short(),
             adopt.short()
         )),

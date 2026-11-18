@@ -822,24 +822,25 @@ impl Repo {
         outcome
     }
 
-    /// [`Candidate::resolution_replay_outcome`] onto `onto`, a commit, in a
-    /// scratch transaction that is dropped unwritten.
-    fn resolution_replay_outcome(
+    /// The paths of the change `resolution` holds against `baseline` that
+    /// `onto`, a commit, does not carry ([`uncarried_change`]), in a scratch
+    /// transaction that is dropped unwritten.
+    pub fn uncarried_resolution_paths(
         &self,
         baseline: ResolutionBaseline<'_>,
         resolution: &CommitId,
         onto: &CommitId,
-    ) -> Result<RebaseOutcome, JjError> {
+    ) -> Result<Vec<String>, JjError> {
         let (resolution, onto) = (
             self.commit(resolution.as_str())?,
             self.commit(onto.as_str())?,
         );
         let base = baseline_tree(self, baseline)?;
         let mut tx = self.repo.start_transaction();
-        let outcome = replayed_change(&mut tx, (base, &resolution), &onto);
+        let uncarried = uncarried_change(&mut tx, (base, &resolution), &onto);
         // Dropped, never committed: the probe leaves no trace in the op log.
         drop(tx);
-        outcome
+        uncarried
     }
 
     /// [`Self::is_ancestor`] by backend id, saving the hex round-trip.
@@ -1108,11 +1109,22 @@ impl Repo {
         Ok(value(first)? == value(second)?)
     }
 
-    /// Whether `revision` holds anything at `path` (repository-internal,
-    /// `/`-separated): a file, symlink, directory or conflict
+    /// The paths of `paths` (repository-internal, `/`-separated) at which
+    /// `revision` holds anything: a file, symlink, directory or conflict
     /// ([`tree_holds`]).
-    pub fn holds_path(&self, revision: &CommitId, path: &str) -> Result<bool, JjError> {
-        tree_holds(&self.commit(revision.as_str())?.tree(), path)
+    pub fn held_paths(
+        &self,
+        revision: &CommitId,
+        paths: &[String],
+    ) -> Result<Vec<String>, JjError> {
+        let tree = self.commit(revision.as_str())?.tree();
+        let mut held = Vec::new();
+        for path in paths {
+            if tree_holds(&tree, path)? {
+                held.push(path.clone());
+            }
+        }
+        Ok(held)
     }
 
     /// The visible commits that share `revision`'s change id, other than
@@ -1902,17 +1914,6 @@ pub fn probe_net_diff(
     Repo::open(repo)?.net_diff_outcome(base, revision, onto)
 }
 
-/// [`Candidate::resolution_replay_outcome`] onto `onto`, a committed commit,
-/// in a repository opened for the one probe.
-pub fn probe_resolution_replay(
-    repo: &Path,
-    baseline: ResolutionBaseline<'_>,
-    resolution: &CommitId,
-    onto: &CommitId,
-) -> Result<RebaseOutcome, JjError> {
-    Repo::open(repo)?.resolution_replay_outcome(baseline, resolution, onto)
-}
-
 /// `revision`'s tree, as the synthetic commit of a replay of `base..revision`
 /// onto `target` carries it: every release log whose block `target` already
 /// holds keeps `base`'s content instead.
@@ -1967,17 +1968,26 @@ fn replayed_tree(
 }
 
 /// A scratch child of `base` with `tree`, rebased onto `onto` in `tx`, which
-/// the caller drops unwritten: empty when `onto` already holds the change
-/// `tree` makes to `base`, else conflicted or clean and non-empty.
+/// the caller drops unwritten.
+fn replayed_commit(
+    tx: &mut Transaction,
+    (base, tree): (&JjCommitId, MergedTree),
+    onto: &JjCommitId,
+) -> Result<jj_lib::commit::Commit, JjError> {
+    let synthetic = block_on(tx.repo_mut().new_commit(vec![base.clone()], tree).write())
+        .map_err(|error| store_error(&error))?;
+    block_on(rebase_commit(tx.repo_mut(), synthetic, vec![onto.clone()]))
+        .map_err(|error| store_error(&error))
+}
+
+/// The replay of [`replayed_commit`]: empty when `onto` already holds the
+/// change `tree` makes to `base`, else conflicted or clean and non-empty.
 fn replayed_outcome(
     tx: &mut Transaction,
     (base, tree): (&JjCommitId, MergedTree),
     onto: &JjCommitId,
 ) -> Result<RebaseOutcome, JjError> {
-    let synthetic = block_on(tx.repo_mut().new_commit(vec![base.clone()], tree).write())
-        .map_err(|error| store_error(&error))?;
-    let replayed = block_on(rebase_commit(tx.repo_mut(), synthetic, vec![onto.clone()]))
-        .map_err(|error| store_error(&error))?;
+    let replayed = replayed_commit(tx, (base, tree), onto)?;
     Ok(if replayed.has_conflict() {
         RebaseOutcome::Conflicted
     } else if block_on(replayed.is_empty(tx.repo())).map_err(|error| store_error(&error))? {
@@ -1987,25 +1997,30 @@ fn replayed_outcome(
     })
 }
 
-/// The change `resolution` holds against `base`, the tree of its baseline
-/// ([`baseline_tree`]), replayed onto `onto` in `tx`, which the caller drops
-/// unwritten: empty when `onto` carries that change.
+/// The paths of the change `resolution` holds against `base`, the tree of
+/// its baseline ([`baseline_tree`]), that `onto` does not carry, each
+/// repository-internal, replayed in `tx`, which the caller drops unwritten.
+/// Each path is judged on its own: `onto` carries a path when the replay
+/// leaves it as `onto` holds it there, whatever the replay does at another
+/// path.
 ///
 /// A path that the baseline left conflicted and the resolution holds
 /// otherwise is a conflict resolved by hand. No three-way replay over a
 /// conflict can read it, so `onto` carries it when it holds the
-/// resolution's value there, and the replay is clean and not empty when it
-/// does not. Every other path replays: `base`, with each resolved path set
-/// to the resolution's value, becomes a scratch commit on `resolution`'s
-/// parents, and the replay runs from it as a replay of a range does
-/// ([`Repo::net_diff_outcome`]), with a release log `onto` holds as a union
-/// left out ([`replayed_tree`]).
-fn replayed_change(
+/// resolution's value there. Every other path replays: `base`, with each
+/// resolved path set to the resolution's value, becomes a scratch commit on
+/// `resolution`'s parents, and the replay runs from it as a replay of a
+/// range does ([`Repo::net_diff_outcome`]), with a release log `onto` holds
+/// as a union left out ([`replayed_tree`]). A path where the replayed tree
+/// differs from `onto`'s, a conflict included, is one `onto` does not
+/// carry.
+fn uncarried_change(
     tx: &mut Transaction,
     (base, resolution): (MergedTree, &jj_lib::commit::Commit),
     onto: &jj_lib::commit::Commit,
-) -> Result<RebaseOutcome, JjError> {
+) -> Result<Vec<String>, JjError> {
     let (revision, target) = (resolution.tree(), onto.tree());
+    let mut uncarried = Vec::new();
     let mut resolved: Vec<(RepoPathBuf, MergedTreeValue)> = Vec::new();
     for entry in collect_stream(base.diff_stream(&revision, &EverythingMatcher)) {
         let values = entry.values.map_err(|error| store_error(&error))?;
@@ -2014,7 +2029,7 @@ fn replayed_change(
         }
         let held = block_on(target.path_value(&entry.path)).map_err(|error| store_error(&error))?;
         if held != values.after {
-            return Ok(RebaseOutcome::CleanNonEmpty);
+            uncarried.push(entry.path.as_internal_file_string().to_owned());
         }
         resolved.push((entry.path, values.after));
     }
@@ -2034,7 +2049,15 @@ fn replayed_change(
             .write(),
     )
     .map_err(|error| store_error(&error))?;
-    replayed_outcome(tx, (base.id(), tree), onto.id())
+    let replayed = replayed_commit(tx, (base.id(), tree), onto.id())?.tree();
+    for entry in collect_stream(target.diff_stream(&replayed, &EverythingMatcher)) {
+        entry.values.map_err(|error| store_error(&error))?;
+        let path = entry.path.as_internal_file_string().to_owned();
+        if !uncarried.contains(&path) {
+            uncarried.push(path);
+        }
+    }
+    Ok(uncarried)
 }
 
 /// The content `value` holds at `path` when it is one resolved regular file,
@@ -2072,6 +2095,15 @@ fn internal_path(path: &str) -> Result<&RepoPath, JjError> {
         revision: path.to_owned(),
         detail: error.to_string(),
     })
+}
+
+/// Whether `path` names a file that a tree can hold.
+///
+/// It must be a repository-internal path, `/`-separated, that jj can read,
+/// and not the root. A string with an empty component, such as `a//b`, `/x`
+/// or `x/`, names no file, and nothing holds it.
+pub fn is_repository_path(path: &str) -> bool {
+    RepoPath::from_internal_string(path).is_ok_and(|path| !path.is_root())
 }
 
 /// Whether `tree` holds anything at `path` (repository-internal,
@@ -3881,39 +3913,30 @@ impl Candidate {
         replayed_outcome(&mut self.tx, (base.id(), tree), self.commit.id())
     }
 
-    /// The change `resolution` holds against `baseline`, the change
-    /// [`resolution_changes`] measures, replayed onto the candidate in its
-    /// own scratch transaction ([`replayed_change`]): empty when the
-    /// candidate already holds it.
-    pub fn resolution_replay_outcome(
+    /// The paths of the change `resolution` holds against `baseline`, the
+    /// change [`resolution_changes`] measures, that the candidate does not
+    /// carry, replayed onto it in its own scratch transaction
+    /// ([`uncarried_change`]).
+    pub fn uncarried_resolution_paths(
         &mut self,
         baseline: ResolutionBaseline<'_>,
         resolution: &CommitId,
-    ) -> Result<RebaseOutcome, JjError> {
+    ) -> Result<Vec<String>, JjError> {
         let resolution = self.repo.commit(resolution.as_str())?;
         let base = baseline_tree(&self.repo, baseline)?;
-        replayed_change(&mut self.tx, (base, &resolution), &self.commit)
+        uncarried_change(&mut self.tx, (base, &resolution), &self.commit)
     }
 
-    /// Whether the candidate holds the same value as `other` at every one of
-    /// `paths` (repository-internal, `/`-separated): the same file, symlink,
+    /// Whether the candidate holds the same value as `other` at `path`
+    /// (repository-internal, `/`-separated): the same file, symlink,
     /// directory or conflict, or nothing at either.
-    pub fn same_path_values(&self, other: &CommitId, paths: &[String]) -> Result<bool, JjError> {
-        let (mine, theirs) = (self.commit.tree(), self.repo.commit(other.as_str())?.tree());
-        for path in paths {
-            let path = internal_path(path)?;
-            let held = block_on(mine.path_value(path)).map_err(|error| store_error(&error))?;
-            let wanted = block_on(theirs.path_value(path)).map_err(|error| store_error(&error))?;
-            if held != wanted {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// Whether the candidate holds anything at `path` ([`tree_holds`]).
-    pub fn holds_path(&self, path: &str) -> Result<bool, JjError> {
-        tree_holds(&self.commit.tree(), path)
+    pub fn same_path_value(&self, other: &CommitId, path: &str) -> Result<bool, JjError> {
+        let path = internal_path(path)?;
+        let theirs = self.repo.commit(other.as_str())?.tree();
+        let held =
+            block_on(self.commit.tree().path_value(path)).map_err(|error| store_error(&error))?;
+        let wanted = block_on(theirs.path_value(path)).map_err(|error| store_error(&error))?;
+        Ok(held == wanted)
     }
 
     /// Paths whose content differs between `previous` and the candidate.

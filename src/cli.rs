@@ -531,16 +531,18 @@ pub enum ReleaseAction {
     /// bookmark at REV. The commit is audited as a cut is, and it must carry
     /// each member of the previous cut and of the newest write of the newest
     /// release the ledger records in the series, and each fix by hand an
-    /// `adopt` of any release of the series recorded that the newest write
-    /// still carries; a fix this repository cannot measure, as where it does
-    /// not hold the adopt, is held by its content, what the newest write
-    /// holds at the files the adopt names. Where an adopt event names its
-    /// files in its text alone, as an older knives writes it, a path read
-    /// from that text that neither REV nor the newest write holds makes the
-    /// fix unreadable, and the record is refused. A repository that does not
-    /// hold the newest write is refused and told to fetch it. In a stacked
-    /// series that write, a successor of it or a copy with its tree must be
-    /// on its first-parent line. The ledger event records its members: in a
+    /// `adopt` of any release of the series recorded, file by file: at each
+    /// file where the newest write still holds the adopt's content, REV's own
+    /// tree must carry the adopt's change there, by a replay where this
+    /// repository can measure the adopt, else by holding what the newest
+    /// write holds there. For an adopt this repository cannot measure, as
+    /// where it does not hold the adopt, a file's hold ends where the newest
+    /// write holds nothing. An adopt event that an older knives wrote names
+    /// its files in its text alone, and each path that its text may name and
+    /// the newest write holds is held. A repository that does not hold the
+    /// newest write is refused and told to fetch it. In a stacked series that
+    /// write, a successor of it or a copy with its tree must be on its
+    /// first-parent line. The ledger event records its members: in a
     /// stacked series the side parents on its first-parent line, with its
     /// previous release labelled as no member. No reap runs, and nothing is
     /// signed or pushed.
@@ -552,12 +554,12 @@ pub enum ReleaseAction {
         /// Proceed even when the cut would drop something: commits reachable
         /// only from the previous release lineage, members that the
         /// previous cut's ledger event or the newest recorded write of the
-        /// newest release the ledger records in the series holds, a fix by
-        /// hand an `adopt` of any release of the series recorded that the
-        /// newest write still carries or that this repository cannot read,
-        /// that write itself where this repository does not hold it, or in a
-        /// stacked series that write, off the line the cut starts on. The
-        /// refusal lists exactly what.
+        /// newest release the ledger records in the series holds, a file of
+        /// a fix by hand that an `adopt` of any release of the series
+        /// recorded and the newest write still holds, that write itself
+        /// where this repository does not hold it, or in a stacked series
+        /// that write, off the line the cut starts on. The refusal lists
+        /// exactly what, each file of a fix by name.
         #[arg(long)]
         allow_drop: bool,
         /// Record a release cut outside knives: the commit becomes NAME's

@@ -18,15 +18,17 @@
 //! cut is held too, and in a stacked series that write must be on the
 //! record's first-parent line, so a commit built below it is refused, or
 //! with `--allow-drop` recorded with the drop stated. A clone that does not
-//! hold that write is refused, naming it and the fetch, and a fix by hand
-//! that a clone cannot measure, as where it does not hold the adopt's
-//! commit, is held by its content. The adopt event lists the files of its
-//! fix whole, so a path that holds a separator reads back whole; an older
-//! adopt event names them in its text alone, and a clone where nothing holds
-//! a path read from it cannot read that fix and is refused. A published name
-//! that the publish remote lacks is not recorded until it is pushed, and the
-//! refusal gives the commands. A printed command quotes the name for the
-//! shell.
+//! hold that write is refused, naming it and the fetch. A fix by hand is
+//! held file by file against that write, and a file's hold ends where that
+//! write no longer holds the adopt's content there; a clone that cannot
+//! measure the fix, as where it does not hold the adopt's commit, holds each
+//! named file while that write holds something at it. The adopt event lists
+//! the files of its fix whole, so a path that holds a separator reads back
+//! whole; an older adopt event names them in its text alone, and a clone
+//! holds each path that the text may name and that write holds. A
+//! published name that the publish remote lacks is not recorded until it is
+//! pushed, and the refusal gives the commands. A printed command quotes the
+//! name for the shell.
 
 #![allow(
     clippy::expect_used,
@@ -2217,15 +2219,17 @@ fn a_record_that_carries_the_fix_the_newest_release_adopted_is_recorded() {
     let refused = record(&lab, &home, "release/2026-08-05", &commit);
 
     // Then: it is refused, naming the adopt and its file, and the refusal
-    // says to record a commit that carries the fix.
+    // says to record a commit that carries the fix, or to keep the new
+    // content by an adopt of it.
     let out = text(&refused);
     assert_eq!(refused.status.code(), Some(3), "{out}");
     assert!(
         out.contains(&format!(
             "demo: refusing to record release/2026-08-05 at {}: it does not carry the fix by hand \
              of {RELEASE}'s adopt {}, in 1 file(s): fix.txt\n  nothing \
-             was recorded; record a commit that carries that fix, or re-run with --allow-drop to \
-             state the drop is intended\n",
+             was recorded; record a commit that carries that fix; to keep the new content of \
+             those files, edit {RELEASE} by hand to hold it and run `knives release adopt \
+             {RELEASE}`, or re-run with --allow-drop to state the drop is intended\n",
             commit.short(),
             adopt.short()
         )),
@@ -2597,8 +2601,8 @@ fn a_record_without_a_fix_an_earlier_release_adopted_is_recorded_under_allow_dro
     );
 
     // Then: it is recorded, and both its line and its event name RELEASE's
-    // adopt, its release and its commit; the drift check names no file of
-    // the fix.
+    // adopt, its release, its commit and the file it went without; the
+    // drift check names no file of the fix.
     let out = text(&allowed);
     assert_eq!(allowed.status.code(), Some(0), "{out}");
     assert!(
@@ -2619,7 +2623,8 @@ fn a_record_without_a_fix_an_earlier_release_adopted_is_recorded_under_allow_dro
     );
     assert!(
         event.text.contains(&format!(
-            "; all carried; without the fix by hand of {RELEASE}'s adopt {}",
+            "; all carried; without the fix by hand of {RELEASE}'s adopt {}, in 1 file(s): \
+             fix.txt",
             adopt.short()
         )),
         "{event:?}"
@@ -3541,87 +3546,58 @@ fn a_record_in_a_clone_without_the_adopts_commit_reads_a_listed_path_with_a_sepa
 }
 
 #[test]
-fn an_older_adopt_of_a_path_with_a_separator_is_unreadable_in_a_clone_without_its_commit() {
+fn an_older_adopt_of_a_path_with_a_separator_holds_that_path_whole_in_a_clone_without_its_commit() {
     for file in ["x, y.txt", "x (why: y.txt"] {
         // Given: RELEASE fixed by hand with the new file `file` and adopted,
         // its event as a knives from before the `fix_files` list writes it,
-        // so its text alone names the file; the next release cut on it in
-        // the work checkout, which holds the adopt and reads the path whole
-        // from it; a second clone that holds the next release and not the
-        // adopt's commit; and the third release merged by hand there, with
-        // the fix.
+        // so its text alone names the file, in pieces; the next release cut
+        // on it in the work checkout; a second clone that holds the next
+        // release and not the adopt's commit; and the third release merged
+        // by hand there, without the fix.
         let (lab, home, adopt, next) = separator_fix_lab(file, true);
-        let commit = fixed_merge_in_second_clone(&lab, file);
+        let commit = hand_merge_in_second_clone(&lab, None);
         let entries = ledger_entries(&home);
 
         // When: it is recorded in the second clone.
-        let recorded = cut_in_second_clone(
+        let refused = cut_in_second_clone(
             &lab,
             &home,
             &["release/2026-08-06", "--at", commit.as_str()],
         );
 
-        // Then: it is refused, naming the adopt and the piece of the path
-        // that nothing here holds, and nothing is written: the clone cannot
-        // tell which files the fix changed, and a path that nothing holds
-        // never counts as held.
-        let out = text(&recorded);
-        assert_eq!(recorded.status.code(), Some(3), "{file}: {out}");
+        // Then: it is refused, naming the adopt and the path whole, and
+        // nothing is written: the clone joins the pieces of the text back
+        // into each path that they may name, and the newest recorded write
+        // holds that one.
+        let out = text(&refused);
+        assert_eq!(refused.status.code(), Some(3), "{file}: {out}");
         assert!(
             out.contains(&format!(
-                "demo: refusing to record release/2026-08-06 at {}: it cannot be held against the \
-                 fix by hand of {RELEASE}'s adopt {}: its adopt event names its files in its text \
-                 alone, and nothing is at x",
+                "demo: refusing to record release/2026-08-06 at {}: it does not carry the fix by \
+                 hand of {RELEASE}'s adopt {adopt}, in 1 file(s): {file} (this repository does \
+                 not hold {adopt}, so the fix is held by its content: what release/2026-08-05's \
+                 newest recorded write (a cut) {} holds in those files)\n",
                 commit.short(),
-                adopt.short()
-            )),
-            "{file}: {out}"
-        );
-        assert!(
-            out.contains(&format!(
-                " in {} or in release/2026-08-05's newest recorded write (a cut) {}, so this \
-                 repository cannot read which files that fix changed\n",
-                commit.short(),
-                next.short()
+                next.short(),
+                adopt = adopt.short()
             )),
             "{file}: {out}"
         );
         assert_eq!(ledger_entries(&home), entries, "{file}: {out}");
 
-        // When: it is recorded again, the drop stated.
-        let allowed = cut_in_second_clone(
-            &lab,
-            &home,
-            &[
-                "release/2026-08-06",
-                "--at",
-                commit.as_str(),
-                "--allow-drop",
-            ],
-        );
+        // When: the third release, merged by hand there with the fix, is
+        // recorded.
+        let fixed = fixed_merge_in_second_clone(&lab, file);
+        let recorded =
+            cut_in_second_clone(&lab, &home, &["release/2026-08-06", "--at", fixed.as_str()]);
 
-        // Then: it is recorded, and both its line and its event name the
-        // adopt as one this repository cannot read.
-        let out = text(&allowed);
-        assert_eq!(allowed.status.code(), Some(0), "{file}: {out}");
+        // Then: it is recorded: it holds at that path what the newest
+        // recorded write holds.
+        let out = text(&recorded);
+        assert_eq!(recorded.status.code(), Some(0), "{file}: {out}");
         assert!(
-            out.contains(&format!(
-                "demo: --allow-drop: recording release/2026-08-06 at {} without the fix by hand of \
-                 {RELEASE}'s adopt {}, which this repository cannot read: its adopt event names \
-                 its files in its text alone",
-                commit.short(),
-                adopt.short()
-            )),
+            out.contains(&recorded_line("release/2026-08-06", &fixed)),
             "{file}: {out}"
-        );
-        let event = newest_event(&home, "release/2026-08-06");
-        assert!(
-            event.text.contains(&format!(
-                "; without the fix by hand of {RELEASE}'s adopt {}, which this repository cannot \
-                 read",
-                adopt.short()
-            )),
-            "{file}: {event:?}"
         );
     }
 }
@@ -3676,5 +3652,396 @@ fn an_adopt_event_that_lists_its_files_reads_in_a_knives_that_does_not_know_the_
                 branches: vec!["feat/beta".to_owned()],
             },
         ]
+    );
+}
+
+/// Change `files` by hand on `release` in place (`jj squash` into it, which
+/// keeps its change id): each written with its content, or removed where it
+/// has none; then adopt it with `why`. Returns the adopt's commit.
+fn fix_by_hand(
+    (lab, home): (&Lab, &tempfile::TempDir),
+    release: &str,
+    files: &[(&str, Option<&str>)],
+    why: &str,
+) -> CommitId {
+    lab.jj_work(["new", "-r", release]);
+    for (file, content) in files {
+        let path = lab.work_path().join(file);
+        match content {
+            Some(content) => std::fs::write(&path, content).expect("write a file by hand"),
+            None => std::fs::remove_file(&path).expect("remove a file by hand"),
+        }
+    }
+    lab.jj_work(["squash", "--into", release]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let adopted = knives_release(lab, home, &["adopt", release, "--why", why]);
+    assert_eq!(adopted.status.code(), Some(0), "{}", text(&adopted));
+    commit_at(lab, release)
+}
+
+/// The next release merged by hand of `feat/alpha` and `feat/beta` in the
+/// work checkout, with each of `files` written with its content, and no ref
+/// on it. Returns its commit.
+fn merged_with(lab: &Lab, files: &[(&str, &str)]) -> CommitId {
+    lab.jj_work([
+        "new",
+        "-r",
+        "feat/alpha",
+        "-r",
+        "feat/beta",
+        "-m",
+        "the next release, merged by hand",
+    ]);
+    for (file, content) in files {
+        std::fs::write(lab.work_path().join(file), content).expect("write a file of the merge");
+    }
+    lab.jj_work(["new"]);
+    commit_of(lab, "@-")
+}
+
+/// The third release merged by hand in the second clone of `feat/alpha` and
+/// `feat/beta` as origin holds them, with each of `files` holding `fixed by
+/// hand`, and no ref on it. Returns its commit.
+fn merged_in_second_clone_with(lab: &Lab, files: &[&str]) -> CommitId {
+    lab.jj_at(
+        &lab.second,
+        [
+            "new",
+            "-r",
+            "feat/alpha@origin",
+            "-r",
+            "feat/beta@origin",
+            "-m",
+            "the third release, merged by hand",
+        ],
+    );
+    for file in files {
+        std::fs::write(lab.second.join(file), "fixed by hand\n").expect("write a fixed file");
+    }
+    lab.jj_at(&lab.second, ["new"]);
+    CommitId::new(lab.revision(&lab.second, "@-", "commit_id").trim())
+}
+
+#[test]
+fn a_record_whose_own_merge_changes_or_deletes_a_fixed_file_is_refused_naming_it() {
+    for fixed in [None, Some("fixed another way\n")] {
+        // Given: RELEASE fixed by hand at `fix.txt` and adopted; the next
+        // release, a knives cut that carries the fix; and the third release
+        // merged by hand of the same two branches, whose resolution leaves
+        // out `fix.txt` or changes it.
+        let (lab, home, adopt) = adopted_then_cut_lab();
+        let commit = third_hand_merge(&lab, fixed);
+        let entries = ledger_entries(&home);
+
+        // When: it is recorded.
+        let refused = record(&lab, &home, "release/2026-08-06", &commit);
+
+        // Then: it is refused, naming the adopt and the file, and nothing
+        // is written.
+        let out = text(&refused);
+        assert_eq!(refused.status.code(), Some(3), "{fixed:?}: {out}");
+        assert!(
+            out.contains(&format!(
+                "demo: refusing to record release/2026-08-06 at {}: it does not carry the fix by \
+                 hand of {RELEASE}'s adopt {}, in 1 file(s): fix.txt\n",
+                commit.short(),
+                adopt.short()
+            )),
+            "{fixed:?}: {out}"
+        );
+        assert!(!out.contains("!! fix.txt"), "{fixed:?}: {out}");
+        assert_eq!(ledger_entries(&home), entries, "{fixed:?}: {out}");
+    }
+}
+
+#[test]
+fn a_record_without_one_file_of_a_fix_is_refused_for_that_file_alone() {
+    // Given: RELEASE, a knives cut of `feat/alpha` and `feat/beta`, fixed by
+    // hand in place at `x.txt` and `y.txt` and adopted; then `x.txt` changed
+    // by hand again and adopted again, which ends the first adopt's hold on
+    // `x.txt` alone; and the next release merged by hand of the two
+    // branches, with `x.txt` as the second adopt left it and without
+    // `y.txt`.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    let first = fix_by_hand(
+        (&lab, &home),
+        RELEASE,
+        &[("x.txt", Some("x fixed\n")), ("y.txt", Some("y fixed\n"))],
+        "a fix by hand",
+    );
+    let second = fix_by_hand(
+        (&lab, &home),
+        RELEASE,
+        &[("x.txt", Some("x refined\n"))],
+        "the fix refined",
+    );
+    let without = merged_with(&lab, &[("x.txt", "x refined\n")]);
+    let entries = ledger_entries(&home);
+
+    // When: it is recorded.
+    let refused = record(&lab, &home, "release/2026-08-05", &without);
+
+    // Then: it is refused, naming the first adopt and `y.txt` alone, and
+    // nothing is written: it carries the second adopt's fix, and the drift
+    // check leaves `y.txt` to the gate.
+    let out = text(&refused);
+    assert_eq!(refused.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to record release/2026-08-05 at {}: it does not carry the fix by hand \
+             of {RELEASE}'s adopt {}, in 1 file(s): y.txt\n",
+            without.short(),
+            first.short()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains(&format!("adopt {}", second.short())), "{out}");
+    assert!(!out.contains("!! y.txt"), "{out}");
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+
+    // When: the merge with `y.txt` too is recorded.
+    let with = merged_with(&lab, &[("x.txt", "x refined\n"), ("y.txt", "y fixed\n")]);
+    let recorded = record(&lab, &home, "release/2026-08-05", &with);
+
+    // Then: it is recorded.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains(&recorded_line("release/2026-08-05", &with)),
+        "{out}"
+    );
+}
+
+/// RELEASE, a knives cut of `feat/alpha` and `feat/beta`, fixed by hand in
+/// place at `fix.txt` and `keep.txt` and adopted, its event as a knives from
+/// before the `fix_files` list writes it when `older`; the next release cut
+/// on it, then `keep.txt` removed from it by hand and adopted; the two
+/// branches and the next release pushed, the first adopt's commit never;
+/// the next release published by a note; and the second clone fetched.
+/// Returns the first adopt's commit.
+fn deleted_named_file_lab(older: bool) -> (Lab, tempfile::TempDir, CommitId) {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    let adopt = fix_by_hand(
+        (&lab, &home),
+        RELEASE,
+        &[
+            ("fix.txt", Some("fixed by hand\n")),
+            ("keep.txt", Some("kept by hand\n")),
+        ],
+        "a fix by hand",
+    );
+    if older {
+        without_fix_files(&home, RELEASE);
+    }
+    let next = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(matches!(next.status.code(), Some(0 | 1)), "{}", text(&next));
+    fix_by_hand(
+        (&lab, &home),
+        "release/2026-08-05",
+        &[("keep.txt", None)],
+        "keep.txt is not needed",
+    );
+    for branch in ["feat/alpha", "feat/beta", "release/2026-08-05"] {
+        lab.push_branch(branch);
+    }
+    mark_published(&lab, &home, "release/2026-08-05");
+    fetch_second_clone(&lab);
+    assert!(
+        !second_clone_holds(&lab, &adopt),
+        "the second clone does not hold the first adopt's commit"
+    );
+    (lab, home, adopt)
+}
+
+#[test]
+fn a_clone_without_the_adopts_commit_ends_the_hold_on_a_file_a_later_release_removed() {
+    for older in [true, false] {
+        // Given: a second clone that does not hold RELEASE's adopt, whose
+        // event names `fix.txt` and `keep.txt`, in its text alone when
+        // `older`; the newest recorded write, which removed `keep.txt` and
+        // holds `fix.txt`; and the third release merged by hand there,
+        // without `fix.txt`.
+        let (lab, home, adopt) = deleted_named_file_lab(older);
+        let without = merged_in_second_clone_with(&lab, &[]);
+        let entries = ledger_entries(&home);
+
+        // When: it is recorded in the second clone.
+        let refused = cut_in_second_clone(
+            &lab,
+            &home,
+            &["release/2026-08-06", "--at", without.as_str()],
+        );
+
+        // Then: it is refused for `fix.txt` alone, which the newest write
+        // holds, and nothing is written.
+        let out = text(&refused);
+        assert_eq!(refused.status.code(), Some(3), "{older}: {out}");
+        assert!(
+            out.contains(&format!(
+                "it does not carry the fix by hand of {RELEASE}'s adopt {}, in 1 file(s): \
+                 fix.txt (this repository does not hold",
+                adopt.short()
+            )),
+            "{older}: {out}"
+        );
+        assert_eq!(ledger_entries(&home), entries, "{older}: {out}");
+
+        // When: the third release is cut in the second clone.
+        let cut = cut_in_second_clone(&lab, &home, &["release/2026-08-06"]);
+
+        // Then: it is cut: the newest write holds nothing at `keep.txt`, so
+        // the hold on it has ended, and the cut holds `fix.txt` as that
+        // write does.
+        let out = text(&cut);
+        assert!(matches!(cut.status.code(), Some(0 | 1)), "{older}: {out}");
+        assert!(!out.contains("the fix by hand of"), "{older}: {out}");
+
+        // When: a release merged by hand there with `fix.txt` is recorded
+        // next.
+        let with = merged_in_second_clone_with(&lab, &["fix.txt"]);
+        let recorded =
+            cut_in_second_clone(&lab, &home, &["release/2026-08-07", "--at", with.as_str()]);
+
+        // Then: it is recorded.
+        let out = text(&recorded);
+        assert_eq!(recorded.status.code(), Some(0), "{older}: {out}");
+        assert!(
+            out.contains(&recorded_line("release/2026-08-07", &with)),
+            "{older}: {out}"
+        );
+    }
+}
+
+#[test]
+fn an_older_adopt_whose_text_reads_two_ways_holds_each_path_that_the_newest_write_holds() {
+    // Given: RELEASE fixed by hand with the new files `x`, `y.txt` and
+    // `x, y.txt` and adopted, its event as a knives from before the
+    // `fix_files` list writes it, so its text `x, x, y.txt, y.txt` reads as
+    // more than one list of paths; the next release cut on it, which holds
+    // all three; a second clone that does not hold the adopt's commit; and
+    // the third release merged by hand there, with `x` and `x, y.txt` and
+    // without `y.txt`.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    let fixed = Some("fixed by hand\n");
+    let adopt = fix_by_hand(
+        (&lab, &home),
+        RELEASE,
+        &[("x", fixed), ("y.txt", fixed), ("x, y.txt", fixed)],
+        "a fix by hand",
+    );
+    without_fix_files(&home, RELEASE);
+    let next = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(matches!(next.status.code(), Some(0 | 1)), "{}", text(&next));
+    for branch in ["feat/alpha", "feat/beta", "release/2026-08-05"] {
+        lab.push_branch(branch);
+    }
+    fetch_second_clone(&lab);
+    assert!(
+        !second_clone_holds(&lab, &adopt),
+        "the second clone does not hold the adopt's commit"
+    );
+    let without = merged_in_second_clone_with(&lab, &["x", "x, y.txt"]);
+    let entries = ledger_entries(&home);
+
+    // When: it is recorded in the second clone.
+    let refused = cut_in_second_clone(
+        &lab,
+        &home,
+        &["release/2026-08-06", "--at", without.as_str()],
+    );
+
+    // Then: it is refused, naming the adopt and `y.txt` alone, and nothing
+    // is written: each path that the text may name and the newest recorded
+    // write holds is held on its own.
+    let out = text(&refused);
+    assert_eq!(refused.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "it does not carry the fix by hand of {RELEASE}'s adopt {}, in 1 file(s): y.txt (this \
+             repository does not hold",
+            adopt.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+
+    // When: the merge with all three is recorded there.
+    let with = merged_in_second_clone_with(&lab, &["x", "y.txt", "x, y.txt"]);
+    let recorded = cut_in_second_clone(&lab, &home, &["release/2026-08-06", "--at", with.as_str()]);
+
+    // Then: it is recorded.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(0), "{out}");
+}
+
+#[test]
+fn a_listed_fix_file_that_names_no_repository_path_ends_its_hold() {
+    // Given: RELEASE, a knives cut of `feat/alpha` and `feat/beta`, fixed by
+    // hand in place at `fix.txt` and adopted; then its adopt event's
+    // `fix_files` list given two strings that are no repository path, as a
+    // peer's ledger may carry.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    fix_by_hand(
+        (&lab, &home),
+        RELEASE,
+        &[("fix.txt", Some("fixed by hand\n"))],
+        "a fix by hand",
+    );
+    let events = adopt_event_files(&home, RELEASE);
+    assert!(!events.is_empty(), "no adopt event of {RELEASE}");
+    for (path, mut frontmatter, text) in events {
+        let listed = frontmatter
+            .get_mut("fix_files")
+            .and_then(toml::Value::as_array_mut)
+            .expect("the adopt event lists its files");
+        for named in ["a//b", "/x"] {
+            let mut file = toml::Table::new();
+            file.insert("path".to_owned(), toml::Value::String(named.to_owned()));
+            file.insert(
+                "change".to_owned(),
+                toml::Value::String("beyond".to_owned()),
+            );
+            listed.push(toml::Value::Table(file));
+        }
+        let frontmatter = toml::to_string(&frontmatter).expect("write the frontmatter");
+        std::fs::write(
+            &path,
+            format!("+++\n{}\n+++\n{text}", frontmatter.trim_end()),
+        )
+        .expect("rewrite the adopt event");
+    }
+
+    // When: the next release is cut.
+    let next = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: it is cut with the fix: nothing holds a string that is no
+    // repository path, so its hold ends, and it is no error.
+    let out = text(&next);
+    assert!(matches!(next.status.code(), Some(0 | 1)), "{out}");
+    assert!(out.contains("cut release/2026-08-05 as"), "{out}");
+    assert_eq!(
+        file_at_revision(&lab, "release/2026-08-05", "fix.txt"),
+        "fixed by hand\n",
+        "{out}"
     );
 }

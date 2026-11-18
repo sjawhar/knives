@@ -1206,8 +1206,8 @@ fn a_record_built_on_a_copy_of_the_newest_write_is_recorded() {
     );
 
     // Then: it is recorded: the copy, on the commit's first-parent line,
-    // has the write's tree, so it stands for the write and carries its fix,
-    // whatever its change id.
+    // has the write's tree, so it stands for the write, whatever its change
+    // id; and the commit's own tree holds the fix.
     let out = text(&recorded);
     assert_eq!(recorded.status.code(), Some(0), "{out}");
     assert_eq!(
@@ -1240,9 +1240,349 @@ fn a_stacked_cut_on_a_copy_of_the_newest_write_goes_ahead() {
     let cut = knives_release(&lab, &home, &["--series", "old", "cut", THIRD]);
 
     // Then: it goes ahead on the copy: a commit with the newest write's tree
-    // stands for that write on the start's first-parent line, and carries
-    // its fix.
+    // stands for that write on the start's first-parent line, and the cut's
+    // own tree, the copy's, holds its fix.
     let out = text(&cut);
     assert_eq!(cut.status.code(), Some(0), "{out}");
     assert_eq!(release_parents(&lab, THIRD), vec![copy], "{out}");
+}
+
+/// Change `files` by hand on [`NEXT`] in place (`jj squash` into it, which
+/// keeps its change id): each written with its content, or removed where it
+/// has none; then adopt it with `why`. Returns the adopt's commit.
+fn fix_next_by_hand(
+    lab: &Lab,
+    home: &tempfile::TempDir,
+    files: &[(&str, Option<&str>)],
+    why: &str,
+) -> knives::ids::CommitId {
+    lab.jj_work(["new", "-r", NEXT]);
+    change_files(lab, files);
+    lab.jj_work(["squash", "--into", NEXT]);
+    lab.jj_work(["new", "-r", "old@upstream"]);
+    release_ok(lab, home, &["adopt", NEXT, "--why", why]);
+    commit_at(lab, NEXT)
+}
+
+/// Write each of `files` in the work checkout with its content, or remove
+/// it where it has none.
+fn change_files(lab: &Lab, files: &[(&str, Option<&str>)]) {
+    for (file, content) in files {
+        let path = lab.work_path().join(file);
+        match content {
+            Some(content) => std::fs::write(&path, content).expect("write a file by hand"),
+            None => std::fs::remove_file(&path).expect("remove a file by hand"),
+        }
+    }
+}
+
+/// A commit merged by hand of `first` and `m7`, with `files` changed in its
+/// resolution ([`change_files`]), and no ref on it. Returns its commit.
+fn merged_by_hand(
+    lab: &Lab,
+    first: &knives::ids::CommitId,
+    files: &[(&str, Option<&str>)],
+) -> knives::ids::CommitId {
+    lab.jj_work([
+        "new",
+        "-r",
+        first.as_str(),
+        "-r",
+        "m7",
+        "-m",
+        "merged by hand",
+    ]);
+    change_files(lab, files);
+    lab.jj_work(["new"]);
+    knives::ids::CommitId::new(lab.jj_work_output([
+        "log",
+        "-r",
+        "@-",
+        "--no-graph",
+        "-T",
+        "commit_id",
+    ]))
+}
+
+#[test]
+fn a_record_on_the_adopt_whose_own_merge_undoes_the_fix_is_refused_naming_the_file() {
+    for fixed in [None, Some("fixed another way\n")] {
+        // Given: NEXT's newest recorded write is an adopt of a fix by hand
+        // at `fix.txt`; `m7` built on that adopt; and a commit merged by hand
+        // of the adopt and `m7`, whose resolution deletes `fix.txt` or
+        // changes it.
+        let (lab, home, _edit, adopted) = adopted_next_lab();
+        branch_on(&lab, adopted.as_str(), "m7", "m7.txt");
+        let commit = merged_by_hand(&lab, &adopted, &[("fix.txt", fixed)]);
+        let entries = ledger_entries(&home);
+
+        // When: it is recorded as the series' third release.
+        let recorded = knives_release(
+            &lab,
+            &home,
+            &["--series", "old", "cut", THIRD, "--at", commit.as_str()],
+        );
+
+        // Then: it is refused, naming the adopt and the file, and nothing is
+        // written: the adopt on the commit's first-parent line carries
+        // nothing for the fix, as the commit's own merge undid it; and the
+        // drift check leaves `fix.txt` to the gate.
+        let out = text(&recorded);
+        assert_eq!(recorded.status.code(), Some(3), "{fixed:?}: {out}");
+        assert!(
+            out.contains(&format!(
+                "demo: refusing to record {THIRD} at {}: it does not carry the fix by hand of \
+                 {NEXT}'s adopt {}, in 1 file(s): fix.txt\n",
+                commit.short(),
+                adopted.short()
+            )),
+            "{fixed:?}: {out}"
+        );
+        assert!(!out.contains("!! fix.txt"), "{fixed:?}: {out}");
+        assert_eq!(ledger_entries(&home), entries, "{fixed:?}: {out}");
+    }
+}
+
+#[test]
+fn a_stacked_cut_on_a_merge_that_undid_the_fix_is_refused_and_one_on_the_adopt_goes_ahead() {
+    // Given: NEXT's newest recorded write is an adopt of a fix by hand at
+    // `fix.txt`; `m7` built on that adopt; a commit merged by hand of the
+    // adopt and `m7`, whose resolution deletes `fix.txt`; and NEXT's
+    // bookmark moved to that merge, published by a note.
+    let (lab, home, _edit, adopted) = adopted_next_lab();
+    branch_on(&lab, adopted.as_str(), "m7", "m7.txt");
+    let merge = merged_by_hand(&lab, &adopted, &[("fix.txt", None)]);
+    lab.jj_work(["bookmark", "set", NEXT, "-r", merge.as_str()]);
+    mark_published(&lab, &home, NEXT);
+    let recorded = ledger_entries(&home).len();
+
+    // When: the next release is cut.
+    let cut = knives_release(&lab, &home, &["--series", "old", "cut", THIRD]);
+
+    // Then: it is refused, naming the adopt and the file, and nothing is
+    // cut: the cut's own tree lacks the fix, whatever its first-parent line
+    // holds.
+    let out = text(&cut);
+    assert_eq!(cut.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut: this cut does not carry the fix by hand of {NEXT}'s adopt {}, \
+             in 1 file(s): fix.txt\n",
+            adopted.short()
+        )),
+        "{out}"
+    );
+    assert!(!resolves(&lab, THIRD), "{out}");
+    assert_eq!(ledger_entries(&home).len(), recorded, "{out}");
+
+    // When: NEXT is moved back to the adopt, published by a note, and the
+    // next release is cut again.
+    lab.jj_work([
+        "bookmark",
+        "set",
+        NEXT,
+        "-r",
+        adopted.as_str(),
+        "--allow-backwards",
+    ]);
+    mark_published(&lab, &home, NEXT);
+    let cut = knives_release(&lab, &home, &["--series", "old", "cut", THIRD]);
+
+    // Then: it goes ahead on the adopt, whose tree carries the fix.
+    let out = text(&cut);
+    assert_eq!(cut.status.code(), Some(0), "{out}");
+    assert_eq!(release_parents(&lab, THIRD), vec![adopted], "{out}");
+}
+
+#[test]
+fn a_stacked_record_without_one_file_of_a_fix_is_refused_for_that_file_alone() {
+    // Given: NEXT cut on the published previous release with `m6` included
+    // and published; fixed by hand in place at `x.txt` and `y.txt` and
+    // adopted; then `x.txt` changed by hand again and adopted again, which
+    // ends the first adopt's hold on `x.txt` alone; `m7` built on the second
+    // adopt; and a commit merged by hand of that adopt and `m7`, whose
+    // resolution deletes `y.txt`.
+    let (lab, home) = previous_release_lab(true);
+    release_ok(&lab, &home, &["cut", NEXT]);
+    release_ok(&lab, &home, &["include", "m6", "--why", "in NEXT"]);
+    mark_published(&lab, &home, NEXT);
+    let first = fix_next_by_hand(
+        &lab,
+        &home,
+        &[("x.txt", Some("x fixed\n")), ("y.txt", Some("y fixed\n"))],
+        "a fix by hand",
+    );
+    let second = fix_next_by_hand(&lab, &home, &[("x.txt", Some("x refined\n"))], "refined");
+    branch_on(&lab, second.as_str(), "m7", "m7.txt");
+    let without = merged_by_hand(&lab, &second, &[("y.txt", None)]);
+    let entries = ledger_entries(&home);
+
+    // When: it is recorded as the series' third release.
+    let refused = knives_release(
+        &lab,
+        &home,
+        &["--series", "old", "cut", THIRD, "--at", without.as_str()],
+    );
+
+    // Then: it is refused, naming the first adopt and `y.txt` alone, and
+    // nothing is written: the second adopt's fix it carries.
+    let out = text(&refused);
+    assert_eq!(refused.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to record {THIRD} at {}: it does not carry the fix by hand of \
+             {NEXT}'s adopt {}, in 1 file(s): y.txt\n",
+            without.short(),
+            first.short()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains(&format!("adopt {}", second.short())), "{out}");
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+
+    // When: the merge that keeps both files is recorded.
+    let with = merged_by_hand(&lab, &second, &[]);
+    let recorded = knives_release(
+        &lab,
+        &home,
+        &["--series", "old", "cut", THIRD, "--at", with.as_str()],
+    );
+
+    // Then: it is recorded.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(0), "{out}");
+}
+
+#[test]
+fn a_stacked_record_whose_member_changes_other_lines_of_a_fixed_file_is_recorded() {
+    // Given: NEXT cut on the published previous release with `m4` included,
+    // which adds `shared.txt` of five lines, and published; a line added by
+    // hand in place at the top of that file and adopted; `m7` built on the
+    // adopt, which changes the last line; and a commit merged by hand of the
+    // adopt and `m7`.
+    let (lab, home) = previous_release_lab(true);
+    lab.jj_work(["new", "-r", PREVIOUS, "-m", "m4"]);
+    std::fs::write(lab.work_path().join("shared.txt"), "1\n2\n3\n4\n5\n").expect("write m4");
+    lab.jj_work(["bookmark", "create", "m4", "-r", "@"]);
+    lab.jj_work(["new"]);
+    release_ok(&lab, &home, &["cut", NEXT]);
+    release_ok(&lab, &home, &["include", "m4", "--why", "in NEXT"]);
+    mark_published(&lab, &home, NEXT);
+    let adopted = fix_next_by_hand(
+        &lab,
+        &home,
+        &[("shared.txt", Some("0 fixed\n1\n2\n3\n4\n5\n"))],
+        "a fix by hand",
+    );
+    lab.jj_work(["new", "-r", adopted.as_str(), "-m", "m7"]);
+    std::fs::write(
+        lab.work_path().join("shared.txt"),
+        "0 fixed\n1\n2\n3\n4\n5 changed\n",
+    )
+    .expect("write m7");
+    lab.jj_work(["bookmark", "create", "m7", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let commit = merged_by_hand(&lab, &adopted, &[]);
+
+    // When: it is recorded as the series' third release.
+    let recorded = knives_release(
+        &lab,
+        &home,
+        &["--series", "old", "cut", THIRD, "--at", commit.as_str()],
+    );
+
+    // Then: it is recorded: the adopt's change at `shared.txt` replays
+    // empty onto it, though it holds there what no recorded write holds.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(0), "{out}");
+    assert!(!out.contains("the fix by hand of"), "{out}");
+}
+
+#[test]
+fn a_member_that_changes_a_file_an_adopt_added_is_refused_until_an_adopt_keeps_its_content() {
+    // Given: NEXT's newest recorded write is an adopt that added `fix.txt`
+    // by hand, a file the composition did not have; `m7` built on that
+    // adopt, which changes `fix.txt`; and a commit merged by hand of the
+    // adopt and `m7`, which holds `m7`'s `fix.txt`.
+    let (lab, home, _edit, adopted) = adopted_next_lab();
+    let changed = "fixed by hand\nand changed by m7\n";
+    lab.jj_work(["new", "-r", adopted.as_str(), "-m", "m7"]);
+    std::fs::write(lab.work_path().join("fix.txt"), changed).expect("write m7");
+    lab.jj_work(["bookmark", "create", "m7", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let commit = merged_by_hand(&lab, &adopted, &[]);
+    let change = lab.jj_work_output([
+        "log",
+        "-r",
+        commit.as_str(),
+        "--no-graph",
+        "-T",
+        "change_id",
+    ]);
+    let entries = ledger_entries(&home);
+
+    // When: it is recorded as the series' third release.
+    let refused = knives_release(
+        &lab,
+        &home,
+        &["--series", "old", "cut", THIRD, "--at", commit.as_str()],
+    );
+
+    // Then: it is refused, naming `fix.txt` and the adopt, and nothing is
+    // written: the adopt's change at a file it added replays onto other
+    // content there as a conflict, and the commit does not hold what the
+    // newest write holds. The refusal says to keep the new content by an
+    // adopt of it.
+    let out = text(&refused);
+    assert_eq!(refused.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to record {THIRD} at {}: it does not carry the fix by hand of \
+             {NEXT}'s adopt {}, in 1 file(s): fix.txt\n",
+            commit.short(),
+            adopted.short()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "to keep the new content of those files, edit {NEXT} by hand to hold it and run \
+             `knives release adopt {NEXT}`"
+        )),
+        "{out}"
+    );
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+
+    // When: NEXT is edited by hand to hold `m7`'s `fix.txt` and adopted, as
+    // the refusal says, and the same commit, which jj rebased with NEXT, is
+    // recorded again.
+    let kept = fix_next_by_hand(
+        &lab,
+        &home,
+        &[("fix.txt", Some(changed))],
+        "keep m7's change",
+    );
+    let rebased = knives::ids::CommitId::new(lab.jj_work_output([
+        "log",
+        "-r",
+        change.as_str(),
+        "--no-graph",
+        "-T",
+        "commit_id",
+    ]));
+    let recorded = knives_release(
+        &lab,
+        &home,
+        &["--series", "old", "cut", THIRD, "--at", rebased.as_str()],
+    );
+
+    // Then: it is recorded: the new adopt holds `fix.txt` now, and the
+    // first adopt's hold on it has ended.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(0), "{out}");
+    assert!(
+        !out.contains(&format!("adopt {}", adopted.short())),
+        "{out}"
+    );
+    assert!(!out.contains(&format!("adopt {}", kept.short())), "{out}");
 }
