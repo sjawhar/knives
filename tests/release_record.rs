@@ -338,6 +338,46 @@ fn a_conflicted_commit_is_refused() {
     assert_eq!(bookmarks(&lab), refs, "{out}");
 }
 
+#[test]
+fn a_commit_that_shares_no_history_with_the_trunk_is_refused() {
+    // Given: a commit made on a history of its own, which no ref names: it
+    // holds none of the trunk, so it is no release of the series.
+    let lab = Lab::new();
+    lab.jj_work(["new", "-r", "root()", "-m", "an unrelated history"]);
+    std::fs::write(lab.work_path().join("other.txt"), "other\n").expect("write other.txt");
+    lab.jj_work(["new"]);
+    let commit = commit_of(&lab, "@-");
+    let (home, _consumer) = release_test_home(&lab);
+    let (entries, refs) = (ledger_entries(&home), bookmarks(&lab));
+
+    // When: it is recorded as the series' release.
+    let recorded = record(&lab, &home, RELEASE, &commit);
+
+    // Then: it is refused, and nothing is written.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+    assert_eq!(bookmarks(&lab), refs, "{out}");
+}
+
+#[test]
+fn the_root_commit_is_refused() {
+    // Given: the repository's root commit, which has no parent and no file.
+    let lab = Lab::new();
+    let root = commit_of(&lab, "root()");
+    let (home, _consumer) = release_test_home(&lab);
+    let (entries, refs) = (ledger_entries(&home), bookmarks(&lab));
+
+    // When: it is recorded as a release.
+    let recorded = record(&lab, &home, RELEASE, &root);
+
+    // Then: it is refused, and nothing is written.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+    assert_eq!(bookmarks(&lab), refs, "{out}");
+}
+
 /// A lab whose upstream carries a second base, `old`, split from `main`.
 fn two_base_lab() -> Lab {
     let lab = Lab::new();
