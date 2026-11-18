@@ -31,10 +31,11 @@ use crate::jj::{self, Repo};
 use crate::ledger::{Entry, Kind, Ledger, RecordedParent};
 use crate::pins::{Pin, PinKind};
 use crate::release_model::{
-    BranchSuccessions, EarlierWrites, MemberEvidence, MemberHistory, MemberSuccession, RecordedCut,
-    RecordedWrite, StackedHistoryContext, carried_from_tips, double_cut_findings,
-    last_recorded_parents, matched_write, member_history, member_parents, newest_release,
-    recorded_release_changes, release_refs_by_commit, repo_slug, trunk_positions,
+    BranchSuccessions, EarlierWrites, MemberEvidence, MemberHistory, MemberSuccession,
+    PreviousRelease, RecordedCut, RecordedWrite, ReleaseReading, StackedHistoryContext,
+    carried_from_tips, double_cut_findings, last_recorded_parents, matched_write, member_history,
+    member_parents, newest_release, previous_release_label, recorded_release_changes,
+    release_parents, release_refs_by_commit, repo_slug, stacked_release, trunk_positions,
 };
 
 /// Registered forge consumers and explicitly requested local checkout scans.
@@ -398,6 +399,10 @@ pub struct Plan {
     /// ([`crate::release_model::carriers`]): listed among `parents`,
     /// labelled, and read by no member check.
     pub carriers: Vec<CommitId>,
+    /// The previous release a release of a stacked series stacks on
+    /// ([`crate::release_model::read_release`]): listed first among
+    /// `parents`, labelled, and never a member.
+    pub previous: Option<PreviousRelease>,
     pub stale: Vec<Finding>,
     pub pins: Vec<Pin>,
     /// A consumer could not be consulted, so `pins` may lack the pin that
@@ -412,6 +417,60 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// The release's parent list as the plan shows it, and its members, the
+    /// parents every member check reads. `None` when the stacked reading
+    /// refuses the release: that is one of the plan's problems, and the
+    /// list is the release's parents.
+    ///
+    /// A release of a stacked series that has a previous release
+    /// ([`stacked_release`]) lists that release first ([`Plan::previous`]),
+    /// then its members and its carriers. Any other release lists its
+    /// parents, its carriers among them ([`Plan::read_carriers`]).
+    fn read_parents(
+        &mut self,
+        (repo, entry): (&Repo, &RepoEntry),
+        (ledger, tips, trunks): (&[Entry], &BookmarkTips, &[CommitId]),
+        (reference, commit): (&BookmarkRef, &CommitId),
+    ) -> anyhow::Result<Option<(Vec<ReleaseParent>, Vec<ReleaseParent>)>> {
+        let release = reference.branch().as_str();
+        match stacked_release(
+            repo,
+            entry,
+            (ledger, tips, trunks),
+            (release, self.published.as_ref(), commit),
+        )? {
+            None => {
+                let parents = repo.parents_of(commit.as_str())?;
+                let members = self.read_carriers(repo, (release, &parents), ledger)?;
+                Ok(Some((parents, members)))
+            }
+            Some(Ok(reading)) => {
+                let mut listed = reading.composition();
+                listed.extend(reading.carriers.iter().cloned());
+                let members = release_parents(tips, &reading.members);
+                self.carriers = reading.carriers;
+                self.previous = reading.previous;
+                Ok(Some((release_parents(tips, &listed), members)))
+            }
+            Some(Err(unexplained)) => {
+                self.problems.push(format!("{reference}: {unexplained}"));
+                self.list_parents(repo.parents_of(commit.as_str())?);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Set [`Plan::parents`] from `parents`, each with the bookmarks on it.
+    fn list_parents(&mut self, parents: Vec<ReleaseParent>) {
+        self.parents = parents
+            .into_iter()
+            .map(|parent| {
+                let names = parent.bookmarks.iter().map(ToString::to_string).collect();
+                (parent.commit, names)
+            })
+            .collect();
+    }
+
     /// Read which of `release`'s `parents` are carriers into
     /// [`Plan::carriers`], from `ledger` and [`Plan::published`]; the
     /// parents without them, which every member check reads.
@@ -438,8 +497,9 @@ impl Plan {
     }
 
     /// The plan's parent list, one line per parent with what holds it, a
-    /// carrier of `release` labelled as one. Bookmarks are names read from
-    /// the repository, so each is escaped.
+    /// carrier of `release` and the previous release of a stacked one
+    /// labelled as such. Bookmarks are names read from the repository, so
+    /// each is escaped.
     fn parent_lines(&self, release: &str) -> Vec<String> {
         use crate::ledger::inline_human_text;
         let label =
@@ -452,15 +512,24 @@ impl Plan {
                 } else {
                     inline_human_text(&names.join(", "))
                 };
-                if self.carriers.contains(commit) {
-                    format!(
-                        "    {}  {} ({held})",
-                        commit.short(),
-                        inline_human_text(&label)
-                    )
-                } else {
-                    format!("    {}  {held}", commit.short())
-                }
+                let previous = self
+                    .previous
+                    .as_ref()
+                    .filter(|previous| previous.commit == *commit)
+                    .map(|previous| previous_release_label(&previous.name));
+                let tag = previous
+                    .as_deref()
+                    .or_else(|| self.carriers.contains(commit).then_some(label.as_str()));
+                tag.map_or_else(
+                    || format!("    {}  {held}", commit.short()),
+                    |tag| {
+                        format!(
+                            "    {}  {} ({held})",
+                            commit.short(),
+                            inline_human_text(tag)
+                        )
+                    },
+                )
             })
             .collect()
     }
@@ -1602,6 +1671,47 @@ fn no_cut_yet(scheme: &ReleaseScheme) -> String {
     }
 }
 
+/// The members of the release `commit` that the trunk tip does not reach:
+/// the ones every member check reads. A member it reaches is a base, and
+/// one other than the release's shared base is a superseded base, a finding
+/// of `plan`.
+fn unlanded_members(
+    repo: &Repo,
+    (commit, trunk_tip): (&CommitId, Option<&CommitId>),
+    members: &[ReleaseParent],
+    plan: &mut Plan,
+) -> anyhow::Result<Vec<ReleaseParent>> {
+    let base = match trunk_tip {
+        Some(trunk) => shared_base(repo, commit, trunk)?,
+        None => None,
+    };
+    let mut member_parents = Vec::new();
+    for parent in members {
+        let trunk_reachable = match trunk_tip {
+            Some(trunk) => repo.is_ancestor(&parent.commit, trunk)?,
+            None => false,
+        };
+        if !trunk_reachable {
+            member_parents.push(parent.clone());
+        } else if base
+            .as_ref()
+            .is_some_and(|candidate| candidate != &parent.commit)
+        {
+            plan.base_findings.push(Finding::new(
+                FindingKind::SupersededBase,
+                Subject::Commit(parent.commit.clone()),
+                format!(
+                    "parent {} is an older upstream base superseded by {}; \
+                     `knives release rebase` self-heals this",
+                    parent.commit.short(),
+                    base.as_ref().map_or("", CommitId::short),
+                ),
+            ));
+        }
+    }
+    Ok(member_parents)
+}
+
 /// The release in hand and what it does not carry.
 ///
 /// `ledger` is this repository's ledger, read by the caller: the last recorded
@@ -1641,44 +1751,40 @@ pub fn plan(
         })
         .cloned();
 
-    let parents = repo.parents_of(commit.as_str())?;
-    let members = plan.read_carriers(&repo, (reference.branch().as_str(), &parents), ledger)?;
-    let trunk_tip = repo.resolve_commit(&entry.trunk_ref()).ok();
     let trunks = trunk_positions(&repo, entry)?;
-    let base = match &trunk_tip {
-        Some(trunk) => shared_base(&repo, &commit, trunk)?,
-        None => None,
+    let Some((parents, members)) = plan.read_parents(
+        (&repo, entry),
+        (ledger, &tips, &trunks),
+        (&reference, &commit),
+    )?
+    else {
+        add_consumer_pins(&mut plan, fork, consumers, &scheme);
+        return Ok(plan);
     };
-    let mut member_parents = Vec::new();
-    for parent in &members {
-        let trunk_reachable = match &trunk_tip {
-            Some(trunk) => repo.is_ancestor(&parent.commit, trunk)?,
-            None => false,
-        };
-        if !trunk_reachable {
-            member_parents.push(parent.clone());
-        } else if base
-            .as_ref()
-            .is_some_and(|candidate| candidate != &parent.commit)
-        {
-            plan.base_findings.push(Finding::new(
-                FindingKind::SupersededBase,
-                Subject::Commit(parent.commit.clone()),
-                format!(
-                    "parent {} is an older upstream base superseded by {}; \
-                     `knives release rebase` self-heals this",
-                    parent.commit.short(),
-                    base.as_ref().map_or("", CommitId::short),
-                ),
-            ));
-        }
-    }
+    let trunk_tip = repo.resolve_commit(&entry.trunk_ref()).ok();
+    let member_parents =
+        unlanded_members(&repo, (&commit, trunk_tip.as_ref()), &members, &mut plan)?;
     let releases = release_refs_by_commit(&tips, &scheme, publish_remote);
     let in_hand = [commit.clone()];
     let written = recorded_release_changes(&repo, ledger, &scheme);
+    // A member of a stacked release may stack on its previous release, so
+    // its history is measured past that release as past the trunk. Branch
+    // succession and the trunk's own messages still read the trunk alone.
+    let measured: std::borrow::Cow<'_, [CommitId]> =
+        plan.previous
+            .as_ref()
+            .map_or(std::borrow::Cow::Borrowed(&trunks), |previous| {
+                std::borrow::Cow::Owned(
+                    trunks
+                        .iter()
+                        .chain(std::iter::once(&previous.commit))
+                        .cloned()
+                        .collect(),
+                )
+            });
     let stacked_context = (!trunks.is_empty()).then_some(StackedHistoryContext {
         repo: &repo,
-        trunks: &trunks,
+        trunks: &measured,
         releases: &releases,
         carried: &in_hand,
         written: &written,
@@ -1706,13 +1812,7 @@ pub fn plan(
         branches: &series_branches,
         recorded: last_recorded_parents(ledger, &reference.to_string()),
     })?);
-    plan.parents = parents
-        .into_iter()
-        .map(|parent| {
-            let names = parent.bookmarks.iter().map(ToString::to_string).collect();
-            (parent.commit, names)
-        })
-        .collect();
+    plan.list_parents(parents);
 
     add_consumer_pins(&mut plan, fork, consumers, &scheme);
     Ok(plan)
@@ -1965,6 +2065,10 @@ fn parent_label(parent: &ReleaseParent) -> String {
 }
 
 /// One direct parent of a release, and what still identifies its commit.
+///
+/// In a stacked series, a row is one commit of the release's composition:
+/// its previous release, a member or a carrier
+/// ([`crate::release_model::read_release`]).
 #[derive(Debug, serde::Serialize)]
 pub struct MemberRow {
     pub commit: CommitId,
@@ -1979,6 +2083,10 @@ pub struct MemberRow {
     /// An earlier write of the release a fast-forward push gave it
     /// ([`crate::release_model::carriers`]): no member, and labelled so.
     pub carrier: bool,
+    /// The name of the previous release a stacked release stacks on, when
+    /// the row is that release: no member, and labelled so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_release: Option<String>,
 }
 
 /// The structural and semantic membership of one release.
@@ -2027,13 +2135,69 @@ fn member_row(
         advanced,
         base_parent,
         carrier,
+        previous_release: None,
     })
 }
 
+/// The rows of a stacked release that has a previous release: that release
+/// on a row of its own, then each member, then each carrier. No branch is
+/// read as continuing the previous release, which every member descends
+/// from.
+fn stacked_rows(
+    opened: &Repo,
+    reading: &ReleaseReading,
+    (tips, trunk): (&BookmarkTips, Option<&CommitId>),
+    successions: &BranchSuccessions<'_>,
+) -> anyhow::Result<Vec<MemberRow>> {
+    let mut rows = Vec::new();
+    if let Some(previous) = &reading.previous {
+        rows.push(MemberRow {
+            commit: previous.commit.clone(),
+            held_by: tips
+                .iter()
+                .filter(|(_, tip)| **tip == previous.commit)
+                .map(|(bookmark, _)| bookmark.to_string())
+                .collect(),
+            advanced: Vec::new(),
+            base_parent: false,
+            carrier: false,
+            previous_release: Some(previous.name.clone()),
+        });
+    }
+    for (commits, carrier) in [(&reading.members, false), (&reading.carriers, true)] {
+        for parent in release_parents(tips, commits) {
+            rows.push(member_row(opened, (parent, carrier), trunk, successions)?);
+        }
+    }
+    Ok(rows)
+}
+
+/// The rows of a release's direct parents, each carrier among them labelled
+/// from `ledger` and `published`, the publish remote's commit of `release`.
+fn parent_rows(
+    opened: &Repo,
+    parents: Vec<ReleaseParent>,
+    (release, ledger, published): (&str, &[Entry], Option<&CommitId>),
+    (trunk, successions): (Option<&CommitId>, &BranchSuccessions<'_>),
+) -> anyhow::Result<Vec<MemberRow>> {
+    let parent_commits: Vec<CommitId> =
+        parents.iter().map(|parent| parent.commit.clone()).collect();
+    let carriers =
+        crate::release_model::carriers(opened, release, &parent_commits, (ledger, published))?;
+    parents
+        .into_iter()
+        .map(|parent| {
+            let carrier = carriers.contains(&parent.commit);
+            member_row(opened, (parent, carrier), trunk, successions)
+        })
+        .collect()
+}
+
 /// Whether a row is one the content audit holds the release to: neither a
-/// legacy cut's base nor an earlier write of the release.
+/// legacy cut's base, an earlier write of the release, nor the previous
+/// release of a stacked one.
 const fn is_member(member: &MemberRow) -> bool {
-    !member.base_parent && !member.carrier
+    !member.base_parent && !member.carrier && member.previous_release.is_none()
 }
 
 /// The label audit buckets use for a member row.
@@ -2058,6 +2222,12 @@ fn member_label(member: &MemberRow) -> String {
 /// ([`crate::release_model::carriers`]). `verify` replays the content
 /// (`--verify`) against no previous release: a member whose change the tree
 /// does not hold reads as missing, however the release came to drop it.
+///
+/// A release of a stacked series that has a previous release reads as its
+/// previous release, on a row of its own, and its members
+/// ([`stacked_release`]); `verify` replays each member from its fork point
+/// with the previous release ([`audit_cut_from`]). A release the
+/// stacked reading refuses is a problem, and its rows are its parents.
 pub fn gather_members(
     opened: &Repo,
     fork: &Fork<'_>,
@@ -2067,6 +2237,7 @@ pub fn gather_members(
     let entry = fork.entry;
     let commit = opened.resolve_commit(name)?;
     let parents = opened.parents_of(commit.as_str())?;
+    let parent_count = parents.len();
     let trunk_name = entry.trunk_ref();
     let mut problems = Vec::new();
     let trunk = match opened.resolve_commit(&trunk_name) {
@@ -2088,22 +2259,32 @@ pub fn gather_members(
         branch: release.clone(),
         remote: RemoteName::new(entry.publish_remote()),
     });
-    let parent_commits: Vec<CommitId> =
-        parents.iter().map(|parent| parent.commit.clone()).collect();
-    let carriers = crate::release_model::carriers(
+    let stacked = stacked_release(
         opened,
-        release.as_str(),
-        &parent_commits,
-        (ledger, published),
+        entry,
+        (ledger, &tips, &trunks),
+        (release.as_str(), published, &commit),
     )?;
-    let members: Vec<MemberRow> = parents
-        .into_iter()
-        .map(|parent| {
-            let carrier = carriers.contains(&parent.commit);
-            member_row(opened, (parent, carrier), trunk.as_ref(), &successions)
-        })
-        .collect::<anyhow::Result<_>>()?;
-    let audit = if verify {
+    let refused = matches!(stacked, Some(Err(_)));
+    let (members, previous) = match stacked {
+        Some(Ok(reading)) => (
+            stacked_rows(opened, &reading, (&tips, trunk.as_ref()), &successions)?,
+            reading.previous,
+        ),
+        stacked => {
+            if let Some(Err(unexplained)) = stacked {
+                problems.push(format!("{name}: {unexplained}"));
+            }
+            let rows = parent_rows(
+                opened,
+                parents,
+                (release.as_str(), ledger, published),
+                (trunk.as_ref(), &successions),
+            )?;
+            (rows, None)
+        }
+    };
+    let audit = if verify && !refused {
         trunk
             .as_ref()
             .map(|trunk| {
@@ -2112,14 +2293,17 @@ pub fn gather_members(
                     .filter(|member| is_member(member))
                     .map(|member| (member_label(member), member.commit.clone()))
                     .collect();
-                audit_cut(
+                audit_cut_from(
                     &fork.checkout.path,
                     &members,
                     CutSubject::Committed(&commit),
-                    AuditContext {
-                        previous: None,
-                        trunk,
-                    },
+                    (
+                        AuditContext {
+                            previous: None,
+                            trunk,
+                        },
+                        previous.as_ref().map(|previous| &previous.commit),
+                    ),
                 )
             })
             .transpose()?
@@ -2130,7 +2314,7 @@ pub fn gather_members(
         repo: fork.checkout.path.display().to_string(),
         release: name.to_owned(),
         commit,
-        parent_count: members.len(),
+        parent_count,
         members,
         audit,
         notes: Vec::new(),
@@ -2160,11 +2344,18 @@ pub fn render_members(report: &MembersReport) -> String {
             }
             description.push_str(&inline_human_text(&member.advanced.join(", ")));
         }
-        if member.carrier {
+        let previous = member
+            .previous_release
+            .as_deref()
+            .map(previous_release_label);
+        let tag = previous
+            .as_deref()
+            .or_else(|| member.carrier.then_some(label.as_str()));
+        if let Some(tag) = tag {
             description = if description.is_empty() {
-                inline_human_text(&label)
+                inline_human_text(tag)
             } else {
-                format!("{} ({description})", inline_human_text(&label))
+                format!("{} ({description})", inline_human_text(tag))
             };
         }
         if description.is_empty() {
@@ -3112,13 +3303,40 @@ impl CutSubject<'_> {
 pub fn audit_cut(
     repo: &Path,
     members: &[(String, CommitId)],
-    mut subject: CutSubject<'_>,
+    subject: CutSubject<'_>,
     context: AuditContext<'_>,
+) -> anyhow::Result<CutAudit> {
+    audit_cut_from(repo, members, subject, (context, None))
+}
+
+/// [`audit_cut`], of a release of a stacked series when `stacked_on` is the
+/// previous release it stacks on ([`crate::release_model::read_release`]).
+///
+/// Such a release carries its previous release whole, and a member may
+/// stack on it. So each member replays from its fork point with the previous
+/// release, the merge base of the two, not from `trunk`: the previous
+/// release's own content is never charged to a member. The drift is what
+/// changed since the previous release, not since `previous`. The previous
+/// release is no member, and the caller does not list it among `members`.
+/// `None` is [`audit_cut`].
+pub fn audit_cut_from(
+    repo: &Path,
+    members: &[(String, CommitId)],
+    mut subject: CutSubject<'_>,
+    (context, stacked_on): (AuditContext<'_>, Option<&CommitId>),
 ) -> anyhow::Result<CutAudit> {
     let mut audit = CutAudit::default();
     let cut_is_conflicted = !subject.conflicted_files(repo)?.is_empty();
+    let stacked = stacked_on
+        .map(|previous| Repo::open(repo).map(|opened| (opened, previous)))
+        .transpose()?;
     for (name, tip) in members {
-        match subject.replay_outcome(repo, context.trunk.as_str(), tip.as_str())? {
+        let fork_point = stacked
+            .as_ref()
+            .map(|(opened, previous)| opened.fork_point(tip, previous))
+            .transpose()?;
+        let base = fork_point.as_ref().unwrap_or(context.trunk);
+        match subject.replay_outcome(repo, base.as_str(), tip.as_str())? {
             RebaseOutcome::Empty => {}
             RebaseOutcome::Conflicted if cut_is_conflicted => audit.inconclusive.push(name.clone()),
             RebaseOutcome::CleanNonEmpty | RebaseOutcome::Conflicted => {
@@ -3133,7 +3351,7 @@ pub fn audit_cut(
                     Some(previous) => !matches!(
                         crate::jj::probe_net_diff(
                             repo,
-                            context.trunk.as_str(),
+                            base.as_str(),
                             tip.as_str(),
                             previous.as_str(),
                         )?,
@@ -3149,7 +3367,7 @@ pub fn audit_cut(
             }
         }
     }
-    if let Some(previous) = context.previous {
+    if let Some(previous) = stacked_on.or(context.previous) {
         let drifted = subject.changed_files_since(repo, previous)?;
         let mut explained = BTreeSet::new();
         for (_, tip) in members {
@@ -3755,6 +3973,7 @@ mod members_tests {
             advanced: advanced.iter().map(ToString::to_string).collect(),
             base_parent,
             carrier: false,
+            previous_release: None,
         }
     }
 

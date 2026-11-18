@@ -303,6 +303,12 @@ impl RepoEntry {
         self.series.get(name.as_str()).map(|series| (name, series))
     }
 
+    /// Whether the selected series stacks each release on the one before it
+    /// ([`SeriesEntry::stacked`]). The default series never does.
+    pub fn stacked(&self) -> bool {
+        self.selected().is_some_and(|(_, series)| series.stacked)
+    }
+
     /// The remote for a role. Total: every role resolves.
     pub fn remote(&self, role: Role) -> &str {
         match role {

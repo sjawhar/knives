@@ -13,7 +13,7 @@ use crate::bind::Fork;
 use crate::cli::Exit;
 use crate::detect::{Finding, divergent_changes, stale_parents};
 use crate::forge::{Forge, PullSummary};
-use crate::ids::{BookmarkRef, is_release_name};
+use crate::ids::{BookmarkRef, CommitId, ReleaseScheme, RemoteName, is_release_name};
 use crate::jj::Repo;
 use crate::ledger::inline_human_text;
 use crate::snapshot::{self, SnapshotConfig};
@@ -335,12 +335,14 @@ fn branch_states_with_findings(
             .collect();
 
     // Which branches a release still pins an older commit of.
+    let stacked = stacked_series(fork, &repo)?;
     let mut stale_branches = std::collections::BTreeSet::new();
     for (reference, commit) in &tips {
         if !is_release_name(reference.branch(), &scheme) {
             continue;
         }
-        for finding in stale_parents(&repo.parents_of(commit.as_str())?, &tips) {
+        let parents = pinned_parents(&repo, (&stacked, &tips), (reference, commit))?;
+        for finding in stale_parents(&parents, &tips) {
             if let crate::detect::Subject::Commit(commit) = finding.subject {
                 stale_branches.insert(commit.to_string());
             }
@@ -414,6 +416,67 @@ fn branch_states_with_findings(
         }
     }
     Ok((states, findings))
+}
+
+/// Every stacked series of the fork with its trunk positions, and the ledger
+/// that records its writes, read only when the fork has one.
+#[derive(Debug)]
+struct StackedSeries {
+    series: Vec<(ReleaseScheme, crate::config::RepoEntry, Vec<CommitId>)>,
+    ledger: Vec<crate::ledger::Entry>,
+}
+
+fn stacked_series(fork: &Fork<'_>, repo: &Repo) -> anyhow::Result<StackedSeries> {
+    let series = fork
+        .entry
+        .all_series()
+        .into_iter()
+        .filter(crate::config::RepoEntry::stacked)
+        .map(|series| {
+            crate::release_model::trunk_positions(repo, &series)
+                .map(|trunks| (series.release_scheme(), series, trunks))
+        })
+        .collect::<Result<Vec<_>, crate::jj::JjError>>()?;
+    let ledger = if series.is_empty() {
+        Vec::new()
+    } else {
+        crate::ledger::Ledger::for_fork(fork).read()?.entries
+    };
+    Ok(StackedSeries { series, ledger })
+}
+
+/// The parents a release ref pins, as the stale scan reads them. A release
+/// of a stacked series that has a previous release pins its members and its
+/// carriers, never that release or a merge between the two
+/// ([`crate::release_model::stacked_release`]). Any other release, and one
+/// the stacked reading refuses, pins its parents.
+fn pinned_parents(
+    repo: &Repo,
+    (stacked, tips): (&StackedSeries, &crate::detect::BookmarkTips),
+    (reference, commit): (&BookmarkRef, &CommitId),
+) -> anyhow::Result<Vec<crate::detect::ReleaseParent>> {
+    let name = reference.branch().as_str();
+    if let Some((_, series, trunks)) = stacked
+        .series
+        .iter()
+        .find(|(scheme, _, _)| scheme.owns(name))
+    {
+        let published = tips.get(&BookmarkRef::Remote {
+            branch: reference.branch().clone(),
+            remote: RemoteName::new(series.publish_remote()),
+        });
+        if let Some(Ok(reading)) = crate::release_model::stacked_release(
+            repo,
+            series,
+            (&stacked.ledger, tips, trunks),
+            (name, published, commit),
+        )? {
+            let mut pinned = reading.members;
+            pinned.extend(reading.carriers);
+            return Ok(crate::release_model::release_parents(tips, &pinned));
+        }
+    }
+    Ok(repo.parents_of(commit.as_str())?)
 }
 
 /// The report as a terminal reads it.
