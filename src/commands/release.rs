@@ -3703,8 +3703,14 @@ pub struct CompositionCheck {
     /// In a stacked series, whether the newest recorded write is off the
     /// first-parent line of the commit the subject starts on
     /// ([`CompositionDelta::start`]): the subject does not carry that
-    /// write's release, whatever members it carries.
+    /// write's release, whatever members it carries. Only a write this
+    /// repository holds is measured so ([`Self::absent_write`]).
     pub off_line: bool,
+    /// Whether this repository does not hold the newest recorded write
+    /// ([`CompositionBaseline::newest_write`]). Nothing here can tell what
+    /// that write carries, so the subject is refused as one that lacks it,
+    /// as a recorded member this repository cannot resolve is.
+    pub absent_write: bool,
     /// The adopts whose fix by hand the subject lacks, by commit, among the
     /// fixes the series holds ([`CompositionDelta::fixes`]).
     pub dropped_fixes: Vec<CommitId>,
@@ -3720,22 +3726,50 @@ pub struct AdoptedFix {
     /// The adopt's commit.
     pub commit: CommitId,
     /// The files the fix changes against its baseline: those resolved by
-    /// hand, then those changed beyond the baseline's conflicts. Empty where
-    /// nothing here can measure the fix: this repository does not hold the
-    /// adopt, or its series cannot read the adopt's release.
+    /// hand, then those changed beyond the baseline's conflicts, then
+    /// [`Self::by_content`]. Where nothing here can measure the fix, the
+    /// files that its adopt event names
+    /// ([`crate::release_model::adopted_fix_files`]).
     pub files: Vec<String>,
-    /// What the fix is measured against, where this repository can measure
+    /// Each file that the adopt event names and the change against the
+    /// baseline here leaves out, as where this repository does not hold the
+    /// write the adopt replaced and measures against an automerge instead.
+    /// Nothing here measures such a file, so it is held by its content
+    /// alone ([`holds_fix`]).
+    by_content: Vec<String>,
+    /// What the fix is measured against, or why nothing here can measure
     /// it.
-    measure: Option<FixBaseline>,
+    measure: Result<FixBaseline, Unmeasured>,
 }
 
 impl AdoptedFix {
     /// The baseline that the fix is the adopt's change against
     /// ([`FixBaseline::baseline`]), or `None` where nothing here can measure
-    /// the fix ([`Self::files`]).
+    /// the fix ([`Self::unmeasured`]).
     fn baseline(&self) -> Option<jj::ResolutionBaseline<'_>> {
-        self.measure.as_ref().map(FixBaseline::baseline)
+        self.measure.as_ref().ok().map(FixBaseline::baseline)
     }
+
+    /// Why nothing here can measure the fix, or `None` where this
+    /// repository measures it. The gate then holds the fix by its content
+    /// alone ([`holds_fix`]).
+    pub const fn unmeasured(&self) -> Option<Unmeasured> {
+        match &self.measure {
+            Ok(_) => None,
+            Err(why) => Some(*why),
+        }
+    }
+}
+
+/// Why nothing in this repository can measure a fix by hand
+/// ([`AdoptedFix::unmeasured`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unmeasured {
+    /// This repository does not hold the adopt's commit.
+    Absent,
+    /// The adopt's series refuses to read its commit as a release
+    /// ([`release_reading`]).
+    Unread,
 }
 
 /// What an adopted fix is measured against, as `adopt` measured it.
@@ -3784,10 +3818,18 @@ impl FixBaseline {
 /// or when it holds, at every file the fix changed, what the adopt holds
 /// there ([`holds_fix`]). So a fix that a later cut or edit kept stays
 /// held, however many releases later, and a later adopt that removes the
-/// fix or changes those lines again lets it go. Where this repository
-/// cannot tell, as where it does not hold `write` or nothing here can
-/// measure the fix, an adopt of the newest release since its cut is held,
-/// as a later write of that release keeps it, and any other adopt is not.
+/// fix or changes those lines again lets it go.
+///
+/// A fix that nothing here can measure ([`AdoptedFix::unmeasured`]), as
+/// where this repository does not hold its adopt's commit, is held all the
+/// same, by its content: at each file its adopt event names, the subject
+/// must hold what `write` holds ([`holds_fix`]). A later adopt that removed
+/// the fix is then no loss, since the subject matches `write` there. Where
+/// this repository does not hold `write`, nothing here can tell what it
+/// carries, so the gate refuses for that write
+/// ([`CompositionCheck::absent_write`]), and of the adopts only those of
+/// the newest release since its cut are held, as a later write of that
+/// release keeps each one.
 pub fn adopted_fixes(
     repo: &Repo,
     entry: &RepoEntry,
@@ -3834,7 +3876,7 @@ pub fn adopted_fixes(
                 continue;
             };
             let kept = at < since_cut;
-            if !kept && (newest.is_none() || repo.resolve_commit(adopt.commit.as_str()).is_err()) {
+            if !kept && newest.is_none() {
                 continue;
             }
             let replaced = events
@@ -3842,15 +3884,19 @@ pub fn adopted_fixes(
                 .skip(at + 1)
                 .find(|(_, older)| older.commit.short() == replaced);
             let release = (entry, (ledger, tips), &writes);
-            let Some(fix) = adopted_fix(repo, release, (name, &adopt.commit), replaced)? else {
+            let recorded = (*event, &adopt.commit);
+            let Some(fix) = adopted_fix(repo, release, (name, recorded), replaced)? else {
                 continue;
             };
             let held = match newest {
-                Some(newest) if fix.measure.is_some() => {
+                Some(newest) if fix.unmeasured().is_none() => {
                     let mut subject = CutSubject::Committed(newest);
                     holds_fix(repo, (repo.path(), &mut subject), &fix, Some(&fix.commit))?
                 }
-                _ => kept,
+                // Nothing here can measure the fix, so it is held by its
+                // content; or nothing here holds `write`, and the fix is an
+                // adopt of its release since its cut.
+                _ => true,
             };
             if held {
                 fixes.push(fix);
@@ -3860,34 +3906,40 @@ pub fn adopted_fixes(
     Ok(fixes)
 }
 
-/// The fix by hand that `adopt`, a commit an `adopt` event of `name`
-/// recorded, holds against `replaced`, the write that event replaced, with
-/// its event, when the ledger still records it.
+/// The fix by hand that `adopt`, a commit that `event`, an `adopt` event of
+/// `name`, recorded, holds against `replaced`, the write that event
+/// replaced, with its event, when the ledger still records it.
 ///
 /// The fix is the adopt's change against the baseline that `adopt` measured
 /// it against: the write it replaced, rebuilt on the adopt's composition, or
 /// an automerge of that composition where this repository does not hold
 /// that write or knives could not check the release it was written over. A
-/// fix that changes no file here is `None`. An adopt that this repository
-/// does not hold, or whose reading its series refuses, is a fix that nothing
-/// here can measure.
+/// file that `event` names and that change leaves out is one that nothing
+/// here measures, so it is held by its content
+/// ([`AdoptedFix::by_content`]). A fix that changes no file here and whose
+/// event names none beyond is `None`. An adopt that this repository does
+/// not hold, or whose reading its series refuses, is a fix that nothing
+/// here can measure ([`Unmeasured`]): its files are the ones that `event`
+/// names ([`crate::release_model::adopted_fix_files`]).
 fn adopted_fix(
     repo: &Repo,
     (entry, (ledger, tips), writes): (&RepoEntry, (&[Entry], &BookmarkTips), &EarlierWrites),
-    (name, adopt): (&str, &CommitId),
+    (name, (event, adopt)): (&str, (&Entry, &CommitId)),
     replaced: Option<&(&Entry, RecordedWrite)>,
 ) -> Result<Option<AdoptedFix>, jj::JjError> {
-    let unmeasured = AdoptedFix {
+    let named = crate::release_model::adopted_fix_files(event, name);
+    let unmeasured = |files, why| AdoptedFix {
         name: name.to_owned(),
         commit: adopt.clone(),
-        files: Vec::new(),
-        measure: None,
+        files,
+        by_content: Vec::new(),
+        measure: Err(why),
     };
     if repo.resolve_commit(adopt.as_str()).is_err() {
-        return Ok(Some(unmeasured));
+        return Ok(Some(unmeasured(named, Unmeasured::Absent)));
     }
     let Ok(reading) = release_reading(repo, entry, (ledger, tips), (writes, adopt))? else {
-        return Ok(Some(unmeasured));
+        return Ok(Some(unmeasured(named, Unmeasured::Unread)));
     };
     let replaced = match replaced {
         Some((event, older))
@@ -3904,14 +3956,21 @@ fn adopted_fix(
         composition: reading.composition(),
     };
     let changes = jj::resolution_changes(repo, measure.baseline(), adopt)?;
-    let files: Vec<String> = changes.resolved.into_iter().chain(changes.beyond).collect();
-    if files.is_empty() {
+    let mut files: Vec<String> = changes.resolved.into_iter().chain(changes.beyond).collect();
+    let by_content: Vec<String> = named
+        .into_iter()
+        .filter(|file| !files.contains(file))
+        .collect();
+    if files.is_empty() && by_content.is_empty() {
         return Ok(None);
     }
+    files.extend(by_content.iter().cloned());
     Ok(Some(AdoptedFix {
+        name: name.to_owned(),
+        commit: adopt.clone(),
         files,
-        measure: Some(measure),
-        ..unmeasured
+        by_content,
+        measure: Ok(measure),
     }))
 }
 
@@ -3972,10 +4031,12 @@ pub struct CompositionDelta<'a> {
 /// point degenerates to the member itself, and that replay would read empty
 /// without consulting the cut subject at all. A recorded commit this
 /// repository cannot resolve counts as dropped: unverifiable must not read as
-/// carried. One check of the line serves a knives cut and a record alike: the
-/// newest write, a successor of it or a copy with its tree must be
-/// [`CompositionDelta::start`] or on its first-parent line, else the subject
-/// does not carry that write's release ([`CompositionCheck::off_line`]).
+/// carried. So does the newest write itself: a subject held against a write
+/// this repository does not hold is refused ([`CompositionCheck::absent_write`]),
+/// never held to less. One check of the line serves a knives cut and a
+/// record alike: the newest write, a successor of it or a copy with its tree
+/// must be [`CompositionDelta::start`] or on its first-parent line, else the
+/// subject does not carry that write's release ([`CompositionCheck::off_line`]).
 ///
 /// Each fix by hand that the series holds ([`CompositionDelta::fixes`]) is
 /// held as a member is ([`fix_carried`]). A fix the subject does not carry
@@ -3987,9 +4048,12 @@ pub fn uncarried_recorded_members(
     delta: &CompositionDelta<'_>,
 ) -> anyhow::Result<CompositionCheck> {
     let mut check = CompositionCheck::default();
-    if let (Some(start), Some(write)) = (delta.start, &delta.baseline.newest_write) {
-        let line = (start, std::slice::from_ref(delta.trunk));
-        check.off_line = !on_first_parent_line(repo, &write.commit, line)?;
+    if let Some(write) = &delta.baseline.newest_write {
+        check.absent_write = repo.resolve_commit(write.commit.as_str()).is_err();
+        if let Some(start) = delta.start.filter(|_| !check.absent_write) {
+            let line = (start, std::slice::from_ref(delta.trunk));
+            check.off_line = !on_first_parent_line(repo, &write.commit, line)?;
+        }
     }
     for fix in delta.fixes {
         if !fix_carried(repo, (path, &mut *subject), delta, fix)? {
@@ -4072,7 +4136,7 @@ pub fn uncarried_recorded_members(
 /// refines it or an `include` of a member that touches it, and then the
 /// replay conflicts: so the subject carries the fix too when it holds, at
 /// every file the fix changed, exactly what the newest recorded write holds
-/// there.
+/// there. A fix that nothing here can measure is held by that test alone.
 fn fix_carried(
     repo: &Repo,
     (path, subject): (&Path, &mut CutSubject<'_>),
@@ -4098,10 +4162,15 @@ fn fix_carried(
 }
 
 /// Whether `subject` holds `fix` by its content: the fix's change against
-/// its baseline replays empty onto it, as a member's change does, or it
-/// holds, at every file the fix changed, exactly what `holder` holds there.
-/// With no `holder` only the replay counts. A fix that nothing here can
-/// measure is not held.
+/// its baseline replays empty onto it, as a member's change does, and it
+/// holds what `holder` holds at each file that nothing here measures
+/// ([`AdoptedFix::by_content`]); or it holds, at every file of the fix,
+/// exactly what `holder` holds there.
+///
+/// A fix that nothing here can measure has no change to replay
+/// ([`AdoptedFix::unmeasured`]), so only its files count: those its adopt
+/// event names. With no `holder`, or no file, only the replay counts, so
+/// such a fix is not held.
 ///
 /// The gate's holder is the newest recorded write ([`fix_carried`]). When
 /// the subject is the newest write itself, the holder is the adopt, so the
@@ -4113,18 +4182,22 @@ fn holds_fix(
     fix: &AdoptedFix,
     holder: Option<&CommitId>,
 ) -> anyhow::Result<bool> {
-    let Some(baseline) = fix.baseline() else {
-        return Ok(false);
-    };
-    if matches!(
-        subject.resolution_replay_outcome(path, baseline, &fix.commit)?,
-        RebaseOutcome::Empty
-    ) {
+    if let Some(baseline) = fix.baseline()
+        && matches!(
+            subject.resolution_replay_outcome(path, baseline, &fix.commit)?,
+            RebaseOutcome::Empty
+        )
+        && (fix.by_content.is_empty()
+            || holder.map_or(Ok(false), |holder| {
+                subject.holds_paths_of(repo, holder, &fix.by_content)
+            })?)
+    {
         return Ok(true);
     }
-    holder.map_or(Ok(false), |holder| {
-        subject.holds_paths_of(repo, holder, &fix.files)
-    })
+    match holder {
+        Some(holder) if !fix.files.is_empty() => subject.holds_paths_of(repo, holder, &fix.files),
+        _ => Ok(false),
+    }
 }
 
 /// `commit` as the gate names it ([`recorded_member_name`]).

@@ -1350,6 +1350,44 @@ pub const ADOPTED_BEYOND: &str = "changed beyond the baseline's conflicts: ";
 /// the reason that a caller gives, which follows them, never reads as one.
 /// `None` for every other event, and for an adopt that changed no file.
 pub fn adopted_fix_replaces<'a>(entry: &'a Entry, release: &str) -> Option<&'a str> {
+    adopted_fix_parts(entry, release).map(|(commit, _)| commit)
+}
+
+/// The files that an `adopt` event of `release` names as its fix by hand.
+///
+/// They are the files it resolved by hand ([`ADOPTED_RESOLVED`]), then the
+/// files it changed beyond the baseline's conflicts ([`ADOPTED_BEYOND`]), as
+/// `adopt` measured them where it ran. Empty for every event that
+/// [`adopted_fix_replaces`] reads as no fix.
+///
+/// The event names each list as its files joined by `, `. The resolved list
+/// ends at the next part, after `; `, and the other list ends where the
+/// reason begins, ` (why: `, or at the next part where no reason follows.
+/// A path that holds a separator does not read back whole.
+pub fn adopted_fix_files(entry: &Entry, release: &str) -> Vec<String> {
+    let Some((_, mut parts)) = adopted_fix_parts(entry, release) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    if let Some(resolved) = parts.strip_prefix(ADOPTED_RESOLVED) {
+        let (list, rest) = resolved.split_once("; ").unwrap_or((resolved, ""));
+        files.extend(list.split(", ").map(str::to_owned));
+        parts = rest;
+    }
+    if let Some(beyond) = parts.strip_prefix(ADOPTED_BEYOND) {
+        let list = beyond
+            .split_once(" (why: ")
+            .or_else(|| beyond.split_once("; "))
+            .map_or(beyond, |(list, _)| list);
+        files.extend(list.split(", ").map(str::to_owned));
+    }
+    files
+}
+
+/// The replaced write's commit prefix and the parts after the baseline of
+/// an `adopt` event of `release` that recorded a fix by hand
+/// ([`adopted_fix_replaces`]).
+fn adopted_fix_parts<'a>(entry: &'a Entry, release: &str) -> Option<(&'a str, &'a str)> {
     let rest = entry
         .text
         .strip_prefix("edited ")?
@@ -1362,7 +1400,8 @@ pub fn adopted_fix_replaces<'a>(entry: &'a Entry, release: &str) -> Option<&'a s
         .or_else(|| replaced.strip_prefix("edit "))?;
     let (commit, measured) = replaced.split_once("; measured against ")?;
     let (_, parts) = measured.split_once("; ")?;
-    (parts.starts_with(ADOPTED_RESOLVED) || parts.starts_with(ADOPTED_BEYOND)).then_some(commit)
+    (parts.starts_with(ADOPTED_RESOLVED) || parts.starts_with(ADOPTED_BEYOND))
+        .then_some((commit, parts))
 }
 
 /// Every earlier write of one release name.
@@ -2407,6 +2446,72 @@ mod unchecked_mark_tests {
         // And: a write over a release knives checked carries no mark.
         let checked = edited("included feat/x", &unchecked_suffix(&InHandWrite::Recorded));
         assert_eq!(unchecked_mark(&checked), None, "{}", checked.text);
+    }
+}
+
+#[cfg(test)]
+mod adopted_fix_tests {
+    use super::{CommitId, adopted_fix_files, adopted_fix_replaces, carrier_tests::event};
+
+    /// An `adopt` event of `integration` whose delta after its baseline says
+    /// `parts`, as `adopt` writes one.
+    fn adopted(parts: &str) -> crate::ledger::Entry {
+        let commit = CommitId::new("a".repeat(40));
+        event(
+            "integration",
+            format!(
+                "edited integration as {} (change kkkkkkkkkkkk) with 2 parent(s): adopted: \
+                 replaces the recorded cut 0123456789ab; measured against the recorded cut \
+                 0123456789ab; {parts}; parents: feat/x@bbbbbbbbbbbb, feat/y@cccccccccccc",
+                commit.short()
+            ),
+            &commit,
+        )
+    }
+
+    #[test]
+    fn an_adopt_event_names_the_files_of_its_fix_and_no_other_event_does() {
+        // Given: adopts that resolved files by hand, changed files beyond the
+        // baseline's conflicts with a reason that holds both separators, or
+        // with no reason, or both; and an adopt that changed no file.
+        let cases = [
+            (
+                "resolved by hand: a.txt, dir/b.txt",
+                vec!["a.txt", "dir/b.txt"],
+            ),
+            (
+                "changed beyond the baseline's conflicts: fix.txt (why: a fix, by hand; again)",
+                vec!["fix.txt"],
+            ),
+            (
+                "resolved by hand: a.txt; changed beyond the baseline's conflicts: c.txt, d.txt \
+                 (why: both); carriers: 0123456789ab",
+                vec!["a.txt", "c.txt", "d.txt"],
+            ),
+            (
+                "changed beyond the baseline's conflicts: e.txt; carriers: 0123456789ab",
+                vec!["e.txt"],
+            ),
+            ("why: nothing changed", Vec::new()),
+        ];
+
+        for (parts, files) in cases {
+            let entry = adopted(parts);
+
+            // Then: each names the files of its fix, and the write it
+            // replaced exactly when it names a file.
+            assert_eq!(adopted_fix_files(&entry, "integration"), files, "{parts}");
+            assert_eq!(
+                adopted_fix_replaces(&entry, "integration").is_some(),
+                !files.is_empty(),
+                "{parts}"
+            );
+            // And: another release's name reads no fix in it.
+            assert_eq!(
+                adopted_fix_files(&entry, "release/2026-08-04"),
+                Vec::<String>::new()
+            );
+        }
     }
 }
 

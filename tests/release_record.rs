@@ -17,10 +17,12 @@
 //! the ledger records, so a member that `include` added since that release's
 //! cut is held too, and in a stacked series that write must be on the
 //! record's first-parent line, so a commit built below it is refused, or
-//! with `--allow-drop` recorded with the drop stated. A published name that
-//! the publish remote lacks is not recorded until it is pushed, and the
-//! refusal gives the commands. A printed command quotes the name for the
-//! shell.
+//! with `--allow-drop` recorded with the drop stated. A clone that does not
+//! hold that write is refused, naming it and the fetch, and a fix by hand
+//! that a clone cannot measure, as where it does not hold the adopt's
+//! commit, is held by its content. A published name that the publish remote
+//! lacks is not recorded until it is pushed, and the refusal gives the
+//! commands. A printed command quotes the name for the shell.
 
 #![allow(
     clippy::expect_used,
@@ -2841,5 +2843,463 @@ fn a_record_in_a_clone_without_the_newest_write_is_refused() {
         out.contains(next.short()) || out.contains(adopt.short()),
         "{out}"
     );
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+}
+
+/// Give the second clone of origin, which shares the ledger, the upstream
+/// remote, then fetch everything both remotes hold now.
+fn fetch_second_clone(lab: &Lab) {
+    let upstream = lab.upstream.to_str().expect("utf-8 path").to_owned();
+    lab.jj_at(&lab.second, ["git", "remote", "add", "upstream", &upstream]);
+    lab.jj_at(&lab.second, ["git", "fetch", "--all-remotes"]);
+}
+
+/// Whether the second clone holds `commit`.
+fn second_clone_holds(lab: &Lab, commit: &CommitId) -> bool {
+    knives::jj::Repo::open(&lab.second)
+        .expect("open the second clone")
+        .resolve_commit(commit.as_str())
+        .is_ok()
+}
+
+/// The third release merged by hand in the second clone of `feat/alpha`
+/// and `feat/beta` as origin holds them, with `fix.txt` holding `fix` when
+/// there is one, and no ref on it. Returns its commit.
+fn hand_merge_in_second_clone(lab: &Lab, fix: Option<&str>) -> CommitId {
+    lab.jj_at(
+        &lab.second,
+        [
+            "new",
+            "-r",
+            "feat/alpha@origin",
+            "-r",
+            "feat/beta@origin",
+            "-m",
+            "the third release, merged by hand",
+        ],
+    );
+    if let Some(fix) = fix {
+        std::fs::write(lab.second.join("fix.txt"), fix).expect("write fix.txt");
+    }
+    lab.jj_at(&lab.second, ["new"]);
+    CommitId::new(lab.revision(&lab.second, "@-", "commit_id").trim())
+}
+
+/// `knives release cut` in the second clone, then `args`, whatever its
+/// exit.
+fn cut_in_second_clone(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> Output {
+    let args: Vec<&str> = ["--text", "release", "--repo", "demo", "cut"]
+        .into_iter()
+        .chain(args.iter().copied())
+        .collect();
+    lab::knives_command(&lab.second, home.path(), lab.temp_path(), &args)
+        .output()
+        .expect("run knives in the second clone")
+}
+
+/// [`adopted_then_cut_lab`] with the two branches and the next release
+/// pushed, never the adopt's commit, and the second clone fetched: it holds
+/// the newest recorded write, the next release's cut, which carries the
+/// fix, and not the adopt's commit. Returns the adopt's commit and the next
+/// release's.
+fn adopt_unfetched_lab() -> (Lab, tempfile::TempDir, CommitId, CommitId) {
+    let (lab, home, adopt) = adopted_then_cut_lab();
+    let next = commit_at(&lab, "release/2026-08-05");
+    for branch in ["feat/alpha", "feat/beta", "release/2026-08-05"] {
+        lab.push_branch(branch);
+    }
+    fetch_second_clone(&lab);
+    assert!(
+        !second_clone_holds(&lab, &adopt) && second_clone_holds(&lab, &next),
+        "the second clone holds the next release and not the adopt's commit"
+    );
+    (lab, home, adopt, next)
+}
+
+/// The line that names RELEASE's fix by hand, of the adopt `adopt`, as one
+/// that the second clone held by its content against `next`, the next
+/// release's cut, the newest recorded write.
+fn fix_held_by_content(adopt: &CommitId, next: &CommitId) -> String {
+    format!(
+        "the fix by hand of {RELEASE}'s adopt {adopt}, in 1 file(s): fix.txt (this repository \
+         does not hold {adopt}, so the fix is held by its content: what release/2026-08-05's \
+         newest recorded write (a cut) {next} holds in those files)\n",
+        adopt = adopt.short(),
+        next = next.short()
+    )
+}
+
+#[test]
+fn a_record_in_a_clone_without_the_adopts_commit_that_holds_its_fix_is_recorded() {
+    // Given: RELEASE fixed by hand and adopted, the next release cut on it
+    // with the fix; a second clone that holds the next release and not the
+    // adopt's commit; and the third release merged by hand there, with
+    // `fix.txt` as the next release holds it.
+    let (lab, home, _adopt, _next) = adopt_unfetched_lab();
+    let commit = hand_merge_in_second_clone(&lab, Some("fixed by hand\n"));
+
+    // When: it is recorded in the second clone.
+    let recorded = cut_in_second_clone(
+        &lab,
+        &home,
+        &["release/2026-08-06", "--at", commit.as_str()],
+    );
+
+    // Then: it is recorded: the clone cannot measure the fix, so it holds it
+    // by its content, and the commit holds at `fix.txt` what the newest
+    // recorded write holds there.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains(&recorded_line("release/2026-08-06", &commit)),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_record_in_a_clone_without_the_adopts_commit_that_changes_its_file_is_refused() {
+    // Given: the same second clone, and the third release merged by hand
+    // there with `fix.txt` changed from what the next release holds.
+    let (lab, home, adopt, next) = adopt_unfetched_lab();
+    let commit = hand_merge_in_second_clone(&lab, Some("fixed another way\n"));
+    let entries = ledger_entries(&home);
+
+    // When: it is recorded in the second clone.
+    let recorded = cut_in_second_clone(
+        &lab,
+        &home,
+        &["release/2026-08-06", "--at", commit.as_str()],
+    );
+
+    // Then: it is refused, naming the adopt's commit as one this clone does
+    // not hold and the write whose content held the fix, and nothing is
+    // written; the drift check leaves `fix.txt` to the gate.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to record release/2026-08-06 at {}: it does not carry {}",
+            commit.short(),
+            fix_held_by_content(&adopt, &next)
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("!! fix.txt"), "{out}");
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+}
+
+#[test]
+fn a_record_in_a_clone_without_the_adopts_commit_goes_ahead_under_allow_drop_naming_it() {
+    // Given: the same second clone, and the third release merged by hand
+    // there with `fix.txt` changed from what the next release holds.
+    let (lab, home, adopt, next) = adopt_unfetched_lab();
+    let commit = hand_merge_in_second_clone(&lab, Some("fixed another way\n"));
+
+    // When: it is recorded in the second clone, the drop stated.
+    let allowed = cut_in_second_clone(
+        &lab,
+        &home,
+        &[
+            "release/2026-08-06",
+            "--at",
+            commit.as_str(),
+            "--allow-drop",
+        ],
+    );
+
+    // Then: it is recorded, and both its line and its event name RELEASE's
+    // adopt and its commit.
+    let out = text(&allowed);
+    assert_eq!(allowed.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: --allow-drop: recording release/2026-08-06 at {} without {}",
+            commit.short(),
+            fix_held_by_content(&adopt, &next)
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&recorded_line("release/2026-08-06", &commit)),
+        "{out}"
+    );
+    let event = newest_event(&home, "release/2026-08-06");
+    assert!(
+        event.text.contains(&format!(
+            "; all carried; without the fix by hand of {RELEASE}'s adopt {}",
+            adopt.short()
+        )),
+        "{event:?}"
+    );
+}
+
+/// [`RELEASE`], a knives cut of `feat/alpha` and `feat/beta`, pushed with
+/// both branches and published by a note; then the next release, a knives
+/// cut in the work checkout, never pushed: the newest recorded write; and
+/// the second clone fetched, which does not hold that write. Returns the
+/// next release's commit.
+fn newest_write_unfetched_lab() -> (Lab, tempfile::TempDir, CommitId) {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    for branch in ["feat/alpha", "feat/beta", RELEASE] {
+        lab.push_branch(branch);
+    }
+    mark_published(&lab, &home, RELEASE);
+    let next = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(matches!(next.status.code(), Some(0 | 1)), "{}", text(&next));
+    let newest = commit_at(&lab, "release/2026-08-05");
+    fetch_second_clone(&lab);
+    assert!(
+        !second_clone_holds(&lab, &newest),
+        "the second clone does not hold the newest write"
+    );
+    (lab, home, newest)
+}
+
+/// What the composition gate says of a subject, `subject` (`this cut` or
+/// `it`), that it cannot hold against `newest`, the next release's cut,
+/// which this clone does not hold.
+fn not_held_against(subject: &str, newest: &CommitId) -> String {
+    format!(
+        "{subject} cannot be held against release/2026-08-05's newest recorded write (a cut) {}: \
+         this repository does not hold that commit, so it cannot tell what that write carries\n",
+        newest.short()
+    )
+}
+
+#[test]
+fn a_record_in_a_clone_without_the_newest_write_is_refused_naming_its_fetch() {
+    // Given: a second clone that does not hold the newest recorded write,
+    // the next release's cut, and a release merged by hand there of the
+    // same two branches.
+    let (lab, home, newest) = newest_write_unfetched_lab();
+    let commit = hand_merge_in_second_clone(&lab, None);
+    let entries = ledger_entries(&home);
+
+    // When: it is recorded in the second clone.
+    let recorded = cut_in_second_clone(
+        &lab,
+        &home,
+        &["release/2026-08-06", "--at", commit.as_str()],
+    );
+
+    // Then: it is refused, naming that write, its release and its commit,
+    // with the fetch and, where the fetch does not bring it, the adopt of
+    // that release, and nothing is written: the clone cannot tell what that
+    // write carries, so it holds the commit to nothing less.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to record release/2026-08-06 at {}: {}",
+            commit.short(),
+            not_held_against("it", &newest)
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "  nothing was recorded; fetch, then record a commit that carries what {next} carries; \
+             if the fetch does not bring {next}, `knives release adopt release/2026-08-05` \
+             records the commit this repository holds as release/2026-08-05's newest write, or \
+             re-run with --allow-drop to state the drop is intended\n",
+            next = newest.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+}
+
+#[test]
+fn a_record_in_a_clone_without_the_newest_write_goes_ahead_under_allow_drop_naming_it() {
+    // Given: the same second clone and hand merge.
+    let (lab, home, newest) = newest_write_unfetched_lab();
+    let commit = hand_merge_in_second_clone(&lab, None);
+
+    // When: it is recorded in the second clone, the drop stated.
+    let allowed = cut_in_second_clone(
+        &lab,
+        &home,
+        &[
+            "release/2026-08-06",
+            "--at",
+            commit.as_str(),
+            "--allow-drop",
+        ],
+    );
+
+    // Then: it is recorded, and both its line and its event name the
+    // write it was not held against, its release and its commit.
+    let out = text(&allowed);
+    assert_eq!(allowed.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: --allow-drop: recording release/2026-08-06 at {} without holding it against \
+             release/2026-08-05's newest recorded write (a cut) {}, which this repository does \
+             not hold\n",
+            commit.short(),
+            newest.short()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&recorded_line("release/2026-08-06", &commit)),
+        "{out}"
+    );
+    let event = newest_event(&home, "release/2026-08-06");
+    assert!(
+        event.text.contains(&format!(
+            "; release/2026-08-05's newest recorded write (a cut) holds 2 member(s); all carried; \
+             not held against release/2026-08-05's newest recorded write (a cut) {}, which this \
+             repository does not hold",
+            newest.short()
+        )),
+        "{event:?}"
+    );
+}
+
+#[test]
+fn a_cut_in_a_clone_without_the_newest_write_is_refused_naming_its_fetch() {
+    // Given: a second clone that does not hold the newest recorded write,
+    // the next release's cut, and whose newest release is the published
+    // RELEASE.
+    let (lab, home, newest) = newest_write_unfetched_lab();
+    let entries = ledger_entries(&home);
+
+    // When: the third release is cut in the second clone.
+    let cut = cut_in_second_clone(&lab, &home, &["release/2026-08-06"]);
+
+    // Then: it is refused, naming that write, its release and its commit,
+    // saying to fetch, then move that release to it, and where the fetch
+    // does not bring it, to adopt the release; nothing is cut.
+    let out = text(&cut);
+    assert_eq!(cut.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut: {}",
+            not_held_against("this cut", &newest)
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "  the candidate was discarded; fetch, then move release/2026-08-05 to {next}, its \
+             newest recorded write: `jj bookmark set release/2026-08-05 -r {next} \
+             --allow-backwards`; if the fetch does not bring {next}, `knives release adopt \
+             release/2026-08-05` records the commit this repository holds as \
+             release/2026-08-05's newest write, or re-run with --allow-drop to state the drop is \
+             intended\n",
+            next = newest.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+    assert!(
+        knives::jj::Repo::open(&lab.second)
+            .expect("open the second clone")
+            .resolve_commit("release/2026-08-06")
+            .is_err(),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_record_in_a_clone_without_the_write_an_adopt_replaced_holds_the_file_it_names() {
+    // Given: RELEASE fixed by hand in place and adopted, pushed, and fetched
+    // by the second clone; then in the work checkout `feat/gamma` included
+    // into it, an edit that carries the fix and is never pushed, the fix
+    // removed from it by hand in place and adopted, and the release and the
+    // branches pushed and fetched by the second clone. That clone holds both
+    // adopts and not the edit the second one replaced, so it measures the
+    // second adopt against an automerge, which no file of it changes.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    lab.jj_work(["new", "-r", RELEASE]);
+    std::fs::write(lab.work_path().join("fix.txt"), "fixed by hand\n").expect("write fix.txt");
+    lab.jj_work(["squash", "--into", RELEASE]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let adopted = knives_release(&lab, &home, &["adopt", RELEASE, "--why", "a fix by hand"]);
+    assert_eq!(adopted.status.code(), Some(0), "{}", text(&adopted));
+    let first = commit_at(&lab, RELEASE);
+    for branch in ["feat/alpha", "feat/beta", RELEASE] {
+        lab.push_branch(branch);
+    }
+    fetch_second_clone(&lab);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    assert_eq!(included.status.code(), Some(0), "{}", text(&included));
+    let edit = commit_at(&lab, RELEASE);
+    lab.jj_work(["new", "-r", RELEASE]);
+    std::fs::remove_file(lab.work_path().join("fix.txt")).expect("remove fix.txt");
+    lab.jj_work(["squash", "--into", RELEASE]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let removed = knives_release(
+        &lab,
+        &home,
+        &["adopt", RELEASE, "--why", "the fix is not needed"],
+    );
+    assert_eq!(removed.status.code(), Some(0), "{}", text(&removed));
+    let second = commit_at(&lab, RELEASE);
+    for branch in ["feat/gamma", RELEASE] {
+        lab.push_branch(branch);
+    }
+    lab.jj_at(&lab.second, ["git", "fetch", "--all-remotes"]);
+    assert!(
+        second_clone_holds(&lab, &first)
+            && second_clone_holds(&lab, &second)
+            && !second_clone_holds(&lab, &edit),
+        "the second clone holds both adopts and not the edit"
+    );
+    lab.jj_at(
+        &lab.second,
+        [
+            "new",
+            "-r",
+            "feat/alpha@origin",
+            "-r",
+            "feat/beta@origin",
+            "-r",
+            "feat/gamma@origin",
+            "-m",
+            "the next release, merged by hand",
+        ],
+    );
+    std::fs::write(lab.second.join("fix.txt"), "fixed by hand\n").expect("write fix.txt");
+    lab.jj_at(&lab.second, ["new"]);
+    let commit = CommitId::new(lab.revision(&lab.second, "@-", "commit_id").trim());
+    let entries = ledger_entries(&home);
+
+    // When: the next release, merged by hand with the fix the second adopt
+    // removed, is recorded in the second clone.
+    let recorded = cut_in_second_clone(
+        &lab,
+        &home,
+        &["release/2026-08-05", "--at", commit.as_str()],
+    );
+
+    // Then: it is refused by the gate, naming the second adopt: the file
+    // that adopt's event names and nothing here measures is held by its
+    // content, and the commit does not hold there what that adopt holds.
+    // Nothing is written, and the drift check leaves `fix.txt` to the gate.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to record release/2026-08-05 at {}: it does not carry the fix by hand \
+             of {RELEASE}'s adopt {}, in 1 file(s): fix.txt\n",
+            commit.short(),
+            second.short()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("!! fix.txt"), "{out}");
     assert_eq!(ledger_entries(&home), entries, "{out}");
 }

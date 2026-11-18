@@ -532,11 +532,15 @@ pub enum ReleaseAction {
     /// each member of the previous cut and of the newest write of the newest
     /// release the ledger records in the series, and each fix by hand an
     /// `adopt` of any release of the series recorded that the newest write
-    /// still carries; in a stacked series that write, a successor of it or a
-    /// copy with its tree must be on its first-parent line. The ledger event
-    /// records its members: in a stacked series the side parents on its
-    /// first-parent line, with its previous release labelled as no member.
-    /// No reap runs, and nothing is signed or pushed.
+    /// still carries; a fix this repository cannot measure, as where it does
+    /// not hold the adopt, is held by its content, what the newest write
+    /// holds at the files the adopt names. A repository that does not hold
+    /// the newest write is refused and told to fetch it. In a stacked series
+    /// that write, a successor of it or a copy with its tree must be on its
+    /// first-parent line. The ledger event records its members: in a stacked
+    /// series the side parents on its first-parent line, with its previous
+    /// release labelled as no member. No reap runs, and nothing is signed or
+    /// pushed.
     Cut {
         /// The dated release name, `release/[<series>/]YYYY-MM-DD[.N|-<label>]`.
         /// It must sort after the newest release of the series. Omit it for a
@@ -547,8 +551,9 @@ pub enum ReleaseAction {
         /// previous cut's ledger event or the newest recorded write of the
         /// newest release the ledger records in the series holds, a fix by
         /// hand an `adopt` of any release of the series recorded that the
-        /// newest write still carries, or in a stacked series that write, off
-        /// the line the cut starts on. The refusal lists exactly what.
+        /// newest write still carries, that write itself where this
+        /// repository does not hold it, or in a stacked series that write,
+        /// off the line the cut starts on. The refusal lists exactly what.
         #[arg(long)]
         allow_drop: bool,
         /// Record a release cut outside knives: the commit becomes NAME's
