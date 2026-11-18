@@ -2756,3 +2756,90 @@ fn a_record_in_a_clone_without_the_adopts_commit_is_refused_naming_it() {
     assert!(out.contains(adopt.short()), "{out}");
     assert_eq!(ledger_entries(&home), entries, "{out}");
 }
+
+#[test]
+fn a_record_in_a_clone_without_the_newest_write_is_refused() {
+    // Given: in the work checkout, RELEASE cut of `feat/alpha` and
+    // `feat/beta`, fixed by hand in place and adopted, then the next release
+    // cut on it, which carries the fix; only the two branches pushed to
+    // origin; and a second clone of origin that shares the ledger, which
+    // holds neither the adopt's commit nor the next release's, with the third
+    // release merged by hand there of the two branches, without the fix.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    lab.jj_work(["new", "-r", RELEASE]);
+    std::fs::write(lab.work_path().join("fix.txt"), "fixed by hand\n").expect("write fix.txt");
+    lab.jj_work(["squash", "--into", RELEASE]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let adopted = knives_release(&lab, &home, &["adopt", RELEASE, "--why", "a fix by hand"]);
+    assert_eq!(adopted.status.code(), Some(0), "{}", text(&adopted));
+    let adopt = commit_at(&lab, RELEASE);
+    let cut_next = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(
+        matches!(cut_next.status.code(), Some(0 | 1)),
+        "{}",
+        text(&cut_next)
+    );
+    let next = commit_at(&lab, "release/2026-08-05");
+    for branch in ["feat/alpha", "feat/beta"] {
+        lab.push_branch(branch);
+    }
+    let upstream = lab.upstream.to_str().expect("utf-8 path").to_owned();
+    lab.jj_at(&lab.second, ["git", "remote", "add", "upstream", &upstream]);
+    lab.jj_at(&lab.second, ["git", "fetch", "--all-remotes"]);
+    let second = knives::jj::Repo::open(&lab.second).expect("open the second clone");
+    assert!(
+        second.resolve_commit(adopt.as_str()).is_err()
+            && second.resolve_commit(next.as_str()).is_err(),
+        "the second clone holds neither the adopt's commit nor the next release's"
+    );
+    lab.jj_at(
+        &lab.second,
+        [
+            "new",
+            "-r",
+            "feat/alpha@origin",
+            "-r",
+            "feat/beta@origin",
+            "-m",
+            "the third release, merged by hand",
+        ],
+    );
+    lab.jj_at(&lab.second, ["new"]);
+    let commit = CommitId::new(lab.revision(&lab.second, "@-", "commit_id").trim());
+    let entries = ledger_entries(&home);
+
+    // When: it is recorded in the second clone.
+    let recorded = lab::knives_command(
+        &lab.second,
+        home.path(),
+        lab.temp_path(),
+        &[
+            "--text",
+            "release",
+            "--repo",
+            "demo",
+            "cut",
+            "release/2026-08-06",
+            "--at",
+            commit.as_str(),
+        ],
+    )
+    .output()
+    .expect("run knives in the second clone");
+
+    // Then: it is refused, naming a commit it cannot read, and nothing is
+    // written: a clone that cannot read the newest write cannot know what
+    // that write carries.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(next.short()) || out.contains(adopt.short()),
+        "{out}"
+    );
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+}
