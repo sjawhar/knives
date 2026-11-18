@@ -35,9 +35,9 @@ use crate::release_model::{
     BranchSuccessions, CompositionBaseline, EarlierWrites, MemberEvidence, MemberHistory,
     MemberSuccession, PreviousRelease, RecordedWrite, ReleaseReading, StackedHistoryContext,
     UnexplainedCommit, carried_from_tips, double_cut_findings, last_recorded_parents,
-    matched_write, member_history, member_parents, newest_release, previous_release_label,
-    read_release, recorded_release_changes, release_refs_by_commit, repo_slug, trunk_positions,
-    trunk_positions_in, with_commit,
+    matched_write, member_history, member_parents, newest_release, on_first_parent_line,
+    previous_release_label, read_release, recorded_release_changes, release_refs_by_commit,
+    repo_slug, trunk_positions, trunk_positions_in, with_commit,
 };
 
 /// Registered forge consumers and explicitly requested local checkout scans.
@@ -420,8 +420,8 @@ pub struct Plan {
     pub published: Option<CommitId>,
     pub parents: Vec<(CommitId, Vec<String>)>,
     /// The parents that are earlier writes of the release, never members
-    /// ([`crate::release_model::carriers`]): listed among `parents`,
-    /// labelled, and read by no member check.
+    /// ([`crate::release_model::EarlierWrites::carriers`]): listed among
+    /// `parents`, labelled, and read by no member check.
     pub carriers: Vec<CommitId>,
     /// The previous release a release of a stacked series stacks on
     /// ([`crate::release_model::read_release`]): listed first among
@@ -2278,7 +2278,8 @@ pub struct MemberRow {
     /// A trunk-reachable parent is the base of a legacy cut, not a member.
     pub base_parent: bool,
     /// An earlier write of the release a fast-forward push gave it
-    /// ([`crate::release_model::carriers`]): no member, and labelled so.
+    /// ([`crate::release_model::EarlierWrites::carriers`]): no member, and
+    /// labelled so.
     pub carrier: bool,
     /// The name of the previous release a stacked release stacks on, when
     /// the row is that release: no member, and labelled so.
@@ -3628,6 +3629,11 @@ pub struct CompositionCheck {
     /// Recorded members carried by another commit with exactly their tree,
     /// reachable from a parent: the member rendered for a human, and the twin.
     pub twins: Vec<(String, CommitId)>,
+    /// In a stacked series, whether the newest recorded write is off the
+    /// first-parent line of the commit the subject starts on
+    /// ([`CompositionDelta::start`]): the subject does not carry that
+    /// write's release, whatever members it carries.
+    pub off_line: bool,
 }
 
 /// What the composition gate compares: the cut's parents against the members
@@ -3646,9 +3652,16 @@ pub struct CompositionDelta<'a> {
     /// carries it, this cut does not, and that is a drop.
     pub trunk: &'a CommitId,
     pub tips: &'a BookmarkTips,
+    /// In a stacked series, the commit the cut subject starts on: the commit
+    /// a record names, or the first parent of a cut, the previous release it
+    /// starts on. The newest recorded write must be this commit or on its
+    /// first-parent line ([`on_first_parent_line`]), so the subject carries
+    /// every level of the stack below it. `None` outside a stacked series.
+    pub start: Option<&'a CommitId>,
 }
 
-/// Members the baseline records that the cut subject does not carry.
+/// Members the baseline records that the cut subject does not carry, and in
+/// a stacked series whether it starts off the newest write's line.
 ///
 /// Identity and ancestry account for a member that is still a parent, was
 /// advanced past, or entered through the cut's base. A member whose change was
@@ -3665,7 +3678,10 @@ pub struct CompositionDelta<'a> {
 /// point degenerates to the member itself, and that replay would read empty
 /// without consulting the cut subject at all. A recorded commit this
 /// repository cannot resolve counts as dropped: unverifiable must not read as
-/// carried.
+/// carried. One check of the line serves a knives cut and a record alike: the
+/// newest write must be [`CompositionDelta::start`] or on its first-parent
+/// line, else the subject does not carry that write's release
+/// ([`CompositionCheck::off_line`]).
 pub fn uncarried_recorded_members(
     repo: &Repo,
     path: &Path,
@@ -3673,6 +3689,9 @@ pub fn uncarried_recorded_members(
     delta: &CompositionDelta<'_>,
 ) -> anyhow::Result<CompositionCheck> {
     let mut check = CompositionCheck::default();
+    if let (Some(start), Some(write)) = (delta.start, &delta.baseline.newest_write) {
+        check.off_line = !on_first_parent_line(repo, &write.commit, start)?;
+    }
     let cut_is_conflicted = !subject.conflicted_files(path)?.is_empty();
     for member in delta.baseline.members() {
         if delta.parents.contains(member) {
@@ -4084,11 +4103,11 @@ pub fn conflict_guidance(release: &str, files: &[String], unions: &[jj::UnionedF
             .to_owned(),
     );
     lines.push("  then re-check the parent count and the test count before publishing".to_owned());
-    // The release is a name read from the repository.
+    // The release is a name read from the repository, inside a command.
     lines.push(format!(
         "  after resolving them by hand, run `knives release adopt {}` before the next write, \
          which refuses until then",
-        inline_human_text(release)
+        crate::ledger::shell_word(release)
     ));
     lines.join("\n")
 }

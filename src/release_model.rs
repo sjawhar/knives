@@ -1043,9 +1043,10 @@ pub fn carries_member_line(
 /// The newest structural cut event, optionally scoped to a release name.
 ///
 /// Its members are its evidence after the commit, less the previous release
-/// its parent set labels ([`previous_release_label`]). An event whose
-/// evidence names nothing after the commit is no cut; one that names only
-/// the previous release is a cut with no member, the start of a stacked cut.
+/// its parent set labels ([`previous_release_label`], [`event_members`]). An
+/// event whose evidence names nothing after the commit is no cut; one that
+/// names only the previous release is a cut with no member, the start of a
+/// stacked cut.
 pub fn last_recorded_cut(entries: &[Entry], subject: Option<&str>) -> Option<RecordedCut> {
     entries.iter().rev().find_map(|entry| {
         let entry_subject = entry.subject.as_deref()?;
@@ -1063,13 +1064,29 @@ pub fn last_recorded_cut(entries: &[Entry], subject: Option<&str>) -> Option<Rec
             kind: RecordedWriteKind::Cut,
             name: entry_subject.to_owned(),
             commit: CommitId::new(commit.as_str()),
-            members: members
-                .iter()
-                .filter(|sha| !recorded_as_previous(&entry.parents, sha))
-                .map(|sha| CommitId::new(sha.as_str()))
-                .collect(),
+            members: event_members(entry, labels_previous),
         })
     })
+}
+
+/// The members a cut or edit event records: its evidence after the commit,
+/// less each commit that its parent set records under a parent `skip`
+/// takes, such as the previous release's label or a carrier's. The one
+/// reading of an event's members that [`last_recorded_cut`] and
+/// [`newest_release_write`] share, each with its own `skip`.
+fn event_members(event: &Entry, skip: impl Fn(&RecordedParent) -> bool) -> Vec<CommitId> {
+    event
+        .evidence
+        .iter()
+        .skip(1)
+        .filter(|commit| {
+            !event
+                .parents
+                .iter()
+                .any(|parent| parent.commit == **commit && skip(parent))
+        })
+        .map(|commit| CommitId::new(commit.as_str()))
+        .collect()
 }
 
 /// Which of knives' own writes a ledger event records.
@@ -1160,11 +1177,11 @@ pub fn recorded_write_events<'a>(
 /// ([`recorded_release_names`]); under a fixed scheme it is the fixed
 /// branch, the one name that the scheme owns. Its newest write is its cut,
 /// its newest edit or an `adopt`, whichever the ledger records last
-/// ([`recorded_write_events`]). The members are that event's evidence after
-/// the commit, less each parent that its parent set labels as the previous
-/// release ([`previous_release_label`]) or as a carrier ([`carrier_label`]).
-/// So a member that `include` added after the cut is held, and so is each
-/// member of a stacked release, whose cut records none.
+/// ([`recorded_write_events`]). The members are that event's
+/// ([`event_members`]), less each parent that its parent set labels as the
+/// previous release ([`previous_release_label`]) or as a carrier
+/// ([`carrier_label`]). So a member that `include` added after the cut is
+/// held, and so is each member of a stacked release, whose cut records none.
 pub fn newest_release_write(
     entries: &[Entry],
     scheme: &ReleaseScheme,
@@ -1184,24 +1201,64 @@ pub fn newest_release_write(
     };
     let (event, write) = recorded_write_events(entries, name).next()?;
     let carrier = carrier_label(name);
-    let labelled = |commit: &str| {
-        event.parents.iter().any(|parent| {
-            parent.commit == commit
-                && (labels_previous(parent) || parent.branches.contains(&carrier))
-        })
-    };
     Some(RecordedCut {
         kind: write.kind,
         name: name.to_owned(),
         commit: write.commit,
-        members: event
-            .evidence
-            .iter()
-            .skip(1)
-            .filter(|commit| !labelled(commit.as_str()))
-            .map(|commit| CommitId::new(commit.as_str()))
-            .collect(),
+        members: event_members(event, |parent| {
+            labels_previous(parent) || parent.branches.contains(&carrier)
+        }),
     })
+}
+
+/// Whether `commit`, or a visible rewrite of it, is `start` or on its
+/// first-parent line. A commit this repository does not hold is on no line
+/// here.
+///
+/// In a stacked series each release is built on the one before it, so the
+/// newest recorded write must be on this line of a release, or of the
+/// commit a cut starts on, for the release to carry everything that write's
+/// release carries, every level of the stack below it included
+/// ([`crate::commands::release::CompositionDelta::start`]). A rewrite has
+/// the write's change id ([`Repo::rewrites_of`]): jj rebases a release over
+/// a member rewritten in place, and knives reads that rewrite as the
+/// recorded write ([`crate::commands::release::in_hand_write`]), so it
+/// stands for the write on the line.
+pub fn on_first_parent_line(
+    repo: &Repo,
+    commit: &CommitId,
+    start: &CommitId,
+) -> Result<bool, jj::JjError> {
+    if repo.resolve_commit(commit.as_str()).is_err() {
+        return Ok(false);
+    }
+    for held in std::iter::once(commit.clone()).chain(repo.rewrites_of(commit.as_str())?) {
+        if first_parent_line_holds(repo, &held, start)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `commit` is `start` or on its first-parent line: every commit on
+/// the line above `commit` descends from it, so the walk ends at the first
+/// commit that does not.
+fn first_parent_line_holds(
+    repo: &Repo,
+    commit: &CommitId,
+    start: &CommitId,
+) -> Result<bool, jj::JjError> {
+    let mut at = start.clone();
+    while at != *commit {
+        if !repo.is_ancestor(commit, &at)? {
+            return Ok(false);
+        }
+        match repo.parent_commits(at.as_str())?.into_iter().next() {
+            Some(parent) => at = parent,
+            None => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 /// What a cut or edit event's text puts before the mark of a write over a
@@ -1368,9 +1425,21 @@ impl EarlierWrites {
             || self.labelled.contains(commit)
     }
 
-    /// Which of a release's `parents` are among these writes, in parent
-    /// order: its carriers ([`carriers`]). A parent of a visible release is
-    /// visible, so a copy that keeps a recorded change id is among them.
+    /// Which of a release's `parents` are fast-forward carriers: earlier
+    /// writes of the same name, never members, in parent order.
+    ///
+    /// A parent of a visible release is visible, so a copy that keeps a
+    /// recorded change id is among them.
+    ///
+    /// A push of a release that does not descend from its published position
+    /// is made a fast-forward by giving it that position as one more parent,
+    /// so the release then carries an older write of itself. Read as a
+    /// member, the carrier accumulates: every later write would keep it, and
+    /// each push would add one more. So every write that composes from a
+    /// release's parents leaves its carriers out, and the plan and `members`
+    /// label them. No other parent is a carrier, however it is named: a write
+    /// recorded under another release name is that release's, and here it is
+    /// a member like any other.
     pub fn carriers(&self, parents: &[CommitId]) -> Vec<CommitId> {
         parents
             .iter()
@@ -1411,28 +1480,6 @@ impl EarlierWrites {
         }
         Ok(found)
     }
-}
-
-/// The parents of `release` that are fast-forward carriers: earlier writes of
-/// the same name ([`EarlierWrites`]), never members.
-///
-/// A push of a release that does not descend from its published position is
-/// made a fast-forward by giving it that position as one more parent, so the
-/// release then carries an older write of itself. Read as a member, the
-/// carrier accumulates: every later write would keep it, and each push would
-/// add one more. So every write that composes from a release's parents leaves
-/// its carriers out, and the plan and `members` label them. `entries` is the
-/// ledger and `published` the publish remote's commit of the name as the
-/// caller reads that ref. No other parent is a carrier, however it is named:
-/// a write recorded under another release name is that release's, and here
-/// it is a member like any other.
-pub fn carriers(
-    repo: &Repo,
-    release: &str,
-    parents: &[CommitId],
-    (entries, published): (&[Entry], Option<&CommitId>),
-) -> Result<Vec<CommitId>, jj::JjError> {
-    Ok(EarlierWrites::read(repo, release, entries, published)?.carriers(parents))
 }
 
 /// The parent set a cut or edit event records for `write`.
@@ -1577,8 +1624,9 @@ fn parents_match(
     Ok(true)
 }
 
-/// The branch label a carrier of `release` ([`carriers`]) takes where a
-/// recorded parent set names it, so no reader takes it for a member's branch.
+/// The branch label a carrier of `release` ([`EarlierWrites::carriers`])
+/// takes where a recorded parent set names it, so no reader takes it for a
+/// member's branch.
 pub fn carrier_label(release: &str) -> String {
     format!("{release} earlier write (carrier, not a member)")
 }
@@ -1681,14 +1729,6 @@ fn labels_previous(parent: &RecordedParent) -> bool {
         .any(|branch| is_previous_release_label(branch))
 }
 
-/// Whether a recorded parent set labels `commit` as the previous release
-/// ([`previous_release_label`]).
-fn recorded_as_previous(parents: &[RecordedParent], commit: &str) -> bool {
-    parents
-        .iter()
-        .any(|parent| parent.commit == commit && labels_previous(parent))
-}
-
 /// The previous release of a release in a stacked series: its first parent,
 /// or the first parent of the chain of merges it is, and never a member.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1716,7 +1756,8 @@ pub struct ReleaseReading {
     /// Each member, in the order a flat cut of them lists its parents.
     pub members: Vec<CommitId>,
     /// The parents that are earlier writes of the release's own name
-    /// ([`carriers`]): neither a member nor the previous release.
+    /// ([`EarlierWrites::carriers`]): neither a member nor the previous
+    /// release.
     pub carriers: Vec<CommitId>,
 }
 
@@ -1982,7 +2023,7 @@ fn ref_previous_names<'a>(
 mod carrier_tests {
     use std::path::{Path, PathBuf};
 
-    use super::{CommitId, Entry, Kind, RecordedParent, carrier_label, carriers};
+    use super::{CommitId, EarlierWrites, Entry, Kind, RecordedParent, carrier_label};
     use crate::config::test_support::run_jj;
     use crate::jj::Repo;
 
@@ -2095,8 +2136,9 @@ mod carrier_tests {
         let opened = Repo::open(&path).expect("open test repository");
 
         // When: the release's parents are read for carriers.
-        let found = carriers(&opened, RELEASE, &parents, (&entries, Some(&published)))
-            .expect("read carriers");
+        let found = EarlierWrites::read(&opened, RELEASE, &entries, Some(&published))
+            .expect("read earlier writes")
+            .carriers(&parents);
 
         // Then: the cut, the edit, the published commit and the rewrite of
         // the reworded edit are each one, in the release's parent order; the
@@ -2129,8 +2171,9 @@ mod carrier_tests {
 
         // When: the release's parents are read for carriers, the publish
         // remote holding no ref of the name.
-        let found = carriers(&opened, RELEASE, &[member, copy.clone()], (&entries, None))
-            .expect("read carriers");
+        let found = EarlierWrites::read(&opened, RELEASE, &entries, None)
+            .expect("read earlier writes")
+            .carriers(&[member, copy.clone()]);
 
         // Then: the copy is a carrier by its change id; the member is not.
         assert_eq!(found, [copy]);
@@ -2162,7 +2205,9 @@ mod carrier_tests {
 
         // When: the release's parents are read for carriers, its publish
         // remote holding no ref of the name.
-        let found = carriers(&opened, RELEASE, &parents, (&entries, None)).expect("read carriers");
+        let found = EarlierWrites::read(&opened, RELEASE, &entries, None)
+            .expect("read earlier writes")
+            .carriers(&parents);
 
         // Then: none of them is a carrier.
         assert_eq!(found, Vec::<CommitId>::new());
@@ -2211,13 +2256,9 @@ mod carrier_tests {
         let parents = [member, pushed.clone()];
 
         // When: the release's parents are read for carriers.
-        let found = carriers(
-            &opened,
-            RELEASE,
-            &parents,
-            (std::slice::from_ref(&adopt), None),
-        )
-        .expect("read carriers");
+        let found = EarlierWrites::read(&opened, RELEASE, std::slice::from_ref(&adopt), None)
+            .expect("read earlier writes")
+            .carriers(&parents);
 
         // Then: the labelled parent is a carrier.
         assert_eq!(found, vec![pushed]);
@@ -2226,13 +2267,9 @@ mod carrier_tests {
         if let Some(labelled) = adopt.parents.get_mut(1) {
             labelled.branches = vec!["feat/pushed".to_owned()];
         }
-        let found = carriers(
-            &opened,
-            RELEASE,
-            &parents,
-            (std::slice::from_ref(&adopt), None),
-        )
-        .expect("read carriers");
+        let found = EarlierWrites::read(&opened, RELEASE, std::slice::from_ref(&adopt), None)
+            .expect("read earlier writes")
+            .carriers(&parents);
 
         // Then: it is a member.
         assert_eq!(found, Vec::<CommitId>::new());

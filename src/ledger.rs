@@ -1003,6 +1003,24 @@ pub fn inline_human_text(text: &str) -> String {
     escape_human_text(text, false)
 }
 
+/// [`inline_human_text`] as one shell word, for a name inside a printed
+/// command that a person pastes.
+///
+/// A name of only `A-Za-z0-9._/+-`, as every release name without a label
+/// is, stays as it is. Any other is put in single quotes, each `'` in it
+/// written `'\''`, so the shell runs no part of it: a label may hold `$`,
+/// `(`, `;`, a quote or a backtick.
+pub fn shell_word(text: &str) -> String {
+    let shown = inline_human_text(text);
+    let plain = |character: char| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '/' | '+' | '-')
+    };
+    if !shown.is_empty() && shown.chars().all(plain) {
+        return shown;
+    }
+    format!("'{}'", shown.replace('\'', r"'\''"))
+}
+
 /// Render ledger body prose for a human terminal.
 ///
 /// Line feeds remain available for the caller to indent; every other control

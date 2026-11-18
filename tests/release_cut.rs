@@ -5,7 +5,9 @@
 //! did not get the parents it asked for, audits members from their fork point,
 //! returns findings for an inconclusive audit or a dropped test count, and
 //! discards a failed candidate without trace. The fixed scheme cuts in place
-//! and keeps its published position; a dated cut refuses a sideways move.
+//! and keeps its published position; a dated cut refuses a sideways move. A
+//! cut that lacks a member only the newest recorded write holds is refused,
+//! and the refusal says to move the release to that write.
 
 #![allow(
     clippy::expect_used,
@@ -1971,6 +1973,270 @@ fn a_cut_refuses_to_drop_a_member_an_edit_added_after_the_previous_cut() {
             .expect("open work checkout")
             .resolve_commit("release/2026-08-05")
             .is_err(),
+        "{out}"
+    );
+}
+
+/// Both streams of a knives run, for an assertion's message.
+fn both_streams(output: &std::process::Output) -> String {
+    format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[test]
+fn a_cut_without_a_member_only_the_newest_write_holds_says_to_move_the_release_to_that_write() {
+    // Given: a cut of `feat/alpha`, then `feat/beta` added to it by
+    // `include`, an edit; then the release's bookmark moved back to the
+    // cut's commit, as a machine that never fetched the edit still has it.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{}", both_streams(&first));
+    let cut = commit_at(&lab, "release/2026-08-04");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let included = knives_release(&lab, &home, &["include", "feat/beta"]);
+    assert!(included.status.success(), "{}", both_streams(&included));
+    let edit = commit_at(&lab, "release/2026-08-04");
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "release/2026-08-04",
+        "-r",
+        cut.as_str(),
+        "--allow-backwards",
+    ]);
+
+    // When: the next release is cut.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: it is refused, and the refusal says to fetch and move the
+    // release to the edit, naming its commit. It offers no `include`, which
+    // on the older commit would write a second write of the release beside
+    // the edit.
+    let out = both_streams(&output);
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "  the candidate was discarded; fetch, then move release/2026-08-04 to {}, its newest \
+             recorded write: `jj bookmark set release/2026-08-04 -r {} --allow-backwards`, or \
+             re-run with --allow-drop to state the drop is intended\n",
+            edit.short(),
+            edit.short()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("restores a member"), "{out}");
+
+    // When: the release is moved to the edit, as the refusal says, and the
+    // next release is cut again.
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "release/2026-08-04",
+        "-r",
+        edit.short(),
+        "--allow-backwards",
+    ]);
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: it is cut, carrying both members.
+    let out = both_streams(&output);
+    assert_eq!(output.status.code(), Some(0), "{out}");
+    assert_eq!(
+        release_parents(&lab, "release/2026-08-05"),
+        vec![commit_at(&lab, "feat/alpha"), commit_at(&lab, "feat/beta")],
+        "{out}"
+    );
+}
+
+#[test]
+fn a_fixed_record_without_a_member_only_an_unpushed_edit_holds_says_to_move_the_release_to_it() {
+    // Given: a fixed release cut of `feat/alpha` and pushed; `feat/beta`
+    // included and pushed; `feat/gamma` included and not pushed; then the
+    // release's bookmark moved back to the pushed edit, as a machine that
+    // never fetched the newest edit still has it. The published composition
+    // is no recorded cut, so a cut records it.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    std::fs::remove_file(home.path().join("local-consumer")).expect("remove local consumer");
+    let registry = home.path().join("repos.toml");
+    let config = std::fs::read_to_string(&registry).expect("read registry");
+    std::fs::write(
+        &registry,
+        format!("{config}release_branch = \"integration\"\n"),
+    )
+    .expect("configure fixed release branch");
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both_streams(&first));
+    lab.push_branch("integration");
+    lab.fetch_work();
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let included = knives_release(&lab, &home, &["include", "feat/beta"]);
+    assert!(included.status.success(), "{}", both_streams(&included));
+    let published = commit_at(&lab, "integration");
+    lab.push_branch("integration");
+    lab.fetch_work();
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    assert!(included.status.success(), "{}", both_streams(&included));
+    let newest = commit_at(&lab, "integration");
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "integration",
+        "-r",
+        published.as_str(),
+        "--allow-backwards",
+    ]);
+
+    // When: the release is cut, which records the published composition.
+    let output = knives_release(&lab, &home, &["cut"]);
+
+    // Then: it is refused, naming `feat/gamma`, which only the newest edit
+    // holds, and saying to fetch and move the release to that edit, naming
+    // its commit; nothing is recorded.
+    let out = both_streams(&output);
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut: this cut does not carry 1 member(s) which integration's \
+             newest recorded write (an edit) holds:\n    feat/gamma@{}\n",
+            commit_at(&lab, "feat/gamma").short()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "  nothing was recorded; fetch, then move integration to {}, its newest recorded \
+             write: `jj bookmark set integration -r {} --allow-backwards`, or re-run with \
+             --allow-drop to state the drop is intended\n",
+            newest.short(),
+            newest.short()
+        )),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_cut_names_include_for_a_previous_cut_member_and_the_newest_write_for_one_only_it_holds() {
+    // Given: a cut of `feat/alpha` and `feat/gamma`; `feat/gamma` dropped,
+    // then `feat/beta` included, two edits; then the release's bookmark
+    // moved back to the drop, as a machine that fetched the drop and not the
+    // include still has it.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{}", both_streams(&first));
+    let dropped = knives_release(
+        &lab,
+        &home,
+        &["drop", "feat/gamma", "--why", "not this time"],
+    );
+    assert!(dropped.status.success(), "{}", both_streams(&dropped));
+    let after_drop = commit_at(&lab, "release/2026-08-04");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let included = knives_release(&lab, &home, &["include", "feat/beta"]);
+    assert!(included.status.success(), "{}", both_streams(&included));
+    let newest = commit_at(&lab, "release/2026-08-04");
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "release/2026-08-04",
+        "-r",
+        after_drop.as_str(),
+        "--allow-backwards",
+    ]);
+
+    // When: the next release is cut.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: it is refused, naming `feat/gamma` with the previous cut and
+    // `feat/beta` with the newest write, and each one's remedy: `include`
+    // for the previous cut's member, and the move to the newest write,
+    // named, for the member only that write holds.
+    let out = both_streams(&output);
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut: the previous cut release/2026-08-04 recorded 1 member(s) this \
+             cut does not carry:\n    feat/gamma@{}\n",
+            commit_at(&lab, "feat/gamma").short()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut: this cut does not carry 1 member(s) which \
+             release/2026-08-04's newest recorded write (an edit) holds:\n    feat/beta@{}\n",
+            commit_at(&lab, "feat/beta").short()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "  the candidate was discarded; `knives release include <branch>` restores a member \
+             the previous cut recorded; fetch, then move release/2026-08-04 to {}, its newest \
+             recorded write: `jj bookmark set release/2026-08-04 -r {} --allow-backwards`, or \
+             re-run with --allow-drop to state the drop is intended\n",
+            newest.short(),
+            newest.short()
+        )),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_fixed_record_without_a_member_a_pushed_drop_removed_names_include_for_it() {
+    // Given: a fixed release cut of `feat/alpha` and `feat/gamma` and
+    // pushed; then `feat/gamma` dropped, an edit, and the drop pushed. The
+    // published composition is no recorded cut, so a cut records it.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let (home, _consumer) = release_test_home(&lab);
+    std::fs::remove_file(home.path().join("local-consumer")).expect("remove local consumer");
+    let registry = home.path().join("repos.toml");
+    let config = std::fs::read_to_string(&registry).expect("read registry");
+    std::fs::write(
+        &registry,
+        format!("{config}release_branch = \"integration\"\n"),
+    )
+    .expect("configure fixed release branch");
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both_streams(&first));
+    lab.push_branch("integration");
+    lab.fetch_work();
+    let dropped = knives_release(
+        &lab,
+        &home,
+        &["drop", "feat/gamma", "--why", "not this time"],
+    );
+    assert!(dropped.status.success(), "{}", both_streams(&dropped));
+    lab.push_branch("integration");
+    lab.fetch_work();
+
+    // When: the release is cut, which records the published composition.
+    let output = knives_release(&lab, &home, &["cut"]);
+
+    // Then: it is refused, naming `feat/gamma` with the previous cut and
+    // `include` as its remedy; nothing is recorded.
+    let out = both_streams(&output);
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut: the previous cut integration recorded 1 member(s) this cut \
+             does not carry:\n    feat/gamma@{}\n  nothing was recorded; `knives release include \
+             <branch>` restores a member the previous cut recorded, or re-run with --allow-drop \
+             to state the drop is intended\n",
+            commit_at(&lab, "feat/gamma").short()
+        )),
         "{out}"
     );
 }

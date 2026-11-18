@@ -2697,10 +2697,11 @@ pub struct ReleaseWrite<'a> {
 #[derive(Debug, Clone, Copy)]
 pub enum Measured<'a> {
     /// Its own parents less these, the parents that are earlier writes of
-    /// the name, never members ([`crate::release_model::carriers`]). With
-    /// any, the source is first written again on its other parents with its
-    /// own tree, so what the source resolved over a carrier becomes its own
-    /// change and the duplicate keeps it.
+    /// the name, never members
+    /// ([`crate::release_model::EarlierWrites::carriers`]). With any, the
+    /// source is first written again on its other parents with its own tree,
+    /// so what the source resolved over a carrier becomes its own change and
+    /// the duplicate keeps it.
     WithoutCarriers(&'a [CommitId]),
     /// What it composes, never its own parents, its carriers left out. A
     /// release of a stacked series composes its previous release and its

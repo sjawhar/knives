@@ -10,10 +10,13 @@
 //! labels the previous release, and the reap keeps every release the live
 //! one descends from. A previous release made by hand, with no recorded
 //! write, is still the previous release once the reap has forgotten its
-//! refs: the cut's event labels it. `adopt` measures a hand resolution
-//! against the merge of the previous release and the members, and counts
-//! only the members' lines. A series without the key keeps the unstacked
-//! rules: a branch built on the previous release is refused.
+//! refs: the cut's event labels it. A cut whose start does not hold the
+//! newest recorded write on its first-parent line, as on a machine whose
+//! refs stop at an older release, is refused naming that write, and
+//! `--allow-drop` states it. `adopt` measures a hand resolution against the
+//! merge of the previous release and the members, and counts only the
+//! members' lines. A series without the key keeps the unstacked rules: a
+//! branch built on the previous release is refused.
 
 #![allow(
     clippy::expect_used,
@@ -803,4 +806,243 @@ fn a_hand_resolution_on_a_stacked_release_is_adopted_and_names_its_files() {
         branches: vec![(*branch).to_owned()],
     }));
     assert_eq!(event.parents, parents, "{event:?}");
+}
+
+/// The release cut on [`THIRD`], with `z` included.
+const FOURTH: &str = "release/old/2026-08-07";
+
+/// The release cut on [`FOURTH`], a start with no member.
+const FIFTH: &str = "release/old/2026-08-08";
+
+/// The release cut after [`FIFTH`].
+const SIXTH: &str = "release/old/2026-08-09";
+
+/// A stacked series whose ledger records NEXT with `del` included, THIRD cut
+/// on it as a start, FOURTH cut on THIRD with `z` included, and FIFTH cut on
+/// FOURTH as a start, each published by a note; while this machine's release
+/// refs stop at THIRD, as on a machine that never fetched FOURTH or FIFTH:
+/// the reap after each cut forgot the refs of the release below it, FIFTH's
+/// bookmark is forgotten here, and THIRD's is made again at its commit.
+/// Returns the commit of THIRD and the commit of FIFTH's cut, the newest
+/// recorded write.
+fn third_behind_fifth_lab() -> (
+    Lab,
+    tempfile::TempDir,
+    knives::ids::CommitId,
+    knives::ids::CommitId,
+) {
+    let (lab, home) = previous_release_lab(true);
+    release_ok(&lab, &home, &["cut", NEXT]);
+    release_ok(&lab, &home, &["include", "del"]);
+    mark_published(&lab, &home, NEXT);
+    release_ok(&lab, &home, &["cut", THIRD]);
+    mark_published(&lab, &home, THIRD);
+    let third = commit_at(&lab, THIRD);
+    branch_on(&lab, THIRD, "z", "z.txt");
+    release_ok(&lab, &home, &["cut", FOURTH]);
+    release_ok(&lab, &home, &["include", "z"]);
+    mark_published(&lab, &home, FOURTH);
+    release_ok(&lab, &home, &["cut", FIFTH]);
+    mark_published(&lab, &home, FIFTH);
+    let fifth = commit_at(&lab, FIFTH);
+    lab.jj_work(["bookmark", "forget", FIFTH]);
+    lab.jj_work(["bookmark", "set", THIRD, "-r", third.as_str()]);
+    assert!(!has_refs(&lab, FOURTH) && !has_refs(&lab, FIFTH));
+    (lab, home, third, fifth)
+}
+
+#[test]
+fn a_stacked_cut_on_a_release_older_than_the_newest_recorded_write_is_refused_naming_it() {
+    // Given: the ledger records FOURTH with `z` and FIFTH on it, and this
+    // machine's newest release ref is THIRD.
+    let (lab, home, third, fifth) = third_behind_fifth_lab();
+    let recorded = ledger_entries(&home).len();
+
+    // When: the next release is cut.
+    let cut = knives_release(&lab, &home, &["--series", "old", "cut", SIXTH]);
+
+    // Then: it is refused, naming FIFTH's newest recorded write, a cut, and
+    // its commit, and saying to fetch and move FIFTH to it; nothing is cut,
+    // so `z` and FIFTH are not dropped by a cut that starts on THIRD.
+    let out = text(&cut);
+    assert_eq!(cut.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut: this cut does not have {FIFTH}'s newest recorded write (a \
+             cut) {} on its first-parent line, so it does not carry {FIFTH}\n",
+            fifth.short()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "  the candidate was discarded; fetch, then move {FIFTH} to {}, its newest recorded \
+             write: `jj bookmark set {FIFTH} -r {} --allow-backwards`, or re-run with \
+             --allow-drop to state the drop is intended\n",
+            fifth.short(),
+            fifth.short()
+        )),
+        "{out}"
+    );
+    assert!(!resolves(&lab, SIXTH), "{out}");
+    assert_eq!(ledger_entries(&home).len(), recorded, "{out}");
+    assert_eq!(commit_at(&lab, THIRD), third, "{out}");
+
+    // When: FIFTH is moved to that write, as the refusal says, and the next
+    // release is cut again.
+    lab.jj_work([
+        "bookmark",
+        "set",
+        FIFTH,
+        "-r",
+        fifth.short(),
+        "--allow-backwards",
+    ]);
+    let cut = knives_release(&lab, &home, &["--series", "old", "cut", SIXTH]);
+
+    // Then: it starts on FIFTH's write.
+    let out = text(&cut);
+    assert_eq!(cut.status.code(), Some(0), "{out}");
+    assert_eq!(release_parents(&lab, SIXTH), vec![fifth], "{out}");
+}
+
+#[test]
+fn a_stacked_cut_off_the_newest_recorded_write_goes_ahead_under_allow_drop_and_says_so() {
+    // Given: the ledger records FOURTH with `z` and FIFTH on it, and this
+    // machine's newest release ref is THIRD.
+    let (lab, home, third, fifth) = third_behind_fifth_lab();
+
+    // When: the next release is cut, the drop stated.
+    let cut = knives_release(
+        &lab,
+        &home,
+        &["--series", "old", "cut", SIXTH, "--allow-drop"],
+    );
+
+    // Then: it starts on THIRD, and both its line and its event name FIFTH's
+    // newest recorded write, its release and its commit.
+    let out = text(&cut);
+    assert_eq!(cut.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: --allow-drop: cutting without {FIFTH}'s newest recorded write (a cut) {} on \
+             its first-parent line\n",
+            fifth.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(release_parents(&lab, SIXTH), vec![third], "{out}");
+    let event = newest_event(&home, SIXTH);
+    assert!(
+        event.text.contains(&format!(
+            "; previous cut {FIFTH} recorded 0 member(s); all carried; not built on {FIFTH}'s \
+             newest recorded write (a cut) {}",
+            fifth.short()
+        )),
+        "{event:?}"
+    );
+}
+
+#[test]
+fn a_stacked_cut_on_an_older_write_of_the_newest_release_names_its_member_and_its_write() {
+    // Given: NEXT cut on the published previous release and `m6` included,
+    // an edit; then NEXT's bookmark moved back to its cut, a start with no
+    // member, as a machine that never fetched the edit still has it, and
+    // that start published by a note.
+    let (lab, home) = previous_release_lab(true);
+    release_ok(&lab, &home, &["cut", NEXT]);
+    let start = commit_at(&lab, NEXT);
+    release_ok(&lab, &home, &["include", "m6"]);
+    let edit = commit_at(&lab, NEXT);
+    lab.jj_work([
+        "bookmark",
+        "set",
+        NEXT,
+        "-r",
+        start.as_str(),
+        "--allow-backwards",
+    ]);
+    mark_published(&lab, &home, NEXT);
+    let recorded = ledger_entries(&home).len();
+
+    // When: the next release is cut.
+    let cut = knives_release(&lab, &home, &["--series", "old", "cut", THIRD]);
+
+    // Then: it is refused, naming `m6`, which only NEXT's newest write
+    // holds, and that write, an edit off the start's first-parent line, and
+    // saying to fetch and move NEXT to it; nothing is cut.
+    let out = text(&cut);
+    assert_eq!(cut.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut: this cut does not carry 1 member(s) which {NEXT}'s newest \
+             recorded write (an edit) holds:\n    m6@{}\n",
+            commit_at(&lab, "m6").short()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut: this cut does not have {NEXT}'s newest recorded write (an \
+             edit) {} on its first-parent line, so it does not carry {NEXT}\n",
+            edit.short()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "  the candidate was discarded; fetch, then move {NEXT} to {}, its newest recorded \
+             write: `jj bookmark set {NEXT} -r {} --allow-backwards`, or re-run with \
+             --allow-drop to state the drop is intended\n",
+            edit.short(),
+            edit.short()
+        )),
+        "{out}"
+    );
+    assert!(!resolves(&lab, THIRD), "{out}");
+    assert_eq!(ledger_entries(&home).len(), recorded, "{out}");
+}
+
+#[test]
+fn a_stacked_first_cut_with_no_release_ref_here_is_refused_naming_the_newest_recorded_write() {
+    // Given: NEXT cut on the published previous release, a start whose cut
+    // is the newest recorded write; the branches built on the previous
+    // release removed; and NEXT's bookmark forgotten, so this machine holds
+    // no release ref of the series, as one that never fetched it.
+    let (lab, home) = previous_release_lab(true);
+    release_ok(&lab, &home, &["cut", NEXT]);
+    let start = commit_at(&lab, NEXT);
+    lab.jj_work(["bookmark", "delete", "del", "m6", "m5"]);
+    lab.jj_work(["bookmark", "forget", NEXT]);
+    assert!(!has_refs(&lab, PREVIOUS) && !has_refs(&lab, NEXT));
+    let recorded = ledger_entries(&home).len();
+
+    // When: the next release is cut, which with no release here reads as the
+    // series' first cut of its branches.
+    let cut = knives_release(&lab, &home, &["--series", "old", "cut", THIRD]);
+
+    // Then: it is refused, naming NEXT's newest recorded write, a cut, and
+    // its commit, and saying to fetch and move NEXT to it; nothing is cut.
+    let out = text(&cut);
+    assert_eq!(cut.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut: this cut does not have {NEXT}'s newest recorded write (a \
+             cut) {} on its first-parent line, so it does not carry {NEXT}\n",
+            start.short()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "  the candidate was discarded; fetch, then move {NEXT} to {}, its newest recorded \
+             write: `jj bookmark set {NEXT} -r {} --allow-backwards`, or re-run with \
+             --allow-drop to state the drop is intended\n",
+            start.short(),
+            start.short()
+        )),
+        "{out}"
+    );
+    assert!(!resolves(&lab, THIRD), "{out}");
+    assert_eq!(ledger_entries(&home).len(), recorded, "{out}");
 }

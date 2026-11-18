@@ -80,7 +80,7 @@ struct ReleaseInHand {
     /// stacked release the side parents on its first-parent line.
     parents: Vec<knives::ids::CommitId>,
     /// The parents that are earlier writes of the release
-    /// ([`knives::release_model::carriers`]).
+    /// ([`knives::release_model::EarlierWrites::carriers`]).
     carriers: Vec<knives::ids::CommitId>,
     /// The previous release a release of a stacked series is built on: its
     /// first parent, which no verb drops or moves.

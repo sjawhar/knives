@@ -12,12 +12,12 @@ use knives::commands::claim::Bound;
 use knives::commands::release;
 use knives::forge::github::CliForge;
 use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, RepoName};
-use knives::ledger::{Draft, Ledger, inline_human_text, problem_human_text};
+use knives::ledger::{Draft, Ledger, inline_human_text, problem_human_text, shell_word};
 use knives::release_model::{
     CompositionBaseline, EarlierWrites, PreviousRelease, RecordedCut, RecordedWriteKind,
     StackedHistoryContext, carried_branches, members_event_text, previous_release_for_cut,
-    previous_release_for_record, series_members, trunk_positions, trunk_positions_in,
-    trunk_reaches,
+    previous_release_for_record, previous_release_label, series_members, trunk_positions,
+    trunk_positions_in, trunk_reaches,
 };
 
 use super::release_edit::{
@@ -202,11 +202,10 @@ pub(crate) fn run_release(
                 // The previous release is the stacked cut's one parent and
                 // never a member: nothing is replayed, and every member
                 // `include` adds later is measured from it.
-                let labelled = PreviousRelease {
-                    name: previous_ref.branch().to_string(),
-                    commit: previous.clone(),
-                }
-                .labelled();
+                let labelled = (
+                    previous_release_label(previous_ref.branch().as_str()),
+                    previous.clone(),
+                );
                 (vec![labelled], Vec::new(), previous.clone())
             } else {
                 let carried = release::parent_sources(&opened, entry, &scheme, &previous_members)?;
@@ -274,9 +273,11 @@ pub(crate) fn run_release(
         // composition itself. The ledger's events are the only record of a
         // parent set that survives the bookmark moving, so every subject is
         // held against the previous cut's event and the newest recorded write
-        // of the release in hand before anything is recorded or published.
+        // of the newest release the ledger records before anything is
+        // recorded or published. In a stacked series that write must also be
+        // on the line of the commit the cut starts on, its first parent.
         let gate = CompositionGate {
-            baseline: CompositionBaseline::read(&ledger, entry, None),
+            baseline: CompositionGate::read_baseline(&ledger, entry, None),
             record: None,
             opened: &opened,
             path,
@@ -284,6 +285,7 @@ pub(crate) fn run_release(
             base: &audit_base,
             trunk: &trunk,
             tips: &tips,
+            start: request.parents.first().filter(|_| entry.stacked()),
         };
         // A cut is audited against the release it duplicates: a member's
         // divergence that release already had is carried, and the drift is
@@ -656,7 +658,8 @@ fn report_cut_audit(
 /// The composition gate's inputs: everything the recorded-member check reads
 /// beside the cut subject.
 struct CompositionGate<'a> {
-    /// What the cut subject is held against, read from the fork's ledger.
+    /// What the cut subject is held against, read from the fork's ledger
+    /// ([`Self::read_baseline`]).
     baseline: CompositionBaseline,
     /// The release cut outside knives that `cut NAME --at` records: NAME and
     /// the commit it is recorded at. `None` for a cut knives writes, and for
@@ -668,14 +671,30 @@ struct CompositionGate<'a> {
     base: &'a knives::ids::CommitId,
     trunk: &'a knives::ids::CommitId,
     tips: &'a knives::detect::BookmarkTips,
+    /// In a stacked series, the commit the subject starts on, whose
+    /// first-parent line must hold the newest recorded write
+    /// ([`release::CompositionDelta::start`]): the commit a record names, or
+    /// the previous release a cut starts on. `None` in any other series.
+    start: Option<&'a CommitId>,
 }
 
 impl CompositionGate<'_> {
+    /// The baseline of the gate of `record` ([`Self::record`]), read from
+    /// `ledger` in `entry`'s series: the name a record records is aside, as
+    /// no write of it is its own baseline.
+    fn read_baseline(
+        ledger: &[knives::ledger::Entry],
+        entry: &knives::config::RepoEntry,
+        record: Option<(&str, &CommitId)>,
+    ) -> CompositionBaseline {
+        CompositionBaseline::read(ledger, entry, record.map(|(name, _)| name))
+    }
+
     /// The records of the baseline in the order the gate's messages name
-    /// them, or `None` when the ledger records neither. A cut names its
-    /// previous cut first, the composition it duplicates; a record names the
-    /// newest write first, the release it follows. The other record names
-    /// each member that only it holds.
+    /// them, with the record the gate holds, or `None` when the ledger
+    /// records neither. A cut names its previous cut first, the composition
+    /// it duplicates; a record names the newest write first, the release it
+    /// follows. The other record names each member that only it holds.
     fn held(&self) -> Option<HeldRecords<'_>> {
         let cut = self
             .baseline
@@ -697,6 +716,7 @@ impl CompositionGate<'_> {
         Some(HeldRecords {
             first,
             other: records.next(),
+            record: self.record,
         })
     }
 }
@@ -712,20 +732,71 @@ enum HeldRecord<'a> {
     NewestWrite(&'a RecordedCut),
 }
 
+/// The words for each kind of record, which every message of the gate and
+/// the cut event use.
 impl<'a> HeldRecord<'a> {
     const fn recorded(self) -> &'a RecordedCut {
         match self {
             Self::PreviousCut(recorded) | Self::NewestWrite(recorded) => recorded,
         }
     }
+
+    /// What the record is called, `name` its release's name as the caller
+    /// renders it: `previous cut NAME`, or `NAME's newest recorded write (an
+    /// edit)`.
+    fn title(self, name: &str) -> String {
+        match self {
+            Self::PreviousCut(_) => format!("previous cut {name}"),
+            Self::NewestWrite(write) => {
+                let kind = match write.kind {
+                    RecordedWriteKind::Cut => "a cut",
+                    RecordedWriteKind::Edit => "an edit",
+                };
+                format!("{name}'s newest recorded write ({kind})")
+            }
+        }
+    }
+
+    /// The record and how many members it holds, as the cut event restates
+    /// it, the name raw: `previous cut NAME recorded N member(s)`, or `NAME's
+    /// newest recorded write (an edit) holds N member(s)`.
+    fn restated(self) -> String {
+        let recorded = self.recorded();
+        let verb = match self {
+            Self::PreviousCut(_) => "recorded",
+            Self::NewestWrite(_) => "holds",
+        };
+        format!(
+            "{} {verb} {} member(s)",
+            self.title(&recorded.name),
+            recorded.members.len()
+        )
+    }
+
+    /// The record and its commit, each given by `render`: `NAME's newest
+    /// recorded write (a cut) 0123456789ab`. The name and the commit are a
+    /// ledger entry's subject and first evidence string, so a message escapes
+    /// them ([`inline_human_text`]) and the cut event keeps them raw.
+    fn with_commit(self, render: fn(&str) -> String) -> String {
+        let recorded = self.recorded();
+        format!(
+            "{} {}",
+            self.title(&render(&recorded.name)),
+            render(recorded.commit.short())
+        )
+    }
 }
 
 /// The records a composition gate holds the cut subject against, in the
-/// order its messages name them ([`CompositionGate::held`]).
+/// order its messages name them ([`CompositionGate::held`]), and the record
+/// the gate holds.
 #[derive(Clone, Copy)]
 struct HeldRecords<'a> {
     first: HeldRecord<'a>,
     other: Option<HeldRecord<'a>>,
+    /// The release cut outside knives that the gate holds
+    /// ([`CompositionGate::record`]): `None` for a cut.
+    record: Option<(&'a str, &'a CommitId)>,
 }
 
 impl<'a> HeldRecords<'a> {
@@ -759,20 +830,59 @@ impl<'a> HeldRecords<'a> {
         }
         (first, self.other.map(|other| (other, rest)))
     }
-}
 
-/// `NAME's newest recorded write (an edit)`: how a refusal and a cut event
-/// name the newest write of the release `name`.
-fn newest_write_text(name: &str, kind: RecordedWriteKind) -> String {
-    let kind = match kind {
-        RecordedWriteKind::Cut => "a cut",
-        RecordedWriteKind::Edit => "an edit",
-    };
-    format!("{name}'s newest recorded write ({kind})")
+    /// The newest write among the records, when the ledger records one.
+    fn newest_write(self) -> Option<HeldRecord<'a>> {
+        std::iter::once(self.first)
+            .chain(self.other)
+            .find(|held| matches!(held, HeldRecord::NewestWrite(_)))
+    }
+
+    /// What follows `N member(s)` where a message names members of `source`
+    /// that the subject lacks, `name` the release's name escaped: `the
+    /// previous cut NAME recorded`; for a cut, `which NAME's newest recorded
+    /// write (an edit) holds`; for a record, which follows that release, `of
+    /// NAME, the newest release that the ledger records in the series`.
+    fn holds(self, source: HeldRecord<'_>, name: &str) -> String {
+        match (source, self.record) {
+            (HeldRecord::PreviousCut(_), _) => format!("the {} recorded", source.title(name)),
+            (HeldRecord::NewestWrite(_), Some(_)) => {
+                format!("of {name}, the newest release that the ledger records in the series")
+            }
+            (HeldRecord::NewestWrite(_), None) => format!("which {} holds", source.title(name)),
+        }
+    }
+
+    /// What an `--allow-drop` line says goes ahead: `cutting`, or `recording
+    /// NAME at COMMIT`, escaped. The name is the caller's, kept to the
+    /// series' grammar, whose label takes any character but `/`.
+    fn doing(self) -> String {
+        self.record.map_or_else(
+            || "cutting".to_owned(),
+            |(name, at)| format!("recording {} at {}", inline_human_text(name), at.short()),
+        )
+    }
+
+    /// A refusal up to the subject's verb, escaped: `REPO: refusing to cut:
+    /// this cut`, or `REPO: refusing to record NAME at COMMIT: it`.
+    fn refusing(self, repo: &RepoName) -> String {
+        self.record.map_or_else(
+            || format!("{repo}: refusing to cut: this cut"),
+            |(name, at)| {
+                format!(
+                    "{repo}: refusing to record {} at {}: it",
+                    inline_human_text(name),
+                    at.short()
+                )
+            },
+        )
+    }
 }
 
 /// Hold the cut subject against the gate's [`CompositionBaseline`]: each
-/// member the previous cut's event or the newest write records.
+/// member the previous cut's event or the newest write records, and in a
+/// stacked series the newest write itself, on the line of the commit the
+/// subject starts on ([`CompositionGate::start`]).
 ///
 /// `Err` is the refusal, already reported. `Ok` carries what the check
 /// found, for the cut event to restate.
@@ -795,6 +905,7 @@ fn recorded_composition_check(
             base: gate.base,
             trunk: gate.trunk,
             tips: gate.tips,
+            start: gate.start,
         },
     )?;
     let on_drop = match (allow_drop, &*subject) {
@@ -802,7 +913,7 @@ fn recorded_composition_check(
         (false, release::CutSubject::Candidate(_)) => DropDisposition::RefuseDiscardingCandidate,
         (false, release::CutSubject::Committed(_)) => DropDisposition::RefuseRecordingNothing,
     };
-    if let Some(exit) = report_uncarried_cut(repo, (held, gate.record), &check, on_drop) {
+    if let Some(exit) = report_uncarried_cut(repo, held, &check, on_drop) {
         return Ok(Err(exit));
     }
     Ok(Ok(check))
@@ -819,7 +930,8 @@ enum DropDisposition {
     RefuseRecordingNothing,
 }
 
-/// Say what the recorded-composition check found; refuse when members are gone.
+/// Say what the recorded-composition check found; refuse when members are
+/// gone, or when a stacked subject is not built on the newest write.
 ///
 /// Inconclusive members are reported without refusing, for the same reason the
 /// audit's are: a conflicted replay onto a conflicted cut subject answers
@@ -831,21 +943,20 @@ enum DropDisposition {
 /// cleanup.
 fn report_uncarried_cut(
     repo: &RepoName,
-    held: (HeldRecords<'_>, Option<(&str, &CommitId)>),
+    held: HeldRecords<'_>,
     check: &release::CompositionCheck,
     on_drop: DropDisposition,
 ) -> Option<Exit> {
     for line in uncarried_cut_lines(repo, held, check, on_drop) {
         println!("{line}");
     }
-    (!check.dropped.is_empty() && !matches!(on_drop, DropDisposition::Allowed))
+    ((!check.dropped.is_empty() || check.off_line) && !matches!(on_drop, DropDisposition::Allowed))
         .then_some(Exit::Incomplete)
 }
 
 /// The lines [`report_uncarried_cut`] prints, which name each member with
-/// the record that names it ([`HeldRecords::holder`]); `record` is the
-/// release cut outside knives that the gate holds, as
-/// [`CompositionGate::record`] names it.
+/// the record that names it ([`HeldRecords::holder`]), and the newest write
+/// a stacked subject is not built on.
 ///
 /// The recorded release's name and its members are a ledger entry's subject
 /// and evidence, which a peer's pulled ledger can carry any text in; a member
@@ -853,7 +964,7 @@ fn report_uncarried_cut(
 /// repository. Each is escaped here; the cut event keeps them raw.
 fn uncarried_cut_lines(
     repo: &RepoName,
-    (held, record): (HeldRecords<'_>, Option<(&str, &CommitId)>),
+    held: HeldRecords<'_>,
     check: &release::CompositionCheck,
     on_drop: DropDisposition,
 ) -> Vec<String> {
@@ -866,38 +977,78 @@ fn uncarried_cut_lines(
         ));
     }
     for member in &check.inconclusive {
-        let recorded_by = match held.holder(&member.commit) {
-            HeldRecord::PreviousCut(cut) => format!("the {} cut", inline_human_text(&cut.name)),
-            HeldRecord::NewestWrite(write) => {
-                format!("the newest write of {}", inline_human_text(&write.name))
-            }
-        };
+        let holder = held.holder(&member.commit);
         lines.push(format!(
-            "  {}: recorded by {recorded_by}; carry check inconclusive (replay conflicted; \
-             re-check after resolving the cut's conflicts)",
-            inline_human_text(&member.name)
+            "  {}: recorded by the {}; carry check inconclusive (replay conflicted; re-check \
+             after resolving the cut's conflicts)",
+            inline_human_text(&member.name),
+            holder.title(&inline_human_text(&holder.recorded().name))
         ));
     }
-    if check.dropped.is_empty() {
+    let off_line = held.newest_write().filter(|_| check.off_line);
+    if check.dropped.is_empty() && off_line.is_none() {
         return lines;
     }
     let allowed = matches!(on_drop, DropDisposition::Allowed);
     let (first, other) = held.split(&check.dropped);
+    let mut sources = Vec::new();
     for (source, dropped) in std::iter::once((held.first, first)).chain(other) {
         if !dropped.is_empty() {
-            lines.extend(dropped_lines(repo, (source, record), &dropped, allowed));
+            lines.extend(dropped_lines(repo, (held, source), &dropped, allowed));
+            sources.push(source);
         }
     }
-    if allowed {
-        return lines;
+    if let Some(write) = off_line {
+        let named = write.with_commit(inline_human_text);
+        lines.push(if allowed {
+            format!(
+                "{repo}: --allow-drop: {} without {named} on its first-parent line",
+                held.doing()
+            )
+        } else {
+            format!(
+                "{} does not have {named} on its first-parent line, so it does not carry {}",
+                held.refusing(repo),
+                inline_human_text(&write.recorded().name)
+            )
+        });
     }
-    if record.is_some() {
-        lines.push(
-            "  nothing was recorded; record a commit that carries each of them, or re-run with \
-             --allow-drop to state the drop is intended"
-                .to_owned(),
-        );
-        return lines;
+    if !allowed {
+        lines.push(refusal_remedy(held, (&sources, off_line), on_drop));
+    }
+    lines
+}
+
+/// The line that closes a refusal of [`uncarried_cut_lines`]: what each
+/// refused finding asks for, or `--allow-drop`. `sources` are the records
+/// whose members the subject lacks, and `off_line` the newest write a
+/// stacked subject is not built on.
+///
+/// A record is built again: on that write when it is off the line. A cut
+/// gets back a member of the previous cut with `include`. A member only the
+/// newest write holds, and a write off the cut's line, mean the release
+/// here is older than that write, as on a machine that has not fetched it:
+/// so the cut is made again once that write's release is moved to it, and
+/// an `include` on the older commit would write a second, divergent write.
+fn refusal_remedy(
+    held: HeldRecords<'_>,
+    (sources, off_line): (&[HeldRecord<'_>], Option<HeldRecord<'_>>),
+    on_drop: DropDisposition,
+) -> String {
+    const ALLOW: &str = "or re-run with --allow-drop to state the drop is intended";
+    if held.record.is_some() {
+        let remedy = match off_line {
+            Some(write) if sources.is_empty() => format!(
+                "build the commit on {} and record that one",
+                inline_human_text(write.recorded().commit.short())
+            ),
+            Some(write) => format!(
+                "record a commit built on {} that carries each of them",
+                inline_human_text(write.recorded().commit.short())
+            ),
+            None => "record a commit that carries each of them".to_owned(),
+        };
+        return format!("  nothing was recorded; {remedy}, {ALLOW}");
     }
     let outcome = match on_drop {
         DropDisposition::RefuseDiscardingCandidate => "the candidate was discarded",
@@ -905,67 +1056,74 @@ fn uncarried_cut_lines(
             "nothing was recorded"
         }
     };
-    lines.push(format!(
-        "  {outcome}; `knives release include <branch>` restores a member, \
-         or re-run with --allow-drop to state the drop is intended"
-    ));
-    lines
+    let mut remedies = Vec::new();
+    if sources
+        .iter()
+        .any(|source| matches!(source, HeldRecord::PreviousCut(_)))
+    {
+        remedies.push(
+            "`knives release include <branch>` restores a member the previous cut recorded"
+                .to_owned(),
+        );
+    }
+    let newer = sources
+        .iter()
+        .copied()
+        .find(|source| matches!(source, HeldRecord::NewestWrite(_)))
+        .or(off_line);
+    if let Some(write) = newer {
+        let recorded = write.recorded();
+        let (name, commit) = (&recorded.name, recorded.commit.short());
+        remedies.push(format!(
+            "fetch, then move {} to {}, its newest recorded write: `jj bookmark set {} -r {} \
+             --allow-backwards`",
+            inline_human_text(name),
+            inline_human_text(commit),
+            shell_word(name),
+            shell_word(commit)
+        ));
+    }
+    format!("  {outcome}; {}, {ALLOW}", remedies.join("; "))
 }
 
 /// The lines of [`uncarried_cut_lines`] that name `dropped`, members that
-/// `held` names and the cut subject does not carry: one statement under
-/// `--allow-drop`, else a refusal's heading and a line for each member.
+/// `source`, one of `held`, names and the cut subject does not carry: one
+/// statement under `--allow-drop`, else a refusal's heading and a line for
+/// each member.
 ///
 /// A cut names a member of the previous cut as it always has, and a member
 /// only the newest write holds with that release and its write. A record
 /// names a member of the newest write with that release, as the newest the
 /// ledger records in the series, and a member only the previous cut holds
-/// with that cut.
+/// with that cut ([`HeldRecords::holds`]).
 fn dropped_lines(
     repo: &RepoName,
-    (held, record): (HeldRecord<'_>, Option<(&str, &CommitId)>),
+    (held, source): (HeldRecords<'_>, HeldRecord<'_>),
     dropped: &[&str],
     allowed: bool,
 ) -> Vec<String> {
     let count = dropped.len();
-    let recorded = inline_human_text(&held.recorded().name);
+    let name = inline_human_text(&source.recorded().name);
     let dropped: Vec<String> = dropped
         .iter()
         .map(|member| inline_human_text(member))
         .collect();
-    let holds = match (held, record) {
-        (HeldRecord::PreviousCut(_), _) => format!("the previous cut {recorded} recorded"),
-        (HeldRecord::NewestWrite(_), Some(_)) => {
-            format!("of {recorded}, the newest release that the ledger records in the series")
-        }
-        (HeldRecord::NewestWrite(write), None) => {
-            format!("which {} holds", newest_write_text(&recorded, write.kind))
-        }
-    };
-    // The name is the caller's, kept to the series' grammar, whose label
-    // takes any character but `/`.
-    let record = record.map(|(name, at)| (inline_human_text(name), at.short()));
+    let holds = held.holds(source, &name);
     if allowed {
-        let doing = record.as_ref().map_or_else(
-            || "cutting".to_owned(),
-            |(name, at)| format!("recording {name} at {at}"),
-        );
         return vec![format!(
-            "{repo}: --allow-drop: {doing} without {count} member(s) {holds}: {}",
+            "{repo}: --allow-drop: {} without {count} member(s) {holds}: {}",
+            held.doing(),
             dropped.join(", ")
         )];
     }
-    let heading = match (held, record) {
+    let heading = match (source, held.record) {
         (HeldRecord::PreviousCut(_), None) => format!(
-            "{repo}: refusing to cut: the previous cut {recorded} recorded {count} member(s) \
-             this cut does not carry:"
+            "{repo}: refusing to cut: the {} recorded {count} member(s) this cut does not carry:",
+            source.title(&name)
         ),
-        (HeldRecord::NewestWrite(_), None) => {
-            format!("{repo}: refusing to cut: this cut does not carry {count} member(s) {holds}:")
-        }
-        (_, Some((name, at))) => format!(
-            "{repo}: refusing to record {name} at {at}: it does not carry {count} member(s) \
-             {holds}:"
+        _ => format!(
+            "{} does not carry {count} member(s) {holds}:",
+            held.refusing(repo)
         ),
     };
     std::iter::once(heading)
@@ -1017,16 +1175,18 @@ struct CompletedCut<'a> {
     /// the cut duplicates ([`release::unchecked_suffix`]); empty otherwise.
     unchecked: &'a str,
     /// The composition of a release composed outside knives that `cut NAME
-    /// --at` records, as its reading reads it, every parent the trunk holds
-    /// left out ([`hand_cut_composition`]): the event records it, and says
-    /// the release was composed outside knives ([`RECORDED_OUTSIDE`]).
-    /// `None` for a cut knives wrote or recorded as published, whose event
-    /// reads its composition from the commit ([`cut_composition`]).
+    /// --at` records: its previous release first, under its label, when it
+    /// has one, then its members, every parent the trunk holds left out
+    /// ([`record_hand_cut`]). The event records it, and says the release was
+    /// composed outside knives ([`RECORDED_OUTSIDE`]). `None` for a cut
+    /// knives wrote or recorded as published, whose event reads its
+    /// composition from the commit ([`cut_composition`]).
     composition: Option<&'a [(String, CommitId)]>,
 }
 
-/// What the event of a cut composed outside knives says after the previous
-/// cut's restatement: `cut NAME --at` recorded it, knives wrote no commit.
+/// What the event of a cut composed outside knives says after it restates
+/// the records it was held against ([`restated_delta`]): `cut NAME --at`
+/// recorded it, knives wrote no commit.
 const RECORDED_OUTSIDE: &str = "; recorded: composed outside knives";
 
 /// Record which branches and commits became a published release cut.
@@ -1099,11 +1259,15 @@ fn record_cut_event(
 }
 
 /// What a cut event says after its members about the records the cut was
-/// held against ([`CompositionGate::held`]): `; previous cut NAME recorded N
-/// member(s)`, NAME and N the first record's, then `all carried` or the
-/// members the cut dropped, each member that only the other record holds
-/// named with that record, then the unverified members. Empty when the
-/// ledger records neither. The event keeps each name raw.
+/// held against ([`CompositionGate::held`]): the first record as what it is
+/// and how many members it holds ([`HeldRecord::restated`]), `; previous cut
+/// NAME recorded N member(s)` or `; NAME's newest recorded write (an edit)
+/// holds N member(s)`, then `all carried` or the members the subject
+/// dropped, each member that only the other record holds named with that
+/// record, then `; not built on <the newest write> <commit>` for a stacked
+/// subject that `--allow-drop` let off that write's line, then the
+/// unverified members. Empty when the ledger records neither. The event
+/// keeps each name raw.
 fn restated_delta(held: Option<HeldRecords<'_>>, check: &release::CompositionCheck) -> String {
     let Some(held) = held else {
         return String::new();
@@ -1116,17 +1280,23 @@ fn restated_delta(held: Option<HeldRecords<'_>>, check: &release::CompositionChe
     if let Some((other, names)) = other
         && !names.is_empty()
     {
-        let source = match other {
-            HeldRecord::PreviousCut(previous) => format!("{}'s cut", previous.name),
-            HeldRecord::NewestWrite(write) => newest_write_text(&write.name, write.kind),
-        };
-        dropped.push(format!("dropped from {source}: {}", names.join(", ")));
+        dropped.push(format!(
+            "dropped from {}: {}",
+            other.title(&other.recorded().name),
+            names.join(", ")
+        ));
     }
     let carried = if dropped.is_empty() {
         "all carried".to_owned()
     } else {
         dropped.join("; ")
     };
+    let off_line = held
+        .newest_write()
+        .filter(|_| check.off_line)
+        .map_or_else(String::new, |write| {
+            format!("; not built on {}", write.with_commit(str::to_owned))
+        });
     let unverified = if check.inconclusive.is_empty() {
         String::new()
     } else {
@@ -1140,11 +1310,9 @@ fn restated_delta(held: Option<HeldRecords<'_>>, check: &release::CompositionChe
                 .join(", ")
         )
     };
-    let recorded = held.first.recorded();
     format!(
-        "; previous cut {} recorded {} member(s); {carried}{unverified}",
-        recorded.name,
-        recorded.members.len()
+        "; {}; {carried}{off_line}{unverified}",
+        held.first.restated()
     )
 }
 
@@ -1250,11 +1418,13 @@ fn checked_committed_cut(
 /// against the gate's baseline ([`CompositionBaseline`], NAME aside): the
 /// members of the series' previous cut and of the newest write of the newest
 /// release the ledger records in the series. So a member `include` added
-/// after that release's cut is held too, and in a stacked series, a commit
-/// built on an older release than that one is refused. Each refusal
-/// writes nothing. Only then is the local bookmark made, where no ref of the
-/// name exists, and the event recorded, which starts the background ledger
-/// sweep.
+/// after that release's cut is held too. In a stacked series that write
+/// itself must be the commit or on its first-parent line
+/// ([`release::CompositionDelta::start`]), so a commit built on an older
+/// release than that one is refused, however many levels of the stack it
+/// leaves out. Each refusal writes nothing. Only then is the local bookmark
+/// made, where no ref of the name exists, and the event recorded, which
+/// starts the background ledger sweep.
 fn record_hand_cut(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
@@ -1288,20 +1458,22 @@ fn record_hand_cut(
         Err(exit) => return Ok(exit),
     };
     let parents = opened.parent_commits(commit.as_str())?;
+    let record = Some((name, commit));
     let gate = CompositionGate {
-        baseline: CompositionBaseline::read(&ledger, entry, Some(name)),
-        record: Some((name, commit)),
+        baseline: CompositionGate::read_baseline(&ledger, entry, record),
+        record,
         opened,
         path: &fork.checkout.path,
         parents: &parents,
         base: &composed.base,
         trunk: &trunk,
         tips: &tips,
+        start: entry.stacked().then_some(commit),
     };
     // A parent the trunk holds is no member, but the release holds its
     // content: it is replayed, and its files explain drift, as a member's.
     let audited: Vec<(String, CommitId)> = composed
-        .members()
+        .members
         .iter()
         .chain(&composed.bases)
         .cloned()
@@ -1326,11 +1498,20 @@ fn record_hand_cut(
     if !held.named {
         knives::jj::set_bookmark(&fork.checkout.path, name, commit.as_str())?;
     }
+    // The event records the reading made above: a stacked release's previous
+    // release first, under its label, then the members, never a parent the
+    // trunk holds.
+    let composition: Vec<(String, CommitId)> = composed
+        .previous
+        .iter()
+        .map(PreviousRelease::labelled)
+        .chain(composed.members.iter().cloned())
+        .collect();
     record_cut_event(
         fork,
         &CompletedCut {
             name,
-            request: &release::Cut::from_carried(name.to_owned(), composed.members()),
+            request: &release::Cut::from_carried(name.to_owned(), &composed.members),
             created: commit,
             audit: &checked.audit,
             scheme: &entry.release_scheme(),
@@ -1340,7 +1521,7 @@ fn record_hand_cut(
             // Recorded, not written: knives unioned nothing.
             unions: &[],
             unchecked: "",
-            composition: Some(&composed.composition),
+            composition: Some(&composition),
         },
         bound,
     )?;
@@ -1501,22 +1682,20 @@ fn unpushed_record_remedy(
     let (repo, entry) = (&fork.name, fork.entry);
     let remote = entry.publish_remote();
     // The name is the caller's, kept to the series' grammar, whose label
-    // takes any character but `/`; the evidence names a tag or quotes a
-    // ledger note.
-    let (shown, at) = (inline_human_text(name), commit.short());
+    // takes any character but `/`: shown escaped, and quoted for the shell
+    // inside each command. The evidence names a tag or quotes a ledger note.
+    let (shown, word, at) = (inline_human_text(name), shell_word(name), commit.short());
     let series = entry
         .selected_series
         .as_ref()
         .map_or_else(String::new, |series| format!(" --series {series}"));
     let mut steps = Vec::new();
     if !named {
-        steps.push(format!("`jj bookmark create {shown} -r {at}`"));
+        steps.push(format!("`jj bookmark create {word} -r {at}`"));
     }
+    steps.push(format!("`jj git push --remote {remote} --bookmark {word}`"));
     steps.push(format!(
-        "`jj git push --remote {remote} --bookmark {shown}`"
-    ));
-    steps.push(format!(
-        "`knives release --repo {repo}{series} cut {shown} --at {at}`"
+        "`knives release --repo {repo}{series} cut {word} --at {at}`"
     ));
     format!(
         "refusing to record {shown} at {at}: it is published ({}), and {remote} does not hold \
@@ -1534,10 +1713,14 @@ fn recorded_hand_cut_line(
     push_to: Option<&str>,
 ) -> String {
     // The name is the caller's, kept to the series' grammar, whose label
-    // takes any character but `/`.
+    // takes any character but `/`: shown escaped, and quoted for the shell
+    // inside the command.
     let shown = inline_human_text(name);
     let push = push_to.map_or_else(String::new, |remote| {
-        format!("; push {shown} with jj git push --remote {remote} --bookmark {shown}")
+        format!(
+            "; push {shown} with jj git push --remote {remote} --bookmark {}",
+            shell_word(name)
+        )
     });
     format!(
         "{repo}: recorded {shown} at {} as its cut; nothing was committed{push}",
@@ -1566,8 +1749,9 @@ fn refuse_recorded_name(
     println!(
         "{repo}: refusing to record {shown} at {}: the ledger already records {shown}, newest as \
          {described}; a commit made over a recorded write is recorded with `knives release adopt \
-         {shown}`",
-        commit.short()
+         {}`",
+        commit.short(),
+        shell_word(name)
     );
     Some(Exit::Incomplete)
 }
@@ -1643,10 +1827,9 @@ fn name_refs(
 struct HandCut {
     /// The previous release a release of a stacked series stacks on.
     previous: Option<PreviousRelease>,
-    /// What the event records ([`composition_sources`]): the previous
-    /// release first, under its label, when there is one, then each member
-    /// with where it came from. Never a parent the trunk holds.
-    composition: Vec<(String, CommitId)>,
+    /// Each member with where it came from ([`release::parent_sources`]).
+    /// Never a parent the trunk holds.
+    members: Vec<(String, CommitId)>,
     /// Each parent of the reading that the trunk holds, with where it came
     /// from: never a member ([`trunk_reaches`]), but content the release
     /// holds all the same.
@@ -1659,14 +1842,6 @@ struct HandCut {
 }
 
 impl HandCut {
-    /// Each member with where it came from: the composition after its
-    /// previous release.
-    fn members(&self) -> &[(String, CommitId)] {
-        self.composition
-            .get(usize::from(self.previous.is_some())..)
-            .unwrap_or_default()
-    }
-
     /// What the record's drift is measured from: the previous release it
     /// stacks on, else `follows`, the series' previous release. The series'
     /// first record follows no release, so its drift is measured from
@@ -1723,33 +1898,24 @@ fn hand_cut_composition(
         }
     };
     let trunks = trunk_positions_in(tips, entry);
-    // The previous release, first under its label, is no parent to sort: it
-    // stays first. Each member the trunk holds is a base instead.
-    let mut sourced =
-        composition_sources(opened, entry, (reading.previous.as_ref(), &reading.members))?
-            .into_iter();
-    let mut composition: Vec<(String, CommitId)> = sourced
-        .by_ref()
-        .take(usize::from(reading.previous.is_some()))
-        .collect();
-    let mut bases = Vec::new();
-    for parent in sourced {
-        if trunk_reaches(opened, &trunks, &parent.1)? {
-            bases.push(parent);
+    let (mut members, mut bases) = (Vec::new(), Vec::new());
+    for sourced in
+        release::parent_sources(opened, entry, &entry.release_scheme(), &reading.members)?
+    {
+        if trunk_reaches(opened, &trunks, &sourced.1)? {
+            bases.push(sourced);
         } else {
-            composition.push(parent);
+            members.push(sourced);
         }
     }
     if let Some(previous) = reading.previous {
         return Ok(Ok(HandCut {
             base: previous.commit.clone(),
             previous: Some(previous),
-            composition,
+            members,
             bases,
         }));
     }
-    // With no previous release, the composition is the members.
-    let members = composition;
     if members.is_empty() {
         println!(
             "{repo}: refusing to record {shown} at {at}: it merges no member: a parent the trunk \
@@ -1786,7 +1952,7 @@ fn hand_cut_composition(
     let base = opened.fork_point_of(&member_tips, trunk)?;
     Ok(Ok(HandCut {
         previous: None,
-        composition: members,
+        members,
         bases,
         base,
     }))
@@ -2442,7 +2608,7 @@ mod tests {
         let write = RecordedCut {
             kind: RecordedWriteKind::Edit,
             name: format!("release/{HOSTILE}.2"),
-            commit: CommitId::new("ffff"),
+            commit: CommitId::new(HOSTILE),
             members: vec![CommitId::new(HOSTILE), CommitId::new("abab")],
         };
         let repo = RepoName::new("demo");
@@ -2462,6 +2628,7 @@ mod tests {
                 name: format!("feat/{HOSTILE}@aaaa"),
             }],
             twins: vec![(format!("feat/{HOSTILE}@bbbb"), CommitId::new("cccc"))],
+            off_line: true,
         };
 
         let published = recorded_published_line(
@@ -2473,20 +2640,16 @@ mod tests {
         let mut lines = vec![published.clone()];
         let at = CommitId::new("eeee");
         let gates = [
-            (
-                HeldRecords {
-                    first: HeldRecord::PreviousCut(&cut),
-                    other: Some(HeldRecord::NewestWrite(&write)),
-                },
-                None,
-            ),
-            (
-                HeldRecords {
-                    first: HeldRecord::NewestWrite(&write),
-                    other: Some(HeldRecord::PreviousCut(&cut)),
-                },
-                Some(("release/2026-11-14", &at)),
-            ),
+            HeldRecords {
+                first: HeldRecord::PreviousCut(&cut),
+                other: Some(HeldRecord::NewestWrite(&write)),
+                record: None,
+            },
+            HeldRecords {
+                first: HeldRecord::NewestWrite(&write),
+                other: Some(HeldRecord::PreviousCut(&cut)),
+                record: Some(("release/2026-11-14", &at)),
+            },
         ];
         for held in gates {
             for on_drop in [
@@ -2512,8 +2675,14 @@ mod tests {
             format!("of release/{ESCAPED}.2, the newest release that the ledger records"),
             format!("    {ESCAPED} (not known to this repository)"),
             format!("    feat/{ESCAPED}@abab"),
-            format!("feat/{ESCAPED}@aaaa: recorded by the release/{ESCAPED} cut"),
+            format!("feat/{ESCAPED}@aaaa: recorded by the previous cut release/{ESCAPED}"),
             format!("feat/{ESCAPED}@bbbb is carried by cccc"),
+            format!(
+                "release/{ESCAPED}.2's newest recorded write (an edit) {} on its first-parent \
+                 line",
+                ids_prefix(ESCAPED)
+            ),
+            format!("`jj bookmark set 'release/{ESCAPED}.2' -r '"),
         ] {
             assert!(text.contains(&expected), "{expected:?} not in {text:?}");
         }
@@ -2556,6 +2725,7 @@ mod tests {
         let held = HeldRecords {
             first: HeldRecord::PreviousCut(&cut),
             other: Some(HeldRecord::NewestWrite(&write)),
+            record: None,
         };
 
         // When: its event restates the records it was held against.

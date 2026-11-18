@@ -21,7 +21,7 @@ use knives::jj::{Repo, ResolutionBaseline, ResolutionChanges};
 use knives::ledger::{Draft, Entry, Ledger, RecordedParent, inline_human_text};
 use knives::release_model::{
     EarlierWrites, PreviousRelease, RecordedWrite, ReleaseReading, carrier_label, matched_write,
-    recorded_members, recorded_write_events,
+    previous_release_label, recorded_members, recorded_write_events,
 };
 
 use super::release_edit::{
@@ -570,7 +570,7 @@ pub(crate) fn refuse_unfinished_commit(
 struct Adoption<'a> {
     change: ChangeId,
     /// The previous release a stacked release is built on, which the event
-    /// records under its label ([`PreviousRelease::labelled`]), never a member.
+    /// records under its label ([`previous_release_label`]), never a member.
     previous: Option<PreviousRelease>,
     /// The parents that are earlier writes of the name.
     carriers: Vec<CommitId>,
@@ -1017,12 +1017,9 @@ fn record(
     let mut parents: Vec<RecordedParent> = adoption
         .previous
         .iter()
-        .map(|previous| {
-            let (label, commit) = previous.labelled();
-            RecordedParent {
-                commit: commit.as_str().to_owned(),
-                branches: vec![label],
-            }
+        .map(|previous| RecordedParent {
+            commit: previous.commit.as_str().to_owned(),
+            branches: vec![previous_release_label(&previous.name)],
         })
         .collect();
     parents.extend(adopting.replaced.parents.iter().cloned());
