@@ -378,6 +378,43 @@ fn the_root_commit_is_refused() {
     assert_eq!(bookmarks(&lab), refs, "{out}");
 }
 
+#[test]
+fn a_change_no_member_explains_is_refused_outside_a_stacked_series() {
+    // Given: RELEASE recorded, then the next release merged by hand of three
+    // branches, with a file added in the merge itself that no member has.
+    let (lab, home) = hand_cut_lab();
+    let first = record(&lab, &home, RELEASE, &commit_at(&lab, RELEASE));
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first));
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    lab.jj_work([
+        "new",
+        "-r",
+        "feat/alpha",
+        "-r",
+        "feat/beta",
+        "-r",
+        "feat/gamma",
+        "-m",
+        "the next release, merged by hand",
+    ]);
+    std::fs::write(lab.work_path().join("unexplained.txt"), "no member\n")
+        .expect("write unexplained.txt");
+    lab.jj_work(["new"]);
+    let commit = commit_of(&lab, "@-");
+    let (entries, refs) = (ledger_entries(&home), bookmarks(&lab));
+
+    // When: it is recorded.
+    let recorded = record(&lab, &home, "release/2026-08-05", &commit);
+
+    // Then: it is refused as a stacked series refuses it, naming the file no
+    // member or trunk explains, and nothing is written.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert!(out.contains("unexplained.txt"), "{out}");
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+    assert_eq!(bookmarks(&lab), refs, "{out}");
+}
+
 /// A lab whose upstream carries a second base, `old`, split from `main`.
 fn two_base_lab() -> Lab {
     let lab = Lab::new();
