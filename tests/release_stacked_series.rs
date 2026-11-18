@@ -8,10 +8,12 @@
 //! parents on its first-parent line. A cut starts the next release as one
 //! commit on the previous release, `include` adds each member, the ledger
 //! labels the previous release, and the reap keeps every release the live
-//! one descends from. `adopt` measures a hand resolution against the merge
-//! of the previous release and the members, and counts only the members'
-//! lines. A series without the key keeps today's rules: a branch built on
-//! the previous release is refused.
+//! one descends from. A previous release made by hand, with no recorded
+//! write, is still the previous release once the reap has forgotten its
+//! refs: the cut's event labels it. `adopt` measures a hand resolution
+//! against the merge of the previous release and the members, and counts
+//! only the members' lines. A series without the key keeps today's rules:
+//! a branch built on the previous release is refused.
 
 #![allow(
     clippy::expect_used,
@@ -82,8 +84,8 @@ fn text(output: &std::process::Output) -> String {
 
 /// Series `old`, with `stacked = true` when `stacked`: its first cut
 /// [`PREVIOUS`] of `fix/a` and `fix/b`, pushed to origin and marked published
-/// by a `record: published` note, and three branches on that cut: `del`
-/// deletes `a.txt`, which the cut carries, and `m6` and `m5` each add a file.
+/// by a `record: published` note, and three branches on that cut
+/// ([`branches_on_previous`]).
 fn previous_release_lab(stacked: bool) -> (Lab, tempfile::TempDir) {
     series_lab(stacked, true)
 }
@@ -102,13 +104,19 @@ fn series_lab(stacked: bool, published: bool) -> (Lab, tempfile::TempDir) {
     if published {
         mark_published(&lab, &home, PREVIOUS);
     }
+    branches_on_previous(&lab);
+    (lab, home)
+}
+
+/// Three branches on [`PREVIOUS`]: `del` deletes `a.txt`, which that
+/// release carries, and `m6` and `m5` each add a file.
+fn branches_on_previous(lab: &Lab) {
     lab.jj_work(["new", "-r", PREVIOUS, "-m", "del"]);
     std::fs::remove_file(lab.work_path().join("a.txt")).expect("delete a file the cut carries");
     lab.jj_work(["bookmark", "create", "del", "-r", "@"]);
     lab.jj_work(["new"]);
-    branch_on(&lab, PREVIOUS, "m6", "m6.txt");
-    branch_on(&lab, PREVIOUS, "m5", "m5.txt");
-    (lab, home)
+    branch_on(lab, PREVIOUS, "m6", "m6.txt");
+    branch_on(lab, PREVIOUS, "m5", "m5.txt");
 }
 
 /// A `record: published` note on release `name`, naming its commit, as the
@@ -561,6 +569,75 @@ fn the_reap_after_a_stacked_cut_keeps_every_release_the_live_one_descends_from()
     assert!(is_visible(&lab, &first), "{out}");
     assert!(is_visible(&lab, &previous), "{out}");
     assert_eq!(release_parents(&lab, THIRD), vec![first], "{out}");
+}
+
+#[test]
+fn a_stacked_cut_on_an_unrecorded_previous_release_takes_its_members() {
+    // Given: a stacked series whose previous release was made by hand, as
+    // the fork's 9.2 releases up to 8.0.9 were: one merge of `fix/a` and
+    // `fix/b` that no knives cut wrote, pushed to origin and published by a
+    // tag on its commit. `del`, `m6` and `m5` are built on it.
+    let lab = two_base_lab();
+    branch_on(&lab, "old@upstream", "fix/a", "a.txt");
+    branch_on(&lab, "old@upstream", "fix/b", "b.txt");
+    let home = series_home(&lab, "stacked = true\n");
+    lab.jj_work(["new", "-r", "fix/a", "-r", "fix/b", "-m", PREVIOUS]);
+    lab.jj_work(["bookmark", "create", PREVIOUS, "-r", "@"]);
+    lab.jj_work(["new"]);
+    lab.push_branch(PREVIOUS);
+    lab.fetch_work();
+    lab.jj_work(["tag", "set", "v1.0.0", "-r", PREVIOUS]);
+    let previous = commit_at(&lab, PREVIOUS);
+    branches_on_previous(&lab);
+
+    // When: the next release is cut.
+    let cut = knives_release(&lab, &home, &["--series", "old", "cut", NEXT]);
+
+    // Then: it exits 0 and starts as one commit on the previous release.
+    // The ledger records no write of the previous release, and the reap
+    // forgets every ref of it and keeps its commit.
+    let out = text(&cut);
+    assert_eq!(cut.status.code(), Some(0), "{out}");
+    assert_eq!(release_parents(&lab, NEXT), vec![previous.clone()], "{out}");
+    assert!(
+        knives::release_model::recorded_writes(&ledger_entries(&home), PREVIOUS)
+            .next()
+            .is_none(),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "reaped {PREVIOUS} (refs forgotten everywhere; commit kept, {NEXT} descends from it)"
+        )),
+        "{out}"
+    );
+    assert!(!has_refs(&lab, PREVIOUS), "{out}");
+
+    // When: each branch built on the previous release is included.
+    for branch in ["del", "m6", "m5"] {
+        release_ok(&lab, &home, &["include", branch]);
+    }
+
+    // Then: the release is one merge of the previous release and the three,
+    // in that order.
+    let mut expected = vec![previous.clone()];
+    expected.extend(["del", "m6", "m5"].map(|branch| commit_at(&lab, branch)));
+    assert_eq!(release_parents(&lab, NEXT), expected);
+
+    // And: `members --verify` exits 0. It shows the previous release on a
+    // row of its own, under its name, though no ref holds it now, then each
+    // member, and nothing is missing.
+    let members = release_ok(&lab, &home, &["members", "--verify"]);
+    let out = text(&members);
+    let own_row = format!(
+        "- {} {PREVIOUS} previous release (not a member)",
+        previous.short()
+    );
+    assert!(out.lines().any(|line| line == own_row), "{out}");
+    for branch in ["del", "m6", "m5"] {
+        assert!(out.contains(&member_row(&lab, branch)), "{out}");
+    }
+    assert!(!out.contains("!!"), "{out}");
 }
 
 #[test]
