@@ -424,7 +424,7 @@ fn shed_stale_bases(
         &knives::jj::ReleaseWrite {
             source: Some(release_commit),
             parents: members,
-            carriers,
+            measured: knives::jj::Measured::WithoutCarriers(carriers),
             message: None,
             bookmark: Some(release_name),
             publish_remote: Some(fork.entry.publish_remote()),
@@ -904,7 +904,7 @@ fn drop_landed_members_in(
         &knives::jj::ReleaseWrite {
             source: Some(&release),
             parents: &kept,
-            carriers: &carriers,
+            measured: knives::jj::Measured::WithoutCarriers(&carriers),
             message: Some(&message),
             bookmark: Some(release_name),
             publish_remote: Some(entry.publish_remote()),

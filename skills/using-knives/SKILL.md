@@ -61,7 +61,7 @@ Use the replay probe, never a source-text search. A symbol's presence does not s
 - `knives release members <target> --carries <revision>` checks that target. Exit `0` is carried, `1` is `NOT carried` or `conflicted`, `3` is unresolved or uncheckable. A superseded target is a valid target.
 - With no `<target>`, it checks live releases and upstream trunk, then superseded cuts. Carriage only by a superseded cut does not make deletion safe. `--census` asks this for every maintained branch.
 - The `landed` column of `status` is the upstream-trunk probe.
-- Bare `members` lists direct parents, and in a stacked series the previous release on a row of its own. `--verify` replays each member. Details: [releases](references/releases.md).
+- Bare `members` lists direct parents. In a stacked series it lists the previous release on a row of its own, then the members that the release's reading gives, not its direct parents. `--verify` replays each member. Details: [releases](references/releases.md).
 
 | Verdict | Evidence |
 |---|---|

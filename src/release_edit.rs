@@ -16,9 +16,9 @@ use knives::ids::{BranchName, CommitId, ReleaseScheme, RepoName};
 use knives::ledger::{Draft, Ledger, inline_human_text};
 use knives::release_model::{
     EarlierWrites, MemberEvidence, MemberHistory, MemberLookup, MemberSuccession, PreviousRelease,
-    SeriesFit, StackedHistoryContext, carried_from_tips, carries_member_line,
+    SeriesFit, StackedHistoryContext, carried_from_tips, carries_member_line, composition,
     is_previous_release_label, last_recorded_parents, member_history, member_parents,
-    members_event_text, previous_release_label, series_fit, trunk_positions,
+    members_event_text, previous_release_label, series_fit, trunk_positions, with_commit,
 };
 
 use super::scribe_for;
@@ -128,36 +128,21 @@ impl ReleaseInHand {
     /// carries that release whole, and a member may stack on it. Succession
     /// and the trunk's own refusals still read [`Self::trunk_tips`] alone.
     fn measured(&self) -> (Cow<'_, [CommitId]>, Cow<'_, [CommitId]>) {
-        let Some(previous) = &self.previous else {
-            return (
-                Cow::Borrowed(self.trunk_tips.as_slice()),
-                Cow::Borrowed(self.parents.as_slice()),
-            );
-        };
-        let with_previous = |commits: &[CommitId]| -> Vec<CommitId> {
-            commits
-                .iter()
-                .chain(std::iter::once(&previous.commit))
-                .cloned()
-                .collect()
-        };
+        let previous = self.previous.as_ref().map(|previous| &previous.commit);
         (
-            Cow::Owned(with_previous(&self.trunk_tips)),
-            Cow::Owned(with_previous(&self.parents)),
+            with_commit(&self.trunk_tips, previous),
+            with_commit(&self.parents, previous),
         )
     }
 
-    /// What the release composes: its previous release when it has one,
-    /// then its members, its carriers left out. Its own change is its tree
-    /// against their merge ([`knives::jj::write_composed_release`]): a
-    /// release made as a chain of merges, one member each, holds what each
-    /// inner merge resolved, and only that merge holds all of it.
-    fn composition(&self) -> Vec<CommitId> {
-        self.previous
-            .iter()
-            .map(|previous| previous.commit.clone())
-            .chain(self.parents.iter().cloned())
-            .collect()
+    /// What the release composes ([`composition`]): its previous release
+    /// when it has one, then its members, its carriers left out. Its own
+    /// change is its tree against their merge
+    /// ([`knives::jj::Measured::Composed`]): a release made as a chain of
+    /// merges, one member each, holds what each inner merge resolved, and
+    /// only that merge holds all of it.
+    fn composition(&self) -> Cow<'_, [CommitId]> {
+        composition(self.previous.as_ref(), &self.parents)
     }
 
     /// The release's name for a terminal line: a name read from the
@@ -803,34 +788,22 @@ fn apply_edit(
 ) -> anyhow::Result<Exit> {
     let (repo, opened, release) = (context.repo, context.opened, context.release);
     let entry = fork.entry;
-    let parents: Cow<'_, [CommitId]> =
-        release
-            .previous
-            .as_ref()
-            .map_or(Cow::Borrowed(new_parents), |previous| {
-                Cow::Owned(
-                    std::iter::once(&previous.commit)
-                        .chain(new_parents)
-                        .cloned()
-                        .collect(),
-                )
-            });
+    let parents = composition(release.previous.as_ref(), new_parents);
     let provenance = composition_sources(opened, entry, (release.previous.as_ref(), new_parents))?;
     let message = release::composition_message(&release.name, &provenance, delta);
-    let written = knives::jj::write_composed_release(
+    let written = knives::jj::write_release(
         &fork.checkout.path,
         &knives::jj::ReleaseWrite {
             source: Some(&release.commit),
             parents: &parents,
             // What the release composes leaves its carriers out.
-            carriers: &[],
+            measured: knives::jj::Measured::Composed(&release.composition()),
             message: Some(&message),
             bookmark: Some(&release.name),
             publish_remote: Some(entry.publish_remote()),
             earlier: release.writes.commits(),
             operation: &format!("knives: {}: {delta}", release.name),
         },
-        &release.composition(),
     )?;
     let created = &written.commit;
     record_edit_event(

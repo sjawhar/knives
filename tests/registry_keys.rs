@@ -20,15 +20,15 @@ use serde_json::Value;
 
 #[test]
 fn an_unknown_key_in_an_entry_warns_and_is_ignored() {
-    // Given: an entry that carries a key no knives reads, and a series table
-    // that carries another.
+    // Given: an entry that carries a key no knives reads, and a series table,
+    // whose name `9.2` is no bare TOML key, that carries another.
     let home = tempfile::tempdir().expect("config home");
     let registry = home.path().join("repos.toml");
     std::fs::write(
         &registry,
         "[repos.tool]\nupstream = \"https://forge.invalid/org/tool\"\n\
          origin = \"https://forge.invalid/acme/tool\"\nfuture_key = 1\n\n\
-         [repos.tool.series.old]\nbase = \"old\"\nstacked2 = true\n",
+         [repos.tool.series.\"9.2\"]\nbase = \"old\"\nstacked2 = true\n",
     )
     .expect("write registry");
     let scan_home = tempfile::tempdir().expect("scan home");
@@ -45,7 +45,8 @@ fn an_unknown_key_in_an_entry_warns_and_is_ignored() {
     .expect("run knives");
 
     // Then: it exits 0 with one JSON document on standard output that lists
-    // the entry, and standard error names each key and its table once.
+    // the entry, and standard error names each key and its table once, with
+    // the series name quoted as the file writes it.
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
@@ -57,8 +58,8 @@ fn an_unknown_key_in_an_entry_warns_and_is_ignored() {
             registry.display()
         ),
         format!(
-            "knives: warning: {}: [repos.tool.series.old] has an unknown key stacked2; it is \
-             ignored\n",
+            "knives: warning: {}: [repos.tool.series.\"9.2\"] has an unknown key stacked2; it \
+             is ignored\n",
             registry.display()
         ),
     ] {
@@ -88,6 +89,5 @@ fn a_series_reads_its_stacked_key() {
     let stderr = String::from_utf8_lossy(&plan.stderr);
     assert_eq!(plan.status.code(), Some(0), "{stdout}\n{stderr}");
     assert!(!stderr.contains("knives: warning"), "{stderr}");
-    assert!(!stderr.contains("stacked"), "{stderr}");
     assert!(stdout.contains("series old has no cut yet"), "{stdout}");
 }

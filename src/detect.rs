@@ -19,7 +19,7 @@ use std::fmt;
 pub use divergence::divergent_changes;
 pub use double_checkout::double_checkout;
 pub use landed::{LandedVerdict, RebaseOutcome, classify_landed};
-pub use stale_parents::{BookmarkTips, ReleaseParent, stale_parents};
+pub use stale_parents::{BookmarkTips, ReleaseParent, release_parents, stale_parents};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]

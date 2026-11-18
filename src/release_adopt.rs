@@ -916,7 +916,8 @@ fn adopt(
         release::InHandWrite::NoRecord => {
             println!(
                 "{repo}: the ledger records no cut or edit of {}, so there is no write for {} \
-                 to replace; cut the release first",
+                 to replace; cut the release first, or, for a release cut outside knives, \
+                 `knives release cut <name> --at <commit>`",
                 held.shown_name(),
                 held.commit.short()
             );

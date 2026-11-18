@@ -334,11 +334,16 @@ fn branch_states_with_findings(
             .map(|finding| finding.subject.to_string())
             .collect();
 
-    // Which branches a release still pins an older commit of.
+    // Which branches a release still pins an older commit of. The parents a
+    // release ref pins depend only on its name and its commit, so a name
+    // held at one commit locally and on remotes is read once.
     let stacked = stacked_series(fork, &repo)?;
     let mut stale_branches = std::collections::BTreeSet::new();
+    let mut read = std::collections::BTreeSet::new();
     for (reference, commit) in &tips {
-        if !is_release_name(reference.branch(), &scheme) {
+        if !is_release_name(reference.branch(), &scheme)
+            || !read.insert((reference.branch(), commit))
+        {
             continue;
         }
         let parents = pinned_parents(&repo, (&stacked, &tips), (reference, commit))?;
@@ -473,7 +478,7 @@ fn pinned_parents(
         )? {
             let mut pinned = reading.members;
             pinned.extend(reading.carriers);
-            return Ok(crate::release_model::release_parents(tips, &pinned));
+            return Ok(crate::detect::release_parents(tips, &pinned));
         }
     }
     Ok(repo.parents_of(commit.as_str())?)

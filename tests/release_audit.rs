@@ -571,7 +571,7 @@ fn committed_cut_fixture(
         &knives::jj::ReleaseWrite {
             source: previous,
             parents: &request.parents,
-            carriers: &[],
+            measured: knives::jj::Measured::WithoutCarriers(&[]),
             message: Some(&request.message()),
             bookmark: None,
             publish_remote: None,

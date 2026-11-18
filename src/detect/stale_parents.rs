@@ -15,6 +15,21 @@ pub struct ReleaseParent {
 /// Tip of every bookmark, local and remote kept apart.
 pub type BookmarkTips = BTreeMap<BookmarkRef, CommitId>;
 
+/// Each of `commits` as a release parent, with every bookmark on it.
+pub fn release_parents(tips: &BookmarkTips, commits: &[CommitId]) -> Vec<ReleaseParent> {
+    commits
+        .iter()
+        .map(|commit| ReleaseParent {
+            commit: commit.clone(),
+            bookmarks: tips
+                .iter()
+                .filter(|(_, tip)| *tip == commit)
+                .map(|(bookmark, _)| bookmark.clone())
+                .collect(),
+        })
+        .collect()
+}
+
 /// Flag release parents that nothing points at any more.
 ///
 /// A remote rewrite (a maintainer pressing "update branch", or a force-push)

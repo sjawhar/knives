@@ -245,16 +245,8 @@ pub struct SeriesEntry {
     /// and its new members. The previous release is the first parent, and it
     /// is never a member. Defaults to false: a release is a flat merge of its
     /// members.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stacked: bool,
-}
-
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "serde's skip_serializing_if passes the field by reference"
-)]
-const fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 impl RepoEntry {
@@ -1301,12 +1293,14 @@ fn deleted_path_field(raw: &toml::Table) -> Option<String> {
 fn unknown_entry_keys(raw: &toml::Table) -> Vec<String> {
     let mut warnings = Vec::new();
     for (name, entry) in subtables(raw.get("repos")) {
+        let name = header_key(name);
         for key in unknown_keys::<RepoEntry>(entry) {
             warnings.push(format!(
                 "[repos.{name}] has an unknown key {key}; it is ignored"
             ));
         }
         for (series, table) in subtables(entry.get("series")) {
+            let series = header_key(series);
             for key in unknown_keys::<SeriesEntry>(table) {
                 warnings.push(format!(
                     "[repos.{name}.series.{series}] has an unknown key {key}; it is ignored"
@@ -1315,6 +1309,20 @@ fn unknown_entry_keys(raw: &toml::Table) -> Vec<String> {
         }
     }
     warnings
+}
+
+/// `key` as TOML writes it in a table header: bare when it holds only
+/// `A-Za-z0-9_-`, else quoted, so a series `9.2` reads as one key, not two.
+fn header_key(key: &str) -> std::borrow::Cow<'_, str> {
+    if !key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        std::borrow::Cow::Borrowed(key)
+    } else {
+        std::borrow::Cow::Owned(toml::Value::String(key.to_owned()).to_string())
+    }
 }
 
 /// Each value of the table `value` that is itself a table, with its key. A
@@ -2094,21 +2102,23 @@ release = "https://example.invalid/releases.git"
     fn an_unknown_entry_or_series_key_warns_and_any_other_unknown_key_is_refused() {
         // An entry or a series table names a key it does not read and ignores
         // it, so a shared registry can carry a key only a newer knives reads.
-        // Every other table keeps `deny_unknown_fields`: a misspelt key would
-        // otherwise silently mean its default.
+        // The warning quotes a series name that is not a bare TOML key, so it
+        // names the table the file has. Every other table keeps
+        // `deny_unknown_fields`: a misspelt key would otherwise silently mean
+        // its default.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("repos.toml");
         std::fs::write(
             &path,
             "[repos.x]\nupstream = \"u\"\norigin = \"o\"\nreleas = \"r\"\n\n\
-             [repos.x.series.old]\nbase = \"old\"\nstacked2 = true\n",
+             [repos.x.series.\"9.2\"]\nbase = \"old\"\nstacked2 = true\n",
         )
         .unwrap();
         let (registry, warnings) = read_registry(&path).unwrap();
         let entry = &registry.repos["x"];
         assert_eq!(entry.release, None);
-        assert_eq!(entry.series["old"].base, "old");
-        assert!(!entry.series["old"].stacked);
+        assert_eq!(entry.series["9.2"].base, "old");
+        assert!(!entry.series["9.2"].stacked);
         assert_eq!(
             warnings,
             [
@@ -2117,7 +2127,7 @@ release = "https://example.invalid/releases.git"
                     path.display()
                 ),
                 format!(
-                    "{}: [repos.x.series.old] has an unknown key stacked2; it is ignored",
+                    "{}: [repos.x.series.\"9.2\"] has an unknown key stacked2; it is ignored",
                     path.display()
                 ),
             ]

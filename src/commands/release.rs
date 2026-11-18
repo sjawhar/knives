@@ -21,7 +21,8 @@ use crate::consumer_pins::{
     ConsumerHeadMemo, ConsumerPinSource, scan_consumer_for, scan_consumer_slug_with_heads,
 };
 use crate::detect::{
-    BookmarkTips, Finding, FindingKind, RebaseOutcome, ReleaseParent, Subject, stale_parents,
+    BookmarkTips, Finding, FindingKind, RebaseOutcome, ReleaseParent, Subject, release_parents,
+    stale_parents,
 };
 use crate::ids::{
     BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, is_our_dated_cut, is_our_release,
@@ -35,8 +36,8 @@ use crate::release_model::{
     PreviousRelease, RecordedCut, RecordedWrite, ReleaseReading, StackedHistoryContext,
     UnexplainedCommit, carried_from_tips, double_cut_findings, last_recorded_parents,
     matched_write, member_history, member_parents, newest_release, previous_release_label,
-    read_release, recorded_release_changes, release_parents, release_refs_by_commit, repo_slug,
-    stacked_release, trunk_positions,
+    read_release, recorded_release_changes, release_refs_by_commit, repo_slug, stacked_release,
+    trunk_positions, trunk_positions_in, with_commit,
 };
 
 /// Registered forge consumers and explicitly requested local checkout scans.
@@ -770,6 +771,23 @@ pub fn superseded_dated_releases(
     found
 }
 
+/// Each superseded dated cut's name ([`superseded_dated_releases`]) with the
+/// commits its refs name, each once, in ref order.
+fn superseded_by_name(
+    tips: &BookmarkTips,
+    scheme: &ReleaseScheme,
+    publish_remote: &str,
+) -> std::collections::BTreeMap<String, Vec<CommitId>> {
+    let mut by_name = std::collections::BTreeMap::<String, Vec<CommitId>>::default();
+    for (reference, commit) in superseded_dated_releases(tips, scheme, publish_remote) {
+        let targets = by_name.entry(reference.branch().to_string()).or_default();
+        if !targets.contains(&commit) {
+            targets.push(commit);
+        }
+    }
+    by_name
+}
+
 #[derive(Debug)]
 pub struct ReapReport {
     /// Bookmark names whose refs were forgotten AND commits abandoned. A name
@@ -837,13 +855,7 @@ pub fn reap_superseded(
 ) -> anyhow::Result<ReapReport> {
     let repo_path = repo.path();
     let tips = repo.bookmark_tips()?;
-    let mut by_name = std::collections::BTreeMap::<String, Vec<CommitId>>::default();
-    for (reference, commit) in superseded_dated_releases(&tips, scheme, publish_remote) {
-        let targets = by_name.entry(reference.branch().to_string()).or_default();
-        if !targets.contains(&commit) {
-            targets.push(commit);
-        }
-    }
+    let by_name = superseded_by_name(&tips, scheme, publish_remote);
     if !by_name.is_empty()
         && let Some((live, commit)) = live_dated_release(&tips, scheme, publish_remote)
         && !crate::jj::conflicted_files(repo_path, commit.as_str())?.is_empty()
@@ -981,13 +993,7 @@ pub fn forget_superseded_ancestors(
     let Some((live, live_commit)) = live_dated_release(&tips, scheme, publish_remote) else {
         return Ok(Vec::new());
     };
-    let mut by_name = std::collections::BTreeMap::<String, Vec<CommitId>>::default();
-    for (reference, commit) in superseded_dated_releases(&tips, scheme, publish_remote) {
-        by_name
-            .entry(reference.branch().to_string())
-            .or_default()
-            .push(commit);
-    }
+    let by_name = superseded_by_name(&tips, scheme, publish_remote);
     let mut names = Vec::new();
     'names: for (name, targets) in by_name {
         for target in &targets {
@@ -1187,7 +1193,7 @@ pub fn in_hand_write(
     // its previous release has that release as its one parent, no carrier.
     let parents = repo.parent_commits(commit.as_str())?;
     if let Some(into) = parents.first()
-        && writes.carriers(&parents).len() == parents.len()
+        && parents.iter().all(|parent| writes.contains(parent))
     {
         return Ok(InHandWrite::Unchecked(Unchecked::NoMatch(
             NoMatch::AllCarriers {
@@ -1287,8 +1293,11 @@ pub fn release_reading(
     ledger: &[Entry],
     (writes, commit): (&EarlierWrites, &CommitId),
 ) -> Result<Result<ReleaseReading, UnexplainedCommit>, crate::jj::JjError> {
+    // The bookmarks are listed once, and the trunk positions read from them.
     let (tips, trunks) = if entry.stacked() {
-        (repo.bookmark_tips()?, trunk_positions(repo, entry)?)
+        let tips = repo.bookmark_tips()?;
+        let trunks = trunk_positions_in(&tips, entry);
+        (tips, trunks)
     } else {
         (BookmarkTips::default(), Vec::new())
     };
@@ -1894,18 +1903,10 @@ pub fn plan(
     // A member of a stacked release may stack on its previous release, so
     // its history is measured past that release as past the trunk. Branch
     // succession and the trunk's own messages still read the trunk alone.
-    let measured: std::borrow::Cow<'_, [CommitId]> =
-        plan.previous
-            .as_ref()
-            .map_or(std::borrow::Cow::Borrowed(&trunks), |previous| {
-                std::borrow::Cow::Owned(
-                    trunks
-                        .iter()
-                        .chain(std::iter::once(&previous.commit))
-                        .cloned()
-                        .collect(),
-                )
-            });
+    let measured = with_commit(
+        &trunks,
+        plan.previous.as_ref().map(|previous| &previous.commit),
+    );
     let stacked_context = (!trunks.is_empty()).then_some(StackedHistoryContext {
         repo: &repo,
         trunks: &measured,
@@ -2038,12 +2039,7 @@ fn built_on_release_note(
              trunk before including it"
         ));
     };
-    let bases: Vec<CommitId> = context
-        .trunks
-        .iter()
-        .chain(std::iter::once(input.release))
-        .cloned()
-        .collect();
+    let bases = with_commit(context.trunks, Some(input.release));
     let measured = StackedHistoryContext {
         trunks: &bases,
         ..context
@@ -2324,13 +2320,14 @@ fn stacked_rows(
 ) -> anyhow::Result<Vec<MemberRow>> {
     let mut rows = Vec::new();
     if let Some(previous) = &reading.previous {
+        let held_by = release_parents(tips, std::slice::from_ref(&previous.commit))
+            .into_iter()
+            .flat_map(|parent| parent.bookmarks)
+            .map(|bookmark| bookmark.to_string())
+            .collect();
         rows.push(MemberRow {
             commit: previous.commit.clone(),
-            held_by: tips
-                .iter()
-                .filter(|(_, tip)| **tip == previous.commit)
-                .map(|(bookmark, _)| bookmark.to_string())
-                .collect(),
+            held_by,
             advanced: Vec::new(),
             base_parent: false,
             carrier: false,
@@ -2409,7 +2406,7 @@ pub fn gather_members(
 ) -> anyhow::Result<MembersReport> {
     let entry = fork.entry;
     let commit = opened.resolve_commit(name)?;
-    let parents = opened.parents_of(commit.as_str())?;
+    let parents = opened.parent_commits(commit.as_str())?;
     let parent_count = parents.len();
     let trunk_name = entry.trunk_ref();
     let mut problems = Vec::new();
@@ -2438,24 +2435,27 @@ pub fn gather_members(
         (ledger, &tips, &trunks),
         (release.as_str(), published, &commit),
     )?;
-    let refused = matches!(stacked, Some(Err(_)));
-    let (members, previous) = match stacked {
+    // A release the stacked reading refuses is a problem, and its rows are its
+    // own parents, as every other release's are.
+    let literal_rows = || {
+        parent_rows(
+            opened,
+            release_parents(&tips, &parents),
+            (release.as_str(), ledger, published),
+            (trunk.as_ref(), &successions),
+        )
+    };
+    let (members, previous, refused) = match stacked {
         Some(Ok(reading)) => (
             stacked_rows(opened, &reading, (&tips, trunk.as_ref()), &successions)?,
             reading.previous,
+            false,
         ),
-        stacked => {
-            if let Some(Err(unexplained)) = stacked {
-                problems.push(format!("{name}: {unexplained}"));
-            }
-            let rows = parent_rows(
-                opened,
-                parents,
-                (release.as_str(), ledger, published),
-                (trunk.as_ref(), &successions),
-            )?;
-            (rows, None)
+        Some(Err(unexplained)) => {
+            problems.push(format!("{name}: {unexplained}"));
+            (literal_rows()?, None, true)
         }
+        None => (literal_rows()?, None, false),
     };
     let audit = if verify && !refused {
         trunk
@@ -3550,11 +3550,15 @@ pub fn audit_cut_from(
                 tip.as_str(),
             )?);
         }
-        explained.extend(crate::jj::changed_files_between(
-            repo,
-            previous.as_str(),
-            context.trunk.as_str(),
-        )?);
+        // A stacked audit's trunk is the previous release itself, and a commit
+        // changes no file against itself.
+        if context.trunk != previous {
+            explained.extend(crate::jj::changed_files_between(
+                repo,
+                previous.as_str(),
+                context.trunk.as_str(),
+            )?);
+        }
         audit.unexplained = drifted
             .into_iter()
             .filter(|file| !explained.contains(file))

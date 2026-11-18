@@ -684,8 +684,8 @@ pub enum ReleaseAction {
         #[arg(long, requires = "census", conflicts_with_all = ["reference", "verify", "carries"])]
         no_github: bool,
     },
-    /// Reap superseded dated cuts: forget their bookmarks everywhere, abandon their commits.
-    /// The remote is never touched.
+    /// Reap superseded dated cuts: forget their bookmarks everywhere, abandon their commits
+    /// unless a rule below keeps them. The remote is never touched.
     ///
     /// Runs automatically after every cut; exists standalone for pre-knives repos carrying
     /// years of historical refs. A later fetch re-materializes forgotten refs as untracked;
@@ -693,8 +693,11 @@ pub enum ReleaseAction {
     /// knives remote, and upstream's tags, which `knives start` writes) those refs pin nothing
     /// for `jj rebase`, so reaping is tidiness, never an unlock.
     ///
-    /// Keeps every superseded cut while the live one still carries conflicts: the previous
-    /// cut is the only record of how they were last resolved.
+    /// In a stacked series, a superseded name the live release descends from loses only its
+    /// refs, even while the live cut still carries conflicts: its commit stays, exit 0.
+    ///
+    /// Otherwise, keeps every superseded cut while the live one still carries conflicts: the
+    /// previous cut is the only record of how they were last resolved.
     ///
     /// Keeps a superseded cut, refs and all, while something rests on it: a workspace's
     /// working copy on it or above it, empty or not, or any other descendant, on the cut, on

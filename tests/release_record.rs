@@ -257,6 +257,7 @@ fn recording_again_at_the_same_commit_writes_nothing() {
 #[test]
 fn a_name_older_than_the_newest_recorded_cut_is_refused() {
     // Given: a knives cut of `release/2026-08-05`, which the ledger records,
+    // whose local bookmark is then forgotten, so only the ledger names it,
     // and a release merged by hand that no ref names.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
@@ -264,6 +265,7 @@ fn a_name_older_than_the_newest_recorded_cut_is_refused() {
     let (home, _consumer) = release_test_home(&lab);
     let cut = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
     assert!(cut.status.success(), "{}", text(&cut));
+    lab.jj_work(["bookmark", "forget", "release/2026-08-05"]);
     lab.jj_work([
         "new",
         "-r",
@@ -280,11 +282,15 @@ fn a_name_older_than_the_newest_recorded_cut_is_refused() {
     // When: the hand merge is recorded under the older name.
     let recorded = record(&lab, &home, RELEASE, &commit);
 
-    // Then: it is refused, the newer name named, and nothing is written.
+    // Then: it is refused, the newer name named with the ledger as what
+    // holds it, and nothing is written.
     let out = text(&recorded);
     assert_eq!(recorded.status.code(), Some(3), "{out}");
     assert!(
-        out.contains("refusing to record release/2026-08-04: release/2026-08-05 sorts after it"),
+        out.contains(
+            "refusing to record release/2026-08-04: release/2026-08-05 sorts after it, and the \
+             ledger records a cut or edit of it"
+        ),
         "{out}"
     );
     assert!(out.contains("the older name first"), "{out}");
@@ -485,11 +491,10 @@ fn a_chain_shaped_release_is_recorded_in_a_stacked_series() {
     // When: the chain is recorded.
     let recorded = record_in_series(&lab, &home, NEXT, NEXT);
 
-    // Then: it exits 0, the audit reports nothing missing, and the line says
-    // how to push it.
+    // Then: it exits 0, so the audit found nothing missing, and the line
+    // says how to push it.
     let out = text(&recorded);
     assert_eq!(recorded.status.code(), Some(0), "{out}");
-    assert!(!out.contains("!!"), "{out}");
     assert!(
         out.contains(&format!(
             "{}; push {NEXT} with jj git push --remote origin --bookmark {NEXT}",
@@ -520,7 +525,7 @@ fn a_chain_shaped_release_is_recorded_in_a_stacked_series() {
         "{event:?}"
     );
 
-    // And: `members --verify` reads those members back, none missing.
+    // And: `members --verify` reads those members back, each replayed empty.
     let verify = knives_release(&lab, &home, &["--series", "old", "members", "--verify"]);
     let out = text(&verify);
     assert_eq!(verify.status.code(), Some(0), "{out}");
@@ -529,8 +534,14 @@ fn a_chain_shaped_release_is_recorded_in_a_stacked_series() {
             out.contains(&format!("- {} {branch}", member.short())),
             "{out}"
         );
+        assert!(
+            out.contains(&format!(
+                "  {branch}@{}: carried (replay empty)",
+                member.short()
+            )),
+            "{out}"
+        );
     }
-    assert!(!out.contains("!!"), "{out}");
 }
 
 #[test]
@@ -596,7 +607,6 @@ fn a_recorded_chain_whose_member_is_rewritten_in_place_reads_as_recorded() {
     // merge changed.
     let out = text(&include);
     assert_eq!(include.status.code(), Some(0), "{out}");
-    assert!(!out.contains("carries a change no knives write"), "{out}");
     assert_eq!(file_at_revision(&lab, NEXT, "lines.txt"), RESOLVED);
 }
 
@@ -788,9 +798,15 @@ fn another_machine_reads_the_record_after_a_sweep() {
     assert!(swept.status.success(), "{}", text(&swept));
     settle(alpha.path());
 
-    // Then: the second machine's audit reads the name as recorded: no note
-    // that it has no record or was written unchecked, and no release drift.
+    // Then: the second machine's audit read everything but pull heads, and
+    // reads the name as recorded: no note that it has no record or was
+    // written unchecked, and no release drift.
     let after = audit_on(&lab, beta.path());
+    assert_eq!(
+        after["problems"],
+        serde_json::json!(["open pull-head reconciliation was skipped (--no-github)"]),
+        "the audit must have read everything but pull heads: {after}"
+    );
     let notes = notes_naming(&after, RELEASE);
     assert!(
         !notes

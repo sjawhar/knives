@@ -38,7 +38,7 @@ use thiserror::Error;
 
 use crate::changelog_union;
 use crate::detect::landed::RebaseOutcome;
-use crate::detect::stale_parents::{BookmarkTips, ReleaseParent};
+use crate::detect::stale_parents::{BookmarkTips, ReleaseParent, release_parents};
 use crate::ids::{
     BookmarkRef, BranchName, ChangeId, CommitId, ReleaseScheme, RemoteName, WorkspaceName,
     is_our_release, pull_number_from_bookmark, short_id,
@@ -613,19 +613,10 @@ impl Repo {
     /// The parents of `revision`, each with the bookmarks that sit on it. The
     /// bookmark view is read once for every parent.
     pub fn parents_of(&self, revision: &str) -> Result<Vec<ReleaseParent>, JjError> {
-        let tips = self.bookmark_tips()?;
-        Ok(self
-            .parent_commits(revision)?
-            .into_iter()
-            .map(|commit| {
-                let bookmarks = tips
-                    .iter()
-                    .filter(|(_, tip)| **tip == commit)
-                    .map(|(bookmark, _)| bookmark.clone())
-                    .collect();
-                ReleaseParent { commit, bookmarks }
-            })
-            .collect())
+        Ok(release_parents(
+            &self.bookmark_tips()?,
+            &self.parent_commits(revision)?,
+        ))
     }
 
     /// The parent commits of `revision`, in jj's parent order.
@@ -778,8 +769,19 @@ impl Repo {
     /// trunk itself when the histories criss-cross to several, as
     /// `uncarried_recorded_members` takes a member's base.
     pub fn fork_point(&self, revision: &CommitId, trunk: &CommitId) -> Result<CommitId, JjError> {
+        self.fork_point_of(std::slice::from_ref(revision), trunk)
+    }
+
+    /// [`Self::fork_point`] of every one of `commits` together: the one
+    /// commit all of them and `trunk` reach, or the trunk itself, as a first
+    /// cut takes its members' base.
+    pub fn fork_point_of(
+        &self,
+        commits: &[CommitId],
+        trunk: &CommitId,
+    ) -> Result<CommitId, JjError> {
         Ok(self
-            .common_ancestor(std::slice::from_ref(revision), trunk)?
+            .common_ancestor(commits, trunk)?
             .unwrap_or_else(|| trunk.clone()))
     }
 
@@ -2644,12 +2646,8 @@ pub struct ReleaseWrite<'a> {
     /// merge of exactly `parents`.
     pub source: Option<&'a CommitId>,
     pub parents: &'a [CommitId],
-    /// The parents of `source` that are earlier writes of the name, never
-    /// members ([`crate::release_model::carriers`]). With any, the source is
-    /// first written again on its other parents with its own tree
-    /// ([`duplicated_from`]), so what the source resolved over a carrier
-    /// becomes its own change and the duplicate keeps it.
-    pub carriers: &'a [CommitId],
+    /// What the source's own change is measured against ([`Measured`]).
+    pub measured: Measured<'a>,
     /// `None` keeps the source's own message (fresh merges must name one).
     pub message: Option<&'a str>,
     /// Point this bookmark at the written commit, sideways moves allowed —
@@ -2671,6 +2669,28 @@ pub struct ReleaseWrite<'a> {
     pub earlier: &'a [CommitId],
     /// The operation-log description, `knives: …` by convention.
     pub operation: &'a str,
+}
+
+/// What a release write's source is measured against: the merge its own
+/// change, its tree against that merge, is taken from ([`duplicated_from`]).
+/// A fresh merge, which has no source, reads neither.
+#[derive(Debug, Clone, Copy)]
+pub enum Measured<'a> {
+    /// Its own parents less these, the parents that are earlier writes of
+    /// the name, never members ([`crate::release_model::carriers`]). With
+    /// any, the source is first written again on its other parents with its
+    /// own tree, so what the source resolved over a carrier becomes its own
+    /// change and the duplicate keeps it.
+    WithoutCarriers(&'a [CommitId]),
+    /// What it composes, never its own parents, its carriers left out. A
+    /// release of a stacked series composes its previous release and its
+    /// members. Made as a chain of merges, one member each, it holds what
+    /// each inner merge resolved, and none of that is its top commit's own
+    /// change. So the source is first written again on these with its own
+    /// tree, and that in-between commit is duplicated: the write keeps every
+    /// resolution the chain holds. A source whose own parents are these is
+    /// duplicated as it is.
+    Composed(&'a [CommitId]),
 }
 
 /// What a release write made, and what became of the commit it replaced.
@@ -2762,44 +2782,15 @@ pub struct ReplacedRelease {
 /// same operation hides each such head that is an earlier write of the name
 /// or superseded ([`hide_exposed`]).
 pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWritten, JjError> {
-    write_measured_release(repo, (write, None))
-}
-
-/// [`write_release`] of a source whose own change is its tree against the
-/// merge of `composed`, what it composes, never against its own parents.
-///
-/// A release of a stacked series composes its previous release and its
-/// members. Made as a chain of merges, one member each, it holds what each
-/// inner merge resolved, and none of that is its top commit's own change. So
-/// the source is first written again on `composed` with its own tree, and that
-/// in-between commit is duplicated: the write keeps every resolution the
-/// chain holds. A source whose own parents are `composed` is duplicated as it
-/// is. `composed` leaves the source's carriers out, so `write.carriers` is
-/// not read.
-pub fn write_composed_release(
-    repo: &Path,
-    write: &ReleaseWrite<'_>,
-    composed: &[CommitId],
-) -> Result<ReleaseWritten, JjError> {
-    write_measured_release(repo, (write, Some(composed)))
-}
-
-/// [`write_release`], its source measured against `composed` when given
-/// ([`write_composed_release`]) and otherwise against its parents less its
-/// carriers.
-fn write_measured_release(
-    repo: &Path,
-    (write, composed): (&ReleaseWrite<'_>, Option<&[CommitId]>),
-) -> Result<ReleaseWritten, JjError> {
     validate_parents(write.source, write.parents)?;
     let repo = Repo::open_to_write(repo)?;
     let (parent_commits, parent_ids) = resolved_parents(&repo, write.parents)?;
     let mut tx = repo.repo.start_transaction();
     let (written, source, unions) = if let Some(source) = write.source {
         let source = repo.commit(source.as_str())?;
-        let measured = match composed {
-            Some(composed) => resolved_parents(&repo, composed)?.1,
-            None => without_carriers(&source, write.carriers),
+        let measured = match write.measured {
+            Measured::Composed(composed) => resolved_parents(&repo, composed)?.1,
+            Measured::WithoutCarriers(carriers) => without_carriers(&source, carriers),
         };
         let (written, unions) =
             duplicated_from(&mut tx, (&source, write.message), measured, &parent_ids)?;
@@ -3273,7 +3264,7 @@ fn without_carriers(source: &jj_lib::commit::Commit, carriers: &[CommitId]) -> V
 
 /// [`duplicated_release`] of `source`, its own change measured against the
 /// merge of `measured`: its parents less its carriers ([`without_carriers`]),
-/// or what it composes ([`write_composed_release`]).
+/// or what it composes ([`Measured::Composed`]).
 ///
 /// A duplicate replays the source's own change, its tree against the merge
 /// of its parents, onto the new parents. With a carrier among those parents

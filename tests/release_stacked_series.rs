@@ -12,8 +12,8 @@
 //! write, is still the previous release once the reap has forgotten its
 //! refs: the cut's event labels it. `adopt` measures a hand resolution
 //! against the merge of the previous release and the members, and counts
-//! only the members' lines. A series without the key keeps today's rules:
-//! a branch built on the previous release is refused.
+//! only the members' lines. A series without the key keeps the unstacked
+//! rules: a branch built on the previous release is refused.
 
 #![allow(
     clippy::expect_used,
@@ -327,7 +327,6 @@ fn members_verify_reads_a_stacked_release_with_no_missing_member() {
             "{out}"
         );
     }
-    assert!(!out.contains("!!"), "{out}");
 }
 
 #[test]
@@ -350,8 +349,14 @@ fn members_verify_reads_a_chain_shaped_release_as_its_previous_release_and_side_
     assert!(out.contains(&previous_row(&lab)), "{out}");
     for branch in ["m5", "m6", "del"] {
         assert!(out.contains(&member_row(&lab, branch)), "{out}");
+        assert!(
+            out.contains(&format!(
+                "  {branch}@{}: carried (replay empty)",
+                commit_at(&lab, branch).short()
+            )),
+            "{out}"
+        );
     }
-    assert!(!out.contains("!!"), "{out}");
 }
 
 #[test]
@@ -366,8 +371,8 @@ fn without_stacked_an_include_stacked_on_the_previous_release_is_refused() {
     // When: a branch built on the previous release is included.
     let include = knives_release(&lab, &home, &["--series", "old", "include", "del"]);
 
-    // Then: today's rule refuses it: its history past the trunk carries the
-    // previous release's merge.
+    // Then: the unstacked rule refuses it: its history past the trunk
+    // carries the previous release's merge.
     let out = text(&include);
     assert_eq!(include.status.code(), Some(3), "{out}");
     assert!(out.contains("rebase it off the trunk"), "{out}");
@@ -436,8 +441,16 @@ fn includes_on_a_stacked_cut_make_one_merge_of_the_previous_release_and_its_memb
     let mut expected = vec![previous.clone()];
     expected.extend(["del", "m6", "m5"].map(|branch| commit_at(&lab, branch)));
     assert_eq!(release_parents(&lab, NEXT), expected);
-    let members = release_ok(&lab, &home, &["members", "--verify"]);
-    assert!(!text(&members).contains("!!"), "{}", text(&members));
+    let members = text(&release_ok(&lab, &home, &["members", "--verify"]));
+    for branch in ["del", "m6", "m5"] {
+        assert!(
+            members.contains(&format!(
+                "  {branch}@{}: carried (replay empty)",
+                commit_at(&lab, branch).short()
+            )),
+            "{members}"
+        );
+    }
     lab.jj_work([
         "new",
         "-r",
@@ -637,7 +650,6 @@ fn a_stacked_cut_on_an_unrecorded_previous_release_takes_its_members() {
     for branch in ["del", "m6", "m5"] {
         assert!(out.contains(&member_row(&lab, branch)), "{out}");
     }
-    assert!(!out.contains("!!"), "{out}");
 }
 
 #[test]

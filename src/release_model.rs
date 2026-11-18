@@ -3,11 +3,12 @@
 //! This module owns facts about release names, recorded cuts, and consumer pins.
 //! Commands gather their I/O and render their answers around these rules.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::config::{RepoEntry, Role};
-use crate::detect::{BookmarkTips, Finding, FindingKind, ReleaseParent, Subject};
+use crate::detect::{BookmarkTips, Finding, FindingKind, Subject};
 use crate::ids::{
     BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, is_our_release, is_release_name,
 };
@@ -261,7 +262,12 @@ pub fn series_members(
 /// behind the branch's base, and left the plan and `advance` disagreeing about
 /// a parent only the local trunk reached.
 pub fn trunk_positions(repo: &Repo, entry: &RepoEntry) -> Result<Vec<CommitId>, jj::JjError> {
-    let tips = repo.bookmark_tips()?;
+    Ok(trunk_positions_in(&repo.bookmark_tips()?, entry))
+}
+
+/// [`trunk_positions`], read from `tips`, every bookmark the caller already
+/// listed.
+pub fn trunk_positions_in(tips: &BookmarkTips, entry: &RepoEntry) -> Vec<CommitId> {
     let trunk = BranchName::new(entry.trunk());
     let views = [
         BookmarkRef::Remote {
@@ -280,7 +286,7 @@ pub fn trunk_positions(repo: &Repo, entry: &RepoEntry) -> Result<Vec<CommitId>, 
             positions.push(commit.clone());
         }
     }
-    Ok(positions)
+    positions
 }
 
 /// The newest release under the configured scheme and publish remote.
@@ -372,17 +378,46 @@ pub fn recorded_release_changes(
     entries: &[Entry],
     scheme: &ReleaseScheme,
 ) -> BTreeSet<crate::ids::ChangeId> {
-    let names: BTreeSet<&str> = entries
-        .iter()
-        .filter(|entry| entry.kind == Kind::Event)
-        .filter_map(|entry| entry.subject.as_deref())
-        .filter(|subject| scheme.owns(subject))
-        .collect();
-    names
+    recorded_release_names(entries, scheme)
         .into_iter()
         .flat_map(|name| recorded_writes(entries, name))
         .filter_map(|write| repo.change_id_of(write.commit.as_str()).ok())
         .collect()
+}
+
+/// Every release name of `scheme` that the ledger records a cut or edit of,
+/// read in one pass over `entries`.
+pub fn recorded_release_names<'a>(
+    entries: &'a [Entry],
+    scheme: &ReleaseScheme,
+) -> BTreeSet<&'a str> {
+    entries
+        .iter()
+        .filter_map(|event| {
+            let subject = event
+                .subject
+                .as_deref()
+                .filter(|subject| scheme.owns(subject))?;
+            recorded_write_events(std::slice::from_ref(event), subject)
+                .next()
+                .map(|_| subject)
+        })
+        .collect()
+}
+
+/// `commits`, then `extra` when there is one: the trunk positions a
+/// branch's history is measured past ([`StackedHistoryContext::trunks`]),
+/// with a release it may stack on too.
+pub fn with_commit<'a>(commits: &'a [CommitId], extra: Option<&CommitId>) -> Cow<'a, [CommitId]> {
+    extra.map_or(Cow::Borrowed(commits), |extra| {
+        Cow::Owned(
+            commits
+                .iter()
+                .chain(std::iter::once(extra))
+                .cloned()
+                .collect(),
+        )
+    })
 }
 
 impl std::fmt::Debug for StackedHistoryContext<'_> {
@@ -1211,12 +1246,7 @@ impl EarlierWrites {
                 let commit = CommitId::new(parent.commit.as_str());
                 if parent.branches.contains(&label) && !writes.labelled.contains(&commit) {
                     writes.labelled.push(commit);
-                } else if parent
-                    .branches
-                    .iter()
-                    .any(|branch| is_previous_release_label(branch))
-                    && !writes.previous.contains(&commit)
-                {
+                } else if labels_previous(parent) && !writes.previous.contains(&commit) {
                     writes.previous.push(commit);
                 }
             }
@@ -1382,10 +1412,7 @@ pub fn recorded_members(
         .filter(|parent| {
             !carriers.contains(&CommitId::new(parent.commit.as_str()))
                 && !parent.branches.contains(&label)
-                && !parent
-                    .branches
-                    .iter()
-                    .any(|branch| is_previous_release_label(branch))
+                && !labels_previous(parent)
         })
         .collect())
 }
@@ -1525,16 +1552,21 @@ pub fn is_previous_release_label(branch: &str) -> bool {
     labelled_previous(branch).is_some()
 }
 
+/// Whether a recorded parent carries the label [`previous_release_label`]
+/// gives the previous release of any release.
+fn labels_previous(parent: &RecordedParent) -> bool {
+    parent
+        .branches
+        .iter()
+        .any(|branch| is_previous_release_label(branch))
+}
+
 /// Whether a recorded parent set labels `commit` as the previous release
 /// ([`previous_release_label`]).
 fn recorded_as_previous(parents: &[RecordedParent], commit: &str) -> bool {
-    parents.iter().any(|parent| {
-        parent.commit == commit
-            && parent
-                .branches
-                .iter()
-                .any(|branch| is_previous_release_label(branch))
-    })
+    parents
+        .iter()
+        .any(|parent| parent.commit == commit && labels_previous(parent))
 }
 
 /// The previous release of a release in a stacked series: its first parent,
@@ -1561,15 +1593,26 @@ pub struct ReleaseReading {
 }
 
 impl ReleaseReading {
-    /// What the release composes, in parent order: the previous release when
-    /// there is one, then each member.
+    /// What the release composes, in parent order ([`composition`]).
     pub fn composition(&self) -> Vec<CommitId> {
-        self.previous
-            .iter()
-            .map(|previous| previous.commit.clone())
-            .chain(self.members.iter().cloned())
-            .collect()
+        composition(self.previous.as_ref(), &self.members).into_owned()
     }
+}
+
+/// What a release of `previous` and `members` composes, in parent order: the
+/// previous release when there is one, then each member.
+pub fn composition<'a>(
+    previous: Option<&PreviousRelease>,
+    members: &'a [CommitId],
+) -> Cow<'a, [CommitId]> {
+    previous.map_or(Cow::Borrowed(members), |previous| {
+        Cow::Owned(
+            std::iter::once(&previous.commit)
+                .chain(members)
+                .cloned()
+                .collect(),
+        )
+    })
 }
 
 /// A commit with one parent between a stacked release and its previous release.
@@ -1632,12 +1675,11 @@ pub fn read_release(
     (writes, commit): (&EarlierWrites, &CommitId),
 ) -> Result<Result<ReleaseReading, UnexplainedCommit>, jj::JjError> {
     let parents = repo.parent_commits(commit.as_str())?;
-    if entry.stacked() {
-        let line = first_parent_line(repo, trunks, &parents)?;
-        if let Some((at, previous)) = previous_on_line(entry, (entries, tips), writes, &line) {
-            let between = line.get(..at).unwrap_or_default();
-            return Ok(stacked_members(writes, (&parents, between), previous));
-        }
+    if entry.stacked()
+        && let Some((between, previous)) =
+            line_to_previous(repo, entry, (entries, tips, trunks), (writes, &parents))?
+    {
+        return Ok(stacked_members(writes, (&parents, &between), previous));
     }
     let (carriers, members) = writes.partition(&parents);
     Ok(Ok(ReleaseReading {
@@ -1676,105 +1718,121 @@ fn stacked_members(
     })
 }
 
-/// The first-parent ancestors of a commit whose parents are `parents`,
-/// nearest first, each with its own parents. The line ends before the first
-/// commit a trunk position reaches, or at the root.
-fn first_parent_line(
+/// Commits on a release's first-parent line, nearest first, each with its
+/// own parents.
+type FirstParentLine = Vec<(CommitId, Vec<CommitId>)>;
+
+/// The first-parent line of a commit whose parents are `parents` down to its
+/// previous release P ([`read_release`]): the commits above P, nearest first,
+/// each with its own parents, and P. `None` when the line ends with no P: it
+/// ends before the first commit a trunk position reaches, or at the root.
+///
+/// The walk stops at the first commit a cut or edit event of the series names
+/// ([`recorded_previous_names`]): the nearest such commit is P. On the way it
+/// remembers the first commit a release ref of the series names
+/// ([`ref_previous_names`]), which is P only when the line ends with no
+/// commit an event names. An earlier write of the commit's own name
+/// (`writes`) is never P.
+fn line_to_previous(
     repo: &Repo,
-    trunks: &[CommitId],
-    parents: &[CommitId],
-) -> Result<Vec<(CommitId, Vec<CommitId>)>, jj::JjError> {
+    entry: &RepoEntry,
+    (entries, tips, trunks): (&[Entry], &BookmarkTips, &[CommitId]),
+    (writes, parents): (&EarlierWrites, &[CommitId]),
+) -> Result<Option<(FirstParentLine, PreviousRelease)>, jj::JjError> {
+    let scheme = entry.release_scheme();
+    let recorded = recorded_previous_names(entries, &scheme);
+    let named = ref_previous_names(tips, (&scheme, entry.publish_remote()));
     let mut line = Vec::new();
+    let mut nearest_named: Option<(usize, PreviousRelease)> = None;
     let mut next = parents.first().cloned();
     while let Some(at) = next {
         if trunk_reaches(repo, trunks, &at)? {
             break;
         }
+        if !writes.contains(&at) {
+            if let Some(&name) = recorded.get(&at) {
+                let previous = PreviousRelease {
+                    name: name.to_owned(),
+                    commit: at,
+                };
+                return Ok(Some((line, previous)));
+            }
+            if nearest_named.is_none()
+                && let Some(&(_, name)) = named.get(&at)
+            {
+                let previous = PreviousRelease {
+                    name: name.to_string(),
+                    commit: at.clone(),
+                };
+                nearest_named = Some((line.len(), previous));
+            }
+        }
         let parents = repo.parent_commits(at.as_str())?;
         next = parents.first().cloned();
         line.push((at, parents));
     }
-    Ok(line)
+    Ok(nearest_named.map(|(above, previous)| {
+        line.truncate(above);
+        (line, previous)
+    }))
 }
 
-/// The previous release on a first-parent `line` ([`read_release`]), with
-/// its position on the line: the record's, else the nearest release ref's.
-fn previous_on_line(
-    entry: &RepoEntry,
-    (entries, tips): (&[Entry], &BookmarkTips),
-    writes: &EarlierWrites,
-    line: &[(CommitId, Vec<CommitId>)],
-) -> Option<(usize, PreviousRelease)> {
-    let scheme = entry.release_scheme();
-    let positions: BTreeMap<&CommitId, usize> = line
-        .iter()
-        .enumerate()
-        .filter(|(_, (commit, _))| !writes.contains(commit))
-        .map(|(at, (commit, _))| (commit, at))
-        .collect();
-    recorded_on_line(entries, &scheme, &positions)
-        .or_else(|| named_on_line(tips, (&scheme, entry.publish_remote()), &positions))
-}
-
-/// The nearest commit at one of `positions` that a cut or edit event of the
-/// series `scheme` names: as its write, under the event's name, or as the
-/// previous release its parent set labels, under the label's name. Where two
-/// events name one commit, the newer one's name is taken.
+/// The name of each commit a cut or edit event of the series `scheme` names:
+/// its write, under the event's name, and the previous release its parent
+/// set labels ([`previous_release_label`]), under the label's name. Where two
+/// events name one commit, the newer one's name is taken, and where one
+/// event names it twice, its write's.
 ///
-/// The nearest, not the newest event's: an event of a release on another
-/// line, or a late `adopt` of an older release, can name a commit further
-/// down the line, and the release directly below the commit is its previous
-/// release.
+/// The nearest of these on a release's line is its previous release, not the
+/// newest event's: an event of a release on another line, or a late `adopt`
+/// of an older release, can name a commit further down the line, and the
+/// release directly below the commit is its previous release.
 ///
 /// The reap after a stacked cut forgets every ref of the previous release.
 /// So for a previous release that no event records as a write (one cut by
 /// hand), the label a later event gives it is the only record of it left.
-fn recorded_on_line(
-    entries: &[Entry],
+fn recorded_previous_names<'a>(
+    entries: &'a [Entry],
     scheme: &ReleaseScheme,
-    positions: &BTreeMap<&CommitId, usize>,
-) -> Option<(usize, PreviousRelease)> {
-    entries.iter().rev().filter_map(|event| {
-        let subject = event
+) -> BTreeMap<CommitId, &'a str> {
+    let mut names = BTreeMap::new();
+    // Events are read newest first, so the first name a commit takes stays.
+    for event in entries.iter().rev() {
+        let Some(subject) = event
             .subject
             .as_deref()
-            .filter(|subject| scheme.owns(subject))?;
-        let (_, write) = recorded_write_events(std::slice::from_ref(event), subject).next()?;
+            .filter(|subject| scheme.owns(subject))
+        else {
+            continue;
+        };
+        let Some((_, write)) = recorded_write_events(std::slice::from_ref(event), subject).next()
+        else {
+            continue;
+        };
         let labelled = event.parents.iter().filter_map(|parent| {
             let name = parent
                 .branches
                 .iter()
                 .find_map(|branch| labelled_previous(branch))?;
-            Some((name, CommitId::new(parent.commit.as_str())))
+            Some((CommitId::new(parent.commit.as_str()), name))
         });
-        std::iter::once((subject, write.commit))
-            .chain(labelled)
-            .filter_map(|(name, commit)| Some((*positions.get(&commit)?, name, commit)))
-            .min_by_key(|(at, _, _)| *at)
-            .map(|(at, name, commit)| {
-                (
-                    at,
-                    PreviousRelease {
-                        name: name.to_owned(),
-                        commit,
-                    },
-                )
-            })
-    })
-    // The first of the nearest: events are read newest first.
-    .min_by_key(|(at, _)| *at)
+        for (commit, name) in std::iter::once((write.commit, subject)).chain(labelled) {
+            names.entry(commit).or_insert(name);
+        }
+    }
+    names
 }
 
-/// The nearest of `positions` that a release ref of the series `scheme`
-/// names, locally, on `publish_remote` or on origin, under the newest name
-/// that names it.
-fn named_on_line(
-    tips: &BookmarkTips,
+/// The newest name a release ref of the series `scheme` gives each commit,
+/// locally, on `publish_remote` or on origin ([`Role::Origin`]), with its
+/// key ([`ReleaseScheme::cut_key`], so tags do not count). Of two refs whose
+/// names are one name, the first is kept.
+fn ref_previous_names<'a>(
+    tips: &'a BookmarkTips,
     (scheme, publish_remote): (&ReleaseScheme, &str),
-    positions: &BTreeMap<&CommitId, usize>,
-) -> Option<(usize, PreviousRelease)> {
+) -> BTreeMap<&'a CommitId, (crate::ids::CutKey<'a>, &'a BranchName)> {
     let origin = Role::Origin.to_string();
-    let mut nearest: Option<(usize, crate::ids::CutKey<'_>, &BranchName, &CommitId)> = None;
+    let mut names: BTreeMap<&CommitId, (crate::ids::CutKey<'_>, &BranchName)> = BTreeMap::new();
     for (reference, commit) in tips {
         let ours = match reference {
             BookmarkRef::Local(_) => true,
@@ -1782,25 +1840,14 @@ fn named_on_line(
                 remote.as_str() == publish_remote || remote.as_str() == origin
             }
         };
-        let (Some(&at), Some(key)) = (
-            positions.get(commit).filter(|_| ours),
-            scheme.cut_key(reference.branch().as_str()),
-        ) else {
+        let Some(key) = scheme.cut_key(reference.branch().as_str()).filter(|_| ours) else {
             continue;
         };
-        if nearest.is_none_or(|(near, newest, _, _)| at < near || (at == near && key > newest)) {
-            nearest = Some((at, key, reference.branch(), commit));
+        if names.get(commit).is_none_or(|(newest, _)| key > *newest) {
+            names.insert(commit, (key, reference.branch()));
         }
     }
-    nearest.map(|(at, _, name, commit)| {
-        (
-            at,
-            PreviousRelease {
-                name: name.to_string(),
-                commit: commit.clone(),
-            },
-        )
-    })
+    names
 }
 
 /// The stacked reading of a release that has a previous release
@@ -1825,21 +1872,6 @@ pub fn stacked_release(
             read => Some(read),
         },
     )
-}
-
-/// Each of `commits` as a release parent, with every bookmark on it.
-pub fn release_parents(tips: &BookmarkTips, commits: &[CommitId]) -> Vec<ReleaseParent> {
-    commits
-        .iter()
-        .map(|commit| ReleaseParent {
-            commit: commit.clone(),
-            bookmarks: tips
-                .iter()
-                .filter(|(_, tip)| *tip == commit)
-                .map(|(bookmark, _)| bookmark.clone())
-                .collect(),
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1897,7 +1929,7 @@ mod carrier_tests {
         path
     }
 
-    fn at(path: &Path, revision: &str) -> CommitId {
+    pub(super) fn at(path: &Path, revision: &str) -> CommitId {
         Repo::open(path)
             .expect("open test repository")
             .resolve_commit(revision)
@@ -2197,7 +2229,8 @@ mod reading_tests {
 
     use super::{
         CommitId, EarlierWrites, Entry, PreviousRelease, RecordedParent, RecordedWrite,
-        RecordedWriteKind, ReleaseReading, UnexplainedCommit, carrier_tests::event,
+        RecordedWriteKind, ReleaseReading, UnexplainedCommit,
+        carrier_tests::{at, event},
         is_previous_release_label, last_recorded_cut, previous_release_label, read_release,
         recorded_members,
     };
@@ -2265,13 +2298,6 @@ mod reading_tests {
             },
         );
         entry.for_series("old").expect("select series old")
-    }
-
-    fn at(path: &Path, revision: &str) -> CommitId {
-        Repo::open(path)
-            .expect("open test repository")
-            .resolve_commit(revision)
-            .expect("resolve a fixture commit")
     }
 
     fn commits(path: &Path, revisions: &[&str]) -> Vec<CommitId> {
@@ -2471,6 +2497,50 @@ mod reading_tests {
             by_record,
             Ok(ReleaseReading {
                 previous: Some(previous(&path)),
+                members: commits(&path, &["del", "m6", "m5"]),
+                carriers: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_labelled_previous_release_comes_before_a_nearer_release_ref() {
+        // Given: the first cut with no ref left, a cut event of the next
+        // release whose write is off the chain's first-parent line and which
+        // labels the first cut as its previous release, and a release ref of
+        // the series on the chain's inner merge of `del`, nearer the chain
+        // than the first cut.
+        let _environment = crate::config::test_support::environment_lock();
+        let directory = tempfile::tempdir().expect("create test directory");
+        let path = repository(directory.path());
+        let first_cut = at(&path, PREVIOUS);
+        run_jj(&path, &["bookmark", "forget", PREVIOUS]);
+        run_jj(&path, &["bookmark", "create", NEXT, "-r", "inner1"]);
+        let start = at(&path, "flat");
+        let mut labelling = event(
+            NEXT,
+            format!("cut {NEXT} as {} with 1 parent(s): x", start.short()),
+            &start,
+        );
+        labelling.evidence = vec![start.as_str().to_owned(), first_cut.as_str().to_owned()];
+        labelling.parents = vec![RecordedParent {
+            commit: first_cut.as_str().to_owned(),
+            branches: vec![previous_release_label(PREVIOUS)],
+        }];
+
+        // When: the chain is read.
+        let reading = read(&path, &series(true), &[labelling], "chain");
+
+        // Then: the labelled first cut is its previous release, not the
+        // commit the nearer ref names, and every merge above it brings a
+        // member.
+        assert_eq!(
+            reading,
+            Ok(ReleaseReading {
+                previous: Some(PreviousRelease {
+                    name: PREVIOUS.to_owned(),
+                    commit: first_cut,
+                }),
                 members: commits(&path, &["del", "m6", "m5"]),
                 carriers: Vec::new(),
             })
