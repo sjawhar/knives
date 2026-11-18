@@ -1046,3 +1046,91 @@ fn a_stacked_first_cut_with_no_release_ref_here_is_refused_naming_the_newest_rec
     assert!(!resolves(&lab, THIRD), "{out}");
     assert_eq!(ledger_entries(&home).len(), recorded, "{out}");
 }
+
+/// The stacked series' NEXT, cut on the published PREVIOUS with `m6`
+/// included and marked published, then fixed by hand in place (`jj squash`
+/// into it, which keeps its change id) and adopted. Returns NEXT's edit,
+/// the commit the adopt replaced, and the adopt's commit, NEXT's newest
+/// recorded write.
+fn adopted_next_lab() -> (
+    Lab,
+    tempfile::TempDir,
+    knives::ids::CommitId,
+    knives::ids::CommitId,
+) {
+    let (lab, home) = previous_release_lab(true);
+    release_ok(&lab, &home, &["cut", NEXT]);
+    release_ok(&lab, &home, &["include", "m6", "--why", "in NEXT"]);
+    mark_published(&lab, &home, NEXT);
+    let edit = commit_at(&lab, NEXT);
+    lab.jj_work(["new", "-r", NEXT]);
+    std::fs::write(lab.work_path().join("fix.txt"), "fixed by hand\n").expect("write fix.txt");
+    lab.jj_work(["squash", "--into", NEXT]);
+    lab.jj_work(["new", "-r", "old@upstream"]);
+    release_ok(&lab, &home, &["adopt", NEXT, "--why", "a fix by hand"]);
+    let adopted = commit_at(&lab, NEXT);
+    assert_ne!(adopted, edit, "the squash rewrote NEXT");
+    (lab, home, edit, adopted)
+}
+
+#[test]
+fn a_record_built_on_the_write_an_adopt_replaced_is_refused() {
+    // Given: NEXT's newest recorded write is an adopt of a fix by hand,
+    // which kept the change id of the edit it replaced; and a commit merged
+    // by hand of that older edit and `m5`, so it lacks the fix.
+    let (lab, home, edit, adopted) = adopted_next_lab();
+    lab.jj_work(["new", "-r", edit.as_str(), "-r", "m5", "-m", THIRD]);
+    lab.jj_work(["new"]);
+    let commit = knives::ids::CommitId::new(lab.jj_work_output([
+        "log",
+        "-r",
+        "@-",
+        "--no-graph",
+        "-T",
+        "commit_id",
+    ]));
+    let entries = ledger_entries(&home);
+
+    // When: it is recorded as the series' third release.
+    let recorded = knives_release(
+        &lab,
+        &home,
+        &["--series", "old", "cut", THIRD, "--at", commit.as_str()],
+    );
+
+    // Then: it is refused, naming the adopt's commit, and nothing is
+    // written: the older write shares the adopt's change id, but it is what
+    // the adopt replaced, not a rewrite of it, and it lacks the fix.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert!(out.contains(adopted.short()), "{out}");
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+}
+
+#[test]
+fn a_stacked_cut_on_the_write_an_adopt_replaced_is_refused() {
+    // Given: NEXT's newest recorded write is an adopt of a fix by hand, and
+    // NEXT's bookmark back at the published edit the adopt replaced, as a
+    // machine has it that keeps that edit.
+    let (lab, home, edit, adopted) = adopted_next_lab();
+    lab.jj_work([
+        "bookmark",
+        "set",
+        NEXT,
+        "-r",
+        edit.as_str(),
+        "--allow-backwards",
+    ]);
+    let recorded = ledger_entries(&home).len();
+
+    // When: the next release is cut.
+    let cut = knives_release(&lab, &home, &["--series", "old", "cut", THIRD]);
+
+    // Then: it is refused, naming the adopt's commit, and nothing is cut:
+    // the cut would start on the edit and drop the fix.
+    let out = text(&cut);
+    assert_eq!(cut.status.code(), Some(3), "{out}");
+    assert!(out.contains(adopted.short()), "{out}");
+    assert!(!resolves(&lab, THIRD), "{out}");
+    assert_eq!(ledger_entries(&home).len(), recorded, "{out}");
+}
