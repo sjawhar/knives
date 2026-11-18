@@ -20,8 +20,9 @@ use knives::ids::{BookmarkRef, BranchName, ChangeId, CommitId, RemoteName, RepoN
 use knives::jj::{Repo, ResolutionBaseline, ResolutionChanges};
 use knives::ledger::{Draft, Entry, Ledger, RecordedParent, inline_human_text};
 use knives::release_model::{
-    EarlierWrites, PreviousRelease, RecordedWrite, ReleaseReading, carrier_label, matched_write,
-    previous_release_label, recorded_members, recorded_write_events,
+    ADOPTED_BEYOND, ADOPTED_RESOLVED, EarlierWrites, PreviousRelease, RecordedWrite,
+    ReleaseReading, carrier_label, matched_write, previous_release_label, recorded_members,
+    recorded_write_events,
 };
 
 use super::release_edit::{
@@ -1057,11 +1058,11 @@ fn adopted_text(replaced: &Replaced, adoption: &Adoption<'_>) -> String {
     )];
     let changes = &adoption.changes;
     if !changes.resolved.is_empty() {
-        parts.push(format!("resolved by hand: {}", changes.resolved.join(", ")));
+        parts.push(format!("{ADOPTED_RESOLVED}{}", changes.resolved.join(", ")));
     }
     match (changes.beyond.is_empty(), adoption.why) {
         (false, why) => parts.push(format!(
-            "changed beyond the baseline's conflicts: {} (why: {})",
+            "{ADOPTED_BEYOND}{} (why: {})",
             changes.beyond.join(", "),
             why.unwrap_or_default()
         )),

@@ -2303,3 +2303,289 @@ fn a_cut_refuses_to_drop_a_fix_an_adopt_recorded_after_the_previous_cut() {
         "{out}"
     );
 }
+
+/// A cut of `feat/alpha` and `feat/beta`, then `fix.txt` added by hand in
+/// place (`jj squash` into the release, which keeps its change id) and
+/// adopted, which the ledger records as the release's newest write; then
+/// the release's bookmark back at the cut's commit, as a machine that never
+/// fetched the adopt has it. Returns the adopt's commit.
+fn release_behind_its_adopted_fix() -> (Lab, tempfile::TempDir, knives::ids::CommitId) {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{}", both_streams(&first));
+    let cut = commit_at(&lab, "release/2026-08-04");
+    lab.jj_work(["new", "-r", "release/2026-08-04"]);
+    std::fs::write(lab.work_path().join("fix.txt"), "fixed by hand\n").expect("write fix.txt");
+    lab.jj_work(["squash", "--into", "release/2026-08-04"]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let adopted = knives_release(
+        &lab,
+        &home,
+        &["adopt", "release/2026-08-04", "--why", "a fix by hand"],
+    );
+    assert!(adopted.status.success(), "{}", both_streams(&adopted));
+    let adopt = commit_at(&lab, "release/2026-08-04");
+    assert_ne!(adopt, cut, "the squash rewrote the release");
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "release/2026-08-04",
+        "-r",
+        cut.as_str(),
+        "--allow-backwards",
+    ]);
+    (lab, home, adopt)
+}
+
+#[test]
+fn a_cut_without_a_fix_an_adopt_recorded_goes_ahead_under_allow_drop_and_names_the_adopt() {
+    // Given: the release's bookmark back at the cut, behind the adopt of its
+    // fix by hand.
+    let (lab, home, adopt) = release_behind_its_adopted_fix();
+
+    // When: the next release is cut, the drop stated.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05", "--allow-drop"]);
+
+    // Then: it is cut without the fix, and both its line and its event name
+    // the adopt, its release and its commit.
+    let out = both_streams(&output);
+    assert_eq!(output.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: --allow-drop: cutting without the fix by hand of release/2026-08-04's adopt \
+             {}, in 1 file(s): fix.txt\n",
+            adopt.short()
+        )),
+        "{out}"
+    );
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .read()
+        .expect("read ledger")
+        .entries;
+    let event = entries
+        .iter()
+        .rev()
+        .find(|entry| entry.subject.as_deref() == Some("release/2026-08-05"))
+        .unwrap_or_else(|| panic!("no cut event: {entries:?}"));
+    assert!(
+        event.text.contains(&format!(
+            "; previous cut release/2026-08-04 recorded 2 member(s); all carried; without the fix \
+             by hand of release/2026-08-04's adopt {}",
+            adopt.short()
+        )),
+        "{}",
+        event.text
+    );
+}
+
+#[test]
+fn a_cut_without_a_conflict_an_adopt_resolved_says_to_move_the_release_to_it_and_goes_ahead_there()
+{
+    // Given: a cut of `feat/alpha` and `feat/beta`, which both write
+    // `shared.txt`, so the cut leaves it conflicted; the conflict resolved by
+    // hand in place (`jj edit`, which keeps the change id) and adopted; then
+    // the release's bookmark back at the conflicted cut, as a machine that
+    // never fetched the adopt has it.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "shared.txt", "alpha\n");
+    lab.branch("feat/beta", "shared.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains("cut release/2026-08-04 as"),
+        "{}",
+        both_streams(&first)
+    );
+    let cut = commit_at(&lab, "release/2026-08-04");
+    lab.jj_work(["edit", "release/2026-08-04"]);
+    std::fs::write(lab.work_path().join("shared.txt"), "alpha\nbeta\n").expect("resolve");
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let adopted = knives_release(&lab, &home, &["adopt", "release/2026-08-04"]);
+    assert!(adopted.status.success(), "{}", both_streams(&adopted));
+    let adopt = commit_at(&lab, "release/2026-08-04");
+    assert_ne!(adopt, cut, "the resolution rewrote the release");
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "release/2026-08-04",
+        "-r",
+        cut.as_str(),
+        "--allow-backwards",
+    ]);
+
+    // When: the next release is cut.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: it is refused, naming the adopt and the file it resolved by hand,
+    // and the refusal says to fetch and move the release to the adopt.
+    let out = both_streams(&output);
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut: this cut does not carry the fix by hand of \
+             release/2026-08-04's adopt {}, in 1 file(s): shared.txt\n",
+            adopt.short()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "  the candidate was discarded; fetch, then move release/2026-08-04 to {}, its newest \
+             recorded write: `jj bookmark set release/2026-08-04 -r {} --allow-backwards`, or \
+             re-run with --allow-drop to state the drop is intended\n",
+            adopt.short(),
+            adopt.short()
+        )),
+        "{out}"
+    );
+
+    // When: the release is moved to the adopt, as the refusal says, and the
+    // next release is cut again.
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "release/2026-08-04",
+        "-r",
+        adopt.as_str(),
+        "--allow-backwards",
+    ]);
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: it is cut, and it carries the resolution.
+    let out = both_streams(&output);
+    assert_eq!(output.status.code(), Some(0), "{out}");
+    assert_eq!(
+        Repo::open(&lab.work)
+            .expect("open work checkout")
+            .file_bytes(&commit_at(&lab, "release/2026-08-05"), "shared.txt")
+            .expect("read shared.txt"),
+        Some(b"alpha\nbeta\n".to_vec()),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_cut_refuses_to_drop_a_member_whose_older_version_it_carries() {
+    // Given: a cut of `feat/alpha` and `feat/beta`; `feat/beta` then changed
+    // in place (`jj squash` into it, which keeps its change id), so jj
+    // rebases the cut onto it; the next release cut, which records the newer
+    // `feat/beta`; then that release's bookmark at the first cut's commit,
+    // whose parent is the older `feat/beta`.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{}", both_streams(&first));
+    let cut = commit_at(&lab, "release/2026-08-04");
+    let older = commit_at(&lab, "feat/beta");
+    lab.jj_work(["new", "-r", "feat/beta"]);
+    std::fs::write(lab.work_path().join("more.txt"), "more of beta\n").expect("write more.txt");
+    lab.jj_work(["squash", "--into", "feat/beta"]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let newer = commit_at(&lab, "feat/beta");
+    assert_ne!(newer, older, "the squash rewrote feat/beta");
+    let second = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(second.status.success(), "{}", both_streams(&second));
+    assert!(
+        release_parents(&lab, "release/2026-08-05").contains(&newer),
+        "{}",
+        both_streams(&second)
+    );
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "release/2026-08-05",
+        "-r",
+        cut.as_str(),
+        "--allow-backwards",
+    ]);
+
+    // When: the next release is cut.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-06"]);
+
+    // Then: it is refused, naming the newer `feat/beta`, and nothing is cut:
+    // the older version shares its change id, but it is what the newer one
+    // replaced, and it lacks `more.txt`.
+    let out = both_streams(&output);
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!("    feat/beta@{}\n", newer.short())),
+        "{out}"
+    );
+    assert!(
+        Repo::open(&lab.work)
+            .expect("open work checkout")
+            .resolve_commit("release/2026-08-06")
+            .is_err(),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_cut_after_an_advance_to_a_member_rebased_in_another_clone_goes_ahead() {
+    // Given: a cut of `feat/alpha` and `feat/beta`; `feat/alpha` pushed, then
+    // rebased in a second clone onto an upstream trunk that writes its file
+    // too, the conflict resolved there on alpha's lines, and pushed; fetched
+    // here, where no operation records that rewrite; then `advance`, which
+    // records the rebased `feat/alpha` as the member.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{}", both_streams(&first));
+    let older = commit_at(&lab, "feat/alpha");
+    lab.push_branch("feat/alpha");
+    lab.upstream_trunk_file("alpha.txt", "trunk\n");
+    let second = lab.second.clone();
+    let upstream = lab.upstream.display().to_string();
+    lab.jj_at(
+        &second,
+        ["git", "remote", "add", "upstream", upstream.as_str()],
+    );
+    lab.jj_at(&second, ["git", "fetch", "--all-remotes"]);
+    lab.jj_at(
+        &second,
+        ["bookmark", "track", "feat/alpha", "--remote", "origin"],
+    );
+    lab.jj_at(
+        &second,
+        ["rebase", "-r", "feat/alpha", "-d", "main@upstream"],
+    );
+    lab.jj_at(&second, ["edit", "feat/alpha"]);
+    std::fs::write(second.join("alpha.txt"), "trunk\nalpha\n").expect("resolve alpha.txt");
+    lab.jj_at(&second, ["new"]);
+    lab.jj_at(
+        &second,
+        [
+            "git",
+            "push",
+            "--remote",
+            "origin",
+            "--bookmark",
+            "feat/alpha",
+        ],
+    );
+    lab.fetch_work();
+    let rebased = commit_at(&lab, "feat/alpha");
+    assert_ne!(rebased, older, "the second clone rebased feat/alpha");
+    let advanced = knives_release(&lab, &home, &["advance", "feat/alpha"]);
+    assert!(advanced.status.success(), "{}", both_streams(&advanced));
+
+    // When: the next release is cut.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: it goes ahead with the rebased `feat/alpha`: the newest recorded
+    // write names it, with the change id of the member the previous cut
+    // recorded, so that older member is superseded and not held.
+    let out = both_streams(&output);
+    assert_eq!(output.status.code(), Some(0), "{out}");
+    assert!(
+        release_parents(&lab, "release/2026-08-05").contains(&rebased),
+        "{out}"
+    );
+}

@@ -530,11 +530,12 @@ pub enum ReleaseAction {
     /// gives the push that records it. A NAME no ref names gets a local
     /// bookmark at REV. The commit is audited as a cut is, and it must carry
     /// each member of the previous cut and of the newest write of the newest
-    /// release the ledger records in the series; in a stacked series that
-    /// write must be on its first-parent line. The ledger event records its
-    /// members: in a stacked series the side parents on its first-parent
-    /// line, with its previous release labelled as no member. No reap runs,
-    /// and nothing is signed or pushed.
+    /// release the ledger records in the series, and each fix by hand an
+    /// `adopt` of that release recorded since its cut; in a stacked series
+    /// that write must be on its first-parent line. The ledger event records
+    /// its members: in a stacked series the side parents on its
+    /// first-parent line, with its previous release labelled as no member.
+    /// No reap runs, and nothing is signed or pushed.
     Cut {
         /// The dated release name, `release/[<series>/]YYYY-MM-DD[.N|-<label>]`.
         /// It must sort after the newest release of the series. Omit it for a
@@ -543,7 +544,8 @@ pub enum ReleaseAction {
         /// Proceed even when the cut would drop something: commits reachable
         /// only from the previous release lineage, members that the
         /// previous cut's ledger event or the newest recorded write of the
-        /// newest release the ledger records in the series holds, or in a
+        /// newest release the ledger records in the series holds, a fix by
+        /// hand an `adopt` of that release recorded since its cut, or in a
         /// stacked series that write, off the line the cut starts on. The
         /// refusal lists exactly what.
         #[arg(long)]

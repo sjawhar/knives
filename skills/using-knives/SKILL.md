@@ -67,7 +67,7 @@ Use the replay probe, never a source-text search. A symbol's presence does not s
 |---|---|
 | `carried-exact` | The revision tip is an ancestor of the target. Against a release, the release's tree also holds its change: its net change replays empty, and a release-log block that a union holds counts as held. |
 | `carried-rewritten` | Replay of its net change leaves the target unchanged. Equivalent content arrived differently, or it has no net change. |
-| `carried-rebased` | Replay differs, but a commit with its change id is an ancestor. Weaker than rewritten: divergent changes can name different trees. |
+| `carried-rebased` | Replay differs, but a rewrite of its change that stands for it is an ancestor: a successor of it in jj's operation log, or a commit with its tree. An older version with its change id does not count. Weaker than rewritten: a rewrite can hold another tree. |
 | `NOT carried` | Replay leaves a clean non-empty diff, and no rewrite is in the target. A member of a release reads this when the release's tree lost its change. |
 | `conflicted` | Replay conflicts, and no rewrite is in the target. Some content can be present, so this needs judgment. |
 

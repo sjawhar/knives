@@ -442,6 +442,45 @@ fn release_carries_answers_carried_rebased_for_a_rewritten_member_the_release_ho
 }
 
 #[test]
+fn release_carries_answers_not_carried_for_a_member_the_release_holds_only_an_older_version_of() {
+    // Given: a cut of alpha; alpha then changed in place (`jj squash` into
+    // it, which keeps its change id), so jj rebases the cut onto it; then the
+    // release's bookmark back at the cut, whose parent is the older alpha.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let cut = commit_at(&lab, "release/2026-08-04");
+    let older = commit_at(&lab, "feat/alpha");
+    lab.jj_work(["new", "-r", "feat/alpha"]);
+    std::fs::write(lab.work.join("more.txt"), "more of alpha\n").expect("write more.txt");
+    lab.jj_work(["squash", "--into", "feat/alpha"]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    assert_ne!(
+        commit_at(&lab, "feat/alpha"),
+        older,
+        "the squash rewrote alpha"
+    );
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "release/2026-08-04",
+        "-r",
+        cut.as_str(),
+        "--allow-backwards",
+    ]);
+
+    // When: alpha is checked against the release and the trunk.
+    let output = knives_release(&lab, &home, &["members", "--carries", "feat/alpha"]);
+
+    // Then: not carried: the older alpha shares its change id, but it is
+    // what the newer one replaced, and it lacks `more.txt`.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    assert!(stdout.contains("NOT carried"), "{stdout}");
+    assert!(!stdout.contains("carried-rebased"), "{stdout}");
+}
+
+#[test]
 fn release_carries_answers_not_carried_for_outside_work() {
     // Given: a release cut carrying alpha and an independent beta branch.
     let lab = Lab::new();

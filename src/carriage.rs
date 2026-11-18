@@ -59,9 +59,12 @@ pub enum CarryVerdict {
     /// Its net tree change leaves the target unchanged, whether the same content
     /// arrived through different commits or the revision itself has no net content.
     CarriedRewritten,
-    /// Its tree does not replay cleanly, but a rewrite of its change — same
-    /// change id, a different commit — is an ancestor of the target: the change
-    /// is carried as its author rebased it, and that rewrite is the evidence.
+    /// Its tree does not replay cleanly, but a rewrite of its change that
+    /// stands for it — a successor of it, or a commit with its tree
+    /// ([`crate::jj::Repo::standing_rewrites_of`]) — is an ancestor of the
+    /// target: the change is carried as its author rebased it, and that
+    /// rewrite is the evidence. An older version of the change, which only
+    /// shares its change id, carries nothing of what the newer one added.
     CarriedRebased,
     NotCarried,
     /// The replay conflicted while the target itself is clean: some content
@@ -850,7 +853,7 @@ pub fn check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryChe
         RebaseOutcome::Conflicted => CarryVerdict::Conflicted,
     };
     if verdict != CarryVerdict::CarriedRewritten {
-        for rewrite in input.repo.rewrites_of(input.tip.as_str())? {
+        for rewrite in input.repo.standing_rewrites_of(input.tip)? {
             if input.repo.is_ancestor(&rewrite, &target.commit)? {
                 return Ok(CarryCheck {
                     verdict: CarryVerdict::CarriedRebased,

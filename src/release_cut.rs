@@ -275,9 +275,13 @@ pub(crate) fn run_release(
         // held against the previous cut's event and the newest recorded write
         // of the newest release the ledger records before anything is
         // recorded or published. In a stacked series that write must also be
-        // on the line of the commit the cut starts on, its first parent.
+        // on the line of the commit the cut starts on, its first parent. Each
+        // fix by hand that an `adopt` of that release recorded since its cut
+        // is held as a member is.
+        let (baseline, fixes) =
+            CompositionGate::read_baseline((&opened, entry), (&ledger, &tips), None)?;
         let gate = CompositionGate {
-            baseline: CompositionGate::read_baseline(&ledger, entry, None),
+            baseline,
             record: None,
             opened: &opened,
             path,
@@ -286,6 +290,7 @@ pub(crate) fn run_release(
             trunk: &trunk,
             tips: &tips,
             start: request.parents.first().filter(|_| entry.stacked()),
+            fixes,
         };
         // A cut is audited against the release it duplicates: a member's
         // divergence that release already had is carried, and the drift is
@@ -676,18 +681,26 @@ struct CompositionGate<'a> {
     /// ([`release::CompositionDelta::start`]): the commit a record names, or
     /// the previous release a cut starts on. `None` in any other series.
     start: Option<&'a CommitId>,
+    /// The fixes by hand that the newest release holds, one for each `adopt`
+    /// of it since its cut ([`release::adopted_fixes`]).
+    fixes: Vec<release::AdoptedFix>,
 }
 
 impl CompositionGate<'_> {
     /// The baseline of the gate of `record` ([`Self::record`]), read from
     /// `ledger` in `entry`'s series: the name a record records is aside, as
-    /// no write of it is its own baseline.
+    /// no write of it is its own baseline. With it, the fixes by hand of the
+    /// newest release ([`release::adopted_fixes`]), read in `opened` with
+    /// `tips`.
     fn read_baseline(
-        ledger: &[knives::ledger::Entry],
-        entry: &knives::config::RepoEntry,
+        (opened, entry): (&knives::jj::Repo, &knives::config::RepoEntry),
+        (ledger, tips): (&[knives::ledger::Entry], &knives::detect::BookmarkTips),
         record: Option<(&str, &CommitId)>,
-    ) -> CompositionBaseline {
-        CompositionBaseline::read(ledger, entry, record.map(|(name, _)| name))
+    ) -> anyhow::Result<(CompositionBaseline, Vec<release::AdoptedFix>)> {
+        let baseline = CompositionBaseline::read(ledger, entry, record.map(|(name, _)| name));
+        let newest = baseline.newest_write.as_ref();
+        let fixes = release::adopted_fixes(opened, entry, (ledger, tips), newest)?;
+        Ok((baseline, fixes))
     }
 
     /// The records of the baseline in the order the gate's messages name
@@ -717,6 +730,7 @@ impl CompositionGate<'_> {
             first,
             other: records.next(),
             record: self.record,
+            fixes: &self.fixes,
         })
     }
 }
@@ -797,6 +811,8 @@ struct HeldRecords<'a> {
     /// The release cut outside knives that the gate holds
     /// ([`CompositionGate::record`]): `None` for a cut.
     record: Option<(&'a str, &'a CommitId)>,
+    /// The fixes by hand of the newest release ([`CompositionGate::fixes`]).
+    fixes: &'a [release::AdoptedFix],
 }
 
 impl<'a> HeldRecords<'a> {
@@ -906,6 +922,7 @@ fn recorded_composition_check(
             trunk: gate.trunk,
             tips: gate.tips,
             start: gate.start,
+            fixes: &gate.fixes,
         },
     )?;
     let on_drop = match (allow_drop, &*subject) {
@@ -931,7 +948,9 @@ enum DropDisposition {
 }
 
 /// Say what the recorded-composition check found; refuse when members are
-/// gone, or when a stacked subject is not built on the newest write.
+/// gone, when a stacked subject is not built on the newest write, or when
+/// the subject lacks a fix by hand that an `adopt` of the newest release
+/// recorded.
 ///
 /// Inconclusive members are reported without refusing, for the same reason the
 /// audit's are: a conflicted replay onto a conflicted cut subject answers
@@ -950,13 +969,15 @@ fn report_uncarried_cut(
     for line in uncarried_cut_lines(repo, held, check, on_drop) {
         println!("{line}");
     }
-    ((!check.dropped.is_empty() || check.off_line) && !matches!(on_drop, DropDisposition::Allowed))
-        .then_some(Exit::Incomplete)
+    ((!check.dropped.is_empty() || check.off_line || !check.dropped_fixes.is_empty())
+        && !matches!(on_drop, DropDisposition::Allowed))
+    .then_some(Exit::Incomplete)
 }
 
 /// The lines [`report_uncarried_cut`] prints, which name each member with
-/// the record that names it ([`HeldRecords::holder`]), and the newest write
-/// a stacked subject is not built on.
+/// the record that names it ([`HeldRecords::holder`]), the newest write a
+/// stacked subject is not built on, and each adopt whose fix the subject
+/// lacks ([`fix_title`]).
 ///
 /// The recorded release's name and its members are a ledger entry's subject
 /// and evidence, which a peer's pulled ledger can carry any text in; a member
@@ -986,7 +1007,12 @@ fn uncarried_cut_lines(
         ));
     }
     let off_line = held.newest_write().filter(|_| check.off_line);
-    if check.dropped.is_empty() && off_line.is_none() {
+    let fixes: Vec<&release::AdoptedFix> = held
+        .fixes
+        .iter()
+        .filter(|fix| check.dropped_fixes.contains(&fix.commit))
+        .collect();
+    if check.dropped.is_empty() && off_line.is_none() && fixes.is_empty() {
         return lines;
     }
     let allowed = matches!(on_drop, DropDisposition::Allowed);
@@ -1013,26 +1039,69 @@ fn uncarried_cut_lines(
             )
         });
     }
+    for fix in &fixes {
+        let named = format!(
+            "{}{}",
+            fix_title((&fix.name, &fix.commit), inline_human_text),
+            fix_files(&fix.files)
+        );
+        lines.push(if allowed {
+            format!("{repo}: --allow-drop: {} without {named}", held.doing())
+        } else {
+            format!("{} does not carry {named}", held.refusing(repo))
+        });
+    }
     if !allowed {
-        lines.push(refusal_remedy(held, (&sources, off_line), on_drop));
+        lines.push(refusal_remedy(
+            held,
+            (&sources, off_line, fixes.len()),
+            on_drop,
+        ));
     }
     lines
 }
 
+/// `the fix by hand of NAME's adopt COMMIT`, the
+/// adopt's release and commit each given by `render`. They are a ledger
+/// entry's subject and first evidence string, so a message escapes them
+/// ([`inline_human_text`]) and the cut event keeps them raw.
+fn fix_title((name, commit): (&str, &CommitId), render: fn(&str) -> String) -> String {
+    format!(
+        "the fix by hand of {}'s adopt {}",
+        render(name),
+        render(commit.short())
+    )
+}
+
+/// What a message says after [`fix_title`]: `, in N file(s): F, G`, the
+/// fix's files, which are the repository's paths, escaped; or, with none,
+/// that nothing here can measure the fix ([`release::AdoptedFix::files`]).
+fn fix_files(files: &[String]) -> String {
+    if files.is_empty() {
+        return " (nothing here can measure it: this repository does not hold the adopt or \
+                cannot read its release)"
+            .to_owned();
+    }
+    let shown: Vec<String> = files.iter().map(|file| inline_human_text(file)).collect();
+    format!(", in {} file(s): {}", shown.len(), shown.join(", "))
+}
+
 /// The line that closes a refusal of [`uncarried_cut_lines`]: what each
 /// refused finding asks for, or `--allow-drop`. `sources` are the records
-/// whose members the subject lacks, and `off_line` the newest write a
-/// stacked subject is not built on.
+/// whose members the subject lacks, `off_line` the newest write a stacked
+/// subject is not built on, and `fixes` how many fixes by hand of the newest
+/// release the subject lacks.
 ///
-/// A record is built again: on that write when it is off the line. A cut
-/// gets back a member of the previous cut with `include`. A member only the
-/// newest write holds, and a write off the cut's line, mean the release
-/// here is older than that write, as on a machine that has not fetched it:
-/// so the cut is made again once that write's release is moved to it, and
-/// an `include` on the older commit would write a second, divergent write.
+/// A record is built again: on that write when it is off the line, which
+/// carries its fixes too. A cut gets back a member of the previous cut with
+/// `include`. A member only the newest write holds, a write off the cut's
+/// line, and a fix of the newest release the cut lacks mean the release here
+/// is older than that write, as on a machine that has not fetched it: so
+/// the cut is made again once that write's release is moved to it, and an
+/// `include` on the older commit would write a second, divergent write.
 fn refusal_remedy(
     held: HeldRecords<'_>,
-    (sources, off_line): (&[HeldRecord<'_>], Option<HeldRecord<'_>>),
+    (sources, off_line, fixes): (&[HeldRecord<'_>], Option<HeldRecord<'_>>, usize),
     on_drop: DropDisposition,
 ) -> String {
     const ALLOW: &str = "or re-run with --allow-drop to state the drop is intended";
@@ -1046,6 +1115,13 @@ fn refusal_remedy(
                 "record a commit built on {} that carries each of them",
                 inline_human_text(write.recorded().commit.short())
             ),
+            None if sources.is_empty() && fixes == 1 => {
+                "record a commit that carries that fix".to_owned()
+            }
+            None if sources.is_empty() => "record a commit that carries those fixes".to_owned(),
+            None if fixes > 0 => {
+                "record a commit that carries each of them and each fix".to_owned()
+            }
             None => "record a commit that carries each of them".to_owned(),
         };
         return format!("  nothing was recorded; {remedy}, {ALLOW}");
@@ -1070,7 +1146,8 @@ fn refusal_remedy(
         .iter()
         .copied()
         .find(|source| matches!(source, HeldRecord::NewestWrite(_)))
-        .or(off_line);
+        .or(off_line)
+        .or_else(|| held.newest_write().filter(|_| fixes > 0));
     if let Some(write) = newer {
         let recorded = write.recorded();
         let (name, commit) = (&recorded.name, recorded.commit.short());
@@ -1265,9 +1342,11 @@ fn record_cut_event(
 /// holds N member(s)`, then `all carried` or the members the subject
 /// dropped, each member that only the other record holds named with that
 /// record, then `; not built on <the newest write> <commit>` for a stacked
-/// subject that `--allow-drop` let off that write's line, then the
-/// unverified members. Empty when the ledger records neither. The event
-/// keeps each name raw.
+/// subject that `--allow-drop` let off that write's line, then `; without
+/// the fix by hand of <release>'s adopt <commit>` for each fix by hand that
+/// `--allow-drop` let the subject go ahead without ([`fix_title`]), then the
+/// unverified members. Empty when the ledger
+/// records neither. The event keeps each name raw.
 fn restated_delta(held: Option<HeldRecords<'_>>, check: &release::CompositionCheck) -> String {
     let Some(held) = held else {
         return String::new();
@@ -1297,6 +1376,15 @@ fn restated_delta(held: Option<HeldRecords<'_>>, check: &release::CompositionChe
         .map_or_else(String::new, |write| {
             format!("; not built on {}", write.with_commit(str::to_owned))
         });
+    let fixes = held
+        .fixes
+        .iter()
+        .filter(|fix| check.dropped_fixes.contains(&fix.commit))
+        .fold(String::new(), |mut text, fix| {
+            text.push_str("; without ");
+            text.push_str(&fix_title((&fix.name, &fix.commit), str::to_owned));
+            text
+        });
     let unverified = if check.inconclusive.is_empty() {
         String::new()
     } else {
@@ -1311,7 +1399,7 @@ fn restated_delta(held: Option<HeldRecords<'_>>, check: &release::CompositionChe
         )
     };
     format!(
-        "; {}; {carried}{off_line}{unverified}",
+        "; {}; {carried}{off_line}{fixes}{unverified}",
         held.first.restated()
     )
 }
@@ -1459,8 +1547,10 @@ fn record_hand_cut(
     };
     let parents = opened.parent_commits(commit.as_str())?;
     let record = Some((name, commit));
+    let (baseline, fixes) =
+        CompositionGate::read_baseline((opened, entry), (&ledger, &tips), record)?;
     let gate = CompositionGate {
-        baseline: CompositionGate::read_baseline(&ledger, entry, record),
+        baseline,
         record,
         opened,
         path: &fork.checkout.path,
@@ -1469,6 +1559,7 @@ fn record_hand_cut(
         trunk: &trunk,
         tips: &tips,
         start: entry.stacked().then_some(commit),
+        fixes,
     };
     // A parent the trunk holds is no member, but the release holds its
     // content: it is replayed, and its files explain drift, as a member's.
@@ -2629,6 +2720,7 @@ mod tests {
             }],
             twins: vec![(format!("feat/{HOSTILE}@bbbb"), CommitId::new("cccc"))],
             off_line: true,
+            dropped_fixes: Vec::new(),
         };
 
         let published = recorded_published_line(
@@ -2644,11 +2736,13 @@ mod tests {
                 first: HeldRecord::PreviousCut(&cut),
                 other: Some(HeldRecord::NewestWrite(&write)),
                 record: None,
+                fixes: &[],
             },
             HeldRecords {
                 first: HeldRecord::NewestWrite(&write),
                 other: Some(HeldRecord::PreviousCut(&cut)),
                 record: Some(("release/2026-11-14", &at)),
+                fixes: &[],
             },
         ];
         for held in gates {
@@ -2726,6 +2820,7 @@ mod tests {
             first: HeldRecord::PreviousCut(&cut),
             other: Some(HeldRecord::NewestWrite(&write)),
             record: None,
+            fixes: &[],
         };
 
         // When: its event restates the records it was held against.
@@ -2739,6 +2834,47 @@ mod tests {
              dropped from release/2026-08-04's newest recorded write (an edit): feat/beta@bbbb"
         );
         assert_eq!(restated_delta(None, &check), "");
+    }
+
+    #[test]
+    fn the_fix_of_an_adopt_from_the_ledger_reaches_the_terminal_escaped() {
+        // Given: an adopt's release and commit, which are a ledger entry's
+        // subject and first evidence string, and a file of its fix, a path
+        // read from the repository.
+        let (name, commit) = (format!("release/{HOSTILE}"), CommitId::new(HOSTILE));
+
+        // When: a message names the fix, and the cut event names it raw.
+        let shown = format!(
+            "{}{}",
+            fix_title((&name, &commit), inline_human_text),
+            fix_files(&[format!("fix{HOSTILE}.txt")])
+        );
+        let raw = fix_title((&name, &commit), str::to_owned);
+
+        // Then: the message is escaped, names the adopt and counts the file;
+        // the event keeps the text as the ledger has it.
+        assert_escaped(std::slice::from_ref(&shown));
+        assert_eq!(
+            shown,
+            format!(
+                "the fix by hand of release/{ESCAPED}'s adopt {}, in \
+                 1 file(s): fix{ESCAPED}.txt",
+                ids_prefix(ESCAPED)
+            )
+        );
+        assert_eq!(
+            raw,
+            format!(
+                "the fix by hand of release/{HOSTILE}'s adopt {}",
+                commit.short()
+            )
+        );
+        // And: with no file, the message says nothing here measured the fix.
+        assert_eq!(
+            fix_files(&[]),
+            " (nothing here can measure it: this repository does not hold the adopt or cannot \
+             read its release)"
+        );
     }
 
     /// What `short` keeps of an escaped id: its first twelve characters.

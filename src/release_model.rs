@@ -1211,19 +1211,21 @@ pub fn newest_release_write(
     })
 }
 
-/// Whether `commit`, or a visible rewrite of it, is `start` or on its
-/// first-parent line. A commit this repository does not hold is on no line
-/// here.
+/// Whether `commit`, or a visible rewrite of it that stands for it, is
+/// `start` or on its first-parent line. A commit this repository does not
+/// hold is on no line here.
 ///
 /// In a stacked series each release is built on the one before it, so the
 /// newest recorded write must be on this line of a release, or of the
 /// commit a cut starts on, for the release to carry everything that write's
 /// release carries, every level of the stack below it included
-/// ([`crate::commands::release::CompositionDelta::start`]). A rewrite has
-/// the write's change id ([`Repo::rewrites_of`]): jj rebases a release over
-/// a member rewritten in place, and knives reads that rewrite as the
-/// recorded write ([`crate::commands::release::in_hand_write`]), so it
-/// stands for the write on the line.
+/// ([`crate::commands::release::CompositionDelta::start`]). A rewrite stands
+/// for the write when it is a successor of it or has its tree
+/// ([`Repo::standing_rewrites_of`]): jj rebases a release over a member
+/// rewritten in place, and knives reads that rewrite as the recorded write
+/// ([`crate::commands::release::in_hand_write`]). A commit that only shares
+/// the write's change id stands for nothing: the edit an `adopt` replaced
+/// keeps the adopt's change id, and lacks the fix the adopt recorded.
 pub fn on_first_parent_line(
     repo: &Repo,
     commit: &CommitId,
@@ -1232,7 +1234,7 @@ pub fn on_first_parent_line(
     if repo.resolve_commit(commit.as_str()).is_err() {
         return Ok(false);
     }
-    for held in std::iter::once(commit.clone()).chain(repo.rewrites_of(commit.as_str())?) {
+    for held in std::iter::once(commit.clone()).chain(repo.standing_rewrites_of(commit)?) {
         if first_parent_line_holds(repo, &held, start)? {
             return Ok(true);
         }
@@ -1317,6 +1319,41 @@ fn recorded_change<'a>(entry: &'a Entry, release: &str) -> Option<&'a str> {
         .split_once(' ')?;
     let (change, _) = rest.strip_prefix("(change ")?.split_once(')')?;
     (!change.is_empty()).then_some(change)
+}
+
+/// What the part of an `adopt` event that names the files resolved by hand
+/// begins with.
+pub const ADOPTED_RESOLVED: &str = "resolved by hand: ";
+
+/// What the part of an `adopt` event that names the files changed beyond
+/// the baseline's conflicts begins with.
+pub const ADOPTED_BEYOND: &str = "changed beyond the baseline's conflicts: ";
+
+/// The write that an `adopt` event of `release` replaced, when the adopt
+/// recorded a fix by hand.
+///
+/// The write is its commit's 12-character prefix ([`crate::ids::short_id`]).
+/// A fix by hand is a file resolved by hand or changed beyond the adopt's
+/// baseline's conflicts. An adopt is an edit event whose delta begins
+/// `adopted: replaces the recorded <kind> <commit>; measured against
+/// <baseline>`. The parts that name files follow it, [`ADOPTED_RESOLVED`]
+/// first, then [`ADOPTED_BEYOND`]. Knives wrote every word before them, so
+/// the reason that a caller gives, which follows them, never reads as one.
+/// `None` for every other event, and for an adopt that changed no file.
+pub fn adopted_fix_replaces<'a>(entry: &'a Entry, release: &str) -> Option<&'a str> {
+    let rest = entry
+        .text
+        .strip_prefix("edited ")?
+        .strip_prefix(release)?
+        .strip_prefix(" as ")?;
+    let (_, delta) = rest.split_once(" parent(s): ")?;
+    let replaced = delta.strip_prefix("adopted: replaces the recorded ")?;
+    let replaced = replaced
+        .strip_prefix("cut ")
+        .or_else(|| replaced.strip_prefix("edit "))?;
+    let (commit, measured) = replaced.split_once("; measured against ")?;
+    let (_, parts) = measured.split_once("; ")?;
+    (parts.starts_with(ADOPTED_RESOLVED) || parts.starts_with(ADOPTED_BEYOND)).then_some(commit)
 }
 
 /// Every earlier write of one release name.

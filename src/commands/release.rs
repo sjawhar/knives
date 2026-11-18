@@ -3492,6 +3492,45 @@ impl CutSubject<'_> {
         }
     }
 
+    /// The change `resolution` holds against `baseline`, replayed onto the
+    /// subject ([`jj::Candidate::resolution_replay_outcome`]).
+    fn resolution_replay_outcome(
+        &mut self,
+        repo: &Path,
+        baseline: jj::ResolutionBaseline<'_>,
+        resolution: &CommitId,
+    ) -> anyhow::Result<RebaseOutcome> {
+        match self {
+            Self::Candidate(candidate) => {
+                Ok(candidate.resolution_replay_outcome(baseline, resolution)?)
+            }
+            Self::Committed(cut) => Ok(crate::jj::probe_resolution_replay(
+                repo, baseline, resolution, cut,
+            )?),
+        }
+    }
+
+    /// Whether the subject holds what `other` holds at every one of
+    /// `paths`, repository-internal paths.
+    fn holds_paths_of(
+        &self,
+        repo: &Repo,
+        other: &CommitId,
+        paths: &[String],
+    ) -> anyhow::Result<bool> {
+        match self {
+            Self::Candidate(candidate) => Ok(candidate.same_path_values(other, paths)?),
+            Self::Committed(cut) => {
+                for path in paths {
+                    if !repo.same_path_value(cut, other, path)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+
     fn changed_files_since(
         &mut self,
         repo: &Path,
@@ -3650,6 +3689,173 @@ pub struct CompositionCheck {
     /// ([`CompositionDelta::start`]): the subject does not carry that
     /// write's release, whatever members it carries.
     pub off_line: bool,
+    /// The adopts whose fix by hand the subject lacks, by commit, among the
+    /// newest release's fixes ([`CompositionDelta::fixes`]).
+    pub dropped_fixes: Vec<CommitId>,
+}
+
+/// A fix by hand that the newest release holds: what one of its `adopt`s
+/// recorded since its cut ([`adopted_fixes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptedFix {
+    /// The release the adopt recorded.
+    pub name: String,
+    /// The adopt's commit.
+    pub commit: CommitId,
+    /// The files the fix changes against its baseline: those resolved by
+    /// hand, then those changed beyond the baseline's conflicts. Empty where
+    /// nothing here can measure the fix: this repository does not hold the
+    /// adopt, or its series cannot read the adopt's release.
+    pub files: Vec<String>,
+    /// What the fix is measured against, where this repository can measure
+    /// it.
+    measure: Option<FixBaseline>,
+}
+
+impl AdoptedFix {
+    /// The baseline that the fix is the adopt's change against
+    /// ([`FixBaseline::baseline`]), or `None` where nothing here can measure
+    /// the fix ([`Self::files`]).
+    fn baseline(&self) -> Option<jj::ResolutionBaseline<'_>> {
+        self.measure.as_ref().map(FixBaseline::baseline)
+    }
+}
+
+/// What an adopted fix is measured against, as `adopt` measured it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FixBaseline {
+    /// The write the adopt replaced and what that write composes
+    /// ([`write_composition`]), where it is the baseline: this repository
+    /// holds it, and knives checked the release it was written over.
+    replaced: Option<(CommitId, Vec<CommitId>)>,
+    /// What the adopt composes ([`ReleaseReading::composition`]).
+    composition: Vec<CommitId>,
+}
+
+impl FixBaseline {
+    /// The replaced write rebuilt on the adopt's composition, or an
+    /// automerge of that composition where the replaced write is not the
+    /// baseline.
+    fn baseline(&self) -> jj::ResolutionBaseline<'_> {
+        match &self.replaced {
+            Some((write, composed)) => jj::ResolutionBaseline::Rebuilt {
+                write,
+                composed,
+                members: &self.composition,
+            },
+            None => jj::ResolutionBaseline::Automerge(&self.composition),
+        }
+    }
+}
+
+/// The fixes by hand that the newest release holds: one for each `adopt`
+/// the ledger records of it since its cut, newest first.
+///
+/// `write` is the baseline's [`CompositionBaseline::newest_write`], the
+/// newest release's newest recorded write, and each release is read as
+/// `entry`'s series reads it, with `tips`, the caller's bookmarks. An adopt
+/// holds a fix when its event records one
+/// ([`crate::release_model::adopted_fix_replaces`]), and a later write of
+/// the release keeps it, so every adopt after the release's cut is held,
+/// not only the newest write. Each fix is its adopt's change against the
+/// baseline that `adopt` measured it against ([`adopted_fix`]).
+pub fn adopted_fixes(
+    repo: &Repo,
+    entry: &RepoEntry,
+    (ledger, tips): (&[Entry], &BookmarkTips),
+    write: Option<&crate::release_model::RecordedCut>,
+) -> Result<Vec<AdoptedFix>, jj::JjError> {
+    let Some(write) = write else {
+        return Ok(Vec::new());
+    };
+    let name = write.name.as_str();
+    let events: Vec<(&Entry, RecordedWrite)> =
+        crate::release_model::recorded_write_events(ledger, name).collect();
+    if events
+        .first()
+        .is_none_or(|(_, newest)| newest.commit != write.commit)
+    {
+        return Ok(Vec::new());
+    }
+    let since_cut = events
+        .iter()
+        .position(|(_, recorded)| recorded.kind == crate::release_model::RecordedWriteKind::Cut)
+        .map_or(events.len(), |cut| cut + 1);
+    let published = tips.get(&BookmarkRef::Remote {
+        branch: BranchName::new(name),
+        remote: RemoteName::new(entry.publish_remote()),
+    });
+    let writes = EarlierWrites::read(repo, name, ledger, published)?;
+    let mut fixes = Vec::new();
+    for (at, (event, adopt)) in events.iter().enumerate().take(since_cut) {
+        let Some(replaced) = crate::release_model::adopted_fix_replaces(event, name) else {
+            continue;
+        };
+        let replaced = events
+            .iter()
+            .skip(at + 1)
+            .find(|(_, older)| older.commit.short() == replaced);
+        let release = (entry, (ledger, tips), &writes);
+        if let Some(fix) = adopted_fix(repo, release, (name, &adopt.commit), replaced)? {
+            fixes.push(fix);
+        }
+    }
+    Ok(fixes)
+}
+
+/// The fix by hand that `adopt`, a commit an `adopt` event of `name`
+/// recorded, holds against `replaced`, the write that event replaced, with
+/// its event, when the ledger still records it.
+///
+/// The fix is the adopt's change against the baseline that `adopt` measured
+/// it against: the write it replaced, rebuilt on the adopt's composition, or
+/// an automerge of that composition where this repository does not hold
+/// that write or knives could not check the release it was written over. A
+/// fix that changes no file here is `None`. An adopt that this repository
+/// does not hold, or whose reading its series refuses, is a fix that nothing
+/// here can measure.
+fn adopted_fix(
+    repo: &Repo,
+    (entry, (ledger, tips), writes): (&RepoEntry, (&[Entry], &BookmarkTips), &EarlierWrites),
+    (name, adopt): (&str, &CommitId),
+    replaced: Option<&(&Entry, RecordedWrite)>,
+) -> Result<Option<AdoptedFix>, jj::JjError> {
+    let unmeasured = AdoptedFix {
+        name: name.to_owned(),
+        commit: adopt.clone(),
+        files: Vec::new(),
+        measure: None,
+    };
+    if repo.resolve_commit(adopt.as_str()).is_err() {
+        return Ok(Some(unmeasured));
+    }
+    let Ok(reading) = release_reading(repo, entry, (ledger, tips), (writes, adopt))? else {
+        return Ok(Some(unmeasured));
+    };
+    let replaced = match replaced {
+        Some((event, older))
+            if repo.resolve_commit(older.commit.as_str()).is_ok()
+                && crate::release_model::unchecked_mark(event).is_none() =>
+        {
+            let composed = write_composition(repo, entry, (ledger, tips), (writes, &older.commit))?;
+            Some((older.commit.clone(), composed))
+        }
+        _ => None,
+    };
+    let measure = FixBaseline {
+        replaced,
+        composition: reading.composition(),
+    };
+    let changes = jj::resolution_changes(repo, measure.baseline(), adopt)?;
+    let files: Vec<String> = changes.resolved.into_iter().chain(changes.beyond).collect();
+    if files.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(AdoptedFix {
+        files,
+        measure: Some(measure),
+        ..unmeasured
+    }))
 }
 
 /// What the composition gate compares: the cut's parents against the members
@@ -3674,19 +3880,32 @@ pub struct CompositionDelta<'a> {
     /// first-parent line ([`on_first_parent_line`]), so the subject carries
     /// every level of the stack below it. `None` outside a stacked series.
     pub start: Option<&'a CommitId>,
+    /// The fixes by hand that the newest release holds, one for each
+    /// `adopt` since its cut ([`adopted_fixes`]). The subject must carry
+    /// each as it carries a member.
+    pub fixes: &'a [AdoptedFix],
 }
 
-/// Members the baseline records that the cut subject does not carry, and in
-/// a stacked series whether it starts off the newest write's line.
+/// Members the baseline records that the cut subject does not carry, in a
+/// stacked series whether it starts off the newest write's line, and the
+/// fixes by hand of the newest release that it lacks.
 ///
 /// Identity and ancestry account for a member that is still a parent, was
 /// advanced past, or entered through the cut's base. A member whose change was
 /// rewritten — `jj rebase` keeps the change id and mints a new commit — is
-/// carried when a rewrite is reachable from a parent or the base, the same
-/// succession `advance` recognises; the recorded commit itself is never an
-/// ancestor again after a rebase. A member recreated outside jj with exactly
-/// its tree is carried when that twin is reachable from a parent past the base
-/// ([`Repo::same_tree_between`]), and the twin is named. The content replay
+/// carried when a rewrite that stands for it is reachable from a parent or
+/// the base: a successor of it, or a commit with its tree
+/// ([`Repo::standing_rewrites_of`]). The recorded commit itself is never an
+/// ancestor again after a rebase. A commit that only shares its change id,
+/// such as the older version a newer member replaced, carries nothing for
+/// it here, and the checks below measure the member. The one exception is
+/// the succession the ledger records: a member of the previous cut whose
+/// change id a member of the newest write has is superseded by that member,
+/// as `advance` recorded it, and is not held; that member is. A member
+/// recreated outside jj with exactly its tree is carried when that twin is
+/// reachable
+/// from a parent past the base ([`Repo::same_tree_between`]), and the twin
+/// is named. The content replay
 /// accounts for one that landed upstream as a squash — the same measure
 /// [`audit_cut`] applies to current members, taken from the member's own fork
 /// point so a moved base is never charged to the member. A member the trunk
@@ -3698,6 +3917,11 @@ pub struct CompositionDelta<'a> {
 /// newest write must be [`CompositionDelta::start`] or on its first-parent
 /// line, else the subject does not carry that write's release
 /// ([`CompositionCheck::off_line`]).
+///
+/// Each fix by hand that the newest release holds
+/// ([`CompositionDelta::fixes`]) is held as a member is ([`fix_carried`]). A
+/// fix the subject does not carry is named by its adopt's commit
+/// ([`CompositionCheck::dropped_fixes`]).
 pub fn uncarried_recorded_members(
     repo: &Repo,
     path: &Path,
@@ -3707,6 +3931,24 @@ pub fn uncarried_recorded_members(
     let mut check = CompositionCheck::default();
     if let (Some(start), Some(write)) = (delta.start, &delta.baseline.newest_write) {
         check.off_line = !on_first_parent_line(repo, &write.commit, start)?;
+    }
+    for fix in delta.fixes {
+        if !fix_carried(repo, (path, &mut *subject), delta, fix)? {
+            check.dropped_fixes.push(fix.commit.clone());
+        }
+    }
+    // The newest write's members, by change id where this repository holds
+    // them: what a member of the previous cut is superseded by.
+    let newest = delta
+        .baseline
+        .newest_write
+        .as_ref()
+        .map_or(&[][..], |write| write.members.as_slice());
+    let mut successors = Vec::new();
+    for member in newest {
+        if repo.resolve_commit(member.as_str()).is_ok() {
+            successors.push(repo.change_id_of(member.as_str())?);
+        }
     }
     let cut_is_conflicted = !subject.conflicted_files(path)?.is_empty();
     for member in delta.baseline.members() {
@@ -3720,10 +3962,13 @@ pub fn uncarried_recorded_members(
             });
             continue;
         }
+        if !newest.contains(member) && successors.contains(&repo.change_id_of(member.as_str())?) {
+            continue;
+        }
         if reaches_any(repo, member, delta)? {
             continue;
         }
-        let rewrites = repo.rewrites_of(member.as_str())?;
+        let rewrites = repo.standing_rewrites_of(member)?;
         let mut rewritten = false;
         for rewrite in &rewrites {
             if reaches_any(repo, rewrite, delta)? {
@@ -3756,6 +4001,45 @@ pub fn uncarried_recorded_members(
         }
     }
     Ok(check)
+}
+
+/// Whether the cut subject carries `fix`, one of the newest release's fixes
+/// by hand ([`AdoptedFix`]).
+///
+/// A stacked subject with the adopt on its start's first-parent line carries
+/// it already. Otherwise its change against its baseline must replay empty
+/// onto the subject, as a member's does. A later write may change a file the
+/// fix changed, a later adopt that refines it or an `include` of a member
+/// that touches it, and then the replay conflicts: so the subject carries the
+/// fix too when it holds, at every file the fix changed, exactly what the
+/// newest recorded write holds there. A fix that nothing here can measure is
+/// not carried.
+fn fix_carried(
+    repo: &Repo,
+    (path, subject): (&Path, &mut CutSubject<'_>),
+    delta: &CompositionDelta<'_>,
+    fix: &AdoptedFix,
+) -> anyhow::Result<bool> {
+    if let Some(start) = delta.start
+        && on_first_parent_line(repo, &fix.commit, start)?
+    {
+        return Ok(true);
+    }
+    let Some(baseline) = fix.baseline() else {
+        return Ok(false);
+    };
+    if matches!(
+        subject.resolution_replay_outcome(path, baseline, &fix.commit)?,
+        RebaseOutcome::Empty
+    ) {
+        return Ok(true);
+    }
+    match &delta.baseline.newest_write {
+        Some(newest) if repo.resolve_commit(newest.commit.as_str()).is_ok() => {
+            subject.holds_paths_of(repo, &newest.commit, &fix.files)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// `commit` as the gate names it ([`recorded_member_name`]).
