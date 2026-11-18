@@ -1915,3 +1915,62 @@ fn a_cut_names_the_workspace_of_a_recorded_branch_that_is_gone() {
         "{stdout}"
     );
 }
+
+#[test]
+fn a_cut_refuses_to_drop_a_member_an_edit_added_after_the_previous_cut() {
+    // Given: a cut of `feat/alpha`, then `feat/beta` added to it by
+    // `include`, which the ledger records as an edit; then the release's
+    // bookmark moved back to the cut's commit, as a machine that never
+    // fetched the edit still has it.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stdout)
+    );
+    let cut = commit_at(&lab, "release/2026-08-04");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let beta = commit_at(&lab, "feat/beta");
+    let included = knives_release(
+        &lab,
+        &home,
+        &["include", "feat/beta", "--why", "added after the cut"],
+    );
+    assert!(
+        included.status.success(),
+        "{}",
+        String::from_utf8_lossy(&included.stdout)
+    );
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "release/2026-08-04",
+        "-r",
+        cut.as_str(),
+        "--allow-backwards",
+    ]);
+
+    // When: the next release is cut.
+    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: it is refused, naming the member the newest recorded write of
+    // the release in hand holds and the cut does not carry, and nothing is
+    // cut: the edit's member is held as a cut's members are.
+    let out = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    assert!(out.contains(beta.short()), "{out}");
+    assert!(
+        Repo::open(&lab.work)
+            .expect("open work checkout")
+            .resolve_commit("release/2026-08-05")
+            .is_err(),
+        "{out}"
+    );
+}
