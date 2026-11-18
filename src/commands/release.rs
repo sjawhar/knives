@@ -1224,13 +1224,14 @@ pub fn in_hand_write(
             reason: reason.to_owned(),
         }));
     }
-    let write_carriers =
-        writes.recorded_carriers(repo, &repo.parent_commits(matched.write.commit.as_str())?)?;
     // A stacked release holds its previous release whole, so the write is
-    // rebased onto that release and the members, in parent order.
+    // rebased onto that release and the members, in parent order, its own
+    // change measured against all it composes: a write made as a chain of
+    // merges keeps what each inner merge resolved.
+    let composed = write_composition(repo, entry, ledger, (writes, &matched.write.commit))?;
     Ok(
         if repo.holds_rebased_write(
-            (&matched.write.commit, &write_carriers),
+            (&matched.write.commit, &composed),
             &reading.composition(),
             commit,
         )? {
@@ -1241,6 +1242,37 @@ pub fn in_hand_write(
             }
         },
     )
+}
+
+/// What `write`, a recorded write of a release whose earlier writes are
+/// `writes`, composes: the commits whose merge its own change is measured
+/// against ([`Repo::holds_rebased_write`]).
+///
+/// That is its own parents, its carriers left out
+/// ([`EarlierWrites::recorded_carriers`]). A write of a stacked series that
+/// has a previous release composes that release and its members
+/// ([`release_reading`]): made as a chain of merges, one member each, it
+/// holds what each inner merge resolved, and none of that is its own change
+/// against its own parents. A write the stacked reading refuses composes its
+/// own parents.
+pub fn write_composition(
+    repo: &Repo,
+    entry: &RepoEntry,
+    ledger: &[Entry],
+    (writes, write): (&EarlierWrites, &CommitId),
+) -> Result<Vec<CommitId>, crate::jj::JjError> {
+    if entry.stacked()
+        && let Ok(reading) = release_reading(repo, entry, ledger, (writes, write))?
+        && reading.previous.is_some()
+    {
+        return Ok(reading.composition());
+    }
+    let parents = repo.parent_commits(write.as_str())?;
+    let carriers = writes.recorded_carriers(repo, &parents)?;
+    Ok(parents
+        .into_iter()
+        .filter(|parent| !carriers.contains(parent))
+        .collect())
 }
 
 /// How `commit`, a release whose earlier writes are `writes`, reads

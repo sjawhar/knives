@@ -147,6 +147,19 @@ impl ReleaseInHand {
         )
     }
 
+    /// What the release composes: its previous release when it has one,
+    /// then its members, its carriers left out. Its own change is its tree
+    /// against their merge ([`knives::jj::write_composed_release`]): a
+    /// release made as a chain of merges, one member each, holds what each
+    /// inner merge resolved, and only that merge holds all of it.
+    fn composition(&self) -> Vec<CommitId> {
+        self.previous
+            .iter()
+            .map(|previous| previous.commit.clone())
+            .chain(self.parents.iter().cloned())
+            .collect()
+    }
+
     /// The release's name for a terminal line: a name read from the
     /// repository, which a remote can give a C1 character.
     fn shown_name(&self) -> String {
@@ -775,7 +788,10 @@ fn edit_release(
 /// its name moved — record the parent set in the ledger, and report.
 ///
 /// `new_parents` are the members; a stacked release's previous release is
-/// put first again here, the one place every verb's parent set passes.
+/// put first again here, the one place every verb's parent set passes. The
+/// release's own change is measured against what it composes
+/// ([`ReleaseInHand::composition`]), never its own parents, so an edit of a
+/// release made as a chain of merges keeps what each inner merge resolved.
 /// `uncarried` is the target of a drop whose parent no remaining member's
 /// history carries. Whether the release lost that content is read from the
 /// written tree: jj merges the remaining parents over their real merge base,
@@ -801,18 +817,20 @@ fn apply_edit(
             });
     let provenance = composition_sources(opened, entry, (release.previous.as_ref(), new_parents))?;
     let message = release::composition_message(&release.name, &provenance, delta);
-    let written = knives::jj::write_release(
+    let written = knives::jj::write_composed_release(
         &fork.checkout.path,
         &knives::jj::ReleaseWrite {
             source: Some(&release.commit),
             parents: &parents,
-            carriers: &release.carriers,
+            // What the release composes leaves its carriers out.
+            carriers: &[],
             message: Some(&message),
             bookmark: Some(&release.name),
             publish_remote: Some(entry.publish_remote()),
             earlier: release.writes.commits(),
             operation: &format!("knives: {}: {delta}", release.name),
         },
+        &release.composition(),
     )?;
     let created = &written.commit;
     record_edit_event(

@@ -260,14 +260,14 @@ struct Replaced {
     /// written over (`; unchecked:`): nothing measured that write, so a
     /// resolution is measured against an automerge instead.
     unchecked: bool,
-    /// The write's own parents, where this repository holds it: the earlier
+    /// What the write composes, where this repository holds it
+    /// ([`release::write_composition`]): its own parents less the earlier
     /// writes of the name among them, which a rebuild of it leaves out
-    /// ([`ResolutionBaseline::Rebuilt`]), and the rest, what it composes: its
-    /// members, after a stacked write's previous release. The rebuild reads
-    /// the write's own parents, so these are too: a write knives made is one
-    /// merge, whose own parents are its composition.
-    carriers: Vec<CommitId>,
-    members: Vec<CommitId>,
+    /// ([`ResolutionBaseline::Rebuilt`]), or a stacked write's previous
+    /// release and members. A rebuild measures the write's own change
+    /// against their merge, so a write made as a chain of merges keeps what
+    /// each inner merge resolved.
+    composed: Vec<CommitId>,
     /// The parent set its event records, its own carriers left out, each
     /// parent with every branch at it then, which `include` and `advance`
     /// match a member by once its bookmark has moved on.
@@ -319,24 +319,17 @@ impl Replaced {
             recorded
         };
         let here = opened.resolve_commit(write.commit.as_str()).is_ok();
-        let (carriers, members) = if here {
-            let own = opened.parent_commits(write.commit.as_str())?;
-            let carriers = writes.recorded_carriers(opened, &own)?;
-            let members = own
-                .into_iter()
-                .filter(|parent| !carriers.contains(parent))
-                .collect();
-            (carriers, members)
+        let composed = if here {
+            release::write_composition(opened, entry, ledger, (writes, &write.commit))?
         } else {
-            (Vec::new(), Vec::new())
+            Vec::new()
         };
         Ok(Some(Self {
             here,
             equal,
             unchecked: knives::release_model::unchecked_mark(event).is_some(),
             write,
-            carriers,
-            members,
+            composed,
             parents,
         }))
     }
@@ -386,7 +379,7 @@ impl Replaced {
         if self.is_baseline() {
             // Rebuilt on its own composition, a write is its own tree, so it
             // is named as itself.
-            let described = if self.members == composition {
+            let described = if self.composed == composition {
                 self.described()
             } else {
                 format!("{} rebuilt on {}", self.described(), composed())
@@ -394,7 +387,7 @@ impl Replaced {
             return (
                 ResolutionBaseline::Rebuilt {
                     write: &self.write.commit,
-                    carriers: &self.carriers,
+                    composed: &self.composed,
                     members: composition,
                 },
                 described,
@@ -464,50 +457,17 @@ struct Adopting<'a, 'f> {
 }
 
 impl Adopting<'_, '_> {
-    /// Refuse, saying why, a commit that is not finished: one that still has
-    /// conflicts, or whose conflicts cannot be read, one a workspace has
-    /// checked out, and a hand edit of a published release the publish
-    /// remote does not hold. `true` after refusing.
+    /// Refuse, saying why, a commit that is not finished
+    /// ([`refuse_unfinished_commit`]), and a hand edit of a published release
+    /// the publish remote does not hold. `true` after refusing.
     fn refuse_unfinished(&self) -> anyhow::Result<bool> {
-        let (repo, held) = (&self.fork.name, self.held);
-        let (shown, at) = (held.shown_name(), held.commit.short());
-        let conflicted = match held.opened.conflicted_files(held.commit.as_str()) {
-            Ok(conflicted) => conflicted,
-            Err(error) => {
-                println!(
-                    "{repo}: could not read whether {shown} at {at} still has conflicts ({}), \
-                     so it is not adopted",
-                    inline_human_text(&error.to_string())
-                );
-                return Ok(true);
-            }
-        };
-        if !conflicted.is_empty() {
-            println!(
-                "{repo}: {shown} at {at} still has {} conflicted file(s), so it is not resolved \
-                 yet; resolve them, then adopt:",
-                conflicted.len()
-            );
-            // The paths are the repository's, each whole.
-            for file in &conflicted {
-                println!("    {}", inline_human_text(file));
-            }
-            return Ok(true);
-        }
-        let change = held.opened.change_id_of(held.commit.as_str())?;
-        let checked_out: Vec<String> = held
-            .opened
-            .workspaces()?
-            .into_iter()
-            .filter(|(_, working)| *working == change)
-            .map(|(workspace, _)| inline_human_text(workspace.as_str()))
-            .collect();
-        if !checked_out.is_empty() {
-            println!(
-                "{repo}: {shown} at {at} is the working copy of workspace {}; run `jj new` there \
-                 first, so editing in that workspace cannot change the adopted commit",
-                checked_out.join(", ")
-            );
+        let held = self.held;
+        if refuse_unfinished_commit(
+            &self.fork.name,
+            &held.opened,
+            (&held.name, &held.commit),
+            ("adopt", "adopted"),
+        )? {
             return Ok(true);
         }
         self.refuse_published()
@@ -532,6 +492,61 @@ impl Adopting<'_, '_> {
         println!("{}: {remedy}", self.fork.name);
         Ok(true)
     }
+}
+
+/// Refuse, saying why, a commit that is not finished, as `adopt` and `cut
+/// NAME --at` read one: it still has conflicts, or its conflicts cannot be
+/// read, or a workspace has it checked out, where an edit would change it
+/// once it is recorded. `name` is the release it would be recorded under;
+/// `(verb, done)` name what is refused, as `("adopt", "adopted")`. `true`
+/// after refusing.
+pub(crate) fn refuse_unfinished_commit(
+    repo: &RepoName,
+    opened: &Repo,
+    (name, commit): (&str, &CommitId),
+    (verb, done): (&str, &str),
+) -> anyhow::Result<bool> {
+    // The release is a name read from the repository.
+    let (shown, at) = (inline_human_text(name), commit.short());
+    let conflicted = match opened.conflicted_files(commit.as_str()) {
+        Ok(conflicted) => conflicted,
+        Err(error) => {
+            println!(
+                "{repo}: could not read whether {shown} at {at} still has conflicts ({}), so it \
+                 is not {done}",
+                inline_human_text(&error.to_string())
+            );
+            return Ok(true);
+        }
+    };
+    if !conflicted.is_empty() {
+        println!(
+            "{repo}: {shown} at {at} still has {} conflicted file(s), so it is not resolved yet; \
+             resolve them, then {verb}:",
+            conflicted.len()
+        );
+        // The paths are the repository's, each whole.
+        for file in &conflicted {
+            println!("    {}", inline_human_text(file));
+        }
+        return Ok(true);
+    }
+    let change = opened.change_id_of(commit.as_str())?;
+    let checked_out: Vec<String> = opened
+        .workspaces()?
+        .into_iter()
+        .filter(|(_, working)| *working == change)
+        .map(|(workspace, _)| inline_human_text(workspace.as_str()))
+        .collect();
+    if !checked_out.is_empty() {
+        println!(
+            "{repo}: {shown} at {at} is the working copy of workspace {}; run `jj new` there \
+             first, so editing in that workspace cannot change the {done} commit",
+            checked_out.join(", ")
+        );
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// What adopting measured: everything the event and the report say.

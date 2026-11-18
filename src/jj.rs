@@ -1142,7 +1142,8 @@ impl Repo {
     }
 
     /// Whether `release`'s tree is exactly `write`'s own change rebased onto
-    /// `members` ([`Self::rebased_write`]).
+    /// `members` ([`Self::rebased_write`]); `composed` is what `write`
+    /// composes.
     ///
     /// That is the tree a release holds when nothing but knives and jj
     /// changed it since the write: jj's own rebase of the write over a
@@ -1151,12 +1152,12 @@ impl Repo {
     /// counts. A tree with conflicts compares by its ids like any other.
     pub fn holds_rebased_write(
         &self,
-        (write, write_carriers): (&CommitId, &[CommitId]),
+        (write, composed): (&CommitId, &[CommitId]),
         members: &[CommitId],
         release: &CommitId,
     ) -> Result<bool, JjError> {
         let release = self.commit(release.as_str())?;
-        let (rebased, written) = self.rebased_write((write, write_carriers), members)?;
+        let (rebased, written) = self.rebased_write((write, composed), members)?;
         if rebased.tree_ids() == release.tree_ids() {
             return Ok(true);
         }
@@ -1169,52 +1170,50 @@ impl Repo {
     /// release-log union ([`union_release_logs`]).
     fn rebuilt_write(
         &self,
-        (write, write_carriers): (&CommitId, &[CommitId]),
+        (write, composed): (&CommitId, &[CommitId]),
         members: &[CommitId],
     ) -> Result<MergedTree, JjError> {
-        let (rebased, written) = self.rebased_write((write, write_carriers), members)?;
+        let (rebased, written) = self.rebased_write((write, composed), members)?;
         Ok(union_release_logs(rebased, Some(&written))?.0)
     }
 
     /// `write`'s own change rebased onto `members`: merge(`members`) +
-    /// `write` - merge(`write`'s parents other than `write_carriers`), the
-    /// step a release write takes ([`duplicated_without_carriers`]), and
-    /// `write`'s own tree, which a union puts under the blocks the members
-    /// bring in.
+    /// `write` - merge(`composed`), the step a release write takes
+    /// ([`duplicated_from`]), and `write`'s own tree, which a union puts
+    /// under the blocks the members bring in.
+    ///
+    /// `composed` is what `write` composes: its parents less its carriers,
+    /// or, for a release of a stacked series, its previous release and its
+    /// members. A release made as a chain of merges, one member each, holds
+    /// what each inner merge resolved, and that is its own change only
+    /// against the merge of all it composes, never against its own parents.
     ///
     /// Built in a transaction that is dropped, never committed, so it leaves
     /// nothing an operation names; the trees it wrote stay readable from the
     /// store.
     fn rebased_write(
         &self,
-        (write, write_carriers): (&CommitId, &[CommitId]),
+        (write, composed): (&CommitId, &[CommitId]),
         members: &[CommitId],
     ) -> Result<(MergedTree, MergedTree), JjError> {
         let write = self.commit(write.as_str())?;
-        let member_ids = members
-            .iter()
-            .map(|member| Ok(self.commit(member.as_str())?.id().clone()))
-            .collect::<Result<Vec<_>, JjError>>()?;
-        let write_members: Vec<JjCommitId> = write
-            .parent_ids()
-            .iter()
-            .filter(|parent| !write_carriers.contains(&commit_id(parent)))
-            .cloned()
-            .collect();
+        let ids = |commits: &[CommitId]| {
+            commits
+                .iter()
+                .map(|commit| Ok(self.commit(commit.as_str())?.id().clone()))
+                .collect::<Result<Vec<_>, JjError>>()
+        };
+        let member_ids = ids(members)?;
+        let composed_ids = ids(composed)?;
         let mut tx = self.repo.start_transaction();
-        // A write whose every parent is an earlier write of its name has no
-        // members to stand on; its own parents are then what it is measured
-        // from, as a duplicate of it would be.
-        let source = if write_members.is_empty() || write_members.len() == write.parent_ids().len()
-        {
+        // A write whose every parent is an earlier write of its name composes
+        // nothing; its own parents are then what it is measured from, as a
+        // duplicate of it would be.
+        let source = if composed_ids.is_empty() || composed_ids.as_slice() == write.parent_ids() {
             write.clone()
         } else {
-            block_on(
-                tx.repo_mut()
-                    .new_commit(write_members, write.tree())
-                    .write(),
-            )
-            .map_err(|error| store_error(&error))?
+            block_on(tx.repo_mut().new_commit(composed_ids, write.tree()).write())
+                .map_err(|error| store_error(&error))?
         };
         let stats = block_on(duplicate_commits(
             tx.repo_mut(),
@@ -2648,8 +2647,8 @@ pub struct ReleaseWrite<'a> {
     /// The parents of `source` that are earlier writes of the name, never
     /// members ([`crate::release_model::carriers`]). With any, the source is
     /// first written again on its other parents with its own tree
-    /// ([`duplicated_without_carriers`]), so what the source resolved over a
-    /// carrier becomes its own change and the duplicate keeps it.
+    /// ([`duplicated_from`]), so what the source resolved over a carrier
+    /// becomes its own change and the duplicate keeps it.
     pub carriers: &'a [CommitId],
     /// `None` keeps the source's own message (fresh merges must name one).
     pub message: Option<&'a str>,
@@ -2757,24 +2756,53 @@ pub struct ReplacedRelease {
 /// the union.
 ///
 /// A source with carriers is duplicated from an in-between commit on its
-/// other parents ([`duplicated_without_carriers`]), which the same operation
-/// abandons, so the write still leaves one new visible commit. Abandoning the
-/// source can leave a carrier, or what sat behind one, a visible head nothing
-/// holds; the same operation hides each such head that is an earlier write of
-/// the name or superseded ([`hide_exposed`]).
+/// other parents ([`duplicated_from`]), which the same operation abandons, so
+/// the write still leaves one new visible commit. Abandoning the source can
+/// leave a carrier, or what sat behind one, a visible head nothing holds; the
+/// same operation hides each such head that is an earlier write of the name
+/// or superseded ([`hide_exposed`]).
 pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWritten, JjError> {
+    write_measured_release(repo, (write, None))
+}
+
+/// [`write_release`] of a source whose own change is its tree against the
+/// merge of `composed`, what it composes, never against its own parents.
+///
+/// A release of a stacked series composes its previous release and its
+/// members. Made as a chain of merges, one member each, it holds what each
+/// inner merge resolved, and none of that is its top commit's own change. So
+/// the source is first written again on `composed` with its own tree, and that
+/// in-between commit is duplicated: the write keeps every resolution the
+/// chain holds. A source whose own parents are `composed` is duplicated as it
+/// is. `composed` leaves the source's carriers out, so `write.carriers` is
+/// not read.
+pub fn write_composed_release(
+    repo: &Path,
+    write: &ReleaseWrite<'_>,
+    composed: &[CommitId],
+) -> Result<ReleaseWritten, JjError> {
+    write_measured_release(repo, (write, Some(composed)))
+}
+
+/// [`write_release`], its source measured against `composed` when given
+/// ([`write_composed_release`]) and otherwise against its parents less its
+/// carriers.
+fn write_measured_release(
+    repo: &Path,
+    (write, composed): (&ReleaseWrite<'_>, Option<&[CommitId]>),
+) -> Result<ReleaseWritten, JjError> {
     validate_parents(write.source, write.parents)?;
     let repo = Repo::open_to_write(repo)?;
     let (parent_commits, parent_ids) = resolved_parents(&repo, write.parents)?;
     let mut tx = repo.repo.start_transaction();
     let (written, source, unions) = if let Some(source) = write.source {
         let source = repo.commit(source.as_str())?;
-        let (written, unions) = duplicated_without_carriers(
-            &mut tx,
-            (&source, write.message),
-            write.carriers,
-            &parent_ids,
-        )?;
+        let measured = match composed {
+            Some(composed) => resolved_parents(&repo, composed)?.1,
+            None => without_carriers(&source, write.carriers),
+        };
+        let (written, unions) =
+            duplicated_from(&mut tx, (&source, write.message), measured, &parent_ids)?;
         (written, Some(source), unions)
     } else {
         let (written, unions) = merged_release(
@@ -3231,37 +3259,45 @@ fn merged_release(
     Ok((commit, unions))
 }
 
-/// [`duplicated_release`] of `source` with `carriers`, its parents that are
-/// earlier writes of its name, left out of what the duplicate measures it
-/// against.
+/// `source`'s parents with `carriers`, its parents that are earlier writes of
+/// its name, left out: what a duplicate of it measures it against
+/// ([`duplicated_from`]).
+fn without_carriers(source: &jj_lib::commit::Commit, carriers: &[CommitId]) -> Vec<JjCommitId> {
+    source
+        .parent_ids()
+        .iter()
+        .filter(|parent| !carriers.contains(&commit_id(parent)))
+        .cloned()
+        .collect()
+}
+
+/// [`duplicated_release`] of `source`, its own change measured against the
+/// merge of `measured`: its parents less its carriers ([`without_carriers`]),
+/// or what it composes ([`write_composed_release`]).
 ///
 /// A duplicate replays the source's own change, its tree against the merge
 /// of its parents, onto the new parents. With a carrier among those parents
 /// the merge already holds every resolution the carrier holds, so the
 /// source's own change is empty there and a duplicate onto the members alone
-/// loses them. So the source is first written again as an in-between commit
-/// on its other parents with its own tree, description and author, which
-/// makes those resolutions its own change; that commit is duplicated; and it
-/// is recorded abandoned in the same transaction, so the write still leaves
-/// one new visible commit. A new commit, never a rewrite of the source: a
-/// rewrite would record the source rewritten and move everything resting on
-/// it, a working copy included.
-fn duplicated_without_carriers(
+/// loses them; a chain of merges holds what each inner merge resolved, which
+/// is no change of its top commit's own. So a source whose parents are not
+/// `measured` is first written again as an in-between commit on `measured`
+/// with its own tree, description and author, which makes those resolutions
+/// its own change; that commit is duplicated; and it is recorded abandoned in
+/// the same transaction, so the write still leaves one new visible commit. A
+/// new commit, never a rewrite of the source: a rewrite would record the
+/// source rewritten and move everything resting on it, a working copy
+/// included.
+fn duplicated_from(
     tx: &mut Transaction,
     (source, message): (&jj_lib::commit::Commit, Option<&str>),
-    carriers: &[CommitId],
+    measured: Vec<JjCommitId>,
     parent_ids: &[JjCommitId],
 ) -> Result<(jj_lib::commit::Commit, Vec<UnionedFile>), JjError> {
-    if carriers.is_empty() {
+    if measured.as_slice() == source.parent_ids() {
         return duplicated_release(tx, (source, message), parent_ids);
     }
-    let members: Vec<JjCommitId> = source
-        .parent_ids()
-        .iter()
-        .filter(|parent| !carriers.contains(&commit_id(parent)))
-        .cloned()
-        .collect();
-    if members.is_empty() {
+    if measured.is_empty() {
         return Err(JjError::Revision {
             revision: source.id().to_string(),
             detail: "every parent of the release is an earlier write of it, so there is no \
@@ -3271,7 +3307,7 @@ fn duplicated_without_carriers(
     }
     let in_between = block_on(
         tx.repo_mut()
-            .new_commit(members, source.tree())
+            .new_commit(measured, source.tree())
             .set_description(source.description())
             .set_author(source.author().clone())
             .write(),
@@ -3447,13 +3483,15 @@ pub enum ResolutionBaseline<'a> {
     Written(&'a CommitId),
     /// A recorded write this repository holds, rebuilt on the resolution's
     /// `members` as a knives write onto them builds it: `write`'s own change,
-    /// its `carriers` left out, rebased onto them with the release-log
-    /// union, the tree [`Repo::holds_rebased_write`] reads. A member
-    /// rewritten in place, which makes jj rebase the release, is then no
-    /// change of the resolution's.
+    /// its tree against the merge of `composed`, what it composes (its
+    /// parents less its carriers, or a stacked write's previous release and
+    /// members), rebased onto them with the release-log union, the tree
+    /// [`Repo::holds_rebased_write`] reads. A member rewritten in place,
+    /// which makes jj rebase the release, is then no change of the
+    /// resolution's.
     Rebuilt {
         write: &'a CommitId,
-        carriers: &'a [CommitId],
+        composed: &'a [CommitId],
         members: &'a [CommitId],
     },
     /// A fresh flat merge of these parents with the release-log union, as a
@@ -3498,9 +3536,9 @@ pub fn resolution_changes(
         ResolutionBaseline::Written(commit) => repo.commit(commit.as_str())?.tree(),
         ResolutionBaseline::Rebuilt {
             write,
-            carriers,
+            composed,
             members,
-        } => repo.rebuilt_write((write, carriers), members)?,
+        } => repo.rebuilt_write((write, composed), members)?,
         ResolutionBaseline::Automerge(parents) => {
             validate_parents(None, parents)?;
             let (parent_commits, parent_ids) = resolved_parents(repo, parents)?;
@@ -3541,8 +3579,8 @@ pub struct CutSpec {
     pub source: Option<CommitId>,
     pub parents: Vec<CommitId>,
     /// The parents of `source` that are earlier writes of its name, left out
-    /// of what the duplicate measures it against
-    /// ([`duplicated_without_carriers`]).
+    /// of what the duplicate measures it against ([`without_carriers`],
+    /// [`duplicated_from`]).
     pub carriers: Vec<CommitId>,
     pub message: String,
 }
@@ -3592,8 +3630,8 @@ pub fn candidate_release(repo: &Path, spec: CutSpec) -> Result<Candidate, JjErro
 
 /// The release commit `spec` describes, written into `tx`, and the release
 /// logs it unioned. A source with carriers goes through the in-between commit
-/// a release write uses ([`duplicated_without_carriers`]), in the audited
-/// candidate and in the published rebuild alike, so both hold the same tree.
+/// a release write uses ([`duplicated_from`]), in the audited candidate and in
+/// the published rebuild alike, so both hold the same tree.
 fn spec_commit(
     repo: &Repo,
     tx: &mut Transaction,
@@ -3602,10 +3640,10 @@ fn spec_commit(
     let (parent_commits, parent_ids) = resolved_parents(repo, &spec.parents)?;
     if let Some(source) = &spec.source {
         let source = repo.commit(source.as_str())?;
-        duplicated_without_carriers(
+        duplicated_from(
             tx,
             (&source, Some(&spec.message)),
-            &spec.carriers,
+            without_carriers(&source, &spec.carriers),
             &parent_ids,
         )
     } else {

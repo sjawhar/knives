@@ -90,13 +90,14 @@ Below, C is a release of the series, and P is its previous release.
 - **`adopt`** measures a hand resolution against the merge of P and the members, with the release-log union. It counts only the members' lines: each member's added lines are measured from its fork point with P. So a member's deletion of P's lines is no lost line ([adopt](#knives-release-adopt-name---why-text)).
 - **The orphan gate** does not run. A stacked cut keeps P as its first parent, and the reap abandons nothing that the cut descends from. So the cut strands no commit, and it needs no `--allow-drop`.
 - **The reap** forgets a superseded name that the live release descends from, and keeps its commit ([reap](#knives-release-reap)).
+- **A release made outside knives**, a chain of merges included, is recorded with [`cut NAME --at REV`](#knives-release-cut-name---at-rev). An edit measures the release's own change against the merge of P and its members, not against its literal parents. So an edit of a chain keeps what each inner merge resolved, and so does the check that reads the release as recorded once jj rebases it over a member rewritten in place.
 
 ## `knives release cut [NAME] [--allow-drop]`
 
 - A normal cut carries the composition in hand: previous parents **verbatim by commit id**, even if a member bookmark is now divergent. It adds no branches and advances no members. Only the first cut, with no composition, starts from every branch. A cut in a [stacked series](#stacked-series) starts as one commit on the previous release instead.
 - The cut audits the candidate first. The net diff of each member, from the members' fork point with upstream trunk, must be in the cut tree. In a stacked series, each member is measured from its fork point with the previous release. Divergence that the release in hand already has is carried forward: `diverges where the release in hand (a recorded write) already does; carried forward`.
 - The cut refuses an unrecorded release in hand, exit `3`, and writes nothing, whatever its audit would say ([below](#adopt-a-hand-resolution-before-the-next-write)). So the divergence it carries forward is a resolution that knives wrote or `adopt` recorded, a release that knives could not check, or a release whose name has no recorded write at all. For a release that knives could not check, the carried rows say `diverges where the unrecorded in-hand release already does`, and say to record it with `knives release adopt` and cut again ([unchecked](#when-knives-cannot-check-the-release-in-hand)). For a release whose name has no recorded write at all, the carried rows say `the ledger records no write of the release in hand, so nothing measured its divergence from this member; check that divergence by hand`. Nothing recorded or measured that divergence, and `adopt` refuses a release with no recorded write, so check each such member's divergence yourself. The cut is still written, with the exit it would have without the rows. It also prints the unchecked line and marks its event `; unchecked: no record` ([unchecked](#when-knives-cannot-check-the-release-in-hand)). `knives release adopt <new name>` records the new name, and the cut after that carries the divergence forward as a recorded write's.
-- A failed audit writes no cut. A pass makes and names the release in one operation, except for the fixed recording path below.
+- A failed audit writes no cut. A pass makes and names the release in one operation, except for the fixed recording path below and for `--at`, which records a release cut outside knives and makes no commit ([`cut NAME --at REV`](#knives-release-cut-name---at-rev)).
 - A cut lists a workspace to remove only when the ledger names its branch, no bookmark of that branch is left locally or on any remote, and no live claim holds it. It never lists the default workspace, a workspace knives did not make, or a `knives start` workspace whose release a reap forgot.
 
 ### Gates
@@ -119,6 +120,38 @@ Below, C is a release of the series, and P is its previous release.
 
 Cut and edit events keep full parent commits, every bookmark on them, and the commit and change id each wrote, in the [ledger](ledger.md). Use that evidence, not the current bookmark names, to find lost members.
 
+## `knives release cut NAME --at REV`
+
+Records a release cut outside knives as the recorded cut of NAME. REV is a revision that names one commit. Use it for a release that a person or a script merged by hand, such as a compose script's chain of merges. The command makes no commit, uses no temporary name and makes no throwaway cut. After it, `adopt`, the edit verbs and `audit` on each machine read the release as recorded.
+
+The gates come in this order. Each refusal writes nothing and exits `3`, except where this list says otherwise:
+
+1. NAME must be a dated cut of the series, in the grammar above. Any other name is a usage error (exit `2`). `--at` on a fixed release branch is a usage error too: a plain `cut` records the fixed branch's published composition ([identical-cut exceptions](#identical-cut-exceptions)).
+2. The plan must have no problems, and a shared ledger must pull, as for every cut.
+3. REV must name one commit. That commit must have no conflict (the refusal names the files), and it must not be a workspace's working copy (run `jj new` there first).
+4. When the ledger already records a write of NAME, and the newest one is REV, the command writes nothing, says `is already recorded`, and exits `0`. When the newest one is another commit, it refuses: a commit made over a recorded write is recorded with `knives release adopt NAME`.
+5. NAME must sort after every other release name of the series, locally and on the publish remote. It must also sort after every name that the ledger records a cut or edit of in the series. The refusal names the newer name. So record the older name first.
+6. Each ref of NAME, locally and on the publish remote, must name REV. Otherwise the command refuses and names each ref and its commit. When no ref of NAME exists, the command makes the local bookmark NAME at REV. It moves no other bookmark.
+7. When NAME is published (a tag or a `record: published` note names its commit), the publish remote must hold REV or a commit that descends from REV. Otherwise the command prints [the published remedy](#the-published-remedy).
+
+Then:
+
+- **The members.** In a [stacked series](#stacked-series) with a previous release P, the members are the reading's: the side parents on the first-parent line of REV, never the literal parents of REV. P is no member, and the event records it first, under its label. A commit with one parent on that line refuses REV. In any other series, the members are the parents of REV, carriers left out. A member that carries a merge past the trunk refuses the command: only a stacked series reads a release made as merges on its previous release. The refusal names the `stacked = true` setting on the series table.
+- **The audit.** Each member must replay empty onto REV, as in a cut: from its fork point with the trunk, or in a stacked series from its fork point with P. Nothing counts as carried forward, as in `members --verify`: a member that REV lacks, or whose lines REV changed, reads as missing. Then the composition gate holds REV against the ledger event of the previous cut ([gates](#gates)). `--allow-drop` works as for a cut. A failed audit or gate records nothing.
+- **The record.** The ledger gets one cut event, the event a knives cut writes, with `; recorded: composed outside knives` in its text. In a stacked series it records P under its label. It carries no `unchecked` mark. The event starts the background ledger sweep, so another machine reads the record after its next pull.
+- The command prints one line: `recorded NAME at <commit> as its cut; nothing was committed`. When the publish remote does not hold NAME, the line ends with `; push NAME with jj git push --remote <publish remote> --bookmark NAME`.
+- No orphan gate runs, because nothing is composed. No reap runs. Nothing is signed or pushed.
+
+An example: series `9.2` has `stacked = true`, and a compose script made its releases 8.0.9 and 8.1. Record the older name first, then read the newer one back:
+
+```bash
+knives release --series 9.2 cut release/9.2/2026-11-15-speed-8.0.9 --at <commit of 8.0.9>
+knives release --series 9.2 cut release/9.2/2026-11-17-speed-8.1 --at <commit of 8.1>
+knives release --series 9.2 members release/9.2/2026-11-17-speed-8.1 --verify
+```
+
+8.1 is the chain `merge(merge(merge(P, D), M6), M5)`, where P is 8.0.9. Its event records 8.0.9 as the previous release and D, M6 and M5 as the members. An edit of 8.1 measures its own change against the merge of 8.0.9 and its members, so the edit keeps what each inner merge of the chain resolved. So does the check that reads 8.1 as recorded after jj rebases it over a member rewritten in place.
+
 ## Editing members
 
 - **`include <branch> [--why "..."]`** adds one branch or revision as a parent. It does not move a member that grew, rebased (inside or outside jj) or merged upstream, which is `advance`. It refuses a second copy and explains the match. It refuses a tip that trunk already reaches, because that moves the base. Use `rebase` onto that trunk instead.
@@ -135,7 +168,7 @@ Records the commit a release name holds now as the name's newest knives write. U
 
 - It pulls the ledger and reads the plan, as the edit verbs do. The commit is the local bookmark's. With no local bookmark, it fetches, then reads the publish remote's ref of the name.
 - The write it replaces is the newest recorded write whose recorded parents, carriers left out, match the commit's parents, carriers left out. A parent matches when it is the recorded commit or a visible rewrite of it with the same change id. A recorded parent that this repository does not hold matches by commit id only. In a [stacked series](#stacked-series), the commit's members are the members that its reading gives, so the previous release is never one.
-- The baseline is that write rebuilt on the commit's member parents: the tree a knives write onto them holds, with the release-log union, the tree that decides whether the release in hand is recorded ([below](#adopt-a-hand-resolution-before-the-next-write)). So a member rewritten in place, which makes jj rebase the release, is no change of the commit's own. A commit equal to an older recorded write is measured against that write itself. Where this repository does not hold the write, or the write's event carries the `; unchecked:` mark, the baseline is a fresh merge of the commit's member parents with the release-log union. The output names the baseline. In a stacked series, the write is rebuilt on the previous release and the members, and the fresh merge is a merge of the previous release and the members.
+- The baseline is that write rebuilt on the commit's member parents: the tree a knives write onto them holds, with the release-log union, the tree that decides whether the release in hand is recorded ([below](#adopt-a-hand-resolution-before-the-next-write)). So a member rewritten in place, which makes jj rebase the release, is no change of the commit's own. A commit equal to an older recorded write is measured against that write itself. Where this repository does not hold the write, or the write's event carries the `; unchecked:` mark, the baseline is a fresh merge of the commit's member parents with the release-log union. The output names the baseline. In a stacked series, the write is rebuilt on the previous release and the members, and the fresh merge is a merge of the previous release and the members. The write's own change is measured against the merge of its own previous release and members, so a write made as a chain of merges keeps what each inner merge resolved.
 - When the commit is the newest recorded write, or a copy of it with the same change id, parents and tree, `adopt` writes nothing and exits `0`. The exception is a newest write whose event carries the `; unchecked:` mark: `adopt` records the commit again, with no mark, and so ends the mark ([unchecked](#when-knives-cannot-check-the-release-in-hand)). A commit equal to an older recorded write is recorded as the newest, so the audit clears.
 - Otherwise it abandons the earlier writes of the name that are visible heads nothing rests on, and records an `edited` event ([ledger](ledger.md)). Then it prints the adopted commit, the write it replaces and the baseline; the files resolved by hand; the files changed beyond the baseline's conflicts, with the reason; for each member and changed file, how many of the member's non-blank added lines, from its fork point with trunk, the commit does not hold; each carrier, labelled `<name> earlier write (carrier, not a member)`; and each commit it abandoned. In a stacked series, it measures each member's added lines from its fork point with the previous release. So a member's deletion of the previous release's lines is no lost line, and the event records the previous release under its label.
 - It exits `1` only against a recorded write, never against a fresh merge, and only for one of two losses: any of a member's added lines lost from a file that the baseline left without a conflict and that is not a release log, or none of the blocks a member added left in a release log or in a file that the baseline left conflicted. A block cut down there is the normal shape of a resolution: the counts report it, and the exit stays `0`. It records first. Read the counts, and repair the release if the resolution lost a member's change. A heading line that you renumbered is expected in the counts.
@@ -146,7 +179,7 @@ It refuses, exit `3`, and writes nothing in these cases:
 - The plan has problems, or a shared ledger did not pull.
 - Upstream trunk does not resolve. Each member's added lines are counted from its fork point with trunk, and a stacked release is read down to trunk.
 - The local bookmark is divergent. Or there is no local bookmark, and the publish remote holds no ref of the name after a fetch.
-- The ledger records no cut or edit of the name. Cut it first.
+- The ledger records no cut or edit of the name. Cut it first. For a release cut outside knives, record it with `knives release cut <name> --at <commit>` ([`cut NAME --at REV`](#knives-release-cut-name---at-rev)).
 - The commit still has conflicts (it names them), or it is a workspace's working copy (run `jj new` there first).
 - A file outside the baseline's conflicts changed, and there is no `--why`.
 - In a stacked series, a commit with one parent lies between the commit and its previous release. No member explains its change.
@@ -186,10 +219,10 @@ In each of two states, the new cut of step 3 exits `1` once. The cut is still wr
 
 ### Adopt a hand resolution before the next write
 
-- The release in hand is **unrecorded** when its tree differs from the tree of its matched recorded write rebased onto the release's parents, carriers left out. In a [stacked series](#stacked-series), the write is rebased onto the previous release and the members. A jj rebase of that write, a fast-forward carrier copy and a metadata rewrite are recorded. A hand edit is not.
+- The release in hand is **unrecorded** when its tree differs from the tree of its matched recorded write rebased onto the release's parents, carriers left out. In a [stacked series](#stacked-series), the write is rebased onto the previous release and the members, and the write's own change is measured against the merge of its own previous release and members, so a chain of merges keeps what its inner merges resolved. A jj rebase of that write, a fast-forward carrier copy and a metadata rewrite are recorded. A hand edit is not.
 - A release equal to any recorded write of its name, or a copy of one with the same change id, parents and tree, is recorded.
 - While the release in hand is unrecorded, `cut`, `include`, `drop`, `advance` and `rebase` refuse, exit `3`, and write nothing. The cut refuses whatever its audit would say. Each refusal names the remedy as a command: `knives release adopt <name>`. `adopt` asks for `--why` only for a change outside the conflicts.
-- When knives cannot check the release in hand, the write goes ahead and says so ([below](#when-knives-cannot-check-the-release-in-hand)). `adopt` records such a release when this repository does not hold its matched write, or when that write's event carries the `; unchecked:` mark. It refuses one whose members match no recorded write: an `include`, `drop` or `advance` records that composition, and `adopt` then records the release ([adopt](#knives-release-adopt-name---why-text)). It refuses a name with no recorded write at all, which has no write to replace: the next write over it records the name, marked, and `adopt` then records it.
+- When knives cannot check the release in hand, the write goes ahead and says so ([below](#when-knives-cannot-check-the-release-in-hand)). `adopt` records such a release when this repository does not hold its matched write, or when that write's event carries the `; unchecked:` mark. It refuses one whose members match no recorded write: an `include`, `drop` or `advance` records that composition, and `adopt` then records the release ([adopt](#knives-release-adopt-name---why-text)). It refuses a name with no recorded write at all, which has no write to replace. `knives release cut <name> --at <commit>` records such a name as it stands ([`cut NAME --at REV`](#knives-release-cut-name---at-rev)). Otherwise the next write over it records the name, marked, and `adopt` then records it.
 - A release whose every parent is a carrier makes every write refuse, with the remedy that `adopt` prints ([adopt](#knives-release-adopt-name---why-text)). An unrecorded published release that the publish remote does not hold gets [the published remedy](#the-published-remedy).
 - A release whose name has no recorded write at all is not refused, unless its every parent is a carrier. So a fork whose ledger predates knives is not blocked. Each write over it goes ahead marked `; unchecked: no record` ([below](#when-knives-cannot-check-the-release-in-hand)).
 - After a hand restore of a release (`jj restore --from <commit> --into <name> <path>...`), run `knives release adopt <name> --why '<what was restored and why>'`, then cut.
@@ -213,12 +246,12 @@ knives could not check <name> at <commit> against its recorded writes: the ledge
 
 - `knives release adopt <name>` ends the mark. Its event carries no mark. Nothing measured the marked write, so `adopt` measures the release against a fresh merge of its members.
 
-### Why `adopt` beside the fixed recording path
+### Why `adopt` beside the recording paths
 
-The fixed scheme's cut records a published commit that the ledger lacks (the recording path above). `adopt` is still needed:
+The fixed scheme's cut records a published commit that the ledger lacks (the recording path above). `cut NAME --at REV` records a release cut outside knives under a dated or series name ([above](#knives-release-cut-name---at-rev)). `adopt` is still needed:
 
-- Dated and series names have no recording path.
-- The recording path records only what the publish remote holds. `adopt` records a resolution before it is pushed.
+- `cut NAME --at REV` records only a name that the ledger records no write of. `adopt` records a commit made over a recorded write: a resolution, a renumbered log or a repair.
+- The fixed recording path records only what the publish remote holds. `adopt` records a resolution before it is pushed.
 - `adopt` records a name that this repository holds only as the publish remote's ref.
 - A fixed release pushed by the fast-forward rebase has a carrier. The candidate leaves the carrier out, so it no longer matches the published commit. The recording path and its "nothing to cut" refusal do not fire for it. `adopt` is how it is recorded.
 

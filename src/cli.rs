@@ -520,6 +520,17 @@ pub enum LedgerAction {
 #[derive(Debug, Subcommand)]
 pub enum ReleaseAction {
     /// Name a new cut of the composition in hand, verbatim. Never pushes.
+    ///
+    /// With `--at`, record a release cut outside knives instead: the commit
+    /// REV becomes NAME's recorded cut, and no commit is made. NAME must sort
+    /// after every other release of the series, so record the older name
+    /// first. REV must have no conflict and be no workspace's working copy,
+    /// every ref of NAME here or on the publish remote must name it, and a
+    /// published NAME must be one the publish remote holds. A NAME no ref
+    /// names gets a local bookmark at REV. The commit is audited as a cut is,
+    /// and the ledger event records its members: in a stacked series the side
+    /// parents on its first-parent line, with its previous release labelled
+    /// as no member. No reap runs, and nothing is signed or pushed.
     Cut {
         /// The dated release name, `release/[<series>/]YYYY-MM-DD[.N|-<label>]`.
         /// It must sort after the newest release of the series. Omit it for a
@@ -530,6 +541,12 @@ pub enum ReleaseAction {
         /// cut's ledger event recorded. The refusal lists exactly what.
         #[arg(long)]
         allow_drop: bool,
+        /// Record a release cut outside knives: the commit becomes NAME's
+        /// recorded cut; no commit is made. A dated or series NAME only: a
+        /// fixed release branch records its published composition with a
+        /// plain `cut`.
+        #[arg(long, value_name = "REV")]
+        at: Option<String>,
     },
     /// Rebase the composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
     ///
@@ -622,7 +639,9 @@ pub enum ReleaseAction {
     /// each member added that it no longer holds, and a file changed outside
     /// the conflicts needs `--why`. Writes no commit and moves no bookmark:
     /// the record is a ledger event, and earlier writes of the name that
-    /// nothing rests on are abandoned.
+    /// nothing rests on are abandoned. A name the ledger records no cut of,
+    /// a release cut outside knives, is recorded first with `knives release
+    /// cut NAME --at <commit>`.
     Adopt {
         /// The release name. Defaults to the release in hand.
         reference: Option<String>,

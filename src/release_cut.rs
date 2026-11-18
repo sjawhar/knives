@@ -29,6 +29,8 @@ pub(crate) enum ReleaseInvocation {
     Cut {
         name: Option<String>,
         allow_drop: bool,
+        /// The commit `--at` records `name` at: a release cut outside knives.
+        at: Option<String>,
     },
 }
 
@@ -56,7 +58,7 @@ pub(crate) fn run_release(
     let heads = knives::consumer_pins::ConsumerHeadMemo::default();
     let opened = knives::jj::Repo::open(path)?;
     let scheme = entry.release_scheme();
-    let (cut_name, allow_drop) = match requested_cut(invocation, &scheme, entry) {
+    let (cut_name, allow_drop, at) = match requested_cut(invocation, &scheme, entry) {
         Ok(request) => request,
         Err(exit) => return Ok(exit),
     };
@@ -74,6 +76,16 @@ pub(crate) fn run_release(
     }
 
     if let Some(name) = cut_name {
+        // A release cut outside knives is recorded, never composed: no orphan
+        // gate, no candidate, no reap.
+        if let Some(at) = at {
+            return Ok(worst.worst(record_hand_cut(
+                fork,
+                &opened,
+                (&name, at, allow_drop),
+                bound,
+            )?));
+        }
         let trunk_name = entry.trunk_ref();
         let trunk = opened.resolve_commit(&trunk_name)?;
         let orphaned = check_orphan_commits_before_cut(&opened, fork)?;
@@ -333,36 +345,35 @@ pub(crate) fn run_release(
                         .as_ref()
                         .is_none_or(|recorded| recorded.commit != *published)
                 {
-                    let audit = release::audit_cut(
-                        path,
-                        &members,
-                        release::CutSubject::Committed(published),
-                        release::AuditContext {
+                    let committed = CommittedCut {
+                        commit: published,
+                        members: &members,
+                        context: release::AuditContext {
                             previous: previous_commit.as_ref(),
                             trunk: &audit_base,
                         },
-                    )?;
-                    if let Some(exit) = report_cut_audit(repo, &audit, carried_from) {
-                        return Ok(exit);
-                    }
-                    let mut subject = release::CutSubject::Committed(published);
-                    let (recorded, check) =
-                        match recorded_composition_check(repo, &mut subject, &gate, allow_drop)? {
-                            Ok(verdict) => verdict,
+                        stacked_on: None,
+                        carried_from,
+                    };
+                    let checked =
+                        match checked_committed_cut(repo, &committed, (&gate, allow_drop))? {
+                            Ok(checked) => checked,
                             Err(exit) => return Ok(exit),
                         };
+                    let (audit, check) = (&checked.audit, &checked.check);
                     let completed = CompletedCut {
                         name: &name,
                         request: &request,
                         created: published,
-                        audit: &audit,
+                        audit,
                         scheme: &scheme,
-                        recorded: recorded.as_ref(),
-                        check: &check,
+                        recorded: checked.recorded.as_ref(),
+                        check,
                         stated_drop: None,
                         // Recorded as published, not written: knives unioned nothing.
                         unions: &[],
                         unchecked: &unchecked,
+                        outside: false,
                     };
                     record_cut_event(fork, &completed, bound)?;
                     println!(
@@ -437,6 +448,7 @@ pub(crate) fn run_release(
             stated_drop: orphaned.as_ref(),
             unions: &unions,
             unchecked: &unchecked,
+            outside: false,
         };
         record_cut_event(fork, &completed, bound)?;
         worst = worst.worst(report_completed_cut(fork, &opened, &completed, bound)?);
@@ -451,14 +463,32 @@ pub(crate) fn run_release(
     Ok(worst)
 }
 
-fn requested_cut(
-    invocation: &ReleaseInvocation,
+/// The name a cut takes, `--allow-drop`, and the commit `--at` records the
+/// name at, or the usage error's exit after saying why.
+fn requested_cut<'a>(
+    invocation: &'a ReleaseInvocation,
     scheme: &knives::ids::ReleaseScheme,
     entry: &knives::config::RepoEntry,
-) -> Result<(Option<String>, bool), Exit> {
+) -> Result<(Option<String>, bool, Option<&'a str>), Exit> {
     match invocation {
-        ReleaseInvocation::Plan => Ok((None, false)),
-        ReleaseInvocation::Cut { name, allow_drop } => {
+        ReleaseInvocation::Plan => Ok((None, false, None)),
+        ReleaseInvocation::Cut {
+            name,
+            allow_drop,
+            at,
+        } => {
+            // A fixed branch has a recording path of its own.
+            if at.is_some()
+                && let ReleaseScheme::Fixed(fixed) = scheme
+            {
+                eprintln!(
+                    "--at records a dated release cut outside knives, and this repo releases on \
+                     the fixed branch {fixed}: a plain `knives release cut` records {fixed}@{} as \
+                     its cut when that ref holds the composition in hand and no cut records it",
+                    entry.publish_remote()
+                );
+                return Err(Exit::Usage);
+            }
             // A series' own prefix is refused first, with its own reason: the
             // grammar would refuse it too, as a name with no date.
             match name
@@ -468,7 +498,7 @@ fn requested_cut(
                 })
                 .and_then(|()| release::cut_name(scheme, name.as_deref()))
             {
-                Ok(name) => Ok((Some(name), *allow_drop)),
+                Ok(name) => Ok((Some(name), *allow_drop, at.as_deref())),
                 Err(message) => {
                     eprintln!("{message}");
                     Err(Exit::Usage)
@@ -811,7 +841,14 @@ struct CompletedCut<'a> {
     /// The mark the event ends with when knives could not check the release
     /// the cut duplicates ([`release::unchecked_suffix`]); empty otherwise.
     unchecked: &'a str,
+    /// Whether the cut is a release composed outside knives that `cut NAME
+    /// --at` records: its event says so ([`RECORDED_OUTSIDE`]).
+    outside: bool,
 }
+
+/// What the event of a cut composed outside knives says after the previous
+/// cut's restatement: `cut NAME --at` recorded it, knives wrote no commit.
+const RECORDED_OUTSIDE: &str = "; recorded: composed outside knives";
 
 /// Record which branches and commits became a published release cut.
 ///
@@ -821,8 +858,9 @@ struct CompletedCut<'a> {
 /// change id survives the
 /// rewrite and still resolves to the release. Evidence keeps the commit first:
 /// the composition gate parses it from that position. The release logs the
-/// cut unioned close the text, after everything a reader of the event parses.
-/// The parents recorded are the cut's composition ([`cut_composition`]).
+/// cut unioned close the text, after everything a reader of the event parses,
+/// and a cut composed outside knives says so before them. The parents
+/// recorded are the cut's composition ([`cut_composition`]).
 fn record_cut_event(
     fork: &Fork<'_>,
     cut: &CompletedCut<'_>,
@@ -877,11 +915,12 @@ fn record_cut_event(
         ..Draft::event(
             Some(cut.name),
             format!(
-                "cut {} as {} (change {}) with {} parent(s): {members_text}{delta}{}{}",
+                "cut {} as {} (change {}) with {} parent(s): {members_text}{delta}{}{}{}",
                 cut.name,
                 cut.created.short(),
                 change.short(),
                 members.len(),
+                if cut.outside { RECORDED_OUTSIDE } else { "" },
                 union_event_text(cut.unions),
                 cut.unchecked
             ),
@@ -926,6 +965,480 @@ fn cut_composition(
         entry,
         scheme,
         &opened.parent_commits(created.as_str())?,
+    )
+}
+
+/// A commit knives did not write, held as every cut is held before it is
+/// recorded: the fixed branch's published composition ([`run_release`]) and
+/// a release cut outside knives ([`record_hand_cut`]).
+struct CommittedCut<'a> {
+    commit: &'a CommitId,
+    /// Each member with where it came from, as the audit replays them.
+    members: &'a [(String, CommitId)],
+    context: release::AuditContext<'a>,
+    /// The previous release a release of a stacked series stacks on, which
+    /// the audit measures each member from ([`release::audit_cut_from`]).
+    stacked_on: Option<&'a CommitId>,
+    carried_from: release::CarriedFrom,
+}
+
+/// What [`checked_committed_cut`] found, for the cut event to restate.
+struct CheckedCut {
+    audit: release::CutAudit,
+    recorded: Option<RecordedCut>,
+    check: release::CompositionCheck,
+}
+
+/// Audit `cut`'s commit ([`report_cut_audit`]), then hold it against the
+/// previous cut's recorded composition ([`recorded_composition_check`]). `Err`
+/// is the exit of a refusal, already reported: nothing is recorded.
+fn checked_committed_cut(
+    repo: &RepoName,
+    cut: &CommittedCut<'_>,
+    (gate, allow_drop): (&CompositionGate<'_>, bool),
+) -> anyhow::Result<Result<CheckedCut, Exit>> {
+    let audit = release::audit_cut_from(
+        gate.path,
+        cut.members,
+        release::CutSubject::Committed(cut.commit),
+        (cut.context, cut.stacked_on),
+    )?;
+    if let Some(exit) = report_cut_audit(repo, &audit, cut.carried_from) {
+        return Ok(Err(exit));
+    }
+    let mut subject = release::CutSubject::Committed(cut.commit);
+    Ok(
+        recorded_composition_check(repo, &mut subject, gate, allow_drop)?.map(
+            |(recorded, check)| CheckedCut {
+                audit,
+                recorded,
+                check,
+            },
+        ),
+    )
+}
+
+/// `knives release cut NAME --at REV`: record the commit `at` names, a
+/// release cut outside knives, as `name`'s cut. No commit is made, and no
+/// orphan gate, reap, signing or push runs.
+///
+/// The name and the pulled plan are gated before this ([`requested_cut`],
+/// [`release_plan_exit`]), and the commit and its name here
+/// ([`hand_cut_gates`]). Its members are its series' reading of it
+/// ([`hand_cut_composition`]), audited and held against the previous cut's
+/// record as every cut is ([`checked_committed_cut`]). Each refusal writes
+/// nothing. Only then is the local bookmark made, where no ref of the name
+/// exists, and the event recorded, which starts the background ledger sweep.
+fn record_hand_cut(
+    fork: &Fork<'_>,
+    opened: &knives::jj::Repo,
+    (name, at, allow_drop): (&str, &str, bool),
+    bound: Bound<'_>,
+) -> anyhow::Result<Exit> {
+    let (repo, entry) = (&fork.name, fork.entry);
+    // The pulled plan refused on any problem this read finds.
+    let ledger = Ledger::for_fork(fork).read()?.entries;
+    let tips = opened.bookmark_tips()?;
+    let held = match hand_cut_gates((fork, opened), (name, at), (&ledger, &tips))? {
+        Ok(held) => held,
+        Err(exit) => return Ok(exit),
+    };
+    let commit = &held.commit;
+    let writes = EarlierWrites::read(opened, name, &ledger, held.published.as_ref())?;
+    let trunk = opened.resolve_commit(&entry.trunk_ref())?;
+    let composed =
+        match hand_cut_composition((fork, opened), (name, commit), (&ledger, &writes), &trunk)? {
+            Ok(composed) => composed,
+            Err(exit) => return Ok(exit),
+        };
+    let parents = opened.parent_commits(commit.as_str())?;
+    let gate = CompositionGate {
+        ledger: Ledger::for_fork(fork),
+        entry,
+        opened,
+        path: &fork.checkout.path,
+        parents: &parents,
+        base: &composed.base,
+        trunk: &trunk,
+        tips: &tips,
+    };
+    let committed = CommittedCut {
+        commit,
+        members: &composed.members,
+        // Measured against no earlier release: a member this commit lacks
+        // is missing, however the commit came to drop it.
+        context: release::AuditContext {
+            previous: None,
+            trunk: &composed.base,
+        },
+        stacked_on: composed.previous.as_ref(),
+        carried_from: release::CarriedFrom::Unledgered,
+    };
+    let checked = match checked_committed_cut(repo, &committed, (&gate, allow_drop))? {
+        Ok(checked) => checked,
+        Err(exit) => return Ok(exit),
+    };
+    if !held.named {
+        knives::jj::set_bookmark(&fork.checkout.path, name, commit.as_str())?;
+    }
+    record_cut_event(
+        fork,
+        &CompletedCut {
+            name,
+            request: &release::Cut::from_carried(name.to_owned(), &composed.members),
+            created: commit,
+            audit: &checked.audit,
+            scheme: &entry.release_scheme(),
+            recorded: checked.recorded.as_ref(),
+            check: &checked.check,
+            stated_drop: None,
+            // Recorded, not written: knives unioned nothing.
+            unions: &[],
+            unchecked: "",
+            outside: true,
+        },
+        bound,
+    )?;
+    let publish_remote = entry.publish_remote();
+    println!(
+        "{}",
+        recorded_hand_cut_line(
+            repo,
+            (name, commit),
+            held.published.is_none().then_some(publish_remote)
+        )
+    );
+    // A commit with no conflict leaves no replay inconclusive.
+    Ok(Exit::Ok)
+}
+
+/// The commit a release cut outside knives is recorded at, as its gates
+/// read it and its name ([`hand_cut_gates`]).
+struct HandCutAt {
+    commit: CommitId,
+    /// Whether a ref of the name exists here or on the publish remote: each
+    /// names the commit. With none, the record makes the local bookmark.
+    named: bool,
+    /// The publish remote's commit of the name: the commit, or none.
+    published: Option<CommitId>,
+}
+
+/// The gates of `cut NAME --at REV` after the name's and the plan's, in this
+/// order, each refusal writing nothing and exiting 3: REV is one commit,
+/// finished ([`super::release_adopt::refuse_unfinished_commit`]); a recorded
+/// write of the name is REV, which is already the record (exit 0), or
+/// `adopt`'s to replace ([`refuse_recorded_name`]); the name sorts after
+/// every other release of the series ([`newer_release`]); each ref of the
+/// name names REV ([`name_refs`]); a published name is one the publish
+/// remote holds ([`release::published_hand_edit_refusal`]). `Err` is the
+/// exit, after saying why.
+fn hand_cut_gates(
+    (fork, opened): (&Fork<'_>, &knives::jj::Repo),
+    (name, at): (&str, &str),
+    (ledger, tips): (&[knives::ledger::Entry], &knives::detect::BookmarkTips),
+) -> anyhow::Result<Result<HandCutAt, Exit>> {
+    let (repo, entry) = (&fork.name, fork.entry);
+    let shown = inline_human_text(name);
+    let commit = match opened.resolve_commit(at) {
+        Ok(commit) => commit,
+        Err(error) => {
+            println!(
+                "{repo}: refusing to record {shown}: {} does not resolve to one commit ({})",
+                inline_human_text(at),
+                problem_human_text(&error.to_string())
+            );
+            return Ok(Err(Exit::Incomplete));
+        }
+    };
+    if super::release_adopt::refuse_unfinished_commit(
+        repo,
+        opened,
+        (name, &commit),
+        ("record it", "recorded"),
+    )? {
+        return Ok(Err(Exit::Incomplete));
+    }
+    if let Some(exit) = refuse_recorded_name(repo, (name, &commit), ledger) {
+        return Ok(Err(exit));
+    }
+    let publish_remote = entry.publish_remote();
+    if let Some((newer, held)) = newer_release(
+        &entry.release_scheme(),
+        (tips, publish_remote),
+        ledger,
+        name,
+    ) {
+        println!(
+            "{repo}: refusing to record {shown}: {} sorts after it, and {held}; a record takes a \
+             name that sorts after every other release of the series, so record each release in \
+             order, the older name first",
+            inline_human_text(&newer)
+        );
+        return Ok(Err(Exit::Incomplete));
+    }
+    let refs = name_refs(opened, (tips, publish_remote), name)?;
+    if refs
+        .iter()
+        .any(|(_, targets)| targets.as_slice() != std::slice::from_ref(&commit))
+    {
+        let listed: Vec<String> = refs
+            .iter()
+            .map(|(reference, targets)| {
+                let targets: Vec<&str> = targets.iter().map(CommitId::short).collect();
+                format!("{reference} at {}", targets.join(" and "))
+            })
+            .collect();
+        println!(
+            "{repo}: refusing to record {shown} at {}: each ref of it must name that commit, and \
+             its refs are {}; record the commit they name, or move them first",
+            commit.short(),
+            listed.join(", ")
+        );
+        return Ok(Err(Exit::Incomplete));
+    }
+    let published = tips.get(&BookmarkRef::Remote {
+        branch: BranchName::new(name),
+        remote: RemoteName::new(publish_remote),
+    });
+    if let Some(remedy) =
+        release::published_hand_edit_refusal((opened, ledger), (name, &commit, published), entry)?
+    {
+        println!("{repo}: {remedy}");
+        return Ok(Err(Exit::Incomplete));
+    }
+    Ok(Ok(HandCutAt {
+        published: published.cloned(),
+        named: !refs.is_empty(),
+        commit,
+    }))
+}
+
+/// What `cut NAME --at` says once it recorded `name` at `commit`, with the
+/// push to make when `push_to`, the publish remote, does not hold the name.
+fn recorded_hand_cut_line(
+    repo: &RepoName,
+    (name, commit): (&str, &CommitId),
+    push_to: Option<&str>,
+) -> String {
+    // The name is the caller's, kept to the series' grammar, whose label
+    // takes any character but `/`.
+    let shown = inline_human_text(name);
+    let push = push_to.map_or_else(String::new, |remote| {
+        format!("; push {shown} with jj git push --remote {remote} --bookmark {shown}")
+    });
+    format!(
+        "{repo}: recorded {shown} at {} as its cut; nothing was committed{push}",
+        commit.short()
+    )
+}
+
+/// The refusal of a name the ledger already records a write of, unless the
+/// newest such write is `commit`, which is already the record: `Some(Ok)`
+/// after saying so. A commit made over a recorded write is `adopt`'s to
+/// record, never a cut's.
+fn refuse_recorded_name(
+    repo: &RepoName,
+    (name, commit): (&str, &CommitId),
+    ledger: &[knives::ledger::Entry],
+) -> Option<Exit> {
+    let newest = knives::release_model::recorded_writes(ledger, name).next()?;
+    let (shown, described) = (inline_human_text(name), release::described_write(&newest));
+    if newest.commit == *commit {
+        println!(
+            "{repo}: {shown} at {} is already recorded, {described}; nothing to record",
+            commit.short()
+        );
+        return Some(Exit::Ok);
+    }
+    println!(
+        "{repo}: refusing to record {shown} at {}: the ledger already records {shown}, newest as \
+         {described}; a commit made over a recorded write is recorded with `knives release adopt \
+         {shown}`",
+        commit.short()
+    );
+    Some(Exit::Incomplete)
+}
+
+/// The newest release of `scheme` other than `name` that sorts after it or
+/// with it, and where it is held: a ref here or on `publish_remote`
+/// ([`knives::release_model::newest_release`]), or a cut or edit the ledger
+/// records.
+///
+/// A record takes a name that sorts after every other release of its series,
+/// as a cut does: the reap after the next cut keeps only the newest name, and
+/// the previous release of a stacked series is the nearest one recorded on
+/// its first-parent line.
+fn newer_release(
+    scheme: &ReleaseScheme,
+    (tips, publish_remote): (&knives::detect::BookmarkTips, &str),
+    ledger: &[knives::ledger::Entry],
+    name: &str,
+) -> Option<(String, &'static str)> {
+    let key = scheme.cut_key(name)?;
+    let others: knives::detect::BookmarkTips = tips
+        .iter()
+        .filter(|(reference, _)| reference.branch().as_str() != name)
+        .map(|(reference, commit)| (reference.clone(), commit.clone()))
+        .collect();
+    let held = knives::release_model::newest_release(&others, scheme, publish_remote).map(
+        |(reference, _)| {
+            (
+                reference.branch().to_string(),
+                "a ref here or on the publish remote names it",
+            )
+        },
+    );
+    let subjects: std::collections::BTreeSet<&str> = ledger
+        .iter()
+        .filter_map(|event| event.subject.as_deref())
+        .filter(|subject| *subject != name && scheme.owns(subject))
+        .collect();
+    let recorded = subjects
+        .into_iter()
+        .filter(|subject| {
+            knives::release_model::recorded_writes(ledger, subject)
+                .next()
+                .is_some()
+        })
+        .map(|subject| (subject.to_owned(), "the ledger records a cut or edit of it"));
+    held.into_iter()
+        .chain(recorded)
+        .filter(|(newer, _)| scheme.cut_key(newer) >= Some(key))
+        .max_by(|(left, _), (right, _)| scheme.cut_key(left).cmp(&scheme.cut_key(right)))
+}
+
+/// Every ref of `name` here and on `publish_remote`, each with what it
+/// names: its commit, or each target of a divergent ref.
+fn name_refs(
+    opened: &knives::jj::Repo,
+    (tips, publish_remote): (&knives::detect::BookmarkTips, &str),
+    name: &str,
+) -> anyhow::Result<Vec<(String, Vec<CommitId>)>> {
+    let ours = |reference: &BookmarkRef| {
+        reference.branch().as_str() == name
+            && match reference {
+                BookmarkRef::Local(_) => true,
+                BookmarkRef::Remote { remote, .. } => remote.as_str() == publish_remote,
+            }
+    };
+    // Each is a ref read from the repository.
+    let mut refs: Vec<(String, Vec<CommitId>)> = tips
+        .iter()
+        .filter(|(reference, _)| ours(reference))
+        .map(|(reference, commit)| {
+            (
+                inline_human_text(&reference.to_string()),
+                vec![commit.clone()],
+            )
+        })
+        .collect();
+    refs.extend(
+        opened
+            .conflicted_bookmarks()?
+            .into_iter()
+            .filter(|(reference, _)| ours(reference))
+            .map(|(reference, targets)| (inline_human_text(&reference.to_string()), targets)),
+    );
+    Ok(refs)
+}
+
+/// What a release cut outside knives composes, as its series reads it.
+struct HandCut {
+    /// The previous release a release of a stacked series stacks on.
+    previous: Option<CommitId>,
+    /// Each member with where it came from ([`release::parent_sources`]).
+    members: Vec<(String, CommitId)>,
+    /// What the audit replays each member from and the composition gate's
+    /// base: the previous release, or the trunk's fork point with the
+    /// members, as for a first cut.
+    base: CommitId,
+}
+
+/// The members of `commit`, a release cut outside knives, as its series
+/// reads it ([`release::release_reading`]), or the exit after refusing it.
+///
+/// A stacked series that has a previous release reads it as that release
+/// and the side parents on its first-parent line, and refuses it when that
+/// line holds a one-parent commit. Otherwise its members are its parents,
+/// its carriers left out, and a member that carries a merge past the trunk
+/// refuses it: only a stacked series reads a release made as merges on its
+/// previous release ([`stacked_record_remedy`]).
+fn hand_cut_composition(
+    (fork, opened): (&Fork<'_>, &knives::jj::Repo),
+    (name, commit): (&str, &CommitId),
+    (ledger, writes): (&[knives::ledger::Entry], &EarlierWrites),
+    trunk: &CommitId,
+) -> anyhow::Result<Result<HandCut, Exit>> {
+    let (repo, entry) = (&fork.name, fork.entry);
+    let (shown, at) = (inline_human_text(name), commit.short());
+    let reading = match release::release_reading(opened, entry, ledger, (writes, commit))? {
+        Ok(reading) => reading,
+        Err(unexplained) => {
+            // The previous release's name is a ledger subject or a ref.
+            println!(
+                "{repo}: refusing to record {shown} at {at}: {}",
+                inline_human_text(&unexplained.to_string())
+            );
+            return Ok(Err(Exit::Incomplete));
+        }
+    };
+    let members =
+        release::parent_sources(opened, entry, &entry.release_scheme(), &reading.members)?;
+    if let Some(previous) = reading.previous {
+        return Ok(Ok(HandCut {
+            base: previous.commit.clone(),
+            previous: Some(previous.commit),
+            members,
+        }));
+    }
+    let stacked = stacked_branches(opened, entry, &members)?;
+    if !stacked.is_empty() {
+        for detail in &stacked {
+            println!("{repo}: {detail}");
+        }
+        println!(
+            "{repo}: refusing to record {shown} at {at}: {}",
+            stacked_record_remedy(fork)
+        );
+        return Ok(Err(Exit::Incomplete));
+    }
+    let tips: Vec<CommitId> = members.iter().map(|(_, tip)| tip.clone()).collect();
+    let base = opened
+        .common_ancestor(&tips, trunk)?
+        .unwrap_or_else(|| trunk.clone());
+    Ok(Ok(HandCut {
+        previous: None,
+        members,
+        base,
+    }))
+}
+
+/// Why a release cut outside knives whose member carries a merge past the
+/// trunk is refused, and what records it.
+fn stacked_record_remedy(fork: &Fork<'_>) -> String {
+    let entry = fork.entry;
+    if entry.stacked() {
+        return "no previous release of the series is on its first-parent line, so it reads as \
+                the series' first cut, which is flat; rebase each member above off the trunk"
+            .to_owned();
+    }
+    let setting = entry.selected_series.as_ref().map_or_else(
+        || {
+            "only a named series whose table sets `stacked = true` reads one, and the default \
+             series has no table; record it in such a series"
+                .to_owned()
+        },
+        |series| {
+            format!(
+                "only a series with `stacked = true` on its table reads one; set `stacked = true` \
+                 on [repos.{}.series.\"{series}\"] to record it",
+                fork.name
+            )
+        },
+    );
+    format!(
+        "a member above stacks on an earlier merge, as a release made as merges on its previous \
+         release does; {setting}, or rebase each member off the trunk"
     )
 }
 
@@ -1150,6 +1663,22 @@ fn refuse_stacked_first_cut(
     entry: &knives::config::RepoEntry,
     carried: &[(String, knives::ids::CommitId)],
 ) -> anyhow::Result<bool> {
+    let stacked = stacked_branches(opened, entry, carried)?;
+    for detail in &stacked {
+        println!("{repo}: {detail}; rebase it off the trunk before cutting");
+    }
+    Ok(!stacked.is_empty())
+}
+
+/// What each branch of `carried` whose history carries a merge past the
+/// trunk is told ([`knives::release_model::stacked_history`]), escaped for a
+/// terminal: the detail names the branch and the release refs it stacks on.
+/// A flat release composes none.
+fn stacked_branches(
+    opened: &knives::jj::Repo,
+    entry: &knives::config::RepoEntry,
+    carried: &[(String, knives::ids::CommitId)],
+) -> anyhow::Result<Vec<String>> {
     let trunks = trunk_positions(opened, entry)?;
     let releases = knives::release_model::release_refs_by_commit(
         &opened.bookmark_tips()?,
@@ -1164,18 +1693,13 @@ fn refuse_stacked_first_cut(
         written: &std::collections::BTreeSet::new(),
         replaced: None,
     };
-    let mut refused = false;
+    let mut stacked = Vec::new();
     for (branch, tip) in carried {
-        if let Some(stacked) = knives::release_model::stacked_history(context, branch, tip)? {
-            // The detail names the branch and the release refs it stacks on.
-            println!(
-                "{repo}: {}; rebase it off the trunk before cutting",
-                inline_human_text(&stacked.detail)
-            );
-            refused = true;
+        if let Some(finding) = knives::release_model::stacked_history(context, branch, tip)? {
+            stacked.push(inline_human_text(&finding.detail));
         }
     }
-    Ok(refused)
+    Ok(stacked)
 }
 
 /// Reap superseded dated cuts now that a newer one exists.

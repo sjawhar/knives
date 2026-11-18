@@ -477,10 +477,18 @@ fn dispatch_release(
 ) -> anyhow::Result<Exit> {
     match action {
         None => run_release(fork, extra_consumers, &ReleaseInvocation::Plan, bound),
-        Some(ReleaseAction::Cut { name, allow_drop }) => run_release(
+        Some(ReleaseAction::Cut {
+            name,
+            allow_drop,
+            at,
+        }) => run_release(
             fork,
             extra_consumers,
-            &ReleaseInvocation::Cut { name, allow_drop },
+            &ReleaseInvocation::Cut {
+                name,
+                allow_drop,
+                at,
+            },
             bound,
         ),
         Some(ReleaseAction::Rebase { reference, no_drop }) => {
