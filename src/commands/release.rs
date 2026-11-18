@@ -3341,6 +3341,20 @@ impl CutAudit {
     pub const fn passed(&self) -> bool {
         self.missing.is_empty() && self.unexplained.is_empty()
     }
+
+    /// Leave out of the drift each file that one of `fixes`, the fixes by
+    /// hand the composition gate after the audit holds ([`adopted_fixes`]),
+    /// changed.
+    ///
+    /// A fix is no member's content, so no member tip explains its loss, and
+    /// the gate, not the drift check, refuses a subject that lacks the fix,
+    /// once, naming its adopt. A subject that carries the fix while the
+    /// release it follows lacks it has no drift there either: the gate
+    /// finds the fix carried.
+    pub fn leave_fixes_to_gate(&mut self, fixes: &[AdoptedFix]) {
+        self.unexplained
+            .retain(|file| !fixes.iter().any(|fix| fix.files.contains(file)));
+    }
 }
 
 /// What a cut audit measures its members and its drift from ([`audit_cut`]).
@@ -3574,7 +3588,9 @@ impl CutSubject<'_> {
 /// member it lacks is missing. The series' first record outside knives
 /// follows no release, and its drift is measured from `context.trunk`, its
 /// members' fork point with the trunk. With no `drift_from` there is no
-/// drift check, as for a first cut.
+/// drift check, as for a first cut. A caller that holds fixes by hand after
+/// the audit leaves their files out of the drift
+/// ([`CutAudit::leave_fixes_to_gate`]).
 ///
 /// Auditing a [`CutSubject::Candidate`] reads a merge that no other observer
 /// can see and that a failure simply drops — nothing to compensate, nothing
@@ -3690,12 +3706,13 @@ pub struct CompositionCheck {
     /// write's release, whatever members it carries.
     pub off_line: bool,
     /// The adopts whose fix by hand the subject lacks, by commit, among the
-    /// newest release's fixes ([`CompositionDelta::fixes`]).
+    /// fixes the series holds ([`CompositionDelta::fixes`]).
     pub dropped_fixes: Vec<CommitId>,
 }
 
-/// A fix by hand that the newest release holds: what one of its `adopt`s
-/// recorded since its cut ([`adopted_fixes`]).
+/// A fix by hand that the series holds: what an `adopt` of one of its
+/// releases recorded, which the newest recorded write still carries
+/// ([`adopted_fixes`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdoptedFix {
     /// The release the adopt recorded.
@@ -3748,56 +3765,96 @@ impl FixBaseline {
     }
 }
 
-/// The fixes by hand that the newest release holds: one for each `adopt`
-/// the ledger records of it since its cut, newest first.
+/// The fixes by hand that the series holds, release by release, from the
+/// last name to the first, each release's newest adopt first.
+///
+/// There is one for each `adopt` that the ledger records of a release of
+/// `entry`'s series, before or after that release's cut, whose fix `write`
+/// still carries.
 ///
 /// `write` is the baseline's [`CompositionBaseline::newest_write`], the
 /// newest release's newest recorded write, and each release is read as
 /// `entry`'s series reads it, with `tips`, the caller's bookmarks. An adopt
 /// holds a fix when its event records one
-/// ([`crate::release_model::adopted_fix_replaces`]), and a later write of
-/// the release keeps it, so every adopt after the release's cut is held,
-/// not only the newest write. Each fix is its adopt's change against the
-/// baseline that `adopt` measured it against ([`adopted_fix`]).
+/// ([`crate::release_model::adopted_fix_replaces`]). Each fix is its
+/// adopt's change against the baseline that `adopt` measured it against
+/// ([`adopted_fix`]).
+///
+/// `write` still carries a fix when the fix's change replays empty onto it,
+/// or when it holds, at every file the fix changed, what the adopt holds
+/// there ([`holds_fix`]). So a fix that a later cut or edit kept stays
+/// held, however many releases later, and a later adopt that removes the
+/// fix or changes those lines again lets it go. Where this repository
+/// cannot tell, as where it does not hold `write` or nothing here can
+/// measure the fix, an adopt of the newest release since its cut is held,
+/// as a later write of that release keeps it, and any other adopt is not.
 pub fn adopted_fixes(
     repo: &Repo,
     entry: &RepoEntry,
     (ledger, tips): (&[Entry], &BookmarkTips),
     write: Option<&crate::release_model::RecordedCut>,
-) -> Result<Vec<AdoptedFix>, jj::JjError> {
+) -> anyhow::Result<Vec<AdoptedFix>> {
     let Some(write) = write else {
         return Ok(Vec::new());
     };
-    let name = write.name.as_str();
-    let events: Vec<(&Entry, RecordedWrite)> =
-        crate::release_model::recorded_write_events(ledger, name).collect();
-    if events
-        .first()
-        .is_none_or(|(_, newest)| newest.commit != write.commit)
-    {
-        return Ok(Vec::new());
-    }
-    let since_cut = events
-        .iter()
-        .position(|(_, recorded)| recorded.kind == crate::release_model::RecordedWriteKind::Cut)
-        .map_or(events.len(), |cut| cut + 1);
-    let published = tips.get(&BookmarkRef::Remote {
-        branch: BranchName::new(name),
-        remote: RemoteName::new(entry.publish_remote()),
-    });
-    let writes = EarlierWrites::read(repo, name, ledger, published)?;
+    let newest = repo
+        .resolve_commit(write.commit.as_str())
+        .is_ok()
+        .then_some(&write.commit);
+    let names = crate::release_model::recorded_release_names(ledger, &entry.release_scheme());
     let mut fixes = Vec::new();
-    for (at, (event, adopt)) in events.iter().enumerate().take(since_cut) {
-        let Some(replaced) = crate::release_model::adopted_fix_replaces(event, name) else {
-            continue;
-        };
-        let replaced = events
+    for name in names.into_iter().rev() {
+        let events: Vec<(&Entry, RecordedWrite)> =
+            crate::release_model::recorded_write_events(ledger, name).collect();
+        if events
             .iter()
-            .skip(at + 1)
-            .find(|(_, older)| older.commit.short() == replaced);
-        let release = (entry, (ledger, tips), &writes);
-        if let Some(fix) = adopted_fix(repo, release, (name, &adopt.commit), replaced)? {
-            fixes.push(fix);
+            .all(|(event, _)| crate::release_model::adopted_fix_replaces(event, name).is_none())
+        {
+            continue;
+        }
+        // The adopts of the newest release since its cut: a later write of
+        // that release keeps each one.
+        let since_cut = if name == write.name {
+            events
+                .iter()
+                .position(|(_, recorded)| {
+                    recorded.kind == crate::release_model::RecordedWriteKind::Cut
+                })
+                .map_or(events.len(), |cut| cut + 1)
+        } else {
+            0
+        };
+        let published = tips.get(&BookmarkRef::Remote {
+            branch: BranchName::new(name),
+            remote: RemoteName::new(entry.publish_remote()),
+        });
+        let writes = EarlierWrites::read(repo, name, ledger, published)?;
+        for (at, (event, adopt)) in events.iter().enumerate() {
+            let Some(replaced) = crate::release_model::adopted_fix_replaces(event, name) else {
+                continue;
+            };
+            let kept = at < since_cut;
+            if !kept && (newest.is_none() || repo.resolve_commit(adopt.commit.as_str()).is_err()) {
+                continue;
+            }
+            let replaced = events
+                .iter()
+                .skip(at + 1)
+                .find(|(_, older)| older.commit.short() == replaced);
+            let release = (entry, (ledger, tips), &writes);
+            let Some(fix) = adopted_fix(repo, release, (name, &adopt.commit), replaced)? else {
+                continue;
+            };
+            let held = match newest {
+                Some(newest) if fix.measure.is_some() => {
+                    let mut subject = CutSubject::Committed(newest);
+                    holds_fix(repo, (repo.path(), &mut subject), &fix, Some(&fix.commit))?
+                }
+                _ => kept,
+            };
+            if held {
+                fixes.push(fix);
+            }
         }
     }
     Ok(fixes)
@@ -3876,19 +3933,21 @@ pub struct CompositionDelta<'a> {
     pub tips: &'a BookmarkTips,
     /// In a stacked series, the commit the cut subject starts on: the commit
     /// a record names, or the first parent of a cut, the previous release it
-    /// starts on. The newest recorded write must be this commit or on its
-    /// first-parent line ([`on_first_parent_line`]), so the subject carries
-    /// every level of the stack below it. `None` outside a stacked series.
+    /// starts on. The newest recorded write, a successor of it or a copy with
+    /// its tree must be this commit or on its first-parent line
+    /// ([`on_first_parent_line`]), so the subject carries every level of the
+    /// stack below it. `None` outside a stacked series.
     pub start: Option<&'a CommitId>,
-    /// The fixes by hand that the newest release holds, one for each
-    /// `adopt` since its cut ([`adopted_fixes`]). The subject must carry
-    /// each as it carries a member.
+    /// The fixes by hand that the series holds ([`adopted_fixes`]): each
+    /// adopt's fix, of any release of the series, that the newest recorded
+    /// write still carries. The subject must carry each as it carries a
+    /// member.
     pub fixes: &'a [AdoptedFix],
 }
 
 /// Members the baseline records that the cut subject does not carry, in a
 /// stacked series whether it starts off the newest write's line, and the
-/// fixes by hand of the newest release that it lacks.
+/// fixes by hand that the series holds that it lacks.
 ///
 /// Identity and ancestry account for a member that is still a parent, was
 /// advanced past, or entered through the cut's base. A member whose change was
@@ -3914,14 +3973,13 @@ pub struct CompositionDelta<'a> {
 /// without consulting the cut subject at all. A recorded commit this
 /// repository cannot resolve counts as dropped: unverifiable must not read as
 /// carried. One check of the line serves a knives cut and a record alike: the
-/// newest write must be [`CompositionDelta::start`] or on its first-parent
-/// line, else the subject does not carry that write's release
-/// ([`CompositionCheck::off_line`]).
+/// newest write, a successor of it or a copy with its tree must be
+/// [`CompositionDelta::start`] or on its first-parent line, else the subject
+/// does not carry that write's release ([`CompositionCheck::off_line`]).
 ///
-/// Each fix by hand that the newest release holds
-/// ([`CompositionDelta::fixes`]) is held as a member is ([`fix_carried`]). A
-/// fix the subject does not carry is named by its adopt's commit
-/// ([`CompositionCheck::dropped_fixes`]).
+/// Each fix by hand that the series holds ([`CompositionDelta::fixes`]) is
+/// held as a member is ([`fix_carried`]). A fix the subject does not carry
+/// is named by its adopt's commit ([`CompositionCheck::dropped_fixes`]).
 pub fn uncarried_recorded_members(
     repo: &Repo,
     path: &Path,
@@ -3930,7 +3988,8 @@ pub fn uncarried_recorded_members(
 ) -> anyhow::Result<CompositionCheck> {
     let mut check = CompositionCheck::default();
     if let (Some(start), Some(write)) = (delta.start, &delta.baseline.newest_write) {
-        check.off_line = !on_first_parent_line(repo, &write.commit, start)?;
+        let line = (start, std::slice::from_ref(delta.trunk));
+        check.off_line = !on_first_parent_line(repo, &write.commit, line)?;
     }
     for fix in delta.fixes {
         if !fix_carried(repo, (path, &mut *subject), delta, fix)? {
@@ -4003,17 +4062,17 @@ pub fn uncarried_recorded_members(
     Ok(check)
 }
 
-/// Whether the cut subject carries `fix`, one of the newest release's fixes
-/// by hand ([`AdoptedFix`]).
+/// Whether the cut subject carries `fix`, one of the fixes by hand that the
+/// series holds ([`AdoptedFix`]).
 ///
-/// A stacked subject with the adopt on its start's first-parent line carries
-/// it already. Otherwise its change against its baseline must replay empty
-/// onto the subject, as a member's does. A later write may change a file the
-/// fix changed, a later adopt that refines it or an `include` of a member
-/// that touches it, and then the replay conflicts: so the subject carries the
-/// fix too when it holds, at every file the fix changed, exactly what the
-/// newest recorded write holds there. A fix that nothing here can measure is
-/// not carried.
+/// A stacked subject with the adopt, or a copy with its tree, on its
+/// start's first-parent line carries it already ([`on_first_parent_line`]).
+/// Otherwise the subject must hold the fix by its content ([`holds_fix`]).
+/// A later write may change a file the fix changed, a later adopt that
+/// refines it or an `include` of a member that touches it, and then the
+/// replay conflicts: so the subject carries the fix too when it holds, at
+/// every file the fix changed, exactly what the newest recorded write holds
+/// there.
 fn fix_carried(
     repo: &Repo,
     (path, subject): (&Path, &mut CutSubject<'_>),
@@ -4021,10 +4080,39 @@ fn fix_carried(
     fix: &AdoptedFix,
 ) -> anyhow::Result<bool> {
     if let Some(start) = delta.start
-        && on_first_parent_line(repo, &fix.commit, start)?
+        && on_first_parent_line(
+            repo,
+            &fix.commit,
+            (start, std::slice::from_ref(delta.trunk)),
+        )?
     {
         return Ok(true);
     }
+    let newest = delta
+        .baseline
+        .newest_write
+        .as_ref()
+        .map(|newest| &newest.commit)
+        .filter(|newest| repo.resolve_commit(newest.as_str()).is_ok());
+    holds_fix(repo, (path, subject), fix, newest)
+}
+
+/// Whether `subject` holds `fix` by its content: the fix's change against
+/// its baseline replays empty onto it, as a member's change does, or it
+/// holds, at every file the fix changed, exactly what `holder` holds there.
+/// With no `holder` only the replay counts. A fix that nothing here can
+/// measure is not held.
+///
+/// The gate's holder is the newest recorded write ([`fix_carried`]). When
+/// the subject is the newest write itself, the holder is the adopt, so the
+/// test asks whether that write still holds the fix's lines
+/// ([`adopted_fixes`]).
+fn holds_fix(
+    repo: &Repo,
+    (path, subject): (&Path, &mut CutSubject<'_>),
+    fix: &AdoptedFix,
+    holder: Option<&CommitId>,
+) -> anyhow::Result<bool> {
     let Some(baseline) = fix.baseline() else {
         return Ok(false);
     };
@@ -4034,12 +4122,9 @@ fn fix_carried(
     ) {
         return Ok(true);
     }
-    match &delta.baseline.newest_write {
-        Some(newest) if repo.resolve_commit(newest.commit.as_str()).is_ok() => {
-            subject.holds_paths_of(repo, &newest.commit, &fix.files)
-        }
-        _ => Ok(false),
-    }
+    holder.map_or(Ok(false), |holder| {
+        subject.holds_paths_of(repo, holder, &fix.files)
+    })
 }
 
 /// `commit` as the gate names it ([`recorded_member_name`]).

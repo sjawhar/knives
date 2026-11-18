@@ -276,8 +276,8 @@ pub(crate) fn run_release(
         // of the newest release the ledger records before anything is
         // recorded or published. In a stacked series that write must also be
         // on the line of the commit the cut starts on, its first parent. Each
-        // fix by hand that an `adopt` of that release recorded since its cut
-        // is held as a member is.
+        // fix by hand that the series holds, an `adopt` of any of its
+        // releases whose fix that write still carries, is held as a member is.
         let (baseline, fixes) =
             CompositionGate::read_baseline((&opened, entry), (&ledger, &tips), None)?;
         let gate = CompositionGate {
@@ -402,13 +402,15 @@ pub(crate) fn run_release(
         }
         // An audit error or failure simply DROPS the candidate: the merge
         // was never a published operation, so there is nothing to abandon
-        // and no crash window that strands one.
-        let audit = release::audit_cut(
+        // and no crash window that strands one. A file of a fix by hand that
+        // the gate holds is the gate's to judge, not the drift check's.
+        let mut audit = release::audit_cut(
             path,
             &members,
             release::CutSubject::Candidate(&mut candidate),
             context,
         )?;
+        audit.leave_fixes_to_gate(&gate.fixes);
         if let Some(exit) = report_cut_audit(repo, &audit, carried_from, context.drift_from) {
             return Ok(exit);
         }
@@ -681,16 +683,17 @@ struct CompositionGate<'a> {
     /// ([`release::CompositionDelta::start`]): the commit a record names, or
     /// the previous release a cut starts on. `None` in any other series.
     start: Option<&'a CommitId>,
-    /// The fixes by hand that the newest release holds, one for each `adopt`
-    /// of it since its cut ([`release::adopted_fixes`]).
+    /// The fixes by hand that the series holds: each `adopt` of any of its
+    /// releases whose fix the newest recorded write still carries
+    /// ([`release::adopted_fixes`]).
     fixes: Vec<release::AdoptedFix>,
 }
 
 impl CompositionGate<'_> {
     /// The baseline of the gate of `record` ([`Self::record`]), read from
     /// `ledger` in `entry`'s series: the name a record records is aside, as
-    /// no write of it is its own baseline. With it, the fixes by hand of the
-    /// newest release ([`release::adopted_fixes`]), read in `opened` with
+    /// no write of it is its own baseline. With it, the fixes by hand that
+    /// the series holds ([`release::adopted_fixes`]), read in `opened` with
     /// `tips`.
     fn read_baseline(
         (opened, entry): (&knives::jj::Repo, &knives::config::RepoEntry),
@@ -949,8 +952,8 @@ enum DropDisposition {
 
 /// Say what the recorded-composition check found; refuse when members are
 /// gone, when a stacked subject is not built on the newest write, or when
-/// the subject lacks a fix by hand that an `adopt` of the newest release
-/// recorded.
+/// the subject lacks a fix by hand that the series holds: an `adopt` of any
+/// of its releases whose fix the newest write still carries.
 ///
 /// Inconclusive members are reported without refusing, for the same reason the
 /// audit's are: a conflicted replay onto a conflicted cut subject answers
@@ -1089,16 +1092,17 @@ fn fix_files(files: &[String]) -> String {
 /// The line that closes a refusal of [`uncarried_cut_lines`]: what each
 /// refused finding asks for, or `--allow-drop`. `sources` are the records
 /// whose members the subject lacks, `off_line` the newest write a stacked
-/// subject is not built on, and `fixes` how many fixes by hand of the newest
-/// release the subject lacks.
+/// subject is not built on, and `fixes` how many fixes by hand that the
+/// series holds the subject lacks.
 ///
 /// A record is built again: on that write when it is off the line, which
 /// carries its fixes too. A cut gets back a member of the previous cut with
 /// `include`. A member only the newest write holds, a write off the cut's
-/// line, and a fix of the newest release the cut lacks mean the release here
-/// is older than that write, as on a machine that has not fetched it: so
-/// the cut is made again once that write's release is moved to it, and an
-/// `include` on the older commit would write a second, divergent write.
+/// line, and a fix that the newest write carries and the cut lacks mean the
+/// release here is older than that write, as on a machine that has not
+/// fetched it: so the cut is made again once that write's release is moved
+/// to it, and an `include` on the older commit would write a second,
+/// divergent write.
 fn refusal_remedy(
     held: HeldRecords<'_>,
     (sources, off_line, fixes): (&[HeldRecord<'_>], Option<HeldRecord<'_>>, usize),
@@ -1465,18 +1469,21 @@ struct CheckedCut {
 
 /// Audit `cut`'s commit ([`report_cut_audit`]), then hold it against the
 /// gate's baseline ([`recorded_composition_check`]). `Err` is the exit of a
-/// refusal, already reported: nothing is recorded.
+/// refusal, already reported: nothing is recorded. A file of a fix by hand
+/// that the gate holds is the gate's to judge, not the drift check's
+/// ([`release::CutAudit::leave_fixes_to_gate`]).
 fn checked_committed_cut(
     repo: &RepoName,
     cut: &CommittedCut<'_>,
     (gate, allow_drop): (&CompositionGate<'_>, bool),
 ) -> anyhow::Result<Result<CheckedCut, Exit>> {
-    let audit = release::audit_cut(
+    let mut audit = release::audit_cut(
         gate.path,
         cut.members,
         release::CutSubject::Committed(cut.commit),
         cut.context,
     )?;
+    audit.leave_fixes_to_gate(&gate.fixes);
     if let Some(exit) = report_cut_audit(repo, &audit, cut.carried_from, cut.context.drift_from) {
         return Ok(Err(exit));
     }
@@ -1506,13 +1513,16 @@ fn checked_committed_cut(
 /// against the gate's baseline ([`CompositionBaseline`], NAME aside): the
 /// members of the series' previous cut and of the newest write of the newest
 /// release the ledger records in the series. So a member `include` added
-/// after that release's cut is held too. In a stacked series that write
-/// itself must be the commit or on its first-parent line
-/// ([`release::CompositionDelta::start`]), so a commit built on an older
-/// release than that one is refused, however many levels of the stack it
-/// leaves out. Each refusal writes nothing. Only then is the local bookmark
-/// made, where no ref of the name exists, and the event recorded, which
-/// starts the background ledger sweep.
+/// after that release's cut is held too, and so is each fix by hand that an
+/// `adopt` of any release of the series recorded, while that write still
+/// carries it ([`release::adopted_fixes`]); the drift check leaves such a
+/// fix's files to the gate. In a stacked series that write, a successor of
+/// it or a copy with its tree must be the commit or on its first-parent
+/// line ([`release::CompositionDelta::start`]), so a commit built on an
+/// older release than that one is refused, however many levels of the
+/// stack it leaves out. Each refusal writes nothing. Only then is the local
+/// bookmark made, where no ref of the name exists, and the event recorded,
+/// which starts the background ledger sweep.
 fn record_hand_cut(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,

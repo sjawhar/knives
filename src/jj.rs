@@ -1145,10 +1145,12 @@ impl Repo {
     /// predecessors, transitively, as the operation log records them
     /// ([`jj_lib::evolution::walk_predecessors`]). jj leaves one when it
     /// rebases a release over a member rewritten in place. A commit with its
-    /// tree carries its content, as a fast-forward copy pushed from another
-    /// clone does, whose rewrite this repository never recorded. A commit
-    /// that only shares the change id stands for nothing: the commit an
-    /// `adopt` replaced has the adopt's change id, and lacks its fix.
+    /// tree carries its content whatever its change id, as a fast-forward
+    /// copy pushed from another clone does, whose rewrite this repository
+    /// never recorded, or a `jj duplicate` of it, which has a new change id.
+    /// A commit that only shares the change id stands for nothing: the
+    /// commit an `adopt` replaced has the adopt's change id, and lacks its
+    /// fix.
     pub fn stands_for(&self, visible: &CommitId, commit: &CommitId) -> Result<bool, JjError> {
         let (visible, commit) = (
             self.commit(visible.as_str())?,
@@ -1164,8 +1166,10 @@ impl Repo {
     }
 
     /// The visible rewrites of `commit` ([`Self::rewrites_of`]) that stand
-    /// for it ([`Self::stands_for`]): its successors and its copies, never a
-    /// commit it replaced.
+    /// for it ([`Self::stands_for`]): its successors and its copies that keep
+    /// its change id, never a commit it replaced. A copy with a new change id
+    /// is no rewrite; a caller that holds copies too compares trees
+    /// ([`crate::release_model::on_first_parent_line`]).
     pub fn standing_rewrites_of(&self, commit: &CommitId) -> Result<Vec<CommitId>, JjError> {
         let mut standing = Vec::new();
         for rewrite in self.rewrites_of(commit.as_str())? {

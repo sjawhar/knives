@@ -1134,3 +1134,115 @@ fn a_stacked_cut_on_the_write_an_adopt_replaced_is_refused() {
     assert!(!resolves(&lab, THIRD), "{out}");
     assert_eq!(ledger_entries(&home).len(), recorded, "{out}");
 }
+
+/// [`adopted_next_lab`], then the adopt, NEXT's newest recorded write,
+/// copied by `jj duplicate`: the copy has the adopt's parents and tree and a
+/// change id of its own. Returns the adopt's commit and the copy's.
+fn copied_next_lab() -> (
+    Lab,
+    tempfile::TempDir,
+    knives::ids::CommitId,
+    knives::ids::CommitId,
+) {
+    let (lab, home, _edit, adopted) = adopted_next_lab();
+    lab.jj_work(["duplicate", adopted.as_str()]);
+    let copies = format!("children(m6) ~ {}", adopted.as_str());
+    let copy = lab.jj_work_output([
+        "log",
+        "-r",
+        copies.as_str(),
+        "--no-graph",
+        "-T",
+        "commit_id",
+    ]);
+    assert!(
+        !copy.is_empty() && !copy.contains('\n'),
+        "one copy: {copy:?}"
+    );
+    let copy = knives::ids::CommitId::new(copy);
+    assert!(
+        same_tree(&lab, adopted.as_str(), copy.as_str()),
+        "the copy has the adopt's tree"
+    );
+    let change = |commit: &knives::ids::CommitId| {
+        lab.jj_work_output([
+            "log",
+            "-r",
+            commit.as_str(),
+            "--no-graph",
+            "-T",
+            "change_id",
+        ])
+    };
+    assert_ne!(
+        change(&copy),
+        change(&adopted),
+        "the copy has a change id of its own"
+    );
+    (lab, home, adopted, copy)
+}
+
+#[test]
+fn a_record_built_on_a_copy_of_the_newest_write_is_recorded() {
+    // Given: NEXT's newest recorded write, an adopt of a fix by hand, copied
+    // by `jj duplicate`; and a commit merged by hand of the copy and `m5`.
+    let (lab, home, _adopted, copy) = copied_next_lab();
+    lab.jj_work(["new", "-r", copy.as_str(), "-r", "m5", "-m", THIRD]);
+    lab.jj_work(["new"]);
+    let commit = knives::ids::CommitId::new(lab.jj_work_output([
+        "log",
+        "-r",
+        "@-",
+        "--no-graph",
+        "-T",
+        "commit_id",
+    ]));
+
+    // When: it is recorded as the series' third release.
+    let recorded = knives_release(
+        &lab,
+        &home,
+        &["--series", "old", "cut", THIRD, "--at", commit.as_str()],
+    );
+
+    // Then: it is recorded: the copy, on the commit's first-parent line,
+    // has the write's tree, so it stands for the write and carries its fix,
+    // whatever its change id.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(0), "{out}");
+    assert_eq!(
+        newest_event(&home, THIRD)
+            .evidence
+            .first()
+            .map(String::as_str),
+        Some(commit.as_str()),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_stacked_cut_on_a_copy_of_the_newest_write_goes_ahead() {
+    // Given: NEXT's newest recorded write, an adopt of a fix by hand, copied
+    // by `jj duplicate`; and NEXT's bookmark on the copy, as a machine has it
+    // that took the copy for NEXT, published by a note.
+    let (lab, home, _adopted, copy) = copied_next_lab();
+    lab.jj_work([
+        "bookmark",
+        "set",
+        NEXT,
+        "-r",
+        copy.as_str(),
+        "--allow-backwards",
+    ]);
+    mark_published(&lab, &home, NEXT);
+
+    // When: the next release is cut.
+    let cut = knives_release(&lab, &home, &["--series", "old", "cut", THIRD]);
+
+    // Then: it goes ahead on the copy: a commit with the newest write's tree
+    // stands for that write on the start's first-parent line, and carries
+    // its fix.
+    let out = text(&cut);
+    assert_eq!(cut.status.code(), Some(0), "{out}");
+    assert_eq!(release_parents(&lab, THIRD), vec![copy], "{out}");
+}

@@ -1211,48 +1211,58 @@ pub fn newest_release_write(
     })
 }
 
-/// Whether `commit`, or a visible rewrite of it that stands for it, is
-/// `start` or on its first-parent line. A commit this repository does not
-/// hold is on no line here.
+/// Whether `start` or a commit on its first-parent line stands for
+/// `commit`, a recorded write.
+///
+/// Such a commit is `commit`, a successor of it
+/// ([`Repo::standing_rewrites_of`]), or a commit with its tree, whatever
+/// its change id. A commit this repository does not hold is on no line
+/// here.
 ///
 /// In a stacked series each release is built on the one before it, so the
 /// newest recorded write must be on this line of a release, or of the
 /// commit a cut starts on, for the release to carry everything that write's
 /// release carries, every level of the stack below it included
-/// ([`crate::commands::release::CompositionDelta::start`]). A rewrite stands
-/// for the write when it is a successor of it or has its tree
-/// ([`Repo::standing_rewrites_of`]): jj rebases a release over a member
-/// rewritten in place, and knives reads that rewrite as the recorded write
-/// ([`crate::commands::release::in_hand_write`]). A commit that only shares
-/// the write's change id stands for nothing: the edit an `adopt` replaced
-/// keeps the adopt's change id, and lacks the fix the adopt recorded.
+/// ([`crate::commands::release::CompositionDelta::start`]). jj rebases a
+/// release over a member rewritten in place, and knives reads that
+/// successor as the recorded write
+/// ([`crate::commands::release::in_hand_write`]). A copy with the write's
+/// tree carries its content: `jj duplicate` makes one with a new change
+/// id, and a fast-forward copy pushed from another clone is one too. A
+/// commit that only shares the write's change id stands for nothing: the
+/// edit an `adopt` replaced keeps the adopt's change id, and lacks the fix
+/// the adopt recorded.
+///
+/// The walk goes down the line from `start`, and it ends at the first
+/// commit that is an ancestor of `commit`. The write, and each successor or
+/// copy of it, which is made after it, is above that commit. Below it, a
+/// commit with the write's tree stands for nothing: a stacked start has
+/// the tree of the previous release it is made on. Once the line has left
+/// the commits that descend from the write, only a copy or a successor can
+/// still be on it, and the walk ends before the first commit that one of
+/// `trunks` reaches, where the line leaves the series, as the reading's
+/// walk does ([`read_release`]). Else it ends at the root.
 pub fn on_first_parent_line(
     repo: &Repo,
     commit: &CommitId,
-    start: &CommitId,
+    (start, trunks): (&CommitId, &[CommitId]),
 ) -> Result<bool, jj::JjError> {
     if repo.resolve_commit(commit.as_str()).is_err() {
         return Ok(false);
     }
-    for held in std::iter::once(commit.clone()).chain(repo.standing_rewrites_of(commit)?) {
-        if first_parent_line_holds(repo, &held, start)? {
+    let successors = repo.standing_rewrites_of(commit)?;
+    let mut at = start.clone();
+    loop {
+        if at == *commit {
             return Ok(true);
         }
-    }
-    Ok(false)
-}
-
-/// Whether `commit` is `start` or on its first-parent line: every commit on
-/// the line above `commit` descends from it, so the walk ends at the first
-/// commit that does not.
-fn first_parent_line_holds(
-    repo: &Repo,
-    commit: &CommitId,
-    start: &CommitId,
-) -> Result<bool, jj::JjError> {
-    let mut at = start.clone();
-    while at != *commit {
-        if !repo.is_ancestor(commit, &at)? {
+        if repo.is_ancestor(&at, commit)? {
+            return Ok(false);
+        }
+        if successors.contains(&at) || repo.same_tree(&at, commit)? {
+            return Ok(true);
+        }
+        if !repo.is_ancestor(commit, &at)? && trunk_reaches(repo, trunks, &at)? {
             return Ok(false);
         }
         match repo.parent_commits(at.as_str())?.into_iter().next() {
@@ -1260,7 +1270,6 @@ fn first_parent_line_holds(
             None => return Ok(false),
         }
     }
-    Ok(true)
 }
 
 /// What a cut or edit event's text puts before the mark of a write over a

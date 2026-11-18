@@ -2460,3 +2460,218 @@ fn a_record_that_lacks_a_fix_an_earlier_release_adopted_is_refused() {
     assert_eq!(ledger_entries(&home), entries, "{out}");
     assert_eq!(bookmarks(&lab), refs, "{out}");
 }
+
+/// [`RELEASE`], a knives cut of `feat/alpha` and `feat/beta`, then `fix.txt`
+/// added by hand in place and adopted; and the next release, a knives cut
+/// that carries the fix and records no adopt of its own. Returns the
+/// adopt's commit.
+fn adopted_then_cut_lab() -> (Lab, tempfile::TempDir, CommitId) {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    lab.jj_work(["new", "-r", RELEASE]);
+    std::fs::write(lab.work_path().join("fix.txt"), "fixed by hand\n").expect("write fix.txt");
+    lab.jj_work(["squash", "--into", RELEASE]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let adopted = knives_release(&lab, &home, &["adopt", RELEASE, "--why", "a fix by hand"]);
+    assert_eq!(adopted.status.code(), Some(0), "{}", text(&adopted));
+    let adopt = commit_at(&lab, RELEASE);
+    let next = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(matches!(next.status.code(), Some(0 | 1)), "{}", text(&next));
+    assert_eq!(
+        file_at_revision(&lab, "release/2026-08-05", "fix.txt"),
+        "fixed by hand\n",
+        "the next cut carries the fix"
+    );
+    (lab, home, adopt)
+}
+
+/// The third release, merged by hand of `feat/alpha` and `feat/beta`, with
+/// `fix.txt` holding `fix` when there is one, and no ref on it. Returns its
+/// commit.
+fn third_hand_merge(lab: &Lab, fix: Option<&str>) -> CommitId {
+    lab.jj_work([
+        "new",
+        "-r",
+        "feat/alpha",
+        "-r",
+        "feat/beta",
+        "-m",
+        "the third release, merged by hand",
+    ]);
+    if let Some(fix) = fix {
+        std::fs::write(lab.work_path().join("fix.txt"), fix).expect("write fix.txt");
+    }
+    lab.jj_work(["new"]);
+    commit_of(lab, "@-")
+}
+
+#[test]
+fn a_record_that_carries_a_fix_an_earlier_release_adopted_is_recorded() {
+    // Given: RELEASE fixed by hand and adopted; the next release, a knives
+    // cut that carries the fix; and the third release merged by hand of the
+    // same two branches, with the fix.
+    let (lab, home, _adopt) = adopted_then_cut_lab();
+    let commit = third_hand_merge(&lab, Some("fixed by hand\n"));
+
+    // When: it is recorded.
+    let recorded = record(&lab, &home, "release/2026-08-06", &commit);
+
+    // Then: it is recorded: it carries the fix that the series holds.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains(&recorded_line("release/2026-08-06", &commit)),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_record_without_a_fix_that_a_later_adopt_removed_is_recorded() {
+    // Given: RELEASE fixed by hand and adopted; the next release, a knives
+    // cut that carries the fix, then the fix removed from it by hand in
+    // place and adopted; and the third release merged by hand of the same
+    // two branches, without the fix.
+    let (lab, home, _adopt) = adopted_then_cut_lab();
+    lab.jj_work(["new", "-r", "release/2026-08-05"]);
+    std::fs::remove_file(lab.work_path().join("fix.txt")).expect("remove fix.txt");
+    lab.jj_work(["squash", "--into", "release/2026-08-05"]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let removed = knives_release(
+        &lab,
+        &home,
+        &[
+            "adopt",
+            "release/2026-08-05",
+            "--why",
+            "the fix is not needed",
+        ],
+    );
+    assert_eq!(removed.status.code(), Some(0), "{}", text(&removed));
+    let commit = third_hand_merge(&lab, None);
+
+    // When: it is recorded.
+    let recorded = record(&lab, &home, "release/2026-08-06", &commit);
+
+    // Then: it is recorded, and its event goes without no fix: the newest
+    // recorded write no longer carries RELEASE's fix, so the series no
+    // longer holds it.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains(&recorded_line("release/2026-08-06", &commit)),
+        "{out}"
+    );
+    let event = newest_event(&home, "release/2026-08-06");
+    assert!(!event.text.contains("without the fix by hand"), "{event:?}");
+}
+
+#[test]
+fn a_record_without_a_fix_an_earlier_release_adopted_is_recorded_under_allow_drop_naming_it() {
+    // Given: RELEASE fixed by hand and adopted; the next release, a knives
+    // cut that carries the fix; and the third release merged by hand of the
+    // same two branches, without the fix.
+    let (lab, home, adopt) = adopted_then_cut_lab();
+    let commit = third_hand_merge(&lab, None);
+
+    // When: it is recorded, the drop stated.
+    let allowed = knives_release(
+        &lab,
+        &home,
+        &[
+            "cut",
+            "release/2026-08-06",
+            "--at",
+            commit.as_str(),
+            "--allow-drop",
+        ],
+    );
+
+    // Then: it is recorded, and both its line and its event name RELEASE's
+    // adopt, its release and its commit; the drift check names no file of
+    // the fix.
+    let out = text(&allowed);
+    assert_eq!(allowed.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: --allow-drop: recording release/2026-08-06 at {} without the fix by hand of \
+             {RELEASE}'s adopt {}, in 1 file(s): fix.txt\n",
+            commit.short(),
+            adopt.short()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("!! fix.txt"), "{out}");
+    let event = newest_event(&home, "release/2026-08-06");
+    assert_eq!(
+        event.evidence.first().map(String::as_str),
+        Some(commit.as_str()),
+        "{event:?}"
+    );
+    assert!(
+        event.text.contains(&format!(
+            "; all carried; without the fix by hand of {RELEASE}'s adopt {}",
+            adopt.short()
+        )),
+        "{event:?}"
+    );
+}
+
+#[test]
+fn a_record_that_carries_a_fix_the_release_it_follows_lacks_is_recorded() {
+    // Given: RELEASE, a knives cut of `feat/alpha` and `feat/beta`, fixed by
+    // hand in place and adopted; RELEASE's bookmark back at its cut, as a
+    // machine that never fetched the adopt has it; and the next release
+    // merged by hand of the same two branches, with the fix. The release
+    // the record follows here lacks the fix, and no member holds it.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    let first = commit_at(&lab, RELEASE);
+    lab.jj_work(["new", "-r", RELEASE]);
+    std::fs::write(lab.work_path().join("fix.txt"), "fixed by hand\n").expect("write fix.txt");
+    lab.jj_work(["squash", "--into", RELEASE]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let adopted = knives_release(&lab, &home, &["adopt", RELEASE, "--why", "a fix by hand"]);
+    assert_eq!(adopted.status.code(), Some(0), "{}", text(&adopted));
+    lab.jj_work([
+        "bookmark",
+        "set",
+        RELEASE,
+        "-r",
+        first.as_str(),
+        "--allow-backwards",
+    ]);
+    lab.jj_work([
+        "new",
+        "-r",
+        "feat/alpha",
+        "-r",
+        "feat/beta",
+        "-m",
+        "the next release, merged by hand",
+    ]);
+    std::fs::write(lab.work_path().join("fix.txt"), "fixed by hand\n").expect("write fix.txt");
+    lab.jj_work(["new"]);
+    let commit = commit_of(&lab, "@-");
+
+    // When: it is recorded.
+    let recorded = record(&lab, &home, "release/2026-08-05", &commit);
+
+    // Then: it is recorded: the file of a fix that the gate holds is the
+    // gate's to judge, not the drift check's, and the gate finds the fix
+    // carried.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains(&recorded_line("release/2026-08-05", &commit)),
+        "{out}"
+    );
+    assert!(!out.contains("!! fix.txt"), "{out}");
+}
