@@ -542,7 +542,8 @@ pub enum ReleaseAction {
         /// Proceed even when the cut would drop something: commits reachable
         /// only from the previous release lineage, or members that the
         /// previous cut's ledger event or the newest recorded write of the
-        /// release in hand records. The refusal lists exactly what.
+        /// newest release the ledger records in the series holds. The refusal
+        /// lists exactly what.
         #[arg(long)]
         allow_drop: bool,
         /// Record a release cut outside knives: the commit becomes NAME's
