@@ -39,7 +39,7 @@ pub use claims::{
 };
 
 pub(crate) use run::run;
-use run::{invocation, output_error, run_with_input, succeeded, transport};
+use run::{invocation, output_error, run_with_input, succeeded, transport, transport_transcript};
 use tree::{
     Mode, ObjectId, TreeItem, batch_blobs, check_entry, commit_tree, hash_objects, references,
     tree_items, write_tree,
@@ -555,13 +555,15 @@ pub fn fetched(repository: &Repository, remote: &str) -> Result<Vec<MachineRef>,
 /// writes only its own ref" holds. The refspec is spelled from the machine name
 /// alone and never forced, and a name that could spell any other ref (a glob,
 /// a second refspec, a nested path) is refused before git runs. Only
-/// [`commit_pending`] writes under `refs/knives/`, so
+/// [`commit_pending`], or a join taking up this machine's own ref from the
+/// remote ([`take_up_own_ref`]), writes under `refs/knives/`, so
 /// `refs/knives/<machine>` exists here only if this checkout committed as that
-/// machine. A machine `remote` has but this checkout never committed as is a
-/// peer, and pushing it is refused; a machine neither side has has nothing to
-/// send, and neither does one `remote` was last seen holding at this commit,
-/// which is what a sweep with nothing new to commit finds. git rejecting the
-/// push means some other writer moved this machine's ref on `remote`.
+/// machine, or took up what an earlier checkout of it committed. A machine
+/// `remote` has but this checkout has no ref of is a peer, and pushing it is
+/// refused; a machine neither side has has nothing to send, and neither does
+/// one `remote` was last seen holding at this commit, which is what a sweep
+/// with nothing new to commit finds. git rejecting the push means some other
+/// writer moved this machine's ref on `remote`.
 ///
 /// Once `remote` has taken the commit, it is recorded as `remote`'s copy,
 /// where [`fetch`] leaves copies, so the next call knows it was sent without
@@ -630,6 +632,59 @@ fn record_sent(
         commit.as_str(),
     ]))?;
     Ok(())
+}
+
+/// Take up `machine`'s ref from `remote` into `repository`, a git directory
+/// that has committed nothing yet; whether `remote` had it.
+///
+/// A machine whose git directory is made again, its disk lost or its config
+/// home deleted, comes back under the same name, and `remote` still holds
+/// the history it committed there. With no `refs/knives/<machine>` here,
+/// [`pending`] and [`push`] would refuse that name as another machine's, and
+/// nothing it wrote could be sent. So the ref is fetched, unforced, both to
+/// `refs/knives/<machine>` and to `remote`'s copy of it, where [`fetch`]
+/// leaves copies: the next commit is a child of that history, as the git
+/// directory that wrote it would have made, and the copy says `remote`
+/// already holds it. A git directory that has committed nothing loses nothing
+/// by it.
+///
+/// `remote` is asked first, with `ls-remote --exit-code`, which exits 2 when
+/// it has no such ref: an answer, and `Ok(false)`. A remote that cannot be
+/// asked, or a fetch that fails, is an error, so a caller making the git
+/// directory can make nothing rather than one that refuses its own ref later.
+pub fn take_up_own_ref(
+    repository: &Repository,
+    remote: &str,
+    machine: &str,
+) -> Result<bool, GitError> {
+    let reference = own_ref(machine)?;
+    let remote = ref_component("remote", remote)?;
+    let mut asked = repository.git();
+    asked.args(["ls-remote", "--exit-code", remote, &reference]);
+    let transcript = transport_transcript(&mut asked)?;
+    if transcript.status.and_then(|status| status.code()) == Some(2) {
+        return Ok(false);
+    }
+    let listed = transcript.answer(&asked)?;
+    // A pattern matches the last components of a ref's name, so only a line
+    // naming exactly this machine's ref says the remote has it.
+    let held = String::from_utf8_lossy(&listed).lines().any(|line| {
+        line.split_once('\t')
+            .is_some_and(|(_, name)| name == reference)
+    });
+    if !held {
+        return Ok(false);
+    }
+    transport(repository.git().args([
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--no-write-fetch-head",
+        remote,
+        &format!("{reference}:{reference}"),
+        &format!("{reference}:{FETCHED}{remote}/{machine}"),
+    ]))?;
+    Ok(true)
 }
 
 /// Whether `git push` rejected its only ref because the remote had already

@@ -635,7 +635,9 @@ fn a_destination_with_forks_but_no_machine_name_fails_naming_the_fix() {
 #[test]
 fn a_fork_whose_ledger_no_git_directory_reaches_is_joined_and_its_sweep_names_that_ledger() {
     // Given: a registry sharing a fork's ledger with one repository, a root
-    // whose origin is another, and an entry of that fork's on disk.
+    // whose origin is another, an entry of that fork's on disk, and the
+    // ledger's own remote, which git reaches only through the URL rule the
+    // sweep's session hands it, and which refuses every push.
     let home = tempfile::tempdir().expect("config home");
     std::fs::write(
         home.path().join("repos.toml"),
@@ -646,9 +648,23 @@ fn a_fork_whose_ledger_no_git_directory_reaches_is_joined_and_its_sweep_names_th
     let (_remote_dir, remote) = lab::bare_remote();
     let root = share(home.path(), "alpha", &remote);
     append(&root, "acme/a-repo", 1);
+    let (_elsewhere_dir, elsewhere) = refusing_remote();
 
     // When: a sweep runs.
-    let swept = sweep(home.path());
+    let swept = lab::knives_command(
+        home.path(),
+        home.path(),
+        home.path(),
+        &["--json", "ledger", "sweep"],
+    )
+    .env("GIT_CONFIG_COUNT", "1")
+    .env(
+        "GIT_CONFIG_KEY_0",
+        format!("url.{}.insteadOf", elsewhere.display()),
+    )
+    .env("GIT_CONFIG_VALUE_0", "https://forge.invalid/acme/elsewhere")
+    .output()
+    .expect("run knives ledger sweep");
 
     // Then: it joined the ledger the registry names, with a git directory
     // over the root whose origin is that ledger on the fork's forge and
@@ -674,19 +690,33 @@ fn a_fork_whose_ledger_no_git_directory_reaches_is_joined_and_its_sweep_names_th
     );
     assert_eq!(config("core.bare").as_deref(), Some("false"));
     assert_eq!(config("core.worktree"), Some(root.display().to_string()));
-    // And: the sweep fails through it, since no machine here reaches that
-    // ledger, naming the git directory and the ledger; it carries the entry
-    // to the root's remote no more than before, and leaves the reason in the
-    // log.
+    // And: the sweep carries the fork through that directory alone, and
+    // fails there, since the ledger refuses the push, naming the directory
+    // (`acme--elsewhere.git`, the ledger's) and git's cause; it carries the
+    // entry to the root's remote no more than before, nor to the ledger's,
+    // and leaves the reason in the log.
     assert_eq!(swept.status.code(), Some(3), "{swept:?}");
     let report: serde_json::Value = serde_json::from_slice(&swept.stdout).expect("JSON");
+    let carrying: Vec<&serde_json::Value> = report["destinations"]
+        .as_array()
+        .expect("destinations")
+        .iter()
+        .filter(|destination| destination["forks"] != serde_json::json!([]))
+        .collect();
+    assert!(
+        matches!(carrying.as_slice(), [destination]
+            if destination["git_dir"] == joined.display().to_string()
+                && destination["forks"] == serde_json::json!(["acme/a-repo"])),
+        "{report}"
+    );
     let problems = report["problems"].to_string();
     let through = format!("origin ({})", joined.display());
     assert!(
-        problems.contains(&through) && problems.contains("forge.invalid/acme/elsewhere"),
+        problems.contains(&through) && problems.contains("push refused by the test"),
         "{report}"
     );
     assert_eq!(entries_on(&remote, "alpha"), 0);
+    assert_eq!(entries_on(&elsewhere, &machine), 0);
     let log = std::fs::read_to_string(home.path().join("ledger-sweep.log")).expect("a log");
     assert!(log.contains(&through), "{log}");
 }

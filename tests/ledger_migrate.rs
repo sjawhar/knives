@@ -58,6 +58,53 @@ fn migrate(home: &Path) -> Output {
         .expect("run knives ledger migrate")
 }
 
+/// [`migrate`], its session handing git a URL rule that reaches `url` at
+/// `remote`.
+fn migrate_reaching(home: &Path, url: &str, remote: &Path) -> Output {
+    lab::knives_command(home, home, home, &["--json", "ledger", "migrate"])
+        .env("KNIVES_OWNER", "ses_migrate")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env(
+            "GIT_CONFIG_KEY_0",
+            format!("url.{}.insteadOf", remote.display()),
+        )
+        .env("GIT_CONFIG_VALUE_0", url)
+        .output()
+        .expect("run knives ledger migrate")
+}
+
+/// A bare remote holding a peer's ref, `refs/knives/a-peer`, whose tree is
+/// no ledger: `stray.txt` at its root, no entry, which every pull of it
+/// refuses.
+fn remote_whose_peer_ref_is_no_ledger() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (remote_dir, remote) = lab::bare_remote();
+    let peer = tempfile::tempdir().expect("a peer's repository");
+    lab::git_repository(peer.path(), &[]);
+    std::fs::write(peer.path().join("stray.txt"), "not a ledger entry\n").expect("write a file");
+    lab::git_output(peer.path(), ["add", "--all"]);
+    lab::git_output(
+        peer.path(),
+        [
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "a peer's tree",
+        ],
+    );
+    lab::git_output(
+        peer.path(),
+        [
+            "push",
+            "--quiet",
+            remote.to_str().expect("utf-8"),
+            "HEAD:refs/knives/a-peer",
+        ],
+    );
+    (remote_dir, remote)
+}
+
 fn report(output: &Output) -> serde_json::Value {
     assert!(
         output.status.success(),
@@ -833,10 +880,13 @@ fn a_dry_run_reports_what_a_migration_would_do_and_changes_nothing() {
         "{would}"
     );
 
-    // And: the real run joins that ledger and says so, then does what the
-    // dry run said it would, and holds back the third fork's statement
-    // because the ledger it joined could not be pulled.
-    let real = migrate(home.path());
+    // And: the real run, whose session hands git a URL rule that reaches the
+    // ledger at a remote holding a peer's ref whose tree is no ledger, joins
+    // that ledger and says so, then does what the dry run said it would, and
+    // holds back the third fork's statement because the ledger it joined
+    // could not be pulled.
+    let (_remote_dir, remote) = remote_whose_peer_ref_is_no_ledger();
+    let real = migrate_reaching(home.path(), "https://forge.invalid/acme/ledger", &remote);
     assert_eq!(real.status.code(), Some(3), "{real:?}");
     let stderr = String::from_utf8_lossy(&real.stderr);
     assert!(
@@ -859,7 +909,8 @@ fn a_dry_run_reports_what_a_migration_would_do_and_changes_nothing() {
         && line.contains(&format!(
             "could not pull the ledger from origin ({})",
             joined.display()
-        ))),
+        ))
+        && line.contains("\"stray.txt\", which is not a ledger entry")),
         "{did}"
     );
     assert!(did.get("dry_run").is_none(), "{did}");

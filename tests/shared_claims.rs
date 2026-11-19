@@ -8,8 +8,10 @@
 //! Machine one's checkout is the lab's own; machine two clones the lab's
 //! fork into a scan root of its own. Both run in this place (one host, one
 //! process namespace), so only their names on the ledger tell them apart,
-//! and every owner is named by `KNIVES_OWNER`, but in the test of an Oh My
-//! Pi session, named by `PI_SESSION_ID`.
+//! and every owner is named by `KNIVES_OWNER`, but in the tests of an Oh My
+//! Pi session, named by `PI_SESSION_ID`. A config home that joins the
+//! ledger itself names its machine for the session that joins it, so two
+//! config homes here that join it are two machines.
 //!
 //! Every test here drives the `knives` binary, raw git and
 //! `tests/common/lab.rs` alone, so this file also runs, unchanged, against
@@ -39,6 +41,13 @@
 //!   `a_claim_push_the_remote_hung_up_on_before_applying_it_leaves_the_branch_to_the_next_start`,
 //!   `a_new_config_home_finishes_a_claim_taken_in_another_place_only_with_force_and_why`,
 //!   `a_branch_no_claim_ref_can_name_is_refused_before_the_ledger_is_joined`;
+//! - these, about the name a machine that joins takes, fail too, and also
+//!   at the commit before a joining machine was named for its session:
+//!   `a_config_home_made_again_joins_as_the_same_machine_and_resumes_and_finishes_its_claim`,
+//!   `two_sessions_on_one_host_join_as_two_machines_and_each_takes_its_branch`;
+//!   and their guard,
+//!   `a_machine_named_by_hand_keeps_its_name_in_a_harness_session`, which
+//!   passes at that commit, as it must;
 //! - these pass at both: the two controls,
 //!   R2 `a_push_that_does_not_compare_the_old_value_lets_two_machines_hold_one_branch`
 //!   and R5 `a_claim_shaped_ref_under_refs_knives_fails_the_whole_sweep_naming_its_path`,
@@ -417,6 +426,24 @@ impl Machine {
             .env("PI_SESSION_ID", session)
             .output()
             .expect("run knives")
+    }
+
+    /// [`Self::tried`], its session handing git a URL rule that reaches
+    /// [`JOINED_URL`] at `remote`, as a session reaches the ledger this
+    /// machine joins.
+    fn tried_joining(&self, remote: &Path, owner: &str, args: &[&str]) -> Output {
+        with_git_rule(
+            &mut self.command(owner, args),
+            &format!("url.{}.insteadOf", remote.display()),
+            JOINED_URL,
+        )
+        .output()
+        .expect("run knives")
+    }
+
+    /// The machine the git directory joining [`LEDGER`] names.
+    fn joined_as(&self) -> Option<String> {
+        git_in(&self.joined(), &["config", "--get", "knives.machine"])
     }
 
     /// [`Self::tried`], which must succeed.
@@ -1709,33 +1736,207 @@ fn a_ledger_that_cannot_be_reached_refuses_start_by_name() {
         ],
     );
 
-    // Then: it joined the ledger, making the git directory, and then, unable
-    // to read the claim through it, exits 3 naming the ledger, that
-    // directory and git's cause.
+    // Then: it exits 3, joining nothing, since the ledger's repository
+    // could not be asked for this machine's ref: no git directory is made
+    // that would refuse that ref later, so the next command tries again.
     let stderr = stderr_of(&refused);
     assert_eq!(refused.status.code(), Some(3), "{stderr}");
-    let joined = one.joined();
+    assert!(!stderr.contains("joined the ledger"), "{stderr}");
     assert!(
-        stderr.contains(&format!(
-            "joined the ledger {LEDGER}: made {} as machine ",
-            joined.display()
-        )),
+        !one.home.path().join("ledger-repositories").exists(),
         "{stderr}"
     );
-    let unread = format!(
-        "nothing was claimed: the claim of {BRANCH} could not be read from the ledger {LEDGER} \
-         ({}): ",
-        joined.display()
+    // And: it says nothing was claimed, naming the fork, the ledger, the git
+    // directory a join would make, and git's cause.
+    let unjoined = format!(
+        "nothing was claimed: {FORK}: repos.toml says its ledger belongs to {LEDGER}, but no \
+         git directory knives reads"
     );
     let line = stderr
         .lines()
-        .find(|line| line.starts_with(&unread))
-        .unwrap_or_else(|| panic!("no line starting {unread:?}: {stderr}"));
+        .find(|line| line.starts_with(&unjoined))
+        .unwrap_or_else(|| panic!("no line starting {unjoined:?}: {stderr}"));
+    assert!(
+        line.contains(&format!(
+            "and joining it failed: could not make {}: ",
+            one.joined().display()
+        )),
+        "{line}"
+    );
     assert!(line.contains("forge.invalid/acme/ledger"), "{line}");
     // And: nothing was claimed: no claim, no entry, no workspace.
     assert_eq!(one.claim(BRANCH), Value::Null);
     assert_eq!(one.entries(), Vec::<String>::new());
     assert!(!one.workspace(BRANCH).exists());
+}
+
+#[test]
+fn a_config_home_made_again_joins_as_the_same_machine_and_resumes_and_finishes_its_claim() {
+    // Given: owner one's claim of a branch, taken through a ledger machine
+    // one's config home joined.
+    let lab = forge_lab();
+    let (_remote_root, remote) = lab::bare_remote();
+    let one = Machine::on_lab(&lab, "machine-one", Ledger::Unjoined);
+    let start = ["--text", "start", BRANCH, "--repo", "demo"];
+    let taken = one.tried_joining(
+        &remote,
+        "owner-one",
+        &[&start[..], &["--why", "port it"]].concat(),
+    );
+    assert!(taken.status.success(), "{}", stderr_of(&taken));
+    let machine = one
+        .joined_as()
+        .expect("the joined git directory names a machine");
+    let held = claim_on(&remote, BRANCH).expect("the claim landed");
+    assert_eq!(held.get("machine"), machine);
+
+    // When: the config home is gone with its git directory and its ledger
+    // root, as a machine's disk goes with it, and is made again with the
+    // same registry; and owner one starts the branch again, without
+    // `--force`.
+    std::fs::remove_dir_all(one.home.path()).expect("remove machine one's config home");
+    std::fs::create_dir(one.home.path()).expect("make machine one's config home again");
+    std::fs::write(one.home.path().join("repos.toml"), registry(true)).expect("write the registry");
+    let resumed = one.tried_joining(&remote, "owner-one", &start);
+
+    // Then: it joins the ledger again as the same machine and resumes owner
+    // one's claim, and the config home holds a copy of it at the same claim
+    // commit.
+    let stderr = stderr_of(&resumed);
+    assert_eq!(resumed.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "joined the ledger {LEDGER}: made {} as machine {machine}, carrying {FORK}\n",
+            one.joined().display()
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stdout_of(&resumed).starts_with("resumed\n"),
+        "{}",
+        stdout_of(&resumed)
+    );
+    let copy = one.claim(BRANCH);
+    assert_eq!(copy["owner"], "owner-one", "{copy}");
+    assert_eq!(copy["machine"], machine.as_str(), "{copy}");
+    assert_eq!(copy["ledger_commit"], held.commit.as_str(), "{copy}");
+
+    // When: owner one finishes it.
+    let finished = one.tried_joining(
+        &remote,
+        "owner-one",
+        &["--text", "finish", BRANCH, "--repo", "demo"],
+    );
+
+    // Then: it exits 0, and the claim is released on the ledger and here.
+    assert_eq!(finished.status.code(), Some(0), "{}", stderr_of(&finished));
+    assert!(
+        stdout_of(&finished).contains(&format!("demo/{BRANCH}: claim released")),
+        "{}",
+        stdout_of(&finished)
+    );
+    assert!(claim_on(&remote, BRANCH).is_none());
+    assert_eq!(one.claim(BRANCH), Value::Null);
+}
+
+#[test]
+fn two_sessions_on_one_host_join_as_two_machines_and_each_takes_its_branch() {
+    // Given: two config homes on this host, each the shell of a session of
+    // its own and with no ledger git directory yet.
+    let lab = forge_lab();
+    let (_remote_root, remote) = lab::bare_remote();
+    let one = Machine::on_lab(&lab, "machine-one", Ledger::Unjoined);
+    let two = Machine::cloned(&lab, "machine-two", Ledger::Unjoined);
+    let other = "feat/delta";
+
+    // When: session one starts a branch, and session two another.
+    let started = [(&one, "session-one", BRANCH), (&two, "session-two", other)].map(
+        |(machine, session, branch)| {
+            machine.tried_joining(
+                &remote,
+                session,
+                &[
+                    "--text", "start", branch, "--repo", "demo", "--why", "port it",
+                ],
+            )
+        },
+    );
+
+    // Then: both take their branch, and neither is told to rename its
+    // machine.
+    for output in &started {
+        let stderr = stderr_of(output);
+        assert_eq!(output.status.code(), Some(0), "{}", shown(&started));
+        assert!(!stderr.contains("knives.machine"), "{stderr}");
+    }
+    // And: each joined under a name of its own, and each claim, with the
+    // entry recording it, is on the remote under its own machine.
+    let names = [&one, &two].map(|machine| {
+        machine
+            .joined_as()
+            .expect("the joined git directory names a machine")
+    });
+    assert_ne!(names[0], names[1]);
+    for ((session, branch), machine) in [("session-one", BRANCH), ("session-two", other)]
+        .into_iter()
+        .zip(&names)
+    {
+        let held = claim_on(&remote, branch).expect("the claim landed");
+        assert_eq!(held.get("owner"), session);
+        assert_eq!(held.get("machine"), machine.as_str());
+        assert_eq!(
+            listed_on(&remote, machine),
+            [format!("{FORK}/{}", held.get("entry"))]
+        );
+    }
+}
+
+#[test]
+fn a_machine_named_by_hand_keeps_its_name_in_a_harness_session() {
+    // Given: a machine whose ledger git directory was made by hand, as the
+    // installer makes it, naming the machine `machine-one`.
+    let lab = forge_lab();
+    let (_remote_root, remote) = lab::bare_remote();
+    let one = Machine::on_lab(&lab, "machine-one", Ledger::Unjoined);
+    lab::join_ledger(
+        &one.joined(),
+        &one.root(),
+        JOINED_URL,
+        &remote,
+        "machine-one",
+    );
+
+    // When: an Oh My Pi session starts a branch there.
+    let started = one.tried_in_pi_session(
+        "session-one",
+        &[
+            "--text", "start", BRANCH, "--repo", "demo", "--why", "port it",
+        ],
+    );
+
+    // Then: it takes the branch, joining nothing, and the git directory
+    // still names `machine-one`.
+    let stderr = stderr_of(&started);
+    assert!(started.status.success(), "{stderr}");
+    assert!(!stderr.contains("joined the ledger"), "{stderr}");
+    assert_eq!(one.joined_as().as_deref(), Some("machine-one"));
+    // And: the claim and the entry recording it are on the remote under
+    // `machine-one`, the one machine ref there.
+    let held = claim_on(&remote, BRANCH).expect("the claim landed");
+    assert_eq!(held.get("owner"), "session-one");
+    assert_eq!(held.get("machine"), "machine-one");
+    assert_eq!(
+        git_in(
+            &remote,
+            &["for-each-ref", "--format=%(refname)", "refs/knives/"]
+        )
+        .as_deref(),
+        Some("refs/knives/machine-one")
+    );
+    assert_eq!(
+        listed_on(&remote, "machine-one"),
+        [format!("{FORK}/{}", held.get("entry"))]
+    );
 }
 
 #[test]
