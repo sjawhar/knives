@@ -19,14 +19,11 @@ owner is: [design.md, Harness adapters](design.md#harness-adapters). This file h
   the ledger does not refuse it, and its pull and sweep work as before, since no claim ref is under
   `refs/knives/`.
 - `state.json` keeps a copy of each ledger claim this machine took or resumed, with its `machine`
-  and `ledger_commit`. `knives status` reads only these copies ([design.md](design.md#knives-start)),
-  so a branch claimed only on another machine has no `claim` there, and a claim it shows may since
-  have been seized or released elsewhere; `start` reads the ledger's claim. Each `start` that
-  takes, seizes or resumes the claim writes the copy afresh, and the `finish` that releases it
-  removes it.
-- A local claim is one in `state.json` with no `ledger_commit`. `start` takes the branch only when
-  neither the ledger's claim nor a local claim is present, and `start` and `finish` go on only when
-  every claim present lets the caller.
+  and `ledger_commit`; a local claim is one with no `ledger_commit`. What the copy and a local claim
+  decide, and what reads the copy: [design.md](design.md#knives-start). Each `start` that takes,
+  seizes or resumes the claim writes the copy afresh, and the `finish` that releases it removes it.
+- `start` takes the branch only when neither the ledger's claim nor a local claim is present, and
+  `start` and `finish` go on only when every claim present lets the caller.
 - `start` refuses (exit `2`), before it reads the ledger, a branch whose whole claim ref would be
   over 255 bytes, which GitHub refuses as a ref, or that `git check-ref-format` refuses. For the
   fork `example/fork`, 223 bytes are left for the encoded branch.
@@ -58,7 +55,9 @@ owner is: [design.md, Harness adapters](design.md#harness-adapters). This file h
   `its activity cannot be read here: this config home did not record that claim, which was taken in <place>`.
   Where this machine can read the activity (a local claim, or one taken on this machine that this
   config home recorded), the refusal gives the last sighting and the workspace, process and place
-  lines instead.
+  lines instead. In each of these refusals, where the claim and the caller are both anonymous
+  (`os-user`, as [design.md](design.md#harness-adapters) says), the first line begins
+  `both sides are anonymous identities, so they can never match; `.
 - `start --force --why "…"` seizes the claim, whoever holds it, on whatever machine. The new claim
   is the caller's, taken now, in this place, on this machine.
 - `finish` names another owner's claim as `start` does, with its machine.
@@ -71,7 +70,7 @@ owner is: [design.md, Harness adapters](design.md#harness-adapters). This file h
 - `claim.toml` has the keys `repo`, `branch`, `owner`, `kind`, `why`, `started` (RFC 3339, UTC),
   `place` (absent when not recorded), `machine` and `entry`, the file name of the ledger entry that
   recorded the change. Readers ignore unknown keys.
-- Where another machine changed the claim after the command read it, the leased push changes
+- Where another config home changed the claim after the command read it, the leased push changes
   nothing:
   - `start` prints `<owner> took <branch> on machine <machine> while this start ran`, then the
     refusal, and exits `2`. Where the claim that won is the caller's own, taken under its owner
@@ -112,10 +111,13 @@ owner is: [design.md, Harness adapters](design.md#harness-adapters). This file h
   `<owner>/<name>` being the ledger's. Its `origin` is the fork's `origin` URL in `repos.toml`, else
   its `upstream`'s, with the repository path replaced by `<owner>/<name>`.
 - Its `knives.machine` is `<short host name>-<8 hex digits>`. In a harness session (one of the
-  owner variables is set), the digits are the first 8 of the SHA-256 of `/etc/machine-id` and the
-  session's owner name, so two sessions on one host, each with its own config home, are two
-  machines. In no harness session, where `/etc/machine-id` is missing or does not begin with 8 hex
-  digits, the digits are random.
+  [harness session variables](design.md#harness-adapters) is set and not blank), the digits are
+  the first 8 of the SHA-256 of `/etc/machine-id` and the session's owner name, so two sessions on
+  one host, each with its own config home, are two machines. In no harness session, the digits are
+  random where `/etc/machine-id` is missing or does not begin with 8 hex digits, and where the
+  ledger's repository already holds
+  `refs/knives/<short host name>-<first 8 hex digits of /etc/machine-id>`, which may be another
+  config home's, still in use ([design.md](design.md#knives-start)).
 - A git directory set up by hand before the first join chooses the URL and the machine name: knives
   joins only a ledger no git directory has as its `origin`, and never changes a git directory it did
   not make. One already at the join's path with another `origin` is a problem naming both fixes:

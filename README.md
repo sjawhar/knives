@@ -117,9 +117,10 @@ exits `3` after one line per fork:
 <fork>: <n> ledger entries this command wrote did not reach the ledger <ledger> (<git dir>): <cause>; `knives ledger sweep` sends them
 ```
 
-The entries stay on the machine, and `knives ledger sweep` sends them. One sweep or send runs at a
-time: each waits up to a minute for `ledger.lock`, beside the ledger root, while another holds it.
-A sweep passes over every git directory until a pass finds nothing new, and nothing ever rebases.
+For one entry the line reads `1 ledger entry`. The entries stay on the machine. One sweep or send
+runs at a time: each waits up to a minute for `ledger.lock`, beside the ledger root, while another
+holds it. A sweep passes over every git directory until a pass finds nothing new, and nothing ever
+rebases.
 `ledger-sweep.log`, beside `ledger.lock`, holds the problems of the last sweep or send, and exists
 only while it failed. A command that decides from the ledger (`status`, `sync`, `audit`, `pushed`,
 the release plan, cut and edits, `release members` without a `REF`) pulls it first, and says so in
@@ -129,7 +130,7 @@ each commit it before either pulls keep both.
 
 On such a fork, a branch's claim is a ref on the ledger's repository, so it holds on every machine
 that shares the ledger and runs a knives that reads claim refs. `start` and `finish` pull no
-ledger, but they read the claim before they decide, and change it in one push with the entry that
+ledger before they decide; they read the claim, and change it in one push with the entry that
 records the change. When they cannot read it or push the change, they exit `3`: `start` records no
 claim and opens no workspace, and `finish` leaves the state file and the workspace as they were.
 The `using-knives` skill's ledger reference has the setup, and
