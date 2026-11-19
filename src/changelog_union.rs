@@ -763,10 +763,11 @@ fn is_unreleased_heading(line: &[u8]) -> bool {
 /// a union writes it where its lists joined another block's: its entries
 /// under the same `### ` heading inside the target's one `[Unreleased]`
 /// section ([`holds_joined`]), is the target carrying that block — the
-/// conflict is masked. The same lines under that heading in a released
-/// section count for nothing, and a target with no `## [Unreleased]`
-/// heading or more than one holds no joined entry. A member whose lines the
-/// target lost is not carried, and says so.
+/// conflict is masked. The lines can be another member's or the target's
+/// own: no occurrence is counted. Lines in a released section count only as
+/// part of a whole run, and a target with no `## [Unreleased]` heading or
+/// more than one holds no joined entry. A member whose lines the target
+/// holds neither way is not carried, and says so.
 pub fn masks(target: &[u8], base: &[u8], member: &[u8], options: &MergeOptions) -> bool {
     let replay = Merge::from_removes_adds([base], [target, member]);
     match merge_hunks(&replay, options) {
