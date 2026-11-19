@@ -49,7 +49,9 @@ pub struct Destinations {
     /// Each fork whose registry entry names a repository its ledger belongs
     /// to that no destination here is: its entries travel to and from no
     /// other machine from this one. Outside a dry run, only a fork whose
-    /// ledger could not be joined.
+    /// ledger could not be joined, or, for a read that routes other forks
+    /// ([`shared_fork`], [`super::pull_at`], [`super::send_now`]), whose
+    /// ledger it did not join.
     pub unreached: BTreeMap<UpstreamName, Unreached>,
     /// A problem for each directory under the root holding entries that no
     /// fork is kept under ([`crate::ledger::unclaimed_problems`]): nothing
@@ -68,7 +70,8 @@ pub struct Unreached {
     /// The `<owner>/<name>` of the repository its ledger belongs to.
     pub ledger: String,
     /// Why joining that ledger failed; `None` where nothing tried to join
-    /// it, as under a dry run, which writes nothing.
+    /// it: under a dry run, which writes nothing, and for a read that routes
+    /// other forks, which joins their ledgers alone.
     pub join_failed: Option<String>,
 }
 
@@ -262,8 +265,9 @@ fn identity(git_dir: &Path) -> Result<Identity, SweepError> {
 /// A fork with no `ledger` is not shared. A ledger no candidate's `origin`
 /// names is joined first ([`super::join`]): its git directory is made in
 /// [`ledger_repositories`], said in one line on stderr, and the candidates
-/// are read again, so that it is one of them. A fork whose ledger could not
-/// be joined is [`Destinations::unreached`], with why. No fork shared and no
+/// are read again, so that it is one of them. Every such ledger the registry
+/// names is joined, for a sweep. A fork whose ledger could not be
+/// joined is [`Destinations::unreached`], with why. No fork shared and no
 /// machine named is a ledger nobody set up to share: no destination, and
 /// nothing to report. A candidate naming a machine and carrying no fork is a
 /// destination that carries nothing. Refused, each with what fixes it: a
@@ -274,36 +278,59 @@ fn identity(git_dir: &Path) -> Result<Identity, SweepError> {
 /// an older knives filed there ([`crate::ledger::LedgerError::FormerName`]),
 /// which no sweep would carry until `knives ledger migrate` moves them.
 pub fn destinations(root: &Path, registry: &Registry) -> Result<Destinations, SweepError> {
-    destinations_telling(root, registry, &mut std::io::stderr())
+    destinations_telling(root, registry, None, &mut std::io::stderr())
 }
 
-/// [`destinations`], saying each ledger it joins on `said`.
+/// [`destinations`], saying each ledger it joins on `said`, and joining
+/// only the ledgers of `routed`, when it names the forks the caller routes.
+///
+/// A command that routes one fork joins that fork's ledger alone. A ledger
+/// that cannot be joined is tried again on every read, so joining the
+/// ledger of a fork it does not route would make it wait on that one, up to
+/// the transport deadline, while it holds its own fork's lock. A ledger it
+/// does not join is [`Destinations::unreached`] with nothing tried.
 pub(super) fn destinations_telling(
     root: &Path,
     registry: &Registry,
+    routed: Option<&[&UpstreamName]>,
     said: &mut dyn Write,
 ) -> Result<Destinations, SweepError> {
     refuse_unmigrated(root, registry, &[])?;
     let mut reached = reach(root, registry)?;
+    let joined: BTreeSet<String> = match routed {
+        None => reached.unreached.values().cloned().collect(),
+        Some(forks) => forks
+            .iter()
+            .filter_map(|fork| reached.unreached.get(*fork))
+            .cloned()
+            .collect(),
+    };
     let mut failed = BTreeMap::new();
-    if !reached.unreached.is_empty() {
-        failed = join_unreached(root, registry, &reached.unreached, said);
+    if !joined.is_empty() {
+        failed = join_unreached(
+            root,
+            registry,
+            reached
+                .unreached
+                .iter()
+                .filter(|(_, ledger)| joined.contains(*ledger)),
+            said,
+        );
         // Only a join that made a git directory, or found one another
         // command made, gives the candidates another to read.
-        let ledgers = reached.unreached.values().collect::<BTreeSet<_>>().len();
-        if failed.len() < ledgers {
+        if failed.len() < joined.len() {
             reached = reach(root, registry)?;
         }
     }
     // A ledger still unreached once joined is one whose directory was
     // already there, its origin another repository's.
     assemble(root, registry, reached, |ledger| {
-        Some(
+        joined.contains(ledger).then(|| {
             failed
                 .get(ledger)
                 .cloned()
-                .unwrap_or_else(|| occupied(root, ledger)),
-        )
+                .unwrap_or_else(|| occupied(root, ledger))
+        })
     })
 }
 
@@ -361,13 +388,14 @@ fn assemble(
     })
 }
 
-/// The destination that carries `fork`, as [`destinations`] finds it, a
-/// ledger no git directory reaches joined first; `None` when `fork`'s
-/// registry entry names no ledger, so nothing of it is shared.
+/// The destination that carries `fork`, as [`destinations`] finds it; `None`
+/// when `fork`'s registry entry names no ledger, so nothing of it is shared.
 ///
-/// Refused as [`destinations`] refuses, and with [`SweepError::Unreached`]
-/// when `fork`'s ledger could not be joined: a command about to decide
-/// from, or write to, a shared fork's ledger cannot go on without it.
+/// The fork's ledger is joined first when no git directory reaches it, and
+/// no other ledger is ([`destinations_telling`]). Refused as
+/// [`destinations`] refuses, and with [`SweepError::Unreached`] when
+/// `fork`'s ledger could not be joined: a command about to decide from, or
+/// write to, a shared fork's ledger cannot go on without it.
 pub fn shared_fork(
     root: &Path,
     registry: &Registry,
@@ -376,7 +404,12 @@ pub fn shared_fork(
     let Some(ledger) = ledger_of(registry, fork).map(str::to_owned) else {
         return Ok(None);
     };
-    let mut reached = destinations(root, registry)?;
+    let mut reached = destinations_telling(
+        root,
+        registry,
+        Some(std::slice::from_ref(&fork)),
+        &mut std::io::stderr(),
+    )?;
     if let Some(index) = reached
         .found
         .iter()

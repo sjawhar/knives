@@ -24,16 +24,10 @@ pub fn same_remote(a: &str, b: &str) -> bool {
 
 /// `(host, path)` of a remote URL as spelled: the authority without its user
 /// or port, and the path without surrounding `/` or a `.git` suffix. `None`
-/// for a non-URL: a filesystem path, or a `file://` URL, whose authority is
-/// empty. scp form without a user, `host:path`, is a URL too when the part
-/// before the colon holds no `/`; a filesystem path with a colon in a later
-/// component stays a path.
+/// for a non-URL ([`authority_and_path`]), and for one whose authority is
+/// empty: a `file://` URL.
 fn host_and_path(remote: &str) -> Option<(&str, &str)> {
-    let trimmed = remote.trim().trim_end_matches('/');
-    let (authority, path) = remote_authority_and_path(trimmed).or_else(|| {
-        let (host, path) = trimmed.split_once(':')?;
-        (!host.is_empty() && !host.contains('/')).then_some((host, path))
-    })?;
+    let (authority, path) = authority_and_path(remote.trim())?;
     if authority.is_empty() {
         return None;
     }
@@ -55,6 +49,47 @@ pub(crate) const fn without_git_suffix(path: &str) -> &str {
     match path.split_at_checked(path.len().saturating_sub(4)) {
         Some((stem, suffix)) if suffix.eq_ignore_ascii_case(".git") => stem,
         _ => path,
+    }
+}
+
+/// `(authority, path)` of a remote URL as spelled, as git tells one from a
+/// filesystem path: `scheme://authority/path`, `user@authority:path`, or
+/// scp form without a user, `host:path`. `None` otherwise.
+///
+/// scp form is a value with a colon, no `/` before it and no `://` in it:
+/// a filesystem path with a colon in a later component stays a path, and a
+/// value with a scheme is read through its scheme alone, as git reads it,
+/// so `https://host`, with no path, is no repository on a host rather than
+/// the host `https`. The one rule that spells a ledger's URL from a fork's
+/// ([`crate::ledger_sweep`]'s join) and that finds which git directory has
+/// that URL as its origin ([`remote_slug`]).
+pub(crate) fn authority_and_path(url: &str) -> Option<(&str, &str)> {
+    let url = url.trim_end_matches('/');
+    remote_authority_and_path(url).or_else(|| {
+        let (host, path) = url.split_once(':')?;
+        (!url.contains("://") && !host.is_empty() && !host.contains('/')).then_some((host, path))
+    })
+}
+
+/// `url` with no userinfo before its host, for a text that shows it.
+///
+/// `https://user:secret@host/path` is `https://host/path`, and
+/// `git@host:path` is `host:path`. A value that is no remote URL
+/// ([`authority_and_path`]), or names no user, is kept as it is; one that
+/// names a user loses any trailing `/` too. The userinfo goes whole, as
+/// git's own messages show a remote: a forge token is often all of it,
+/// `https://<token>@host/…` with no password, so no part of it can be told
+/// apart from a secret.
+pub fn without_userinfo(url: &str) -> String {
+    let Some((authority, path)) = authority_and_path(url) else {
+        return url.to_owned();
+    };
+    let Some((_, host)) = authority.rsplit_once('@') else {
+        return url.to_owned();
+    };
+    match url.split_once("://") {
+        Some((scheme, _)) => format!("{scheme}://{host}/{path}"),
+        None => format!("{host}:{path}"),
     }
 }
 
@@ -103,7 +138,10 @@ pub fn repository_name(url: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{remote_host, remote_slug, repository_name, same_remote, url_owner};
+    use super::{
+        authority_and_path, remote_host, remote_slug, repository_name, same_remote, url_owner,
+        without_userinfo,
+    };
 
     #[test]
     fn https_and_ssh_spellings_of_one_repository_are_the_same_remote() {
@@ -157,6 +195,63 @@ mod tests {
             "https://tmp/lab/a:b/tool"
         ));
         assert!(same_remote("/tmp/lab/a:b/tool", " /tmp/lab/a:b/tool/ "));
+    }
+
+    #[test]
+    fn a_value_with_a_scheme_is_never_scp_form() {
+        // `https://forge.example` names no repository on a host, as git reads
+        // it: its scheme is no host, and `//forge.example` no path. A colon
+        // before a later `://` makes no host either.
+        for not_scp in [
+            "https://forge.example",
+            "ssh://git@forge.example:2222",
+            "forge.example:org/tool://x",
+        ] {
+            assert_eq!(remote_host(not_scp), None, "{not_scp}");
+            assert_eq!(authority_and_path(not_scp), None, "{not_scp}");
+        }
+        assert!(!same_remote("https://forge.example", "https:forge.example"));
+        // Such a value is only ever equal to itself.
+        assert!(same_remote(
+            "https://forge.example",
+            "https://forge.example/"
+        ));
+    }
+
+    #[test]
+    fn a_remote_is_shown_with_no_userinfo() {
+        for (url, shown) in [
+            (
+                "https://user:secret@forge.example/org/tool.git",
+                "https://forge.example/org/tool.git",
+            ),
+            (
+                "https://secret@forge.example/org/tool",
+                "https://forge.example/org/tool",
+            ),
+            (
+                "https://user:p@ss@forge.example:8443/org/tool/",
+                "https://forge.example:8443/org/tool",
+            ),
+            (
+                "ssh://git@forge.example:2222/org/tool",
+                "ssh://forge.example:2222/org/tool",
+            ),
+            (
+                "git@forge.example:org/tool.git",
+                "forge.example:org/tool.git",
+            ),
+            // No userinfo, or an `@` past the host, is kept as it is.
+            (
+                "https://forge.example/org/to@ol/",
+                "https://forge.example/org/to@ol/",
+            ),
+            ("forge.example:org/tool", "forge.example:org/tool"),
+            ("/srv/user@host/tool", "/srv/user@host/tool"),
+            ("file:///srv/tool.git", "file:///srv/tool.git"),
+        ] {
+            assert_eq!(without_userinfo(url), shown, "{url}");
+        }
     }
 
     #[test]

@@ -6,14 +6,19 @@
 //! directory itself, as a machine is set up by hand to share a ledger:
 //! `<owner>--<name>.git` in [`ledger_repositories`], over the ledger root,
 //! whose `origin` is the ledger's repository on the fork's own forge, and
-//! which names this machine. A caller in a harness session names it for
-//! that session on this host ([`this_machine`]): two sessions on one host,
-//! each with its own config home, never share a ref, and the same session
-//! joining again gets the same name back. What the remote already holds
-//! under that name is this machine's own history, taken up before the
-//! directory is in place ([`make`]), so a config home made again resumes
-//! the claims it took rather than refuse its own ref. A directory already at
-//! that path is never touched, and a dry run joins nothing.
+//! which names this machine ([`this_machine`]). Two config homes that are
+//! live at once never share that name. A caller in a harness session names
+//! it for that session on this host: two sessions on one host, each with
+//! its own config home, never share a ref, and the same session joining
+//! again gets the same name back. What the remote already holds under that
+//! name is that session's own history, taken up before the directory is in
+//! place ([`make`]), so a config home made again resumes the claims it took
+//! rather than refuse its own ref. A caller in no harness session names it
+//! for the host, as the host's own config home is named when it is set up
+//! by hand; a name the remote already holds may be that config home's,
+//! still in use, so the join takes random digits instead and takes nothing
+//! up. A directory already at that path is never touched, and a dry run
+//! joins nothing.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -44,22 +49,24 @@ pub(super) fn occupied(root: &Path, ledger: &str) -> String {
     )
 }
 
-/// Join each ledger `unreached` names, the forks no git directory reaches
-/// by the `<owner>/<name>` of the ledger each belongs to, saying each join
-/// on `said`; why each one that could not be joined was not, by ledger.
-pub(super) fn join_unreached(
+/// Join each ledger `unreached` names, each fork no git directory reaches
+/// with the `<owner>/<name>` of the ledger it belongs to, as
+/// [`this_machine`], saying each join on `said`; why each one that could not
+/// be joined was not, by ledger.
+pub(super) fn join_unreached<'a>(
     root: &Path,
     registry: &Registry,
-    unreached: &BTreeMap<UpstreamName, String>,
+    unreached: impl IntoIterator<Item = (&'a UpstreamName, &'a String)>,
     said: &mut dyn Write,
 ) -> BTreeMap<String, String> {
     let mut by_ledger: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (fork, ledger) in unreached {
         by_ledger.entry(ledger).or_default().push(fork.as_str());
     }
+    let machine = this_machine();
     let mut failed = BTreeMap::new();
     for (ledger, forks) in by_ledger {
-        match join(root, registry, ledger, &forks) {
+        match join(root, registry, ledger, &forks, &machine) {
             Ok(Some(line)) => {
                 let _ = writeln!(said, "{}", crate::ledger::inline_human_text(&line));
             }
@@ -72,20 +79,27 @@ pub(super) fn join_unreached(
     failed
 }
 
-/// Make [`joined_git_dir`] for `ledger`, which `forks` name; the line that
-/// says so, `None` when another command made it first, or why it could not
-/// be made.
+/// Make [`joined_git_dir`] for `ledger`, which `forks` name, as the machine
+/// `name` gives; the line that says so, `None` when another command made it
+/// first, or why it could not be made.
 ///
 /// Its `origin` is the URL of a fork entry naming `ledger` ([`ledger_url`]),
-/// its origin's else its upstream's, and it commits as [`this_machine`],
-/// from what the remote already holds of that machine's ref ([`make`]).
-/// Nothing is made where something already stands at its path, or when the
-/// remote cannot be asked: the next command that routes `ledger` tries again.
+/// its origin's else its upstream's, and it commits as `name`, or as another
+/// name when the remote already holds that one and it is not this session's
+/// own ([`make`]). Nothing is made where something already stands at its
+/// path, or when the remote cannot be asked: the next command that routes
+/// `ledger` tries again.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the ledger root, the registry, the ledger, the forks naming it and the machine it \
+              joins as are independent inputs"
+)]
 fn join(
     root: &Path,
     registry: &Registry,
     ledger: &str,
     forks: &[&str],
+    name: &Name,
 ) -> Result<Option<String>, String> {
     let root =
         &std::path::absolute(root).map_err(|error| format!("{}: {error}", root.display()))?;
@@ -107,8 +121,7 @@ fn join(
                 forks.join(", ")
             )
         })?;
-    let machine = this_machine();
-    Ok(make(root, &git_dir, &url, &machine)?.then(|| {
+    Ok(make(root, &git_dir, &url, name)?.map(|machine| {
         format!(
             "joined the ledger {ledger}: made {} as machine {machine}, carrying {}",
             git_dir.display(),
@@ -118,28 +131,44 @@ fn join(
 }
 
 /// Make the git directory `git_dir` over the ledger root `root`, an
-/// absolute path, whose `origin` is `url` and whose `knives.machine` is
-/// `machine`; whether this call made it, rather than another command that
-/// joined the same ledger at the same moment.
+/// absolute path, whose `origin` is `url`, naming the machine `name` gives
+/// or another; that machine when this call made it, `None` when another
+/// command that joined the same ledger at the same moment made it first.
 ///
 /// It is made whole in a scratch directory beside [`ledger_repositories`]
 /// and only then renamed into it, because every command reads each
 /// directory there as a git directory: half made, one with no origin yet
 /// would carry nothing, and one with no machine would refuse every sweep.
 /// Its `core.worktree` is the root, which is not made: a root that does not
-/// exist yet holds no entries, and the first write or pull makes it.
+/// exist yet holds no entries, and the first write or pull makes it. Its
+/// `origin` is `url` as the registry spells it, credentials and all, since
+/// git reaches the remote through it. Every text this gives shows `url`
+/// with no userinfo ([`crate::remote_url::without_userinfo`]), so that no
+/// password or token in it reaches a terminal or a log.
 ///
-/// Before the rename, the remote is asked for `refs/knives/<machine>`, and
-/// what it holds there is taken up
-/// ([`crate::ledger_git::take_up_own_ref`]). A name the remote already has
-/// is this machine's own, from a git directory whose disk or config home is
-/// gone: made without that history, this one would refuse its own ref at
-/// the first write, and the claims taken under it could be released only
-/// from another machine. A remote that cannot be asked, or a fetch that
-/// fails, makes nothing, so the next command asks again rather than find a
-/// git directory that refuses its own ref.
-fn make(root: &Path, git_dir: &Path, url: &str, machine: &str) -> Result<bool, String> {
-    let failed = |cause: String| format!("could not make {}: {cause}", git_dir.display());
+/// Before the rename, the remote is asked for `refs/knives/<machine>`. A
+/// [`Name::Session`] it holds is this session's own, from a git directory
+/// whose disk or config home is gone, and is taken up
+/// ([`crate::ledger_git::take_up_own_ref`]): made without that history,
+/// this one would refuse its own ref at the first write, and the claims
+/// taken under it could be released only from another machine. A
+/// [`Name::Host`] it holds may be another config home's of this host, still
+/// in use: taken up, that ref would have two writers, and the first push of
+/// either would leave the other refused at every write after. So nothing is
+/// taken up, and the directory names this machine [`machine_name`] with
+/// random digits in place of the machine id's. A remote that cannot be
+/// asked, or a fetch that fails, makes nothing, so the next command asks
+/// again rather than find a git directory that refuses its own ref or
+/// shares a live one's.
+fn make(root: &Path, git_dir: &Path, url: &str, name: &Name) -> Result<Option<String>, String> {
+    let shown = crate::remote_url::without_userinfo(url);
+    let failed = |cause: String| {
+        format!(
+            "could not make {}: {}",
+            git_dir.display(),
+            cause.replace(url, &shown)
+        )
+    };
     let repositories = ledger_repositories(root);
     let home = repositories.parent().unwrap_or(root);
     std::fs::create_dir_all(home)
@@ -155,28 +184,49 @@ fn make(root: &Path, git_dir: &Path, url: &str, machine: &str) -> Result<bool, S
         })?;
     let made = scratch.path().join("ledger.git");
     let os = OsStr::new;
+    let configure = |args: &[&OsStr]| {
+        git(&[[os("--git-dir"), made.as_os_str()].as_slice(), args].concat()).map_err(&failed)
+    };
     git(&[os("init"), os("--quiet"), os("--bare"), made.as_os_str()]).map_err(&failed)?;
     for args in [
         [os("config"), os("core.bare"), os("false")].as_slice(),
         &[os("config"), os("core.worktree"), root.as_os_str()],
         &[os("remote"), os("add"), os(REMOTE), os(url)],
-        &[os("config"), os("knives.machine"), os(machine)],
     ] {
-        git(&[[os("--git-dir"), made.as_os_str()].as_slice(), args].concat()).map_err(&failed)?;
+        configure(args)?;
     }
-    crate::ledger_git::Repository::new(&made, root, std::iter::empty())
-        .and_then(|repository| crate::ledger_git::take_up_own_ref(&repository, REMOTE, machine))
-        .map_err(|error| {
-            failed(format!(
-                "asking {url} for this machine's ref, refs/knives/{machine}: {error}"
-            ))
-        })?;
+    let repository = crate::ledger_git::Repository::new(&made, root, std::iter::empty())
+        .map_err(|error| failed(error.to_string()))?;
+    let machine = match name {
+        Name::Session(machine) => crate::ledger_git::take_up_own_ref(&repository, REMOTE, machine)
+            .map(|()| machine.clone()),
+        Name::Host(machine) => {
+            crate::ledger_git::remote_has_machine_ref(&repository, REMOTE, machine).map(|held| {
+                if held {
+                    machine_name(
+                        &crate::liveness::host_name(),
+                        None,
+                        crate::lock::random_u64(),
+                    )
+                } else {
+                    machine.clone()
+                }
+            })
+        }
+    }
+    .map_err(|error| {
+        let (Name::Session(asked) | Name::Host(asked)) = name;
+        failed(format!(
+            "asking {shown} for this machine's ref, refs/knives/{asked}: {error}"
+        ))
+    })?;
+    configure(&[os("config"), os("knives.machine"), os(machine.as_str())])?;
     std::fs::create_dir_all(&repositories)
         .map_err(|error| failed(format!("making {}: {error}", repositories.display())))?;
     match std::fs::rename(&made, git_dir) {
-        Ok(()) => Ok(true),
+        Ok(()) => Ok(Some(machine)),
         // Another command joined first: what is there is its directory.
-        Err(_) if git_dir.symlink_metadata().is_ok() => Ok(false),
+        Err(_) if git_dir.symlink_metadata().is_ok() => Ok(None),
         Err(error) => Err(failed(error.to_string())),
     }
 }
@@ -192,19 +242,16 @@ fn git(args: &[&OsStr]) -> Result<(), String> {
 /// `<owner>/<name>`: the scheme, user, host and port kept as spelled, and a
 /// `.git` suffix too when the path had one. `None` for a value that names no
 /// repository on a host: a filesystem path, or a `file://` URL, whose
-/// authority is empty.
+/// authority is empty. Read by the rule that finds which git directory has
+/// the URL made as its origin ([`crate::remote_url::authority_and_path`]),
+/// so that the directory a join makes is the one every later read finds.
 ///
 /// A forge serves a fork and the ledger its owners share from one host, so
 /// the fork's own URL says how this machine reaches the ledger, with the
 /// credentials and the protocol it already uses there.
 fn ledger_url(fork_url: &str, ledger: &str) -> Option<String> {
     let url = fork_url.trim().trim_end_matches('/');
-    let (authority, path) = crate::remote_url::remote_authority_and_path(url).or_else(|| {
-        // scp form without a user, `host:path`, as git reads it: no `/`
-        // before the colon.
-        let (host, path) = url.split_once(':')?;
-        (!url.contains("://") && !host.is_empty() && !host.contains('/')).then_some((host, path))
-    })?;
+    let (authority, path) = crate::remote_url::authority_and_path(url)?;
     let repository = path.trim_start_matches('/');
     if authority.is_empty() || repository.is_empty() {
         return None;
@@ -216,25 +263,47 @@ fn ledger_url(fork_url: &str, ledger: &str) -> Option<String> {
     Some(format!("{kept}{ledger}{suffix}"))
 }
 
-/// This machine's name on a ledger it joins, chosen once, when [`make`]
-/// writes it to the git directory's `knives.machine`: for a caller in a
-/// harness session ([`crate::commands::claim::harness_session`]),
-/// [`session_machine_name`] of its host name, its `/etc/machine-id` and that
-/// session; else [`machine_name`] of its host name, its `/etc/machine-id`
-/// and a random number.
-fn this_machine() -> String {
+/// The name a join gives this machine ([`this_machine`]); its kind says
+/// whose the ref the remote may already hold under it is ([`make`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Name {
+    /// [`session_machine_name`]'s, for a caller in a harness session. No
+    /// other session has it, so the ref the remote holds under it is this
+    /// session's own, from an earlier config home of it.
+    Session(String),
+    /// [`machine_name`]'s, for a caller in no harness session: the name the
+    /// host's own config home has when it is set up by hand, so the ref the
+    /// remote holds under it may be that config home's, still in use.
+    Host(String),
+}
+
+/// This machine's name on a ledger it joins, before the remote is asked
+/// ([`make`]): for a caller in a harness session
+/// ([`crate::commands::claim::harness_session`]), [`session_machine_name`]
+/// of its host name, its `/etc/machine-id` and that session; else
+/// [`machine_name`] of its host name, its `/etc/machine-id` and a random
+/// number.
+fn this_machine() -> Name {
     let host = crate::liveness::host_name();
     let id = std::fs::read_to_string("/etc/machine-id").ok();
     crate::commands::claim::harness_session().map_or_else(
-        || machine_name(&host, id.as_deref(), crate::lock::random_u64()),
-        |(_, owner)| session_machine_name(&host, id.as_deref(), &owner),
+        || {
+            Name::Host(machine_name(
+                &host,
+                id.as_deref(),
+                crate::lock::random_u64(),
+            ))
+        },
+        |(_, owner)| Name::Session(session_machine_name(&host, id.as_deref(), &owner)),
     )
 }
 
 /// `<short host name>-<8 hex digits>`, as machines set up by hand to share
 /// a ledger are named: the host name as [`named`] keeps it, and the first
 /// eight characters of `machine_id` when they are hex digits, else eight
-/// from `random`. The name of a machine that joins in no harness session.
+/// from `random`. The name of a machine that joins in no harness session,
+/// and, with no machine id, of one whose name the remote already holds
+/// ([`make`]).
 fn machine_name(host: &str, machine_id: Option<&str>, random: u64) -> String {
     let digits = machine_id
         .and_then(|id| id.get(..8))
@@ -303,7 +372,11 @@ mod tests {
 
     use super::*;
     use crate::ids::CommitId;
-    use crate::ledger_sweep::{destinations, lab, unpullable};
+    use crate::ledger::{Draft, Ledger, Scribe};
+    use crate::ledger_sweep::{Swept, destinations, lab, pull_at, shared_fork, unpullable};
+
+    /// A machine id, as `/etc/machine-id` holds one.
+    const MACHINE_ID: &str = "0123abcd4567ef890123abcd4567ef89\n";
 
     /// A config home with a registry naming `forks`, each `(key, origin,
     /// ledger)`: the fork `acme/<key>`, whose upstream is on the forge, and
@@ -355,24 +428,34 @@ mod tests {
 
     /// The ledger's remote: a bare repository git reaches at `url` through
     /// the URL rule a session hands it (`GIT_CONFIG_COUNT` and its numbered
-    /// pair), with the caller in the harness session `owner-one`; both are
-    /// this process's environment until it drops.
+    /// pair), with the caller in a harness session or in none; both are this
+    /// process's environment until it drops.
     struct Remote {
         git_dir: PathBuf,
-        _dir: tempfile::TempDir,
-        _environment: crate::config::test_support::EnvironmentGuard,
+        dir: tempfile::TempDir,
+        environment: crate::config::test_support::EnvironmentGuard,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Remote {
+        /// [`Remote::reached_in`] the harness session `owner-one`.
         fn reached_at(url: &str) -> Self {
+            Self::reached_in(url, Some("owner-one"))
+        }
+
+        /// The remote reached at `url`, with the caller in the harness
+        /// session `owner`, or in none.
+        fn reached_in(url: &str, owner: Option<&str>) -> Self {
             let lock = crate::config::test_support::environment_lock();
             let environment = crate::config::test_support::no_harness_session(&[
                 "GIT_CONFIG_COUNT",
                 "GIT_CONFIG_KEY_0",
                 "GIT_CONFIG_VALUE_0",
+                "GIT_TRACE",
             ]);
-            environment.set("KNIVES_OWNER", "owner-one");
+            if let Some(owner) = owner {
+                environment.set("KNIVES_OWNER", owner);
+            }
             let dir = tempfile::tempdir().unwrap();
             let git_dir = dir.path().join("ledger.git");
             lab::init(&git_dir, true);
@@ -384,10 +467,26 @@ mod tests {
             environment.set("GIT_CONFIG_VALUE_0", url);
             Self {
                 git_dir,
-                _dir: dir,
-                _environment: environment,
+                dir,
+                environment,
                 _lock: lock,
             }
+        }
+
+        /// Have every git command that starts until this drops append what
+        /// it runs, with its arguments, to the log [`Remote::traced`] reads.
+        fn trace_git(&self) {
+            self.environment
+                .set("GIT_TRACE", self.git_log().to_str().unwrap());
+        }
+
+        /// Every git command [`Remote::trace_git`] logged so far.
+        fn traced(&self) -> String {
+            std::fs::read_to_string(self.git_log()).unwrap_or_default()
+        }
+
+        fn git_log(&self) -> PathBuf {
+            self.dir.path().join("git.log")
         }
 
         /// Point `reference` here at a new commit of an empty tree; that commit.
@@ -430,7 +529,8 @@ mod tests {
         // When: where the ledger travels is read, as a sweep or a pull does.
         let mut said = Vec::new();
         let found =
-            super::super::destinations::destinations_telling(&root, &registry, &mut said).unwrap();
+            super::super::destinations::destinations_telling(&root, &registry, None, &mut said)
+                .unwrap();
 
         // Then: the git directory is made, over the root, reaching the
         // ledger on the fork's forge, and naming this machine.
@@ -484,7 +584,8 @@ mod tests {
         // When: it is read again.
         let mut again = Vec::new();
         let second =
-            super::super::destinations::destinations_telling(&root, &registry, &mut again).unwrap();
+            super::super::destinations::destinations_telling(&root, &registry, None, &mut again)
+                .unwrap();
 
         // Then: it finds the directory, makes nothing and says nothing.
         assert!(again.is_empty(), "{}", String::from_utf8_lossy(&again));
@@ -546,17 +647,19 @@ mod tests {
 
     #[test]
     fn a_join_takes_up_the_ref_the_remote_holds_under_this_machines_name() {
-        // Given: a new machine whose registry shares a fork's ledger, and a
-        // remote that already holds a commit under the name this machine
-        // joins as, as a config home that wrote there and then was deleted
-        // leaves it.
+        // Given: a caller in a harness session, a new machine whose registry
+        // shares a fork's ledger, and a remote that already holds a commit
+        // under the name this session joins as, as a config home of it that
+        // wrote there and then was deleted leaves it.
         let remote = Remote::reached_at("https://forge.invalid/acme/ledger");
         let (_home, root, registry) = new_machine(&[(
             "a-repo",
             "https://forge.invalid/ours/a-repo",
             Some("acme/ledger"),
         )]);
-        let machine = this_machine();
+        let Name::Session(machine) = this_machine() else {
+            panic!("a caller in a harness session joins under the host's name");
+        };
         let own = format!("refs/knives/{machine}");
         let commit = remote.commit_at(&own);
 
@@ -585,6 +688,121 @@ mod tests {
     }
 
     #[test]
+    fn a_join_in_no_session_whose_name_the_remote_holds_takes_another_and_takes_up_nothing() {
+        // Given: a caller in no harness session, a new machine whose registry
+        // shares a fork's ledger, and a remote that already holds a commit
+        // under the name this host's machine id gives, as the host's own
+        // config home, still in use, leaves it.
+        let remote = Remote::reached_in("https://forge.invalid/acme/ledger", None);
+        let (_home, root, registry) = new_machine(&[(
+            "a-repo",
+            "https://forge.invalid/ours/a-repo",
+            Some("acme/ledger"),
+        )]);
+        assert!(matches!(this_machine(), Name::Host(_)));
+        let host = machine_name(&crate::liveness::host_name(), Some(MACHINE_ID), 0);
+        let theirs = format!("refs/knives/{host}");
+        let commit = remote.commit_at(&theirs);
+
+        // When: the ledger is joined under that name.
+        let said = join(
+            &root,
+            &registry,
+            "acme/ledger",
+            &["acme/a-repo"],
+            &Name::Host(host.clone()),
+        )
+        .unwrap()
+        .unwrap();
+
+        // Then: the git directory names another machine of this host, with
+        // random digits in place of the machine id's, and says so.
+        let git_dir = joined_git_dir(&root, "acme/ledger");
+        let machine = config(&git_dir, "knives.machine").unwrap();
+        assert_ne!(machine, host);
+        let short = host.strip_suffix("0123abcd").unwrap();
+        let digits = machine.strip_prefix(short).unwrap();
+        assert!(
+            digits.len() == 8 && digits.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{machine}"
+        );
+        assert_eq!(
+            said,
+            format!(
+                "joined the ledger acme/ledger: made {} as machine {machine}, carrying \
+                 acme/a-repo",
+                git_dir.display()
+            )
+        );
+        // And: it took up nothing the remote holds.
+        assert_eq!(
+            lab::git(
+                &git_dir,
+                &["for-each-ref", "refs/knives/", "refs/knives-remotes/"]
+            ),
+            ""
+        );
+
+        // When: an entry this config home writes is sent.
+        Scribe::unanchored(
+            Ledger::at(root.join("acme/a-repo")),
+            UpstreamName::new("acme/a-repo"),
+            "owner-one".to_owned(),
+        )
+        .record_to(&Draft::event(None, "noted".into(), None))
+        .unwrap();
+        let swept = crate::ledger_sweep::run(&root, Ok(registry)).unwrap();
+
+        // Then: it reached the remote under the new name, and the ref of the
+        // first name is where it was.
+        let Swept::Ran { problems, .. } = swept else {
+            panic!("{swept:?}");
+        };
+        assert_eq!(problems, Vec::<String>::new());
+        assert!(lab::at(&remote.git_dir, &format!("refs/knives/{machine}")).is_some());
+        assert_eq!(lab::at(&remote.git_dir, &theirs), Some(commit));
+    }
+
+    #[test]
+    fn a_join_in_no_session_whose_name_the_remote_lacks_keeps_the_machine_id_name() {
+        // Given: a caller in no harness session, a new machine whose registry
+        // shares a fork's ledger, and a remote that holds nothing.
+        let remote = Remote::reached_in("https://forge.invalid/acme/ledger", None);
+        let (_home, root, registry) = new_machine(&[(
+            "a-repo",
+            "https://forge.invalid/ours/a-repo",
+            Some("acme/ledger"),
+        )]);
+        assert!(matches!(this_machine(), Name::Host(_)));
+        let host = machine_name(&crate::liveness::host_name(), Some(MACHINE_ID), 0);
+
+        // When: the ledger is joined under the name this host's machine id
+        // gives.
+        let said = join(
+            &root,
+            &registry,
+            "acme/ledger",
+            &["acme/a-repo"],
+            &Name::Host(host.clone()),
+        )
+        .unwrap()
+        .unwrap();
+
+        // Then: the git directory names the machine by it, and says so.
+        let git_dir = joined_git_dir(&root, "acme/ledger");
+        assert_eq!(config(&git_dir, "knives.machine"), Some(host.clone()));
+        assert_eq!(
+            said,
+            format!(
+                "joined the ledger acme/ledger: made {} as machine {host}, carrying acme/a-repo",
+                git_dir.display()
+            )
+        );
+        // And: the join sent nothing.
+        assert_eq!(lab::git(&remote.git_dir, &["for-each-ref"]), "");
+    }
+
+    #[test]
     fn a_ledger_whose_remote_cannot_be_asked_is_not_joined_and_the_next_read_tries_again() {
         // Given: a new machine whose registry shares a fork's ledger on a
         // forge whose host does not resolve.
@@ -603,7 +821,7 @@ mod tests {
             // When: where the ledger travels is read.
             let mut said = Vec::new();
             let found =
-                super::super::destinations::destinations_telling(&root, &registry, &mut said)
+                super::super::destinations::destinations_telling(&root, &registry, None, &mut said)
                     .unwrap();
 
             // Then: nothing is made or said, and the fork is unreached, with
@@ -637,6 +855,186 @@ mod tests {
         // Then: the ledger is joined.
         assert!(again.unreached.is_empty(), "{:?}", again.unreached);
         assert_eq!(again.found.len(), 1);
+    }
+
+    #[test]
+    fn a_join_whose_remote_cannot_be_asked_shows_its_url_with_no_password() {
+        // Given: a new machine whose registry shares a fork's ledger through
+        // an origin URL holding a user and a password, on a forge whose host
+        // does not resolve.
+        let (_home, root, registry) = new_machine(&[(
+            "a-repo",
+            "https://someone:secret@forge.invalid/ours/a-repo",
+            Some("acme/ledger"),
+        )]);
+        let fork = UpstreamName::new("acme/a-repo");
+        // The lock keeps the remote unreachable: no other test's `Remote`
+        // reaches forge.invalid while it is held.
+        let _lock = crate::config::test_support::environment_lock();
+
+        // When: the fork is routed to its ledger, as `start` does, and a
+        // sweep runs.
+        let refused = shared_fork(&root, &registry, &fork)
+            .unwrap_err()
+            .to_string();
+        let swept = crate::ledger_sweep::run(&root, Ok(registry)).unwrap();
+
+        // Then: the refusal, the sweep's problems and its log each say the
+        // ledger could not be joined, naming the URL it asked with no
+        // userinfo, and none of them holds the password.
+        let Swept::Ran { problems, .. } = swept else {
+            panic!("{swept:?}");
+        };
+        let log = std::fs::read_to_string(crate::ledger_sweep::sweep_log(&root)).unwrap();
+        for said in [refused, problems.join("\n"), log] {
+            assert!(
+                said.contains("asking https://forge.invalid/acme/ledger for this machine's ref"),
+                "{said}"
+            );
+            assert!(!said.contains("secret"), "{said}");
+        }
+    }
+
+    #[test]
+    fn routing_a_fork_joins_its_own_ledger_alone_and_a_sweep_joins_every_one() {
+        // Given: a new machine whose registry shares one fork's ledger with
+        // acme/ledger, whose remote answers, and another fork's with
+        // acme/elsewhere, on a forge whose host does not resolve; and a log
+        // of every git command run from here on.
+        let remote = Remote::reached_at("https://forge.invalid/acme/ledger");
+        let (_home, root, registry) = new_machine(&[
+            (
+                "a-repo",
+                "https://forge.invalid/ours/a-repo",
+                Some("acme/ledger"),
+            ),
+            (
+                "b-repo",
+                "https://forge.invalid/ours/b-repo",
+                Some("acme/elsewhere"),
+            ),
+        ]);
+        remote.trace_git();
+        let a_repo = UpstreamName::new("acme/a-repo");
+
+        // When: the first fork is routed to its ledger, as `start` and
+        // `finish` do.
+        let shared = shared_fork(&root, &registry, &a_repo).unwrap().unwrap();
+
+        // Then: its ledger is joined, and carries it.
+        assert_eq!(
+            shared.destination.repository.git_dir(),
+            joined_git_dir(&root, "acme/ledger")
+        );
+        // And: the other ledger was neither joined nor asked: no git
+        // directory is made for it, and no git command named it.
+        assert_eq!(
+            listed(&ledger_repositories(&root)),
+            BTreeSet::from(["acme--ledger.git".to_owned()])
+        );
+        let traced = remote.traced();
+        assert!(!traced.contains("acme/elsewhere"), "{traced}");
+
+        // When: the first fork is pulled, as a report about it does.
+        let pulled = pull_at(&root, &registry, &[&a_repo]);
+
+        // Then: the pull found no problem, and nothing asked the other
+        // ledger either.
+        assert_eq!(pulled.problems_for(&a_repo), Vec::<String>::new());
+        let traced = remote.traced();
+        assert!(!traced.contains("acme/elsewhere"), "{traced}");
+
+        // When: a sweep runs.
+        let swept = crate::ledger_sweep::run(&root, Ok(registry)).unwrap();
+
+        // Then: it tries to join every ledger the registry names, and says
+        // why the other could not be joined.
+        let Swept::Ran { problems, .. } = swept else {
+            panic!("{swept:?}");
+        };
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.starts_with("acme/b-repo: ")
+                    && problem.contains("and joining it failed")),
+            "{problems:?}"
+        );
+        assert!(
+            remote.traced().contains("acme/elsewhere"),
+            "{}",
+            remote.traced()
+        );
+    }
+
+    #[test]
+    fn a_write_sends_through_its_own_ledger_alone_and_asks_no_other() {
+        // Given: a new machine whose registry shares one fork's ledger with
+        // acme/ledger, whose remote answers, and another fork's with
+        // acme/elsewhere, on a forge whose host does not resolve; an entry a
+        // write recorded about the first fork; and a log of every git
+        // command run from here on.
+        let remote = Remote::reached_at("https://forge.invalid/acme/ledger");
+        let (_home, root, registry) = new_machine(&[
+            (
+                "a-repo",
+                "https://forge.invalid/ours/a-repo",
+                Some("acme/ledger"),
+            ),
+            (
+                "b-repo",
+                "https://forge.invalid/ours/b-repo",
+                Some("acme/elsewhere"),
+            ),
+        ]);
+        let (_, written) = Scribe::unanchored(
+            Ledger::at(root.join("acme/a-repo")),
+            UpstreamName::new("acme/a-repo"),
+            "owner-one".to_owned(),
+        )
+        .record_to(&Draft::event(None, "noted".into(), None))
+        .unwrap();
+        let appended: Vec<crate::ledger::Appended> = crate::ledger::appended()
+            .into_iter()
+            .filter(|appended| appended.path.starts_with(&root))
+            .collect();
+        remote.trace_git();
+
+        // When: the write's entry is sent, as the command exits.
+        let sent = crate::ledger_sweep::send_now(&root, &registry, &appended);
+
+        // Then: it reached the first fork's ledger, joined for it, under
+        // this machine's ref.
+        assert_eq!(sent.unsent, Vec::new());
+        assert_eq!(sent.unlogged, None);
+        let machine = config(&joined_git_dir(&root, "acme/ledger"), "knives.machine").unwrap();
+        let carried = lab::git(
+            &remote.git_dir,
+            &[
+                "ls-tree",
+                "-r",
+                "--name-only",
+                &format!("refs/knives/{machine}"),
+            ],
+        );
+        let relative = written.strip_prefix(&root).unwrap();
+        assert!(
+            carried.lines().any(|path| Path::new(path) == relative),
+            "{carried}"
+        );
+        // And: the other ledger was neither joined nor asked, and the sweep
+        // log says nothing of its fork.
+        assert_eq!(
+            listed(&ledger_repositories(&root)),
+            BTreeSet::from(["acme--ledger.git".to_owned()])
+        );
+        let log =
+            std::fs::read_to_string(crate::ledger_sweep::sweep_log(&root)).unwrap_or_default();
+        assert!(!log.contains("acme/b-repo"), "{log}");
+        assert!(
+            !remote.traced().contains("acme/elsewhere"),
+            "{}",
+            remote.traced()
+        );
     }
 
     #[test]
@@ -684,11 +1082,19 @@ mod tests {
                 Some(ledger),
                 "{fork}"
             );
+            // The rule that finds which git directory has it as its origin
+            // reads it as the ledger's.
+            assert_eq!(
+                crate::remote_url::remote_slug(ledger),
+                Some("acme/ledger"),
+                "{ledger}"
+            );
         }
         for not_a_forge in [
             "/srv/ours/a-repo",
             "file:///srv/ours/a-repo.git",
             "https://forge.invalid",
+            "ssh://git@forge.invalid:2222",
         ] {
             assert_eq!(
                 ledger_url(not_a_forge, "acme/ledger"),
@@ -785,16 +1191,35 @@ mod tests {
     }
 
     #[test]
-    fn this_machines_name_is_a_ref_component_ending_in_eight_hex_digits() {
-        let named = this_machine();
+    fn this_machine_is_named_for_its_session_in_a_harness_session_and_its_host_in_none() {
+        let _lock = crate::config::test_support::environment_lock();
+        let environment = crate::config::test_support::no_harness_session(&[]);
+        let host = crate::liveness::host_name();
+        let id = std::fs::read_to_string("/etc/machine-id").ok();
+
+        // In no harness session, the name is the host's: its host name and
+        // its machine id, with random digits when the id does not read.
+        let Name::Host(named) = this_machine() else {
+            panic!("a caller in no harness session joins under a session's name");
+        };
         crate::ledger_git::ref_component("machine", &named).unwrap();
         let digits = named
             .rsplit_once('-')
             .map_or(named.as_str(), |(_, digits)| digits);
-        assert_eq!(digits.len(), 8, "{named}");
-        assert!(
-            digits.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "{named}"
+        assert_eq!(
+            named,
+            machine_name(
+                &host,
+                id.as_deref(),
+                u64::from_str_radix(digits, 16).unwrap()
+            )
+        );
+
+        // In one, it is that session's on this host.
+        environment.set("KNIVES_OWNER", "owner-one");
+        assert_eq!(
+            this_machine(),
+            Name::Session(session_machine_name(&host, id.as_deref(), "owner-one"))
         );
     }
 }

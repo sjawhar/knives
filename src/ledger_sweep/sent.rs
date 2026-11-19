@@ -14,12 +14,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use super::destinations::ledger_of;
+use super::destinations::{destinations_telling, ledger_of};
 use super::join::joined_git_dir;
 use super::kept::keep;
-use super::{
-    Destination, Destinations, REMOTE, Tally, destinations, ledger_repositories, pass, record,
-};
+use super::{Destination, Destinations, REMOTE, Tally, ledger_repositories, pass, record};
 use crate::config::Registry;
 use crate::ids::UpstreamName;
 use crate::ledger::{Appended, inline_human_text, problem_human_text};
@@ -125,12 +123,13 @@ impl Written<'_> {
 /// what did not reach it, and what else went wrong.
 ///
 /// An entry of a fork with no `ledger` is not shared: nothing is read or
-/// sent for it. A ledger that no git directory here reaches is joined first
-/// ([`destinations`]). A destination whose remote copy already holds every
-/// entry of `appended` it carries, as when another command's send carried
-/// them meanwhile, is asked nothing: when every one is held, nothing goes
-/// over the network and the ledger's lock is not taken. An entry a claim's
-/// push carried is not in `appended` at all
+/// sent for it. The ledger of each fork it sends that no git directory here
+/// reaches is joined first, and no other ([`destinations_telling`]): a
+/// write does not wait on a ledger it has nothing for. A destination whose
+/// remote copy already holds every entry of `appended` it carries, as when
+/// another command's send carried them meanwhile, is asked nothing: when
+/// every one is held, nothing goes over the network and the ledger's lock
+/// is not taken. An entry a claim's push carried is not in `appended` at all
 /// ([`crate::ledger::forget_appended`]). Otherwise the lock is waited for
 /// as a sweep waits for it, and each destination still lacking one of
 /// them, looked at again under the lock since a command that held it
@@ -140,13 +139,18 @@ impl Written<'_> {
 /// carries it; one this command removed again is not in `appended`. What
 /// the passes discarded and left unread goes to the
 /// [`sweep_record`](super::sweep_record), and their problems replace the
-/// [`sweep_log`](super::sweep_log), as a sweep's do.
+/// [`sweep_log`](super::sweep_log), as a sweep's do. A fork it sends
+/// nothing of is not in that log: this send did not route it, so it has
+/// nothing true to say of its ledger, and the next sweep, or the next
+/// command that routes the fork, says it again.
 pub fn send_now(root: &Path, registry: &Registry, appended: &[Appended]) -> SentNow {
     let shared = shared_of(registry, appended);
     if shared.is_empty() {
         return SentNow::default();
     }
-    let reached = match destinations(root, registry) {
+    let routed: Vec<&UpstreamName> = shared.iter().map(|each| each.fork).collect();
+    let reached = match destinations_telling(root, registry, Some(&routed), &mut std::io::stderr())
+    {
         Ok(reached) => reached,
         Err(error) => return unread(root, &shared, &error.to_string()),
     };
@@ -188,6 +192,7 @@ pub fn send_now(root: &Path, registry: &Registry, appended: &[Appended]) -> Sent
                 let mut logged: Vec<String> = reached
                     .unreached
                     .iter()
+                    .filter(|(fork, _)| routed.contains(fork))
                     .map(|(fork, unreached)| Destinations::unreached_problem(root, fork, unreached))
                     .collect();
                 logged.extend(reached.unclaimed.iter().cloned());

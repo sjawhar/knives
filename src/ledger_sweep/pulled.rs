@@ -4,11 +4,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use super::destinations::destinations_telling;
 use super::kept::Kept;
-use super::{
-    Destination, Destinations, REMOTE, SweepError, destinations, pull_held, setup_problems,
-    sweep_log,
-};
+use super::{Destination, Destinations, REMOTE, SweepError, pull_held, setup_problems, sweep_log};
 use crate::config::Registry;
 use crate::ids::UpstreamName;
 use crate::ledger_git;
@@ -166,18 +164,20 @@ pub fn pull(registry: &Registry, forks: &[&UpstreamName]) -> Pulled {
 
 /// [`pull`] for the ledger at `root`.
 ///
-/// A ledger the registry names that no git directory here reaches is
-/// joined first ([`destinations`]). Each destination's fetch waits for its
-/// transport lock, so a pull racing a sweep reads what the sweep left rather
-/// than failing on it. A failure is a problem for every fork asked about
-/// that the destination carries, never an error: the command still answers
-/// from the entries this machine has. So is each peer entry the pull did
-/// not write, because it could not read it or its contents disagree
-/// ([`ledger_git::Materialised::unwritten`]), for the fork it is in; a fork
-/// asked about whose ledger could not be joined ([`Destinations::unreached`]);
-/// and every directory of entries no fork is kept under
-/// ([`Destinations::unclaimed`]), which is a problem for each fork asked
-/// about: any of them may be the one reading its ledger without them.
+/// The ledger of each of `forks` that no git directory here reaches is
+/// joined first, and no other ([`destinations_telling`]): a ledger of a
+/// fork it does not pull that cannot be joined costs it nothing. Each
+/// destination's fetch waits for its transport lock, so a pull racing a
+/// sweep reads what the sweep left rather than failing on it. A failure is
+/// a problem for every fork asked about that the destination carries, never
+/// an error: the command still answers from the entries this machine has.
+/// So is each peer entry the pull did not write, because it could not read
+/// it or its contents disagree ([`ledger_git::Materialised::unwritten`]),
+/// for the fork it is in; a fork asked about whose ledger could not be
+/// joined ([`Destinations::unreached`]); and every directory of entries no
+/// fork is kept under ([`Destinations::unclaimed`]), which is a problem for
+/// each fork asked about: any of them may be the one reading its ledger
+/// without them.
 pub fn pull_at(root: &Path, registry: &Registry, forks: &[&UpstreamName]) -> Pulled {
     let mut pulled = Pulled {
         root: root.to_owned(),
@@ -186,7 +186,7 @@ pub fn pull_at(root: &Path, registry: &Registry, forks: &[&UpstreamName]) -> Pul
     if forks.is_empty() {
         return pulled;
     }
-    let reached = destinations(root, registry);
+    let reached = destinations_telling(root, registry, Some(forks), &mut std::io::stderr());
     pulled.problems = setup_problems(
         root,
         forks,

@@ -661,20 +661,20 @@ fn record_sent(
 /// already holds it. A git directory that has committed nothing loses nothing
 /// by it.
 ///
-/// `remote` is asked first for exactly that ref, and one that has none
-/// leaves `repository` as it is. A remote that cannot be asked, or a fetch
-/// that fails, is an error, so a caller making the git directory can make
-/// nothing rather than one that refuses its own ref later.
+/// `remote` is asked first for exactly that ref ([`remote_has_machine_ref`]),
+/// and one that has none leaves `repository` as it is. A remote that cannot
+/// be asked, or a fetch that fails, is an error, so a caller making the git
+/// directory can make nothing rather than one that refuses its own ref later.
 pub fn take_up_own_ref(
     repository: &Repository,
     remote: &str,
     machine: &str,
 ) -> Result<(), GitError> {
-    let reference = own_ref(machine)?;
-    let remote = ref_component("remote", remote)?;
-    if !claims::remote_refs(repository, remote, &[reference.as_str()])?.contains_key(&reference) {
+    if !remote_has_machine_ref(repository, remote, machine)? {
         return Ok(());
     }
+    let reference = own_ref(machine)?;
+    let remote = ref_component("remote", remote)?;
     transport(repository.git().args([
         "fetch",
         "--quiet",
@@ -685,6 +685,22 @@ pub fn take_up_own_ref(
         &format!("{reference}:{FETCHED}{remote}/{machine}"),
     ]))?;
     Ok(())
+}
+
+/// Whether `remote` holds `machine`'s ref, `refs/knives/<machine>`, asked for
+/// exactly that ref and nothing fetched.
+///
+/// What a git directory being made asks before it commits as `machine`: a
+/// name the remote holds already committed there, from this machine's own
+/// earlier git directory ([`take_up_own_ref`]) or from another's.
+pub fn remote_has_machine_ref(
+    repository: &Repository,
+    remote: &str,
+    machine: &str,
+) -> Result<bool, GitError> {
+    let reference = own_ref(machine)?;
+    let remote = ref_component("remote", remote)?;
+    Ok(claims::remote_refs(repository, remote, &[reference.as_str()])?.contains_key(&reference))
 }
 
 /// Whether `git push` rejected its only ref because the remote had already
