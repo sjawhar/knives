@@ -153,18 +153,22 @@ pub fn possession_permits_release(claim: &Claim, identity: &Identity) -> bool {
 /// lifecycle notices: `<repo>/<branch> is claimed by` its holder
 /// ([`render_holder`]).
 ///
+/// `machine` is `None` on a fork that shares no ledger, and on one that
+/// shares its ledger the machine the claim was taken on.
+///
 /// It is printed to the refused `start`, the refused `finish` and the
 /// notice after a resume. The notice after a seizure names the same holder
 /// as the one the branch was taken from ([`render_seized`]).
 pub fn render_claim_context(
     claim: &Claim,
-    last_seen: crate::seen::LastSeen,
+    machine: Option<&str>,
+    last_seen: Option<crate::seen::LastSeen>,
     now: jiff::Timestamp,
 ) -> String {
     format!(
         "{} is claimed by {}",
         claim.key(),
-        render_holder(claim, last_seen, now)
+        render_holder(claim, machine, last_seen, now)
     )
 }
 
@@ -175,66 +179,14 @@ pub fn render_claim_context(
 /// no longer that holder's, so the line never says it is claimed by it.
 pub fn render_seized(
     claim: &Claim,
-    last_seen: crate::seen::LastSeen,
-    now: jiff::Timestamp,
-) -> String {
-    format!(
-        "seized {} from {}",
-        claim.key(),
-        render_holder(claim, last_seen, now)
-    )
-}
-
-/// The holder of `claim`, as a line about the claim names it: its owner,
-/// how that owner was named, when it was taken, its last sighting and its
-/// reason.
-///
-/// The owner name and the reason are the text of whatever session took the
-/// claim — another agent of this machine, through `knives start --why` — and
-/// every session of the machine reads that state file, so both reach the
-/// terminal escaped ([`crate::ledger::inline_human_text`]): a reason holding
-/// a terminal control sequence would otherwise drive the terminal of every
-/// caller the line is printed to. The age and the sighting are this
-/// process's own words about timestamps, and need no escaping.
-fn render_holder(claim: &Claim, last_seen: crate::seen::LastSeen, now: jiff::Timestamp) -> String {
-    format!(
-        "{} ({}), {}, {}: {}",
-        crate::ledger::inline_human_text(&claim.owner),
-        owner_kind_label(claim.kind),
-        claimed_when(claim, now),
-        render_last_seen(last_seen, now),
-        crate::ledger::inline_human_text(&claim.why),
-    )
-}
-
-/// [`render_claim_context`] for a claim on a fork that shares its ledger,
-/// taken on machine `machine`: `<repo>/<branch> is claimed by` its holder
-/// ([`render_shared_holder`]).
-pub fn render_shared_claim_context(
-    claim: &Claim,
-    machine: &str,
-    last_seen: Option<crate::seen::LastSeen>,
-    now: jiff::Timestamp,
-) -> String {
-    format!(
-        "{} is claimed by {}",
-        claim.key(),
-        render_shared_holder(claim, machine, last_seen, now)
-    )
-}
-
-/// [`render_seized`] on a fork that shares its ledger, the holder named as
-/// [`render_shared_claim_context`] names it.
-pub fn render_shared_seized(
-    claim: &Claim,
-    machine: &str,
+    machine: Option<&str>,
     last_seen: Option<crate::seen::LastSeen>,
     now: jiff::Timestamp,
 ) -> String {
     format!(
         "seized {} from {}",
         claim.key(),
-        render_shared_holder(claim, machine, last_seen, now)
+        render_holder(claim, machine, last_seen, now)
     )
 }
 
@@ -248,39 +200,52 @@ pub fn render_seized_unread(claim: &ClaimRef, commit: Option<&CommitId>) -> Stri
     )
 }
 
-/// [`render_holder`] for a claim on a fork that shares its ledger, taken on
-/// machine `machine`.
+/// The holder of `claim`, as a line about the claim names it: its owner,
+/// how that owner was named, the machine it was taken on, when it was
+/// taken, its last sighting and its reason.
 ///
-/// `last_seen` is its sighting where its activity can be read here; where
-/// it cannot (`None`), the holder is named with when the claim was taken
-/// instead, and nothing about a sighting: this machine's records of another
-/// machine's claim, or of one another config home recorded, are empty for
-/// want of looking, and "no activity observed" would say the work is idle.
-/// Every value but the age and the sighting was written by whichever
-/// session took the claim, on whichever machine, so each reaches the
-/// terminal escaped.
-fn render_shared_holder(
+/// `machine` is the machine a claim on a fork that shares its ledger was
+/// taken on; on a fork that shares no ledger (`None`) every claim is this
+/// machine's, and the line names no machine. `last_seen` is its sighting
+/// where its activity can be read here, which it always can on a fork that
+/// shares no ledger. Where it cannot (`None`), the holder is named with
+/// when the claim was taken instead, and nothing about a sighting: this
+/// machine's records of another machine's claim, or of one another config
+/// home recorded, are empty for want of looking, and "no activity
+/// observed" would say the work is idle.
+///
+/// The owner name, the machine, the time taken and the reason are the text
+/// of whatever session took the claim — another agent of this machine,
+/// through `knives start --why`, or one on whichever machine took a ledger
+/// claim — and every session reads that record, so each reaches the
+/// terminal escaped ([`crate::ledger::inline_human_text`]): a reason holding
+/// a terminal control sequence would otherwise drive the terminal of every
+/// caller the line is printed to. The age and the sighting are this
+/// process's own words about timestamps, and need no escaping.
+fn render_holder(
     claim: &Claim,
-    machine: &str,
+    machine: Option<&str>,
     last_seen: Option<crate::seen::LastSeen>,
     now: jiff::Timestamp,
 ) -> String {
-    let owner = format!(
-        "{} ({}) on machine {}",
-        crate::ledger::inline_human_text(&claim.owner),
-        owner_kind_label(claim.kind),
-        crate::ledger::inline_human_text(machine),
-    );
-    let why = crate::ledger::inline_human_text(&claim.why);
-    last_seen.map_or_else(
-        || format!("{owner}, {}: {why}", taken_when(claim, now)),
+    let on_machine = machine.map_or_else(String::new, |machine| {
+        format!(" on machine {}", crate::ledger::inline_human_text(machine))
+    });
+    let when = last_seen.map_or_else(
+        || taken_when(claim, now),
         |last_seen| {
             format!(
-                "{owner}, {}, {}: {why}",
+                "{}, {}",
                 claimed_when(claim, now),
                 render_last_seen(last_seen, now)
             )
         },
+    );
+    format!(
+        "{} ({}){on_machine}, {when}: {}",
+        crate::ledger::inline_human_text(&claim.owner),
+        owner_kind_label(claim.kind),
+        crate::ledger::inline_human_text(&claim.why),
     )
 }
 
@@ -1307,15 +1272,15 @@ mod tests {
         let now = "2026-01-03T00:00:00Z".parse().unwrap();
 
         assert_eq!(
-            render_shared_claim_context(&claim, "machine-two", None, now),
+            render_claim_context(&claim, Some("machine-two"), None, now),
             "a-repo/feat/alpha is claimed by owner-two (harness-session) on machine machine-two, \
              taken 2026-01-01T00:00:00Z (2d ago): w"
         );
         // Where it can be read, the sighting is today's.
         assert_eq!(
-            render_shared_claim_context(
+            render_claim_context(
                 &claim,
-                "machine-two",
+                Some("machine-two"),
                 Some(crate::seen::LastSeen::NoneSinceClaim),
                 now
             ),
@@ -1357,9 +1322,14 @@ mod tests {
         let now = "2026-01-03T00:00:00Z".parse().unwrap();
 
         let lines = [
-            render_shared_claim_context(&claim, "machine\u{7}two", None, now),
-            render_shared_seized(&claim, "machine\u{7}two", None, now),
-            render_seized(&claim, crate::seen::LastSeen::NoneSinceClaim, now),
+            render_claim_context(&claim, Some("machine\u{7}two"), None, now),
+            render_seized(&claim, Some("machine\u{7}two"), None, now),
+            render_seized(
+                &claim,
+                None,
+                Some(crate::seen::LastSeen::NoneSinceClaim),
+                now,
+            ),
             unreadable_activity(&claim, "machine\u{7}two", "machine-one"),
             unreadable_activity(&claim, "machine\u{7}two", "machine\u{7}two"),
         ];
@@ -1382,11 +1352,11 @@ mod tests {
         now: jiff::Timestamp,
     ) -> [String; 6] {
         [
-            render_claim_context(local, seen, now),
-            render_seized(local, seen, now),
-            render_shared_claim_context(shared, "machine-one", None, now),
-            render_shared_claim_context(shared, "machine-one", Some(seen), now),
-            render_shared_seized(shared, "machine-one", None, now),
+            render_claim_context(local, None, Some(seen), now),
+            render_seized(local, None, Some(seen), now),
+            render_claim_context(shared, Some("machine-one"), None, now),
+            render_claim_context(shared, Some("machine-one"), Some(seen), now),
+            render_seized(shared, Some("machine-one"), None, now),
             render_claim_line("feat/alpha", local, seen, now),
         ]
     }
@@ -1460,7 +1430,7 @@ mod tests {
         let seen = crate::seen::LastSeen::At("2026-01-01T02:00:00Z".parse().unwrap());
 
         // When: a seize names the claim it took.
-        let line = render_seized(&claim, seen, now);
+        let line = render_seized(&claim, None, Some(seen), now);
 
         // Then: one sentence, which never says the branch is still claimed
         // by its former holder.
@@ -1480,10 +1450,10 @@ mod tests {
 
         // When: a seize names the claim it took, where its activity cannot
         // be read here, and where it can.
-        let elsewhere = render_shared_seized(&claim, "machine-one", None, now);
-        let here = render_shared_seized(
+        let elsewhere = render_seized(&claim, Some("machine-one"), None, now);
+        let here = render_seized(
             &claim,
-            "machine-one",
+            Some("machine-one"),
             Some(crate::seen::LastSeen::NoneSinceClaim),
             now,
         );

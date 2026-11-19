@@ -15,8 +15,8 @@ use crate::commands::claim::{
     Bound, ClaimContext, ClaimDecision, Identity, SharedClaims, Sighting, both_anonymous,
     change_on_ledger, claimed_on, copy_of, current_identity, decide, git_dir_of, names,
     owner_kind_label, refusing, render_claim_context, render_seized, render_seized_unread,
-    render_shared_claim_context, render_shared_seized, sighting_provenance, unapplied_cause,
-    unread_claim, unreadable_activity, unreadable_holder, unwritten,
+    sighting_provenance, unapplied_cause, unread_claim, unreadable_activity, unreadable_holder,
+    unwritten,
 };
 use crate::commands::release::shared_base;
 use crate::commands::wip::workspace_for;
@@ -368,7 +368,7 @@ fn refuse_claim(
     eprintln!(
         "{}{}\n{}\nuse `knives start {} --force --why \"…\"` to seize the claim",
         anonymous_note(anonymous),
-        render_claim_context(claim, last_seen, jiff::Timestamp::now()),
+        render_claim_context(claim, None, Some(last_seen), jiff::Timestamp::now()),
         claim_evidence(claim, workspace),
         claim.branch,
     );
@@ -487,7 +487,7 @@ fn force_claim(
     )?;
     println!(
         "{}\n{workspace_notice}",
-        render_seized(previous, last_seen, jiff::Timestamp::now()),
+        render_seized(previous, None, Some(last_seen), jiff::Timestamp::now()),
     );
     Ok(Exit::Ok)
 }
@@ -529,7 +529,7 @@ fn resume_claim(
     context.store.save()?;
     println!(
         "{event}\n{}\n{workspace_notice}",
-        render_claim_context(claim, last_seen, jiff::Timestamp::now()),
+        render_claim_context(claim, None, Some(last_seen), jiff::Timestamp::now()),
     );
     Ok(Exit::Ok)
 }
@@ -1350,7 +1350,7 @@ fn shared_refusal(refused: Refused<'_>, now: jiff::Timestamp) -> String {
     format!(
         "{}{}\n{evidence}\nuse `knives start {} --force --why \"…\"` to seize the claim",
         anonymous_note(refused.anonymous),
-        render_shared_claim_context(refused.claim, refused.machine, last_seen, now),
+        render_claim_context(refused.claim, Some(refused.machine), last_seen, now),
         refused.claim.branch,
     )
 }
@@ -1577,9 +1577,9 @@ fn seize_shared(
             let seized = previous.map_or_else(
                 || render_seized_unread(&on.claim, on.read.as_ref()),
                 |claim| {
-                    render_shared_seized(
+                    render_seized(
                         claim,
-                        claimed_on(claim, on.machine()),
+                        Some(claimed_on(claim, on.machine())),
                         last_seen,
                         jiff::Timestamp::now(),
                     )
@@ -1671,9 +1671,9 @@ fn resume_shared(
         ))?;
         held.clone()
     };
-    let line = render_shared_claim_context(
+    let line = render_claim_context(
         &copy,
-        claimed_on(&copy, on.machine()),
+        Some(claimed_on(&copy, on.machine())),
         last_seen,
         jiff::Timestamp::now(),
     );
@@ -1826,7 +1826,7 @@ fn own_claim_meanwhile(claim: &Claim, machine: &str, now: jiff::Timestamp) -> St
         claim.branch,
         inline_human_text(machine),
         claim.branch,
-        render_shared_claim_context(claim, machine, None, now)
+        render_claim_context(claim, Some(machine), None, now)
     )
 }
 

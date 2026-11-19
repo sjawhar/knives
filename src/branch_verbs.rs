@@ -21,8 +21,8 @@ use knives::cli::Exit;
 use knives::commands::claim::{
     Bound, ClaimContext, ClaimDecision, Identity, SharedClaims, Sighting, change_on_ledger,
     claimed_on, copy_of, current_identity, decide, git_dir_of, possession_permits_release,
-    refusing, render_claim_context, render_shared_claim_context, sighting_provenance,
-    unapplied_cause, unread_claim, unreadable_activity, unreadable_holder, unwritten,
+    refusing, render_claim_context, sighting_provenance, unapplied_cause, unread_claim,
+    unreadable_activity, unreadable_holder, unwritten,
 };
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
 use knives::config::Registry;
@@ -513,11 +513,11 @@ fn no_claim_now(branch: &BranchName) -> String {
 
 /// `claim`, taken on machine `machine`, as `finish` names its holder on a
 /// fork that shares its ledger, `here` being this machine: in `start`'s
-/// words ([`render_shared_claim_context`]), with its sighting where its
+/// words ([`render_claim_context`]), with its sighting where its
 /// activity can be read here (`last_seen`), else with why it cannot
 /// ([`unreadable_activity`]).
 fn shared_holder(claim: &Claim, machine: &str, here: &str, last_seen: Option<LastSeen>) -> String {
-    let context = render_shared_claim_context(claim, machine, last_seen, jiff::Timestamp::now());
+    let context = render_claim_context(claim, Some(machine), last_seen, jiff::Timestamp::now());
     if last_seen.is_some() {
         context
     } else {
@@ -999,7 +999,7 @@ fn finish_claim_gate(finishing: &Finishing<'_>, store: &Store) -> anyhow::Result
             ledger: read_ledger(store, &target.repo),
             identity: &identity,
             claim: refused,
-            context: render_claim_context(refused, last_seen, jiff::Timestamp::now()),
+            context: render_claim_context(refused, None, Some(last_seen), jiff::Timestamp::now()),
             anonymous: decision == ClaimDecision::RefuseAnonymous,
         }));
     }
