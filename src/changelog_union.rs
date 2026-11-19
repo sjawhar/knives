@@ -24,10 +24,10 @@
 //! whole, byte for byte, as knives 4.0.1 did, except at the one shape a
 //! reader is sure of: in a file with one `## [Unreleased]` heading line, the
 //! place is inside that section ([`Above`]), and every block written there
-//! is plain `### ` lists ([`plain_lists`]). There each `### ` heading, such
-//! as `### Fixed`, is written once ([`joined_blocks`]): the entries that the
-//! other blocks put under it join its list in the last block that has it,
-//! above that list's own entries. A heading is the same only where its text
+//! is plain `### ` lists ([`plain_lists`]). There, for each `### ` heading,
+//! such as `### Fixed` ([`joined_blocks`]), the lists of the last block that
+//! has the heading stay as that block wrote them, and every other block's
+//! lists of that heading join its first one, above that list's own entries. A heading is the same only where its text
 //! is the same: one that differs by case or by a trailing space is another
 //! heading. Entry lines are kept byte for byte, and a joined list's heading
 //! and its blank lines are written once. The check that a member is carried
@@ -36,8 +36,8 @@
 //! in a file's one `[Unreleased]` section, each block is written whole, and
 //! [`Union::left_twice`] names each `### ` heading that two of the blocks
 //! there leave in one section, for a person to join. A heading that one
-//! block holds twice stays as that block wrote it, joined or not, and is
-//! not named.
+//! block written whole holds twice stays as that block wrote it, and that
+//! line does not name it.
 //!
 //! After every release write and every `adopt`, knives reads each release
 //! log in the tree that the command writes or records, changed by it or not.
