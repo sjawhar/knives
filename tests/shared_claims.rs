@@ -15,50 +15,7 @@
 //!
 //! Every test here drives the `knives` binary, raw git and
 //! `tests/common/lab.rs` alone, so this file also runs, unchanged, against
-//! the release before claims were shared, where by design:
-//!
-//! - these fail, each proving its requirement:
-//!   R1 `start_refuses_a_branch_another_machine_holds`,
-//!   `a_pi_session_holds_its_claim_against_another_and_resumes_it_from_a_new_config_home`;
-//!   R2 `a_start_that_read_no_claim_loses_to_a_machine_that_took_it_before_its_push`,
-//!   `two_machines_starting_one_branch_at_once_leave_one_holder`;
-//!   R3 `every_write_on_a_shared_fork_is_on_the_ledger_when_it_exits`,
-//!   `a_write_the_ledger_refuses_exits_3_naming_it_and_a_later_sweep_sends_it`,
-//!   `a_claim_outlives_the_config_home_that_took_it`,
-//!   `standing_in_a_workspace_resumes_only_on_the_machine_that_took_the_claim`,
-//!   `a_claim_taken_on_another_machine_is_finished_only_with_force_and_why`,
-//!   `a_claim_taken_on_another_machine_is_seized_with_force_and_why`,
-//!   `a_new_config_home_with_the_same_machine_name_resumes_and_finishes_its_claim`,
-//!   `a_ledger_with_no_git_directory_is_joined_and_the_claim_reaches_it`;
-//!   R4 `start_takes_no_claim_when_the_ledger_cannot_be_written`,
-//!   `a_ledger_that_cannot_be_reached_refuses_start_by_name`;
-//!   R5 `claim_refs_stay_outside_the_machine_refs_and_another_machine_reads_the_ledger`;
-//!   R6 `finish_records_its_why_without_force`;
-//! - these fail too, each a further case of the same change:
-//!   `a_finish_whose_release_cannot_be_sent_releases_nothing`,
-//!   `a_seize_that_loses_to_a_finish_takes_nothing`,
-//!   `a_claim_push_the_remote_applied_before_it_hung_up_is_held_and_resumed`,
-//!   `a_claim_push_the_remote_hung_up_on_before_applying_it_leaves_the_branch_to_the_next_start`,
-//!   `a_new_config_home_finishes_a_claim_taken_in_another_place_only_with_force_and_why`,
-//!   `a_branch_no_claim_ref_can_name_is_refused_before_the_ledger_is_joined`;
-//! - these, about the name a machine that joins takes, fail too, and also
-//!   at the commit before a joining machine was named for its session:
-//!   `a_config_home_made_again_joins_as_the_same_machine_and_resumes_and_finishes_its_claim`,
-//!   `two_sessions_on_one_host_join_as_two_machines_and_each_takes_its_branch`;
-//!   and their guard,
-//!   `a_machine_named_by_hand_keeps_its_name_in_a_harness_session`, which
-//!   passes at that commit, as it must;
-//! - this fails too, for a cause of its own: knives read workspace names in
-//!   jj's revset quoting, so it never found the workspace a start of such a
-//!   branch made:
-//!   `a_branch_whose_name_jj_would_quote_is_claimed_on_the_ledger_and_released_by_finish`;
-//! - these pass at both: the two controls,
-//!   R2 `a_push_that_does_not_compare_the_old_value_lets_two_machines_hold_one_branch`
-//!   and R5 `a_claim_shaped_ref_under_refs_knives_fails_the_whole_sweep_naming_its_path`,
-//!   which show the failure each guards against; and R5's two regression
-//!   tests, `a_claim_an_older_release_recorded_binds_only_its_machine` and
-//!   `a_fork_without_a_ledger_keeps_its_claims_on_the_machine`, which show
-//!   a behaviour the change must not alter.
+//! the release before claims were shared.
 
 #![allow(
     clippy::expect_used,
@@ -494,6 +451,12 @@ impl Machine {
     /// This machine's ledger root.
     fn root(&self) -> PathBuf {
         self.home.path().join("ledger")
+    }
+
+    /// The log of this machine's last ledger sweep or send, which exists
+    /// only while that one failed.
+    fn sweep_log(&self) -> PathBuf {
+        self.home.path().join("ledger-sweep.log")
     }
 
     /// The git directory knives makes to join [`LEDGER`].
@@ -1372,10 +1335,11 @@ fn every_write_on_a_shared_fork_is_on_the_ledger_when_it_exits() {
         let before = one.entries();
 
         // When: the write runs.
-        one.ran("owner-one", args);
+        let output = one.ran("owner-one", args);
 
         // Then: as it exits, machine one's ref on the remote holds the
-        // entry it wrote, as it wrote it.
+        // entry it wrote, as it wrote it; and the write said nothing on
+        // stderr and left no sweep log.
         let written = one.written_since(&before);
         assert!(!written.is_empty(), "`{}` wrote no entry", args.join(" "));
         let listed = shared.listed("machine-one");
@@ -1390,6 +1354,17 @@ fn every_write_on_a_shared_fork_is_on_the_ledger_when_it_exits() {
                 one.entry(path).trim()
             );
         }
+        assert!(
+            output.stderr.is_empty(),
+            "`{}`: {}",
+            args.join(" "),
+            stderr_of(&output)
+        );
+        assert!(
+            !one.sweep_log().exists(),
+            "`{}` left a sweep log",
+            args.join(" ")
+        );
     }
 }
 
@@ -1409,7 +1384,8 @@ fn a_write_the_ledger_refuses_exits_3_naming_it_and_a_later_sweep_sends_it() {
 
     // Then: it exits 3, naming the fork, the ledger, the git directory and
     // the remote's refusal, and what sends the entry; the entry stays on
-    // machine one, and the remote has none.
+    // machine one, the remote has none, and machine one's sweep log says
+    // why.
     let stderr = stderr_of(&wrote);
     assert_eq!(wrote.status.code(), Some(3), "{stderr}");
     let named = format!(
@@ -1428,6 +1404,8 @@ fn a_write_the_ledger_refuses_exits_3_naming_it_and_a_later_sweep_sends_it() {
     let written = one.entries();
     assert_eq!(written.len(), 1, "{written:?}");
     assert_eq!(shared.listed("machine-one"), Vec::<String>::new());
+    let log = std::fs::read_to_string(one.sweep_log()).expect("a sweep log");
+    assert!(log.contains("push refused by the test"), "{log}");
 
     // When: the remote takes pushes again, machine one sweeps, and then
     // machine two.
@@ -1435,10 +1413,11 @@ fn a_write_the_ledger_refuses_exits_3_naming_it_and_a_later_sweep_sends_it() {
     let sent = one.tried("owner-one", &["--json", "ledger", "sweep"]);
     let pulled = two.tried("owner-two", &["--json", "ledger", "sweep"]);
 
-    // Then: machine one's sweep sends the entry, and machine two's brings
-    // it to machine two as machine one wrote it.
+    // Then: machine one's sweep sends the entry and leaves no sweep log,
+    // and machine two's brings it to machine two as machine one wrote it.
     assert!(sent.status.success(), "{}", stdout_of(&sent));
     assert_eq!(shared.listed("machine-one"), written);
+    assert!(!one.sweep_log().exists());
     assert!(pulled.status.success(), "{}", stdout_of(&pulled));
     assert_eq!(two.entries(), written);
     assert_eq!(two.entry(&written[0]), one.entry(&written[0]));
