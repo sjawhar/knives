@@ -123,7 +123,7 @@ that shares the ledger and runs a knives that reads claim refs. `start` and `fin
 they decide, and change it in one push with the entry that records the change. When they cannot
 read it or push the change, they exit `3`: `start` records no claim and opens no workspace, and
 `finish` leaves the state file and the workspace as they were. The `using-knives` skill's ledger
-reference has the setup and the claim refs.
+reference has the setup, and its shared-claims reference the claim refs.
 
 An older knives kept branch statements in `state.json` and filed each fork's ledger under its
 registry key. This one refuses such a state file or ledger, naming `knives ledger migrate`, which

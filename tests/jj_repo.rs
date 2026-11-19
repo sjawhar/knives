@@ -480,7 +480,7 @@ fn divergent_changes_reports_copies_buried_under_descendants() {
     let lab = lab::Lab::new();
     lab.branch("feature", "feature.txt", "original\n");
     lab.rewrite_in_both_clones("feature");
-    // Bury the local rewrite: make the parked child real so it survives, then
+    // Bury the local rewrite: make the empty working-copy child real so it survives, then
     // bury the fetched rewrite under a child of its own.
     std::fs::write(lab.work.join("local-child.txt"), "local\n").expect("write local child");
     lab.jj_work(["describe", "-m", "child of local rewrite"]);
@@ -812,7 +812,7 @@ fn diff_git_reads_a_branch_adding_a_latin_1_file() {
 #[test]
 fn cutting_a_release_does_not_move_another_agents_working_copy() {
     // Reproduction of a defect found in review. `create_merge` used `jj new`,
-    // which moves `@`, so cutting a release parked whoever was working in the
+    // which moves `@`, so cutting a release moved the working copy of whoever was working in the
     // repo's default workspace on top of the release octopus with their
     // uncommitted edits pending against it. That is verbatim the accident
     // `knives start` exists to prevent, caused by `knives release`.

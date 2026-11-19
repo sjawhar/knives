@@ -230,14 +230,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ledger = Ledger::at(dir.path().join("a-repo.jsonl"));
         ledger
-            .append(&entry(Some("feat/alpha"), "parked\nby the owner"))
+            .append(&entry(Some("feat/alpha"), "stopped\nby the owner"))
             .unwrap();
 
         let text = std::fs::read_to_string(ledger.path()).unwrap();
         assert_eq!(text.lines().count(), 1, "was: {text}");
         assert_eq!(
             ledger.entries().unwrap()[0].text,
-            "parked\nby the owner"
+            "stopped\nby the owner"
         );
     }
 
@@ -450,8 +450,8 @@ pub fn default_ledger_path(repo: &RepoName) -> PathBuf {
 /// Who put an entry there.
 ///
 /// Two values, not three. The question a reader asks is whether a machine
-/// observed this or an agent asserted it; a supersession or a parking arrives as
-/// an event through `finish --superseded-by` and `start --why`, and everything an
+/// observed this or an agent asserted it; a supersession or the owner's decision to stop the work
+/// arrives as an event through `finish --superseded-by` and `start --why`, and everything an
 /// agent asserts is a note. Asking a writing agent to grade its own entry as
 /// judgment-versus-note is a decision with no read-time payoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2737,7 +2737,7 @@ _**Storage note (2026-08-16).** Task 11 swapped the ledger to one markdown file 
         row.notch = Some(LastNotch {
             ts: jiff::Timestamp::now().to_string(),
             kind: crate::ledger::Kind::Note,
-            text: "parked by the owner\nuntil the trait lands upstream, which may be weeks"
+            text: "stopped by the owner\nuntil the trait lands upstream, which may be weeks"
                 .to_owned(),
         });
         let lines = branch_table(&[row]);
@@ -2745,7 +2745,7 @@ _**Storage note (2026-08-16).** Task 11 swapped the ledger to one markdown file 
         assert!(!lines[1].contains('\n'));
         assert!(lines[1].contains('…'), "truncation is marked: {}", lines[1]);
         assert!(
-            lines[1].contains("parked by the owner until"),
+            lines[1].contains("stopped by the owner until"),
             "newlines collapse to spaces: {}",
             lines[1]
         );
@@ -3187,9 +3187,9 @@ carefully: an entry saying "superseded by #1157" at a commit the branch has sinc
 past is a reason to re-check, not a conclusion to inherit. A weird branch nobody can
 explain is exactly what this answers, and the reason it exists is usually one line long.
 
-When you make a call worth remembering — this is superseded, the owner parked it, you
-promised a reviewer something, you re-homed a pull request onto another branch — record it
-before you move on:
+When you make a call worth remembering — this is superseded, the owner stopped it until a
+named event, you promised a reviewer something, you re-homed a pull request onto another
+branch — record it before you move on:
 
 ```
 knives notch <branch> -m "what you decided and why" --evidence <commit-or-ref>
@@ -3244,8 +3244,9 @@ entry belongs in the library's ledger.
 | `pr` | automatically | the pull request `knives track` states for the subject, if any |
 
 Two kinds, not three. The question a reader has is whether a machine observed this or an
-agent asserted it. Supersessions and parkings arrive as events, through `finish
---superseded-by` and `start --why`; everything you assert by hand is a note.
+agent asserted it. Supersessions and an owner's decisions to stop work arrive as
+events, through `finish --superseded-by` and `start --why`; everything you assert by hand
+is a note.
 
 `anchor` is why this record does not rot. A stored disposition goes wrong the moment
 upstream moves: a branch census that inferred "not a release parent, therefore unhomed"
@@ -3586,7 +3587,7 @@ The pure Task 2 and Task 3 tests never knew the file shape and stay byte-for-byt
         // rather than truncate the body.
         let dir = tempfile::tempdir().unwrap();
         let ledger = Ledger::at(dir.path().join("a-repo"));
-        let text = "parked\nby the owner\n+++\nthat line is prose, not a fence";
+        let text = "stopped\nby the owner\n+++\nthat line is prose, not a fence";
         ledger.append(&entry(Some("feat/alpha"), text)).unwrap();
         assert_eq!(ledger.entries().unwrap()[0].text, text);
     }

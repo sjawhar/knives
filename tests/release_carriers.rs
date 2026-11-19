@@ -143,9 +143,9 @@ fn change_of(lab: &Lab, commit: &CommitId) -> ChangeId {
         .expect("read a change id")
 }
 
-/// Park the working copy as an empty child of the trunk, off every member
-/// and release, so nothing the lab's branch helper left holds them.
-fn park(lab: &Lab) {
+/// Step the working copy off every member and release onto an empty child
+/// of the trunk, so that no working copy the lab's branch helper left sits on them.
+fn step_off_onto_trunk(lab: &Lab) {
     lab.jj_work(["new", "main@origin"]);
 }
 
@@ -184,13 +184,13 @@ struct CarrierState {
 
 /// `members` on files of their own: cut, pushed, `feat/gamma` included, the
 /// push made a fast-forward by hand, adopted and pushed again. The working
-/// copy is parked on the trunk.
+/// copy sits on the trunk.
 fn carrier_state(members: &[(&str, &str, &str)]) -> CarrierState {
     let lab = Lab::new();
     for (branch, file, content) in members {
         lab.branch(branch, file, content);
     }
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ok(&lab, &home, &["cut"]);
     adopted_carrier(lab, home)
@@ -202,7 +202,7 @@ fn adopted_carrier(lab: Lab, home: tempfile::TempDir) -> CarrierState {
     let carrier = commit_at(&lab, RELEASE);
     lab.push_branch(RELEASE);
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     release_ok(&lab, &home, &["include", "feat/gamma"]);
     fast_forward(&lab);
     assert!(release_parents(&lab, RELEASE).contains(&carrier));
@@ -228,7 +228,7 @@ fn resolved_carrier_state() -> CarrierState {
     let lab = Lab::new();
     lab.branch("feat/alpha", "shared.txt", "alpha\n");
     lab.branch("feat/beta", "shared.txt", "beta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     // The conflict leaves the cut's audit inconclusive, which exits with
     // findings; the cut is written all the same.
@@ -244,7 +244,7 @@ fn resolved_carrier_state() -> CarrierState {
     );
     lab.jj_work(["edit", RELEASE]);
     std::fs::write(lab.work.join("shared.txt"), RESOLVED).expect("resolve by hand");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     adopt_ok(&lab, &home);
     adopted_carrier(lab, home)
 }
@@ -313,13 +313,13 @@ fn a_fast_forward_carrier_is_labelled_and_left_out_of_the_next_include_and_cut()
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ok(&lab, &home, &["cut"]);
     let carrier = commit_at(&lab, RELEASE);
     lab.push_branch(RELEASE);
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     release_ok(&lab, &home, &["include", "feat/gamma"]);
     fast_forward(&lab);
 
@@ -354,7 +354,7 @@ fn a_fast_forward_carrier_is_labelled_and_left_out_of_the_next_include_and_cut()
 
     // When: the next include, then the next cut.
     lab.branch("feat/delta", "delta.txt", "delta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     release_ok(&lab, &home, &["include", "feat/delta"]);
     assert!(!release_parents(&lab, RELEASE).contains(&carrier));
     // The unpushed include leaves the local release and its pushed position
@@ -403,16 +403,16 @@ fn an_extra_parent_beside_a_carrier_is_refused_as_a_membership_change_outside_kn
     // of the release ever had: its members match no recorded write.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ok(&lab, &home, &["cut"]);
     let carrier = commit_at(&lab, RELEASE);
     lab.push_branch(RELEASE);
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     release_ok(&lab, &home, &["include", "feat/gamma"]);
     lab.branch("feat/stranger", "stranger.txt", "stranger\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     lab.jj_work([
         "rebase",
         "-r",
@@ -449,7 +449,7 @@ fn a_drop_names_a_loss_only_when_the_written_tree_lost_something() {
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/alpha-twin", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ok(&lab, &home, &["cut"]);
 
@@ -629,7 +629,7 @@ fn a_rebase_over_a_carrier_keeps_the_hand_resolution_and_moves_the_working_copy_
 #[test]
 fn a_rebase_over_a_carrier_with_no_working_copy_on_it_leaves_no_anonymous_head() {
     // Given: the adopted carrier state with a hand resolution, the working
-    // copy parked on the trunk, and the upstream trunk moved on.
+    // copy sitting on the trunk, and the upstream trunk moved on.
     let state = resolved_carrier_state();
     let (lab, home) = (&state.lab, &state.home);
     lab.advance_upstream("upstream moved\n");
@@ -650,7 +650,7 @@ fn an_include_then_a_rebase_before_any_push_leaves_no_anonymous_head() {
     let state = resolved_carrier_state();
     let (lab, home) = (&state.lab, &state.home);
     lab.branch("feat/delta", "delta.txt", "delta\n");
-    park(lab);
+    step_off_onto_trunk(lab);
     lab.advance_upstream("upstream moved\n");
 
     // When: a branch is included, then the release rebased, nothing pushed.
@@ -668,7 +668,7 @@ fn an_include_then_a_plain_push_leaves_no_anonymous_head() {
     let state = resolved_carrier_state();
     let (lab, home) = (&state.lab, &state.home);
     lab.branch("feat/delta", "delta.txt", "delta\n");
-    park(lab);
+    step_off_onto_trunk(lab);
 
     // When: a branch is included and the release pushed.
     release_ok(lab, home, &["include", "feat/delta"]);
@@ -860,7 +860,7 @@ fn a_member_with_no_bookmark_dropped_from_an_unpushed_release_stays_visible() {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/m", "m.txt", "m\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ok(&lab, &home, &["cut"]);
     let member = commit_at(&lab, "feat/m");
@@ -891,7 +891,7 @@ fn a_conflicted_write_over_a_carrier_abandons_no_earlier_write() {
     ]);
     let (lab, home) = (&state.lab, &state.home);
     lab.branch("feat/clash", "alpha.txt", "clash\n");
-    park(lab);
+    step_off_onto_trunk(lab);
     let visible: Vec<CommitId> = earlier_writes(lab, home)
         .into_iter()
         .filter(|commit| *commit != state.release && is_visible(lab, commit))
@@ -922,7 +922,7 @@ fn a_bookmarkless_member_dropped_over_a_carrier_stays_while_a_superseded_one_goe
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/n", "n.txt", "n\n");
     lab.branch("feat/s", "s.txt", "s\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ok(&lab, &home, &["cut"]);
     let carrier = commit_at(&lab, RELEASE);
@@ -936,7 +936,7 @@ fn a_bookmarkless_member_dropped_over_a_carrier_stays_while_a_superseded_one_goe
         "the describe hid s's older version"
     );
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     release_ok(&lab, &home, &["include", "feat/gamma"]);
     fast_forward(&lab);
     assert!(is_visible(&lab, &older), "the fast-forward brings it back");
@@ -955,7 +955,7 @@ fn a_bookmarkless_member_dropped_over_a_carrier_stays_while_a_superseded_one_goe
     // When: the next push and the next knives write.
     lab.push_branch(RELEASE);
     lab.branch("feat/delta", "delta.txt", "delta\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     release_ok(&lab, &home, &["include", "feat/delta"]);
 
     // Then: n is still visible, and the audit reports it as an orphan commit.
@@ -979,7 +979,7 @@ fn a_member_reworded_under_a_tagged_release_stays_when_its_rewrite_is_dropped() 
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/m", "m.txt", "m\n");
-    park(&lab);
+    step_off_onto_trunk(&lab);
     let home = fixed_home(&lab);
     release_ok(&lab, &home, &["cut"]);
     let member = commit_at(&lab, "feat/m");

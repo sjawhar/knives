@@ -2,7 +2,6 @@
 
 Read this when `knives start` refuses because the branch bookmark is divergent (step 1).
 
-Compare the tips with `jj -R <path> --ignore-working-copy diff --from <a> --to <b>` (path from `knives repos`).
-
-- Same content, one tip is the live PR's origin ref: apply only the same-content recovery that the refusal prints, then retry.
-- Else: record the tips and ask the orchestrator. Never pick by recency.
+1. Compare the tips with `jj -R <path> --ignore-working-copy diff --from <a> --to <b>` (path from `knives repos`).
+2. Same content, and one tip is the live PR head: set the bookmark to that tip with the command the refusal prints, then run `start` again.
+3. Otherwise record the tips and ask the orchestrator. Never pick by recency: that can lose the live PR's commits.

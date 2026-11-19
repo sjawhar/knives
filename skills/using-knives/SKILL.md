@@ -1,84 +1,73 @@
 ---
 name: using-knives
-description: "Use when running any knives command or reading its output. Also use for fork remotes (upstream, origin, release), branch-to-PR matching, branch dependencies, release plans and cuts, and whether a release carries a change. Also use for the notch ledger and its sharing or migration, JSON output, or OpenCode plugin options. For checks before touching a fork, use fork-work."
+description: "Use when running a knives command or reading its output: claims, branch-to-PR links, dependencies, the notch ledger, release plans, edits, cuts and pushes, whether a release carries a change, the registry, trust, or the OpenCode plugin. Before touching a fork, use fork-work."
 ---
 
 # The knives CLI
 
-If this skill disagrees with the code, a command's output or its `--help`, follow those and say which line of this skill is wrong.
-
-knives reports fork state and shows who owns what. A finding is a fact to investigate. It is not an instruction to remove a branch, repair a ref, open a PR, or call work merge-ready. For what to do before touching a fork, use **fork-work**. Flags: `knives <command> --help`.
+knives reports fork state and records who owns what. A finding is a fact to investigate, not an instruction to remove a branch, repair a ref, open a PR or call work merge-ready. Flags: `knives <command> --help`. If this skill disagrees with the code, a command's output or its `--help`, follow those and say which line of this skill is wrong.
 
 ## After an upgrade
 
-Run `knives ledger migrate` once on each machine. Until the migration moves the old data, commands that read the state file or a fork's ledger exit `3` and name it. The hook puts that refusal in the agent's context in place of the claims notice. See [upgrading](references/ledger.md#upgrading-from-an-older-knives).
+Run `knives ledger migrate` once on each machine. Until then, commands that read the state file or a fork's ledger exit `3` and name it, and the hook shows that refusal in place of the claims notice. Read [references/ledger.md](references/ledger.md#upgrading-from-an-older-knives) when the migration reports a problem.
 
-## Before acting
+## Rules
 
-- **Bind the right repository.** Commands use the checkout you are in. A named repository is found by a scan of home, not taken from the current directory. `repos` always scans. Scan scope, ambiguous checkouts, registry: [configuration](references/configuration.md).
-- **Keep remote roles separate.** `upstream` takes our work only through a PR. `origin` is our fork, with ordinary branches and PR heads. The optional `release` remote is where releases are consumed. When it is absent or equal to `origin`, publish to `origin`. A matching name on the wrong remote proves nothing.
-- **Registration is not trust.** Trust injects guidance as data and never authorizes fork commands. Repo and owner trust match self-declared remote URLs, not forge authentication. Read [configuration](references/configuration.md) before you grant it.
-- **Respect ownership.** A claim names an active worker, not an important branch. Harness session identities tell apart agents under one OS user. Another holder's claim is not yours. Sightings do not prove liveness. On a fork whose registry entry sets `ledger`, a claim holds on every machine that shares that ledger, and `status` lists only this machine's claims. Before `start` or `finish`, read [coordination](references/coordination.md). Never remove `state.lock` or a lock in `fork-locks/`.
-- **Release a claim when active work stops**, also while a PR waits for review. First record in the ledger why the branch exists and any supersession. `finish` removes the workspace, not the branch or PR. To keep files jj never tracked, use `--no-cleanup`. Check this before cleanup.
-- **A missing observation is not clearance.** Missing, `null`, zero and `UNKNOWN` differ. Read `problems` and the field definitions: [audit](references/reports.md), [status](references/status.md).
-- **Keep dependencies.** `depends <branch> --on <repo>#<number>` says the branch cannot merge before that PR. Never keep a dependent and drop its requirement: the release cannot work. A status report does not authorize discarding either.
-- **One branch is both release member and PR head.** It is linear past the shared release base. Never make a second "release-lineage" or sibling copy so that it composes. Moving the release base is an intentional release operation.
-- **Change releases explicitly.** Make release names only with `release cut`, never by hand. `--allow-drop` states an intended drop. It is not a way past a refusal. Before any release change, read the pin gates and cut evidence in [releases](references/releases.md). A fork with named release series (one per base, such as 9.3 and 9.2) needs `knives release --series <name>` to act on any series but the default.
-- **Adopt a hand resolution before the next write.** After you resolve, renumber or repair a release commit by hand, run `knives release adopt <name>`. Add `--why` for a change outside the conflicts. Until then, `cut`, `include`, `drop`, `advance` and `rebase` refuse. See [adopt](references/releases.md#knives-release-adopt-name---why-text). A hand edit of a published dated or series release cannot be adopted while the publish remote does not hold it: redo it under a new dated name, in the order of [the published remedy](references/releases.md#the-published-remedy).
-- **Before a raw branch rebase**, run fork-work's bidirectional gate (§7). Is the branch a parent of a release/keep merge, or does it descend from one? Bare `release members` sees only the release in hand. Keep published merge ids, because a broad `jj rebase -b` can rewrite them. Read the [rebase rules](references/releases.md) first.
+1. Bind the right repository. Commands use the checkout you stand in. A named repository is found by a scan of `$HOME`, not by your current directory, and `repos` always scans.
+2. Keep remote roles apart. `upstream` takes our work only through a PR. `origin` is our fork: branches and PR heads. `release` is an optional publish remote; when it is absent or equal to `origin`, publish to `origin`. A matching name on the wrong remote proves nothing.
+3. Registration is not trust. `[trust]` injects repository guidance as data and never authorizes fork commands; its repo and owner rules match self-declared remote URLs.
+4. A claim means "working here now". Another holder's claim is not yours, and a sighting does not prove liveness. On a fork whose registry entry sets `ledger`, a claim holds on every machine that shares that ledger, and `status` lists only this machine's claims. Never remove `state.lock` or a file in `fork-locks/`.
+5. Release a claim with `knives finish` when active work stops, also while a PR waits for review. First record in the ledger why the branch exists and any supersession: `finish` drops the claim's reason. The branch, bookmark and PR stay.
+6. A missing observation is not clearance. Absent, `null`, `0` and `UNKNOWN` differ. Read `problems`.
+7. Keep dependencies. Never keep a dependent in a release and drop its requirement.
+8. One branch is both release member and PR head. Never make a "release-lineage" or sibling copy so that it composes: move the release.
+9. Make release names only with `release cut`, never by hand. `--allow-drop` states an intended drop; it is not a way past a refusal.
+10. After any hand change on a release commit, run `knives release adopt <name>` before the next release write.
+11. Before a raw `jj rebase` of a branch, run fork-work's bidirectional gate (§7).
 
-## Commands
+## Which reference to read
 
-Open a reference when you run the command or read its output.
+- Read [references/reports.md](references/reports.md) when you run or read `repos`, `consumers`, `pushed`, `audit` or `pr`.
+- Read [references/status.md](references/status.md) when you read `knives status` rows, states or columns.
+- Read [references/coordination.md](references/coordination.md) before `sync`, `preflight`, `start`, `finish`, `track` or `depends`, and when a command waits on a lock.
+- Read [references/shared-claims.md](references/shared-claims.md) before `start` or `finish` on a fork whose registry entry sets `ledger`, when a claim refusal names a machine, when `start` or `finish` exits `3` naming a ledger, and when a command prints `joined the ledger`.
+- Read [references/ledger.md](references/ledger.md) before you read or write `knives notch`, set up ledger sharing, or run `knives ledger sweep` or `migrate`.
+- Read [references/release-composition.md](references/release-composition.md) before you plan, cut, `include`, `drop`, `advance` or `rebase` a release, or read `release members`.
+- Read [references/releases.md](references/releases.md) before you adopt a hand change, when a release write prints `could not check` or `is published`, when a reap keeps a cut, and before you push a release.
+- Read [references/configuration.md](references/configuration.md) when a checkout does not bind or binds twice, before you register a fork or edit `repos.toml` or `[trust]`, and when you configure the OpenCode plugin.
 
-| Question or action | Command | Reference |
-|---|---|---|
-| Known forks and consumer pins | `repos`, `consumers` | [reports](references/reports.md) |
-| Does the live owning remote hold this tip? | `pushed [BRANCH]...` | [reports](references/reports.md) |
-| What differs across the estate? | `audit [REPO] [--all]` | [reports](references/reports.md) |
-| One PR's state or event history | `pr NUMBER [--timeline]` | [reports](references/reports.md) |
-| Each branch's state, owner, latest note | `status [REPO\|--all]` | [status](references/status.md) |
-| Fetch and classify changes since last look | `sync [REPO\|--all]` | [coordination](references/coordination.md) |
-| Upstream contribution facts | `preflight [REPO]` | [coordination](references/coordination.md) |
-| Claim or release work | `start`, `finish` | [coordination](references/coordination.md) |
-| State a PR link or prerequisite | `track`, `depends` | [coordination](references/coordination.md) |
-| Read or record decisions and evidence | `notch [SUBJECT]` | [ledger](references/ledger.md) |
-| Share the ledger, or migrate an old one | `ledger sweep`, `ledger migrate` | [ledger](references/ledger.md) |
-| Plan, edit, cut, rebase, adopt, reap a release | `release ...` | [releases](references/releases.md) |
-| Identity, trust, plugin | `register`, registry, plugin | [configuration](references/configuration.md) |
+## What changes state
 
-- These change local state: `sync`, `start`, `finish`, `track`, `depends`, ledger writes, release edits. When the ledger is [shared](references/ledger.md#sharing-between-machines), a write sends its entries to it before the command exits. A write whose entries did not arrive exits `3`, and a `knives ledger sweep` that you run sends them.
-- These pull a shared ledger first: `status`, `sync`, `audit`, `pushed`, and release commands that read the ledger. On a shared fork, `start` and `finish` read the branch's claim from the ledger's repository first. When they cannot read or write that claim, each exits `3`, and `state.json` and the workspace stay as they were.
-- `audit` and `pushed` never repair, remove, push or open PRs.
-- Release commands never push. Publish a new release name with `jj git push --remote <publish-remote> --bookmark <name>`. Push a release that the publish remote moves only forward with plain `git push`, after the fast-forward rebase and `adopt`. Never use `jj git push` for it. See [publishing](references/releases.md#publishing).
+- Local writes: `sync`, `start`, `finish`, `track`, `depends`, `notch -m`, release edits. On a fork that shares its ledger, a write sends its entries before it exits; one whose entries did not arrive exits `3`, and `knives ledger sweep` sends them later.
+- `repos`, `consumers`, `pushed`, `audit`, `status` and `pr` never repair, remove, push or open PRs.
+- Release commands never push. Publish as [references/releases.md](references/releases.md#publishing) says.
 - `knives hook claude-code|opencode` is harness plumbing. Do not run it.
 
 ## Is this content carried?
 
-Use the replay probe, never a source-text search. A symbol's presence does not show that its change is carried.
+Use the replay probe, never a source-text search: a symbol's presence does not show that its change is carried.
 
-- `knives release members <target> --carries <revision>` checks that target. Exit `0` is carried, `1` is `NOT carried` or `conflicted`, `3` is unresolved or uncheckable. A superseded target is a valid target.
-- With no `<target>`, it checks live releases and upstream trunk, then superseded cuts. Carriage only by a superseded cut does not make deletion safe. `--census` asks this for every maintained branch.
-- The `landed` column of `status` is the upstream-trunk probe.
-- Bare `members` lists direct parents. `--verify` replays each member. Details: [releases](references/releases.md).
+- `knives release members <target> --carries <revision>` checks that one target. Exit `0` carried, `1` `NOT carried` or `conflicted`, `3` unresolved or uncheckable. A superseded target is a valid target.
+- With no target, it checks live releases and upstream trunk, then superseded cuts. Carriage only by a superseded cut does not make deletion safe.
+- `--census` asks this for every maintained branch. The `landed` column of `status` is the upstream-trunk probe.
 
 | Verdict | Evidence |
 |---|---|
-| `carried-exact` | The revision tip is an ancestor of the target. Against a release, the release's tree also holds its change: its net change replays empty, and a release-log block that a union holds counts as held. |
-| `carried-rewritten` | Replay of its net change leaves the target unchanged. Equivalent content arrived differently, or it has no net change. |
-| `carried-rebased` | Replay differs, but a commit with its change id is an ancestor. Weaker than rewritten: divergent changes can name different trees. |
-| `NOT carried` | Replay leaves a clean non-empty diff, and no rewrite is in the target. A member of a release reads this when the release's tree lost its change. |
-| `conflicted` | Replay conflicts, and no rewrite is in the target. Some content can be present, so this needs judgment. |
+| `carried-exact` | The revision tip is an ancestor of the target. Against a release, its net change also replays empty onto the release's tree. |
+| `carried-rewritten` | Replaying its net change leaves the target unchanged: equivalent content arrived another way, or it has no net change. |
+| `carried-rebased` | Replay differs, but a commit with its change id is an ancestor. Weaker: divergent changes can name different trees. |
+| `NOT carried` (JSON `not-carried`) | Replay leaves a clean non-empty diff, and no rewrite is in the target. |
+| `conflicted` | Replay conflicts, and no rewrite is in the target. Some content can be present: judge it. |
 
 ## Output and exit codes
 
-Reports use TOON when an agent is detected or stdout is not a terminal. `--json` forces JSON and `--text` forces prose. TOON and JSON carry the same structure. Read the fields, not the prose for people.
+Reports are TOON when an agent is detected or stdout is not a terminal. `--json` forces JSON and `--text` forces prose; TOON and JSON carry the same structure. Read the fields, not the prose.
 
 | Exit | Meaning |
 |---|---|
 | `0` | No findings. Not a readiness verdict. |
 | `1` | Findings. |
-| `2` | Usage error. |
-| `3` | Incomplete: something could not be answered, or a write did not reach a shared ledger. |
+| `2` | Usage error, or a `start` or `finish` refusal. A `finish` refused because another owner took your claim exits `1`. |
+| `3` | Incomplete: something could not be answered, or a write did not reach a shared ledger. Release writes also refuse with `3`. |
 
-An incomplete report can still hold useful observations. Audit branch rows do not change the exit, but findings and problems do. A `null` thread count is not zero, even at exit `0`.
+An incomplete report can still hold useful observations.

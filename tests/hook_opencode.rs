@@ -1167,7 +1167,7 @@ fn an_abandoned_hook_invocation_exits_at_its_deadline_instead_of_living_forever(
     // Given: a harness spawned the hook with a piped stdin and then abandoned
     // it — nothing will ever write or close that pipe. This is the state that
     // accumulated ~13k immortal knives processes and took down a devbox on
-    // 2026-08-25: without a watchdog the process parks in its stdin read.
+    // 2026-08-25: without a watchdog the process blocks in its stdin read.
     let mut child = Command::new(env!("CARGO_BIN_EXE_knives"))
         .args(["hook", "opencode"])
         .env("KNIVES_HOOK_DEADLINE_MS", "250")
