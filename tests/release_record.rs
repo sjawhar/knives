@@ -32,12 +32,14 @@
 //! that a list of up to 16 pieces may name. A list of more pieces does not
 //! read whole there, nor does a list of files resolved by hand that another
 //! part follows, as the list may hold that part, so the record is refused,
-//! naming the adopt and its fetch, or recorded under `--allow-drop` with the
+//! naming the adopt, and its fetch where a remote has a branch or tag at
+//! it, else `--allow-drop` alone; or recorded under `--allow-drop` with the
 //! drop stated. A record that lacks a file with no reference here is told
-//! to fetch the write where the walk for that reference stopped. A
-//! published name that the publish remote lacks is not recorded until it is
-//! pushed, and the refusal gives the commands. A printed command quotes the
-//! name for the shell.
+//! to fetch the write where the walk for that reference stopped where a
+//! remote has it, and keeps the adopt of the new content where none does.
+//! A published name that the publish remote lacks is not recorded until it
+//! is pushed, and the refusal gives the commands. A printed command quotes
+//! the name for the shell.
 
 #![allow(
     clippy::expect_used,
@@ -4589,8 +4591,8 @@ fn an_older_adopt_of_two_thousand_files_is_refused_in_a_clone_without_its_commit
     // before the `fix_files` list writes it, so its text alone names them,
     // in one list of 2,016 pieces; the next release cut on it, which holds
     // them all; a second clone that holds the next release and not the
-    // adopt's commit; and the third release merged by hand there, without
-    // the fix.
+    // adopt's commit, which no remote holds either, as the registry reaches
+    // origin; and the third release merged by hand there, without the fix.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
@@ -4623,6 +4625,7 @@ fn an_older_adopt_of_two_thousand_files_is_refused_in_a_clone_without_its_commit
         "the second clone holds the next release and not the adopt's commit"
     );
     let commit = hand_merge_in_second_clone(&lab, None);
+    with_lab_origin(&lab, home.path());
     let entries = ledger_entries(&home);
 
     // When: it is recorded in the second clone.
@@ -4633,10 +4636,11 @@ fn an_older_adopt_of_two_thousand_files_is_refused_in_a_clone_without_its_commit
     );
 
     // Then: it is refused, naming the adopt, its release and its commit, and
-    // the fetch of that commit, and nothing is written: a list of 2,016
-    // pieces may name a path of more than 16, which the text does not give,
-    // so the clone cannot read the fix's files whole, and it reads none of
-    // them.
+    // nothing is written: a list of 2,016 pieces may name a path of more
+    // than 16, which the text does not give, so the clone cannot read the
+    // fix's files whole, and it reads none of them. No remote has a branch
+    // or tag at the adopt, so no fetch brings it, and the remedy gives
+    // `--allow-drop` alone and says why.
     let out = text(&refused);
     assert_eq!(refused.status.code(), Some(3), "{out}");
     assert!(
@@ -4652,10 +4656,10 @@ fn an_older_adopt_of_two_thousand_files_is_refused_in_a_clone_without_its_commit
     );
     assert!(
         out.contains(&format!(
-            "\n  nothing was recorded; fetch {RELEASE}'s recorded write {}, which this repository \
-             does not hold, then record a commit that carries that fix, or re-run with \
-             --allow-drop to state the drop is intended\n",
-            adopt.short()
+            "\n  nothing was recorded; re-run with --allow-drop to state the drop is intended: \
+             nothing in this repository can hold a release against the fix by hand of \
+             {RELEASE}'s adopt {adopt}, as no remote has a branch or tag at {adopt}\n",
+            adopt = adopt.short()
         )),
         "{out}"
     );
@@ -4701,6 +4705,80 @@ fn an_older_adopt_of_two_thousand_files_is_refused_in_a_clone_without_its_commit
         )),
         "{event:?}"
     );
+}
+
+#[test]
+fn an_older_adopt_past_the_piece_bound_is_refused_naming_the_branch_that_origin_holds_at_it() {
+    // Given: RELEASE fixed by hand with one new file whose path joins 17
+    // pieces with `, `, one more than an older event's text is read for, and
+    // adopted, its event as a knives from before the `fix_files` list writes
+    // it; the next release cut on it; a second clone that holds the next
+    // release and not the adopt's commit; RELEASE then pushed at the adopt,
+    // so the publish remote, origin, which the registry reaches, holds it;
+    // and the third release merged by hand in the second clone, without the
+    // fix.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    let seventeen = (1..=17)
+        .map(|piece| format!("p{piece:02}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let adopt = fix_by_hand(
+        (&lab, &home),
+        RELEASE,
+        &[(seventeen.as_str(), Some("fixed by hand\n"))],
+        "a fix by hand",
+    );
+    without_fix_files(&home, RELEASE);
+    let next = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(matches!(next.status.code(), Some(0 | 1)), "{}", text(&next));
+    for branch in ["feat/alpha", "feat/beta", "release/2026-08-05"] {
+        lab.push_branch(branch);
+    }
+    fetch_second_clone(&lab);
+    lab.jj_work([
+        "bookmark",
+        "set",
+        RELEASE,
+        "-r",
+        adopt.as_str(),
+        "--allow-backwards",
+    ]);
+    lab.push_branch(RELEASE);
+    with_lab_origin(&lab, home.path());
+    assert!(
+        !second_clone_holds(&lab, &adopt),
+        "the second clone does not hold the adopt's commit"
+    );
+    let commit = hand_merge_in_second_clone(&lab, None);
+    let entries = ledger_entries(&home);
+
+    // When: it is recorded in the second clone.
+    let refused = cut_in_second_clone(
+        &lab,
+        &home,
+        &["release/2026-08-06", "--at", commit.as_str()],
+    );
+
+    // Then: it is refused, and its remedy names origin's branch at the
+    // adopt, with its fetch, then a commit that carries the fix; and nothing
+    // is written.
+    let out = text(&refused);
+    assert_eq!(refused.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "\n  nothing was recorded; fetch origin's refs/heads/{RELEASE}, which holds {}, then \
+             record a commit that carries that fix, or re-run with --allow-drop to state the drop \
+             is intended\n",
+            adopt.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(ledger_entries(&home), entries, "{out}");
 }
 
 #[test]
@@ -4864,9 +4942,11 @@ fn an_older_adopt_whose_resolved_list_a_reason_follows_is_refused_where_its_comm
     );
 
     // Then: it is refused, naming the adopt, its release and its commit, and
-    // the part that its list holds, with the fetch of that commit, and
-    // nothing is written: the clone cannot tell which reading the adopt
-    // wrote, and the one that ends the list at `; why: ` may hold less.
+    // the part that its list holds, and nothing is written: the clone cannot
+    // tell which reading the adopt wrote, and the one that ends the list at
+    // `; why: ` may hold less. The registry's origin cannot be read here, so
+    // no fetch is named: the remedy gives `--allow-drop` alone and names
+    // that remote.
     let out = text(&refused);
     assert_eq!(refused.status.code(), Some(3), "{out}");
     assert!(
@@ -4882,10 +4962,11 @@ fn an_older_adopt_whose_resolved_list_a_reason_follows_is_refused_where_its_comm
     );
     assert!(
         out.contains(&format!(
-            "\n  nothing was recorded; fetch {RELEASE}'s recorded write {}, which this repository \
-             does not hold, then record a commit that carries that fix, or re-run with \
-             --allow-drop to state the drop is intended\n",
-            adopt.short()
+            "\n  nothing was recorded; re-run with --allow-drop to state the drop is intended: \
+             nothing in this repository can hold a release against the fix by hand of \
+             {RELEASE}'s adopt {adopt}, as no remote that this repository could read has a branch \
+             or tag at {adopt}; origin could not be read\n",
+            adopt = adopt.short()
         )),
         "{out}"
     );
@@ -4987,7 +5068,7 @@ fn unpushed_edit_before(home: &tempfile::TempDir, name: &str, (write, commit): (
 }
 
 #[test]
-fn a_record_that_lacks_a_named_file_with_no_reference_here_is_told_to_fetch_the_write_it_needs() {
+fn a_record_that_lacks_a_named_file_whose_reference_write_no_remote_holds_keeps_the_adopt_remedy() {
     // Given: shared.txt on the trunk; RELEASE cut of `feat/alpha` and
     // `feat/beta`, which changes its line 5; RELEASE fixed by hand in place
     // on line 2 and adopted; RELEASE fixed by hand again with the new file
@@ -5038,6 +5119,7 @@ fn a_record_that_lacks_a_named_file_with_no_reference_here_is_told_to_fetch_the_
     );
     let newest = commit_at(&lab, "release/2026-08-05");
     unpushed_edit_before(&home, "release/2026-08-05", (&newest, UNPUSHED));
+    with_lab_origin(&lab, home.path());
     let commit = merged_with(&lab, &[("x, shared.txt", "fixed by hand\n")]);
     let entries = ledger_entries(&home);
 
@@ -5046,9 +5128,11 @@ fn a_record_that_lacks_a_named_file_with_no_reference_here_is_told_to_fetch_the_
     let refused = record(&lab, &home, "release/2026-08-06", &commit);
 
     // Then: it is refused, naming the second adopt at `shared.txt`, which
-    // no commit carries here; the remedy names the peer's edit where the
-    // walk stopped, with its release, and its fetch, then the adopt that
-    // keeps the new content; and nothing is written.
+    // no commit carries here: the walk for its reference stopped at the
+    // peer's edit, which no remote has a branch or tag at, so no fetch is
+    // named; the remedy keeps the commit for the first adopt's fix, which a
+    // commit carries, and the adopt that keeps the new content; and nothing
+    // is written.
     let out = text(&refused);
     assert_eq!(refused.status.code(), Some(3), "{out}");
     assert!(
@@ -5060,14 +5144,12 @@ fn a_record_that_lacks_a_named_file_with_no_reference_here_is_told_to_fetch_the_
         "{out}"
     );
     assert!(
-        out.contains(&format!(
-            "\n  nothing was recorded; fetch release/2026-08-05's recorded write {}, which this \
-             repository does not hold, then record a commit that carries those fixes; to keep \
-             the new content of those files, edit release/2026-08-05 by hand to hold it and run \
-             `knives release adopt release/2026-08-05`, or re-run with --allow-drop to state the \
-             drop is intended\n",
-            &UNPUSHED[..12]
-        )),
+        out.contains(
+            "\n  nothing was recorded; record a commit that carries that fix; to keep the new \
+             content of those files, edit release/2026-08-05 by hand to hold it and run `knives \
+             release adopt release/2026-08-05`, or re-run with --allow-drop to state the drop is \
+             intended\n"
+        ),
         "{out}"
     );
     assert_eq!(ledger_entries(&home), entries, "{out}");
