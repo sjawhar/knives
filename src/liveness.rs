@@ -248,6 +248,9 @@ mod tests {
 
     #[test]
     fn a_child_inside_the_directory_is_a_live_user() {
+        // `sleep` is found through `PATH`, which another test may hold at a
+        // directory of its own fakes while it runs.
+        let _lock = crate::config::test_support::environment_lock();
         let directory = tempfile::tempdir().expect("tempdir");
         let mut child = std::process::Command::new("sleep")
             .arg("30")
@@ -262,6 +265,10 @@ mod tests {
 
     #[test]
     fn this_process_inside_the_directory_is_not() {
+        // A child another test is starting holds a copy of every file this
+        // process has open, the held one too, until it execs: the lock keeps
+        // every test that starts one out until this one is done.
+        let _lock = crate::config::test_support::environment_lock();
         let directory = tempfile::tempdir().expect("tempdir");
         let file = std::fs::File::create(directory.path().join("held")).expect("create");
         let users = live_users(directory.path(), None);

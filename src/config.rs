@@ -31,7 +31,9 @@ pub(crate) mod test_support {
     /// through `PATH` and inherits the environment at that instant, so an
     /// unlocked spawn racing a mutator fails in ways that look like the
     /// production code flaking (measured: `git`/`jj` fixtures in the hook and
-    /// sync tests, 3 failures in 50 parallel suite runs).
+    /// sync tests, 3 failures in 50 parallel suite runs). A test whose result
+    /// needs no child to be starting meanwhile holds it too: from its fork to
+    /// its exec a child holds a copy of every file this process has open.
     pub(crate) fn environment_lock() -> MutexGuard<'static, ()> {
         ENVIRONMENT_LOCK
             .lock()
