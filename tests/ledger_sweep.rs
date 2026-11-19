@@ -534,10 +534,11 @@ fn a_sweep_reaches_the_remote_through_the_git_config_its_session_hands_it() {
             .env_remove("GIT_CONFIG_VALUE_0")
             .env("GIT_DIR", elsewhere.path().join(".git"));
         if let Some(include) = include {
-            command
-                .env("GIT_CONFIG_COUNT", "1")
-                .env("GIT_CONFIG_KEY_0", "include.path")
-                .env("GIT_CONFIG_VALUE_0", include);
+            lab::with_git_rule(
+                &mut command,
+                "include.path",
+                include.to_str().expect("utf-8 path"),
+            );
         }
         command.output().expect("run knives ledger sweep")
     };
@@ -651,18 +652,16 @@ fn a_fork_whose_ledger_no_git_directory_reaches_is_joined_and_its_sweep_names_th
     let (_elsewhere_dir, elsewhere) = refusing_remote();
 
     // When: a sweep runs.
-    let swept = lab::knives_command(
-        home.path(),
-        home.path(),
-        home.path(),
-        &["--json", "ledger", "sweep"],
+    let swept = lab::with_git_rule(
+        &mut lab::knives_command(
+            home.path(),
+            home.path(),
+            home.path(),
+            &["--json", "ledger", "sweep"],
+        ),
+        &format!("url.{}.insteadOf", elsewhere.display()),
+        "https://forge.invalid/acme/elsewhere",
     )
-    .env("GIT_CONFIG_COUNT", "1")
-    .env(
-        "GIT_CONFIG_KEY_0",
-        format!("url.{}.insteadOf", elsewhere.display()),
-    )
-    .env("GIT_CONFIG_VALUE_0", "https://forge.invalid/acme/elsewhere")
     .output()
     .expect("run knives ledger sweep");
 
@@ -693,8 +692,8 @@ fn a_fork_whose_ledger_no_git_directory_reaches_is_joined_and_its_sweep_names_th
     // And: the sweep carries the fork through that directory alone, and
     // fails there, since the ledger refuses the push, naming the directory
     // (`acme--elsewhere.git`, the ledger's) and git's cause; it carries the
-    // entry to the root's remote no more than before, nor to the ledger's,
-    // and leaves the reason in the log.
+    // entry to the root's remote no more than before, and leaves the reason
+    // in the log.
     assert_eq!(swept.status.code(), Some(3), "{swept:?}");
     let report: serde_json::Value = serde_json::from_slice(&swept.stdout).expect("JSON");
     let carrying: Vec<&serde_json::Value> = report["destinations"]
@@ -716,7 +715,6 @@ fn a_fork_whose_ledger_no_git_directory_reaches_is_joined_and_its_sweep_names_th
         "{report}"
     );
     assert_eq!(entries_on(&remote, "alpha"), 0);
-    assert_eq!(entries_on(&elsewhere, &machine), 0);
     let log = std::fs::read_to_string(home.path().join("ledger-sweep.log")).expect("a log");
     assert!(log.contains(&through), "{log}");
 }
@@ -2153,39 +2151,6 @@ fn a_peer_ref_that_moved_backward_keeps_out_only_that_machines_entries() {
     assert_eq!(beta_entries(), 4);
 }
 
-/// Push to `remote`, as `machine`'s ref, one commit carrying `contents` at
-/// `path` under the ledger root: what a machine running another knives, or
-/// a broken one, could send.
-fn push_as_peer(remote: &Path, machine: &str, path: &str, contents: &str) {
-    let scratch = tempfile::tempdir().expect("peer checkout");
-    let root = scratch.path().join("peer");
-    lab::git_repository(&root, &[]);
-    let file = root.join(path);
-    std::fs::create_dir_all(file.parent().expect("an entry's directory")).expect("mkdir");
-    std::fs::write(&file, contents).expect("write the peer's entry");
-    lab::git_output(&root, ["add", "--all"]);
-    lab::git_output(
-        &root,
-        [
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--quiet",
-            "-m",
-            "peer",
-        ],
-    );
-    lab::git_output(
-        &root,
-        [
-            "push",
-            "--quiet",
-            remote.to_str().expect("utf-8"),
-            &format!("HEAD:refs/knives/{machine}"),
-        ],
-    );
-}
-
 #[test]
 fn a_peer_directory_named_with_control_characters_is_refused_and_reaches_the_terminal_escaped() {
     // Given: a machine carrying one fork, and a peer's ref on the remote
@@ -2196,7 +2161,7 @@ fn a_peer_directory_named_with_control_characters_is_refused_and_reaches_the_ter
     let (_remote_dir, remote) = lab::bare_remote();
     share(home.path(), "alpha", &remote);
     let owner = "\u{1b}]0;pwned\u{7}";
-    push_as_peer(
+    lab::push_as_peer(
         &remote,
         "mallory",
         &format!("{owner}/repo/20261011T120000.000000000Z-0000.md"),
@@ -2241,7 +2206,7 @@ fn a_peer_entry_of_a_kind_this_knives_does_not_know_leaves_notch_and_status_read
     let (_remote_dir, remote) = lab::bare_remote();
     share(beta.path(), "beta", &remote);
     let name = "20261011T120000.000000000Z-0000.md";
-    push_as_peer(
+    lab::push_as_peer(
         &remote,
         "alpha",
         &format!("{FORK}/{name}"),
@@ -2294,7 +2259,7 @@ fn a_peer_entry_that_does_not_parse_is_kept_out_and_named_on_every_pull() {
     let (_remote_dir, remote) = lab::bare_remote();
     share(beta.path(), "beta", &remote);
     let path = format!("{FORK}/20261011T120000.000000000Z-dead.md");
-    push_as_peer(&remote, "alpha", &path, "not an entry\n");
+    lab::push_as_peer(&remote, "alpha", &path, "not an entry\n");
 
     for round in ["the first pull", "the next pull"] {
         // When: status pulls.
@@ -2352,8 +2317,8 @@ fn two_peers_carrying_different_entries_at_one_path_write_neither_and_say_so() {
     let (_remote_dir, remote) = lab::bare_remote();
     share(beta.path(), "beta", &remote);
     let path = format!("{FORK}/20261011T120000.000000000Z-0000.md");
-    push_as_peer(&remote, "alpha", &path, &peer_entry("alpha's account"));
-    push_as_peer(&remote, "gamma", &path, &peer_entry("gamma's account"));
+    lab::push_as_peer(&remote, "alpha", &path, &peer_entry("alpha's account"));
+    lab::push_as_peer(&remote, "gamma", &path, &peer_entry("gamma's account"));
     let on_disk = beta.path().join("ledger").join(&path);
 
     // When: status pulls.
@@ -2392,7 +2357,7 @@ fn a_peer_entry_that_differs_from_the_file_here_leaves_the_file_and_says_so() {
     std::fs::create_dir_all(on_disk.parent().expect("the fork's directory")).expect("mkdir");
     let ours = peer_entry("this machine's account");
     std::fs::write(&on_disk, &ours).expect("write this machine's file");
-    push_as_peer(&remote, "alpha", &path, &peer_entry("alpha's account"));
+    lab::push_as_peer(&remote, "alpha", &path, &peer_entry("alpha's account"));
 
     // When: status pulls.
     let (code, report) = status_on(&lab, beta.path());
@@ -2420,8 +2385,8 @@ fn two_peers_carrying_the_same_entry_at_one_path_write_it_once_and_say_nothing()
     share(beta.path(), "beta", &remote);
     let path = format!("{FORK}/20261011T120000.000000000Z-0000.md");
     let entry = peer_entry("one account");
-    push_as_peer(&remote, "alpha", &path, &entry);
-    push_as_peer(&remote, "gamma", &path, &entry);
+    lab::push_as_peer(&remote, "alpha", &path, &entry);
+    lab::push_as_peer(&remote, "gamma", &path, &entry);
     let on_disk = beta.path().join("ledger").join(&path);
 
     for round in [

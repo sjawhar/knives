@@ -265,7 +265,7 @@ pub fn read_claim(
 
 /// Each of `names` that `remote` has, with its commit: exactly those refs,
 /// since `ls-remote` also lists any ref whose name merely ends in one.
-fn remote_refs(
+pub(super) fn remote_refs(
     repository: &Repository,
     remote: &str,
     names: &[&str],

@@ -61,16 +61,14 @@ fn migrate(home: &Path) -> Output {
 /// [`migrate`], its session handing git a URL rule that reaches `url` at
 /// `remote`.
 fn migrate_reaching(home: &Path, url: &str, remote: &Path) -> Output {
-    lab::knives_command(home, home, home, &["--json", "ledger", "migrate"])
-        .env("KNIVES_OWNER", "ses_migrate")
-        .env("GIT_CONFIG_COUNT", "1")
-        .env(
-            "GIT_CONFIG_KEY_0",
-            format!("url.{}.insteadOf", remote.display()),
-        )
-        .env("GIT_CONFIG_VALUE_0", url)
-        .output()
-        .expect("run knives ledger migrate")
+    lab::with_git_rule(
+        lab::knives_command(home, home, home, &["--json", "ledger", "migrate"])
+            .env("KNIVES_OWNER", "ses_migrate"),
+        &format!("url.{}.insteadOf", remote.display()),
+        url,
+    )
+    .output()
+    .expect("run knives ledger migrate")
 }
 
 /// A bare remote holding a peer's ref, `refs/knives/a-peer`, whose tree is
@@ -78,30 +76,7 @@ fn migrate_reaching(home: &Path, url: &str, remote: &Path) -> Output {
 /// refuses.
 fn remote_whose_peer_ref_is_no_ledger() -> (tempfile::TempDir, std::path::PathBuf) {
     let (remote_dir, remote) = lab::bare_remote();
-    let peer = tempfile::tempdir().expect("a peer's repository");
-    lab::git_repository(peer.path(), &[]);
-    std::fs::write(peer.path().join("stray.txt"), "not a ledger entry\n").expect("write a file");
-    lab::git_output(peer.path(), ["add", "--all"]);
-    lab::git_output(
-        peer.path(),
-        [
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--quiet",
-            "-m",
-            "a peer's tree",
-        ],
-    );
-    lab::git_output(
-        peer.path(),
-        [
-            "push",
-            "--quiet",
-            remote.to_str().expect("utf-8"),
-            "HEAD:refs/knives/a-peer",
-        ],
-    );
+    lab::push_as_peer(&remote, "a-peer", "stray.txt", "not a ledger entry\n");
     (remote_dir, remote)
 }
 

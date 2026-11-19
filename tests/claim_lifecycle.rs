@@ -462,16 +462,10 @@ fn start_refuses_two_anonymous_owners_with_the_same_name() {
     let (home, _consumer) = release_test_home(&lab);
     let outside = tempfile::tempdir().expect("create unmanaged terminal");
     let run = |args: &[&str]| {
-        lab::without_harness_session(
-            Command::new(env!("CARGO_BIN_EXE_knives"))
-                .args(args)
-                .current_dir(outside.path())
-                .env("KNIVES_CONFIG_HOME", home.path())
-                .env("HOME", lab.temp_path())
-                .env("USER", "terminal-user"),
-        )
-        .output()
-        .expect("run start")
+        knives_at(&lab, home.path(), outside.path(), args)
+            .env("USER", "terminal-user")
+            .output()
+            .expect("run start")
     };
 
     let first = run(&[
@@ -1017,14 +1011,13 @@ fn start_from_inside_the_claimed_workspace_resumes_by_possession() {
     );
     let workspace = lab.work.parent().expect("parent").join("feat-gamma");
 
-    let second = lab::without_harness_session(
-        Command::new(env!("CARGO_BIN_EXE_knives"))
-            .args(["--text", "start", "feat/gamma", "--repo", "demo"])
-            .current_dir(&workspace)
-            .env("KNIVES_CONFIG_HOME", home.path())
-            .env("HOME", lab.temp_path())
-            .env("USER", "terminal-user"),
+    let second = knives_at(
+        &lab,
+        home.path(),
+        &workspace,
+        &["--text", "start", "feat/gamma", "--repo", "demo"],
     )
+    .env("USER", "terminal-user")
     .output()
     .expect("resume from workspace");
 
@@ -2729,16 +2722,10 @@ fn an_owner_that_took_its_own_branch_back_is_told_of_no_takeover() {
     let (home, _consumer) = release_test_home(&lab);
     let outside = tempfile::tempdir().expect("create unmanaged terminal");
     let as_sami = |args: &[&str]| {
-        lab::without_harness_session(
-            Command::new(env!("CARGO_BIN_EXE_knives"))
-                .args(args)
-                .current_dir(outside.path())
-                .env("KNIVES_CONFIG_HOME", home.path())
-                .env("HOME", lab.temp_path())
-                .env("USER", "sami"),
-        )
-        .output()
-        .expect("run knives as the OS user sami")
+        knives_at(&lab, home.path(), outside.path(), args)
+            .env("USER", "sami")
+            .output()
+            .expect("run knives as the OS user sami")
     };
     let claimed = as_sami(&[
         "--text",

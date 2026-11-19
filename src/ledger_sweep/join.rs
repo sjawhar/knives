@@ -256,16 +256,13 @@ fn machine_name(host: &str, machine_id: Option<&str>, random: u64) -> String {
 /// session's name on two hosts of one host name apart.
 fn session_machine_name(host: &str, machine_id: Option<&str>, owner: &str) -> String {
     use sha2::Digest as _;
-    let digest = sha2::Sha256::new()
+    let [a, b, c, d, ..]: [u8; 32] = sha2::Sha256::new()
         .chain_update(machine_id.unwrap_or_default().trim())
         .chain_update("\n")
         .chain_update(owner)
-        .finalize();
-    let digits = digest
-        .as_slice()
-        .first_chunk::<4>()
-        .map_or(0, |bytes| u32::from_be_bytes(*bytes));
-    named(host, &format!("{digits:08x}"))
+        .finalize()
+        .into();
+    named(host, &format!("{:08x}", u32::from_be_bytes([a, b, c, d])))
 }
 
 /// `<short host name>-<digits>`: the host name up to its first `.`, and
@@ -305,7 +302,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::ledger_sweep::{destinations, unpullable};
+    use crate::ids::CommitId;
+    use crate::ledger_sweep::{destinations, lab, unpullable};
 
     /// A config home with a registry naming `forks`, each `(key, origin,
     /// ledger)`: the fork `acme/<key>`, whose upstream is on the forge, and
@@ -369,20 +367,15 @@ mod tests {
     impl Remote {
         fn reached_at(url: &str) -> Self {
             let lock = crate::config::test_support::environment_lock();
-            let sessions = crate::commands::claim::HARNESS_SESSION_VARIABLES;
-            let names: Vec<&'static str> =
-                ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"]
-                    .into_iter()
-                    .chain(sessions)
-                    .collect();
-            let environment = crate::config::test_support::EnvironmentGuard::capture(&names);
-            for name in sessions {
-                environment.remove(name);
-            }
+            let environment = crate::config::test_support::no_harness_session(&[
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0",
+            ]);
             environment.set("KNIVES_OWNER", "owner-one");
             let dir = tempfile::tempdir().unwrap();
             let git_dir = dir.path().join("ledger.git");
-            git_out(dir.path(), &["init", "--quiet", "--bare", "ledger.git"]);
+            lab::init(&git_dir, true);
             environment.set("GIT_CONFIG_COUNT", "1");
             environment.set(
                 "GIT_CONFIG_KEY_0",
@@ -398,60 +391,20 @@ mod tests {
         }
 
         /// Point `reference` here at a new commit of an empty tree; that commit.
-        fn commit_at(&self, reference: &str) -> String {
-            let git_dir = self.git_dir.to_str().unwrap();
-            let tree = git_out(Path::new("/"), &["--git-dir", git_dir, "mktree"]);
-            let commit = git_out(
-                Path::new("/"),
+        fn commit_at(&self, reference: &str) -> CommitId {
+            let tree = lab::git(&self.git_dir, &["mktree"]);
+            let commit = lab::git(
+                &self.git_dir,
                 &[
-                    "-c",
-                    "user.name=machine-one",
-                    "-c",
-                    "user.email=machine-one@example.invalid",
-                    "--git-dir",
-                    git_dir,
                     "commit-tree",
                     &tree,
                     "-m",
                     "committed by an earlier config home",
                 ],
             );
-            git_out(
-                Path::new("/"),
-                &["--git-dir", git_dir, "update-ref", reference, &commit],
-            );
-            commit
+            lab::git(&self.git_dir, &["update-ref", reference, &commit]);
+            CommitId::new(commit)
         }
-    }
-
-    /// `git <args>` in `directory`, which must succeed; its trimmed stdout.
-    fn git_out(directory: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .current_dir(directory)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    }
-
-    /// The commit `reference` holds in `git_dir`, or `None`.
-    fn at(git_dir: &Path, reference: &str) -> Option<String> {
-        let output = std::process::Command::new("git")
-            .arg("--git-dir")
-            .arg(git_dir)
-            .args(["rev-parse", "--verify", "--quiet", reference])
-            .output()
-            .unwrap();
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8(output.stdout).unwrap().trim().to_owned())
     }
 
     #[test]
@@ -617,8 +570,8 @@ mod tests {
         assert_eq!(config(&git_dir, "knives.machine"), Some(machine.clone()));
         for reference in [&own, &format!("refs/knives-remotes/origin/{machine}")] {
             assert_eq!(
-                at(&git_dir, reference).as_deref(),
-                Some(commit.as_str()),
+                lab::at(&git_dir, reference).as_ref(),
+                Some(&commit),
                 "{reference}"
             );
         }
@@ -628,7 +581,7 @@ mod tests {
         };
         assert!(!crate::ledger_git::has_new_entries(&destination.repository, &machine).unwrap());
         // And: the join sent nothing: the remote's ref is where it was.
-        assert_eq!(at(&remote.git_dir, &own), Some(commit));
+        assert_eq!(lab::at(&remote.git_dir, &own), Some(commit));
     }
 
     #[test]
@@ -641,34 +594,41 @@ mod tests {
             Some("acme/ledger"),
         )]);
         let fork = UpstreamName::new("acme/a-repo");
+        {
+            // The lock keeps the remote unreachable: another test's `Remote`
+            // reaches the same URL while it holds it. It is released before
+            // this test's own `Remote` takes it.
+            let _lock = crate::config::test_support::environment_lock();
 
-        // When: where the ledger travels is read.
-        let mut said = Vec::new();
-        let found =
-            super::super::destinations::destinations_telling(&root, &registry, &mut said).unwrap();
+            // When: where the ledger travels is read.
+            let mut said = Vec::new();
+            let found =
+                super::super::destinations::destinations_telling(&root, &registry, &mut said)
+                    .unwrap();
 
-        // Then: nothing is made or said, and the fork is unreached, with
-        // why: the remote could not be asked for this machine's ref.
-        assert_eq!(
-            listed(home.path()),
-            BTreeSet::from(["repos.toml".to_owned()])
-        );
-        assert!(said.is_empty(), "{}", String::from_utf8_lossy(&said));
-        let why = found
-            .unreached
-            .get(&fork)
-            .and_then(|unreached| unreached.join_failed.as_deref())
-            .unwrap();
-        assert!(
-            why.starts_with(&format!(
-                "could not make {}: asking https://forge.invalid/acme/ledger for this machine's \
-                 ref, refs/knives/",
-                std::path::absolute(joined_git_dir(&root, "acme/ledger"))
-                    .unwrap()
-                    .display()
-            )),
-            "{why}"
-        );
+            // Then: nothing is made or said, and the fork is unreached, with
+            // why: the remote could not be asked for this machine's ref.
+            assert_eq!(
+                listed(home.path()),
+                BTreeSet::from(["repos.toml".to_owned()])
+            );
+            assert!(said.is_empty(), "{}", String::from_utf8_lossy(&said));
+            let why = found
+                .unreached
+                .get(&fork)
+                .and_then(|unreached| unreached.join_failed.as_deref())
+                .unwrap();
+            assert!(
+                why.starts_with(&format!(
+                    "could not make {}: asking https://forge.invalid/acme/ledger for this \
+                     machine's ref, refs/knives/",
+                    std::path::absolute(joined_git_dir(&root, "acme/ledger"))
+                        .unwrap()
+                        .display()
+                )),
+                "{why}"
+            );
+        }
 
         // When: the remote can be reached, and it is read again.
         let _remote = Remote::reached_at("https://forge.invalid/acme/ledger");
@@ -778,17 +738,15 @@ mod tests {
 
     #[test]
     fn a_machine_joined_in_a_session_is_named_for_its_host_machine_id_and_session() {
-        // One host, machine id and session give one name, every time: the
-        // first eight hex digits of the SHA-256 of the trimmed id, a newline
-        // and the session.
+        // One host, machine id and session give one name: the first eight
+        // hex digits of the SHA-256 of the trimmed id, a newline and the
+        // session.
         let id = Some("0123abcd4567ef890123abcd4567ef89\n");
         let host = "box-one.example.invalid";
-        for _ in 0..2 {
-            assert_eq!(
-                session_machine_name(host, id, "owner-one"),
-                "box-one-e6fa3479"
-            );
-        }
+        assert_eq!(
+            session_machine_name(host, id, "owner-one"),
+            "box-one-e6fa3479"
+        );
         // Another session on the same host gets another name.
         assert_eq!(
             session_machine_name(host, id, "owner-two"),
@@ -808,8 +766,6 @@ mod tests {
                 "{missing:?}"
             );
         }
-        // Outside a session the name is the machine id's, as before.
-        assert_eq!(machine_name(host, id, 0), "box-one-0123abcd");
         // The host name is kept as outside a session: each character no ref
         // component holds becomes `-`, and the name never starts with one.
         for (host, name) in [

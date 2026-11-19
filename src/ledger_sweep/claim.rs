@@ -385,20 +385,11 @@ mod tests {
     use crate::ids::{BranchName, UpstreamName};
     use crate::ledger::{Draft, Ledger, Scribe};
     use crate::ledger_git::Repository;
-    use crate::ledger_sweep::lab::{self, FORK, git};
+    use crate::ledger_sweep::lab::{self, FORK, at, git};
     use crate::ledger_sweep::shared_fork;
     use crate::store::OwnerKind;
 
     const MACHINE: &str = "refs/knives/machine-one";
-
-    /// The commit `reference` holds in `git_dir`, if it exists.
-    fn at(git_dir: &Path, reference: &str) -> Option<CommitId> {
-        let id = git(
-            git_dir,
-            &["for-each-ref", "--format=%(objectname)", reference],
-        );
-        (!id.is_empty()).then(|| CommitId::new(id))
-    }
 
     fn claim_of(branch: &str) -> ClaimRef {
         ClaimRef::new(&UpstreamName::new(FORK), &BranchName::new(branch)).unwrap()

@@ -612,7 +612,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::config::test_support::{EnvironmentGuard, environment_lock};
+    use crate::config::test_support::{EnvironmentGuard, environment_lock, no_harness_session};
     use crate::store::{Claim, OwnerKind};
 
     fn held(owner: &str, kind: OwnerKind) -> Claim {
@@ -661,24 +661,6 @@ mod tests {
             in_claimed_workspace,
             machine: Some(here),
         }
-    }
-
-    /// The environment of a shell no harness names a session in: each of
-    /// `HARNESS_SESSION_VARIABLES` captured and removed, and each of `others`
-    /// captured, all restored when the guard drops. A test of one harness
-    /// variable names it in `others` too, so that, were the list to lose it,
-    /// the test fails on the identity it resolves rather than on the guard.
-    fn no_harness_session(others: &[&'static str]) -> EnvironmentGuard {
-        let names: Vec<&'static str> = HARNESS_SESSION_VARIABLES
-            .iter()
-            .chain(others)
-            .copied()
-            .collect();
-        let environment = EnvironmentGuard::capture(&names);
-        for name in HARNESS_SESSION_VARIABLES {
-            environment.remove(name);
-        }
-        environment
     }
 
     #[test]

@@ -11,7 +11,7 @@
 //! and every owner is named by `KNIVES_OWNER`, but in the tests of an Oh My
 //! Pi session, named by `PI_SESSION_ID`. A config home that joins the
 //! ledger itself names its machine for the session that joins it, so two
-//! config homes here that join it are two machines.
+//! config homes here that join it in two sessions are two machines.
 //!
 //! Every test here drives the `knives` binary, raw git and
 //! `tests/common/lab.rs` alone, so this file also runs, unchanged, against
@@ -161,15 +161,6 @@ fn stdout_of(output: &Output) -> String {
 
 fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
-/// `command` with one rule handed to git as `GIT_CONFIG_COUNT` and its
-/// numbered pair, as a session hands git configuration of its own.
-fn with_git_rule<'c>(command: &'c mut Command, key: &str, value: &str) -> &'c mut Command {
-    command
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", key)
-        .env("GIT_CONFIG_VALUE_0", value)
 }
 
 /// Commit everything in the git repository `root`, quietly.
@@ -432,7 +423,7 @@ impl Machine {
     /// [`JOINED_URL`] at `remote`, as a session reaches the ledger this
     /// machine joins.
     fn tried_joining(&self, remote: &Path, owner: &str, args: &[&str]) -> Output {
-        with_git_rule(
+        lab::with_git_rule(
             &mut self.command(owner, args),
             &format!("url.{}.insteadOf", remote.display()),
             JOINED_URL,
@@ -679,7 +670,7 @@ impl Shared {
             "url.{}/nowhere/.pushInsteadOf",
             self.remote_root.path().display()
         );
-        with_git_rule(command, &nowhere, "https://forge.invalid/")
+        lab::with_git_rule(command, &nowhere, "https://forge.invalid/")
     }
 }
 
@@ -1604,18 +1595,13 @@ fn a_ledger_with_no_git_directory_is_joined_and_the_claim_reaches_it() {
     let one = Machine::on_lab(&lab, "machine-one", Ledger::Unjoined);
 
     // When: owner one starts a branch.
-    let started = with_git_rule(
-        &mut one.command(
-            "owner-one",
-            &[
-                "--text", "start", BRANCH, "--repo", "demo", "--why", "port it",
-            ],
-        ),
-        &format!("url.{}.insteadOf", remote.display()),
-        JOINED_URL,
-    )
-    .output()
-    .expect("run knives start");
+    let started = one.tried_joining(
+        &remote,
+        "owner-one",
+        &[
+            "--text", "start", BRANCH, "--repo", "demo", "--why", "port it",
+        ],
+    );
 
     // Then: it joined the ledger, naming the ledger, the git directory it
     // made and the machine that directory names, and took the branch.
@@ -1626,7 +1612,8 @@ fn a_ledger_with_no_git_directory_is_joined_and_the_claim_reaches_it() {
         joined.is_dir(),
         "no git directory joined the ledger: {stderr}"
     );
-    let machine = git_in(&joined, &["config", "--get", "knives.machine"])
+    let machine = one
+        .joined_as()
         .expect("the joined git directory names a machine");
     assert!(
         stderr.contains(&format!(

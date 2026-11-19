@@ -2,13 +2,14 @@
 //! write's send ([`super::send_now`]) both stand on: a machine sharing a
 //! fork's ledger through a git directory in [`ledger_repositories`], as
 //! one set up by hand to share it has, and the bare remote git reaches as
-//! that ledger's repository.
+//! that ledger's repository. The tests of a join use its git helpers too.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use super::ledger_repositories;
 use crate::config::Registry;
+use crate::ids::CommitId;
 
 /// The fork whose ledger the lab shares.
 pub(super) const FORK: &str = "acme/a-repo";
@@ -47,6 +48,15 @@ pub(super) fn init(path: &Path, bare: bool) {
         .status()
         .unwrap();
     assert!(status.success(), "git init {}", path.display());
+}
+
+/// The commit `reference` holds in `git_dir`, if it exists.
+pub(super) fn at(git_dir: &Path, reference: &str) -> Option<CommitId> {
+    let id = git(
+        git_dir,
+        &["for-each-ref", "--format=%(objectname)", reference],
+    );
+    (!id.is_empty()).then(|| CommitId::new(id))
 }
 
 /// A machine sharing [`FORK`]'s ledger with acme/ledger through a git

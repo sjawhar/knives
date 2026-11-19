@@ -39,7 +39,7 @@ pub use claims::{
 };
 
 pub(crate) use run::run;
-use run::{invocation, output_error, run_with_input, succeeded, transport, transport_transcript};
+use run::{invocation, output_error, run_with_input, succeeded, transport};
 use tree::{
     Mode, ObjectId, TreeItem, batch_blobs, check_entry, commit_tree, hash_objects, references,
     tree_items, write_tree,
@@ -635,7 +635,7 @@ fn record_sent(
 }
 
 /// Take up `machine`'s ref from `remote` into `repository`, a git directory
-/// that has committed nothing yet; whether `remote` had it.
+/// that has committed nothing yet, when `remote` has it.
 ///
 /// A machine whose git directory is made again, its disk lost or its config
 /// home deleted, comes back under the same name, and `remote` still holds
@@ -648,32 +648,19 @@ fn record_sent(
 /// already holds it. A git directory that has committed nothing loses nothing
 /// by it.
 ///
-/// `remote` is asked first, with `ls-remote --exit-code`, which exits 2 when
-/// it has no such ref: an answer, and `Ok(false)`. A remote that cannot be
-/// asked, or a fetch that fails, is an error, so a caller making the git
-/// directory can make nothing rather than one that refuses its own ref later.
+/// `remote` is asked first for exactly that ref, and one that has none
+/// leaves `repository` as it is. A remote that cannot be asked, or a fetch
+/// that fails, is an error, so a caller making the git directory can make
+/// nothing rather than one that refuses its own ref later.
 pub fn take_up_own_ref(
     repository: &Repository,
     remote: &str,
     machine: &str,
-) -> Result<bool, GitError> {
+) -> Result<(), GitError> {
     let reference = own_ref(machine)?;
     let remote = ref_component("remote", remote)?;
-    let mut asked = repository.git();
-    asked.args(["ls-remote", "--exit-code", remote, &reference]);
-    let transcript = transport_transcript(&mut asked)?;
-    if transcript.status.and_then(|status| status.code()) == Some(2) {
-        return Ok(false);
-    }
-    let listed = transcript.answer(&asked)?;
-    // A pattern matches the last components of a ref's name, so only a line
-    // naming exactly this machine's ref says the remote has it.
-    let held = String::from_utf8_lossy(&listed).lines().any(|line| {
-        line.split_once('\t')
-            .is_some_and(|(_, name)| name == reference)
-    });
-    if !held {
-        return Ok(false);
+    if !claims::remote_refs(repository, remote, &[reference.as_str()])?.contains_key(&reference) {
+        return Ok(());
     }
     transport(repository.git().args([
         "fetch",
@@ -684,7 +671,7 @@ pub fn take_up_own_ref(
         &format!("{reference}:{reference}"),
         &format!("{reference}:{FETCHED}{remote}/{machine}"),
     ]))?;
-    Ok(true)
+    Ok(())
 }
 
 /// Whether `git push` rejected its only ref because the remote had already
