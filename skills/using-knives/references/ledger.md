@@ -255,7 +255,7 @@ The ref:
 
 - It is `refs/knives-claims/<owner>/<name>/<branch>`. `<owner>/<name>` is the fork's lowercase upstream name.
 - The branch is one ref component: `%` is written `%25`, `/` is written `%2F`, and every other byte stays. So `feat/alpha` is `feat%2Falpha`, and the refs of `a` and `a/b` never collide.
-- `start` refuses a branch with exit `2`, before it reads the claim, when the encoded branch is longer than 255 bytes or `git check-ref-format` refuses the ref. No claim of such a branch can exist, so its `finish` is that of a fork with no `ledger`.
+- `start` refuses a branch with exit `2`, before it reads the claim, when the whole claim ref is longer than 255 bytes or `git check-ref-format` refuses the ref. GitHub refuses every ref longer than 255 bytes, so the ledger's repository could never hold that claim. The prefix and `<owner>/<name>/` count too: for the fork `acme/demo`, 226 bytes are left for the encoded branch. No claim of such a branch can exist, so its `finish` is that of a fork with no `ledger`.
 - The ref is on the remote only. knives writes no local ref under `refs/knives-claims/`. A read runs `git ls-remote origin <ref>`, then fetches the objects of that one commit, under the git directory's `knives-transport.lock`.
 
 The record:

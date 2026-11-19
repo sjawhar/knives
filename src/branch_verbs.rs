@@ -302,8 +302,10 @@ pub(crate) fn run_finish(
 /// is the exit after saying why nothing was released: a ledger that cannot
 /// be joined is no ledger to release a claim on.
 ///
-/// A branch no claim ref can name ([`ClaimRef::new`]) has never been
-/// claimed on any ledger, so its finish is that of a fork that shares none.
+/// A branch no claim ref can name ([`ClaimRef::new`]: its claim ref would
+/// be longer than the ledger's remote holds, or git refuses it as a ref
+/// name) is one `start` refuses on a shared fork, so it has never been
+/// claimed on any ledger, and its finish is that of a fork that shares none.
 fn ledgered<'a>(
     fork: &Fork<'_>,
     target: &'a BranchTarget,

@@ -35,16 +35,22 @@ use crate::store::OwnerKind;
 const CLAIMS: &str = "refs/knives-claims/";
 /// The one file a claim commit's tree holds.
 const RECORD: &str = "claim.toml";
-/// The longest a ref component may be: a loose ref is a file named by it,
-/// and a file name holds at most 255 bytes on the file systems git runs on.
-const MAX_COMPONENT: usize = 255;
+/// The longest a claim ref may be, in bytes, all of it: GitHub, where a
+/// ledger's repository is kept, refuses every longer ref ("refs longer than
+/// 255 bytes are not allowed"), so a claim under a longer ref could never be
+/// taken there. The branch's component, a strict part of the ref, is then
+/// shorter than the 255 bytes a file name may hold, as its loose ref's file
+/// must be.
+const MAX_REF: usize = 255;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClaimError {
+    /// The branch's claim ref would be `bytes` long, all of it, more than the
+    /// 255 bytes the ledger's remote holds.
     #[error(
-        "refusing branch {branch:?} on a shared ledger: its claim ref's last component would be \
-         {bytes} bytes, more than the {} a ref component may hold",
-        MAX_COMPONENT
+        "refusing branch {branch:?} on a shared ledger: its claim ref would be {bytes} bytes, \
+         more than the {} a ref may be on the ledger's remote",
+        MAX_REF
     )]
     TooLong { branch: String, bytes: usize },
     #[error(
@@ -78,21 +84,20 @@ impl ClaimRef {
     /// [`crate::config::RepoEntry::upstream_name`] gives.
     ///
     /// Refused before anything is written, with [`ClaimError::TooLong`] or
-    /// [`ClaimError::Refused`], when the encoded branch is longer than a ref
-    /// component may be, or `git check-ref-format` refuses the whole name (a
-    /// `..`, a space, a `~` or a `.lock` ending among its reasons): no
-    /// remote could hold such a ref, so no claim of that branch could ever
-    /// be taken or released.
+    /// [`ClaimError::Refused`], when the whole claim ref is longer than 255
+    /// bytes, or `git check-ref-format` refuses it (a `..`, a space, a `~` or
+    /// a `.lock` ending among its reasons): the ledger's remote could not hold
+    /// such a ref, so no claim of that branch could ever be taken or
+    /// released.
     pub fn new(repo: &UpstreamName, branch: &BranchName) -> Result<Self, ClaimError> {
         let repo = fork_directory(repo.clone())?;
-        let component = encode(branch.as_str());
-        if component.len() > MAX_COMPONENT {
+        let reference = format!("{CLAIMS}{repo}/{}", encode(branch.as_str()));
+        if reference.len() > MAX_REF {
             return Err(ClaimError::TooLong {
                 branch: branch.to_string(),
-                bytes: component.len(),
+                bytes: reference.len(),
             });
         }
-        let reference = format!("{CLAIMS}{repo}/{component}");
         let mut command = crate::bind::git_command();
         command.args(["check-ref-format", &reference]);
         let output = command
@@ -929,15 +934,20 @@ mod tests {
     }
 
     #[test]
-    fn a_branch_whose_encoded_component_passes_255_bytes_is_refused() {
+    fn a_branch_whose_whole_claim_ref_passes_255_bytes_is_refused() {
+        // Given: the fork's claim refs, whose `refs/knives-claims/example/fork/`
+        // is 32 bytes, so 223 are left for the branch.
         let fork = UpstreamName::new(FORK);
         let claim = |branch: String| ClaimRef::new(&fork, &BranchName::new(branch));
-        // Each `/` is three bytes once written out.
-        let longest = format!("{}/", "a".repeat(252));
-        assert_eq!(encode(&longest).len(), 255);
-        assert!(claim(longest).is_ok());
-        assert!(claim("a".repeat(255)).is_ok());
-        for branch in [format!("{}/", "a".repeat(253)), "a".repeat(256)] {
+
+        // Then: a branch whose claim ref is 255 bytes has it, whether a plain
+        // byte or a `/`, three bytes once written out, ends the branch.
+        for longest in ["a".repeat(223), format!("{}/", "a".repeat(220))] {
+            let reference = claim(longest.clone()).unwrap();
+            assert_eq!(reference.as_str().len(), 255, "{longest}");
+        }
+        // And: one byte more is refused, naming the 256 its ref would be.
+        for branch in ["a".repeat(224), format!("{}/", "a".repeat(221))] {
             assert!(
                 matches!(
                     claim(branch.clone()),

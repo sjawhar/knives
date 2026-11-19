@@ -1930,10 +1930,12 @@ fn a_machine_named_by_hand_keeps_its_name_in_a_harness_session() {
 fn a_branch_no_claim_ref_can_name_is_refused_before_the_ledger_is_joined() {
     // Given: a machine whose registry shares the lab fork's ledger, with no
     // ledger git directory, and a branch whose claim ref's last component,
-    // `feat%2F` and 249 bytes more, would be 256 bytes long.
+    // `feat%2F` and 249 bytes more, would be 256 bytes long, more than a file
+    // name may hold, and the whole claim ref 285.
     let lab = forge_lab();
     let one = Machine::on_lab(&lab, "machine-one", Ledger::Unjoined);
     let branch = format!("feat/{}", "a".repeat(249));
+    assert_eq!(claim_ref(&branch).len(), 285);
 
     // When: owner one starts it.
     let refused = one.tried(
@@ -1947,7 +1949,10 @@ fn a_branch_no_claim_ref_can_name_is_refused_before_the_ledger_is_joined() {
     // git directory joining the ledger, no claim, no entry, no workspace.
     let stderr = stderr_of(&refused);
     assert_eq!(refused.status.code(), Some(2), "{stderr}");
-    assert!(stderr.contains("would be 256 bytes"), "{stderr}");
+    assert!(
+        stderr.contains("its claim ref would be 285 bytes, more than the 255"),
+        "{stderr}"
+    );
     assert!(
         !one.home.path().join("ledger-repositories").exists(),
         "{stderr}"
