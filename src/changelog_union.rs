@@ -39,8 +39,9 @@
 //! block written whole holds twice stays as that block wrote it, and that
 //! line does not name it.
 //!
-//! After every release write and every `adopt`, knives reads each release
-//! log in the tree that the command writes or records, changed by it or not.
+//! After every release write and every `adopt` that records a tree, knives
+//! reads each release log in the tree that the command writes or records,
+//! changed by it or not.
 //! It skips a file that is still conflicted there, and a file with no single
 //! `## [Unreleased]` heading. For each `### ` heading that the `[Unreleased]`
 //! section holds more than once ([`repeated_headings`]), it prints one line
@@ -759,8 +760,8 @@ fn unreleased_runs(target: &[u8]) -> Option<Vec<Run<'_>>> {
 /// `MD024` rule with `siblings_only` reads them. A heading is the same only
 /// where its text is the same: one that differs by case or by a trailing
 /// space is another heading. Whoever placed the lines, a union, a clean
-/// merge, a member or a person, every release write and every `adopt` names
-/// each heading here and changes no line for it
+/// merge, a member or a person, every release write and every `adopt` that
+/// records a tree names each heading here and changes no line for it
 /// ([`crate::jj::repeated_headings`]).
 pub fn repeated_headings(content: &[u8]) -> Vec<(&[u8], usize)> {
     let mut fence = Fence::default();
