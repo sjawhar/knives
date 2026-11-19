@@ -71,8 +71,6 @@ Release-only members are yours, with the same claim, evidence and independent re
 - When an owner sends a packet, a handback or a `decision:`, read [references/owners.md](references/owners.md): the relay checks, accepted dispositions, and which questions reach the human.
 - The claim holder writes the branch. A lone branch's rebase follows `fork-work`. A release-member rebase is yours.
 - Before a release-wide write (a release rebase, a `rehome needed` handback, a hand resolution on the release commit), read [references/release-wide-writes.md](references/release-wide-writes.md): the claim barrier, the per-member checks and the `adopt` record.
-- A stacked series (`stacked = true`): read `using-knives`' stacked-series reference (`references/stacked-series.md`).
-- Record a release composed outside knives with `knives release cut <release> --at <commit>`: `using-knives`' hand-cut reference (`references/hand-cut.md`).
 
 **Done when:** each packet has a verdict, each handback agrees with notches and current state, and each integration change has preserved-content evidence.
 

@@ -71,13 +71,6 @@ One `branches` row per local bookmark with one target that is not trunk or a rel
 - After the published remedy, one `release-drift` line stays on the old published name when its published commit is itself an all-carrier hand edit: a resolution made on top of the release and pushed under its name. It is true and needs no action.
 - A note names each release whose newest recorded write ends `; unchecked: <reason>`, until `adopt` records it.
 
-### Origin release refs
-
-When releases publish to a separate remote, `audit` holds each release name on origin against the publish remote's ref of that name, both read live.
-
-- The same commit: origin's ref is a copy, a note: `origin has release ref <name> at <id>, a copy of <publish-remote>'s <name> at the same commit`.
-- No such name on the publish remote, or the name at another commit (a re-signed copy too): a `remote-drift` finding on `<name>@origin` that ends `this ref is misplaced`.
-
 ## `knives pr NUMBER [--repo REPO] [--timeline]`
 
 One PR's live state. `--timeline` adds the head ref's event log: force pushes with commit and tree ids, delete, restore, close, reopen, merge. `head_ref_deleted` absent means no answer (for example a head repository that refuses the token), not `false`.

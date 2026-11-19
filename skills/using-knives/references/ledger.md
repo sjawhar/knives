@@ -33,12 +33,11 @@ knives notch --verify '#4545'
 | `pr` | `--pr`, else the subject's tracked PR. |
 | `statement` | `{kind, value}` from `track`, `depends`, `finish --superseded-by` or `ledger migrate`. Kind `pull`, `fork-only`, `superseded` or `depends`. |
 | `claim_change` | `claimed`, `taken`, `released` or `resumed`, with `claim_change_why` and, when it displaced an owner, `previous_owner`, `previous_kind`, `previous_started`, `previous_last_seen`, `previous_why`. |
-| `fix_files` | On an `adopt` event that changed a file: one `{path, change}` record for each file of its fix by hand, each path whole. `change` is `resolved` (resolved by hand) or `beyond` (changed beyond the baseline's conflicts). The composition gate reads it before the event's text. An adopt event that an older knives wrote has none. |
 
 - Per branch and statement kind, the entry with the greatest `ts` is live. A statement with no value is a forget.
 - A `depends` list is every requirement stated since the newest `depends` forget, so two machines that each add one keep both.
 - Only the `statement` field states anything; prose does not. A statement this knives cannot fully read states nothing and is a problem (exit `3`), and release writes refuse.
-- Commands record what they see: claims (`start`, `finish`), statements (`track`, `depends`), PR transitions (`sync`), and every release write. A release write records each parent's full commit and all its bookmarks, and the commit and change id it wrote. Find a lost member from that record, not from current bookmark names. In a stacked series, it records the previous release first under its own label, as no member, then the members the release's reading gives, not the commit's literal parents ([stacked-series.md](stacked-series.md)).
+- Commands record what they see: claims (`start`, `finish`), statements (`track`, `depends`), PR transitions (`sync`), and every release write. A release write records each parent's full commit and all its bookmarks, and the commit and change id it wrote. Find a lost member from that record, not from current bookmark names.
 
 ## Storage
 

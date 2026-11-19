@@ -21,7 +21,7 @@ Run `knives ledger migrate` once on each machine. Until then, commands that read
 6. A missing observation is not clearance. Absent, `null`, `0` and `UNKNOWN` differ. Read `problems`.
 7. Keep dependencies. Never keep a dependent in a release and drop its requirement.
 8. One branch is both release member and PR head. Never make a "release-lineage" or sibling copy so that it composes: move the release.
-9. Make release names only with `release cut`, never by hand. Record a release that a person or a script composed outside knives with `release cut NAME --at REV`. `--allow-drop` states an intended drop; it is not a way past a refusal.
+9. Make release names only with `release cut`, never by hand. `--allow-drop` states an intended drop; it is not a way past a refusal.
 10. After any hand change on a release commit, run `knives release adopt <name>` before the next release write.
 11. Before a raw `jj rebase` of a branch, run fork-work's bidirectional gate (§7).
 
@@ -33,9 +33,6 @@ Run `knives ledger migrate` once on each machine. Until then, commands that read
 - Read [references/ledger.md](references/ledger.md) before you read or write `knives notch`, set up ledger sharing, or run `knives ledger sweep` or `migrate`.
 - Read [references/release-composition.md](references/release-composition.md) before you plan, cut, `include`, `drop`, `advance` or `rebase` a release, or read `release members`.
 - Read [references/releases.md](references/releases.md) before you adopt a hand change, when a release write prints `could not check` or `is published`, when a reap keeps a cut, and before you push a release.
-- Read [references/hand-cut.md](references/hand-cut.md) before you record a release that a person or a script composed outside knives with `knives release cut NAME --at REV`.
-- Read [references/stacked-series.md](references/stacked-series.md) before you cut, edit, adopt, record, reap or rebase in a series with `stacked = true`.
-- Read [references/release-logs.md](references/release-logs.md) when a release write or `adopt` prints a line about a `CHANGELOG.md` or `RELEASE_NOTES.md`, and before you join their lists by hand.
 - Read [references/configuration.md](references/configuration.md) when a checkout does not bind or binds twice, before you register a fork or edit `repos.toml` or `[trust]`, and when you configure the OpenCode plugin.
 
 ## What changes state
@@ -57,7 +54,7 @@ Use the replay probe, never a source-text search: a symbol's presence does not s
 |---|---|
 | `carried-exact` | The revision tip is an ancestor of the target. Against a release, its net change also replays empty onto the release's tree. |
 | `carried-rewritten` | Replaying its net change leaves the target unchanged: equivalent content arrived another way, or it has no net change. |
-| `carried-rebased` | Replay differs, but a rewrite that stands for it is an ancestor: a successor in jj's operation log, or a commit with its tree. An older version that only shares its change id does not count. Weaker: a rewrite can hold another tree. |
+| `carried-rebased` | Replay differs, but a commit with its change id is an ancestor. Weaker: divergent changes can name different trees. |
 | `NOT carried` (JSON `not-carried`) | Replay leaves a clean non-empty diff, and no rewrite is in the target. |
 | `conflicted` | Replay conflicts, and no rewrite is in the target. Some content can be present: judge it. |
 

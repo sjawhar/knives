@@ -15,7 +15,7 @@ Records the commit a release name holds now as its newest knives write. It makes
 
 - With no local bookmark, `adopt` fetches and reads `<name>@<publish-remote>`.
 - After a hand `jj restore --from <commit> --into <name> <path>...`, adopt with `--why`, then cut.
-- `adopt` refuses a name with no recorded write: record it with `knives release cut NAME --at REV` ([hand-cut.md](hand-cut.md)) or write over it.
+- `adopt` refuses a name the ledger records no write of; the next write over it records the name.
 
 ## Adopt a hand resolution before the next write
 
@@ -23,7 +23,7 @@ A release in hand is **unrecorded** when its tree differs from its matched recor
 
 ## When knives cannot check the release in hand
 
-Three cases: this repository lacks the matched write, no recorded write matches the release's parents (members changed outside knives), or the name has no recorded write. An edit goes ahead, a cut only if this repository holds the newest recorded write. It prints `knives could not check …` and the remedy; its event ends `; unchecked: W absent`, `no match` or `no record`.
+Three cases: this repository lacks the matched write (made on another machine, not fetched here), no recorded write matches the release's parents (the members changed outside knives), or the ledger records no write of the name. The write goes ahead, prints `knives could not check <name> at <commit> against its recorded writes: …` with the remedy, and its ledger event ends `; unchecked: W absent`, `no match` or `no record`.
 
 - The mark is sticky: every later write over that release repeats it, and `audit` shows a note while the newest write of the name carries it.
 - `knives release adopt <name>` ends it. For `no match`, first make the change with `knives release include`, `drop` or `advance` (a member added by hand: drop it, then include it), then adopt.
@@ -78,4 +78,4 @@ git push <publish-remote> "$(jj log -r <name> --no-graph -T commit_id):refs/head
 - Adopt after the last rewrite and before the push: the publish ref still names the old head then, so `adopt` reads it as a carrier.
 - Change the author only with `jj metaedit`. Git plumbing drops jj's `change-id` header, and another machine then cannot read the pushed copy as a carrier.
 - Push with no `+` and no `--force`, and stop when git refuses. Never `jj git push` here: it moves the remote branch whenever it is where jj last fetched it, which hides the non-fast-forward refusal.
-- Without `adopt`, nothing records the pushed head: another machine's next edit gets `; unchecked: W absent`, and its cut refuses until it holds the newest recorded write. A refused push after `adopt` leaves a recorded write the fork lacks: `release-drift` until the next write or `adopt`.
+- Skip `adopt` and nothing records the pushed head: another machine's next write goes ahead marked `; unchecked: W absent`. A push git refuses after `adopt` leaves a recorded write the fork lacks: audit reports `release-drift` until the next write or `adopt`.

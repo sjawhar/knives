@@ -10,7 +10,7 @@ Read this before a release-wide write: a release rebase, a member rehome an owne
 
 ## Rebase and check each member
 
-- Pick the target from the need: `knives release --repo <repo> rebase [<target>]`. Record `rehome:` with the target and the resulting release commit. In a stacked series, `rebase` refuses: rebase each member by hand as `fork-work`'s gate (§7) says, then `knives release advance` it, and check it as below.
+- Pick the target from the need: `knives release --repo <repo> rebase [<target>]`. Record `rehome:` with the target and the resulting release commit.
 - Exit `0` is not enough. Each affected member must be on the target, keep its patch and have no conflicts:
 
   ```sh
