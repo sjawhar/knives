@@ -532,20 +532,26 @@ pub enum ReleaseAction {
     /// each member of the previous cut and of the newest write of the newest
     /// release the ledger records in the series, and each fix by hand an
     /// `adopt` of any release of the series recorded, file by file: at each
-    /// file where the newest write still holds the adopt's content, REV's own
-    /// tree must carry the adopt's change there, by a replay where this
-    /// repository can measure the adopt, else by holding what the newest
-    /// write holds there. For an adopt this repository cannot measure, as
-    /// where it does not hold the adopt, a file's hold ends where the newest
-    /// write holds nothing. An adopt event that an older knives wrote names
-    /// its files in its text alone, and each path that its text may name and
-    /// the newest write holds is held. A repository that does not hold the
-    /// newest write is refused and told to fetch it. In a stacked series that
-    /// write, a successor of it or a copy with its tree must be on its
-    /// first-parent line. The ledger event records its members: in a
-    /// stacked series the side parents on its first-parent line, with its
-    /// previous release labelled as no member. No reap runs, and nothing is
-    /// signed or pushed.
+    /// file where the file's reference, the newest recorded write that holds
+    /// it with no conflict, still holds the adopt's content, REV's own tree
+    /// must carry the adopt's change there, by a replay where this
+    /// repository can measure the adopt, else by holding what the reference
+    /// holds there, nothing included. A write that leaves the file
+    /// conflicted is no reference and does not end the hold. A deletion is
+    /// content: a REV that holds a file the fix deleted lacks the fix. For an
+    /// adopt this repository cannot measure, as where it does not hold the
+    /// adopt, each named file is held to what its reference holds, and a
+    /// reference that holds nothing there holds the fix as an absence. An
+    /// adopt event that an older knives wrote names its files in its text
+    /// alone; each path that its text may name is held where this
+    /// repository cannot measure the adopt, and where it can, each such path
+    /// that the adopt's own tree holds. A repository that does not hold the
+    /// newest write is refused and told to fetch it.
+    /// In a stacked series that write, a successor of it or a copy with its
+    /// tree must be on its first-parent line. The ledger event records its
+    /// members: in a stacked series the side parents on its first-parent
+    /// line, with its previous release labelled as no member. No reap runs,
+    /// and nothing is signed or pushed.
     Cut {
         /// The dated release name, `release/[<series>/]YYYY-MM-DD[.N|-<label>]`.
         /// It must sort after the newest release of the series. Omit it for a
@@ -556,10 +562,10 @@ pub enum ReleaseAction {
         /// previous cut's ledger event or the newest recorded write of the
         /// newest release the ledger records in the series holds, a file of
         /// a fix by hand that an `adopt` of any release of the series
-        /// recorded and the newest write still holds, that write itself
-        /// where this repository does not hold it, or in a stacked series
-        /// that write, off the line the cut starts on. The refusal lists
-        /// exactly what, each file of a fix by name.
+        /// recorded and the file's reference still holds, the newest write
+        /// itself where this repository does not hold it, or in a stacked
+        /// series that write, off the line the cut starts on. The refusal
+        /// lists exactly what, each file of a fix by name.
         #[arg(long)]
         allow_drop: bool,
         /// Record a release cut outside knives: the commit becomes NAME's

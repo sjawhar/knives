@@ -1211,6 +1211,36 @@ pub fn newest_release_write(
     })
 }
 
+/// Every write that `entries` record in the series `scheme`, `except`
+/// aside, newest first: what a fix by hand is held against, file by file
+/// ([`crate::commands::release::adopted_fixes`]).
+///
+/// The releases come newest first, in the order that
+/// [`newest_release_write`] takes the newest from, and each release's
+/// writes newest first ([`recorded_writes`]). So the first write is the
+/// newest recorded write, and each later one is older.
+pub fn series_writes(
+    entries: &[Entry],
+    scheme: &ReleaseScheme,
+    except: Option<&str>,
+) -> Vec<CommitId> {
+    let mut names: Vec<_> = recorded_release_names(entries, scheme)
+        .into_iter()
+        .filter(|name| Some(*name) != except)
+        .filter_map(|name| match scheme {
+            ReleaseScheme::Fixed(_) => Some((None, name)),
+            ReleaseScheme::Dated | ReleaseScheme::Series(_) => {
+                scheme.cut_key(name).map(|key| (Some(key), name))
+            }
+        })
+        .collect();
+    names.sort_unstable_by(|first, second| second.cmp(first));
+    names
+        .into_iter()
+        .flat_map(|(_, name)| recorded_writes(entries, name).map(|write| write.commit))
+        .collect()
+}
+
 /// Whether `start` or a commit on its first-parent line stands for
 /// `commit`, a recorded write.
 ///
@@ -1365,8 +1395,10 @@ pub struct AdoptedFixFiles {
     /// a `fix_files` list ([`Entry::fix_files`]), which an older knives
     /// writes. The text joins a list's files with `, ` and ends the list at
     /// `; ` or ` (why: `, so it cannot tell a path that holds one of those
-    /// from two paths: a reader holds only those of [`Self::files`] that the
-    /// newest recorded write holds.
+    /// from two paths. A reader that measures the adopt holds only those of
+    /// [`Self::files`] that the adopt's own tree holds, beside the files that
+    /// its change changes; a reader that cannot measure it holds each of
+    /// them.
     pub from_text: bool,
 }
 

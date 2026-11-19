@@ -1109,6 +1109,16 @@ impl Repo {
         Ok(value(first)? == value(second)?)
     }
 
+    /// Whether `revision` holds a conflict at `path` (repository-internal,
+    /// `/`-separated). A file, symlink or directory there is no conflict,
+    /// and neither is nothing at all.
+    pub fn conflicted_at(&self, revision: &CommitId, path: &str) -> Result<bool, JjError> {
+        let path = internal_path(path)?;
+        let tree = self.commit(revision.as_str())?.tree();
+        let value = block_on(tree.path_value(path)).map_err(|error| store_error(&error))?;
+        Ok(!value.is_resolved())
+    }
+
     /// The paths of `paths` (repository-internal, `/`-separated) at which
     /// `revision` holds anything: a file, symlink, directory or conflict
     /// ([`tree_holds`]).

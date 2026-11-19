@@ -11,7 +11,7 @@
 //! of them writes locally only, and none of them pushes.
 // allow: SIZE_OK: 4044 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::bind::Fork;
@@ -3354,8 +3354,11 @@ impl CutAudit {
     /// either: the gate finds the file carried. A file that no fix holds stays
     /// in the drift.
     pub fn leave_fixes_to_gate(&mut self, fixes: &[AdoptedFix]) {
-        self.unexplained
-            .retain(|file| !fixes.iter().any(|fix| fix.files.contains(file)));
+        self.unexplained.retain(|file| {
+            !fixes
+                .iter()
+                .any(|fix| fix.files.iter().any(|held| held.path == *file))
+        });
     }
 }
 
@@ -3703,8 +3706,16 @@ pub struct CompositionCheck {
     pub absent_write: bool,
     /// The fixes by hand that the series holds and the subject lacks at one
     /// of their files or more ([`CompositionDelta::fixes`]), each with the
-    /// files it lacks.
+    /// files it lacks, none of them a file that the subject leaves
+    /// conflicted.
     pub dropped_fixes: Vec<LackedFix>,
+    /// The fixes by hand that the series holds at a file that the subject
+    /// and the newest recorded write both leave conflicted, each with those files: unanswerable until the
+    /// conflict is resolved, as for a member whose replay conflicted
+    /// ([`Self::inconclusive`]). A knives cut then goes ahead with the
+    /// conflict for the person to resolve in place and `adopt`; the write
+    /// it makes is no reference of those files, so the fix stays held.
+    pub inconclusive_fixes: Vec<LackedFix>,
 }
 
 impl CompositionCheck {
@@ -3719,6 +3730,12 @@ impl CompositionCheck {
             || self.absent_write
             || !self.dropped_fixes.is_empty()
     }
+
+    /// Whether the check could not answer for a member or a fix by hand,
+    /// as the subject leaves a conflict: no refusal, but no clean result.
+    pub const fn is_inconclusive(&self) -> bool {
+        !self.inconclusive.is_empty() || !self.inconclusive_fixes.is_empty()
+    }
 }
 
 /// A fix by hand that the series holds and the cut subject lacks
@@ -3730,27 +3747,41 @@ pub struct LackedFix {
     /// The adopt's commit.
     pub commit: CommitId,
     /// The files of the fix that the subject does not carry
-    /// ([`fix_lacks`]), each a repository path.
-    pub files: Vec<String>,
+    /// ([`fix_lacks`]), each with the write it was held against.
+    pub files: Vec<HeldFile>,
     /// Why nothing here can measure the fix, where nothing can: the subject
-    /// was then held to what the newest recorded write holds at those files.
+    /// was then held to what each file's reference holds there.
     pub unmeasured: Option<Unmeasured>,
 }
 
+/// A file of a fix by hand that the series holds, and the recorded write
+/// that it is held against ([`FixReferences::of`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldFile {
+    /// The file, a repository path.
+    pub path: String,
+    /// The file's reference: the newest recorded write of the series that
+    /// holds the file with no conflict, nothing there included. A write that
+    /// leaves the file conflicted is no reference. `None` where no write
+    /// holds the file so before one that this repository does not hold, or
+    /// none at all: nothing here then holds what the fix holds there.
+    pub reference: Option<CommitId>,
+}
+
 /// A fix by hand that the series holds: what an `adopt` of one of its
-/// releases recorded, at each file where the newest recorded write still
-/// holds it ([`adopted_fixes`]).
+/// releases recorded, at each file where its hold has not ended
+/// ([`adopted_fixes`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdoptedFix {
     /// The release the adopt recorded.
     name: String,
     /// The adopt's commit.
     commit: CommitId,
-    /// The files of the fix that the series holds, each on its own: those
-    /// that the adopt's change against its baseline changes and the newest
-    /// write still holds, then those that its adopt event names beyond
-    /// them ([`adopted_fix`]).
-    files: Vec<String>,
+    /// The files of the fix that the series holds, each on its own and with
+    /// its reference: those that the adopt's change against its baseline
+    /// changes and whose reference still holds that change, then those that
+    /// its adopt event names beyond them ([`adopted_fix`]).
+    files: Vec<HeldFile>,
     /// The files of [`Self::files`] that the adopt's change against its
     /// baseline changes, where this repository measures the fix: a subject
     /// carries such a file where that change replays empty onto it there
@@ -3771,7 +3802,7 @@ impl AdoptedFix {
 
     /// Why nothing here can measure the fix, or `None` where this
     /// repository measures it. The gate then holds each file of the fix to
-    /// what the newest recorded write holds there ([`fix_lacks`]).
+    /// what its reference holds there ([`fix_lacks`]).
     const fn unmeasured(&self) -> Option<Unmeasured> {
         match &self.measure {
             Ok(_) => None,
@@ -3822,33 +3853,40 @@ impl FixBaseline {
 /// last name to the first, each release's newest adopt first.
 ///
 /// There is one for each `adopt` that the ledger records of a release of
-/// `entry`'s series, before or after that release's cut, whose fix `write`
-/// still holds at one file or more. `write` is the baseline's
-/// [`CompositionBaseline::newest_write`], the newest release's newest
-/// recorded write, and each release is read as `entry`'s series reads it,
-/// with `tips`, the caller's bookmarks. An adopt holds a fix when its event
-/// records one ([`crate::release_model::adopted_fix_replaces`]).
+/// `entry`'s series, before or after that release's cut, whose hold has not
+/// ended at one file or more. `writes` are the series' recorded writes,
+/// newest first ([`crate::release_model::series_writes`]): the first is the
+/// baseline's [`CompositionBaseline::newest_write`], the newest release's
+/// newest recorded write. Each release is read as `entry`'s series reads
+/// it, with `tips`, the caller's bookmarks. An adopt holds a fix when its
+/// event records one ([`crate::release_model::adopted_fix_replaces`]).
 ///
-/// `write` is the one record that each fix is held against. Each file of a
-/// fix is held on its own, and its hold ends where `write` no longer holds
-/// the adopt's content there ([`adopted_fix`]). So a fix that a later cut
-/// or edit kept stays held, however many releases later, and a later write
-/// that removes the fix from one file, or changes the fix's lines there
-/// again, ends the hold on that file alone. Where this repository does not
-/// hold `write`, nothing here can tell what that write holds: no fix is
-/// held, and the gate refuses for that write
-/// ([`CompositionCheck::absent_write`]).
+/// Each file of a fix is held on its own, against its reference: the
+/// newest of `writes` that holds the file with no conflict
+/// ([`FixReferences::of`]). A write that leaves the file conflicted neither
+/// ends its hold nor holds what a subject must hold there. The hold on a
+/// file ends where its reference no longer holds the adopt's content there
+/// ([`adopted_fix`]). So a fix that a later cut or edit kept stays held,
+/// however many releases later, and a later write that removes the fix
+/// from one file, or changes the fix's lines there again, ends the hold on
+/// that file alone. Where this repository does not hold the newest write,
+/// nothing here can tell what that write holds: no fix is held, and the
+/// gate refuses for that write ([`CompositionCheck::absent_write`]).
 pub fn adopted_fixes(
     repo: &Repo,
     entry: &RepoEntry,
     (ledger, tips): (&[Entry], &BookmarkTips),
-    write: Option<&crate::release_model::RecordedCut>,
+    writes: &[CommitId],
 ) -> anyhow::Result<Vec<AdoptedFix>> {
-    let Some(newest) = write
-        .map(|write| &write.commit)
-        .filter(|commit| repo.resolve_commit(commit.as_str()).is_ok())
-    else {
+    if writes
+        .first()
+        .is_none_or(|newest| repo.resolve_commit(newest.as_str()).is_err())
+    {
         return Ok(Vec::new());
+    }
+    let mut references = FixReferences {
+        writes,
+        found: BTreeMap::new(),
     };
     let names = crate::release_model::recorded_release_names(ledger, &entry.release_scheme());
     let mut fixes = Vec::new();
@@ -3865,7 +3903,7 @@ pub fn adopted_fixes(
             branch: BranchName::new(name),
             remote: RemoteName::new(entry.publish_remote()),
         });
-        let writes = EarlierWrites::read(repo, name, ledger, published)?;
+        let earlier = EarlierWrites::read(repo, name, ledger, published)?;
         for (at, (event, adopt)) in events.iter().enumerate() {
             let Some(replaced) = crate::release_model::adopted_fix_replaces(event, name) else {
                 continue;
@@ -3874,9 +3912,11 @@ pub fn adopted_fixes(
                 .iter()
                 .skip(at + 1)
                 .find(|(_, older)| older.commit.short() == replaced);
-            let release = (entry, (ledger, tips), &writes);
+            let release = (entry, (ledger, tips), &earlier);
             let recorded = (*event, &adopt.commit);
-            if let Some(fix) = adopted_fix(repo, release, (name, recorded), (replaced, newest))? {
+            if let Some(fix) =
+                adopted_fix(repo, release, (name, recorded), (replaced, &mut references))?
+            {
                 fixes.push(fix);
             }
         }
@@ -3884,38 +3924,82 @@ pub fn adopted_fixes(
     Ok(fixes)
 }
 
+/// The reference of each file of a fix by hand ([`HeldFile::reference`]),
+/// found once for each file.
+struct FixReferences<'a> {
+    /// The series' recorded writes, newest first
+    /// ([`crate::release_model::series_writes`]).
+    writes: &'a [CommitId],
+    /// Each file found so far, with its reference.
+    found: BTreeMap<String, Option<CommitId>>,
+}
+
+impl FixReferences<'_> {
+    /// The reference of `file`, a repository path: the newest of
+    /// [`Self::writes`] that holds it with no conflict, a file, a symlink, a
+    /// directory or nothing. A knives write that leaves the file conflicted
+    /// is no reference: it neither removes a fix there nor holds what a
+    /// subject must hold. `None` where no write holds it so before one that
+    /// this repository does not hold, which nothing here can read, or at
+    /// all.
+    fn of(&mut self, repo: &Repo, file: &str) -> Result<Option<CommitId>, jj::JjError> {
+        if let Some(found) = self.found.get(file) {
+            return Ok(found.clone());
+        }
+        let mut reference = None;
+        for write in self.writes {
+            if repo.resolve_commit(write.as_str()).is_err() {
+                break;
+            }
+            if !repo.conflicted_at(write, file)? {
+                reference = Some(write.clone());
+                break;
+            }
+        }
+        self.found.insert(file.to_owned(), reference.clone());
+        Ok(reference)
+    }
+}
+
 /// The fix by hand that `adopt`, a commit that `event`, an `adopt` event of
 /// `name`, recorded, holds against `replaced`, the write that event
 /// replaced, with its event, when the ledger still records it: each file of
-/// it that `newest`, the newest recorded write, still holds as the adopt
-/// left it. `None` where `newest` holds it at no file.
+/// it whose hold has not ended, with its reference, which `references`
+/// finds. `None` where the hold has ended at every file.
 ///
-/// The fix is the adopt's change against the baseline that `adopt` measured
-/// it against ([`fix_baseline`]). `newest` holds a file of that change while
-/// the change replays empty onto it there
-/// ([`jj::Repo::uncarried_resolution_paths`]). A file that `event` names
-/// ([`crate::release_model::adopted_fix_files`]) and that change leaves out
-/// is one that nothing here measures: `newest` holds it while it holds
-/// there what the adopt holds.
+/// Where this repository measures the fix, its files are those of the
+/// adopt's change and those that `event` names beyond them
+/// ([`measured_fix_files`]). A deletion is content: the file's absence is
+/// the fix there.
 ///
 /// An adopt that this repository does not hold, or whose reading its series
 /// refuses, is a fix that nothing here can measure ([`Unmeasured`]). Its
-/// files are the ones that `event` names, and `newest` holds each while it
-/// holds anything there.
+/// files are the ones that `event` names
+/// ([`crate::release_model::adopted_fix_files`]), and each is held to what
+/// its reference holds there. A reference that holds nothing at a file
+/// holds the fix there as an absence, as nothing here can tell a fix that
+/// deleted the file from a later write that removed it. That hold ends only
+/// where a later reference holds the file again, and the file is then held
+/// to what that reference holds. A file with no reference stays held, and
+/// no subject carries it.
 ///
 /// An event without its `fix_files` list, as an older knives writes it,
 /// names its files in its text alone, which gives back a path that holds a
-/// separator in pieces. Its files are then each path that the text may
-/// name and `newest` holds, every such path, as no reading of the text can
-/// tell them apart ([`crate::release_model::AdoptedFixFiles::from_text`]).
-/// A piece that no such path holds ends its hold. A string that is no
-/// repository path, as a peer's ledger may carry, is no file of the fix
-/// ([`jj::is_repository_path`]).
+/// separator in pieces ([`crate::release_model::AdoptedFixFiles::from_text`]).
+/// Where this repository measures the fix, the adopt's change gives its
+/// real files, so a path that the text may name is a file of the fix only
+/// where the adopt's own tree holds it: a piece such as `y.txt` of
+/// `x, y.txt` is no file of it. Where nothing here can measure the fix, its
+/// files are each path that the text may name, as no reading of the text
+/// can tell them apart, and each is held as any other: one that its
+/// reference does not hold is held as an absence. That may hold more than
+/// the fix, never less. A string that is no repository path, as a peer's
+/// ledger may carry, is no file of the fix ([`jj::is_repository_path`]).
 fn adopted_fix(
     repo: &Repo,
     (entry, (ledger, tips), writes): (&RepoEntry, (&[Entry], &BookmarkTips), &EarlierWrites),
     (name, (event, adopt)): (&str, (&Entry, &CommitId)),
-    (replaced, newest): (Option<&(&Entry, RecordedWrite)>, &CommitId),
+    (replaced, references): (Option<&(&Entry, RecordedWrite)>, &mut FixReferences<'_>),
 ) -> Result<Option<AdoptedFix>, jj::JjError> {
     let named = crate::release_model::adopted_fix_files(event, name);
     let from_text = named.from_text;
@@ -3925,45 +4009,93 @@ fn adopted_fix(
         .filter(|file| jj::is_repository_path(file))
         .collect();
     let measure = fix_baseline(repo, (entry, (ledger, tips), writes), adopt, replaced)?;
-    let (files, kept) = match &measure {
-        Err(_) => (repo.held_paths(newest, &named)?, Vec::new()),
-        Ok(baseline) => {
-            let named = if from_text {
-                repo.held_paths(newest, &named)?
-            } else {
-                named
-            };
-            let changes = jj::resolution_changes(repo, baseline.baseline(), adopt)?;
-            let touched: Vec<String> = changes.resolved.into_iter().chain(changes.beyond).collect();
-            let uncarried = if touched.is_empty() {
-                Vec::new()
-            } else {
-                repo.uncarried_resolution_paths(baseline.baseline(), adopt, newest)?
-            };
-            let kept: Vec<String> = touched
-                .iter()
-                .filter(|file| !uncarried.contains(file))
-                .cloned()
-                .collect();
-            let mut files = kept.clone();
-            for file in named {
-                if !touched.contains(&file)
-                    && !files.contains(&file)
-                    && repo.same_path_value(newest, adopt, &file)?
-                {
-                    files.push(file);
-                }
+    let (files, changed) = if let Ok(baseline) = &measure {
+        let named = if from_text {
+            repo.held_paths(adopt, &named)?
+        } else {
+            named
+        };
+        measured_fix_files(repo, (baseline.baseline(), adopt), named, references)?
+    } else {
+        let mut files: Vec<HeldFile> = Vec::new();
+        for path in named {
+            if !files.iter().any(|file| file.path == path) {
+                let reference = references.of(repo, &path)?;
+                files.push(HeldFile { path, reference });
             }
-            (files, kept)
         }
+        (files, Vec::new())
     };
     Ok((!files.is_empty()).then(|| AdoptedFix {
         name: name.to_owned(),
         commit: adopt.clone(),
         files,
-        replayed: kept,
+        replayed: changed,
         measure,
     }))
+}
+
+/// The files of the fix by hand of `adopt`, which this repository measures
+/// against `baseline`, whose hold has not ended, each with its reference
+/// ([`FixReferences::of`]); and those of them that the adopt's change
+/// changes ([`AdoptedFix::replayed`]).
+///
+/// The hold on a file of the adopt's change lasts while the change replays
+/// empty onto the file's reference there
+/// ([`jj::Repo::uncarried_resolution_paths`]), replayed once for each
+/// reference. So the hold on a file that the fix deleted lasts while the
+/// reference holds nothing there, and ends where it holds the file again.
+/// A file of `named`, the files that the adopt's event names, that the
+/// change leaves out is one that nothing here measures: its hold lasts
+/// while its reference holds there what the adopt holds, nothing at both
+/// included. A file with no reference stays held.
+fn measured_fix_files(
+    repo: &Repo,
+    (baseline, adopt): (jj::ResolutionBaseline<'_>, &CommitId),
+    named: Vec<String>,
+    references: &mut FixReferences<'_>,
+) -> Result<(Vec<HeldFile>, Vec<String>), jj::JjError> {
+    let changes = jj::resolution_changes(repo, baseline, adopt)?;
+    let touched: Vec<String> = changes.resolved.into_iter().chain(changes.beyond).collect();
+    let mut uncarried: Vec<(CommitId, Vec<String>)> = Vec::new();
+    let (mut files, mut replayed) = (Vec::new(), Vec::new());
+    for path in &touched {
+        let reference = references.of(repo, path)?;
+        let held = match &reference {
+            None => true,
+            Some(write) => {
+                if let Some((_, paths)) = uncarried.iter().find(|(onto, _)| onto == write) {
+                    !paths.contains(path)
+                } else {
+                    let paths = repo.uncarried_resolution_paths(baseline, adopt, write)?;
+                    let held = !paths.contains(path);
+                    uncarried.push((write.clone(), paths));
+                    held
+                }
+            }
+        };
+        if held {
+            replayed.push(path.clone());
+            files.push(HeldFile {
+                path: path.clone(),
+                reference,
+            });
+        }
+    }
+    for path in named {
+        if touched.contains(&path) || files.iter().any(|file| file.path == path) {
+            continue;
+        }
+        let reference = references.of(repo, &path)?;
+        let held = match &reference {
+            None => true,
+            Some(write) => repo.same_path_value(write, adopt, &path)?,
+        };
+        if held {
+            files.push(HeldFile { path, reference });
+        }
+    }
+    Ok((files, replayed))
 }
 
 /// What the fix by hand of `adopt` is measured against, as `adopt`
@@ -4025,9 +4157,9 @@ pub struct CompositionDelta<'a> {
     /// stack below it. `None` outside a stacked series.
     pub start: Option<&'a CommitId>,
     /// The fixes by hand that the series holds ([`adopted_fixes`]): each
-    /// adopt's fix, of any release of the series, at each file where the
-    /// newest recorded write still holds it. The subject must carry each
-    /// such file ([`fix_lacks`]).
+    /// adopt's fix, of any release of the series, at each file where its
+    /// hold has not ended, with the file's reference. The subject must
+    /// carry each such file ([`fix_lacks`]).
     pub fixes: &'a [AdoptedFix],
 }
 
@@ -4066,9 +4198,14 @@ pub struct CompositionDelta<'a> {
 /// subject does not carry that write's release ([`CompositionCheck::off_line`]).
 ///
 /// Each fix by hand that the series holds ([`CompositionDelta::fixes`]) is
-/// held file by file against the newest write ([`fix_lacks`]), whatever
-/// the subject's ancestry. A fix the subject lacks at a file is named by
-/// its adopt, with each file it lacks ([`CompositionCheck::dropped_fixes`]).
+/// held file by file, each file against its reference ([`fix_lacks`]),
+/// whatever the subject's ancestry. A fix the subject lacks at a file is
+/// named by its adopt, with each file it lacks
+/// ([`CompositionCheck::dropped_fixes`]); at a file that the subject leaves
+/// conflicted, as a knives cut over a conflicted write does, the fix is
+/// inconclusive instead and refuses nothing
+/// ([`CompositionCheck::inconclusive_fixes`]), so the cut goes ahead with
+/// the conflict for the person to resolve in place and `adopt`.
 pub fn uncarried_recorded_members(
     repo: &Repo,
     path: &Path,
@@ -4076,6 +4213,7 @@ pub fn uncarried_recorded_members(
     delta: &CompositionDelta<'_>,
 ) -> anyhow::Result<CompositionCheck> {
     let mut check = CompositionCheck::default();
+    let conflicted = subject.conflicted_files(path)?;
     if let Some(write) = &delta.baseline.newest_write {
         check.absent_write = repo.resolve_commit(write.commit.as_str()).is_err();
         if let Some(start) = delta.start.filter(|_| !check.absent_write) {
@@ -4090,15 +4228,12 @@ pub fn uncarried_recorded_members(
             delta.fixes
         };
         for fix in held {
-            let lacked = fix_lacks(repo, &mut *subject, fix, &write.commit)?;
-            if !lacked.is_empty() {
-                check.dropped_fixes.push(LackedFix {
-                    name: fix.name.clone(),
-                    commit: fix.commit.clone(),
-                    files: lacked,
-                    unmeasured: fix.unmeasured(),
-                });
-            }
+            fix_findings(
+                (repo, &mut *subject),
+                fix,
+                (&write.commit, &conflicted),
+                &mut check,
+            )?;
         }
     }
     // The newest write's members, by change id where this repository holds
@@ -4114,7 +4249,7 @@ pub fn uncarried_recorded_members(
             successors.push(repo.change_id_of(member.as_str())?);
         }
     }
-    let cut_is_conflicted = !subject.conflicted_files(path)?.is_empty();
+    let cut_is_conflicted = !conflicted.is_empty();
     for member in delta.baseline.members() {
         if delta.parents.contains(member) {
             continue;
@@ -4167,19 +4302,60 @@ pub fn uncarried_recorded_members(
     Ok(check)
 }
 
+/// Record what the subject lacks of `fix`, one of the fixes by hand that the
+/// series holds ([`fix_lacks`]), in `check`: a file that the subject leaves
+/// conflicted, of `conflicted`, where `newest`, the newest recorded write,
+/// holds that conflict too, as inconclusive
+/// ([`CompositionCheck::inconclusive_fixes`]): the conflict came from a
+/// recorded write, and the person resolves it in place. Every other file
+/// it lacks as dropped ([`CompositionCheck::dropped_fixes`]), refused with
+/// the move to the newest write.
+fn fix_findings(
+    (repo, subject): (&Repo, &mut CutSubject<'_>),
+    fix: &AdoptedFix,
+    (newest, conflicted): (&CommitId, &[String]),
+    check: &mut CompositionCheck,
+) -> anyhow::Result<()> {
+    let (mut open, mut lacked) = (Vec::new(), Vec::new());
+    for file in fix_lacks(repo, subject, fix)? {
+        if conflicted.contains(&file.path) && repo.conflicted_at(newest, &file.path)? {
+            open.push(file);
+        } else {
+            lacked.push(file);
+        }
+    }
+    for (files, found) in [
+        (lacked, &mut check.dropped_fixes),
+        (open, &mut check.inconclusive_fixes),
+    ] {
+        if !files.is_empty() {
+            found.push(LackedFix {
+                name: fix.name.clone(),
+                commit: fix.commit.clone(),
+                files,
+                unmeasured: fix.unmeasured(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The files of `fix`, one of the fixes by hand that the series holds
 /// ([`AdoptedFix`]), that the cut subject does not carry, each judged on its
-/// own against `newest`, the newest recorded write.
+/// own against its reference ([`HeldFile::reference`]).
 ///
 /// The subject carries a file that the adopt's change changes where that
 /// change replays empty onto it there ([`AdoptedFix::replayed`]): a member
 /// that changes other lines of a file whose lines the fix changed leaves
 /// the fix there. Otherwise it carries a file where it holds exactly what
-/// `newest` holds there: a later write may change a file of the fix, a
-/// later adopt that refines it or an `include` of a member that touches it,
-/// and the replay then conflicts, as it does for any other content at a
-/// file the fix added. A file that nothing here measures is held by that
-/// test alone.
+/// the file's reference holds there, nothing at both included: a later
+/// write may change a file of the fix, a later adopt that refines it or an
+/// `include` of a member that touches it, and the replay then conflicts,
+/// as it does for any other content at a file the fix added. A file that
+/// nothing here measures is held by that test alone, and a file with no
+/// reference by the replay alone. So a subject that holds a file that the
+/// fix deleted lacks the fix there, and so does one that leaves the file
+/// conflicted, which the caller reports as inconclusive.
 ///
 /// Only the subject's own tree counts: the candidate a cut builds, or the
 /// commit a record names. A subject with the adopt on its first-parent line
@@ -4188,8 +4364,7 @@ fn fix_lacks(
     repo: &Repo,
     subject: &mut CutSubject<'_>,
     fix: &AdoptedFix,
-    newest: &CommitId,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<Vec<HeldFile>> {
     let uncarried = match fix.baseline() {
         Some(baseline) if !fix.replayed.is_empty() => {
             subject.uncarried_resolution_paths(repo, baseline, &fix.commit)?
@@ -4198,8 +4373,14 @@ fn fix_lacks(
     };
     let mut lacked = Vec::new();
     for file in &fix.files {
-        let replayed = fix.replayed.contains(file) && !uncarried.contains(file);
-        if !replayed && !subject.same_path_value(repo, newest, file)? {
+        if fix.replayed.contains(&file.path) && !uncarried.contains(&file.path) {
+            continue;
+        }
+        let held = match &file.reference {
+            Some(reference) => subject.same_path_value(repo, reference, &file.path)?,
+            None => false,
+        };
+        if !held {
             lacked.push(file.clone());
         }
     }

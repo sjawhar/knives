@@ -1647,3 +1647,340 @@ fn a_stacked_record_that_resolves_an_advance_conflict_against_an_adopted_fix_is_
     assert!(out.contains(adopt.short()), "{out}");
     assert_eq!(ledger_entries(&home).len(), entries, "{out}");
 }
+
+#[test]
+fn a_conflicted_stacked_cut_keeps_an_adopted_fix_held_and_a_record_without_it_is_refused() {
+    // Given: the next release cut on the published previous release, with
+    // `m6` included; NEXT fixed by hand in place, a.txt changed, and adopted;
+    // then `m6` changes a.txt as well, `advance` writes NEXT with a.txt
+    // conflicted, and NEXT is published by a note.
+    let (lab, home) = previous_release_lab(true);
+    release_ok(&lab, &home, &["cut", NEXT]);
+    release_ok(&lab, &home, &["include", "m6", "--why", "in NEXT"]);
+    let adopt = fix_next_by_hand(
+        &lab,
+        &home,
+        &[("a.txt", Some("fixed by hand\n"))],
+        "a fix by hand",
+    );
+    extend_branch(&lab, "m6", "a.txt", "m6\n");
+    let advanced = knives_release(&lab, &home, &["--series", "old", "advance", "m6"]);
+    assert!(
+        matches!(advanced.status.code(), Some(0 | 1)),
+        "{}",
+        text(&advanced)
+    );
+    mark_published(&lab, &home, NEXT);
+
+    // When: the third release is cut on NEXT.
+    let cut = knives_release(&lab, &home, &["--series", "old", "cut", THIRD]);
+
+    // Then: it is cut with a.txt conflicted for the person to resolve, exit
+    // 1, and names the fix as inconclusive at a.txt, not dropped.
+    let out = text(&cut);
+    assert_eq!(cut.status.code(), Some(1), "{out}");
+    assert!(
+        out.contains(&format!(
+            "  the fix by hand of {NEXT}'s adopt {}, in 1 file(s): a.txt: carry check \
+             inconclusive (the cut leaves those files conflicted; resolve them in place, then \
+             run `knives release adopt`)\n",
+            adopt.short()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("does not carry the fix by hand"), "{out}");
+    assert!(resolves(&lab, THIRD), "{out}");
+
+    // When: the fourth release, merged by hand of the third and `m5` with
+    // a.txt as `m6` has it, is recorded.
+    lab.jj_work([
+        "new",
+        "-r",
+        THIRD,
+        "-r",
+        "m5",
+        "-m",
+        "the fourth release, merged by hand",
+    ]);
+    change_files(&lab, &[("a.txt", Some("m6\n"))]);
+    lab.jj_work(["new"]);
+    let commit = knives::ids::CommitId::new(lab.jj_work_output([
+        "log",
+        "-r",
+        "@-",
+        "--no-graph",
+        "-T",
+        "commit_id",
+    ]));
+    let entries = ledger_entries(&home).len();
+    let recorded = knives_release(
+        &lab,
+        &home,
+        &["--series", "old", "cut", FOURTH, "--at", commit.as_str()],
+    );
+
+    // Then: it is refused, naming the adopt, and nothing is written: neither
+    // conflicted write is the reference of a.txt, so the adopt is.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to record {FOURTH} at {}: it does not carry the fix by hand of \
+             {NEXT}'s adopt {}, in 1 file(s): a.txt\n",
+            commit.short(),
+            adopt.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(ledger_entries(&home).len(), entries, "{out}");
+}
+
+#[test]
+fn a_stacked_record_that_holds_a_file_an_adopt_deleted_is_refused_until_a_later_write_holds_it() {
+    // Given: the next release cut on the published previous release, with
+    // `m6` included; NEXT fixed by hand in place by deleting b.txt, which
+    // the previous release carries, and adopted; `m7` built on the previous
+    // release; and a commit merged by hand of the adopt and `m7`, which
+    // holds b.txt again.
+    let (lab, home) = previous_release_lab(true);
+    let previous = commit_at(&lab, PREVIOUS);
+    release_ok(&lab, &home, &["cut", NEXT]);
+    release_ok(&lab, &home, &["include", "m6", "--why", "in NEXT"]);
+    let adopt = fix_next_by_hand(&lab, &home, &[("b.txt", None)], "b.txt is not needed");
+    branch_on(&lab, previous.as_str(), "m7", "m7.txt");
+    let held = merged_by_hand(&lab, &adopt, &[("b.txt", Some("fix/b\n"))]);
+    let entries = ledger_entries(&home).len();
+
+    // When: it is recorded as the series' third release.
+    let refused = knives_release(
+        &lab,
+        &home,
+        &["--series", "old", "cut", THIRD, "--at", held.as_str()],
+    );
+
+    // Then: it is refused, naming the adopt and b.txt, and nothing is
+    // written: the file's absence is the fix.
+    let out = text(&refused);
+    assert_eq!(refused.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to record {THIRD} at {}: it does not carry the fix by hand of \
+             {NEXT}'s adopt {}, in 1 file(s): b.txt\n",
+            held.short(),
+            adopt.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(ledger_entries(&home).len(), entries, "{out}");
+
+    // When: it is recorded under `--allow-drop`, so the newest recorded
+    // write holds b.txt again; and the fourth release, merged by hand of it
+    // and `m8`, is recorded next.
+    let allowed = knives_release(
+        &lab,
+        &home,
+        &[
+            "--series",
+            "old",
+            "cut",
+            THIRD,
+            "--at",
+            held.as_str(),
+            "--allow-drop",
+        ],
+    );
+    let out = text(&allowed);
+    assert_eq!(allowed.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: --allow-drop: recording {THIRD} at {} without the fix by hand of {NEXT}'s \
+             adopt {}, in 1 file(s): b.txt\n",
+            held.short(),
+            adopt.short()
+        )),
+        "{out}"
+    );
+    branch_on(&lab, previous.as_str(), "m8", "m8.txt");
+    lab.jj_work([
+        "new",
+        "-r",
+        held.as_str(),
+        "-r",
+        "m8",
+        "-m",
+        "the fourth release, merged by hand",
+    ]);
+    lab.jj_work(["new"]);
+    let again = knives::ids::CommitId::new(lab.jj_work_output([
+        "log",
+        "-r",
+        "@-",
+        "--no-graph",
+        "-T",
+        "commit_id",
+    ]));
+    let recorded = knives_release(
+        &lab,
+        &home,
+        &["--series", "old", "cut", FOURTH, "--at", again.as_str()],
+    );
+
+    // Then: it is recorded: the hold on b.txt ended where a recorded write
+    // holds the file again.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(0), "{out}");
+    assert!(!out.contains("the fix by hand of"), "{out}");
+}
+
+/// Each file of the fork's ledger that holds an `adopt` event of `name`:
+/// its path, its frontmatter and its text.
+fn adopt_event_files(
+    home: &tempfile::TempDir,
+    name: &str,
+) -> Vec<(std::path::PathBuf, toml::Table, String)> {
+    let mut files = Vec::new();
+    let ledger = home.path().join("ledger").join("demo");
+    for dirent in std::fs::read_dir(&ledger).expect("read the ledger directory") {
+        let path = dirent.expect("read a ledger file").path();
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some((frontmatter, text)) = contents
+            .strip_prefix("+++\n")
+            .and_then(|rest| rest.split_once("+++\n"))
+        else {
+            continue;
+        };
+        if text.starts_with(&format!("edited {name} as ")) && text.contains(" parent(s): adopted: ")
+        {
+            let frontmatter: toml::Table = frontmatter
+                .parse()
+                .expect("parse an adopt event's frontmatter");
+            files.push((path, frontmatter, text.to_owned()));
+        }
+    }
+    files
+}
+
+/// Remove the `fix_files` list from each `adopt` event of `name`, so the
+/// event reads as a knives from before that list writes it: its text alone
+/// names the files of its fix.
+fn without_fix_files(home: &tempfile::TempDir, name: &str) {
+    let events = adopt_event_files(home, name);
+    assert!(!events.is_empty(), "no adopt event of {name}");
+    for (path, mut frontmatter, text) in events {
+        frontmatter.remove("fix_files");
+        let frontmatter = toml::to_string(&frontmatter).expect("write the frontmatter");
+        std::fs::write(
+            &path,
+            format!("+++\n{}\n+++\n{text}", frontmatter.trim_end()),
+        )
+        .expect("rewrite the adopt event");
+    }
+}
+
+#[test]
+fn an_older_adopt_whose_paths_the_newest_write_holds_none_of_holds_each_as_absent_in_a_clone() {
+    // Given: the next release cut on the published previous release, with
+    // `m6` included; NEXT fixed by hand in place with the new file
+    // `x, y.txt` and adopted, its event as a knives from before the
+    // `fix_files` list writes it, so its text may name `x`, `x, y.txt` and
+    // `y.txt`; then the file removed by hand and adopted again, so the
+    // newest recorded write holds none of those paths; `m7` built on the
+    // previous release, which adds `y.txt`; the branches and NEXT pushed,
+    // the first adopt's commit never; and a commit merged by hand in the
+    // second clone of NEXT and `m7`, which holds `y.txt`.
+    let (lab, home) = previous_release_lab(true);
+    let previous = commit_at(&lab, PREVIOUS);
+    release_ok(&lab, &home, &["cut", NEXT]);
+    release_ok(&lab, &home, &["include", "m6", "--why", "in NEXT"]);
+    let adopt = fix_next_by_hand(
+        &lab,
+        &home,
+        &[("x, y.txt", Some("fixed by hand\n"))],
+        "a fix by hand",
+    );
+    without_fix_files(&home, NEXT);
+    let removed = fix_next_by_hand(&lab, &home, &[("x, y.txt", None)], "not needed");
+    branch_on(&lab, previous.as_str(), "m7", "y.txt");
+    for branch in ["fix/a", "fix/b", "m5", "m6", "m7", NEXT] {
+        lab.push_branch(branch);
+    }
+    let upstream = lab.upstream.to_str().expect("utf-8 path").to_owned();
+    lab.jj_at(&lab.second, ["git", "remote", "add", "upstream", &upstream]);
+    lab.jj_at(&lab.second, ["git", "fetch", "--all-remotes"]);
+    let second = knives::jj::Repo::open(&lab.second).expect("open the second clone");
+    assert!(
+        second.resolve_commit(adopt.as_str()).is_err()
+            && second.resolve_commit(removed.as_str()).is_ok(),
+        "the second clone holds the second adopt and not the first"
+    );
+    lab.jj_at(
+        &lab.second,
+        [
+            "new",
+            "-r",
+            &format!("{NEXT}@origin"),
+            "-r",
+            "m7@origin",
+            "-m",
+            "the third release, merged by hand",
+        ],
+    );
+    lab.jj_at(&lab.second, ["new"]);
+    let commit = knives::ids::CommitId::new(lab.revision(&lab.second, "@-", "commit_id").trim());
+    let args = [
+        "--text",
+        "release",
+        "--repo",
+        "demo",
+        "--series",
+        "old",
+        "cut",
+        THIRD,
+        "--at",
+        commit.as_str(),
+    ];
+    let entries = ledger_entries(&home).len();
+
+    // When: it is recorded in the second clone.
+    let refused = lab::knives_command(&lab.second, home.path(), lab.temp_path(), &args)
+        .output()
+        .expect("run knives in the second clone");
+
+    // Then: it is refused, naming the first adopt and `y.txt`, and nothing
+    // is written: each path that the first adopt's text may name is held as
+    // an absence, as the newest recorded write holds none of them.
+    let out = text(&refused);
+    assert_eq!(refused.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "it does not carry the fix by hand of {NEXT}'s adopt {adopt}, in 1 file(s): y.txt \
+             (this repository does not hold {adopt}",
+            adopt = adopt.short()
+        )),
+        "{out}"
+    );
+    assert!(out.contains("--allow-drop"), "{out}");
+    assert_eq!(ledger_entries(&home).len(), entries, "{out}");
+
+    // When: it is recorded there under `--allow-drop`.
+    let mut allow = args.to_vec();
+    allow.push("--allow-drop");
+    let allowed = lab::knives_command(&lab.second, home.path(), lab.temp_path(), &allow)
+        .output()
+        .expect("run knives in the second clone");
+
+    // Then: it is recorded, and the line names the first adopt and `y.txt`.
+    let out = text(&allowed);
+    assert_eq!(allowed.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: --allow-drop: recording {THIRD} at {} without the fix by hand of {NEXT}'s \
+             adopt {}, in 1 file(s): y.txt (this repository does not hold",
+            commit.short(),
+            adopt.short()
+        )),
+        "{out}"
+    );
+}
