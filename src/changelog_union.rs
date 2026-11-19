@@ -34,8 +34,10 @@
 //! ([`masks`]) reads a joined entry by the same rule, so a join knives wrote
 //! never reads as a member's entry lost. Where the place is not plain lists
 //! in a file's one `[Unreleased]` section, each block is written whole, and
-//! [`Union::left_twice`] names each `### ` heading that the blocks there
-//! leave twice in one section, for a person to join.
+//! [`Union::left_twice`] names each `### ` heading that two of the blocks
+//! there leave in one section, for a person to join. A heading that one
+//! block holds twice stays as that block wrote it, joined or not, and is
+//! not named.
 //!
 //! One insertion is left to a person too: a side's block whose last line has
 //! no newline, where something would follow it. Written verbatim, that line
@@ -210,7 +212,7 @@ fn written_union<B: AsRef<[u8]>>(
 /// `[Unreleased]` section of that text ([`Above::reads_unreleased`]), and
 /// every block is plain `### ` lists ([`plain_lists`]), their lists are
 /// joined ([`joined_blocks`]). Anywhere else each block is written whole,
-/// byte for byte, and each `### ` heading that the blocks leave twice in one
+/// byte for byte, and each `### ` heading that two of the blocks leave in one
 /// section goes in the union's `left_twice` ([`name_left_twice`]).
 fn place_blocks<'a>(
     inserted: &[&'a [u8]],

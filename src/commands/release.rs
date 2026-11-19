@@ -4842,8 +4842,8 @@ pub fn check_test_count(fork: &Fork<'_>, cut: &CommitId, parent: &CommitId) -> T
 /// renumbers, so two blocks claiming one version read as two such lines, and
 /// settling that is a person's. Where the blocks at a place are not plain
 /// `### ` lists in a file's one `[Unreleased]` section, the union writes each
-/// of them whole, and one line for the file names each `### ` heading they
-/// leave twice in one section, for a person to join.
+/// of them whole, and one line for the file names each `### ` heading that
+/// two of them leave in one section, for a person to join.
 ///
 /// Every other conflict stays a person's. Independent branches that each
 /// append a config key land in the same regions, so a real cut carries real
