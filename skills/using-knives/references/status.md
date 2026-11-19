@@ -43,7 +43,6 @@ A `-` is a missing value, not zero.
 - `landed` replays the branch onto `<trunk>@upstream` and never reads a release, so a member that a release carries can read `conflicts-with-trunk`. Ask `knives release members --carries <branch>` for that.
 - A merged PR whose landing commit is in trunk reads `in-trunk` from forge evidence while the branch holds nothing past it.
 - `activity_at` is the newest review or comment time. A notch's `anchor` is the subject tip when it was written.
-- `claim` is this machine's `state.json`: the claims it took or resumed. On a fork that shares its ledger, `status` reads no claim ref, so a claim held only on another machine has no `claim` here, and one shown may since have been seized or released elsewhere. `knives start <branch>` reads the ledger's claim ([shared-claims.md](shared-claims.md)).
 
 ## Sightings
 

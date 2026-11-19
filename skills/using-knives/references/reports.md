@@ -9,7 +9,7 @@ Read this when you run or read `knives repos`, `consumers`, `pushed`, `audit` or
           behind?, notes?, problems?}], notes?, problems?, config_path}
 ```
 
-- `name` is the registry key you type. `upstream_name` is the lowercase upstream `<owner>/<name>` (the key when upstream is a path), under which the ledger, claims and state are kept. A claim's `repo` in `state.json` is an `upstream_name`: match it against `upstream_name`, never `name`. `state.json` holds only this machine's claims; on a fork with `ledger`, the claim that decides is on the ledger's repository ([shared-claims.md](shared-claims.md)).
+- `name` is the registry key you type. `upstream_name` is the lowercase upstream `<owner>/<name>` (the key when upstream is a path), under which the ledger, claims and state are kept. A claim's `repo` in `state.json` is an `upstream_name`: match it against `upstream_name`, never `name`.
 - `not on this machine` (`path: null`) is a scan miss, not proof of absence. `ambiguous: 2 checkouts` and `upstream disagrees with repos.toml` are problems (exit `3`).
 - `ledger` is the shared ledger repository, absent when the ledger is not shared.
 - `repos` reads no ledger or state file, so it works before `knives ledger migrate`.

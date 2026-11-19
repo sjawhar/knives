@@ -16,7 +16,7 @@ Run `knives ledger migrate` once on each machine. Until then, commands that read
 1. Bind the right repository. Commands use the checkout you stand in. A named repository is found by a scan of `$HOME`, not by your current directory, and `repos` always scans.
 2. Keep remote roles apart. `upstream` takes our work only through a PR. `origin` is our fork: branches and PR heads. `release` is an optional publish remote; when it is absent or equal to `origin`, publish to `origin`. A matching name on the wrong remote proves nothing.
 3. Registration is not trust. `[trust]` injects repository guidance as data and never authorizes fork commands; its repo and owner rules match self-declared remote URLs.
-4. A claim means "working here now". Another holder's claim is not yours, and a sighting does not prove liveness. On a fork whose registry entry sets `ledger`, a claim holds on every machine that shares that ledger, and `status` lists only this machine's claims. Never remove `state.lock` or a file in `fork-locks/`.
+4. A claim means "working here now". Another holder's claim is not yours, and a sighting does not prove liveness. Never remove `state.lock` or a file in `fork-locks/`.
 5. Release a claim with `knives finish` when active work stops, also while a PR waits for review. First record in the ledger why the branch exists and any supersession: `finish` drops the claim's reason. The branch, bookmark and PR stay.
 6. A missing observation is not clearance. Absent, `null`, `0` and `UNKNOWN` differ. Read `problems`.
 7. Keep dependencies. Never keep a dependent in a release and drop its requirement.
@@ -30,7 +30,6 @@ Run `knives ledger migrate` once on each machine. Until then, commands that read
 - Read [references/reports.md](references/reports.md) when you run or read `repos`, `consumers`, `pushed`, `audit` or `pr`.
 - Read [references/status.md](references/status.md) when you read `knives status` rows, states or columns.
 - Read [references/coordination.md](references/coordination.md) before `sync`, `preflight`, `start`, `finish`, `track` or `depends`, and when a command waits on a lock.
-- Read [references/shared-claims.md](references/shared-claims.md) before `start` or `finish` on a fork whose registry entry sets `ledger`, when a claim refusal names a machine, when `start` or `finish` exits `3` naming a ledger, and when a command prints `joined the ledger`.
 - Read [references/ledger.md](references/ledger.md) before you read or write `knives notch`, set up ledger sharing, or run `knives ledger sweep` or `migrate`.
 - Read [references/release-composition.md](references/release-composition.md) before you plan, cut, `include`, `drop`, `advance` or `rebase` a release, or read `release members`.
 - Read [references/releases.md](references/releases.md) before you adopt a hand change, when a release write prints `could not check` or `is published`, when a reap keeps a cut, and before you push a release.
@@ -38,7 +37,7 @@ Run `knives ledger migrate` once on each machine. Until then, commands that read
 
 ## What changes state
 
-- Local writes: `sync`, `start`, `finish`, `track`, `depends`, `notch -m`, release edits. On a fork that shares its ledger, a write sends its entries before it exits; one whose entries did not arrive exits `3`, and `knives ledger sweep` sends them later.
+- Local writes: `sync`, `start`, `finish`, `track`, `depends`, `notch -m`, release edits. A ledger write starts a background sweep that pushes a shared ledger.
 - `repos`, `consumers`, `pushed`, `audit`, `status` and `pr` never repair, remove, push or open PRs.
 - Release commands never push. Publish as [references/releases.md](references/releases.md#publishing) says.
 - `knives hook claude-code|opencode` is harness plumbing. Do not run it.
@@ -68,6 +67,6 @@ Reports are TOON when an agent is detected or stdout is not a terminal. `--json`
 | `0` | No findings. Not a readiness verdict. |
 | `1` | Findings. |
 | `2` | Usage error, or a `start` or `finish` refusal. A `finish` refused because another owner took your claim exits `1`. |
-| `3` | Incomplete: something could not be answered, or a write did not reach a shared ledger. Release writes also refuse with `3`. |
+| `3` | Incomplete: something could not be answered. Release writes also refuse with `3`. |
 
 An incomplete report can still hold useful observations.

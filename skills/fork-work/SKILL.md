@@ -16,7 +16,7 @@ Do this before you read code too: the wrong copy gives wrong answers, and nothin
 
 ## 2. Read the status and the notches
 
-1. Run `knives status` in the checkout. Read the other agents' claims before you touch anything: another agent on your branch is a collision. On a shared ledger, it lists only this machine's claims.
+1. Run `knives status` in the checkout. Read the other agents' claims before you touch anything: another agent on your branch is a collision.
 2. Run `knives notch` for recent decisions, and `knives notch <branch>` before you touch a branch you do not understand. An entry at a commit the branch has since moved past is a reason to check again, not a conclusion.
 3. Record a decision worth keeping (superseded, stopped by its owner until an event, a promise to a reviewer, a PR moved), with a commit or `file:line`:
    `knives notch <branch> -m "what you decided and why" --evidence <commit-or-ref>`
@@ -63,7 +63,6 @@ Shipping a fork member is part of the same work:
 
 1. `knives start <branch> --why "what you are doing"` claims the branch and opens a jj workspace on it. Work only there. A `start` that pauses is waiting for another agent's claim lock: let it finish.
 2. When your active work stops, also to wait for review, run `knives finish <branch>`. It returns the claim and removes the workspace; jj keeps the work by change id, and the branch, bookmark and PR stay.
-3. A subagent that is its own session is another owner: your claim refuses it, or its `--force` seizes yours. Have it run knives with `KNIVES_OWNER` set to your owner name (`using-knives` coordination). Never release your claim for it.
 
 ## 6. Never improvise
 

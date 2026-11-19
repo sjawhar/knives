@@ -24,22 +24,19 @@ Reports upstream contribution facts: convention files and their changes since la
 
 ## Claims: `start` and `finish`
 
-- The claim holder is `KNIVES_OWNER` (the OpenCode plugin sets it), else `CLAUDE_CODE_SESSION_ID`, else `OMP_SESSION_ID`, else `PI_SESSION_ID` (set by an Oh My Pi build that sets no `OMP_SESSION_ID`). Two agents under one OS user are separate claimants. With none set, the claim is anonymous (`<user>/os-user`) and resumes only inside its own workspace.
-- On a fork whose registry entry sets `ledger`, the claim that decides is a ref on the ledger's repository: it holds on every machine that shares the ledger, and a refusal names the holder's machine. Read [shared-claims.md](shared-claims.md) before `start` or `finish` there. When `start` or `finish` cannot read or change that claim, it exits `3`, and `state.json` and the workspace stay as they were.
+- The claim holder is `KNIVES_OWNER` (the OpenCode plugin sets it), else `CLAUDE_CODE_SESSION_ID`, else `OMP_SESSION_ID`. Two agents under one OS user are separate claimants. With none set, the claim is anonymous (`<user>/os-user`) and resumes only inside its own workspace.
 - `start` refuses (exit `2`) a branch another identity holds. It names the holder, the claim's workspace, the processes this machine sees in it, and what those facts prove. `start --force --why "<reason>"` takes the claim over.
-- Standing in the claimed workspace resumes a claim under any owner name, but `finish` releases only a claim whose owner name equals yours. An anonymous claim (`<user>/os-user`) is finished only from inside its own workspace: outside it, two anonymous owners never match, even under one user name.
+- Standing in the claimed workspace resumes a claim under any owner name, but `finish` releases only a claim whose owner name equals yours.
 - `start --why "…"` by the holder replaces the claim's reason and keeps its time and place.
 - `finish` snapshots the working copy into jj and prints `its working copy is kept as change <id> (commit <id>)`, then forgets the workspace and removes the directory. Files jj never tracks (build output, an ignored `.env`) are lost; `--no-cleanup` keeps the directory.
 - When jj cannot snapshot all of it, `finish` releases the claim anyway, keeps the directory and its jj registration as they are, and exits `3`. The next `start` of that branch adopts the directory.
 - `finish` refuses (exit `2`) while another process on this machine has its working directory or an open file in the workspace (your own shell, harness and session processes do not count), while another identity holds the claim (except in the case below), and when the claim was taken on another host or agent box. After you check that nothing uses the workspace: `finish --force --why "<reason>"`. A forced release of another owner's claim leaves that workspace as it is.
 - When this fork's ledger says another owner took or released your own claim, `finish` says who, when and why, and exits `1`. If someone holds the branch now, it changes nothing on disk and offers `knives start <branch> --force --why "<reason>"`. If nobody does, it offers `knives start <branch>` and disposes of your workspace as any finish does (a refusal or failure there raises the exit to `2` or `3`). Neither offers `finish --force`, which would release the new holder's claim.
 - `--superseded-by <branch>` records where the work went.
-- `--why "<reason>"` is recorded on every `finish`, with `--force` or without: as the reason of the release, or, where no claim was held, in the entry's text.
 
 ### Locks
 
 - `start`, `finish`, `track`, `depends` and `sync` hold the fork's lock (`fork-locks/<owner>/<name>.lock` beside `state.json`) while they work. Another of them on the same fork waits up to one minute, with pauses from 20 ms doubling to 2 s, with jitter. A command on another fork does not wait. The `state.json` write takes `state.lock`, also with a one-minute wait. Sighting and hook-session locks wait one second, with pauses from 20 ms to 200 ms.
-- On a fork that shares its ledger, a claim change also takes `ledger.lock`, then the ledger git directory's `knives-transport.lock`, each with a one-minute wait. A write's send waits as long for `ledger.lock`.
 - Each lock is the OS advisory lock on its file and ends with its process, also on SIGKILL. Never remove a lock file: a held lock belongs to a running process.
 - When the wait runs out, the command exits `3`:
 

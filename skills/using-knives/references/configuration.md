@@ -15,7 +15,6 @@ Read this when a checkout does not bind or binds twice, before you register a fo
 - `series.<name>`: one `/`-free segment that is a valid git ref component and does not look like a date. Each series' base differs from every other base and from the default trunk, and is not under `release/`. Use `base_remote = "origin"` for a base pinned on the fork. A base that does not resolve makes every release verb exit `3`.
 - `forbidden`: case-insensitive substrings matched against lines a branch adds since its fork point with upstream trunk; `--fork-only` branches are exempt. Blank terms and case-insensitive duplicates are refused, also across `repos.local.toml`. Audit reports hits and never blocks.
 - `repos.local.toml` beside `repos.toml` holds only `forbidden` and `consumers` for entries `repos.toml` has. Its lists are appended to the entry's.
-- `ledger` (README, "Configuration") also puts the fork's claims on that repository, where they bind every machine that shares it and runs a knives that reads claim refs: [shared-claims.md](shared-claims.md).
 
 ## How a checkout is found
 
@@ -36,4 +35,4 @@ Read this when a checkout does not bind or binds twice, before you register a fo
 ## OpenCode plugin
 
 - Options, all default `true`: `notice`, `guidance`, `owner` (exports `KNIVES_OWNER` into shells) and `skills` (registers the bundled skills). Example: docs/design.md, "OpenCode configuration".
-- Once per repository per session it says the fork is managed and names the claims this machine's `state.json` holds. A fork entry alone gives only that notice; trusted repository instructions are appended as data.
+- Once per repository per session it says the fork is managed and names claims. A fork entry alone gives only that notice; trusted repository instructions are appended as data.
