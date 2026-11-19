@@ -824,8 +824,9 @@ fn is_unreleased_heading(line: &[u8]) -> bool {
 /// other blocks sit where the member's block ends. This says what such a
 /// replay means: a conflict every side of which only inserted, and whose
 /// member side the target holds as a whole run of its own lines, or holds as
-/// a union writes it where its lists joined another block's: its entries
-/// under the same `### ` heading inside the target's one `[Unreleased]`
+/// a union writes it where its lists joined another block's: the entries
+/// of each of its lists as one run of lines, in its order, under one list
+/// of the same `### ` heading inside the target's one `[Unreleased]`
 /// section ([`holds_joined`]), is the target carrying that block — the
 /// conflict is masked. The lines can be another member's or the target's
 /// own: no occurrence is counted. Lines in a released section count only as
