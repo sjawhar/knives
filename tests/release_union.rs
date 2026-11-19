@@ -785,3 +785,52 @@ fn a_first_cut_of_two_members_puts_their_entries_under_one_heading() {
     entries.sort_unstable();
     assert_eq!(entries, ["- Alpha's fix.", "- Beta's fix."], "{log}");
 }
+
+#[test]
+fn a_first_cut_of_three_members_puts_two_members_entries_under_one_heading() {
+    // Given: a trunk whose changelog's `[Unreleased]` section is empty;
+    // `feat/alpha` and `feat/beta` each add one entry under `### Fixed`
+    // there, and `feat/gamma` one under `### Added`.
+    let (trunk, alpha, beta, gamma) = (
+        with_unreleased(""),
+        with_unreleased("### Fixed\n\n- Alpha's fix.\n\n"),
+        with_unreleased("### Fixed\n\n- Beta's fix.\n\n"),
+        with_unreleased("### Added\n\n- Gamma's addition.\n\n"),
+    );
+    let lab = trunk_with(&[("CHANGELOG.md", trunk.as_str())]);
+    member(&lab, "feat/alpha", &[("CHANGELOG.md", alpha.as_str())]);
+    member(&lab, "feat/beta", &[("CHANGELOG.md", beta.as_str())]);
+    member(&lab, "feat/gamma", &[("CHANGELOG.md", gamma.as_str())]);
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: the release is cut of all three at once.
+    let cut = release_ok(&lab, &home, &["cut", RELEASE]);
+
+    // Then: no conflict is left, and `[Unreleased]` holds `### Fixed` once,
+    // with alpha's and beta's entries in its one list, and `### Added` once,
+    // with gamma's, each line unchanged. The order is not part of the rule.
+    assert_eq!(conflicts(&lab), Vec::<String>::new(), "{cut}");
+    let log = file_at_revision(&lab, RELEASE, "CHANGELOG.md");
+    let unreleased = log
+        .split_once("## [Unreleased]\n")
+        .and_then(|(_, rest)| rest.split_once("## [1.0.0]"))
+        .map(|(section, _)| section)
+        .expect("an [Unreleased] section before [1.0.0]");
+    assert_eq!(unreleased.matches("### Fixed\n").count(), 1, "{log}");
+    assert_eq!(unreleased.matches("### Added\n").count(), 1, "{log}");
+    let list = |heading: &str| {
+        let mut entries: Vec<&str> = unreleased
+            .split_once(&format!("{heading}\n\n"))
+            .map_or("", |(_, rest)| rest.split("\n\n").next().unwrap_or(""))
+            .lines()
+            .collect();
+        entries.sort_unstable();
+        entries
+    };
+    assert_eq!(
+        list("### Fixed"),
+        ["- Alpha's fix.", "- Beta's fix."],
+        "{log}"
+    );
+    assert_eq!(list("### Added"), ["- Gamma's addition."], "{log}");
+}
