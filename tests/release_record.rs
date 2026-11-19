@@ -28,13 +28,14 @@
 //! the adopt's commit, holds each named file to what its reference holds
 //! there, nothing included. The adopt event lists the files of its fix
 //! whole, so a path that holds a separator reads back whole; an older adopt
-//! event names them in its text alone, and a clone holds each path of up to
-//! 16 pieces that the text may name, however many files its list names. A
-//! record that lacks a file with no reference here is told to fetch the
-//! write where the walk for that reference stopped. A published name that
-//! the publish remote lacks is not recorded until it is pushed, and the
-//! refusal gives the commands. A printed command quotes the name for the
-//! shell.
+//! event names them in its text alone, and such a clone holds each path
+//! that a list of up to 16 pieces may name. A list of more pieces does not
+//! read whole there, so the record is refused, naming the adopt and its
+//! fetch, or recorded under `--allow-drop` with the drop stated. A record
+//! that lacks a file with no reference here is told to fetch the write
+//! where the walk for that reference stopped. A published name that the
+//! publish remote lacks is not recorded until it is pushed, and the refusal
+//! gives the commands. A printed command quotes the name for the shell.
 
 #![allow(
     clippy::expect_used,
@@ -4579,7 +4580,8 @@ fn a_clone_without_the_adopts_commit_holds_a_deleted_path_as_absent_until_a_writ
 }
 
 #[test]
-fn an_older_adopt_of_two_thousand_files_holds_each_of_them_in_a_clone_without_its_commit() {
+fn an_older_adopt_of_two_thousand_files_is_refused_in_a_clone_without_its_commit_and_goes_ahead_under_allow_drop()
+ {
     // Given: RELEASE fixed by hand with 2,000 new files and one whose path
     // joins 16 pieces with `, `, and adopted, its event as a knives from
     // before the `fix_files` list writes it, so its text alone names them,
@@ -4628,25 +4630,141 @@ fn an_older_adopt_of_two_thousand_files_holds_each_of_them_in_a_clone_without_it
         &["release/2026-08-06", "--at", commit.as_str()],
     );
 
-    // Then: it is refused, naming the adopt and each of its files, the path
-    // of 16 pieces whole among them, and nothing is written: the clone reads
-    // each run of up to 16 pieces of the list, and the newest recorded write
-    // holds each file.
+    // Then: it is refused, naming the adopt, its release and its commit, and
+    // the fetch of that commit, and nothing is written: a list of 2,016
+    // pieces may name a path of more than 16, which the text does not give,
+    // so the clone cannot read the fix's files whole, and it reads none of
+    // them.
     let out = text(&refused);
     assert_eq!(refused.status.code(), Some(3), "{out}");
     assert!(
         out.contains(&format!(
-            "demo: refusing to record release/2026-08-06 at {}: it does not carry the fix by hand \
-             of {RELEASE}'s adopt {adopt}, in 2001 file(s): {} (this repository does not hold \
-             {adopt}, so the fix is held by its content: what release/2026-08-05's newest \
-             recorded write (a cut) {} holds in those files)\n",
+            "demo: refusing to record release/2026-08-06 at {}: it cannot be held against the fix \
+             by hand of {RELEASE}'s adopt {adopt}: this repository does not hold {adopt}, and the \
+             adopt's event names the files of the fix in a list of more than 16 pieces, which \
+             this repository cannot read whole\n",
             commit.short(),
-            files.join(", "),
+            adopt = adopt.short()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "\n  nothing was recorded; fetch {RELEASE}'s recorded write {}, which this repository \
+             does not hold, then record a commit that carries that fix, or re-run with \
+             --allow-drop to state the drop is intended\n",
+            adopt.short()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains(files[0].as_str()), "{out}");
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+
+    // When: the same record runs with `--allow-drop`.
+    let allowed = cut_in_second_clone(
+        &lab,
+        &home,
+        &[
+            "release/2026-08-06",
+            "--at",
+            commit.as_str(),
+            "--allow-drop",
+        ],
+    );
+
+    // Then: it is recorded, and both its line and its event name the adopt
+    // that it was not held against, its release and its commit.
+    let out = text(&allowed);
+    assert_eq!(allowed.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: --allow-drop: recording release/2026-08-06 at {} without holding it against \
+             the fix by hand of {RELEASE}'s adopt {}, whose files this repository cannot read \
+             whole\n",
+            commit.short(),
+            adopt.short()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&recorded_line("release/2026-08-06", &commit)),
+        "{out}"
+    );
+    let event = newest_event(&home, "release/2026-08-06");
+    assert!(
+        event.text.contains(&format!(
+            "; all carried; not held against the fix by hand of {RELEASE}'s adopt {}, whose \
+             files this repository cannot read whole",
+            adopt.short()
+        )),
+        "{event:?}"
+    );
+}
+
+#[test]
+fn an_older_adopt_of_a_path_of_sixteen_pieces_holds_that_path_whole_in_a_clone_without_its_commit()
+{
+    // Given: RELEASE fixed by hand with one new file whose path joins 16
+    // pieces with `, `, as many as an older event's text reads whole, and
+    // adopted, its event as a knives from before the `fix_files` list writes
+    // it; the next release cut on it, which holds the file; a second clone
+    // that holds the next release and not the adopt's commit; and the third
+    // release merged by hand there, without the fix.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    let sixteen = (1..=16)
+        .map(|piece| format!("p{piece:02}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let adopt = fix_by_hand(
+        (&lab, &home),
+        RELEASE,
+        &[(sixteen.as_str(), Some("fixed by hand\n"))],
+        "a fix by hand",
+    );
+    without_fix_files(&home, RELEASE);
+    let next = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(matches!(next.status.code(), Some(0 | 1)), "{}", text(&next));
+    let next = commit_at(&lab, "release/2026-08-05");
+    for branch in ["feat/alpha", "feat/beta", "release/2026-08-05"] {
+        lab.push_branch(branch);
+    }
+    fetch_second_clone(&lab);
+    assert!(
+        !second_clone_holds(&lab, &adopt) && second_clone_holds(&lab, &next),
+        "the second clone holds the next release and not the adopt's commit"
+    );
+    let commit = hand_merge_in_second_clone(&lab, None);
+    let entries = ledger_entries(&home);
+
+    // When: it is recorded in the second clone.
+    let refused = cut_in_second_clone(
+        &lab,
+        &home,
+        &["release/2026-08-06", "--at", commit.as_str()],
+    );
+
+    // Then: it is refused, naming the adopt and that path whole, and nothing
+    // is written: a list of 16 pieces reads whole, so the clone holds each
+    // path that it may name, and the newest recorded write holds that one.
+    let out = text(&refused);
+    assert_eq!(refused.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "it does not carry the fix by hand of {RELEASE}'s adopt {adopt}, in 1 file(s): \
+             {sixteen} (this repository does not hold {adopt}, so the fix is held by its \
+             content: what release/2026-08-05's newest recorded write (a cut) {} holds in those \
+             files)\n",
             next.short(),
             adopt = adopt.short()
         )),
         "{out}"
     );
+    assert!(!out.contains("cannot read whole"), "{out}");
     assert_eq!(ledger_entries(&home), entries, "{out}");
 }
 

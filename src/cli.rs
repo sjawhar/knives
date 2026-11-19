@@ -545,8 +545,12 @@ pub enum ReleaseAction {
     /// adopt event that an older knives wrote names its files in its text
     /// alone; each path that its text may name is held where this
     /// repository cannot measure the adopt, and where it can, each such path
-    /// that the adopt's own tree holds. A repository that does not hold the
-    /// newest write is refused and told to fetch it.
+    /// that the adopt's own tree holds. Where this repository cannot measure
+    /// the adopt and a list of that text has more than 16 pieces, the list
+    /// does not read whole, and REV is refused, naming the adopt, and the
+    /// fetch of its commit where this repository does not hold it. A
+    /// repository that does not hold the newest write is refused and told to
+    /// fetch it.
     /// In a stacked series that write, a successor of it or a copy with its
     /// tree must be on its first-parent line. The ledger event records its
     /// members: in a stacked series the side parents on its first-parent
@@ -562,7 +566,8 @@ pub enum ReleaseAction {
         /// previous cut's ledger event or the newest recorded write of the
         /// newest release the ledger records in the series holds, a file of
         /// a fix by hand that an `adopt` of any release of the series
-        /// recorded and the file's reference still holds, the newest write
+        /// recorded and the file's reference still holds, a fix by hand
+        /// whose files this repository cannot read whole, the newest write
         /// itself where this repository does not hold it, or in a stacked
         /// series that write, off the line the cut starts on. The refusal
         /// lists exactly what, each file of a fix by name.

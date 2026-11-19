@@ -1415,7 +1415,8 @@ pub struct AdoptedFixFiles {
     /// ([`adopted_fix_files`]). A reader that measures the adopt holds only
     /// those of [`Self::files`] that the adopt's own tree holds, beside the
     /// files that its change changes; a reader that cannot measure it holds
-    /// each of them.
+    /// each of them, where the text reads whole
+    /// ([`adopted_fix_files_whole`]).
     pub from_text: bool,
 }
 
@@ -1423,44 +1424,53 @@ pub struct AdoptedFixFiles {
 /// the list at, and so what a path that holds one reads back cut at.
 const TEXT_SEPARATORS: [&str; 3] = [", ", "; ", " (why: "];
 
-/// The most pieces of a list in an `adopt` event's text that one path read
-/// back from it joins ([`text_paths`]). A path that holds up to 15
-/// separators reads back whole; a path that holds more is not read, as a
-/// path that a person names holds a few separators at most. The cap bounds
-/// the reading of a list of `n` pieces, which any peer's ledger may carry,
-/// to at most `16 * n` paths of at most 16 pieces each: every run of its
-/// pieces would be `n * (n + 1) / 2` paths, each up to the whole list long.
-const TEXT_PATH_PIECES: usize = 16;
+/// The most pieces that a path read from a list of an `adopt` event's text
+/// joins ([`text_paths`]), and that a list read whole has
+/// ([`adopted_fix_files_whole`]).
+///
+/// A path that holds up to 15 separators reads back whole; a path that
+/// holds more is not read, as a path that a person names holds a few
+/// separators at most. So a reader that measures the adopt reads its fix's
+/// files from its change, and a reader that cannot measure it cannot read a
+/// list of more pieces whole. The cap bounds the reading of a list of `n`
+/// pieces, which any peer's ledger may carry, to at most `16 * n` paths of
+/// at most 16 pieces each: every run of its pieces would be
+/// `n * (n + 1) / 2` paths, each up to the whole list long.
+pub const TEXT_PATH_PIECES: usize = 16;
 
 /// Where each piece of `list`, one list of files in an `adopt` event's
-/// text, begins and ends: the text cuts it at each separator
+/// text, begins and ends, in order: the text cuts it at each separator
 /// ([`TEXT_SEPARATORS`]), the first one after each piece. Each separator
 /// is searched for again only once the pieces have passed its last match,
 /// so the list is read once for each separator.
-fn text_pieces(list: &str) -> Vec<(usize, usize)> {
-    let find = |separator: &str, from: usize| {
+fn text_pieces(list: &str) -> impl Iterator<Item = (usize, usize)> {
+    let find = move |separator: &str, from: usize| {
         list.get(from..)
             .and_then(|rest| rest.find(separator))
             .map(|offset| from + offset)
     };
     let mut next = TEXT_SEPARATORS.map(|separator| find(separator, 0));
-    let (mut pieces, mut start) = (Vec::new(), 0);
-    while let Some((end, length)) = TEXT_SEPARATORS
-        .iter()
-        .zip(next)
-        .filter_map(|(separator, at)| Some((at?, separator.len())))
-        .min_by_key(|(at, _)| *at)
-    {
-        pieces.push((start, end));
-        start = end + length;
+    let mut start = Some(0);
+    std::iter::from_fn(move || {
+        let from = start?;
+        let Some((end, length)) = TEXT_SEPARATORS
+            .iter()
+            .zip(next)
+            .filter_map(|(separator, at)| Some((at?, separator.len())))
+            .min_by_key(|(at, _)| *at)
+        else {
+            start = None;
+            return Some((from, list.len()));
+        };
+        let after = end + length;
+        start = Some(after);
         for (found, separator) in next.iter_mut().zip(TEXT_SEPARATORS) {
-            if found.is_some_and(|at| at < start) {
-                *found = find(separator, start);
+            if found.is_some_and(|at| at < after) {
+                *found = find(separator, after);
             }
         }
-    }
-    pieces.push((start, list.len()));
-    pieces
+        Some((from, end))
+    })
 }
 
 /// Every path that `lists`, the lists of files in an `adopt` event's text,
@@ -1472,7 +1482,7 @@ fn text_pieces(list: &str) -> Vec<(usize, usize)> {
 fn text_paths<'a>(lists: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     let (mut paths, mut named) = (Vec::new(), HashSet::new());
     for list in lists {
-        let pieces = text_pieces(list);
+        let pieces: Vec<(usize, usize)> = text_pieces(list).collect();
         for (piece, (start, _)) in pieces.iter().enumerate() {
             for (_, end) in pieces.iter().skip(piece).take(TEXT_PATH_PIECES) {
                 if let Some(path) = list.get(*start..*end)
@@ -1509,7 +1519,8 @@ fn text_paths<'a>(lists: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
 /// path of at most [`TEXT_PATH_PIECES`] pieces that it may name
 /// ([`text_paths`]). So the text names no file resolved by hand whose path
 /// holds one of those parts that ends its list, and no path of more pieces;
-/// the `fix_files` list has neither limit.
+/// a list of more pieces does not read whole ([`adopted_fix_files_whole`]).
+/// The `fix_files` list has neither limit.
 pub fn adopted_fix_files(entry: &Entry, release: &str) -> AdoptedFixFiles {
     let Some((_, parts)) = adopted_fix_parts(entry, release) else {
         return AdoptedFixFiles::default();
@@ -1526,6 +1537,50 @@ pub fn adopted_fix_files(entry: &Entry, release: &str) -> AdoptedFixFiles {
             from_text: false,
         };
     }
+    let (resolved, beyond) = text_lists(parts);
+    AdoptedFixFiles {
+        files: text_paths(std::iter::once(resolved).chain(beyond))
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        from_text: true,
+    }
+}
+
+/// Whether a reader that cannot measure the adopt that `entry`, an `adopt`
+/// event of `release`, records reads the files of its fix whole
+/// ([`adopted_fix_files`]).
+///
+/// An event with its `fix_files` list names each file whole, and an event
+/// that records no fix names none. An event without the list, as an older
+/// knives writes it, reads whole where each list of its text has at most
+/// [`TEXT_PATH_PIECES`] pieces ([`text_pieces`]): every path such a list
+/// may name is then one that the text gives. A list of more pieces may name
+/// a path of more pieces, which the text does not give, so such a reader
+/// cannot tell what the fix holds.
+pub fn adopted_fix_files_whole(entry: &Entry, release: &str) -> bool {
+    let Some((_, parts)) = adopted_fix_parts(entry, release) else {
+        return true;
+    };
+    if !entry.fix_files.is_empty() {
+        return true;
+    }
+    let (resolved, beyond) = text_lists(parts);
+    std::iter::once(resolved)
+        .chain(beyond)
+        .all(|list| text_pieces(list).nth(TEXT_PATH_PIECES).is_none())
+}
+
+/// The lists of files that `parts`, an `adopt` event's parts after its
+/// baseline ([`adopted_fix_parts`]), name in its text: the files resolved
+/// by hand, empty where it resolved none, then the files changed beyond the
+/// baseline's conflicts, where it changed any. Its parents come last, after
+/// `; parents: `. The resolved list ends where the other list begins, at
+/// the first `; changed beyond the baseline's conflicts: `, or, where no
+/// other list follows, at the next part that knives writes
+/// ([`resolved_list`]). The other list ends where its reason begins, at its
+/// last ` (why: `, or else at the next `; ` ([`adopted_fix_files`]).
+fn text_lists(parts: &str) -> (&str, Option<&str>) {
     let parts = parts
         .rsplit_once("; parents: ")
         .map_or(parts, |(parts, _)| parts);
@@ -1545,13 +1600,7 @@ pub fn adopted_fix_files(entry: &Entry, release: &str) -> AdoptedFixFiles {
             .or_else(|| beyond.split_once("; "))
             .map_or(beyond, |(list, _)| list)
     });
-    AdoptedFixFiles {
-        files: text_paths(std::iter::once(resolved).chain(beyond))
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-        from_text: true,
-    }
+    (resolved, beyond)
 }
 
 /// The resolved list of an `adopt` event's text that no other list
@@ -2637,8 +2686,8 @@ mod adopted_fix_tests {
     use std::collections::HashSet;
 
     use super::{
-        AdoptedFixFiles, CommitId, TEXT_PATH_PIECES, adopted_fix_files, adopted_fix_replaces,
-        carrier_tests::event,
+        AdoptedFixFiles, CommitId, TEXT_PATH_PIECES, adopted_fix_files, adopted_fix_files_whole,
+        adopted_fix_replaces, carrier_tests::event,
     };
     use crate::ledger::{Entry, FixChange, FixFile};
 
@@ -2790,6 +2839,73 @@ mod adopted_fix_tests {
             assert!(read.contains(file.as_str()), "{file}");
         }
         assert!(!read.contains(seventeen.as_str()));
+    }
+
+    #[test]
+    fn an_older_adopt_event_reads_whole_only_where_each_list_has_at_most_sixteen_pieces() {
+        // Given: adopts whose text names a list of 16 pieces or a list of
+        // 17, as the files resolved by hand or as those changed beyond the
+        // baseline's conflicts, as a knives from before the `fix_files` list
+        // writes them; a reason that holds 17 pieces after a list of 16; and
+        // an adopt that changed no file.
+        let joined = |pieces: usize| {
+            (1..=pieces)
+                .map(|piece| format!("p{piece:02}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let (sixteen, seventeen) = (joined(16), joined(17));
+        let cases = [
+            (format!("resolved by hand: {sixteen}"), true),
+            (
+                format!(
+                    "resolved by hand: {sixteen}; changed beyond the baseline's conflicts: \
+                     {sixteen} (why: {seventeen})"
+                ),
+                true,
+            ),
+            (format!("resolved by hand: {seventeen}"), false),
+            (
+                format!(
+                    "resolved by hand: a.txt; changed beyond the baseline's conflicts: \
+                     {seventeen} (why: a fix)"
+                ),
+                false,
+            ),
+            ("why: nothing changed".to_owned(), true),
+        ];
+
+        for (parts, whole) in cases {
+            let entry = adopted(&parts);
+
+            // When: a reader asks whether the event reads whole.
+            // Then: it does exactly where no list of files has more than 16
+            // pieces, whatever its reason holds; a list of 16 pieces reads
+            // whole, and its files are read, the path of 16 pieces among them.
+            assert_eq!(
+                adopted_fix_files_whole(&entry, "integration"),
+                whole,
+                "{parts}"
+            );
+            if whole && parts.contains(&sixteen) {
+                assert!(
+                    adopted_fix_files(&entry, "integration")
+                        .files
+                        .contains(&sixteen),
+                    "{parts}"
+                );
+            }
+        }
+
+        // And: an event with its `fix_files` list reads whole at any length.
+        let listed = Entry {
+            fix_files: vec![FixFile {
+                path: seventeen.clone(),
+                change: FixChange::Resolved,
+            }],
+            ..adopted(&format!("resolved by hand: {seventeen}"))
+        };
+        assert!(adopted_fix_files_whole(&listed, "integration"));
     }
 }
 
