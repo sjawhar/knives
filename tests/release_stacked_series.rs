@@ -1586,3 +1586,64 @@ fn a_member_that_changes_a_file_an_adopt_added_is_refused_until_an_adopt_keeps_i
     );
     assert!(!out.contains(&format!("adopt {}", kept.short())), "{out}");
 }
+
+#[test]
+fn a_stacked_record_that_resolves_an_advance_conflict_against_an_adopted_fix_is_refused() {
+    // Given: the next release cut on the published previous release, with
+    // `m6` included; NEXT fixed by hand in place, a.txt changed, and adopted;
+    // then `m6` changes a.txt as well, and `advance` writes NEXT with a.txt
+    // conflicted; and the third release merged by hand of NEXT and `m5`,
+    // which resolves a.txt to `m6`'s content, without the fix.
+    let (lab, home) = previous_release_lab(true);
+    release_ok(&lab, &home, &["cut", NEXT]);
+    release_ok(&lab, &home, &["include", "m6"]);
+    lab.jj_work(["new", "-r", NEXT]);
+    std::fs::write(lab.work_path().join("a.txt"), "fixed by hand\n").expect("write the fix");
+    lab.jj_work(["squash", "--into", NEXT]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    release_ok(&lab, &home, &["adopt", NEXT, "--why", "a fix by hand"]);
+    let adopt = commit_at(&lab, NEXT);
+    extend_branch(&lab, "m6", "a.txt", "m6\n");
+    let advanced = knives_release(&lab, &home, &["--series", "old", "advance", "m6"]);
+    assert!(
+        matches!(advanced.status.code(), Some(0 | 1)),
+        "{}",
+        text(&advanced)
+    );
+    let conflicted = commit_at(&lab, NEXT);
+    lab.jj_work([
+        "new",
+        "-r",
+        conflicted.as_str(),
+        "-r",
+        "m5",
+        "-m",
+        "the third release, merged by hand",
+    ]);
+    std::fs::write(lab.work_path().join("a.txt"), "m6\n").expect("resolve a.txt to m6's");
+    lab.jj_work(["new"]);
+    let commit = knives::ids::CommitId::new(lab.jj_work_output([
+        "log",
+        "-r",
+        "@-",
+        "--no-graph",
+        "-T",
+        "commit_id",
+    ]));
+    let entries = ledger_entries(&home).len();
+
+    // When: it is recorded.
+    let recorded = knives_release(
+        &lab,
+        &home,
+        &["--series", "old", "cut", THIRD, "--at", commit.as_str()],
+    );
+
+    // Then: it is refused, naming the adopt whose fix it drops, and nothing
+    // is written: a write that left the fixed file conflicted did not remove
+    // the fix, so the hold on it stands until an adopt states otherwise.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert!(out.contains(adopt.short()), "{out}");
+    assert_eq!(ledger_entries(&home).len(), entries, "{out}");
+}
