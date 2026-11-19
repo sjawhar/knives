@@ -9,7 +9,7 @@
 //! as their union, and refuses while the release in hand carries a change
 //! knives did not write or adopt, printing the steps that record it. Every one
 //! of them writes locally only, and none of them pushes.
-// allow: SIZE_OK: 5387 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
+// allow: SIZE_OK: 5388 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -4115,8 +4115,9 @@ impl FixReferences<'_> {
 /// than [`crate::release_model::TEXT_PATH_PIECES`] pieces, so it may name a
 /// path of more pieces, which the text does not give. The fix is then held
 /// at no file, no path of the text is read for it, and the gate refuses
-/// every subject, naming the adopt, and its fetch where this repository
-/// does not hold it ([`fix_findings`]). The `fix_files` list of a newer
+/// every subject, naming the adopt and, where origin or the publish remote
+/// has a branch or tag at it, its fetch, else `--allow-drop` alone (the
+/// binary's `release_cut::fix_remedy`). The `fix_files` list of a newer
 /// event reads whole. A string that is no repository path, as a peer's
 /// ledger may carry, is no file of the fix ([`jj::is_repository_path`]).
 fn adopted_fix(
