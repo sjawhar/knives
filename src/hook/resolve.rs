@@ -202,14 +202,10 @@ fn canonical_existing_parent(path: &Path) -> Option<PathBuf> {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use crate::config::{Registry, RepoEntry, TrustRules};
+    use crate::config::{Registry, RepoEntry, TrustRules, test_support::environment_lock};
     use crate::ids::{RepoName, UpstreamName};
 
     use super::{Managed, argument_paths, match_checkout};
-    // Every test that resolves a path in a repository runs git, so it holds
-    // the environment lock for its whole body: a test that swaps `PATH` or
-    // git's config while it runs would otherwise hand its git to these.
-    use crate::config::test_support::environment_lock;
 
     fn registry(entries: &[(&str, &str)], trust: TrustRules) -> Registry {
         Registry {

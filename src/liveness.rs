@@ -248,8 +248,6 @@ mod tests {
 
     #[test]
     fn a_child_inside_the_directory_is_a_live_user() {
-        // `sleep` is found through `PATH`, which another test may hold at a
-        // directory of its own fakes while it runs.
         let _lock = crate::config::test_support::environment_lock();
         let directory = tempfile::tempdir().expect("tempdir");
         let mut child = std::process::Command::new("sleep")

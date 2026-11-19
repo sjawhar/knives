@@ -2484,10 +2484,7 @@ mod tests {
         assert_eq!(texts, wanted);
     }
 
-    /// A scribe for a checkout that is no repository. Its writes run git for
-    /// the writer's email, so a test that writes through one holds the
-    /// environment lock for its whole body: a test that swaps `PATH` or git's
-    /// config while it runs would otherwise hand its git to that one.
+    /// A scribe for a checkout that is no repository; its writes run git for the writer's email.
     fn scribe(dir: &std::path::Path) -> Scribe {
         Scribe::new(
             Ledger::at(dir.join("ledger").join("a-repo")),

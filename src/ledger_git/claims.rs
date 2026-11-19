@@ -687,14 +687,16 @@ mod tests {
         clippy::indexing_slicing,
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
+    #![allow(
+        clippy::significant_drop_tightening,
+        reason = "a lab holds the environment lock to the end of its test, past its last use"
+    )]
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
 
     use super::*;
-    // Every test that names a claim ref or makes a lab runs git, so it holds
-    // the environment lock for its whole body: a test that swaps `PATH` or
-    // git's config while it runs would otherwise hand its git to these.
+    // `ClaimRef::new` runs `git check-ref-format`, so naming a claim ref spawns git.
     use crate::config::test_support::environment_lock;
 
     const FORK: &str = "example/fork";
@@ -770,18 +772,25 @@ mod tests {
     }
 
     /// A scratch directory holding the ledger's remote, `remote.git`, and
-    /// each machine's git directory.
+    /// each machine's git directory. It holds the environment lock until it
+    /// drops.
     struct Lab {
         dir: tempfile::TempDir,
         remote: PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Lab {
         fn new() -> Self {
+            let lock = environment_lock();
             let dir = tempfile::tempdir().unwrap();
             let remote = dir.path().join("remote.git");
             init_bare(&remote);
-            Self { dir, remote }
+            Self {
+                dir,
+                remote,
+                _lock: lock,
+            }
         }
 
         /// A machine's ledger git directory, whose `origin` is the remote.
@@ -1021,7 +1030,6 @@ mod tests {
 
     #[test]
     fn a_claim_commit_has_no_parent_and_holds_only_its_record_by_its_machine() {
-        let _lock = environment_lock();
         // Given: machine one's claim record.
         let lab = Lab::new();
         let one = lab.machine("one");
@@ -1068,7 +1076,6 @@ mod tests {
 
     #[test]
     fn a_claim_ref_the_remote_lacks_reads_as_no_claim() {
-        let _lock = environment_lock();
         let lab = Lab::new();
         let one = lab.machine("one");
         assert_eq!(read_claim(&one, "origin", &claim_ref()).unwrap(), None);
@@ -1076,7 +1083,6 @@ mod tests {
 
     #[test]
     fn a_claim_read_brings_its_record_and_objects_and_writes_no_local_ref() {
-        let _lock = environment_lock();
         // Given: machine two's claim on the remote, and machine one's git
         // directory configured to copy every remote ref it fetches.
         let lab = Lab::new();
@@ -1117,7 +1123,6 @@ mod tests {
 
     #[test]
     fn a_claim_whose_record_is_not_toml_is_still_a_claim_with_the_reason() {
-        let _lock = environment_lock();
         // Given: a claim commit on the remote whose `claim.toml` is not TOML.
         let lab = Lab::new();
         let blob = git_in(
@@ -1148,7 +1153,6 @@ mod tests {
 
     #[test]
     fn a_take_lands_the_claim_and_the_machine_ref_together() {
-        let _lock = environment_lock();
         // Given: no claim on the remote, and machine one's ref moved to N.
         let lab = Lab::new();
         let one = lab.machine("one");
@@ -1167,7 +1171,6 @@ mod tests {
 
     #[test]
     fn a_take_of_a_claim_another_machine_holds_is_refused_and_changes_nothing() {
-        let _lock = environment_lock();
         // Given: machine two's claim on the remote.
         let lab = Lab::new();
         let theirs = lab.held(&record("machine-two", "owner-two", ENTRY_TWO));
@@ -1193,7 +1196,6 @@ mod tests {
 
     #[test]
     fn a_seize_leasing_on_the_claim_it_read_lands() {
-        let _lock = environment_lock();
         // Given: machine two's claim, as machine one read it.
         let lab = Lab::new();
         let theirs = lab.held(&record("machine-two", "owner-two", ENTRY_TWO));
@@ -1214,7 +1216,6 @@ mod tests {
 
     #[test]
     fn a_seize_whose_lease_is_stale_is_refused() {
-        let _lock = environment_lock();
         // Given: machine two's claim, and a lease on another commit.
         let lab = Lab::new();
         let theirs = lab.held(&record("machine-two", "owner-two", ENTRY_TWO));
@@ -1238,7 +1239,6 @@ mod tests {
 
     #[test]
     fn a_release_leasing_on_the_claim_deletes_it() {
-        let _lock = environment_lock();
         // Given: machine one's landed claim.
         let lab = Lab::new();
         let one = lab.machine("one");
@@ -1259,7 +1259,6 @@ mod tests {
 
     #[test]
     fn a_machine_ref_the_remote_holds_at_another_commit_refuses_the_push() {
-        let _lock = environment_lock();
         // Given: the remote's machine-one ref at a commit another machine
         // made under the same name.
         let lab = Lab::new();
@@ -1281,7 +1280,6 @@ mod tests {
 
     #[test]
     fn a_push_the_remote_applied_before_it_hung_up_is_landed() {
-        let _lock = environment_lock();
         // Given: a remote that ends receive-pack after it updated the refs, so
         // a push there fails on the client although it landed.
         let lab = Lab::new();
@@ -1312,7 +1310,6 @@ mod tests {
 
     #[test]
     fn a_push_the_remote_dropped_before_any_update_is_never_landed() {
-        let _lock = environment_lock();
         // Given: a remote that ends receive-pack before it updates anything.
         let lab = Lab::new();
         lab.hook("pre-receive", "#!/bin/sh\nkill -9 \"$PPID\"\n");
@@ -1344,7 +1341,6 @@ mod tests {
 
     #[test]
     fn a_refused_push_moves_the_machine_ref_back_to_what_it_held() {
-        let _lock = environment_lock();
         // Given: machine one's ref moved from P to N.
         let lab = Lab::new();
         let one = lab.machine("one");
@@ -1360,7 +1356,6 @@ mod tests {
 
     #[test]
     fn a_machine_ref_that_did_not_exist_before_is_deleted_again() {
-        let _lock = environment_lock();
         let lab = Lab::new();
         let one = lab.machine("one");
         let (before, after) = commit_entries(&one, "entry one");
@@ -1373,7 +1368,6 @@ mod tests {
 
     #[test]
     fn a_machine_ref_that_moved_meanwhile_is_left_alone_and_the_move_back_fails() {
-        let _lock = environment_lock();
         // Given: machine one's ref moved from P to N, then on to another commit.
         let lab = Lab::new();
         let one = lab.machine("one");

@@ -546,9 +546,6 @@ fn remove_if_present(path: PathBuf) -> Result<(), SweepError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Every test here runs git, so each holds the environment lock for its
-    // whole body: a test that swaps `PATH` or git's config while it runs
-    // would otherwise hand its git to these.
     use crate::config::test_support::environment_lock;
 
     fn git(git_dir: &Path, args: &[&str]) {

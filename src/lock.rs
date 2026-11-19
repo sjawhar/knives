@@ -351,13 +351,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_lock_held_by_a_killed_process_is_free_at_once() {
+        use std::io::BufRead as _;
+        let _environment = crate::config::test_support::environment_lock();
         // Given: another process holds the lock and is killed with SIGKILL, so
         // nothing of its own runs at exit.
-        use std::io::BufRead as _;
-        // It starts a process, so it holds the environment lock as every test
-        // that does: until that child execs it holds every file this process
-        // has open, which a test that counts their holders would see.
-        let _lock = crate::config::test_support::environment_lock();
         let dir = tempfile::tempdir().expect("state dir");
         let path = dir.path().join("state.json");
         let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
@@ -435,19 +432,22 @@ mod tests {
 
     #[test]
     fn trying_a_held_lock_answers_at_once_and_a_free_one_is_taken() {
-        // Given: a lock this thread took with a try and holds to the end of
-        // the test, so a try that waited for its release would never return.
+        // A child another test starts holds a copy of the lock until it execs.
+        let _environment = crate::config::test_support::environment_lock();
+        // Given: a lock this thread took with a try, so a try that waited for
+        // its release would never return.
         let dir = tempfile::tempdir().expect("state dir");
         let path = dir.path().join("ledger");
-        let _held = FileLock::try_acquire(&path)
+        let held = FileLock::try_acquire(&path)
             .expect("try")
             .expect("a free lock is taken");
 
-        // When / Then: a try of the held lock answers that it is held, and a
-        // try of a free lock beside it takes that one.
+        // When / Then: a try of it answers that it is held.
         assert!(FileLock::try_acquire(&path).expect("try").is_none());
-        let free = dir.path().join("state.json");
-        assert!(FileLock::try_acquire(&free).expect("try").is_some());
+
+        // When / Then: once it is let go, a try takes it.
+        drop(held);
+        assert!(FileLock::try_acquire(&path).expect("try").is_some());
     }
 
     #[test]

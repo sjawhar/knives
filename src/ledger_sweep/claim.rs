@@ -379,6 +379,10 @@ fn roll_back(destination: &Destination, moved: Option<&Moved>, path: &Path) -> V
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::significant_drop_tightening,
+        reason = "a lab holds the environment lock to the end of its test, past its last use"
+    )]
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
@@ -388,10 +392,6 @@ mod tests {
     use crate::ledger_sweep::lab::{self, FORK, at, git};
     use crate::ledger_sweep::shared_fork;
     use crate::store::OwnerKind;
-    // Every test here runs git, so each holds the environment lock for its
-    // whole body: a test that swaps `PATH` or git's config while it runs
-    // would otherwise hand its git to these.
-    use crate::config::test_support::environment_lock;
 
     const MACHINE: &str = "refs/knives/machine-one";
 
@@ -430,12 +430,14 @@ mod tests {
     }
 
     /// The machine of [`lab::Lab`], sharing [`FORK`]'s ledger, and the
-    /// destination that carries the fork there.
+    /// destination that carries the fork there. It keeps the lab's hold on
+    /// the environment lock until it drops.
     struct Lab {
         home: tempfile::TempDir,
         root: PathBuf,
         remote: PathBuf,
         shared: SharedFork,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Lab {
@@ -445,6 +447,7 @@ mod tests {
                 root,
                 remote,
                 registry,
+                _lock: lock,
                 ..
             } = lab::Lab::new();
             let shared = shared_fork(&root, &registry, &UpstreamName::new(FORK))
@@ -455,6 +458,7 @@ mod tests {
                 root,
                 remote,
                 shared,
+                _lock: lock,
             }
         }
 
@@ -556,7 +560,6 @@ mod tests {
 
     #[test]
     fn a_take_that_lands_puts_the_claim_and_its_entry_on_the_remote() {
-        let _lock = environment_lock();
         // Given: a machine sharing the fork's ledger, and no claim.
         let lab = Lab::new();
         let claim = claim_of("feat/a");
@@ -601,7 +604,6 @@ mod tests {
 
     #[test]
     fn a_take_that_loses_to_a_claim_already_there_puts_everything_back() {
-        let _lock = environment_lock();
         // Given: this machine's ref on the remote at P, and another machine's
         // claim of the branch.
         let lab = Lab::new();
@@ -635,7 +637,6 @@ mod tests {
 
     #[test]
     fn a_machine_ref_this_checkout_never_committed_is_refused_and_the_entry_goes() {
-        let _lock = environment_lock();
         // Given: the remote holding machine one's ref from another checkout,
         // which this one has fetched and never committed as.
         let lab = Lab::new();
@@ -680,7 +681,6 @@ mod tests {
 
     #[test]
     fn a_seize_leased_on_the_claim_it_read_lands() {
-        let _lock = environment_lock();
         // Given: another machine's claim, as this machine read it.
         let lab = Lab::new();
         let claim = claim_of("feat/a");
@@ -713,7 +713,6 @@ mod tests {
 
     #[test]
     fn a_release_leased_on_the_claim_deletes_it_with_its_entry_sent() {
-        let _lock = environment_lock();
         // Given: this machine's landed claim.
         let lab = Lab::new();
         let claim = claim_of("feat/a");
@@ -736,7 +735,6 @@ mod tests {
 
     #[test]
     fn a_release_whose_lease_is_stale_removes_nothing_and_puts_everything_back() {
-        let _lock = environment_lock();
         // Given: this machine's landed claim, which another machine has since
         // seized.
         let lab = Lab::new();
@@ -768,7 +766,6 @@ mod tests {
 
     #[test]
     fn a_push_whose_outcome_is_unknown_keeps_the_commit_and_the_entry() {
-        let _lock = environment_lock();
         // Given: a remote whose receive-pack advertises its refs, takes the
         // commands and ends before it applies any.
         let lab = Lab::new();
@@ -824,7 +821,6 @@ mod tests {
 
     #[test]
     fn a_change_leaves_an_unreadable_entry_of_this_machine_out_and_says_so() {
-        let _lock = environment_lock();
         // Given: an entry file of this machine's that does not parse.
         let lab = Lab::new();
         let broken = lab
@@ -860,7 +856,6 @@ mod tests {
 
     #[test]
     fn a_read_finds_no_claim_a_claim_or_a_claim_whose_record_does_not_read() {
-        let _lock = environment_lock();
         let lab = Lab::new();
         let claim = claim_of("feat/a");
 
@@ -905,7 +900,6 @@ mod tests {
 
     #[test]
     fn a_read_that_fails_says_what_git_said() {
-        let _lock = environment_lock();
         // Given: a ledger remote that is gone.
         let lab = Lab::new();
         std::fs::remove_dir_all(&lab.remote).unwrap();

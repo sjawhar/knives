@@ -61,7 +61,9 @@ pub(super) fn at(git_dir: &Path, reference: &str) -> Option<CommitId> {
 
 /// A machine sharing [`FORK`]'s ledger with acme/ledger through a git
 /// directory in `ledger-repositories`, committing as `machine-one`, and
-/// the bare remote git reaches as [`LEDGER_URL`].
+/// the bare remote git reaches as [`LEDGER_URL`]. It holds the
+/// [environment lock](crate::config::test_support::environment_lock) until
+/// it drops.
 #[derive(Debug)]
 pub(super) struct Lab {
     pub(super) home: tempfile::TempDir,
@@ -69,10 +71,12 @@ pub(super) struct Lab {
     pub(super) remote: PathBuf,
     pub(super) git_dir: PathBuf,
     pub(super) registry: Registry,
+    pub(super) _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Lab {
     pub(super) fn new() -> Self {
+        let lock = crate::config::test_support::environment_lock();
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("ledger");
         let registry = home.path().join("repos.toml");
@@ -104,6 +108,7 @@ impl Lab {
             remote,
             git_dir,
             registry,
+            _lock: lock,
         }
     }
 }
