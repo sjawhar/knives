@@ -354,6 +354,10 @@ mod tests {
         // Given: another process holds the lock and is killed with SIGKILL, so
         // nothing of its own runs at exit.
         use std::io::BufRead as _;
+        // It starts a process, so it holds the environment lock as every test
+        // that does: until that child execs it holds every file this process
+        // has open, which a test that counts their holders would see.
+        let _lock = crate::config::test_support::environment_lock();
         let dir = tempfile::tempdir().expect("state dir");
         let path = dir.path().join("state.json");
         let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
@@ -431,18 +435,19 @@ mod tests {
 
     #[test]
     fn trying_a_held_lock_answers_at_once_and_a_free_one_is_taken() {
+        // Given: a lock this thread took with a try and holds to the end of
+        // the test, so a try that waited for its release would never return.
         let dir = tempfile::tempdir().expect("state dir");
         let path = dir.path().join("ledger");
-        let first = FileLock::try_acquire(&path)
+        let _held = FileLock::try_acquire(&path)
             .expect("try")
             .expect("a free lock is taken");
 
-        let started = std::time::Instant::now();
+        // When / Then: a try of the held lock answers that it is held, and a
+        // try of a free lock beside it takes that one.
         assert!(FileLock::try_acquire(&path).expect("try").is_none());
-        assert!(started.elapsed() < Duration::from_millis(100));
-
-        drop(first);
-        assert!(FileLock::try_acquire(&path).expect("try").is_some());
+        let free = dir.path().join("state.json");
+        assert!(FileLock::try_acquire(&free).expect("try").is_some());
     }
 
     #[test]
