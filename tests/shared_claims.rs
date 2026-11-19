@@ -8,14 +8,16 @@
 //! Machine one's checkout is the lab's own; machine two clones the lab's
 //! fork into a scan root of its own. Both run in this place (one host, one
 //! process namespace), so only their names on the ledger tell them apart,
-//! and every owner is named by `KNIVES_OWNER`.
+//! and every owner is named by `KNIVES_OWNER`, but in the test of an Oh My
+//! Pi session, named by `PI_SESSION_ID`.
 //!
 //! Every test here drives the `knives` binary, raw git and
 //! `tests/common/lab.rs` alone, so this file also runs, unchanged, against
 //! the release before claims were shared, where by design:
 //!
 //! - these fail, each proving its requirement:
-//!   R1 `start_refuses_a_branch_another_machine_holds`;
+//!   R1 `start_refuses_a_branch_another_machine_holds`,
+//!   `a_pi_session_holds_its_claim_against_another_and_resumes_it_from_a_new_config_home`;
 //!   R2 `a_start_that_read_no_claim_loses_to_a_machine_that_took_it_before_its_push`,
 //!   `two_machines_starting_one_branch_at_once_leave_one_holder`;
 //!   R3 `every_write_on_a_shared_fork_is_on_the_ledger_when_it_exits`,
@@ -404,6 +406,17 @@ impl Machine {
     /// completion, whatever it comes to.
     fn tried(&self, owner: &str, args: &[&str]) -> Output {
         self.command(owner, args).output().expect("run knives")
+    }
+
+    /// `knives <args>` from this machine's checkout in the Oh My Pi session
+    /// `session`, which names itself by `PI_SESSION_ID` alone, as builds
+    /// that set no `OMP_SESSION_ID` do; run to completion, whatever it
+    /// comes to.
+    fn tried_in_pi_session(&self, session: &str, args: &[&str]) -> Output {
+        lab::knives_command(&self.checkout, self.home.path(), &self.scan, args)
+            .env("PI_SESSION_ID", session)
+            .output()
+            .expect("run knives")
     }
 
     /// [`Self::tried`], which must succeed.
@@ -832,6 +845,72 @@ fn start_refuses_a_branch_another_machine_holds() {
         shared.claim(BRANCH).map(|held| held.commit),
         Some(taken.commit)
     );
+}
+
+#[test]
+fn a_pi_session_holds_its_claim_against_another_and_resumes_it_from_a_new_config_home() {
+    // Given: machine one and machine two sharing the ledger, each shell in
+    // an Oh My Pi session named by `PI_SESSION_ID` alone.
+    let shared = Shared::new();
+    let two = shared.two();
+    let start = ["--text", "start", BRANCH, "--repo", "demo"];
+
+    // When: session one starts the branch on machine one.
+    let taken = shared
+        .one
+        .tried_in_pi_session("session-one", &[&start[..], &["--why", "port it"]].concat());
+
+    // Then: it takes the branch, and the ledger's claim is held by session
+    // one, a harness session, on machine one.
+    assert!(taken.status.success(), "{}", stderr_of(&taken));
+    let held = shared.claim(BRANCH).expect("the claim landed");
+    assert_eq!(held.get("owner"), "session-one");
+    assert_eq!(held.get("kind"), "harness-session");
+    assert_eq!(held.get("machine"), "machine-one");
+
+    // When: session two starts the branch on machine one, and then on
+    // machine two.
+    let here = shared.one.tried_in_pi_session("session-two", &start);
+    let there = two.tried_in_pi_session("session-two", &start);
+
+    // Then: each is refused naming session one as the holder, a harness
+    // session, on machine one, and the claim stands.
+    for refused in [&here, &there] {
+        let stderr = stderr_of(refused);
+        assert_eq!(refused.status.code(), Some(2), "{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "{FORK}/{BRANCH} is claimed by session-one (harness-session) on machine \
+                 machine-one, "
+            )),
+            "{stderr}"
+        );
+    }
+    assert_eq!(two.claim(BRANCH), Value::Null);
+    assert_eq!(
+        shared.claim(BRANCH).map(|claim| claim.commit),
+        Some(held.commit.clone())
+    );
+
+    // When: machine one's config home is gone, and session one, resumed in
+    // a new config home under the same machine name, its ref restored from
+    // the remote, starts the branch again without `--force`.
+    std::fs::remove_dir_all(shared.one.home.path()).expect("remove machine one's config home");
+    let fresh = shared.fresh("machine-one");
+    let resumed = fresh.tried_in_pi_session("session-one", &start);
+
+    // Then: it resumes session one's claim, and the new config home holds a
+    // copy of it at the same claim commit.
+    assert!(resumed.status.success(), "{}", stderr_of(&resumed));
+    assert!(
+        stdout_of(&resumed).starts_with("resumed\n"),
+        "{}",
+        stdout_of(&resumed)
+    );
+    let copy = fresh.claim(BRANCH);
+    assert_eq!(copy["owner"], "session-one", "{copy}");
+    assert_eq!(copy["kind"], "harness-session", "{copy}");
+    assert_eq!(copy["ledger_commit"], held.commit.as_str(), "{copy}");
 }
 
 #[test]

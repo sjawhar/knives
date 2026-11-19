@@ -456,17 +456,16 @@ fn finish_by_possession_still_releases() {
     let (home, _consumer) = release_test_home(&lab);
     let workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
 
-    let finished = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args(["--text", "finish", "feat/gamma", "--repo", "demo"])
-        .current_dir(&workspace)
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .env("HOME", lab.temp_path())
-        .env_remove("KNIVES_OWNER")
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("OMP_SESSION_ID")
-        .env("USER", "terminal-user")
-        .output()
-        .expect("finish held workspace by possession");
+    let finished = lab::without_harness_session(
+        Command::new(env!("CARGO_BIN_EXE_knives"))
+            .args(["--text", "finish", "feat/gamma", "--repo", "demo"])
+            .current_dir(&workspace)
+            .env("KNIVES_CONFIG_HOME", home.path())
+            .env("HOME", lab.temp_path())
+            .env("USER", "terminal-user"),
+    )
+    .output()
+    .expect("finish held workspace by possession");
 
     assert!(
         finished.status.success(),
@@ -487,17 +486,16 @@ fn finish_by_possession_is_refused_when_the_fork_has_a_second_claimant() {
     let workspace = start_claim_for_finish(&lab, &home, "agent-one", "feat/gamma");
     hold_claim(&home, "feat/delta", "ses_fff688");
 
-    let refused = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args(["--text", "finish", "feat/gamma", "--repo", "demo"])
-        .current_dir(&workspace)
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .env("HOME", lab.temp_path())
-        .env_remove("KNIVES_OWNER")
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("OMP_SESSION_ID")
-        .env("USER", "terminal-user")
-        .output()
-        .expect("finish held workspace from inside");
+    let refused = lab::without_harness_session(
+        Command::new(env!("CARGO_BIN_EXE_knives"))
+            .args(["--text", "finish", "feat/gamma", "--repo", "demo"])
+            .current_dir(&workspace)
+            .env("KNIVES_CONFIG_HOME", home.path())
+            .env("HOME", lab.temp_path())
+            .env("USER", "terminal-user"),
+    )
+    .output()
+    .expect("finish held workspace from inside");
 
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert_eq!(

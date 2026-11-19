@@ -43,7 +43,7 @@ Claims the branch and opens a jj workspace.
 
 ### Claim identity and locking
 
-- The holder identity is `KNIVES_OWNER` (from the OpenCode plugin), `CLAUDE_CODE_SESSION_ID` or `OMP_SESSION_ID`. Two agents under one OS user are separate claimants. The second `start` refuses with the holder's name.
+- The holder identity is the first of `KNIVES_OWNER` (from the OpenCode plugin), `CLAUDE_CODE_SESSION_ID`, `OMP_SESSION_ID` and `PI_SESSION_ID` (the session id of an Oh My Pi build that sets no `OMP_SESSION_ID`) that is set. Two agents under one OS user are separate claimants. The second `start` refuses with the holder's name.
 - With no harness identity, the claim is anonymous (`<user>/os-user`) and resumes only inside its own workspace. Status shows `<id>/<kind>`.
 - On a fork whose `repos.toml` entry sets `ledger`, the ledger's claim decides: one ref per branch on the ledger's repository ([claim refs](ledger.md#claim-refs)). `start` and `finish` read it under the fork lock, before they decide. So the claim holds on every machine that shares the ledger and runs a knives that reads claim refs. It stays after the machine that took it is gone.
 - On such a fork, a claim in this machine's `state.json` with no `ledger_commit` is a local claim: an older knives took it, or it was taken before the registry named a ledger. It still binds this machine. A claim of either kind that names another owner refuses `start` (exit `2`). `start` resumes only when every claim present names you, and takes the branch only when no claim is present.

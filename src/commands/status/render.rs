@@ -107,12 +107,13 @@ fn landed_cell(row: &BranchRow) -> String {
 /// kind that name was derived from.
 ///
 /// The owner is text this process did not write — whichever session took the
-/// claim chose it, through `KNIVES_OWNER`, `CLAUDE_CODE_SESSION_ID` or
-/// `OMP_SESSION_ID` — so the terminal reads it escaped, as every other
-/// printer of a claim owner does (`claim_evidence`, `src/commands/claim.rs`).
-/// Escaped before it is shortened, because the escape maps each control
-/// character to one U+FFFD and the column stays twelve characters long. The
-/// state file, the ledger and the machine surfaces keep the raw name.
+/// claim chose it, through `KNIVES_OWNER`, `CLAUDE_CODE_SESSION_ID`,
+/// `OMP_SESSION_ID` or `PI_SESSION_ID` — so the terminal reads it escaped, as
+/// every other printer of a claim owner does (`claim_evidence`,
+/// `src/commands/claim.rs`). Escaped before it is shortened, because the
+/// escape maps each control character to one U+FFFD and the column stays
+/// twelve characters long. The state file, the ledger and the machine
+/// surfaces keep the raw name.
 fn claim_cell(row: &BranchRow) -> String {
     row.claim.as_ref().map_or_else(
         || "-".to_owned(),

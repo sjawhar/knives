@@ -967,13 +967,22 @@ pub fn jj_workspace_add(checkout: &Path, name: &str, path: &Path) {
     );
 }
 
+/// `command` with every variable a harness names its session by removed
+/// (`HARNESS_SESSION_VARIABLES`: `KNIVES_OWNER`, `CLAUDE_CODE_SESSION_ID`,
+/// `OMP_SESSION_ID`, `PI_SESSION_ID`). The harness running the suite names
+/// its own session in the environment; without this, a test's identity would
+/// be that session rather than the one the test states.
+pub fn without_harness_session(command: &mut Command) -> &mut Command {
+    for name in knives::commands::claim::HARNESS_SESSION_VARIABLES {
+        command.env_remove(name);
+    }
+    command
+}
+
 /// The knives binary, run from `cwd` against the registry in `config_home` and
-/// scanning `scan_home` for checkouts. Returned unrun so a caller can add an
-/// environment variable (`KNIVES_OWNER`, say) before `.output()`.
-///
-/// The harness running the suite names its own session in the environment
-/// (`OMP_SESSION_ID`, `CLAUDE_CODE_SESSION_ID`, `KNIVES_OWNER`); those are
-/// removed so a test's identity is the one it states, whoever runs it.
+/// scanning `scan_home` for checkouts, with no harness session in its
+/// environment ([`without_harness_session`]). Returned unrun so a caller can
+/// add an environment variable (`KNIVES_OWNER`, say) before `.output()`.
 pub fn knives_command(cwd: &Path, config_home: &Path, scan_home: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
     command
@@ -981,9 +990,7 @@ pub fn knives_command(cwd: &Path, config_home: &Path, scan_home: &Path, args: &[
         .current_dir(cwd)
         .env("KNIVES_CONFIG_HOME", config_home)
         .env("HOME", scan_home);
-    for name in knives::commands::claim::HARNESS_SESSION_VARIABLES {
-        command.env_remove(name);
-    }
+    without_harness_session(&mut command);
     command
 }
 

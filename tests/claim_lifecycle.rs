@@ -462,17 +462,16 @@ fn start_refuses_two_anonymous_owners_with_the_same_name() {
     let (home, _consumer) = release_test_home(&lab);
     let outside = tempfile::tempdir().expect("create unmanaged terminal");
     let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_knives"))
-            .args(args)
-            .current_dir(outside.path())
-            .env("KNIVES_CONFIG_HOME", home.path())
-            .env("HOME", lab.temp_path())
-            .env_remove("KNIVES_OWNER")
-            .env_remove("CLAUDE_CODE_SESSION_ID")
-            .env_remove("OMP_SESSION_ID")
-            .env("USER", "terminal-user")
-            .output()
-            .expect("run start")
+        lab::without_harness_session(
+            Command::new(env!("CARGO_BIN_EXE_knives"))
+                .args(args)
+                .current_dir(outside.path())
+                .env("KNIVES_CONFIG_HOME", home.path())
+                .env("HOME", lab.temp_path())
+                .env("USER", "terminal-user"),
+        )
+        .output()
+        .expect("run start")
     };
 
     let first = run(&[
@@ -648,9 +647,7 @@ fn start_refusing_a_claim_names_the_processes_working_in_its_workspace() {
     // stand-in for the holder's shell carries none of this test's variables.
     let mut working = Command::new("sleep");
     working.arg("3600").current_dir(&workspace);
-    for name in knives::commands::claim::HARNESS_SESSION_VARIABLES {
-        working.env_remove(name);
-    }
+    lab::without_harness_session(&mut working);
     let mut holder = working.spawn().expect("spawn a process in the workspace");
 
     let refused = tried(
@@ -734,9 +731,7 @@ fn start_refusing_a_claim_escapes_the_control_characters_of_a_live_process() {
         .arg0("sleep\u{1b}]0;held\u{7}\u{9b}31m")
         .arg("3600")
         .current_dir(&workspace);
-    for name in knives::commands::claim::HARNESS_SESSION_VARIABLES {
-        working.env_remove(name);
-    }
+    lab::without_harness_session(&mut working);
     let mut holder = working.spawn().expect("spawn a process in the workspace");
 
     // When: another identity tries to start the claimed branch
@@ -1022,17 +1017,16 @@ fn start_from_inside_the_claimed_workspace_resumes_by_possession() {
     );
     let workspace = lab.work.parent().expect("parent").join("feat-gamma");
 
-    let second = Command::new(env!("CARGO_BIN_EXE_knives"))
-        .args(["--text", "start", "feat/gamma", "--repo", "demo"])
-        .current_dir(&workspace)
-        .env("KNIVES_CONFIG_HOME", home.path())
-        .env("HOME", lab.temp_path())
-        .env_remove("KNIVES_OWNER")
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("OMP_SESSION_ID")
-        .env("USER", "terminal-user")
-        .output()
-        .expect("resume from workspace");
+    let second = lab::without_harness_session(
+        Command::new(env!("CARGO_BIN_EXE_knives"))
+            .args(["--text", "start", "feat/gamma", "--repo", "demo"])
+            .current_dir(&workspace)
+            .env("KNIVES_CONFIG_HOME", home.path())
+            .env("HOME", lab.temp_path())
+            .env("USER", "terminal-user"),
+    )
+    .output()
+    .expect("resume from workspace");
 
     assert!(
         second.status.success(),
@@ -2735,17 +2729,16 @@ fn an_owner_that_took_its_own_branch_back_is_told_of_no_takeover() {
     let (home, _consumer) = release_test_home(&lab);
     let outside = tempfile::tempdir().expect("create unmanaged terminal");
     let as_sami = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_knives"))
-            .args(args)
-            .current_dir(outside.path())
-            .env("KNIVES_CONFIG_HOME", home.path())
-            .env("HOME", lab.temp_path())
-            .env_remove("KNIVES_OWNER")
-            .env_remove("CLAUDE_CODE_SESSION_ID")
-            .env_remove("OMP_SESSION_ID")
-            .env("USER", "sami")
-            .output()
-            .expect("run knives as the OS user sami")
+        lab::without_harness_session(
+            Command::new(env!("CARGO_BIN_EXE_knives"))
+                .args(args)
+                .current_dir(outside.path())
+                .env("KNIVES_CONFIG_HOME", home.path())
+                .env("HOME", lab.temp_path())
+                .env("USER", "sami"),
+        )
+        .output()
+        .expect("run knives as the OS user sami")
     };
     let claimed = as_sami(&[
         "--text",
