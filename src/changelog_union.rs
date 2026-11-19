@@ -22,18 +22,20 @@
 //! last where that release inserted its own text there ([`side_order`]), and
 //! the other blocks before it in jj's term order. It writes each block
 //! whole, byte for byte, as knives 4.0.1 did, except at the one shape a
-//! reader is sure of: the place is inside the one `[Unreleased]` section
-//! ([`Above`]), and every block written there is plain `### ` lists
-//! ([`plain_lists`]). There each `### ` heading, such as `### Fixed`, is
-//! written once ([`joined_blocks`]): the entries that the other blocks put
-//! under it join its list in the last block that has it, above that list's
-//! own entries. A heading is the same only where its text is the same: one
-//! that differs by case or by a trailing space is another heading. Entry
-//! lines are kept byte for byte, and a joined list's heading and its blank
-//! lines are written once. Where the place is not plain lists in
-//! `[Unreleased]`, each block is written whole, and [`Union::left_twice`]
-//! names each `### ` heading that the blocks there leave twice in one
-//! section, for a person to join.
+//! reader is sure of: in a file with one `## [Unreleased]` heading line, the
+//! place is inside that section ([`Above`]), and every block written there
+//! is plain `### ` lists ([`plain_lists`]). There each `### ` heading, such
+//! as `### Fixed`, is written once ([`joined_blocks`]): the entries that the
+//! other blocks put under it join its list in the last block that has it,
+//! above that list's own entries. A heading is the same only where its text
+//! is the same: one that differs by case or by a trailing space is another
+//! heading. Entry lines are kept byte for byte, and a joined list's heading
+//! and its blank lines are written once. The check that a member is carried
+//! ([`masks`]) reads a joined entry by the same rule, so a join knives wrote
+//! never reads as a member's entry lost. Where the place is not plain lists
+//! in a file's one `[Unreleased]` section, each block is written whole, and
+//! [`Union::left_twice`] names each `### ` heading that the blocks there
+//! leave twice in one section, for a person to join.
 //!
 //! One insertion is left to a person too: a side's block whose last line has
 //! no newline, where something would follow it. Written verbatim, that line
@@ -47,6 +49,7 @@
 //! given.
 
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::HashMap;
 
 use jj_lib::files::{MergeResult, merge_hunks};
@@ -103,9 +106,9 @@ pub struct Union {
 /// no index names it reliably; where it has been cancelled no side matches
 /// and every side keeps the order jj gave it, which is also what a fresh
 /// composition with no earlier release gets. At each conflicting place the
-/// blocks are written whole, or, where the place is inside the one
-/// `[Unreleased]` section and every block there is plain `### ` lists, their
-/// lists are joined ([`place_blocks`]).
+/// blocks are written whole, or, in a file with one `## [Unreleased]`
+/// heading line, where the place is inside that section and every block
+/// there is plain `### ` lists, their lists are joined ([`place_blocks`]).
 pub fn union_of<T: AsRef<[u8]>>(
     contents: &Merge<T>,
     earlier_release: Option<&[u8]>,
@@ -119,11 +122,34 @@ pub fn union_of<T: AsRef<[u8]>>(
     let earlier = earlier_release
         .and_then(|published| contents.adds().position(|side| side.as_ref() == published));
     let order = side_order(contents.num_sides(), earlier);
+    let (union, joined) = written_union(&hunks, &order, true)?;
+    // The text above each place it joined held one `## [Unreleased]`
+    // heading line, and a join takes none away. Where the file it wrote
+    // holds another below, the check that a member is carried reads no
+    // joined entry ([`unreleased_runs`]), so the union is written again
+    // with every block whole: a join knives wrote never reads as lost.
+    if joined && unreleased_runs(&union.content).is_none() {
+        return written_union(&hunks, &order, false).map(|(union, _)| union);
+    }
+    Some(union)
+}
+
+/// The union of `hunks`, a file's merge hunks, with the sides of each
+/// conflicting place in `order` ([`side_order`]), and whether a place joined
+/// lists. A place joins its lists only where `join` holds
+/// ([`place_blocks`]). `None` where the conflict is not one a union
+/// resolves ([`union_of`]).
+fn written_union<B: AsRef<[u8]>>(
+    hunks: &[Merge<B>],
+    order: &[usize],
+    join: bool,
+) -> Option<(Union, bool)> {
     let mut union = Union {
         content: Vec::new(),
         first_lines: Vec::new(),
         left_twice: Vec::new(),
     };
+    let mut joined = false;
     // What the text written so far says about the next conflicting place.
     let mut above = Above::default();
     // Whether the bytes written last are an inserted block whose last line
@@ -132,32 +158,37 @@ pub fn union_of<T: AsRef<[u8]>>(
     // adds no byte to keep them apart. So such a block is written only where
     // it ends the file, and any byte after it leaves the conflict to a person.
     let mut unterminated = false;
-    for hunk in &hunks {
+    for hunk in hunks {
         if let Some(resolved) = hunk.as_resolved() {
             if unterminated {
                 return None;
             }
-            union.content.extend_from_slice(resolved);
+            union.content.extend_from_slice(resolved.as_ref());
             continue;
         }
         // A base region that is not empty is text one side kept and another
         // changed: a disagreement, and a person's.
-        if hunk.removes().any(|base_region| !base_region.is_empty()) {
+        if hunk
+            .removes()
+            .any(|base_region| !base_region.as_ref().is_empty())
+        {
             return None;
         }
         // Dropped per hunk, not per file: a side that inserted the same text
         // as another side contributes one block here, while a side that
         // inserted the same text somewhere else contributes one there too.
         let mut inserted: Vec<&[u8]> = Vec::new();
-        for &side in &order {
+        for &side in order {
             // A hunk carries the sides of the file it was cut from, so this
             // holds; `?` says so without a branch that cannot be reached.
-            let text = hunk.get_add(side)?.as_slice();
+            let text = hunk.get_add(side)?.as_ref();
             if !text.is_empty() && !inserted.contains(&text) {
                 inserted.push(text);
             }
         }
-        for block in place_blocks(&inserted, &mut above, &union.content, &mut union.left_twice) {
+        let (blocks, joined_here) = place_blocks(&inserted, &mut above, &mut union, join);
+        joined |= joined_here;
+        for block in blocks {
             if block.is_empty() {
                 continue;
             }
@@ -169,36 +200,40 @@ pub fn union_of<T: AsRef<[u8]>>(
             unterminated = !block.ends_with(b"\n");
         }
     }
-    Some(union)
+    Some((union, joined))
 }
 
 /// The blocks that one conflicting place writes: `inserted`, each side's
-/// text once, in the order the union writes them ([`union_of`]), below
-/// `written`, the text the union has written above the place, which `above`
-/// reads. Where the place is inside the one `[Unreleased]` section
-/// ([`Above::reads_unreleased`]) and every block is plain `### ` lists
-/// ([`plain_lists`]), their lists are joined ([`joined_blocks`]). Anywhere
-/// else each block is written whole, byte for byte, and each `### ` heading
-/// that the blocks leave twice in one section goes in `left_twice`
-/// ([`name_left_twice`]).
+/// text once, in the order the union writes them ([`union_of`]), below the
+/// text that `union` holds so far, which `above` reads; and whether their
+/// lists joined. Where `join` holds, the place is inside the one
+/// `[Unreleased]` section of that text ([`Above::reads_unreleased`]), and
+/// every block is plain `### ` lists ([`plain_lists`]), their lists are
+/// joined ([`joined_blocks`]). Anywhere else each block is written whole,
+/// byte for byte, and each `### ` heading that the blocks leave twice in one
+/// section goes in the union's `left_twice` ([`name_left_twice`]).
 fn place_blocks<'a>(
     inserted: &[&'a [u8]],
     above: &mut Above,
-    written: &[u8],
-    left_twice: &mut Vec<Vec<u8>>,
-) -> Vec<Cow<'a, [u8]>> {
+    union: &mut Union,
+    join: bool,
+) -> (Vec<Cow<'a, [u8]>>, bool) {
     if inserted.len() > 1 {
-        let plain: Option<Vec<PlainBlock<'a>>> = if above.reads_unreleased(written) {
+        let inside = above.reads_unreleased(&union.content);
+        let plain: Option<Vec<PlainBlock<'a>>> = if join && inside {
             inserted.iter().copied().map(plain_lists).collect()
         } else {
             None
         };
         if let Some(blocks) = plain {
-            return joined_blocks(&blocks);
+            return (joined_blocks(&blocks), true);
         }
-        name_left_twice(inserted, above.fence, left_twice);
+        name_left_twice(inserted, above.fence, &mut union.left_twice);
     }
-    inserted.iter().map(|block| Cow::Borrowed(*block)).collect()
+    (
+        inserted.iter().map(|block| Cow::Borrowed(*block)).collect(),
+        false,
+    )
 }
 
 /// Add to `left_twice` each `### ` heading that `blocks`, written whole at
@@ -258,7 +293,7 @@ impl Above {
             }
             self.read += line.len();
             if self.fence.read(line) == Kind::Section {
-                let unreleased = line.trim_ascii_end() == b"## [Unreleased]";
+                let unreleased = is_unreleased_heading(line);
                 self.unreleased += usize::from(unreleased);
                 self.in_unreleased = unreleased;
             }
@@ -422,24 +457,24 @@ fn plain_lists(text: &[u8]) -> Option<PlainBlock<'_>> {
 }
 
 /// The blocks that one conflicting place writes where every block there is
-/// plain `### ` lists inside the one `[Unreleased]` section
-/// ([`place_blocks`]), in the order the union writes them. Each `### `
-/// heading there has one target: the first list under it in the last block
-/// that has it, the same text. Each list of an earlier block under that
-/// heading joins the target: its entries go after the target's heading and
-/// the blank lines that follow it, above the target's own entries, in the
-/// order the union writes the blocks, so what the write brings in goes above
-/// what the earlier release published. Entry lines are kept byte for byte.
-/// The joining list's heading and its blank lines are not written, so the
-/// heading and the blank lines around the entries are written once. Where
-/// the target has no entries of its own, its blank lines are written below
-/// the joined entries too, so a blank line still parts them from the next
-/// heading. A block keeps the blank lines before its first list; a block
-/// whose every list joined another is left with those alone, and writes
-/// nothing. One block can be the target under one heading and lose its list
-/// under another, and a second list under one heading in the target's block
-/// stays where it is. A list finds its target by its heading's text, so no
-/// list is read once for each other list.
+/// plain `### ` lists inside the `[Unreleased]` section of a file with one
+/// `## [Unreleased]` heading line ([`union_of`]), in the order the union
+/// writes them. Each `### ` heading there has one target: the first list
+/// under it in the last block that has it, the same text. Each list of an
+/// earlier block under that heading joins the target: its entries go after
+/// the target's heading and the blank lines that follow it, above the
+/// target's own entries, in the order the union writes the blocks, so what
+/// the write brings in goes above what the earlier release published. Entry
+/// lines are kept byte for byte. The joining list's heading and its blank
+/// lines are not written, so the heading and the blank lines around the
+/// entries are written once. Where the target has no entries of its own, its
+/// blank lines are written below the joined entries too, so a blank line
+/// still parts them from the next heading. A block keeps the blank lines
+/// before its first list; a block whose every list joined another is left
+/// with those alone, and writes nothing. One block can be the target under
+/// one heading and lose its list under another, and a second list under one
+/// heading in the target's block stays where it is. A list finds its target
+/// by its heading's text, so no list is read once for each other list.
 fn joined_blocks<'a>(blocks: &[PlainBlock<'a>]) -> Vec<Cow<'a, [u8]>> {
     // A block read later takes over each heading it has, so a heading's
     // target is in the last block that has it.
@@ -605,41 +640,100 @@ fn is_list_item(line: &[u8]) -> bool {
     line.get(digits).is_some_and(|mark| marks.contains(mark)) && line.get(digits + 1) == Some(&b' ')
 }
 
-/// Whether `target` holds `block`, a member's inserted block, as a union
-/// writes it where the block's lists joined other blocks' lists
+/// Whether `runs`, the lists of a target's one `[Unreleased]` section
+/// ([`unreleased_runs`]), hold `block`, a member's inserted block, as a
+/// union writes it where the block's lists joined other blocks' lists
 /// ([`joined_blocks`]): the block is plain `### ` lists ([`plain_lists`]),
-/// and the entries of each of its lists are a whole run of the target's
-/// lines under that heading, the nearest heading above them.
-fn holds_joined(target: &[u8], block: &[u8]) -> bool {
-    let Some(block) = plain_lists(block) else {
-        return false;
-    };
-    let target_lines = lines(target);
-    block
-        .lists
-        .iter()
-        .all(|list| listed_under(&target_lines, list.name(), &lines(list.entries)))
+/// and the entries of each of its lists are a whole run of lines under the
+/// same heading there, byte for byte.
+fn holds_joined(runs: &[Run<'_>], block: &[u8]) -> bool {
+    plain_lists(block).is_some_and(|block| {
+        block
+            .lists
+            .iter()
+            .all(|list| listed_under(runs, list.name(), &lines(list.entries)))
+    })
 }
 
-/// Whether `entries` are a whole run of `target_lines` whose nearest heading
-/// above them is `heading`; for a heading with no entries, whether a line of
-/// the target is that heading.
-fn listed_under(target_lines: &[&[u8]], heading: &[u8], entries: &[&[u8]]) -> bool {
-    if entries.is_empty() {
-        return target_lines.iter().any(|line| first_line(line) == heading);
+/// Whether `entries` are a whole run of the lines of one of `runs` under
+/// `heading`; for a heading with no entries, whether one of `runs` is under
+/// that heading.
+fn listed_under(runs: &[Run<'_>], heading: &[u8], entries: &[&[u8]]) -> bool {
+    runs.iter().filter(|run| run.heading == heading).any(|run| {
+        entries.is_empty()
+            || run
+                .lines
+                .windows(entries.len())
+                .any(|window| window == entries)
+    })
+}
+
+/// Lines of a target that stand under one `### ` heading inside its one
+/// `[Unreleased]` section ([`unreleased_runs`]).
+struct Run<'a> {
+    /// The heading's text ([`first_line`]).
+    heading: &'a [u8],
+    /// The lines, each with its terminator, in the target's order.
+    lines: Vec<&'a [u8]>,
+}
+
+/// The runs of `target`'s lines under each `### ` heading of its one
+/// `[Unreleased]` section, or `None` where `target` holds no
+/// `## [Unreleased]` heading line or more than one
+/// ([`is_unreleased_heading`]). The section runs from that heading line to
+/// the next `#` or `##` heading or setext underline, and a `### ` heading at
+/// the start of a line opens a list there ([`Fence::read`]). A run is lines
+/// of one list outside any code fence: a fence ends a run, and the list's
+/// lines after it start another. Any other heading ends the list. A list
+/// with no lines is one empty run, so its heading is still read.
+fn unreleased_runs(target: &[u8]) -> Option<Vec<Run<'_>>> {
+    let mut fence = Fence::default();
+    let mut headings = 0_usize;
+    let mut inside = false;
+    let mut runs: Vec<Run<'_>> = Vec::new();
+    // The heading of the list that the next line stands in, and whether a
+    // fence since its last line makes that line start a run of its own.
+    let mut list: Option<&[u8]> = None;
+    let mut split = false;
+    for line in target.split_inclusive(|byte| *byte == b'\n') {
+        match fence.read(line) {
+            Kind::Section => {
+                inside = is_unreleased_heading(line);
+                headings += usize::from(inside);
+                if headings > 1 {
+                    return None;
+                }
+                list = None;
+            }
+            Kind::List => {
+                list = inside.then(|| first_line(line));
+                if let Some(heading) = list {
+                    runs.push(Run {
+                        heading,
+                        lines: Vec::new(),
+                    });
+                }
+                split = false;
+            }
+            Kind::Code => split = true,
+            Kind::Text if atx_level(line).is_some() => list = None,
+            Kind::Text => {
+                if let Some(heading) = list {
+                    if split {
+                        runs.push(Run {
+                            heading,
+                            lines: Vec::new(),
+                        });
+                        split = false;
+                    }
+                    if let Some(run) = runs.last_mut() {
+                        run.lines.push(line);
+                    }
+                }
+            }
+        }
     }
-    target_lines
-        .windows(entries.len())
-        .enumerate()
-        .any(|(start, window)| {
-            window == entries
-                && target_lines
-                    .iter()
-                    .take(start)
-                    .rev()
-                    .find(|line| heading_level(line).is_some())
-                    .is_some_and(|line| first_line(line) == heading)
-        })
+    (headings == 1).then_some(runs)
 }
 
 /// `block`'s lines, each with its terminator.
@@ -652,11 +746,10 @@ fn is_blank(line: &[u8]) -> bool {
     line.iter().all(u8::is_ascii_whitespace)
 }
 
-/// The level of a heading line, `# ` to `### `, or `None` for any other
-/// line.
-fn heading_level(line: &[u8]) -> Option<usize> {
-    let level = line.iter().take_while(|byte| **byte == b'#').count();
-    ((1..=3).contains(&level) && line.get(level) == Some(&b' ')).then_some(level)
+/// Whether `line` is the `## [Unreleased]` heading line, trailing
+/// whitespace aside.
+fn is_unreleased_heading(line: &[u8]) -> bool {
+    line.trim_ascii_end() == b"## [Unreleased]"
 }
 
 /// Whether `target` already holds what `member` added to `base`.
@@ -667,15 +760,22 @@ fn heading_level(line: &[u8]) -> Option<usize> {
 /// other blocks sit where the member's block ends. This says what such a
 /// replay means: a conflict every side of which only inserted, and whose
 /// member side the target holds as a whole run of its own lines, or holds as
-/// a union writes it where its lists joined another block's
-/// ([`holds_joined`]), is the target carrying that block — the conflict is
-/// masked. A member whose lines the target lost is not carried, and says so.
+/// a union writes it where its lists joined another block's: its entries
+/// under the same `### ` heading inside the target's one `[Unreleased]`
+/// section ([`holds_joined`]), is the target carrying that block — the
+/// conflict is masked. The same lines under that heading in a released
+/// section count for nothing, and a target with no `## [Unreleased]`
+/// heading or more than one holds no joined entry. A member whose lines the
+/// target lost is not carried, and says so.
 pub fn masks(target: &[u8], base: &[u8], member: &[u8], options: &MergeOptions) -> bool {
     let replay = Merge::from_removes_adds([base], [target, member]);
     match merge_hunks(&replay, options) {
         MergeResult::Resolved(content) => content.as_slice() == target,
         MergeResult::Conflict(hunks) => {
             let mut replayed: Vec<u8> = Vec::new();
+            // The target's `[Unreleased]` lists, read once, at the first
+            // hunk that needs them.
+            let unreleased = OnceCell::new();
             for hunk in &hunks {
                 if let Some(resolved) = hunk.as_resolved() {
                     replayed.extend_from_slice(resolved);
@@ -689,7 +789,10 @@ pub fn masks(target: &[u8], base: &[u8], member: &[u8], options: &MergeOptions) 
                     return false;
                 };
                 if !is_line_run(target, member_side.as_slice())
-                    && !holds_joined(target, member_side.as_slice())
+                    && !unreleased
+                        .get_or_init(|| unreleased_runs(target))
+                        .as_deref()
+                        .is_some_and(|runs| holds_joined(runs, member_side.as_slice()))
                 {
                     return false;
                 }
@@ -1472,6 +1575,42 @@ mod tests {
         assert_eq!(left(&union), ["### Fixed"]);
     }
 
+    #[test]
+    fn a_second_unreleased_heading_below_the_place_keeps_every_block_whole() {
+        // Given: a changelog whose `[Unreleased]` section two members each
+        // gave a `### Fixed` list, and which holds a stray second
+        // `## [Unreleased]` heading below its `[1.0.0]` section, each from the
+        // same base
+        let options = merge_options();
+        let file = |inserted: &str| {
+            [
+                unreleased(inserted),
+                b"\n## [Unreleased]\n\n- Stale.\n".to_vec(),
+            ]
+            .concat()
+        };
+        let alpha_list = "### Fixed\n\n- Alpha's fix.\n\n";
+        let beta_list = "### Fixed\n\n- Beta's fix.\n\n";
+        let (base, alpha, beta) = (file(""), file(alpha_list), file(beta_list));
+        let contents = merge_of([base.as_slice()], [alpha.as_slice(), beta.as_slice()]);
+
+        // When: a fresh composition unions them
+        let union = union_of(&contents, None, &options).expect("both sides only inserted");
+
+        // Then: the text above the place holds one `## [Unreleased]`, but the
+        // file holds two, so each block is written whole, byte for byte, in
+        // term order, and `### Fixed` is named as left twice
+        assert_bytes(&union.content, &file(&format!("{alpha_list}{beta_list}")));
+        assert_eq!(headings(&union), ["### Fixed", "### Fixed"]);
+        assert_eq!(left(&union), ["### Fixed"]);
+
+        // And: the content check reads each side as carried by that union,
+        // as a whole run of its lines
+        for side in [&alpha, &beta] {
+            assert!(masks(&union.content, &base, side, &options));
+        }
+    }
+
     /// A changelog whose `## [Unreleased]` heading line is followed at once
     /// by `unreleased`, with no blank line of the file's own between them,
     /// so each side's text there is one insertion, its blank lines included.
@@ -1589,6 +1728,56 @@ mod tests {
             member_a,
             &options
         ));
+    }
+
+    #[test]
+    fn a_joined_entry_is_carried_only_under_its_heading_in_the_one_unreleased_section() {
+        // Given: a changelog whose released `[1.0.0]` section lists
+        // `- Bump dependencies.` under `### Changed`, and a member that adds
+        // that same line under `### Changed` in `[Unreleased]`
+        let options = merge_options();
+        let file = |unreleased: &str| {
+            format!(
+                "## [Unreleased]\n\n{unreleased}## [1.0.0]\n\n### Changed\n\n\
+                 - Bump dependencies.\n- Other.\n"
+            )
+            .into_bytes()
+        };
+        let base = file("");
+        let member = file("### Changed\n\n- Bump dependencies.\n\n");
+
+        // When: the target's `[Unreleased]` holds an earlier fix and not the
+        // member's entry
+        let dropped = file("### Fixed\n\n- Earlier fix.\n\n");
+        // Then: it does not carry the member: the same line under the same
+        // heading in the released section counts for nothing
+        assert!(!masks(&dropped, &base, &member, &options));
+
+        // When: the target is the union that joined the member's entry to
+        // the earlier release's `### Changed` list in `[Unreleased]`
+        let earlier = file("### Changed\n\n- Earlier change.\n\n");
+        let contents = merge_of([base.as_slice()], [earlier.as_slice(), member.as_slice()]);
+        let joined = union_of(&contents, Some(earlier.as_slice()), &options)
+            .expect("both sides only inserted")
+            .content;
+        assert_bytes(
+            &joined,
+            &file("### Changed\n\n- Bump dependencies.\n- Earlier change.\n\n"),
+        );
+        // Then: it carries the member
+        assert!(masks(&joined, &base, &member, &options));
+
+        // When: that target holds a second `## [Unreleased]` heading
+        let twice = [joined.as_slice(), b"\n## [Unreleased]\n\n- Stale.\n"].concat();
+        // Then: it holds no joined entry, so it does not carry the member
+        assert!(!masks(&twice, &base, &member, &options));
+
+        // When: the line stands under `### Changed` in `[Unreleased]`, but
+        // inside a code fence
+        let fenced = file("### Changed\n\n- Earlier change:\n\n```\n- Bump dependencies.\n```\n\n");
+        // Then: it is code, not an entry, so the target does not carry the
+        // member
+        assert!(!masks(&fenced, &base, &member, &options));
     }
 
     #[test]

@@ -2946,9 +2946,10 @@ pub struct UnionedFile {
     /// a reader; the file holds the bytes verbatim.
     pub first_lines: Vec<String>,
     /// Each `### ` heading the union left in more than one block of one
-    /// section, where the blocks at a place are not plain `### ` lists in
-    /// `[Unreleased]` ([`changelog_union::Union::left_twice`]). Read as UTF-8
-    /// with replacement, as `first_lines` is.
+    /// section, where the blocks at a place are not plain `### ` lists in a
+    /// file's one `[Unreleased]` section
+    /// ([`changelog_union::Union::left_twice`]). Read as UTF-8 with
+    /// replacement, as `first_lines` is.
     pub left_twice: Vec<String>,
 }
 

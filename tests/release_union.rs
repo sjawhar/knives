@@ -5,13 +5,14 @@
 //! conflicts in both files although no side touched another's text. A cut, an
 //! `include`, an `advance` and a rebase write that conflict's union — the
 //! block the write brings in above what the release already held, each
-//! block whole, except that inside the one `[Unreleased]` section, where
-//! every block is plain `### ` lists, the entries under one `### ` heading
-//! join that heading's one list, the heading written once — and the content
-//! checks read a member whose block the union holds as carried. A
-//! conflict that is not every side inserting its own block — a member that
-//! rewrote its block, sides on different bases, a code file, a drop that
-//! takes a block out — stays conflicted and is named as a person's.
+//! block whole, except that in a file with one `## [Unreleased]` heading,
+//! inside that section, where every block is plain `### ` lists, the entries
+//! under one `### ` heading join that heading's one list, the heading written
+//! once — and the content checks read a member whose block the union holds
+//! as carried. A conflict that is not every side inserting its own block —
+//! a member that rewrote its block, sides on different bases, a code file, a
+//! drop that takes a block out — stays conflicted and is named as a
+//! person's.
 //! The fixtures are the real ygo and oh-my-pi files, cut down; their README
 //! names each source.
 
@@ -870,11 +871,115 @@ fn a_first_cut_writes_lists_beside_a_code_fence_whole_and_names_the_heading_left
     );
 
     // And: the output names `### Fixed` as a heading left twice there.
+    assert!(cut.contains(LEFT_FIXED_TWICE), "{cut}");
+}
+
+/// The line a write prints for a `CHANGELOG.md` whose union it wrote whole
+/// and which it left with `### Fixed` twice in one section.
+const LEFT_FIXED_TWICE: &str = "\n  CHANGELOG.md: left `### Fixed` twice: knives joins only plain \
+                                `### ` lists in a file's one [Unreleased] section; join them by \
+                                hand\n";
+
+/// A changelog whose `[Unreleased]` section holds `unreleased`, above a
+/// published release that lists `- Bump dependencies.` under `### Changed`.
+fn with_bumped_release(unreleased: &str) -> String {
+    format!(
+        "# Changelog\n\n## [Unreleased]\n\n{unreleased}## [1.0.0] - 2026-08-01\n\n### Changed\n\n\
+         - Bump dependencies.\n- Other.\n"
+    )
+}
+
+#[test]
+fn members_verify_reads_an_entry_unreleased_lost_as_missing_where_an_older_section_lists_its_line()
+{
+    // Given: a trunk whose changelog's `[1.0.0]` section lists
+    // `- Bump dependencies.` under `### Changed`; `feat/alpha` adds a
+    // `### Fixed` entry to `[Unreleased]`, and `feat/beta` adds that same
+    // `- Bump dependencies.` line under `### Changed` there; a first cut of
+    // both; then a hand edit of the release that drops beta's list from
+    // `[Unreleased]`.
+    let (trunk, alpha, beta) = (
+        with_bumped_release(""),
+        with_bumped_release("### Fixed\n\n- Alpha's fix.\n\n"),
+        with_bumped_release("### Changed\n\n- Bump dependencies.\n\n"),
+    );
+    let lab = trunk_with(&[("CHANGELOG.md", trunk.as_str())]);
+    member(&lab, "feat/alpha", &[("CHANGELOG.md", alpha.as_str())]);
+    member(&lab, "feat/beta", &[("CHANGELOG.md", beta.as_str())]);
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = release_ok(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(conflicts(&lab), Vec::<String>::new(), "{cut}");
+    let dropped = commit_at(&lab, "feat/beta");
+    lab.jj_work(["edit", RELEASE]);
+    write_files(&lab, &[("CHANGELOG.md", alpha.as_str())]);
+    lab.jj_work(["new"]);
+
+    // When: each member's content is replayed against the release.
+    let output = knives_release(&lab, &home, &["members", "--verify"]);
+
+    // Then: beta is a finding, named as missing, although `[1.0.0]` lists
+    // its line under the same heading; alpha, whose entry the release holds,
+    // is carried.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(knives::cli::Exit::Findings.code())),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
-        cut.contains(
-            "\n  CHANGELOG.md: left `### Fixed` twice: a block there is not plain `### ` lists \
-             in [Unreleased]; join them by hand\n"
-        ),
-        "{cut}"
+        stdout.contains(&format!(
+            "  !! feat/beta@{}: the cut tree is missing or diverges from the member's content",
+            dropped.as_str().chars().take(12).collect::<String>()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches(": carried (replay empty)").count(),
+        1,
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_first_cut_writes_lists_whole_where_the_changelog_holds_a_second_unreleased_heading() {
+    // Given: a trunk whose changelog holds a stray second `## [Unreleased]`
+    // heading below its `[1.0.0]` section, and two members that each add one
+    // entry under `### Fixed` in the first `[Unreleased]` section.
+    let stray = |unreleased: &str| with_unreleased(unreleased) + "\n## [Unreleased]\n\n- Stale.\n";
+    let (alpha_list, beta_list) = (
+        "### Fixed\n\n- Alpha's fix.\n\n",
+        "### Fixed\n\n- Beta's fix.\n\n",
+    );
+    let (trunk, alpha, beta) = (stray(""), stray(alpha_list), stray(beta_list));
+    let lab = trunk_with(&[("CHANGELOG.md", trunk.as_str())]);
+    member(&lab, "feat/alpha", &[("CHANGELOG.md", alpha.as_str())]);
+    member(&lab, "feat/beta", &[("CHANGELOG.md", beta.as_str())]);
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: the release is cut of both at once.
+    let cut = release_ok(&lab, &home, &["cut", RELEASE]);
+
+    // Then: no conflict is left, and the changelog is the union of the two
+    // blocks, each whole and byte for byte, in the parent order: a file with
+    // two `## [Unreleased]` headings gets no join, and the output names
+    // `### Fixed` as a heading left twice.
+    assert_eq!(conflicts(&lab), Vec::<String>::new(), "{cut}");
+    assert_release_file(
+        &lab,
+        "CHANGELOG.md",
+        &stray(&format!("{alpha_list}{beta_list}")),
+    );
+    assert!(cut.contains(LEFT_FIXED_TWICE), "{cut}");
+
+    // And: the cut's audit and `members --verify` read both members as
+    // carried.
+    assert!(!cut.contains("missing or diverges"), "{cut}");
+    let verified = release_ok(&lab, &home, &["members", "--verify"]);
+    assert!(!verified.contains("!!"), "{verified}");
+    assert_eq!(
+        verified.matches(": carried (replay empty)").count(),
+        2,
+        "{verified}"
     );
 }

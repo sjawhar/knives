@@ -4815,9 +4815,9 @@ pub fn check_test_count(fork: &Fork<'_>, cut: &CommitId, parent: &CommitId) -> T
 /// first line of every block, in the order written: the union never
 /// renumbers, so two blocks claiming one version read as two such lines, and
 /// settling that is a person's. Where the blocks at a place are not plain
-/// `### ` lists in `[Unreleased]`, the union writes each of them whole, and
-/// one line for the file names each `### ` heading they leave twice in one
-/// section, for a person to join.
+/// `### ` lists in a file's one `[Unreleased]` section, the union writes each
+/// of them whole, and one line for the file names each `### ` heading they
+/// leave twice in one section, for a person to join.
 ///
 /// Every other conflict stays a person's. Independent branches that each
 /// append a config key land in the same regions, so a real cut carries real
@@ -4864,8 +4864,8 @@ pub fn conflict_guidance(release: &str, files: &[String], unions: &[jj::UnionedF
                 .map(|heading| format!("`{}`", inline_human_text(heading)))
                 .collect();
             lines.push(format!(
-                "  {}: left {} twice: a block there is not plain `### ` lists in [Unreleased]; \
-                 join them by hand",
+                "  {}: left {} twice: knives joins only plain `### ` lists in a file's one \
+                 [Unreleased] section; join them by hand",
                 inline_human_text(&union.path),
                 headings.join(", ")
             ));
@@ -5004,8 +5004,8 @@ mod conflict_tests {
         // no line names the joined file so.
         assert!(
             rendered.contains(
-                "\n  CHANGELOG.md: left `### Fixed\u{fffd}[2J` twice: a block there is not plain \
-                 `### ` lists in [Unreleased]; join them by hand\n"
+                "\n  CHANGELOG.md: left `### Fixed\u{fffd}[2J` twice: knives joins only plain \
+                 `### ` lists in a file's one [Unreleased] section; join them by hand\n"
             ),
             "{rendered}"
         );
