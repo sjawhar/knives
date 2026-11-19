@@ -4121,3 +4121,86 @@ fn a_record_that_resolves_an_advance_conflict_against_an_adopted_fix_is_refused(
     assert!(out.contains(adopt.short()), "{out}");
     assert_eq!(ledger_entries(&home), entries, "{out}");
 }
+
+#[test]
+fn a_record_in_a_clone_without_the_adopts_commit_holds_a_fix_that_deletes_a_file() {
+    // Given: keep.txt on the trunk; in the work checkout, RELEASE cut of
+    // `feat/alpha` and `feat/beta`, fixed by hand in place by deleting
+    // keep.txt, and adopted; the next release cut on it, which carries the
+    // fix; the two branches and the next release pushed to origin, the
+    // adopt's commit never; and a second clone of origin that shares the
+    // ledger, with the third release merged by hand there of the two
+    // branches, which still holds keep.txt, so it lacks the fix.
+    let lab = Lab::new();
+    lab.upstream_trunk_file("keep.txt", "keep\n");
+    lab.mirror_upstream_trunk_to_origin();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    lab.jj_work(["new", "-r", RELEASE]);
+    std::fs::remove_file(lab.work_path().join("keep.txt")).expect("delete keep.txt");
+    lab.jj_work(["squash", "--into", RELEASE]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let adopted = knives_release(&lab, &home, &["adopt", RELEASE, "--why", "a fix by hand"]);
+    assert_eq!(adopted.status.code(), Some(0), "{}", text(&adopted));
+    let adopt = commit_at(&lab, RELEASE);
+    let next = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(matches!(next.status.code(), Some(0 | 1)), "{}", text(&next));
+    for branch in ["feat/alpha", "feat/beta", "release/2026-08-05"] {
+        lab.push_branch(branch);
+    }
+    let upstream = lab.upstream.to_str().expect("utf-8 path").to_owned();
+    lab.jj_at(&lab.second, ["git", "remote", "add", "upstream", &upstream]);
+    lab.jj_at(&lab.second, ["git", "fetch", "--all-remotes"]);
+    assert!(
+        knives::jj::Repo::open(&lab.second)
+            .expect("open the second clone")
+            .resolve_commit(adopt.as_str())
+            .is_err(),
+        "the second clone does not hold the adopt's commit"
+    );
+    lab.jj_at(
+        &lab.second,
+        [
+            "new",
+            "-r",
+            "feat/alpha@origin",
+            "-r",
+            "feat/beta@origin",
+            "-m",
+            "the third release, merged by hand",
+        ],
+    );
+    lab.jj_at(&lab.second, ["new"]);
+    let commit = CommitId::new(lab.revision(&lab.second, "@-", "commit_id").trim());
+    let entries = ledger_entries(&home);
+
+    // When: it is recorded in the second clone.
+    let recorded = lab::knives_command(
+        &lab.second,
+        home.path(),
+        lab.temp_path(),
+        &[
+            "--text",
+            "release",
+            "--repo",
+            "demo",
+            "cut",
+            "release/2026-08-06",
+            "--at",
+            commit.as_str(),
+        ],
+    )
+    .output()
+    .expect("run knives in the second clone");
+
+    // Then: it is refused, naming the adopt's commit, and nothing is written:
+    // a fix that deletes a file is held there by the newest write holding
+    // nothing, which is the fix itself and not its end.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert!(out.contains(adopt.short()), "{out}");
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+}
