@@ -13,7 +13,7 @@
 //! Enforcement layer three. Advisory on purpose: layers one and two are
 //! default-correct paths and detectors, and hard refusal waits for evidence
 //! that advice was insufficient.
-// allow: SIZE_OK: claim coordination keeps identity-resolution behavior beside its tests.
+// allow: SIZE_OK: 1499 lines - owner identity, the claim decision, and a ledger claim's read, copy and change, with the lines that report each, sit beside their tests.
 
 use crate::commands::hook::owner_for;
 use crate::config::Registry;
