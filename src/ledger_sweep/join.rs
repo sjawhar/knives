@@ -373,7 +373,9 @@ mod tests {
     use super::*;
     use crate::ids::CommitId;
     use crate::ledger::{Draft, Ledger, Scribe};
-    use crate::ledger_sweep::{Swept, destinations, lab, pull_at, shared_fork, unpullable};
+    use crate::ledger_sweep::{
+        Swept, destinations, lab, ledger_of, pull_at, shared_fork, unpullable,
+    };
 
     /// A machine id, as `/etc/machine-id` holds one.
     const MACHINE_ID: &str = "0123abcd4567ef890123abcd4567ef89\n";
@@ -874,9 +876,14 @@ mod tests {
 
         // When: the fork is routed to its ledger, as `start` does, and a
         // sweep runs.
-        let refused = shared_fork(&root, &registry, &fork)
-            .unwrap_err()
-            .to_string();
+        let refused = shared_fork(
+            &root,
+            &registry,
+            &fork,
+            ledger_of(&registry, &fork).unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
         let swept = crate::ledger_sweep::run(&root, Ok(registry)).unwrap();
 
         // Then: the refusal, the sweep's problems and its log each say the
@@ -919,7 +926,8 @@ mod tests {
 
         // When: the first fork is routed to its ledger, as `start` and
         // `finish` do.
-        let shared = shared_fork(&root, &registry, &a_repo).unwrap().unwrap();
+        let ledger = ledger_of(&registry, &a_repo).unwrap();
+        let shared = shared_fork(&root, &registry, &a_repo, ledger).unwrap();
 
         // Then: its ledger is joined, and carries it.
         assert_eq!(

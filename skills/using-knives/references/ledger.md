@@ -273,7 +273,7 @@ The push:
 
 - A take, a seize, a restate (the holder's `start --why`) and a release are each one `git push --atomic`. It moves the claim ref and this machine's `refs/knives/<machine>` together, and that ref carries the entry that records the change. The two reach the remote together or not at all.
 - The push is leased (`--force-with-lease=<ref>:<commit>`) on the claim commit that the command read, or on no ref for a take. When another machine changed the claim after the read, the remote refuses the push and nothing changes.
-- A `start` that lost that race reads the claim again. It prints `<owner> took <branch> on machine <machine> while this start ran`, then the refusal, and exits `2`. A `finish` that lost it names the claim that the ledger holds now, releases and removes nothing, and exits `1`.
+- A `start` that lost that race reads the claim again. It prints `<owner> took <branch> on machine <machine> while this start ran`, then the refusal, and exits `2`. When the claim is the caller's own owner name, taken in another config home, the `start` says so and that `knives start <branch>` resumes it, offers no `--force`, and exits `3`. A `finish` that lost it names the claim that the ledger holds now, releases and removes nothing, and exits `1`.
 - The command holds the fork lock, then takes `ledger.lock`, then the git directory's `knives-transport.lock`, and waits up to a minute for each. A sweep takes the last two in the same order.
 
 When the push fails:

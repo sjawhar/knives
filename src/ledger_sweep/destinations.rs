@@ -388,8 +388,8 @@ fn assemble(
     })
 }
 
-/// The destination that carries `fork`, as [`destinations`] finds it; `None`
-/// when `fork`'s registry entry names no ledger, so nothing of it is shared.
+/// The destination that carries `fork`, whose registry entry names the
+/// ledger `ledger` ([`ledger_of`]), as [`destinations`] finds it.
 ///
 /// The fork's ledger is joined first when no git directory reaches it, and
 /// no other ledger is ([`destinations_telling`]). Refused as
@@ -400,10 +400,8 @@ pub fn shared_fork(
     root: &Path,
     registry: &Registry,
     fork: &UpstreamName,
-) -> Result<Option<SharedFork>, SweepError> {
-    let Some(ledger) = ledger_of(registry, fork).map(str::to_owned) else {
-        return Ok(None);
-    };
+    ledger: &str,
+) -> Result<SharedFork, SweepError> {
     let mut reached = destinations_telling(
         root,
         registry,
@@ -415,14 +413,14 @@ pub fn shared_fork(
         .iter()
         .position(|destination| destination.carries(fork))
     {
-        return Ok(Some(SharedFork {
-            ledger,
+        return Ok(SharedFork {
+            ledger: ledger.to_owned(),
             destination: reached.found.swap_remove(index),
             root: root.to_owned(),
-        }));
+        });
     }
     Err(SweepError::Unreached {
-        problem: reached.uncarried_problem(root, fork, &ledger),
+        problem: reached.uncarried_problem(root, fork, ledger),
     })
 }
 

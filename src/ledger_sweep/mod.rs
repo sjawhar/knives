@@ -905,7 +905,9 @@ mod tests {
         );
 
         // And: the lookup of its destination refuses with the same problem.
-        let refused = shared_fork(&root, &loaded(&root), &a_repo).unwrap_err();
+        let registry = loaded(&root);
+        let ledger = ledger_of(&registry, &a_repo).unwrap();
+        let refused = shared_fork(&root, &registry, &a_repo, ledger).unwrap_err();
         assert_eq!(refused.to_string(), *problem);
     }
 
@@ -922,9 +924,9 @@ mod tests {
 
         // When / Then: the shared fork's destination is that repository, as
         // this machine.
-        let shared = shared_fork(&root, &registry, &UpstreamName::new("acme/a-repo"))
-            .unwrap()
-            .unwrap();
+        let a_repo = UpstreamName::new("acme/a-repo");
+        let ledger = ledger_of(&registry, &a_repo).unwrap();
+        let shared = shared_fork(&root, &registry, &a_repo, ledger).unwrap();
         assert_eq!(shared.ledger, "acme/ledger");
         assert_eq!(
             shared.destination.repository.git_dir(),
@@ -932,12 +934,10 @@ mod tests {
         );
         assert_eq!(shared.destination.machine, "alpha");
         // And: a fork sharing no ledger, and one the registry does not name,
-        // have no destination.
+        // name no ledger, so no destination is looked up for them.
         for fork in ["acme/c-repo", "acme/unnamed"] {
             assert!(
-                shared_fork(&root, &registry, &UpstreamName::new(fork))
-                    .unwrap()
-                    .is_none(),
+                ledger_of(&registry, &UpstreamName::new(fork)).is_none(),
                 "{fork}"
             );
         }

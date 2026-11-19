@@ -432,7 +432,7 @@ mod tests {
     use crate::ids::{BranchName, UpstreamName};
     use crate::ledger::{Draft, Ledger, Scribe};
     use crate::ledger_sweep::lab::{self, FORK, at, git};
-    use crate::ledger_sweep::shared_fork;
+    use crate::ledger_sweep::{ledger_of, shared_fork};
     use crate::store::OwnerKind;
 
     const MACHINE: &str = "refs/knives/machine-one";
@@ -491,9 +491,14 @@ mod tests {
                 _lock: lock,
                 ..
             } = lab::Lab::new();
-            let shared = shared_fork(&root, &registry, &UpstreamName::new(FORK))
-                .unwrap()
-                .unwrap();
+            let fork = UpstreamName::new(FORK);
+            let shared = shared_fork(
+                &root,
+                &registry,
+                &fork,
+                ledger_of(&registry, &fork).unwrap(),
+            )
+            .unwrap();
             Self {
                 home,
                 root,

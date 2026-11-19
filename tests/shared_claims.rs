@@ -679,31 +679,40 @@ impl Shared {
 }
 
 /// A `git` first on `PATH` that, when `LAB_PUSH_GATE` names a file, writes
-/// `$LAB_PUSH_GATE.waiting` before a push and waits (up to a minute) for
-/// that file to exist, then runs the real `git`: a command held there has
-/// read all it reads before its push, and pushes once the gate opens.
+/// `$LAB_PUSH_GATE.waiting` before a push it holds and waits (up to a
+/// minute) for that file to exist, then runs the real `git`: a command held
+/// there has read all it reads before that push, and pushes once the gate
+/// opens.
 struct Gate {
     root: TempDir,
     path: OsString,
 }
 
 impl Gate {
+    /// A gate that holds every push.
     fn new() -> Self {
+        Self::holding("*\" push \"*")
+    }
+
+    /// A gate that holds only a push that deletes a claim ref, as a
+    /// release does: a `start` held there has pushed its claim already.
+    fn on_release() -> Self {
+        Self::holding("*\" push \"*\" :refs/knives-claims/\"*")
+    }
+
+    /// A gate that holds each git command whose arguments, spelled ` $* `,
+    /// match the shell pattern `pattern`.
+    fn holding(pattern: &str) -> Self {
         let root = tempfile::tempdir().expect("gate directory");
         let path = std::env::var_os("PATH").expect("PATH");
-        let real = std::env::split_paths(&path)
-            .map(|directory| directory.join("git"))
-            .find(|candidate| candidate.is_file())
-            .expect("git on PATH");
         let bin = root.path().join("bin");
         std::fs::create_dir_all(&bin).expect("gate bin directory");
-        let script = bin.join("git");
-        std::fs::write(
-            &script,
-            format!(
+        executable(
+            &bin.join("git"),
+            &format!(
                 "#!/bin/sh\n\
                  case \" $* \" in\n\
-                 *\" push \"*)\n\
+                 {pattern})\n\
                  \x20 if [ -n \"$LAB_PUSH_GATE\" ]; then\n\
                  \x20   : > \"$LAB_PUSH_GATE.waiting\"\n\
                  \x20   i=0\n\
@@ -711,15 +720,33 @@ impl Gate {
                  \x20 fi;;\n\
                  esac\n\
                  exec '{}' \"$@\"\n",
-                real.display()
+                on_path("git").display()
             ),
-        )
-        .expect("write the gated git");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("make the gated git executable");
+        );
         let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path)))
             .expect("join PATH");
         Self { root, path }
+    }
+
+    /// This gate, with a `jj` first on its `PATH` that refuses `jj
+    /// workspace add`, saying so, and runs the real `jj` for anything else:
+    /// a `start` it holds takes its claim, and then cannot open the
+    /// workspace.
+    fn refusing_workspace_add(self) -> Self {
+        executable(
+            &self.root.path().join("bin").join("jj"),
+            &format!(
+                "#!/bin/sh\n\
+                 case \" $* \" in\n\
+                 *\" workspace add \"*)\n\
+                 \x20 echo 'workspace add refused by the test' >&2\n\
+                 \x20 exit 1;;\n\
+                 esac\n\
+                 exec '{}' \"$@\"\n",
+                on_path("jj").display()
+            ),
+        );
+        self
     }
 
     fn file(&self) -> PathBuf {
@@ -758,6 +785,22 @@ impl Gate {
         std::fs::write(self.file(), "").expect("open the gate");
         child.wait_with_output().expect("collect the held command")
     }
+}
+
+/// Where `program` is on this process's `PATH`.
+fn on_path(program: &str) -> PathBuf {
+    let path = std::env::var_os("PATH").expect("PATH");
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(program))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("{program} on PATH"))
+}
+
+/// Write the script `contents` to `path`, executable.
+fn executable(path: &Path, contents: &str) {
+    std::fs::write(path, contents).expect("write the script");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("make the script executable");
 }
 
 /// Drop every claim from the state file in `home`, as a start killed
@@ -1010,6 +1053,179 @@ fn a_start_that_read_no_claim_loses_to_a_machine_that_took_it_before_its_push() 
     assert_eq!(two.machine_ref(), machine_ref);
     assert_eq!(claim.get("owner"), "owner-one");
     assert_eq!(claim.get("machine"), "machine-one");
+}
+
+#[test]
+fn a_start_that_loses_to_its_own_owner_in_another_config_home_says_a_start_resumes_it() {
+    // Given: machine two, whose own ref already carries an entry, and owner
+    // one's start there of a branch nobody holds, held at its claim push:
+    // it read no claim, and has pushed nothing.
+    let shared = Shared::new();
+    let two = shared.two();
+    two.ran(
+        "owner-one",
+        &[
+            "--text",
+            "notch",
+            "-m",
+            "machine two was here",
+            "--repo",
+            "demo",
+        ],
+    );
+    let (entries, machine_ref) = (two.entries(), two.machine_ref());
+    let gate = Gate::new();
+    let (held, reached) = gate.hold(&mut two.command(
+        "owner-one",
+        &[
+            "--text",
+            "start",
+            BRANCH,
+            "--repo",
+            "demo",
+            "--why",
+            "port it too",
+        ],
+    ));
+
+    // When: the same owner takes the branch on machine one, another config
+    // home, while that push waits, and then the push goes.
+    let took = shared.one.tried(
+        "owner-one",
+        &[
+            "--text", "start", BRANCH, "--repo", "demo", "--why", "port it",
+        ],
+    );
+    let lost = gate.release(held);
+
+    // Then: machine two's start, whose lease expected no claim, claims
+    // nothing and exits 3, saying that the claim is its own owner's and
+    // that a plain start resumes it, and offers no seizure of it.
+    assert!(
+        reached,
+        "machine two's start never reached its claim push: {}",
+        stderr_of(&lost)
+    );
+    assert!(took.status.success(), "{}", stderr_of(&took));
+    let stderr = stderr_of(&lost);
+    assert_eq!(lost.status.code(), Some(3), "{stderr}");
+    let claim = shared.claim(BRANCH).expect("owner one's claim");
+    assert!(
+        stderr.contains(&format!(
+            "nothing was claimed: owner-one, the owner of this start, took {BRANCH} in another \
+             config home, on machine machine-one, while this start ran; `knives start {BRANCH}` \
+             resumes that claim\n{FORK}/{BRANCH} is claimed by owner-one (harness-session) on \
+             machine machine-one, taken {} (",
+            claim.get("started")
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("--force"), "{stderr}");
+    // And: machine two left nothing behind: no workspace, no entry, no
+    // claim, and its own ref where it was.
+    assert!(!two.workspace(BRANCH).exists());
+    assert_eq!(two.entries(), entries);
+    assert_eq!(two.claim(BRANCH), Value::Null);
+    assert_eq!(two.machine_ref(), machine_ref);
+
+    // When: owner one starts the branch on machine two again, as it was
+    // told.
+    let again = two.tried("owner-one", &["--text", "start", BRANCH, "--repo", "demo"]);
+
+    // Then: it resumes the claim it took on machine one.
+    assert!(again.status.success(), "{}", stderr_of(&again));
+    assert!(
+        stdout_of(&again).starts_with("resumed\n"),
+        "{}",
+        stdout_of(&again)
+    );
+    assert_eq!(two.claim(BRANCH)["ledger_commit"], claim.commit.as_str());
+}
+
+#[test]
+fn a_start_whose_claim_another_owner_seized_before_its_release_names_the_holder() {
+    // Given: owner two's start on machine two of a branch nobody holds,
+    // which takes the claim on the ledger, cannot open the workspace, and
+    // is held at the push that releases the claim again.
+    let shared = Shared::new();
+    let two = shared.two();
+    let gate = Gate::on_release().refusing_workspace_add();
+    let (held, reached) = gate.hold(&mut two.command(
+        "owner-two",
+        &[
+            "--text",
+            "start",
+            BRANCH,
+            "--repo",
+            "demo",
+            "--why",
+            "port it too",
+        ],
+    ));
+    let taken = shared
+        .claim(BRANCH)
+        .map(|claim| claim.get("owner").to_owned());
+
+    // When: owner one seizes the branch on machine one while that release
+    // waits, and then the release goes.
+    let seized = shared.one.tried(
+        "owner-one",
+        &[
+            "--text",
+            "start",
+            BRANCH,
+            "--repo",
+            "demo",
+            "--force",
+            "--why",
+            "take it over",
+        ],
+    );
+    let lost = gate.release(held);
+
+    // Then: machine two's release, leased on the claim it took, finds owner
+    // one's claim there and exits 3, naming owner one as the holder, with
+    // the refusal any start of that claim gets, and offers no finish, which
+    // that claim would refuse.
+    assert!(
+        reached,
+        "machine two's start never reached its release: {}",
+        stderr_of(&lost)
+    );
+    assert_eq!(taken.as_deref(), Some("owner-two"));
+    assert!(seized.status.success(), "{}", stderr_of(&seized));
+    let stderr = stderr_of(&lost);
+    assert_eq!(lost.status.code(), Some(3), "{stderr}");
+    let claim = shared.claim(BRANCH).expect("owner one's claim");
+    assert!(
+        stderr.contains(&format!(
+            "knives start could not open the workspace of {BRANCH}: "
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "\nowner-one took {BRANCH} on machine machine-one while this start ran\n{FORK}/{BRANCH} \
+             is claimed by owner-one (harness-session) on machine machine-one, taken {} (",
+            claim.get("started")
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "): take it over\nits activity cannot be read from this machine (machine-two): its \
+             sightings and its processes are on machine machine-one\nuse `knives start {BRANCH} \
+             --force --why \"…\"` to seize the claim\n"
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("knives finish"), "{stderr}");
+    // And: the claim is owner one's, and machine two keeps no copy of it
+    // and no workspace.
+    assert_eq!(claim.get("owner"), "owner-one");
+    assert_eq!(claim.get("machine"), "machine-one");
+    assert_eq!(two.claim(BRANCH), Value::Null);
+    assert!(!two.workspace(BRANCH).exists());
 }
 
 #[test]

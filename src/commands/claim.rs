@@ -127,8 +127,9 @@ fn permits_by_possession(claim: &Claim, context: &ClaimContext<'_>) -> bool {
     context.in_claimed_workspace && taken_here(claim, context.machine)
 }
 
-/// Whether `claim` names `identity` as its holder.
-fn names(claim: &Claim, identity: &Identity) -> bool {
+/// Whether `claim` names `identity` as its holder: the identity match
+/// [`decide`] resumes on, which two anonymous `os-user` names never pass.
+pub fn names(claim: &Claim, identity: &Identity) -> bool {
     claim.kind == identity.kind && claim.kind != OwnerKind::OsUser && claim.owner == identity.owner
 }
 

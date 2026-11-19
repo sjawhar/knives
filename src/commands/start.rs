@@ -13,8 +13,8 @@ use crate::bind::Fork;
 use crate::cli::Exit;
 use crate::commands::claim::{
     Bound, ClaimContext, ClaimDecision, Identity, SharedClaims, Sighting, both_anonymous,
-    change_on_ledger, claimed_on, copy_of, current_identity, decide, git_dir_of, owner_kind_label,
-    refusing, render_claim_context, render_seized, render_seized_unread,
+    change_on_ledger, claimed_on, copy_of, current_identity, decide, git_dir_of, names,
+    owner_kind_label, refusing, render_claim_context, render_seized, render_seized_unread,
     render_shared_claim_context, render_shared_seized, sighting_provenance, unapplied_cause,
     unread_claim, unreadable_activity, unreadable_holder, unwritten,
 };
@@ -1183,9 +1183,9 @@ fn start_on_ledger(request: &Request<'_>, store: &mut Store) -> anyhow::Result<O
         bound,
         ..
     } = *request;
-    if ledger_sweep::ledger_of(bound.registry, &fork.upstream).is_none() {
+    let Some(ledger) = ledger_sweep::ledger_of(bound.registry, &fork.upstream) else {
         return Ok(None);
-    }
+    };
     let claim = match ClaimRef::new(&fork.upstream, branch) {
         Ok(claim) => claim,
         Err(error @ (ClaimError::TooLong { .. } | ClaimError::Refused { .. })) => {
@@ -1194,9 +1194,13 @@ fn start_on_ledger(request: &Request<'_>, store: &mut Store) -> anyhow::Result<O
         }
         Err(error) => return Err(error.into()),
     };
-    match ledger_sweep::shared_fork(&default_ledger_root(), bound.registry, &fork.upstream) {
-        Ok(Some(shared)) => shared_start(request, store, &shared, claim).map(Some),
-        Ok(None) => Ok(None),
+    match ledger_sweep::shared_fork(
+        &default_ledger_root(),
+        bound.registry,
+        &fork.upstream,
+        ledger,
+    ) {
+        Ok(shared) => shared_start(request, store, &shared, claim).map(Some),
         Err(error) => {
             eprintln!(
                 "nothing was claimed: {}",
@@ -1733,7 +1737,11 @@ fn lost(
     failure: &LedgerFailure,
 ) -> Exit {
     match why {
-        NotApplied::Lost { now: Some(_) } => taken_meanwhile(context, on),
+        NotApplied::Lost { now: Some(_) } => {
+            let (said, exit) = taken_meanwhile(context, on);
+            eprintln!("{said}");
+            exit
+        }
         NotApplied::Lost { now: None } => {
             eprintln!("{}", released_meanwhile(context.branch, on));
             Exit::Incomplete
@@ -1748,37 +1756,41 @@ fn lost(
     }
 }
 
-/// A lost lease: another machine took or changed the claim between this
-/// `start`'s read and its push. The claim is read again, and refuses as any
-/// claim there refuses, after a line that says who took it.
-fn taken_meanwhile(context: &StartContext<'_>, on: &OnLedger<'_>) -> Exit {
+/// A lost lease: another config home took or changed the claim between
+/// this `start`'s read and its push. What to say of the claim it holds now,
+/// read again, and the exit of a `start` that lost its race to it.
+///
+/// Another owner's claim refuses as any claim there refuses, after a line
+/// that says who took it (exit 2). The caller's own claim ([`names`], as
+/// [`decide`] matches it), taken in another config home, refuses nothing:
+/// a `start` again resumes it, so no seizure of it is offered (exit 3). A
+/// claim gone, or one that cannot be read, is no claim to name (exit 3).
+fn taken_meanwhile(context: &StartContext<'_>, on: &OnLedger<'_>) -> (String, Exit) {
     let branch = context.branch;
     let target = BranchTarget::new(context.fork.upstream.clone(), branch.clone());
     match ledger_sweep::read_claim(on.shared, &on.claim) {
-        Err(failure) => {
-            eprintln!("{}", unread(branch, on.shared, &failure));
-            Exit::Incomplete
-        }
-        Ok(None) => {
-            eprintln!("{}", released_meanwhile(branch, on));
-            Exit::Incomplete
-        }
+        Err(failure) => (unread(branch, on.shared, &failure), Exit::Incomplete),
+        Ok(None) => (released_meanwhile(branch, on), Exit::Incomplete),
         Ok(Some(HeldClaim {
             commit,
             record: Err(cause),
-        })) => {
-            eprintln!(
+        })) => (
+            format!(
                 "the claim of {branch} changed while this start ran\n{}",
                 unreadable_record_refusal(&target, &on.claim, &commit, &cause)
-            );
-            Exit::Usage
-        }
+            ),
+            Exit::Usage,
+        ),
         Ok(Some(HeldClaim {
             commit,
             record: Ok(record),
         })) => {
             let claim = copy_of(&target, &commit, record);
             let machine = claimed_on(&claim, on.machine());
+            let now = jiff::Timestamp::now();
+            if names(&claim, &context.identity) {
+                return (own_claim_meanwhile(&claim, machine, now), Exit::Incomplete);
+            }
             // Taken after this config home read the claim, so it recorded
             // nothing of it: its activity cannot be read here.
             let refusal = shared_refusal(
@@ -1789,24 +1801,44 @@ fn taken_meanwhile(context: &StartContext<'_>, on: &OnLedger<'_>) -> Exit {
                     activity: None,
                     anonymous: both_anonymous(&claim, &context.identity),
                 },
-                jiff::Timestamp::now(),
+                now,
             );
-            eprintln!(
-                "{} took {branch} on machine {} while this start ran\n{refusal}",
-                inline_human_text(&claim.owner),
-                inline_human_text(machine)
-            );
-            Exit::Usage
+            (
+                format!(
+                    "{} took {branch} on machine {} while this start ran\n{refusal}",
+                    inline_human_text(&claim.owner),
+                    inline_human_text(machine)
+                ),
+                Exit::Usage,
+            )
         }
     }
+}
+
+/// What `start` says where the claim that won its race is the caller's own,
+/// `claim`, taken on machine `machine` in another config home: this
+/// `start` claimed nothing, and a `start` again resumes that claim.
+fn own_claim_meanwhile(claim: &Claim, machine: &str, now: jiff::Timestamp) -> String {
+    format!(
+        "nothing was claimed: {}, the owner of this start, took {} in another config home, on \
+         machine {}, while this start ran; `knives start {}` resumes that claim\n{}",
+        inline_human_text(&claim.owner),
+        claim.branch,
+        inline_human_text(machine),
+        claim.branch,
+        render_shared_claim_context(claim, machine, None, now)
+    )
 }
 
 /// The workspace could not be opened, or the claim's copy not saved, after
 /// the ledger took the claim at `commit`: release it, leased on that
 /// commit, so that no claim stays on the ledger with no workspace. Where
-/// that release cannot be sent either, the claim is held with no workspace,
-/// and `knives finish` is what releases it. Exit 3 either way: the start
-/// did not open the workspace.
+/// another config home took the claim meanwhile, the lease is lost, and the
+/// claim it holds now is named as for a race this `start` lost
+/// ([`taken_meanwhile`]); where it released the claim, nothing is held.
+/// Where the release cannot be sent, the claim is held with no workspace,
+/// and `knives finish` is what releases it. Exit 3 each way: the start did
+/// not open the workspace.
 fn release_unopened(
     context: &StartContext<'_>,
     on: &OnLedger<'_>,
@@ -1835,6 +1867,14 @@ fn release_unopened(
             "its claim is released on the ledger {}, so nothing is claimed",
             on.shared.ledger
         ),
+        ClaimOutcome::NotApplied {
+            why: NotApplied::Lost { now: Some(_) },
+            ..
+        } => eprintln!("{}", taken_meanwhile(context, on).0),
+        ClaimOutcome::NotApplied {
+            why: NotApplied::Lost { now: None },
+            ..
+        } => eprintln!("{}", released_meanwhile(branch, on)),
         ClaimOutcome::NotApplied { failure, .. } | ClaimOutcome::Unknown { failure } => {
             eprintln!(
                 "the claim of {branch} is held on the ledger {} with no workspace, since its \

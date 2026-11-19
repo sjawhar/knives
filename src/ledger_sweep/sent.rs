@@ -381,7 +381,9 @@ mod tests {
     use crate::ledger_git::{ClaimRecord, ClaimRef};
     use crate::ledger_sweep::kept::Kept;
     use crate::ledger_sweep::lab::{FORK, LEDGER_URL, Lab, git, init};
-    use crate::ledger_sweep::{ClaimChange, ClaimOutcome, change_claim, shared_fork, sweep_log};
+    use crate::ledger_sweep::{
+        ClaimChange, ClaimOutcome, change_claim, ledger_of, shared_fork, sweep_log,
+    };
     use crate::store::OwnerKind;
 
     /// What a send's tests do on the lab's machine and its remote.
@@ -471,9 +473,8 @@ mod tests {
         // nothing can reach.
         let lab = Lab::new();
         let fork = UpstreamName::new(FORK);
-        let shared = shared_fork(&lab.root, &lab.registry, &fork)
-            .unwrap()
-            .unwrap();
+        let ledger = ledger_of(&lab.registry, &fork).unwrap();
+        let shared = shared_fork(&lab.root, &lab.registry, &fork, ledger).unwrap();
         let claim = ClaimRef::new(&fork, &BranchName::new("feat/a")).unwrap();
         let scribe = lab.scribe();
         let changed = change_claim(
