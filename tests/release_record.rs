@@ -4773,3 +4773,58 @@ fn a_record_that_lacks_a_named_file_with_no_reference_here_is_told_to_fetch_the_
     );
     assert_eq!(ledger_entries(&home), entries, "{out}");
 }
+
+#[test]
+fn an_older_adopt_of_a_path_past_the_piece_bound_is_refused_in_a_clone_without_its_commit() {
+    // Given: RELEASE fixed by hand with one new file whose path joins 17
+    // pieces with `, `, one more than an older event's text is read for, and
+    // adopted, its event as a knives from before the `fix_files` list writes
+    // it; the next release cut on it, which holds the file; a second clone
+    // that holds the next release and not the adopt's commit; and the third
+    // release merged by hand there, without the fix.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    let seventeen = (1..=17)
+        .map(|piece| format!("p{piece:02}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let adopt = fix_by_hand(
+        (&lab, &home),
+        RELEASE,
+        &[(seventeen.as_str(), Some("fixed by hand\n"))],
+        "a fix by hand",
+    );
+    without_fix_files(&home, RELEASE);
+    let next = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(matches!(next.status.code(), Some(0 | 1)), "{}", text(&next));
+    let next = commit_at(&lab, "release/2026-08-05");
+    for branch in ["feat/alpha", "feat/beta", "release/2026-08-05"] {
+        lab.push_branch(branch);
+    }
+    fetch_second_clone(&lab);
+    assert!(
+        !second_clone_holds(&lab, &adopt) && second_clone_holds(&lab, &next),
+        "the second clone holds the next release and not the adopt's commit"
+    );
+    let commit = hand_merge_in_second_clone(&lab, None);
+    let entries = ledger_entries(&home);
+
+    // When: it is recorded in the second clone.
+    let recorded = cut_in_second_clone(
+        &lab,
+        &home,
+        &["release/2026-08-06", "--at", commit.as_str()],
+    );
+
+    // Then: it is refused, naming the adopt, and nothing is written: a path
+    // the bound does not read is a fix this clone cannot hold, so the record
+    // refuses rather than hold less (INFRA-1484's architect, 06:09Z).
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert!(out.contains(adopt.short()), "{out}");
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+}
