@@ -5,11 +5,12 @@
 //! conflicts in both files although no side touched another's text. A cut, an
 //! `include`, an `advance` and a rebase write that conflict's union — every
 //! block verbatim, the block the write brings in above what the release
-//! already held — and the content checks read a member whose block the union
-//! holds as carried. A conflict that is not every side inserting its own
-//! block — a member that rewrote its block, sides on different bases, a code
-//! file, a drop that takes a block out — stays conflicted and is named as a
-//! person's.
+//! already held, and a member's entries under a `### ` heading the release's
+//! block already has in that one list, the heading written once — and the
+//! content checks read a member whose block the union holds as carried. A
+//! conflict that is not every side inserting its own block — a member that
+//! rewrote its block, sides on different bases, a code file, a drop that
+//! takes a block out — stays conflicted and is named as a person's.
 //! The fixtures are the real ygo and oh-my-pi files, cut down; their README
 //! names each source.
 
@@ -695,5 +696,55 @@ fn a_rebase_that_sheds_a_stale_base_says_once_that_the_shed_write_unioned() {
             .ends_with("; union: CHANGELOG.md, RELEASE_NOTES.md; unchecked: no record"),
         "{stdout}\n{}",
         event.text
+    );
+}
+
+/// A changelog whose `[Unreleased]` section holds `unreleased`, above one
+/// published release.
+fn with_unreleased(unreleased: &str) -> String {
+    format!(
+        "# Changelog\n\n## [Unreleased]\n\n{unreleased}## [1.0.0] - 2026-08-01\n\n### Added\n\n\
+         - The first release.\n"
+    )
+}
+
+#[test]
+fn an_include_puts_a_members_entries_under_a_heading_the_release_already_has_in_that_one_list() {
+    // Given: a trunk whose changelog's `[Unreleased]` section is empty; a
+    // release cut from a member that adds an entry under `### Fixed` there;
+    // and a second member that adds two entries under `### Fixed` there.
+    let (trunk, alpha, beta) = (
+        with_unreleased(""),
+        with_unreleased("### Fixed\n\n- Alpha's fix.\n\n"),
+        with_unreleased("### Fixed\n\n- Beta's first fix.\n- Beta's second fix.\n\n"),
+    );
+    let lab = trunk_with(&[("CHANGELOG.md", trunk.as_str())]);
+    member(&lab, "feat/alpha", &[("CHANGELOG.md", alpha.as_str())]);
+    let (home, _consumer) = release_test_home(&lab);
+    release_ok(&lab, &home, &["cut", RELEASE]);
+    member(&lab, "feat/beta", &[("CHANGELOG.md", beta.as_str())]);
+
+    // When: the second member is included.
+    let included = release_ok(&lab, &home, &["include", "feat/beta"]);
+
+    // Then: no conflict is left, and `[Unreleased]` holds `### Fixed` once,
+    // with all three entries in its one list, the member's two above the
+    // entry the release held, each line as its member wrote it.
+    assert_eq!(conflicts(&lab), Vec::<String>::new(), "{included}");
+    assert_release_file(
+        &lab,
+        "CHANGELOG.md",
+        &with_unreleased(
+            "### Fixed\n\n- Beta's first fix.\n- Beta's second fix.\n- Alpha's fix.\n\n",
+        ),
+    );
+
+    // And: the content check reads both members as carried.
+    let verified = release_ok(&lab, &home, &["members", "--verify"]);
+    assert!(!verified.contains("!!"), "{verified}");
+    assert_eq!(
+        verified.matches(": carried (replay empty)").count(),
+        2,
+        "{verified}"
     );
 }

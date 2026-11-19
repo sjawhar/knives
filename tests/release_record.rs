@@ -28,10 +28,13 @@
 //! the adopt's commit, holds each named file to what its reference holds
 //! there, nothing included. The adopt event lists the files of its fix
 //! whole, so a path that holds a separator reads back whole; an older adopt
-//! event names them in its text alone, and a clone holds each path that the
-//! text may name. A published name that the publish remote lacks is not
-//! recorded until it is pushed, and the refusal gives the commands. A
-//! printed command quotes the name for the shell.
+//! event names them in its text alone, and a clone holds each path of up to
+//! 16 pieces that the text may name, however many files its list names. A
+//! record that lacks a file with no reference here is told to fetch the
+//! write where the walk for that reference stopped. A published name that
+//! the publish remote lacks is not recorded until it is pushed, and the
+//! refusal gives the commands. A printed command quotes the name for the
+//! shell.
 
 #![allow(
     clippy::expect_used,
@@ -4573,4 +4576,200 @@ fn a_clone_without_the_adopts_commit_holds_a_deleted_path_as_absent_until_a_writ
         );
         assert!(!out.contains("the fix by hand of"), "{older}: {out}");
     }
+}
+
+#[test]
+fn an_older_adopt_of_two_thousand_files_holds_each_of_them_in_a_clone_without_its_commit() {
+    // Given: RELEASE fixed by hand with 2,000 new files and one whose path
+    // joins 16 pieces with `, `, and adopted, its event as a knives from
+    // before the `fix_files` list writes it, so its text alone names them,
+    // in one list of 2,016 pieces; the next release cut on it, which holds
+    // them all; a second clone that holds the next release and not the
+    // adopt's commit; and the third release merged by hand there, without
+    // the fix.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    let sixteen = (1..=16)
+        .map(|piece| format!("p{piece:02}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let files: Vec<String> = (0..2000)
+        .map(|file| format!("f{file:04}.txt"))
+        .chain(std::iter::once(sixteen))
+        .collect();
+    let fixed: Vec<(&str, Option<&str>)> = files
+        .iter()
+        .map(|file| (file.as_str(), Some("fixed by hand\n")))
+        .collect();
+    let adopt = fix_by_hand((&lab, &home), RELEASE, &fixed, "a fix by hand");
+    without_fix_files(&home, RELEASE);
+    let next = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(matches!(next.status.code(), Some(0 | 1)), "{}", text(&next));
+    let next = commit_at(&lab, "release/2026-08-05");
+    for branch in ["feat/alpha", "feat/beta", "release/2026-08-05"] {
+        lab.push_branch(branch);
+    }
+    fetch_second_clone(&lab);
+    assert!(
+        !second_clone_holds(&lab, &adopt) && second_clone_holds(&lab, &next),
+        "the second clone holds the next release and not the adopt's commit"
+    );
+    let commit = hand_merge_in_second_clone(&lab, None);
+    let entries = ledger_entries(&home);
+
+    // When: it is recorded in the second clone.
+    let refused = cut_in_second_clone(
+        &lab,
+        &home,
+        &["release/2026-08-06", "--at", commit.as_str()],
+    );
+
+    // Then: it is refused, naming the adopt and each of its files, the path
+    // of 16 pieces whole among them, and nothing is written: the clone reads
+    // each run of up to 16 pieces of the list, and the newest recorded write
+    // holds each file.
+    let out = text(&refused);
+    assert_eq!(refused.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to record release/2026-08-06 at {}: it does not carry the fix by hand \
+             of {RELEASE}'s adopt {adopt}, in 2001 file(s): {} (this repository does not hold \
+             {adopt}, so the fix is held by its content: what release/2026-08-05's newest \
+             recorded write (a cut) {} holds in those files)\n",
+            commit.short(),
+            files.join(", "),
+            next.short(),
+            adopt = adopt.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+}
+
+/// A commit that no repository here holds: a write that a peer recorded and
+/// never pushed.
+const UNPUSHED: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// Record an edit of `name` that a peer wrote just before `write`, the
+/// newest recorded write of `name`, and never pushed, at `commit`: a copy of
+/// `write`'s event that names `commit`, filed to sort just before it, as a
+/// ledger pulled from that peer holds it.
+fn unpushed_edit_before(home: &tempfile::TempDir, name: &str, (write, commit): (&CommitId, &str)) {
+    let ledger = home.path().join("ledger").join("demo");
+    let said = format!("edited {name} as {} ", write.short());
+    for dirent in std::fs::read_dir(&ledger).expect("read the ledger directory") {
+        let path = dirent.expect("read a ledger file").path();
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if !contents.contains(&said) {
+            continue;
+        }
+        let file = path
+            .file_name()
+            .and_then(|file| file.to_str())
+            .expect("a ledger file name");
+        let (stamp, rest) = file.split_once('Z').expect("an entry file name");
+        let (seconds, nanoseconds) = stamp.split_once('.').expect("an entry file stamp");
+        let nanoseconds: u32 = nanoseconds.parse().expect("the stamp's nanoseconds");
+        assert!(nanoseconds > 0, "no stamp sorts just before {file}");
+        let earlier = format!("{seconds}.{:09}Z{rest}", nanoseconds - 1);
+        let copied = contents
+            .replace(write.as_str(), commit)
+            .replace(write.short(), &commit[..12]);
+        std::fs::write(ledger.join(earlier), copied).expect("write the peer's edit");
+        return;
+    }
+    panic!("no event records {name} at {write}");
+}
+
+#[test]
+fn a_record_that_lacks_a_named_file_with_no_reference_here_is_told_to_fetch_the_write_it_needs() {
+    // Given: shared.txt on the trunk; RELEASE cut of `feat/alpha` and
+    // `feat/beta`, which changes its line 5; RELEASE fixed by hand in place
+    // on line 2 and adopted; RELEASE fixed by hand again with the new file
+    // `x, shared.txt` and adopted, both adopt events as a knives from before
+    // the `fix_files` list writes them, so the second one's text may name
+    // `x`, `x, shared.txt` and `shared.txt`; the next release cut on it;
+    // then `feat/beta` changes line 2 as well, and `advance` writes the next
+    // release with that line conflicted; and a peer's edit of the next
+    // release recorded just before that write, whose commit no remote
+    // holds. So the second adopt's own tree holds `shared.txt`, a file its
+    // change leaves out, and the walk for that file's reference passes the
+    // conflicted newest write and stops at the peer's edit, which this
+    // repository does not hold.
+    let lab = Lab::new();
+    lab.upstream_trunk_file("shared.txt", "l1\nl2\nl3\nl4\nl5\n");
+    lab.mirror_upstream_trunk_to_origin();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "shared.txt", "l1\nl2\nl3\nl4\nl5-beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    fix_by_hand(
+        (&lab, &home),
+        RELEASE,
+        &[("shared.txt", Some("l1\nl2-fixed\nl3\nl4\nl5-beta\n"))],
+        "a fix by hand",
+    );
+    let second = fix_by_hand(
+        (&lab, &home),
+        RELEASE,
+        &[("x, shared.txt", Some("fixed by hand\n"))],
+        "a second fix by hand",
+    );
+    without_fix_files(&home, RELEASE);
+    let next = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(matches!(next.status.code(), Some(0 | 1)), "{}", text(&next));
+    lab::extend_branch(
+        &lab,
+        "feat/beta",
+        "shared.txt",
+        "l1\nl2-beta\nl3\nl4\nl5-beta\n",
+    );
+    let advanced = knives_release(&lab, &home, &["advance", "feat/beta"]);
+    assert!(
+        matches!(advanced.status.code(), Some(0 | 1)),
+        "{}",
+        text(&advanced)
+    );
+    let newest = commit_at(&lab, "release/2026-08-05");
+    unpushed_edit_before(&home, "release/2026-08-05", (&newest, UNPUSHED));
+    let commit = merged_with(&lab, &[("x, shared.txt", "fixed by hand\n")]);
+    let entries = ledger_entries(&home);
+
+    // When: the third release, merged by hand with `x, shared.txt` and with
+    // line 2 of `shared.txt` as `feat/beta` has it, is recorded.
+    let refused = record(&lab, &home, "release/2026-08-06", &commit);
+
+    // Then: it is refused, naming the second adopt at `shared.txt`, which
+    // no commit carries here; the remedy names the peer's edit where the
+    // walk stopped, with its release, and its fetch, then the adopt that
+    // keeps the new content; and nothing is written.
+    let out = text(&refused);
+    assert_eq!(refused.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "it does not carry the fix by hand of {RELEASE}'s adopt {}, in 1 file(s): \
+             shared.txt\n",
+            second.short()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "\n  nothing was recorded; fetch release/2026-08-05's recorded write {}, which this \
+             repository does not hold, then record a commit that carries those fixes; to keep \
+             the new content of those files, edit release/2026-08-05 by hand to hold it and run \
+             `knives release adopt release/2026-08-05`, or re-run with --allow-drop to state the \
+             drop is intended\n",
+            &UNPUSHED[..12]
+        )),
+        "{out}"
+    );
+    assert_eq!(ledger_entries(&home), entries, "{out}");
 }

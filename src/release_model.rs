@@ -4,7 +4,7 @@
 //! Commands gather their I/O and render their answers around these rules.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use crate::config::{RepoEntry, Role};
@@ -1172,34 +1172,21 @@ pub fn recorded_write_events<'a>(
 /// the series `scheme`, `except` aside: what a cut is held against beside
 /// the series' previous cut ([`CompositionBaseline`]).
 ///
-/// The release is the newest name, in the series' one order
-/// ([`ReleaseScheme::cut_key`]), that the ledger records a cut or edit of
-/// ([`recorded_release_names`]); under a fixed scheme it is the fixed
-/// branch, the one name that the scheme owns. Its newest write is its cut,
-/// its newest edit or an `adopt`, whichever the ledger records last
-/// ([`recorded_write_events`]). The members are that event's
-/// ([`event_members`]), less each parent that its parent set labels as the
-/// previous release ([`previous_release_label`]) or as a carrier
-/// ([`carrier_label`]). So a member that `include` added after the cut is
-/// held, and so is each member of a stacked release, whose cut records none.
+/// It is the first of the series' writes ([`series_write_events`]): the
+/// newest release's cut, its newest edit or an `adopt`, whichever the
+/// ledger records last. Under a fixed scheme the release is the fixed
+/// branch, the one name that the scheme owns. The members are that
+/// event's ([`event_members`]), less each parent that its parent set
+/// labels as the previous release ([`previous_release_label`]) or as a
+/// carrier ([`carrier_label`]). So a member that `include` added after the
+/// cut is held, and so is each member of a stacked release, whose cut
+/// records none.
 pub fn newest_release_write(
     entries: &[Entry],
     scheme: &ReleaseScheme,
     except: Option<&str>,
 ) -> Option<RecordedCut> {
-    let mut names = recorded_release_names(entries, scheme)
-        .into_iter()
-        .filter(|name| Some(*name) != except);
-    let name = match scheme {
-        ReleaseScheme::Fixed(_) => names.next()?,
-        ReleaseScheme::Dated | ReleaseScheme::Series(_) => {
-            names
-                .filter_map(|name| scheme.cut_key(name).map(|key| (key, name)))
-                .max_by_key(|(key, _)| *key)?
-                .1
-        }
-    };
-    let (event, write) = recorded_write_events(entries, name).next()?;
+    let (name, event, write) = series_write_events(entries, scheme, except).next()?;
     let carrier = carrier_label(name);
     Some(RecordedCut {
         kind: write.kind,
@@ -1211,19 +1198,49 @@ pub fn newest_release_write(
     })
 }
 
+/// A recorded write of a series ([`series_writes`]): the release it wrote
+/// and its commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesWrite<'a> {
+    /// The release, a ledger entry's subject.
+    pub name: &'a str,
+    /// The write's commit.
+    pub commit: CommitId,
+}
+
 /// Every write that `entries` record in the series `scheme`, `except`
-/// aside, newest first: what a fix by hand is held against, file by file
-/// ([`crate::commands::release::adopted_fixes`]).
+/// aside, newest first, each with its release: what a fix by hand is held
+/// against, file by file ([`crate::commands::release::adopted_fixes`]).
 ///
-/// The releases come newest first, in the order that
-/// [`newest_release_write`] takes the newest from, and each release's
-/// writes newest first ([`recorded_writes`]). So the first write is the
-/// newest recorded write, and each later one is older.
-pub fn series_writes(
-    entries: &[Entry],
+/// They are [`series_write_events`], so the first is the newest recorded
+/// write ([`newest_release_write`]), and each later one is older.
+pub fn series_writes<'a>(
+    entries: &'a [Entry],
     scheme: &ReleaseScheme,
     except: Option<&str>,
-) -> Vec<CommitId> {
+) -> Vec<SeriesWrite<'a>> {
+    series_write_events(entries, scheme, except)
+        .map(|(name, _, write)| SeriesWrite {
+            name,
+            commit: write.commit,
+        })
+        .collect()
+}
+
+/// The one order of a series' writes: every write that `entries` record in
+/// the series `scheme`, `except` aside, newest first, each with its release
+/// and its event.
+///
+/// The releases are the names that the ledger records a cut or edit of
+/// ([`recorded_release_names`]), newest first in the series' one order
+/// ([`ReleaseScheme::cut_key`]); under a fixed scheme there is one, the
+/// fixed branch. Each release's writes come newest first
+/// ([`recorded_write_events`]).
+fn series_write_events<'a>(
+    entries: &'a [Entry],
+    scheme: &ReleaseScheme,
+    except: Option<&str>,
+) -> impl Iterator<Item = (&'a str, &'a Entry, RecordedWrite)> {
     let mut names: Vec<_> = recorded_release_names(entries, scheme)
         .into_iter()
         .filter(|name| Some(*name) != except)
@@ -1235,10 +1252,9 @@ pub fn series_writes(
         })
         .collect();
     names.sort_unstable_by(|first, second| second.cmp(first));
-    names
-        .into_iter()
-        .flat_map(|(_, name)| recorded_writes(entries, name).map(|write| write.commit))
-        .collect()
+    names.into_iter().flat_map(move |(_, name)| {
+        recorded_write_events(entries, name).map(move |(event, write)| (name, event, write))
+    })
 }
 
 /// Whether `start` or a commit on its first-parent line stands for
@@ -1388,17 +1404,18 @@ pub fn adopted_fix_replaces<'a>(entry: &'a Entry, release: &str) -> Option<&'a s
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AdoptedFixFiles {
     /// The files resolved by hand, then those changed beyond the baseline's
-    /// conflicts. Read from the event's text, they are every path the text
-    /// may name ([`text_paths`]).
+    /// conflicts, each path once. Read from the event's text, they are every
+    /// path the text may name ([`text_paths`]).
     pub files: Vec<String>,
     /// Whether they were read from the event's text, as for an event without
     /// a `fix_files` list ([`Entry::fix_files`]), which an older knives
     /// writes. The text joins a list's files with `, ` and ends the list at
     /// `; ` or ` (why: `, so it cannot tell a path that holds one of those
-    /// from two paths. A reader that measures the adopt holds only those of
-    /// [`Self::files`] that the adopt's own tree holds, beside the files that
-    /// its change changes; a reader that cannot measure it holds each of
-    /// them.
+    /// from two paths, and it names no path that it cannot read whole
+    /// ([`adopted_fix_files`]). A reader that measures the adopt holds only
+    /// those of [`Self::files`] that the adopt's own tree holds, beside the
+    /// files that its change changes; a reader that cannot measure it holds
+    /// each of them.
     pub from_text: bool,
 }
 
@@ -1406,41 +1423,72 @@ pub struct AdoptedFixFiles {
 /// the list at, and so what a path that holds one reads back cut at.
 const TEXT_SEPARATORS: [&str; 3] = [", ", "; ", " (why: "];
 
-/// Every path that `list`, one list of files in an `adopt` event's text,
-/// may name: each run of its pieces, as the text cuts it at each separator
-/// ([`TEXT_SEPARATORS`]), joined back with the separators the text holds
-/// between them. So `x, y.txt` gives `x`, `x, y.txt` and `y.txt`: two paths,
-/// or one path that holds `, `. Each path once, in the order the text
-/// names them.
-fn text_paths(list: &str) -> Vec<String> {
-    let (mut starts, mut ends) = (vec![0], Vec::new());
-    let mut at = 0;
-    while let Some((offset, separator)) = list.get(at..).and_then(|rest| {
-        TEXT_SEPARATORS
-            .iter()
-            .filter_map(|separator| rest.find(separator).map(|offset| (offset, *separator)))
-            .min_by_key(|(offset, _)| *offset)
-    }) {
-        ends.push(at + offset);
-        at += offset + separator.len();
-        starts.push(at);
+/// The most pieces of a list in an `adopt` event's text that one path read
+/// back from it joins ([`text_paths`]). A path that holds up to 15
+/// separators reads back whole; a path that holds more is not read, as a
+/// path that a person names holds a few separators at most. The cap bounds
+/// the reading of a list of `n` pieces, which any peer's ledger may carry,
+/// to at most `16 * n` paths of at most 16 pieces each: every run of its
+/// pieces would be `n * (n + 1) / 2` paths, each up to the whole list long.
+const TEXT_PATH_PIECES: usize = 16;
+
+/// Where each piece of `list`, one list of files in an `adopt` event's
+/// text, begins and ends: the text cuts it at each separator
+/// ([`TEXT_SEPARATORS`]), the first one after each piece. Each separator
+/// is searched for again only once the pieces have passed its last match,
+/// so the list is read once for each separator.
+fn text_pieces(list: &str) -> Vec<(usize, usize)> {
+    let find = |separator: &str, from: usize| {
+        list.get(from..)
+            .and_then(|rest| rest.find(separator))
+            .map(|offset| from + offset)
+    };
+    let mut next = TEXT_SEPARATORS.map(|separator| find(separator, 0));
+    let (mut pieces, mut start) = (Vec::new(), 0);
+    while let Some((end, length)) = TEXT_SEPARATORS
+        .iter()
+        .zip(next)
+        .filter_map(|(separator, at)| Some((at?, separator.len())))
+        .min_by_key(|(at, _)| *at)
+    {
+        pieces.push((start, end));
+        start = end + length;
+        for (found, separator) in next.iter_mut().zip(TEXT_SEPARATORS) {
+            if found.is_some_and(|at| at < start) {
+                *found = find(separator, start);
+            }
+        }
     }
-    ends.push(list.len());
-    let mut paths: Vec<String> = Vec::new();
-    for (piece, start) in starts.iter().enumerate() {
-        for end in ends.iter().skip(piece) {
-            if let Some(path) = list.get(*start..*end)
-                && !path.is_empty()
-                && !paths.iter().any(|named| named == path)
-            {
-                paths.push(path.to_owned());
+    pieces.push((start, list.len()));
+    pieces
+}
+
+/// Every path that `lists`, the lists of files in an `adopt` event's text,
+/// may name: each run of at most [`TEXT_PATH_PIECES`] pieces of a list
+/// ([`text_pieces`]), joined back with the separators the text holds
+/// between them. So `x, y.txt` gives `x`, `x, y.txt` and `y.txt`: two paths,
+/// or one path that holds `, `. Each path once, in the order that the text
+/// names them, as a slice of the text.
+fn text_paths<'a>(lists: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let (mut paths, mut named) = (Vec::new(), HashSet::new());
+    for list in lists {
+        let pieces = text_pieces(list);
+        for (piece, (start, _)) in pieces.iter().enumerate() {
+            for (_, end) in pieces.iter().skip(piece).take(TEXT_PATH_PIECES) {
+                if let Some(path) = list.get(*start..*end)
+                    && !path.is_empty()
+                    && named.insert(path)
+                {
+                    paths.push(path);
+                }
             }
         }
     }
     paths
 }
 
-/// The files that an `adopt` event of `release` names as its fix by hand.
+/// The files that an `adopt` event of `release` names as its fix by hand,
+/// each path once.
 ///
 /// They are the files it resolved by hand ([`ADOPTED_RESOLVED`]), then the
 /// files it changed beyond the baseline's conflicts ([`ADOPTED_BEYOND`]), as
@@ -1453,20 +1501,26 @@ fn text_paths(list: &str) -> Vec<String> {
 /// alone ([`AdoptedFixFiles::from_text`]): each list as its files joined by
 /// `, `, then the event's other parts after `; `, and its parents last,
 /// after `; parents: `. The resolved list ends where the other list begins,
-/// after `; `, or else at the next part that knives writes: `why: `,
-/// `carriers: ` or `added lines absent: `. The other list ends where its
-/// reason begins, at its last ` (why: `, or else at the next `; `. A path
-/// that holds a separator does not read back whole from a list, so each
-/// list gives every path it may name ([`text_paths`]).
+/// at the first `; changed beyond the baseline's conflicts: `, or, where
+/// no other list follows, at the first `; why: `, `; carriers: ` or
+/// `; added lines absent: `. The other list ends where its reason begins,
+/// at its last ` (why: `, or else at the next `; `. A path that holds a
+/// separator does not read back whole from a list, so each list gives every
+/// path of at most [`TEXT_PATH_PIECES`] pieces that it may name
+/// ([`text_paths`]). So the text names no file resolved by hand whose path
+/// holds one of those parts that ends its list, and no path of more pieces;
+/// the `fix_files` list has neither limit.
 pub fn adopted_fix_files(entry: &Entry, release: &str) -> AdoptedFixFiles {
     let Some((_, parts)) = adopted_fix_parts(entry, release) else {
         return AdoptedFixFiles::default();
     };
     if !entry.fix_files.is_empty() {
+        let mut listed = HashSet::new();
         return AdoptedFixFiles {
             files: entry
                 .fix_files
                 .iter()
+                .filter(|file| listed.insert(file.path.as_str()))
                 .map(|file| file.path.clone())
                 .collect(),
             from_text: false,
@@ -1485,20 +1539,17 @@ pub fn adopted_fix_files(entry: &Entry, release: &str) -> AdoptedFixFiles {
             )
         },
     );
-    let mut files = text_paths(resolved);
-    if let Some(beyond) = beyond {
-        let list = beyond
+    let beyond = beyond.map(|beyond| {
+        beyond
             .rsplit_once(" (why: ")
             .or_else(|| beyond.split_once("; "))
-            .map_or(beyond, |(list, _)| list);
-        for path in text_paths(list) {
-            if !files.contains(&path) {
-                files.push(path);
-            }
-        }
-    }
+            .map_or(beyond, |(list, _)| list)
+    });
     AdoptedFixFiles {
-        files,
+        files: text_paths(std::iter::once(resolved).chain(beyond))
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         from_text: true,
     }
 }
@@ -2583,8 +2634,11 @@ mod unchecked_mark_tests {
 
 #[cfg(test)]
 mod adopted_fix_tests {
+    use std::collections::HashSet;
+
     use super::{
-        AdoptedFixFiles, CommitId, adopted_fix_files, adopted_fix_replaces, carrier_tests::event,
+        AdoptedFixFiles, CommitId, TEXT_PATH_PIECES, adopted_fix_files, adopted_fix_replaces,
+        carrier_tests::event,
     };
     use crate::ledger::{Entry, FixChange, FixFile};
 
@@ -2697,6 +2751,45 @@ mod adopted_fix_tests {
             adopted_fix_replaces(&listed, "integration"),
             adopted_fix_replaces(&older, "integration")
         );
+    }
+
+    #[test]
+    fn an_older_adopt_events_long_list_reads_at_most_sixteen_paths_for_each_of_its_pieces() {
+        // Given: an adopt of 3,000 files, of a path that joins 16 pieces with
+        // `, ` and of one that joins 17, whose text names them in one list,
+        // as a knives from before the `fix_files` list writes it.
+        let many: Vec<String> = (0..3000).map(|file| format!("f{file:04}.txt")).collect();
+        let joined = |prefix: char, pieces: usize| {
+            (1..=pieces)
+                .map(|piece| format!("{prefix}{piece:02}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let (sixteen, seventeen) = (joined('p', 16), joined('q', 17));
+        let entry = adopted(&format!(
+            "changed beyond the baseline's conflicts: {}, {sixteen}, {seventeen} (why: a fix)",
+            many.join(", ")
+        ));
+        let pieces = many.len() + 16 + 17;
+
+        // When: its files are read.
+        let named = adopted_fix_files(&entry, "integration");
+
+        // Then: they are at most 16 paths for each piece of the list, each
+        // once, and they hold each file that joins 16 pieces or fewer, but
+        // not the path that joins 17.
+        assert!(named.from_text);
+        assert!(
+            named.files.len() <= pieces * TEXT_PATH_PIECES,
+            "{} paths",
+            named.files.len()
+        );
+        let read: HashSet<&str> = named.files.iter().map(String::as_str).collect();
+        assert_eq!(read.len(), named.files.len());
+        for file in many.iter().chain(std::iter::once(&sixteen)) {
+            assert!(read.contains(file.as_str()), "{file}");
+        }
+        assert!(!read.contains(seventeen.as_str()));
     }
 }
 

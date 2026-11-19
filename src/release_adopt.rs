@@ -269,18 +269,17 @@ struct Replaced {
     /// Whether the adopted commit is this write, or it re-signed or
     /// metaedited: an older recorded write adopted as the newest.
     equal: bool,
-    /// Whether its event says knives could not check the release it was
-    /// written over (`; unchecked:`): nothing measured that write, so a
-    /// resolution is measured against an automerge instead.
-    unchecked: bool,
-    /// What the write composes, where this repository holds it
-    /// ([`release::write_composition`]): its own parents less the earlier
+    /// What the write composes, where it is the baseline a resolution is
+    /// measured against ([`release::baseline_write`]): this repository holds
+    /// it, and its event says knives checked the release it was written
+    /// over (no `; unchecked:`). That is its own parents less the earlier
     /// writes of the name among them, which a rebuild of it leaves out
     /// ([`ResolutionBaseline::Rebuilt`]), or a stacked write's previous
     /// release and members. A rebuild measures the write's own change
     /// against their merge, so a write made as a chain of merges keeps what
-    /// each inner merge resolved.
-    composed: Vec<CommitId>,
+    /// each inner merge resolved. `None` where nothing measured that write,
+    /// and a resolution is measured against an automerge instead.
+    composed: Option<Vec<CommitId>>,
     /// The parent set its event records, its own carriers left out, each
     /// parent with every branch at it then, which `include` and `advance`
     /// match a member by once its bookmark has moved on.
@@ -332,38 +331,34 @@ impl Replaced {
             recorded
         };
         let here = opened.resolve_commit(write.commit.as_str()).is_ok();
-        let composed = if here {
-            release::write_composition(
-                opened,
-                entry,
-                (ledger, &held.tips),
-                (writes, &write.commit),
-            )?
-        } else {
-            Vec::new()
-        };
+        let composed = release::baseline_write(
+            opened,
+            entry,
+            (ledger, &held.tips),
+            (writes, (event, &write.commit)),
+        )?;
         Ok(Some(Self {
+            write,
             here,
             equal,
-            unchecked: knives::release_model::unchecked_mark(event).is_some(),
-            write,
             composed,
             parents,
         }))
     }
 
-    /// Whether the write is the baseline a resolution is measured against:
-    /// it is here, and knives checked the release it was written over.
-    /// Otherwise the baseline is an automerge of what the commit composes.
+    /// Whether the write is the baseline a resolution is measured against
+    /// ([`release::baseline_write`]). Otherwise the baseline is an automerge
+    /// of what the commit composes.
     const fn is_baseline(&self) -> bool {
-        self.here && !self.unchecked
+        self.composed.is_some()
     }
 
     /// The baseline for a commit that composes `composition`, and how a
     /// reader is told it: the write itself, when the commit is it or a copy
     /// of it; the write rebuilt on `composition`, the tree a write onto it
     /// holds, when the write is the baseline ([`Self::is_baseline`]);
-    /// otherwise a fresh automerge of `composition`, saying why.
+    /// otherwise a fresh automerge of `composition`, saying why
+    /// ([`release::resolution_baseline`]).
     ///
     /// `composition` is the commit's members, or for a stacked release its
     /// `previous` release, then its members
@@ -394,37 +389,33 @@ impl Replaced {
                 },
             )
         };
-        if self.is_baseline() {
+        let replaced = self
+            .composed
+            .as_deref()
+            .map(|written| (&self.write.commit, written));
+        let described = match replaced {
             // Rebuilt on its own composition, a write is its own tree, so it
             // is named as itself.
-            let described = if self.composed == composition {
-                self.described()
-            } else {
-                format!("{} rebuilt on {}", self.described(), composed())
-            };
-            return (
-                ResolutionBaseline::Rebuilt {
-                    write: &self.write.commit,
-                    composed: &self.composed,
-                    members: composition,
-                },
-                described,
-            );
-        }
-        let reason = if self.here {
-            format!(
-                "knives could not check the release {} was written over",
-                self.described()
-            )
-        } else {
-            format!("this repository does not hold {}", self.described())
+            Some((_, written)) if written == composition => self.described(),
+            Some(_) => format!("{} rebuilt on {}", self.described(), composed()),
+            None => {
+                let reason = if self.here {
+                    format!(
+                        "knives could not check the release {} was written over",
+                        self.described()
+                    )
+                } else {
+                    format!("this repository does not hold {}", self.described())
+                };
+                format!(
+                    "an automerge of {} with the release-log union, because {reason}",
+                    composed()
+                )
+            }
         };
         (
-            ResolutionBaseline::Automerge(composition),
-            format!(
-                "an automerge of {} with the release-log union, because {reason}",
-                composed()
-            ),
+            release::resolution_baseline(replaced, composition),
+            described,
         )
     }
 
