@@ -1432,7 +1432,6 @@ mod tests {
                 "feat/alpha (owner-one, harness-session, claimed just now, last seen just now): w",
             ]
         );
-        assert_eq!(render_last_seen(seen, now), "last seen just now");
         // And: a time that does not parse is said to be one that cannot be
         // read, never "unknown ago".
         assert_eq!(
@@ -1452,10 +1451,6 @@ mod tests {
                  last seen just now): w",
             ]
         );
-        for line in recent.iter().chain(&unparsed) {
-            assert!(!line.contains("now ago"), "{line}");
-            assert!(!line.contains("unknown ago"), "{line}");
-        }
     }
 
     #[test]

@@ -577,8 +577,8 @@ fn die_no_bookmark() -> ! {
 /// (`feat/x*` for a bookmark ahead of its remote, `feat/x??` for a conflicted one), and
 /// the charset check below would then read a real bookmark as none. The names come as
 /// JSON: printed as text, jj writes each as a revset must spell it, quoted where its
-/// grammar needs (`"feat/wip-"`), which the check read as no bookmark either. Local
-/// bookmarks only: a remote-only `feat/x@origin` on `@` is not a head gh can name.
+/// grammar needs (`"feat/wip-"`), which the check would read as no bookmark either.
+/// Local bookmarks only: a remote-only `feat/x@origin` on `@` is not a head gh can name.
 pub(crate) fn current_bookmark(cwd: &Path) -> Option<String> {
     let output = Command::new("jj")
         .current_dir(cwd)

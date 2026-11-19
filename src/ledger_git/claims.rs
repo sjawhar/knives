@@ -27,7 +27,10 @@ use serde::{Deserialize, Serialize};
 
 use super::run::{invocation, output_error, run, run_with_input, succeeded, transport_transcript};
 use super::tree::{Mode, ObjectId, tree_item};
-use super::{GitError, MAX_REF, Repository, fork_directory, own_ref, record_sent, ref_component};
+use super::{
+    GitError, MAX_REF, Repository, fork_directory, machine_component, own_ref, record_sent,
+    ref_component,
+};
 use crate::ids::{BranchName, CommitId, UpstreamName};
 use crate::store::OwnerKind;
 
@@ -38,8 +41,6 @@ const RECORD: &str = "claim.toml";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClaimError {
-    /// The branch's claim ref would be `bytes` long, all of it, more than the
-    /// 255 bytes the ledger's remote holds.
     #[error(
         "refusing branch {branch:?} on a shared ledger: its claim ref would be {bytes} bytes, \
          more than the {} a ref may be on the ledger's remote",
@@ -181,8 +182,7 @@ pub struct HeldClaim {
 /// record's entry name is unique to the nanosecond, so no two claim commits
 /// are one, and a lease meant for one claim never matches an older one.
 pub fn write_claim(repository: &Repository, record: &ClaimRecord) -> Result<CommitId, ClaimError> {
-    own_ref(&record.machine)?;
-    let machine = record.machine.as_str();
+    let machine = machine_component(&record.machine)?;
     let text = toml::to_string(record).map_err(|source| ClaimError::Record {
         repo: record.repo.clone(),
         branch: record.branch.clone(),

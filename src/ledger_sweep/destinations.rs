@@ -206,11 +206,11 @@ struct Identity {
 ///
 /// Refused, with the command that fixes it: a machine name that cannot spell
 /// this machine's ref (`refs/knives/<machine>`) as one component, or spells
-/// one longer than the ledger's remote holds ([`ledger_git::own_ref`]), found
-/// otherwise only when a sweep commits and failing there instead. Any other
-/// `knives.*` key is one a newer knives may read: it is reported and passed
-/// over, since machines sharing a ledger, and sessions on one machine, run
-/// different versions.
+/// one longer than the ledger's remote holds
+/// ([`ledger_git::machine_component`]), found otherwise only when a sweep
+/// commits and failing there instead. Any other `knives.*` key is one a newer
+/// knives may read: it is reported and passed over, since machines sharing a
+/// ledger, and sessions on one machine, run different versions.
 fn identity(git_dir: &Path) -> Result<Identity, SweepError> {
     let mut found = Identity {
         machine: None,
@@ -226,7 +226,7 @@ fn identity(git_dir: &Path) -> Result<Identity, SweepError> {
     for (key, value) in ledger_git::local_config(git_dir, &pattern)? {
         match key.as_str() {
             "knives.machine" => {
-                if let Err(error) = ledger_git::own_ref(&value) {
+                if let Err(error) = ledger_git::machine_component(&value) {
                     return Err(refused(format!(
                         "{error}. Name this machine again, uniquely among every machine sharing \
                          {REMOTE}: git --git-dir={} config knives.machine <name>",

@@ -1602,9 +1602,8 @@ fn seized_event(
 ) -> String {
     let Some(claim) = previous else {
         return format!(
-            "seized the claim {} at {}, whose holder could not be read: {reason}",
-            on.claim,
-            on.read.as_ref().map_or("", CommitId::as_str)
+            "{}: {reason}",
+            render_seized_unread(&on.claim, on.read.as_ref())
         );
     };
     let sighting = last_seen.map_or_else(

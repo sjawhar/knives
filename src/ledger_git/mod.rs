@@ -943,17 +943,24 @@ fn occupant(repository: &Repository, relative: &Path) -> Result<Occupant, GitErr
     }
 }
 
-/// `refs/knives/<machine>`, for a machine name that spells exactly that ref,
-/// in no more than [`MAX_REF`] bytes: a longer one could never be pushed.
-pub(crate) fn own_ref(machine: &str) -> Result<String, GitError> {
-    let reference = format!("{OWN}{}", ref_component("machine", machine)?);
-    if reference.len() > MAX_REF {
+/// `refs/knives/<machine>`, for a machine name [`machine_component`] takes.
+fn own_ref(machine: &str) -> Result<String, GitError> {
+    Ok(format!("{OWN}{}", machine_component(machine)?))
+}
+
+/// `machine` when it spells exactly one component of this machine's ref,
+/// `refs/knives/<machine>`, and that ref is no more than [`MAX_REF`] bytes:
+/// a longer one could never be pushed.
+pub(crate) fn machine_component(machine: &str) -> Result<&str, GitError> {
+    let machine = ref_component("machine", machine)?;
+    let bytes = OWN.len() + machine.len();
+    if bytes > MAX_REF {
         return Err(GitError::MachineRefTooLong {
             name: machine.to_owned(),
-            bytes: reference.len(),
+            bytes,
         });
     }
-    Ok(reference)
+    Ok(machine)
 }
 
 /// `name` when it can stand as exactly one component of a ref name.
