@@ -1171,25 +1171,29 @@ const UNREAD_FILES: &str = "whose files this repository cannot read whole";
 /// What a refusal says of the fix by hand of the adopt `commit`, whose
 /// files nothing here reads whole ([`release::FixLack::Unread`]): why
 /// nothing here can measure it, `unmeasured` ([`unmeasured_why`]), and why
-/// its event's text does not read whole, `why`: it names the files of the
-/// fix in a list of more than [`knives::release_model::TEXT_PATH_PIECES`]
-/// pieces, which this repository cannot read whole, or in a list that holds
-/// a part that `adopt` writes after that list, which it cannot read one way.
+/// its event's text does not read whole, `why`. The event is an older one
+/// that names the files of the fix in its text alone, in a list of more
+/// than [`knives::release_model::TEXT_PATH_PIECES`] pieces, which may name
+/// a path of more pieces than this repository reads, or in a list of files
+/// resolved by hand that another part that `adopt` writes follows, which
+/// may end there or name a path that holds that part.
 fn unread_fix(
     commit: &CommitId,
     (unmeasured, why): (release::Unmeasured, UnreadFixText),
 ) -> String {
     let list = match why {
         UnreadFixText::Pieces => format!(
-            "a list of more than {} pieces, which this repository cannot read whole",
+            "a list of more than {} pieces, which may name a path of more pieces than this \
+             repository reads",
             knives::release_model::TEXT_PATH_PIECES
         ),
-        UnreadFixText::Marker(part) => {
-            format!("a list that holds `{part}`, which this repository cannot read one way")
-        }
+        UnreadFixText::Marker(part) => format!(
+            "a list that `{part}` follows, which may end there or name a path that holds it"
+        ),
     };
     format!(
-        "{}, and the adopt's event names the files of the fix in {list}",
+        "{}, and the adopt's event is an older one that names the files of the fix in its text \
+         alone, in {list}",
         unmeasured_why(unmeasured, commit)
     )
 }
@@ -1403,8 +1407,9 @@ enum FixRemedy<'r> {
     /// The fetch of the adopt, whose own commit reads the files of its fix
     /// whole ([`unread_fetch`]), then a commit that carries the fix.
     FetchAdopt(Fetch<'r>),
-    /// No step: this repository does not hold the adopt, and no remote has
-    /// a branch or tag at it, so no fetch brings what reads its files, and
+    /// No step: this repository does not hold the adopt, and none of the
+    /// remotes that could be read has a branch or tag at it
+    /// ([`Remotes::answered`]), so no fetch brings what reads its files, and
     /// only `--allow-drop` goes past it ([`closing_line`]).
     NoRemote,
     /// No step: this repository holds the adopt but cannot read it as a
@@ -1508,10 +1513,14 @@ fn fix_remedy<'r>(fix: &'r release::LackedFix, remotes: &'r Remotes<'_>) -> FixR
 }
 
 /// What the closing line says of `fix` where no step meets it
-/// ([`FixRemedy::has_step`]): its title, and where no remote has a branch
-/// or tag at its adopt ([`FixRemedy::NoRemote`]), that too, as no fetch
-/// brings it; of the remotes that could be read, where one could not
-/// ([`Remotes::unread`]). `None` for a fix that a step meets.
+/// ([`FixRemedy::has_step`]): its title, and where none of the remotes that
+/// could be read has a branch or tag at its adopt ([`FixRemedy::NoRemote`]),
+/// that too, as no fetch brings it, naming exactly the remotes that were
+/// read ([`Remotes::answered`]): `as origin has no branch or tag at
+/// <commit>`, `as neither origin nor release has a branch or tag at
+/// <commit>`, or `as no remote could be read for a branch or tag at
+/// <commit>`. The closing line names each remote that could not be read
+/// ([`closing_line`]). `None` for a fix that a step meets.
 fn unheld_fix(
     fix: &release::LackedFix,
     ask: &FixRemedy<'_>,
@@ -1521,15 +1530,25 @@ fn unheld_fix(
     match ask {
         FixRemedy::Unholdable => Some(title),
         FixRemedy::NoRemote => {
-            let read = if remotes.unread().is_empty() {
-                ""
-            } else {
-                "that this repository could read "
+            let at = inline_human_text(fix.commit.short());
+            let none = match remotes.answered() {
+                [] => format!("no remote could be read for a branch or tag at {at}"),
+                [(remote, _)] => {
+                    format!("{} has no branch or tag at {at}", inline_human_text(remote))
+                }
+                [(first, _), others @ ..] => {
+                    let others: Vec<String> = others
+                        .iter()
+                        .map(|(remote, _)| inline_human_text(remote))
+                        .collect();
+                    format!(
+                        "neither {} nor {} has a branch or tag at {at}",
+                        inline_human_text(first),
+                        others.join(" nor ")
+                    )
+                }
             };
-            Some(format!(
-                "{title}, as no remote {read}has a branch or tag at {}",
-                inline_human_text(fix.commit.short())
-            ))
+            Some(format!("{title}, as {none}"))
         }
         FixRemedy::Files { .. } | FixRemedy::FetchAdopt(_) => None,
     }
@@ -1705,6 +1724,16 @@ impl<'a> Remotes<'a> {
     /// ([`Advertised::at`]), reading the remotes if they are not read yet.
     fn at(&self, commit: &CommitId) -> Option<(&str, &str)> {
         self.advertised().at(commit)
+    }
+
+    /// The remotes that could be read, each by name with its branches and
+    /// tags, in the order read, where they were read: empty where no
+    /// refusal asked.
+    fn answered(&self) -> &[(&'a str, BTreeMap<String, CommitId>)] {
+        match self.read.get() {
+            Some(advertised) => &advertised.refs,
+            None => &[],
+        }
     }
 
     /// The remotes that could not be read, where they were read: empty
@@ -3345,10 +3374,13 @@ mod tests {
         }
     }
 
-    /// Remotes read already, none of which has a branch or tag at any
+    /// Remotes read already: origin, which has no branch or tag at any
     /// commit.
     fn no_remote() -> Remotes<'static> {
-        Remotes::read_as(Advertised::default())
+        Remotes::read_as(Advertised {
+            refs: vec![("origin", BTreeMap::new())],
+            unread: Vec::new(),
+        })
     }
 
     /// Remotes read already, where origin has `reference` at `commit`.
@@ -3692,9 +3724,9 @@ mod tests {
                 format!(
                     "demo: refusing to record release/2026-11-14 at eeee: it cannot be held \
                      against the fix by hand of release/{ESCAPED}'s adopt {short}: this \
-                     repository does not hold {short}, and the adopt's event names the files of \
-                     the fix in a list of more than 16 pieces, which this repository cannot read \
-                     whole"
+                     repository does not hold {short}, and the adopt's event is an older one \
+                     that names the files of the fix in its text alone, in a list of more than \
+                     16 pieces, which may name a path of more pieces than this repository reads"
                 ),
                 format!(
                     "  nothing was recorded; fetch origin's refs/heads/release/{ESCAPED}, which \
@@ -3739,15 +3771,21 @@ mod tests {
     fn a_fix_whose_adopt_no_remote_has_asks_only_for_allow_drop() {
         // Given: the fix by hand of an adopt that this repository does not
         // hold, whose files nothing here reads whole, lacked by a record and
-        // by a cut; and remotes read where none has a branch or tag at the
-        // adopt, where origin has a tag at it, whose commit the ledger gives
-        // short, and where origin could not be read.
+        // by a cut; and remotes read where origin has no branch or tag at
+        // the adopt, where neither origin nor the publish remote has one,
+        // where origin has a tag at it, whose commit the ledger gives short,
+        // where origin has none and the publish remote could not be read,
+        // and where origin could not be read.
         let adopt = "0123456789abcdef0123456789abcdef01234567";
         let fix = LackedFix {
             name: "release/2026-11-12".to_owned(),
             commit: CommitId::new("0123456789ab"),
             ..beyond_bound(release::Unmeasured::Absent)
         };
+        let both = Remotes::read_as(Advertised {
+            refs: vec![("origin", BTreeMap::new()), ("release", BTreeMap::new())],
+            unread: Vec::new(),
+        });
         let tagged = Remotes::read_as(Advertised {
             refs: vec![(
                 "origin",
@@ -3758,6 +3796,10 @@ mod tests {
             )],
             unread: Vec::new(),
         });
+        let publish_unread = Remotes::read_as(Advertised {
+            refs: vec![("origin", BTreeMap::new())],
+            unread: vec!["release"],
+        });
         let unread = Remotes::read_as(Advertised {
             refs: Vec::new(),
             unread: vec!["origin"],
@@ -3766,28 +3808,41 @@ mod tests {
         // When: the gate refuses each.
         let record = fix_refusal(true, vec![fix.clone()], &no_remote());
         let cut = fix_refusal(false, vec![fix.clone()], &no_remote());
+        let neither = fix_refusal(true, vec![fix.clone()], &both);
         let fetched = fix_refusal(true, vec![fix.clone()], &tagged);
+        let half = fix_refusal(true, vec![fix.clone()], &publish_unread);
         let blind = fix_refusal(true, vec![fix], &unread);
 
-        // Then: where no remote has a branch or tag at the adopt, no fetch
-        // brings it, so the remedy asks for no fetch, no commit and no move,
-        // says so, and gives `--allow-drop` alone; where origin has a tag at
-        // it, the remedy names that tag, peeled, from the full commit that
-        // the short one starts; and where origin could not be read, it says
-        // that no remote that could be read has the adopt, and names origin.
+        // Then: where no remote that was read has a branch or tag at the
+        // adopt, no fetch brings it, so the remedy asks for no fetch, no
+        // commit and no move, gives `--allow-drop` alone, and says why,
+        // naming exactly the remotes that were read: origin alone, or origin
+        // and the publish remote; where origin has a tag at it, the remedy
+        // names that tag, peeled, from the full commit that the short one
+        // starts; where the publish remote could not be read, the line says
+        // that origin has none, then names the publish remote; and where no
+        // remote could be read, it says so, then names origin.
         let ending = "re-run with --allow-drop to state the drop is intended: nothing in this \
                       repository can hold a release against the fix by hand of \
-                      release/2026-11-12's adopt 0123456789ab, as no remote";
+                      release/2026-11-12's adopt 0123456789ab, as";
         assert_eq!(
             record.last(),
             Some(&format!(
-                "  nothing was recorded; {ending} has a branch or tag at 0123456789ab"
+                "  nothing was recorded; {ending} origin has no branch or tag at 0123456789ab"
             ))
         );
         assert_eq!(
             cut.last(),
             Some(&format!(
-                "  the candidate was discarded; {ending} has a branch or tag at 0123456789ab"
+                "  the candidate was discarded; {ending} origin has no branch or tag at \
+                 0123456789ab"
+            ))
+        );
+        assert_eq!(
+            neither.last(),
+            Some(&format!(
+                "  nothing was recorded; {ending} neither origin nor release has a branch or tag \
+                 at 0123456789ab"
             ))
         );
         assert_eq!(
@@ -3799,10 +3854,17 @@ mod tests {
             )
         );
         assert_eq!(
+            half.last(),
+            Some(&format!(
+                "  nothing was recorded; {ending} origin has no branch or tag at 0123456789ab; \
+                 release could not be read"
+            ))
+        );
+        assert_eq!(
             blind.last(),
             Some(&format!(
-                "  nothing was recorded; {ending} that this repository could read has a branch or \
-                 tag at 0123456789ab; origin could not be read"
+                "  nothing was recorded; {ending} no remote could be read for a branch or tag at \
+                 0123456789ab; origin could not be read"
             ))
         );
     }
@@ -3857,8 +3919,11 @@ mod tests {
         let origin = origin_has(&format!("refs/heads/release/{HOSTILE}"), HOSTILE);
         let lines = fix_refusal(true, vec![fix], &origin);
 
-        // Then: the refusal names the adopt and the part, and its remedy is
-        // that of a list past the bound: the adopt's fetch, then a commit.
+        // Then: the refusal names the adopt, says that its event is an older
+        // one that names the files in its text alone, and names the part
+        // that follows the list, which the list may end at or hold in a
+        // path; its remedy is that of a list past the bound: the adopt's
+        // fetch, then a commit.
         let short = ids_prefix(ESCAPED);
         assert_eq!(
             lines,
@@ -3866,9 +3931,9 @@ mod tests {
                 format!(
                     "demo: refusing to record release/2026-11-14 at eeee: it cannot be held \
                      against the fix by hand of release/{ESCAPED}'s adopt {short}: this \
-                     repository does not hold {short}, and the adopt's event names the files of \
-                     the fix in a list that holds `; why: `, which this repository cannot read \
-                     one way"
+                     repository does not hold {short}, and the adopt's event is an older one \
+                     that names the files of the fix in its text alone, in a list that `; why: ` \
+                     follows, which may end there or name a path that holds it"
                 ),
                 format!(
                     "  nothing was recorded; fetch origin's refs/heads/release/{ESCAPED}, which \
@@ -3955,8 +4020,9 @@ mod tests {
                     "demo: refusing to record release/2026-11-14 at eeee: it cannot be held \
                      against the fix by hand of release/{ESCAPED}'s adopt {short}: this \
                      repository cannot read {short} as a release of the series, and the adopt's \
-                     event names the files of the fix in a list of more than 16 pieces, which \
-                     this repository cannot read whole"
+                     event is an older one that names the files of the fix in its text alone, in \
+                     a list of more than 16 pieces, which may name a path of more pieces than \
+                     this repository reads"
                 ),
                 format!("  nothing was recorded; {ending}"),
             ]

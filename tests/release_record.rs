@@ -31,12 +31,13 @@
 //! event names them in its text alone, and such a clone holds each path
 //! that a list of up to 16 pieces may name. A list of more pieces does not
 //! read whole there, nor does a list of files resolved by hand that another
-//! part follows, as the list may hold that part, so the record is refused,
-//! naming the adopt, and its fetch where a remote has a branch or tag at
-//! it, else `--allow-drop` alone; or recorded under `--allow-drop` with the
-//! drop stated. A record that lacks a file with no reference here is told
-//! to fetch the write where the walk for that reference stopped where a
-//! remote has it, and keeps the adopt of the new content where none does.
+//! part follows, as the list may end there or name a path that holds that
+//! part, so the record is refused, naming the adopt, and its fetch where a
+//! remote has a branch or tag at it, else `--allow-drop` alone; or recorded
+//! under `--allow-drop` with the drop stated. A record that lacks a file
+//! with no reference here is told to fetch the write where the walk for
+//! that reference stopped where a remote has it, and keeps the adopt of the
+//! new content where none does.
 //! A published name that the publish remote lacks is not recorded until it
 //! is pushed, and the refusal gives the commands. A printed command quotes
 //! the name for the shell.
@@ -4636,19 +4637,21 @@ fn an_older_adopt_of_two_thousand_files_is_refused_in_a_clone_without_its_commit
     );
 
     // Then: it is refused, naming the adopt, its release and its commit, and
-    // nothing is written: a list of 2,016 pieces may name a path of more
-    // than 16, which the text does not give, so the clone cannot read the
-    // fix's files whole, and it reads none of them. No remote has a branch
-    // or tag at the adopt, so no fetch brings it, and the remedy gives
-    // `--allow-drop` alone and says why.
+    // nothing is written: the adopt's event is an older one that names the
+    // files in its text alone, and a list of 2,016 pieces may name a path of
+    // more than 16, which the text does not give, so the clone cannot read
+    // the fix's files whole, and it reads none of them. Origin, the one
+    // remote read, has no branch or tag at the adopt, so no fetch brings it,
+    // and the remedy gives `--allow-drop` alone and says why.
     let out = text(&refused);
     assert_eq!(refused.status.code(), Some(3), "{out}");
     assert!(
         out.contains(&format!(
             "demo: refusing to record release/2026-08-06 at {}: it cannot be held against the fix \
              by hand of {RELEASE}'s adopt {adopt}: this repository does not hold {adopt}, and the \
-             adopt's event names the files of the fix in a list of more than 16 pieces, which \
-             this repository cannot read whole\n",
+             adopt's event is an older one that names the files of the fix in its text alone, in \
+             a list of more than 16 pieces, which may name a path of more pieces than this \
+             repository reads\n",
             commit.short(),
             adopt = adopt.short()
         )),
@@ -4658,7 +4661,7 @@ fn an_older_adopt_of_two_thousand_files_is_refused_in_a_clone_without_its_commit
         out.contains(&format!(
             "\n  nothing was recorded; re-run with --allow-drop to state the drop is intended: \
              nothing in this repository can hold a release against the fix by hand of \
-             {RELEASE}'s adopt {adopt}, as no remote has a branch or tag at {adopt}\n",
+             {RELEASE}'s adopt {adopt}, as origin has no branch or tag at {adopt}\n",
             adopt = adopt.short()
         )),
         "{out}"
@@ -4941,20 +4944,22 @@ fn an_older_adopt_whose_resolved_list_a_reason_follows_is_refused_where_its_comm
         &["release/2026-08-06", "--at", commit.as_str()],
     );
 
-    // Then: it is refused, naming the adopt, its release and its commit, and
-    // the part that its list holds, and nothing is written: the clone cannot
-    // tell which reading the adopt wrote, and the one that ends the list at
-    // `; why: ` may hold less. The registry's origin cannot be read here, so
-    // no fetch is named: the remedy gives `--allow-drop` alone and names
-    // that remote.
+    // Then: it is refused, naming the adopt, its release and its commit,
+    // that its event is an older one that names the files in its text
+    // alone, and the part that follows its list, and nothing is written: the
+    // clone cannot tell which reading the adopt wrote, as the list may end
+    // at `; why: ` or name a path that holds it, and the reading that ends
+    // it there may hold less. The registry's origin cannot be read here, so
+    // no fetch is named: the remedy gives `--allow-drop` alone, says that no
+    // remote could be read, and names that remote.
     let out = text(&refused);
     assert_eq!(refused.status.code(), Some(3), "{out}");
     assert!(
         out.contains(&format!(
             "demo: refusing to record release/2026-08-06 at {}: it cannot be held against the fix \
              by hand of {RELEASE}'s adopt {adopt}: this repository does not hold {adopt}, and the \
-             adopt's event names the files of the fix in a list that holds `; why: `, which this \
-             repository cannot read one way\n",
+             adopt's event is an older one that names the files of the fix in its text alone, in \
+             a list that `; why: ` follows, which may end there or name a path that holds it\n",
             commit.short(),
             adopt = adopt.short()
         )),
@@ -4964,8 +4969,8 @@ fn an_older_adopt_whose_resolved_list_a_reason_follows_is_refused_where_its_comm
         out.contains(&format!(
             "\n  nothing was recorded; re-run with --allow-drop to state the drop is intended: \
              nothing in this repository can hold a release against the fix by hand of \
-             {RELEASE}'s adopt {adopt}, as no remote that this repository could read has a branch \
-             or tag at {adopt}; origin could not be read\n",
+             {RELEASE}'s adopt {adopt}, as no remote could be read for a branch or tag at \
+             {adopt}; origin could not be read\n",
             adopt = adopt.short()
         )),
         "{out}"

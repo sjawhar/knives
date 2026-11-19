@@ -550,9 +550,9 @@ pub enum ReleaseAction {
     /// the adopt, and the fetch of its commit where this repository does not
     /// hold it and a remote has a branch or tag at it, else `--allow-drop`
     /// alone: a list of more than 16 pieces, or a list of files resolved by
-    /// hand that another part follows, which the list may hold. A
-    /// repository that does not hold the newest write is refused and told to
-    /// fetch it.
+    /// hand that another part follows, which may end there or name a path
+    /// that holds that part. A repository that does not hold the newest
+    /// write is refused and told to fetch it.
     /// In a stacked series that write, a successor of it or a copy with its
     /// tree must be on its first-parent line. The ledger event records its
     /// members: in a stacked series the side parents on its first-parent
