@@ -983,3 +983,114 @@ fn a_first_cut_writes_lists_whole_where_the_changelog_holds_a_second_unreleased_
         "{verified}"
     );
 }
+
+/// A changelog whose `[Unreleased]` section holds `unreleased`, then the
+/// trunk's `### Added` list and a `### Fixed` list with `fix`, above one
+/// published release.
+fn with_trunk_lists(unreleased: &str, fix: &str) -> String {
+    format!(
+        "# Changelog\n\n## [Unreleased]\n\n{unreleased}### Added\n\n- The trunk's addition.\n\n\
+         ### Fixed\n\n- {fix}\n\n## [1.0.0] - 2026-08-01\n\n### Added\n\n- The first release.\n"
+    )
+}
+
+/// A member's own new `### Added` block at the top of `[Unreleased]`, above
+/// the `### Added` list the release already has.
+const NEW_ADDED: &str = "### Added\n\n- The member's addition.\n\n";
+
+/// The line a release command prints for a `CHANGELOG.md` whose one
+/// `[Unreleased]` section holds `### Added` twice.
+const ADDED_TWICE: &str = "\n  CHANGELOG.md: [Unreleased] holds `### Added` twice; knives changed no \
+                           line for it; join them by hand before you push\n";
+
+#[test]
+fn an_include_whose_clean_merge_leaves_a_heading_twice_in_unreleased_names_it_and_changes_nothing()
+{
+    // Given: a trunk whose changelog's `[Unreleased]` section holds a
+    // `### Added` list; a release cut of `feat/alpha`, which changes no
+    // release log; and `feat/beta`, whose own changelog adds a new
+    // `### Added` block above that list, as at the Oh My Pi release commit
+    // b40fd3c3.
+    let (trunk, beta) = (
+        with_trunk_lists("", "The trunk's fix."),
+        with_trunk_lists(NEW_ADDED, "The trunk's fix."),
+    );
+    let lab = trunk_with(&[("CHANGELOG.md", trunk.as_str())]);
+    member(&lab, "feat/alpha", &[("alpha.txt", "alpha\n")]);
+    let (home, _consumer) = release_test_home(&lab);
+    release_ok(&lab, &home, &["cut", RELEASE]);
+    member(&lab, "feat/beta", &[("CHANGELOG.md", beta.as_str())]);
+
+    // When: `feat/beta` is included.
+    let included = release_ok(&lab, &home, &["include", "feat/beta"]);
+
+    // Then: the merge is clean and the release's changelog is the bytes it
+    // wrote, the member's file, so `[Unreleased]` holds `### Added` twice.
+    assert_eq!(conflicts(&lab), Vec::<String>::new(), "{included}");
+    assert!(!included.contains("written as the union"), "{included}");
+    assert_release_file(&lab, "CHANGELOG.md", &beta);
+
+    // And: one line names the file and that heading.
+    assert!(included.contains(ADDED_TWICE), "{included}");
+    assert_eq!(
+        included.matches("[Unreleased] holds").count(),
+        1,
+        "{included}"
+    );
+}
+
+#[test]
+fn an_advance_that_leaves_the_changelog_conflicted_names_no_heading_and_the_adopt_names_it() {
+    // Given: a trunk whose changelog's `[Unreleased]` section holds a
+    // `### Added` and a `### Fixed` list; a release cut of `feat/alpha`,
+    // which changes no release log, and `feat/beta`, which rewords the
+    // trunk's fix; then `feat/alpha` grown by a commit whose changelog adds a
+    // new `### Added` block at the top of `[Unreleased]` and rewords that fix
+    // its own way, as at the Oh My Pi release commit b40fd3c3.
+    let (trunk, beta, grown) = (
+        with_trunk_lists("", "The trunk's fix."),
+        with_trunk_lists("", "The trunk's fix, as beta words it."),
+        with_trunk_lists(NEW_ADDED, "The trunk's fix, as alpha words it."),
+    );
+    let lab = trunk_with(&[("CHANGELOG.md", trunk.as_str())]);
+    member(&lab, "feat/alpha", &[("alpha.txt", "alpha\n")]);
+    member(&lab, "feat/beta", &[("CHANGELOG.md", beta.as_str())]);
+    let (home, _consumer) = release_test_home(&lab);
+    release_ok(&lab, &home, &["cut", RELEASE]);
+    grow(&lab, "feat/alpha", &[("CHANGELOG.md", grown.as_str())]);
+
+    // When: the release advances `feat/alpha`.
+    let advanced = release_ok(&lab, &home, &["advance", "feat/alpha"]);
+
+    // Then: the new block merges cleanly, but the two rewordings conflict,
+    // so the changelog is left conflicted, named as a person's, and no line
+    // names a heading in it.
+    assert_eq!(conflicts(&lab), ["CHANGELOG.md"], "{advanced}");
+    assert!(
+        advanced.contains("  1 conflicted file(s) left for a person:\n    CHANGELOG.md\n"),
+        "{advanced}"
+    );
+    assert!(!advanced.contains("[Unreleased] holds"), "{advanced}");
+
+    // When: a person resolves the conflict in place, keeping both
+    // `### Added` headings and both rewordings, and adopts the release.
+    let resolved = with_trunk_lists(
+        NEW_ADDED,
+        "The trunk's fix, as alpha words it.\n- The trunk's fix, as beta words it.",
+    );
+    lab.jj_work(["edit", RELEASE]);
+    write_files(&lab, &[("CHANGELOG.md", resolved.as_str())]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let adopted = release_ok(&lab, &home, &["adopt", RELEASE]);
+
+    // Then: one line names the file and `### Added`, and the changelog is
+    // the bytes the person wrote.
+    assert!(adopted.contains(ADDED_TWICE), "{adopted}");
+    assert_eq!(
+        adopted.matches("[Unreleased] holds").count(),
+        1,
+        "{adopted}"
+    );
+    assert_eq!(conflicts(&lab), Vec::<String>::new(), "{adopted}");
+    assert_release_file(&lab, "CHANGELOG.md", &resolved);
+}

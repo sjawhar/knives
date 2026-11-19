@@ -1103,7 +1103,9 @@ fn adopted_text(replaced: &Replaced, adoption: &Adoption<'_>) -> String {
 
 /// Say what was adopted: the commit, the write it replaces and the baseline;
 /// the files resolved by hand; the files changed beyond the conflicts, with
-/// the reason; each member's lost lines; and each carrier, labelled.
+/// the reason; each member's lost lines; each carrier, labelled; and each
+/// `### ` heading that a release log's one `[Unreleased]` section holds more
+/// than once ([`release::report_repeated_headings`]).
 fn report(adopting: &Adopting<'_, '_>, adoption: &Adoption<'_>) {
     let (repo, held) = (&adopting.fork.name, adopting.held);
     // Names, paths and labels are read from the repository, and the reason is
@@ -1164,6 +1166,7 @@ fn report(adopting: &Adopting<'_, '_>, adoption: &Adoption<'_>) {
             inline_human_text(&carrier_label(&held.name))
         );
     }
+    release::report_repeated_headings(&adopting.fork.checkout.path, &held.commit);
 }
 
 #[cfg(test)]

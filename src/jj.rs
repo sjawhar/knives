@@ -2953,6 +2953,21 @@ pub struct UnionedFile {
     pub left_twice: Vec<String>,
 }
 
+/// A release log whose one `[Unreleased]` section holds a `### ` heading
+/// more than once ([`repeated_headings`]).
+///
+/// It is in a tree that a release command writes or records, whoever placed
+/// its lines. The command changes no line for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepeatedHeadings {
+    /// The repository-internal path, `/`-separated.
+    pub path: String,
+    /// Each such heading line, without its line terminator, and how many
+    /// times the section holds it, in the order the section first holds each.
+    /// Read as UTF-8 with replacement, as [`UnionedFile::first_lines`] is.
+    pub headings: Vec<(String, usize)>,
+}
+
 /// The commit a release write replaced under its name.
 #[derive(Debug)]
 pub struct ReplacedRelease {
@@ -3663,6 +3678,43 @@ fn union_release_logs(
     }
     let tree = block_on(builder.write_tree()).map_err(|error| store_error(&error))?;
     Ok((tree, unions))
+}
+
+/// Each release log in `revision`'s tree whose one `[Unreleased]` section
+/// holds a `### ` heading more than once, in path order.
+///
+/// Every file that [`changelog_union::eligible`] names is read
+/// ([`changelog_union::repeated_headings`]), whether the command that wrote
+/// or recorded the tree changed it or not, and whoever placed its lines: the
+/// union ([`union_release_logs`]), a clean merge, a member or a person. A log
+/// that the tree leaves conflicted, or holds as no regular file, is not
+/// read: its conflict is a person's already. Reading writes nothing.
+pub fn repeated_headings(repo: &Path, revision: &str) -> Result<Vec<RepeatedHeadings>, JjError> {
+    let repo = Repo::open(repo)?;
+    let tree = repo.commit(revision)?.tree();
+    let store = repo.repo.store();
+    let mut repeated = Vec::new();
+    for (path, value) in tree.entries() {
+        if !changelog_union::eligible(path.as_internal_file_string()) {
+            continue;
+        }
+        let value = value.map_err(|error| store_error(&error))?;
+        let Some(content) = regular_file_content(store, &path, &value)? else {
+            continue;
+        };
+        let headings = changelog_union::repeated_headings(&content);
+        if headings.is_empty() {
+            continue;
+        }
+        repeated.push(RepeatedHeadings {
+            path: path.as_internal_file_string().to_owned(),
+            headings: headings
+                .into_iter()
+                .map(|(heading, count)| (String::from_utf8_lossy(heading).into_owned(), count))
+                .collect(),
+        });
+    }
+    Ok(repeated)
 }
 
 /// A conflict whose every term is a regular file of one mode: the terms'

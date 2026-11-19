@@ -9,7 +9,7 @@
 //! as their union, and refuses while the release in hand carries a change
 //! knives did not write or adopt, printing the steps that record it. Every one
 //! of them writes locally only, and none of them pushes.
-// allow: SIZE_OK: 5388 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
+// allow: SIZE_OK: 5470 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -4931,6 +4931,51 @@ pub fn conflict_guidance(release: &str, files: &[String], unions: &[jj::UnionedF
     lines.join("\n")
 }
 
+/// Print one line for each `### ` heading that a release log of `commit`'s
+/// tree holds more than once in its one `[Unreleased]` section.
+///
+/// A release command calls it after it wrote or recorded that tree
+/// ([`jj::repeated_headings`]). Every release log in the tree is read,
+/// changed or not, and whoever placed its lines: a clean merge, a member or
+/// a person. A heading that the union's own line names as left twice is
+/// named here too. knives changes no line for it: a person joins the lists
+/// before the release is pushed.
+pub fn report_repeated_headings(path: &Path, commit: &CommitId) {
+    match jj::repeated_headings(path, commit.as_str()) {
+        Ok(repeated) => {
+            for line in repeated_heading_lines(&repeated) {
+                println!("{line}");
+            }
+        }
+        Err(error) => println!("  could not read the release logs for repeated headings: {error}"),
+    }
+}
+
+/// The lines [`report_repeated_headings`] prints, one for each file and
+/// heading. The path is read from the tree and the heading from the file, so
+/// each reaches the terminal escaped.
+fn repeated_heading_lines(repeated: &[jj::RepeatedHeadings]) -> Vec<String> {
+    use crate::ledger::inline_human_text;
+    repeated
+        .iter()
+        .flat_map(|file| {
+            file.headings.iter().map(|(heading, count)| {
+                let times = if *count == 2 {
+                    "twice".to_owned()
+                } else {
+                    format!("{count} times")
+                };
+                format!(
+                    "  {}: [Unreleased] holds `{}` {times}; knives changed no line for it; join \
+                     them by hand before you push",
+                    inline_human_text(&file.path),
+                    inline_human_text(heading)
+                )
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod consumer_scope_tests {
     #![allow(
@@ -5038,6 +5083,43 @@ mod conflict_tests {
         );
         assert!(!rendered.contains('\u{1b}'), "{rendered}");
         assert_eq!(rendered.matches(" twice: ").count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn a_repeated_heading_is_named_once_for_each_file_and_heading_escaped() {
+        // Given: a changelog whose `[Unreleased]` section holds `### Added`
+        // twice and a heading with a control character three times, and
+        // release notes that hold `### Fixed` twice.
+        let repeated = [
+            jj::RepeatedHeadings {
+                path: "CHANGELOG.md".to_owned(),
+                headings: vec![
+                    ("### Added".to_owned(), 2),
+                    ("### Fixed\u{1b}[2J".to_owned(), 3),
+                ],
+            },
+            jj::RepeatedHeadings {
+                path: "docs/RELEASE_NOTES.md".to_owned(),
+                headings: vec![("### Fixed".to_owned(), 2)],
+            },
+        ];
+
+        // When: its lines are rendered.
+        let lines = repeated_heading_lines(&repeated);
+
+        // Then: one line names each file and heading, with how many times,
+        // escaped.
+        assert_eq!(
+            lines,
+            [
+                "  CHANGELOG.md: [Unreleased] holds `### Added` twice; knives changed no line for \
+                 it; join them by hand before you push",
+                "  CHANGELOG.md: [Unreleased] holds `### Fixed\u{fffd}[2J` 3 times; knives changed \
+                 no line for it; join them by hand before you push",
+                "  docs/RELEASE_NOTES.md: [Unreleased] holds `### Fixed` twice; knives changed no \
+                 line for it; join them by hand before you push",
+            ]
+        );
     }
 }
 

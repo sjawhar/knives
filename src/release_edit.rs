@@ -860,6 +860,7 @@ fn apply_edit(
         ),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
+    release::report_repeated_headings(&fork.checkout.path, created);
     Ok(Exit::Ok)
 }
 

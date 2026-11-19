@@ -943,6 +943,7 @@ fn drop_landed_members_in(
         ),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
+    release::report_repeated_headings(path, &created);
     Ok(Exit::Ok)
 }
 
@@ -1031,6 +1032,7 @@ fn report_rebased_release(
         ),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
+    release::report_repeated_headings(path, &described);
     Ok(())
 }
 

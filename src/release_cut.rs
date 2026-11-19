@@ -395,6 +395,7 @@ pub(crate) fn run_release(
                             gate.baseline.previous_cut.as_ref()
                         )
                     );
+                    release::report_repeated_headings(path, published);
                     if let Some(orphaned) = &orphaned {
                         report_stated_drop(fork, orphaned)?;
                     }
@@ -2358,6 +2359,7 @@ fn record_hand_cut(
             held.published.is_none().then_some(publish_remote)
         )
     );
+    release::report_repeated_headings(&fork.checkout.path, commit);
     // A commit with no conflict leaves no replay inconclusive.
     Ok(Exit::Ok)
 }
@@ -2856,6 +2858,7 @@ fn report_completed_cut(
         ),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
+    release::report_repeated_headings(&fork.checkout.path, cut.created);
     if let Some(first) = cut.request.parents.first() {
         let test_count = release::check_test_count(fork, cut.created, first);
         println!("{}", test_count.render());

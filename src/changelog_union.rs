@@ -39,6 +39,15 @@
 //! block holds twice stays as that block wrote it, joined or not, and is
 //! not named.
 //!
+//! After every release write and every `adopt`, knives reads each release
+//! log in the tree that the command writes or records, changed by it or not.
+//! It skips a file that is still conflicted there, and a file with no single
+//! `## [Unreleased]` heading. For each `### ` heading that the `[Unreleased]`
+//! section holds more than once ([`repeated_headings`]), it prints one line
+//! that names the file and the heading, once for each file and heading. It
+//! names a heading that [`Union::left_twice`] names too. It changes no line
+//! for it: a clean merge can leave such a heading, and a person joins it.
+//!
 //! One insertion is left to a person too: a side's block whose last line has
 //! no newline, where something would follow it. Written verbatim, that line
 //! and the next would run together into one line no side wrote, and the union
@@ -736,6 +745,59 @@ fn unreleased_runs(target: &[u8]) -> Option<Vec<Run<'_>>> {
         }
     }
     (headings == 1).then_some(runs)
+}
+
+/// Each `### ` heading line that the one `[Unreleased]` section of
+/// `content`, a release log, holds more than once, and how many times.
+///
+/// A heading is its line without the line terminator ([`first_line`]), in
+/// the order the section first holds each. The section is read as
+/// [`unreleased_runs`] reads it ([`Fence::read`]): a `### ` line inside a
+/// code fence is no heading, and a file with no `## [Unreleased]` heading
+/// line, or more than one, has no one section and holds none. Every `### `
+/// heading in the section is a sibling of the others, as markdownlint's
+/// `MD024` rule with `siblings_only` reads them. A heading is the same only
+/// where its text is the same: one that differs by case or by a trailing
+/// space is another heading. Whoever placed the lines, a union, a clean
+/// merge, a member or a person, every release write and every `adopt` names
+/// each heading here and changes no line for it
+/// ([`crate::jj::repeated_headings`]).
+pub fn repeated_headings(content: &[u8]) -> Vec<(&[u8], usize)> {
+    let mut fence = Fence::default();
+    let mut unreleased = 0_usize;
+    let mut inside = false;
+    let mut counts: HashMap<&[u8], usize> = HashMap::new();
+    // Each heading once, in the order the section first holds it.
+    let mut order: Vec<&[u8]> = Vec::new();
+    for line in content.split_inclusive(|byte| *byte == b'\n') {
+        match fence.read(line) {
+            Kind::Section => {
+                inside = is_unreleased_heading(line);
+                unreleased += usize::from(inside);
+            }
+            Kind::List if inside => {
+                let heading = first_line(line);
+                let count = counts.entry(heading).or_insert(0);
+                if *count == 0 {
+                    order.push(heading);
+                }
+                *count += 1;
+            }
+            Kind::List | Kind::Code | Kind::Text => {}
+        }
+    }
+    if unreleased != 1 {
+        return Vec::new();
+    }
+    order
+        .into_iter()
+        .filter_map(|heading| {
+            counts
+                .get(heading)
+                .filter(|count| **count > 1)
+                .map(|&count| (heading, count))
+        })
+        .collect()
 }
 
 /// `block`'s lines, each with its terminator.
@@ -1793,6 +1855,78 @@ mod tests {
         assert!(!eligible("CHANGELOG.md.bak"));
         assert!(!eligible("changelog.md"));
         assert!(!eligible("src/changelog_union.rs"));
+    }
+
+    #[test]
+    fn a_heading_the_one_unreleased_section_holds_more_than_once_is_counted() {
+        // Given: a changelog whose `[Unreleased]` section holds what each
+        // case writes, above a released `[1.0.0]` section with one
+        // `### Added` list
+        let file = |unreleased: &str| {
+            format!(
+                "# Changelog\n\n## [Unreleased]\n\n{unreleased}## [1.0.0] - 2026-08-01\n\n\
+                 ### Added\n\n- The first release.\n"
+            )
+            .into_bytes()
+        };
+
+        // When: the section holds `### Added` twice and `### Fixed` once
+        let twice = file("### Added\n\n- New.\n\n### Added\n\n- Old.\n\n### Fixed\n\n- A fix.\n\n");
+        // Then: `### Added` is counted twice, and the released section's
+        // `### Added` is not counted
+        assert_eq!(repeated_headings(&twice), [(b"### Added".as_slice(), 2)]);
+
+        // When: the section holds `### Fixed` three times and `### Added`
+        // twice
+        let three = file(
+            "### Fixed\n\n- One.\n\n### Added\n\n- A.\n\n### Fixed\n\n- Two.\n\n\
+             ### Fixed\n\n- Three.\n\n### Added\n\n- B.\n\n",
+        );
+        // Then: each is counted, in the order the section first holds it
+        assert_eq!(
+            repeated_headings(&three),
+            [(b"### Fixed".as_slice(), 3), (b"### Added".as_slice(), 2)]
+        );
+    }
+
+    #[test]
+    fn a_heading_only_a_released_section_or_a_code_fence_repeats_is_not_counted() {
+        // Given: a changelog whose released `[1.0.0]` section holds
+        // `### Fixed` twice, and whose `[Unreleased]` section holds it once
+        let released: &[u8] = b"## [Unreleased]\n\n### Fixed\n\n- New.\n\n## [1.0.0]\n\n\
+                                ### Fixed\n\n- One.\n\n### Fixed\n\n- Two.\n";
+        // When/Then: nothing is counted
+        assert_eq!(repeated_headings(released), Vec::<(&[u8], usize)>::new());
+
+        // Given: an `[Unreleased]` section with one `### Added` list whose
+        // entry holds a fenced sample with a `### Added` line
+        let fenced: &[u8] =
+            b"## [Unreleased]\n\n### Added\n\n- A sample:\n\n```md\n### Added\n```\n";
+        // When/Then: the fenced line is code, so nothing is counted
+        assert_eq!(repeated_headings(fenced), Vec::<(&[u8], usize)>::new());
+    }
+
+    #[test]
+    fn a_file_with_no_one_unreleased_section_or_headings_of_other_text_counts_nothing() {
+        // Given: a changelog with no `## [Unreleased]` heading, one with two,
+        // and one whose `[Unreleased]` headings differ by case or by a
+        // trailing space
+        let none: &[u8] =
+            b"# Changelog\n\n## [1.0.0]\n\n### Added\n\n- One.\n\n### Added\n\n- Two.\n";
+        let two: &[u8] = b"## [Unreleased]\n\n### Added\n\n- One.\n\n### Added\n\n- Two.\n\n\
+                           ## [Unreleased]\n\n- Stale.\n";
+        let near: &[u8] =
+            b"## [Unreleased]\n\n### Added\n\n- One.\n\n### added\n\n- Two.\n\n### Added \n\n- Three.\n";
+
+        // When/Then: none of them counts a heading
+        for content in [none, two, near] {
+            assert_eq!(
+                repeated_headings(content),
+                Vec::<(&[u8], usize)>::new(),
+                "{}",
+                String::from_utf8_lossy(content)
+            );
+        }
     }
 
     #[test]
