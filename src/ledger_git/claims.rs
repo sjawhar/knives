@@ -26,7 +26,7 @@ use std::process::Stdio;
 use serde::{Deserialize, Serialize};
 
 use super::run::{invocation, output_error, run, run_with_input, succeeded, transport_transcript};
-use super::tree::{Mode, ObjectId, tree_item};
+use super::tree::{Mode, ObjectId, TreeItem, tree_item};
 use super::{
     GitError, MAX_REF, Repository, fork_directory, machine_component, own_ref, record_sent,
     ref_component,
@@ -168,6 +168,18 @@ struct Stored<'a> {
     #[serde(flatten)]
     record: &'a ClaimRecord,
     entry: &'a str,
+}
+
+/// The file name of the entry a `claim.toml` of `text` names
+/// ([`Stored::entry`]), where it names one.
+#[cfg(test)]
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "re-exported through `ledger_git` for the claim tests of `ledger_sweep`"
+)]
+pub(crate) fn stored_entry(text: &str) -> Option<String> {
+    let stored: toml::Table = toml::from_str(text).ok()?;
+    stored.get("entry")?.as_str().map(str::to_owned)
 }
 
 /// The most bytes a `claim.toml` is read at: far more than any record
@@ -313,14 +325,14 @@ pub(super) fn remote_refs(
 }
 
 /// The record `commit` carries, or why it carries none that reads: one
-/// larger than [`MAX_RECORD`] is not read at all, its size asked of git
-/// first.
+/// larger than [`MAX_RECORD`] is not read at all, its size read first from
+/// the listing of the tree that holds it.
 fn record_of(
     repository: &Repository,
     commit: &CommitId,
 ) -> Result<Result<ClaimRecord, String>, GitError> {
     let mut command = repository.git();
-    command.args(["ls-tree", "-z", commit.as_str(), "--", RECORD]);
+    command.args(["ls-tree", "-l", "-z", commit.as_str(), "--", RECORD]);
     let answer = run(&mut command)?;
     let Some(listed) = answer
         .split(|&byte| byte == 0)
@@ -328,18 +340,11 @@ fn record_of(
     else {
         return Ok(Err(format!("its tree holds no {RECORD}")));
     };
-    let item = tree_item(listed)
-        .ok_or_else(|| output_error(&command, "`<mode> <type> <id>\\t<path>` records"))?;
-    if item.mode != Mode::File {
+    let (item, size) = sized_tree_item(listed)
+        .ok_or_else(|| output_error(&command, "`<mode> <type> <id> <size>\\t<path>` records"))?;
+    let (Mode::File, Some(size)) = (item.mode, size) else {
         return Ok(Err(format!("its {RECORD} is not a regular file")));
-    }
-    let mut command = repository.git();
-    command.args(["cat-file", "-s", item.oid.as_str()]);
-    let answer = run(&mut command)?;
-    let size = std::str::from_utf8(&answer)
-        .ok()
-        .and_then(|text| text.trim_end().parse::<u64>().ok())
-        .ok_or_else(|| output_error(&command, "a size in bytes"))?;
+    };
     if size > MAX_RECORD {
         return Ok(Err(format!(
             "its {RECORD} is {size} bytes, more than the {MAX_RECORD} a claim record may be"
@@ -348,6 +353,23 @@ fn record_of(
     let mut command = repository.git();
     command.args(["cat-file", "blob", item.oid.as_str()]);
     Ok(parse_record(&run(&mut command)?))
+}
+
+/// One `ls-tree -l -z` record, `<mode> <type> <id> <size>\t<path>`, parsed
+/// as [`tree_item`] parses it without its size, which git pads with spaces
+/// on the left: a blob's size in bytes, and `None` for a tree or a
+/// submodule, which git sizes `-`. `None` for a record that is not one.
+fn sized_tree_item(record: &[u8]) -> Option<(TreeItem, Option<u64>)> {
+    let tab = record.iter().position(|&byte| byte == b'\t')?;
+    let (header, path) = record.split_at_checked(tab)?;
+    let (short, size) = std::str::from_utf8(header).ok()?.rsplit_once(' ')?;
+    let item = tree_item(&[short.trim_end_matches(' ').as_bytes(), path].concat())?;
+    let size = match (item.mode.is_blob(), size) {
+        (true, bytes) => Some(bytes.parse().ok()?),
+        (false, "-") => None,
+        (false, _) => return None,
+    };
+    Some((item, size))
 }
 
 /// `claim.toml`'s bytes as a record, or why they are not one.
@@ -1098,12 +1120,7 @@ mod tests {
             &["cat-file", "blob", &format!("{commit}:claim.toml")],
         );
         assert_eq!(parse_record(text.as_bytes()), Ok(record));
-        let stored: toml::Table = toml::from_str(&text).unwrap();
-        assert_eq!(
-            stored.get("entry").and_then(toml::Value::as_str),
-            Some(ENTRY_ONE),
-            "{text}"
-        );
+        assert_eq!(stored_entry(&text).as_deref(), Some(ENTRY_ONE), "{text}");
     }
 
     #[test]
@@ -1218,6 +1235,29 @@ mod tests {
                 )
             })
         );
+    }
+
+    #[test]
+    fn a_long_tree_record_gives_a_blobs_padded_size_and_none_for_a_tree() {
+        let id = "a".repeat(40);
+        let record = |text: String| sized_tree_item(text.as_bytes());
+        let (item, size) = record(format!("100644 blob {id}      12\tclaim.toml")).unwrap();
+        assert_eq!((item.mode, size), (Mode::File, Some(12)));
+        assert_eq!(item.oid.as_str(), id);
+        assert_eq!(item.path, Path::new("claim.toml"));
+        let (_, size) = record(format!("100644 blob {id} 12345678\tx")).unwrap();
+        assert_eq!(size, Some(12_345_678));
+        let (item, size) = record(format!("040000 tree {id}       -\tclaim.toml")).unwrap();
+        assert_eq!((item.mode, size), (Mode::Tree, None));
+        for text in [
+            format!("100644 blob {id}\tx"),
+            format!("100644 blob {id}       -\tx"),
+            format!("040000 tree {id}      12\tx"),
+            format!("100644 blob {id}     1 2\tx"),
+            format!("100644 tree {id}      12\tx"),
+        ] {
+            assert!(record(text.clone()).is_none(), "{text:?} parsed");
+        }
     }
 
     #[test]

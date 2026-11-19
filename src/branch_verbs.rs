@@ -98,7 +98,7 @@ enum FinishClaimGate {
     /// where jj cannot read the workspace state or snapshot the working
     /// copy. The finish releases no claim: what the state file holds of the
     /// branch, if anything, is no claim of the caller's now.
-    Lost(Released),
+    Lost,
     /// The ledger holds another owner's claim in place of the caller's own,
     /// which this machine's state file still keeps a copy of. The caller has
     /// been told who holds it; the copy is removed, nothing else changes,
@@ -146,14 +146,6 @@ struct Ledgered<'a> {
     shared: SharedFork,
     claim: ClaimRef,
     target: &'a BranchTarget,
-}
-
-/// The claims of a branch a `finish` read on a fork that shares its
-/// ledger ([`SharedClaims`]), with the ledger they were read through: a
-/// claim read from the ledger never goes without that ledger.
-struct LedgerClaims<'a> {
-    ledger: &'a Ledgered<'a>,
-    claims: SharedClaims,
 }
 
 /// Hand a branch back and remove its workspace. The inverse of `start`.
@@ -228,7 +220,7 @@ pub(crate) fn run_finish(
     let gate = claim_gate(&finishing, &store)?;
     let (released, lost) = match gate {
         FinishClaimGate::Continue(released) => (released, false),
-        FinishClaimGate::Lost(released) => (released, true),
+        FinishClaimGate::Lost => (Released::default(), true),
         FinishClaimGate::StaleCopy => return forget_stale_copy(store, target),
         FinishClaimGate::Refuse(exit) => return Ok(exit),
     };
@@ -417,11 +409,13 @@ fn record_finish(
 /// writes; `Err` is the exit after saying why nothing was released, with
 /// nothing here changed.
 ///
-/// A claim another machine changed or released meanwhile is read again and
-/// named, as the gate names it (exit 1). A ledger that could not be written
-/// releases nothing (exit 3). A push whose outcome is unknown may have
-/// landed or not, so it leaves the state file and the workspace as they
-/// were, and the next `finish` reads the claim again (exit 3).
+/// A claim another machine changed meanwhile is read again and named, as
+/// the gate names it, and one it released meanwhile is named as no claim
+/// with no read, since the push already found none (exit 1). A ledger that
+/// could not be written releases nothing (exit 3). A push whose outcome is
+/// unknown may have landed or not, so it leaves the state file and the
+/// workspace as they were, and the next `finish` reads the claim again
+/// (exit 3).
 fn release_on_ledger(
     ledger: &Ledgered<'_>,
     commit: &CommitId,
@@ -432,15 +426,15 @@ fn release_on_ledger(
         shared: &ledger.shared,
         claim: &ledger.claim,
         expected: Some(commit),
-        becomes: ledger_sweep::Released,
+        becomes: ledger_sweep::NoClaim,
     };
     let branch = &ledger.target.branch;
     match change_on_ledger(change, scribe, draft) {
         ClaimOutcome::Landed(()) => Ok(()),
         ClaimOutcome::NotApplied {
-            why: NotApplied::Lost { .. },
+            why: NotApplied::Lost { held },
             ..
-        } => Err(changed_meanwhile(ledger)),
+        } => Err(changed_meanwhile(ledger, held)),
         ClaimOutcome::NotApplied { why, failure } => {
             eprintln!(
                 "nothing was released: {}; run `knives finish {branch}` again",
@@ -466,12 +460,18 @@ fn release_on_ledger(
 }
 
 /// A lost lease: the ledger's claim changed between this `finish`'s read
-/// and its push, so nothing was released or removed. The claim is read
-/// again and named, as the gate names it (exit 1).
-fn changed_meanwhile(ledger: &Ledgered<'_>) -> Exit {
+/// and its push, so nothing was released or removed. Where another claim
+/// holds the branch now (`held`), it is read again and named, as the gate
+/// names it; where none does, that is said with no read (exit 1).
+fn changed_meanwhile(ledger: &Ledgered<'_>, held: bool) -> Exit {
     let target = ledger.target;
     let here = ledger.shared.destination.machine.as_str();
-    let now = match ledger_sweep::read_claim(&ledger.shared, &ledger.claim) {
+    let read = if held {
+        ledger_sweep::read_claim(&ledger.shared, &ledger.claim)
+    } else {
+        Ok(None)
+    };
+    let now = match read {
         Err(failure) => {
             eprintln!(
                 "nothing was released: {}",
@@ -1126,19 +1126,14 @@ fn claim_gate(finishing: &Finishing<'_>, store: &Store) -> anyhow::Result<Finish
             return Ok(FinishClaimGate::Refuse(Exit::Incomplete));
         }
     };
-    let read = LedgerClaims {
-        ledger,
-        claims: SharedClaims::new(target, held, store.claim_of(target).cloned()),
-    };
-    let claims = &read.claims;
-    let lease = claims.commit().cloned();
+    let claims = SharedClaims::new(target, held, store.claim_of(target).cloned());
+    let lease = claims.commit();
     let stale = claims.recorded.as_ref().filter(|copy| {
-        copy.ledger_commit.is_some()
-            && copy.ledger_commit.as_deref() != lease.as_ref().map(CommitId::as_str)
+        copy.ledger_commit.is_some() && copy.ledger_commit.as_deref() != lease.map(CommitId::as_str)
     });
     if stale.is_some() && lease.is_none() {
         eprintln!("{}", no_claim_now(&target.branch));
-        return Ok(FinishClaimGate::Lost(Released::default()));
+        return Ok(FinishClaimGate::Lost);
     }
     if let Some((commit, Err(cause))) = &claims.ledger
         && !options.force
@@ -1160,7 +1155,7 @@ fn claim_gate(finishing: &Finishing<'_>, store: &Store) -> anyhow::Result<Finish
         machine: Some(here),
     });
     let Some(claim) = refused else {
-        return holder_gate(finishing, store, &read);
+        return holder_gate(finishing, store, &claims, ledger);
     };
     let machine = claimed_on(claim, here);
     let last_seen = claims
@@ -1170,7 +1165,7 @@ fn claim_gate(finishing: &Finishing<'_>, store: &Store) -> anyhow::Result<Finish
         let why = forced_why(options)?;
         let sighting = last_seen.map_or_else(|| Sighting::Elsewhere(machine), Sighting::Seen);
         return Ok(FinishClaimGate::Continue(Released {
-            on_ledger: lease,
+            on_ledger: lease.cloned(),
             ..forced_release(claim, &identity, sighting, why)
         }));
     }
@@ -1205,11 +1200,11 @@ fn claim_gate(finishing: &Finishing<'_>, store: &Store) -> anyhow::Result<Finish
 fn holder_gate(
     finishing: &Finishing<'_>,
     store: &Store,
-    read: &LedgerClaims<'_>,
+    claims: &SharedClaims,
+    ledger: &Ledgered<'_>,
 ) -> anyhow::Result<FinishClaimGate> {
-    let LedgerClaims { ledger, claims } = read;
     let Some(claim) = claims.on_ledger().or_else(|| claims.local()) else {
-        let Some((commit, _)) = &claims.ledger else {
+        let Some(commit) = claims.commit() else {
             return unheld_gate(finishing, store);
         };
         let why = forced_why(finishing.options)?;
@@ -1264,7 +1259,7 @@ fn unheld_gate(finishing: &Finishing<'_>, store: &Store) -> anyhow::Result<Finis
         target.key(),
         target.branch,
     );
-    Ok(FinishClaimGate::Lost(Released::default()))
+    Ok(FinishClaimGate::Lost)
 }
 
 /// `repo`'s ledger as the store read it, oldest first, or why it could not

@@ -58,7 +58,7 @@ pub fn read_claim(
 
 /// One change of a claim on a shared fork: a take, a seize or a restate,
 /// which `becomes` a [`ClaimRecord`], or a release, which `becomes`
-/// [`Released`].
+/// [`NoClaim`].
 #[derive(Debug)]
 pub struct ClaimChange<'a, B> {
     pub shared: &'a SharedFork,
@@ -85,7 +85,7 @@ pub trait Becomes {
 
 /// A take, a seize or a restate: a claim commit of this record, naming the
 /// file name of the entry that records the change.
-impl Becomes for ClaimRecord {
+impl Becomes for &ClaimRecord {
     type Landed = CommitId;
 
     fn write(self, repository: &Repository, entry: &Path) -> Result<CommitId, String> {
@@ -95,7 +95,7 @@ impl Becomes for ClaimRecord {
                 entry.display()
             )
         })?;
-        ledger_git::write_claim(repository, &self, name).map_err(|error| error.to_string())
+        ledger_git::write_claim(repository, self, name).map_err(|error| error.to_string())
     }
 
     fn commit(landed: &CommitId) -> Option<&CommitId> {
@@ -106,9 +106,9 @@ impl Becomes for ClaimRecord {
 /// A release: the claim ref goes, and a release that landed carries
 /// nothing.
 #[derive(Debug, Clone, Copy)]
-pub struct Released;
+pub struct NoClaim;
 
-impl Becomes for Released {
+impl Becomes for NoClaim {
     type Landed = ();
 
     fn write(self, _: &Repository, _: &Path) -> Result<(), String> {
@@ -158,10 +158,10 @@ pub enum ClaimOutcome<L> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotApplied {
     /// The claim was lost: git refused the push, and just after it the
-    /// claim ref held `now` (`None`: no claim), not the claim commit the
-    /// change expected. Another machine took, changed or released the claim
-    /// while this ran.
-    Lost { now: Option<CommitId> },
+    /// claim ref held another claim commit than the change expected
+    /// (`held`), or no claim where the change expected one. Another machine
+    /// took, changed or released the claim while this ran.
+    Lost { held: bool },
     /// git refused this machine's ref ([`Refusal::MachineRef`]): another
     /// machine may be committing under the same name.
     MachineRef,
@@ -341,8 +341,8 @@ fn send<B: Becomes>(
 /// refused.
 fn why_refused(refusal: Refusal, seen: ClaimSeen, expected: Option<&CommitId>) -> NotApplied {
     match seen {
-        ClaimSeen::At(now) if Some(&now) != expected => NotApplied::Lost { now: Some(now) },
-        ClaimSeen::Absent if expected.is_some() => NotApplied::Lost { now: None },
+        ClaimSeen::At(now) if Some(&now) != expected => NotApplied::Lost { held: true },
+        ClaimSeen::Absent if expected.is_some() => NotApplied::Lost { held: false },
         ClaimSeen::At(_) | ClaimSeen::Absent | ClaimSeen::Unread => match refusal {
             Refusal::MachineRef => NotApplied::MachineRef,
             Refusal::Other => NotApplied::Failed,
@@ -552,7 +552,7 @@ mod tests {
             let (changed, path) = self.change(
                 &claim_of(branch),
                 None,
-                record(branch, "machine-one", "owner-one"),
+                &record(branch, "machine-one", "owner-one"),
             );
             match changed.outcome {
                 ClaimOutcome::Landed(claim) => (claim, path),
@@ -609,7 +609,7 @@ mod tests {
 
         // When: it takes the branch.
         let (changed, path) =
-            lab.change(&claim, None, record("feat/a", "machine-one", "owner-one"));
+            lab.change(&claim, None, &record("feat/a", "machine-one", "owner-one"));
 
         // Then: it landed, and the claim ref holds its claim commit.
         assert!(changed.problems.is_empty(), "{:?}", changed.problems);
@@ -639,13 +639,12 @@ mod tests {
                 record: Ok(record("feat/a", "machine-one", "owner-one"))
             }
         );
-        let stored: toml::Table = toml::from_str(&git(
+        let stored = git(
             &lab.remote,
             &["cat-file", "blob", &format!("{taken}:claim.toml")],
-        ))
-        .unwrap();
+        );
         assert_eq!(
-            stored.get("entry").and_then(toml::Value::as_str),
+            ledger_git::stored_entry(&stored).as_deref(),
             path.file_name().and_then(OsStr::to_str)
         );
     }
@@ -661,15 +660,10 @@ mod tests {
         let theirs = lab.held(&claim, &record("feat/a", "machine-two", "owner-two"));
 
         // When: this machine takes the branch, as though it read no claim.
-        let (changed, _) = lab.change(&claim, None, record("feat/a", "machine-one", "owner-one"));
+        let (changed, _) = lab.change(&claim, None, &record("feat/a", "machine-one", "owner-one"));
 
         // Then: the claim was lost to the claim there now.
-        assert_eq!(
-            why_not(changed),
-            NotApplied::Lost {
-                now: Some(theirs.clone())
-            }
-        );
+        assert_eq!(why_not(changed), NotApplied::Lost { held: true });
         // And: the remote is as it was, this machine's ref is back at P, and
         // the entry is gone from disk and from the list, the earlier one
         // staying on disk.
@@ -694,7 +688,7 @@ mod tests {
         let claim = claim_of("feat/a");
 
         // When: this checkout takes the branch.
-        let (changed, _) = lab.change(&claim, None, record("feat/a", "machine-one", "owner-one"));
+        let (changed, _) = lab.change(&claim, None, &record("feat/a", "machine-one", "owner-one"));
 
         // Then: it failed before anything was sent, saying the ref is not
         // its own.
@@ -736,7 +730,7 @@ mod tests {
         let (changed, path) = lab.change(
             &claim,
             Some(&read.commit),
-            record("feat/a", "machine-one", "owner-one"),
+            &record("feat/a", "machine-one", "owner-one"),
         );
 
         // Then: the claim is this machine's, with its entry on the remote.
@@ -758,7 +752,7 @@ mod tests {
         let (taken, _) = lab.taken("feat/a");
 
         // When: it releases the claim, leasing on its commit.
-        let (changed, path) = lab.change(&claim, Some(&taken), Released);
+        let (changed, path) = lab.change(&claim, Some(&taken), NoClaim);
 
         // Then: the claim ref is gone, and the release's entry was sent.
         assert!(
@@ -782,15 +776,10 @@ mod tests {
         let theirs = lab.held(&claim, &record("feat/a", "machine-two", "owner-two"));
 
         // When: this machine releases, leasing on its own commit.
-        let (changed, _) = lab.change(&claim, Some(&taken), Released);
+        let (changed, _) = lab.change(&claim, Some(&taken), NoClaim);
 
         // Then: the claim was lost to the claim there now.
-        assert_eq!(
-            why_not(changed),
-            NotApplied::Lost {
-                now: Some(theirs.clone())
-            }
-        );
+        assert_eq!(why_not(changed), NotApplied::Lost { held: true });
         // And: nothing was removed on the remote, and here everything is back.
         assert_eq!(at(&lab.remote, claim.as_str()), Some(theirs));
         assert_eq!(at(&lab.remote, MACHINE), Some(before.clone()));
@@ -820,11 +809,11 @@ mod tests {
         let (changed, path) = lab.change(
             &claim,
             Some(&read.commit),
-            record("feat/a", "machine-one", "owner-one"),
+            &record("feat/a", "machine-one", "owner-one"),
         );
 
         // Then: the claim was lost, with no claim there now.
-        assert_eq!(why_not(changed), NotApplied::Lost { now: None });
+        assert_eq!(why_not(changed), NotApplied::Lost { held: false });
         // And: the remote holds no claim, and the entry is gone.
         assert_eq!(at(&lab.remote, claim.as_str()), None);
         assert!(!path.exists());
@@ -856,7 +845,7 @@ mod tests {
 
         // When: this machine takes the branch.
         let (changed, path) =
-            lab.change(&claim, None, record("feat/a", "machine-one", "owner-one"));
+            lab.change(&claim, None, &record("feat/a", "machine-one", "owner-one"));
 
         // Then: the outcome is unknown, and the remote holds nothing.
         assert!(
@@ -896,7 +885,7 @@ mod tests {
         let (changed, path) = lab.change(
             &claim_of("feat/a"),
             None,
-            record("feat/a", "machine-one", "owner-one"),
+            &record("feat/a", "machine-one", "owner-one"),
         );
 
         // Then: the change said so, naming the destination, and went on: the

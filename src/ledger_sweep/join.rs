@@ -6,19 +6,28 @@
 //! directory itself, as a machine is set up by hand to share a ledger:
 //! `<owner>--<name>.git` in [`ledger_repositories`], over the ledger root,
 //! whose `origin` is the ledger's repository on the fork's own forge, and
-//! which names this machine ([`this_machine`]). Two config homes that are
-//! live at once never share that name. A caller in a harness session names
-//! it for that session on this host: two sessions on one host, each with
-//! its own config home, never share a ref, and the same session joining
-//! again gets the same name back. What the remote already holds under that
-//! name is that session's own history, taken up before the directory is in
-//! place ([`make`]), so a config home made again resumes the claims it took
+//! which names this machine ([`this_machine`]). That name is never one
+//! whose ref the ledger's repository already holds, unless the ref is the
+//! session's own. A caller in a harness session names it for that session
+//! on this host: two sessions on one host, each with its own config home,
+//! never share a ref, and the same session joining again gets the same
+//! name back. What the remote already holds under that name is that
+//! session's own history, taken up before the directory is in place
+//! ([`make`]), so a config home made again resumes the claims it took
 //! rather than refuse its own ref. A caller in no harness session names it
 //! for the host, as the host's own config home is named when it is set up
 //! by hand; a name the remote already holds may be that config home's,
 //! still in use, so the join takes random digits instead and takes nothing
-//! up. A directory already at that path is never touched, and a dry run
-//! joins nothing.
+//! up. Only the remote is asked, so a config home set up by hand whose ref
+//! is not there yet can share the name, and whichever of the two pushes
+//! second is refused as another writer of that ref: as a name that is
+//! another machine's ([`GitError::NotOwn`]), or, where it has committed as
+//! the machine, with the command that renames it
+//! ([`GitError::MachineNameCollision`]). A directory already at that path
+//! is never touched, and a dry run joins nothing.
+//!
+//! [`GitError::NotOwn`]: crate::ledger_git::GitError::NotOwn
+//! [`GitError::MachineNameCollision`]: crate::ledger_git::GitError::MachineNameCollision
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -428,6 +437,19 @@ mod tests {
         )
     }
 
+    /// Write an entry of `acme/a-repo` under the ledger root `root`, as a
+    /// write records one; its path.
+    fn noted(root: &Path) -> PathBuf {
+        let (_, path) = Scribe::unanchored(
+            Ledger::at(root.join("acme/a-repo")),
+            UpstreamName::new("acme/a-repo"),
+            "owner-one".to_owned(),
+        )
+        .record_to(&Draft::event(None, "noted".into(), None))
+        .unwrap();
+        path
+    }
+
     /// The ledger's remote: a bare repository git reaches at `url` through
     /// the URL rule a session hands it (`GIT_CONFIG_COUNT` and its numbered
     /// pair), with the caller in a harness session or in none; both are this
@@ -722,7 +744,7 @@ mod tests {
         let git_dir = joined_git_dir(&root, "acme/ledger");
         let machine = config(&git_dir, "knives.machine").unwrap();
         assert_ne!(machine, host);
-        let short = host.strip_suffix("0123abcd").unwrap();
+        let short = host.strip_suffix(MACHINE_ID.get(..8).unwrap()).unwrap();
         let digits = machine.strip_prefix(short).unwrap();
         assert!(
             digits.len() == 8 && digits.bytes().all(|byte| byte.is_ascii_hexdigit()),
@@ -746,13 +768,7 @@ mod tests {
         );
 
         // When: an entry this config home writes is sent.
-        Scribe::unanchored(
-            Ledger::at(root.join("acme/a-repo")),
-            UpstreamName::new("acme/a-repo"),
-            "owner-one".to_owned(),
-        )
-        .record_to(&Draft::event(None, "noted".into(), None))
-        .unwrap();
+        noted(&root);
         let swept = crate::ledger_sweep::run(&root, Ok(registry)).unwrap();
 
         // Then: it reached the remote under the new name, and the ref of the
@@ -994,13 +1010,7 @@ mod tests {
                 Some("acme/elsewhere"),
             ),
         ]);
-        let (_, written) = Scribe::unanchored(
-            Ledger::at(root.join("acme/a-repo")),
-            UpstreamName::new("acme/a-repo"),
-            "owner-one".to_owned(),
-        )
-        .record_to(&Draft::event(None, "noted".into(), None))
-        .unwrap();
+        let written = noted(&root);
         let appended: Vec<crate::ledger::Appended> = crate::ledger::appended()
             .into_iter()
             .filter(|appended| appended.path.starts_with(&root))
@@ -1116,11 +1126,7 @@ mod tests {
     fn a_machine_is_named_for_its_short_host_name_and_its_machine_id() {
         // A readable machine id gives its first eight characters.
         assert_eq!(
-            machine_name(
-                "box-one.example.invalid",
-                Some("0123abcd4567ef890123abcd4567ef89\n"),
-                0
-            ),
+            machine_name("box-one.example.invalid", Some(MACHINE_ID), 0),
             "box-one-0123abcd"
         );
         // An id that is missing, short or not hex gives eight random digits.
@@ -1155,7 +1161,7 @@ mod tests {
         // One host, machine id and session give one name: the first eight
         // hex digits of the SHA-256 of the trimmed id, a newline and the
         // session.
-        let id = Some("0123abcd4567ef890123abcd4567ef89\n");
+        let id = Some(MACHINE_ID);
         let host = "box-one.example.invalid";
         assert_eq!(
             session_machine_name(host, id, "owner-one"),

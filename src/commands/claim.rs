@@ -1,7 +1,9 @@
-//! Claim identity resolution.
+//! Claims: who owns one, and whether a caller may take it.
 //!
-//! [`current_identity`] records both the claimant's name and how it was resolved.
-//! The claim-lifecycle matrix introduced in Task 2 consumes that resolution kind.
+//! The owner's identity ([`current_identity`], with how its name was
+//! resolved), the claim decision ([`decide`]), a ledger claim's read, copy
+//! and change ([`SharedClaims`], [`copy_of`], [`change_on_ledger`]), and the
+//! lines that report each.
 //!
 //! On a fork that shares its ledger, `start` and `finish` read a branch's
 //! claims the same way ([`SharedClaims`]), weigh them with the same rule

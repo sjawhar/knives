@@ -33,6 +33,8 @@ mod claims;
 mod run;
 mod tree;
 
+#[cfg(test)]
+pub(crate) use claims::stored_entry;
 pub use claims::{
     ClaimError, ClaimPush, ClaimPushed, ClaimRecord, ClaimRef, ClaimSeen, HeldClaim, Refusal,
     push_claim, read_claim, restore_machine_ref, write_claim,
@@ -670,11 +672,9 @@ pub fn take_up_own_ref(
     remote: &str,
     machine: &str,
 ) -> Result<(), GitError> {
-    if !remote_has_machine_ref(repository, remote, machine)? {
+    let Some((reference, remote)) = held_machine_ref(repository, remote, machine)? else {
         return Ok(());
-    }
-    let reference = own_ref(machine)?;
-    let remote = ref_component("remote", remote)?;
+    };
     transport(repository.git().args([
         "fetch",
         "--quiet",
@@ -698,9 +698,21 @@ pub fn remote_has_machine_ref(
     remote: &str,
     machine: &str,
 ) -> Result<bool, GitError> {
+    Ok(held_machine_ref(repository, remote, machine)?.is_some())
+}
+
+/// `machine`'s ref, `refs/knives/<machine>`, and `remote`, each as git
+/// takes it, where `remote` holds that ref; `None` where it does not.
+fn held_machine_ref<'r>(
+    repository: &Repository,
+    remote: &'r str,
+    machine: &str,
+) -> Result<Option<(String, &'r str)>, GitError> {
     let reference = own_ref(machine)?;
     let remote = ref_component("remote", remote)?;
-    Ok(claims::remote_refs(repository, remote, &[reference.as_str()])?.contains_key(&reference))
+    let held =
+        claims::remote_refs(repository, remote, &[reference.as_str()])?.contains_key(&reference);
+    Ok(held.then_some((reference, remote)))
 }
 
 /// Whether `git push` rejected its only ref because the remote had already

@@ -602,10 +602,7 @@ impl Shared {
 
     /// Run `script` as the remote's hook `name`.
     fn hook(&self, name: &str, script: &str) {
-        let hook = self.remote.join("hooks").join(name);
-        std::fs::write(&hook, script).expect("write the hook");
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
-            .expect("make the hook executable");
+        executable(&self.remote.join("hooks").join(name), script);
     }
 
     /// Take the remote's hook `name` away.

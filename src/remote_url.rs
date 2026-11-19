@@ -31,7 +31,7 @@ fn host_and_path(remote: &str) -> Option<(&str, &str)> {
     if authority.is_empty() {
         return None;
     }
-    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let (_, host) = user_and_host(authority);
     // `host:2222` is `host`: the port is how to reach it, not what it is.
     let host = match host.rsplit_once(':') {
         Some((name, port))
@@ -84,7 +84,7 @@ pub fn without_userinfo(url: &str) -> String {
     let Some((authority, path)) = authority_and_path(url) else {
         return url.to_owned();
     };
-    let Some((_, host)) = authority.rsplit_once('@') else {
+    let (Some(_), host) = user_and_host(authority) else {
         return url.to_owned();
     };
     match url.split_once("://") {
@@ -93,9 +93,17 @@ pub fn without_userinfo(url: &str) -> String {
     }
 }
 
+/// `authority` split at its last `@`: the user part, where it names one,
+/// and the host.
+fn user_and_host(authority: &str) -> (Option<&str>, &str) {
+    authority
+        .rsplit_once('@')
+        .map_or((None, authority), |(user, host)| (Some(user), host))
+}
+
 /// `(authority, path)` of `scheme://authority/path` or `user@authority:path`;
 /// `None` otherwise.
-pub fn remote_authority_and_path(url: &str) -> Option<(&str, &str)> {
+fn remote_authority_and_path(url: &str) -> Option<(&str, &str)> {
     let url = url.trim_end_matches('/');
     if let Some((_, authority_and_path)) = url.split_once("://") {
         return authority_and_path.split_once('/');

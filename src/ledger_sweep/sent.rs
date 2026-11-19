@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 use super::destinations::{destinations_telling, ledger_of};
 use super::join::joined_git_dir;
 use super::kept::keep;
-use super::{Destination, Destinations, REMOTE, Tally, ledger_repositories, pass, record};
+use super::{
+    Destination, Destinations, REMOTE, Tally, ledger_repositories, pass, record, setup_problems,
+};
 use crate::config::Registry;
 use crate::ids::UpstreamName;
 use crate::ledger::{Appended, inline_human_text, problem_human_text};
@@ -139,10 +141,10 @@ impl Written<'_> {
 /// carries it; one this command removed again is not in `appended`. What
 /// the passes discarded and left unread goes to the
 /// [`sweep_record`](super::sweep_record), and their problems replace the
-/// [`sweep_log`](super::sweep_log), as a sweep's do. A fork it sends
-/// nothing of is not in that log: this send did not route it, so it has
-/// nothing true to say of its ledger, and the next sweep, or the next
-/// command that routes the fork, says it again.
+/// [`sweep_log`](super::sweep_log), as a sweep's do. The log names no
+/// unreached ledger of a fork this send did not route: it has nothing true
+/// to say of whether that ledger is reached, and the next sweep, or the
+/// next command that routes the fork, says it again.
 pub fn send_now(root: &Path, registry: &Registry, appended: &[Appended]) -> SentNow {
     let shared = shared_of(registry, appended);
     if shared.is_empty() {
@@ -189,11 +191,9 @@ pub fn send_now(root: &Path, registry: &Registry, appended: &[Appended]) -> Sent
     match FileLock::acquire(root, LockWait::TRANSPORT) {
         Ok(_lock) => {
             if let Some(passed) = pass_each(root, &reached, &carried, &mut sent) {
-                let mut logged: Vec<String> = reached
-                    .unreached
-                    .iter()
-                    .filter(|(fork, _)| routed.contains(fork))
-                    .map(|(fork, unreached)| Destinations::unreached_problem(root, fork, unreached))
+                let mut logged: Vec<String> = setup_problems(root, &routed, Ok(&reached.unreached))
+                    .into_values()
+                    .flatten()
                     .collect();
                 logged.extend(reached.unclaimed.iter().cloned());
                 logged.extend(passed);
@@ -482,7 +482,7 @@ mod tests {
                 shared: &shared,
                 claim: &claim,
                 expected: None,
-                becomes: ClaimRecord {
+                becomes: &ClaimRecord {
                     repo: FORK.to_owned(),
                     branch: "feat/a".to_owned(),
                     owner: "owner-one".to_owned(),

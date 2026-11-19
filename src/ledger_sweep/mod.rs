@@ -38,7 +38,7 @@ mod pulled;
 mod sent;
 
 pub use claim::{
-    Becomes, ClaimChange, ClaimChanged, ClaimOutcome, LedgerFailure, NotApplied, Released,
+    Becomes, ClaimChange, ClaimChanged, ClaimOutcome, LedgerFailure, NoClaim, NotApplied,
     change_claim, read_claim,
 };
 pub use destinations::{

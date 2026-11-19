@@ -1103,7 +1103,7 @@ impl OnLedger<'_> {
     }
 
     /// A change of the claim from `expected` to what it `becomes`: a claim
-    /// commit of a record, or none ([`ledger_sweep::Released`]).
+    /// commit of a record, or none ([`ledger_sweep::NoClaim`]).
     const fn change<'b, B>(
         &'b self,
         expected: Option<&'b CommitId>,
@@ -1689,10 +1689,12 @@ fn resume_shared(
 /// `start` read, with the entry `draft` recording it, in one push.
 ///
 /// The claim commit that landed and its copy for the state file; or the
-/// exit after saying why nothing was claimed: a claim another machine took
-/// or changed meanwhile refuses as any claim refuses (exit 2), and a ledger
-/// that could not be written, or a push whose outcome is unknown, claims
-/// nothing here (exit 3).
+/// exit after saying why nothing was claimed. Where another config home
+/// took or changed the claim meanwhile ([`taken_meanwhile`]), another
+/// owner's claim refuses as any claim refuses (exit 2), and the caller's
+/// own claim is named with how to resume it (exit 3). A ledger that could
+/// not be written, or a push whose outcome is unknown, claims nothing here
+/// (exit 3).
 fn land(
     context: &StartContext<'_>,
     on: &OnLedger<'_>,
@@ -1700,7 +1702,7 @@ fn land(
     draft: &Draft<'_>,
 ) -> Result<(CommitId, Claim), Exit> {
     let branch = context.branch;
-    let change = on.change(on.read.as_ref(), record.clone());
+    let change = on.change(on.read.as_ref(), &record);
     match change_on_ledger(change, &scribe_for(context), draft) {
         ClaimOutcome::Landed(commit) => {
             let target = BranchTarget::new(context.fork.upstream.clone(), branch.clone());
@@ -1725,26 +1727,20 @@ fn land(
 /// What a claim push that applied nothing comes to: the exit after saying
 /// so.
 ///
-/// Where the claim was lost ([`NotApplied::Lost`]), to a claim commit this
-/// `start` did not read, another machine took or changed the claim meanwhile
-/// ([`taken_meanwhile`]); where to no claim, it was released meanwhile.
-/// Otherwise nothing was claimed, for why the push applied nothing
-/// ([`unapplied_cause`]): exit 3.
+/// Where the claim was lost ([`NotApplied::Lost`]), it is named as
+/// [`lost_meanwhile`] names it. Otherwise nothing was claimed, for why the
+/// push applied nothing ([`unapplied_cause`]): exit 3.
 fn lost(
     context: &StartContext<'_>,
     on: &OnLedger<'_>,
     why: &NotApplied,
     failure: &LedgerFailure,
 ) -> Exit {
-    match why {
-        NotApplied::Lost { now: Some(_) } => {
-            let (said, exit) = taken_meanwhile(context, on);
+    match *why {
+        NotApplied::Lost { held } => {
+            let (said, exit) = lost_meanwhile(context, on, held);
             eprintln!("{said}");
             exit
-        }
-        NotApplied::Lost { now: None } => {
-            eprintln!("{}", released_meanwhile(context.branch, on));
-            Exit::Incomplete
         }
         NotApplied::MachineRef | NotApplied::Failed => {
             eprintln!(
@@ -1753,6 +1749,19 @@ fn lost(
             );
             Exit::Incomplete
         }
+    }
+}
+
+/// A lost lease ([`NotApplied::Lost`]): what to say of it, and the exit of
+/// a `start` that lost its race. Where another claim holds the branch now
+/// (`held`), another config home took or changed it meanwhile
+/// ([`taken_meanwhile`]); where none does, it was released meanwhile, and
+/// a `start` again takes it (exit 3).
+fn lost_meanwhile(context: &StartContext<'_>, on: &OnLedger<'_>, held: bool) -> (String, Exit) {
+    if held {
+        taken_meanwhile(context, on)
+    } else {
+        (released_meanwhile(context.branch, on), Exit::Incomplete)
     }
 }
 
@@ -1854,7 +1863,7 @@ fn release_unopened(
         None,
     );
     let outcome = change_on_ledger(
-        on.change(Some(commit), ledger_sweep::Released),
+        on.change(Some(commit), ledger_sweep::NoClaim),
         &scribe_for(context),
         &draft,
     );
@@ -1868,13 +1877,9 @@ fn release_unopened(
             on.shared.ledger
         ),
         ClaimOutcome::NotApplied {
-            why: NotApplied::Lost { now: Some(_) },
+            why: NotApplied::Lost { held },
             ..
-        } => eprintln!("{}", taken_meanwhile(context, on).0),
-        ClaimOutcome::NotApplied {
-            why: NotApplied::Lost { now: None },
-            ..
-        } => eprintln!("{}", released_meanwhile(branch, on)),
+        } => eprintln!("{}", lost_meanwhile(context, on, held).0),
         ClaimOutcome::NotApplied { failure, .. } | ClaimOutcome::Unknown { failure } => {
             eprintln!(
                 "the claim of {branch} is held on the ledger {} with no workspace, since its \
