@@ -2161,6 +2161,7 @@ mod tests {
 
     #[test]
     fn a_claim_whose_record_does_not_read_is_refused_naming_its_ref_and_commit() {
+        let _lock = crate::config::test_support::environment_lock();
         let target = BranchTarget::new(
             crate::ids::UpstreamName::new("acme/demo"),
             BranchName::new("feat/alpha"),

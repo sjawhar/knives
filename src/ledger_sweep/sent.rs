@@ -374,6 +374,10 @@ mod tests {
     use crate::ledger_sweep::lab::{FORK, LEDGER_URL, Lab, git, init};
     use crate::ledger_sweep::{ClaimChange, ClaimOutcome, change_claim, shared_fork, sweep_log};
     use crate::store::OwnerKind;
+    // Every test here runs git, so each holds the environment lock for its
+    // whole body: a test that swaps `PATH` or git's config while it runs
+    // would otherwise hand its git to these.
+    use crate::config::test_support::environment_lock;
 
     /// What a send's tests do on the lab's machine and its remote.
     impl Lab {
@@ -457,6 +461,7 @@ mod tests {
 
     #[test]
     fn entries_a_claims_push_or_a_sweep_carried_are_sent_without_asking_the_remote() {
+        let _lock = environment_lock();
         // Given: a take of a branch whose push landed, carrying the entry
         // that records it, a note a sweep then carried, and then a remote
         // nothing can reach.
@@ -520,6 +525,7 @@ mod tests {
 
     #[test]
     fn an_entry_discarded_as_a_repeat_is_sent_and_the_discard_is_kept() {
+        let _lock = environment_lock();
         // Given: another machine's `#7 merged` on the remote, which this
         // machine has not pulled, and this machine's own record of the same
         // merge, written since.
@@ -561,6 +567,7 @@ mod tests {
 
     #[test]
     fn an_entry_no_remote_takes_stays_unsent_naming_the_ledger_and_the_git_directory() {
+        let _lock = environment_lock();
         // Given: this machine's entry, and a remote nothing can reach.
         let lab = Lab::new();
         lab.cut_off();

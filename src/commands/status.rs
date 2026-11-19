@@ -1315,6 +1315,7 @@ mod tests {
 
     #[test]
     fn a_branch_whose_path_diff_errors_is_unanswered() {
+        let _lock = crate::config::test_support::environment_lock();
         let scratch = tempfile::tempdir().expect("temporary non-repository");
         let mut row = BranchRow::bare(BranchName::new("feat/unresolvable"));
         row.tip = Some("0700338c".to_owned());

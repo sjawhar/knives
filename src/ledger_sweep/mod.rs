@@ -546,6 +546,10 @@ fn remove_if_present(path: PathBuf) -> Result<(), SweepError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Every test here runs git, so each holds the environment lock for its
+    // whole body: a test that swaps `PATH` or git's config while it runs
+    // would otherwise hand its git to these.
+    use crate::config::test_support::environment_lock;
 
     fn git(git_dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
@@ -608,6 +612,7 @@ mod tests {
 
     #[test]
     fn a_ledger_no_fork_shares_and_no_machine_names_is_not_shared() {
+        let _lock = environment_lock();
         let home = tempfile::tempdir().unwrap();
         let missing = destinations(&home.path().join("ledger"), &Registry::default()).unwrap();
         assert!(missing.found.is_empty() && missing.unreached.is_empty());
@@ -621,6 +626,7 @@ mod tests {
 
     #[test]
     fn forks_with_no_machine_name_are_refused_with_the_command_that_names_one() {
+        let _lock = environment_lock();
         let (_home, root) = ledger_root();
         registry(&root, &[("a-repo", Some("acme/ledger"))]);
         origin_at(&root, "/nonexistent/remote.git");
@@ -639,6 +645,7 @@ mod tests {
 
     #[test]
     fn a_machine_name_no_ref_can_spell_is_refused_with_the_command_that_names_one() {
+        let _lock = environment_lock();
         // Given: a repository carrying a fork, naming this machine `dev/box`,
         // which would nest under another machine's ref, or a name of 244
         // bytes, whose ref would be 256, longer than the ledger's remote
@@ -673,6 +680,7 @@ mod tests {
 
     #[test]
     fn a_knives_key_nothing_reads_is_reported_and_passed_over() {
+        let _lock = environment_lock();
         // A newer knives may read it, and machines sharing a ledger upgrade
         // at different times: refusing it would stop every pull and sweep.
         // `knives.fork` gets the same note as any other.
@@ -697,6 +705,7 @@ mod tests {
 
     #[test]
     fn the_root_carries_each_fork_whose_registry_entry_names_its_origin() {
+        let _lock = environment_lock();
         // Given: two forks sharing their ledger with the root's origin, one
         // spelling it in other letter case with `.git`, and one not shared.
         let (_home, root) = ledger_root();
@@ -744,6 +753,7 @@ mod tests {
 
     #[test]
     fn each_ledger_repository_is_a_destination_carrying_the_forks_that_name_it() {
+        let _lock = environment_lock();
         // Given: the root's own repository for acme/ledger, a second git
         // directory over the same root for a dot-named personal repository,
         // and a fork naming each.
@@ -810,6 +820,7 @@ mod tests {
 
     #[test]
     fn two_git_directories_with_one_origin_are_refused() {
+        let _lock = environment_lock();
         let (_home, root) = ledger_root();
         registry(&root, &[("a-repo", Some("acme/ledger"))]);
         origin_at(&root, "/nonexistent/remote.git");
@@ -824,6 +835,7 @@ mod tests {
 
     #[test]
     fn a_file_among_the_ledger_repositories_is_refused() {
+        let _lock = environment_lock();
         let (_home, root) = ledger_root();
         registry(&root, &[("a-repo", None)]);
         std::fs::create_dir_all(ledger_repositories(&root)).unwrap();
@@ -837,6 +849,7 @@ mod tests {
 
     #[test]
     fn a_fork_whose_ledger_could_not_be_joined_is_unreached_and_a_pull_and_a_lookup_say_why() {
+        let _lock = environment_lock();
         // Given: a fork sharing its ledger with a repository no git directory
         // here has as its origin, and where joining it would make one, a git
         // directory whose origin is another repository.
@@ -900,6 +913,7 @@ mod tests {
 
     #[test]
     fn a_shared_forks_destination_is_the_git_directory_carrying_it_and_other_forks_have_none() {
+        let _lock = environment_lock();
         // Given: one fork sharing its ledger through the root's repository,
         // and one sharing none.
         let (_home, root) = ledger_root();
@@ -933,6 +947,7 @@ mod tests {
 
     #[test]
     fn a_machine_name_with_no_fork_carries_nothing_and_a_pull_asks_no_remote() {
+        let _lock = environment_lock();
         let (_home, root) = ledger_root();
         registry(&root, &[("a-repo", None)]);
         git(&root.join(".git"), &["config", "knives.machine", "alpha"]);
@@ -948,6 +963,7 @@ mod tests {
 
     #[test]
     fn a_pull_that_fails_is_a_problem_for_the_forks_it_carries_only() {
+        let _lock = environment_lock();
         let (_home, root) = ledger_root();
         registry(&root, &[("a-repo", Some("acme/ledger")), ("b-repo", None)]);
         git(&root.join(".git"), &["config", "knives.machine", "alpha"]);

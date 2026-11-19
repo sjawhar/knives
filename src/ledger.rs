@@ -1621,6 +1621,7 @@ mod tests {
 
     #[test]
     fn each_entry_a_scribe_appends_is_listed_in_order_and_one_can_be_taken_out() {
+        let _lock = crate::config::test_support::environment_lock();
         // Given: writers for two forks, appending three entries between them.
         let dir = tempfile::tempdir().unwrap();
         let scribe = |name: &str| {
@@ -2460,6 +2461,7 @@ mod tests {
 
     #[test]
     fn entries_written_back_to_back_read_back_in_write_order() {
+        let _lock = crate::config::test_support::environment_lock();
         // One hundred writes as fast as the machine can make them: equal
         // wall-clock stamps would hand the order to the random suffix, and the
         // monotonic bump is what forbids equal stamps within a process.
@@ -2481,6 +2483,11 @@ mod tests {
         let wanted: Vec<String> = (0..100).map(|index| format!("entry {index}")).collect();
         assert_eq!(texts, wanted);
     }
+
+    /// A scribe for a checkout that is no repository. Its writes run git for
+    /// the writer's email, so a test that writes through one holds the
+    /// environment lock for its whole body: a test that swaps `PATH` or git's
+    /// config while it runs would otherwise hand its git to that one.
     fn scribe(dir: &std::path::Path) -> Scribe {
         Scribe::new(
             Ledger::at(dir.join("ledger").join("a-repo")),
@@ -2492,6 +2499,7 @@ mod tests {
 
     #[test]
     fn an_event_stamps_the_fields_no_caller_supplies() {
+        let _lock = crate::config::test_support::environment_lock();
         let dir = tempfile::tempdir().unwrap();
         let scribe = scribe(dir.path());
 
@@ -2518,6 +2526,7 @@ mod tests {
 
     #[test]
     fn an_entry_carries_the_writers_git_email_and_none_when_git_has_none() {
+        let _lock = crate::config::test_support::environment_lock();
         // Given: a checkout whose own config names its committer.
         let dir = tempfile::tempdir().unwrap();
         let checkout = dir.path().join("checkout");
@@ -2561,6 +2570,7 @@ mod tests {
 
     #[test]
     fn an_anchor_is_omitted_when_the_subject_does_not_resolve() {
+        let _lock = crate::config::test_support::environment_lock();
         // A branch deleted since, a reaped release ref, or a path that is not a
         // repository. None of them invalidates the entry, so none of them may
         // fail the write.
@@ -2573,6 +2583,7 @@ mod tests {
 
     #[test]
     fn a_note_carries_its_evidence_and_a_repo_level_entry_has_no_subject() {
+        let _lock = crate::config::test_support::environment_lock();
         let dir = tempfile::tempdir().unwrap();
         let written = scribe(dir.path())
             .record(&Draft {
@@ -2589,6 +2600,7 @@ mod tests {
 
     #[test]
     fn an_append_that_cannot_be_written_is_an_error_rather_than_a_shrug() {
+        let _lock = crate::config::test_support::environment_lock();
         // A ledger append failure fails its command loudly: the ledger and the
         // state file live in one config home, and a write that can fail one
         // can fail the other. Here a stray file squats on the directory name.

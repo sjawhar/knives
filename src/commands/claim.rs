@@ -1511,6 +1511,7 @@ mod tests {
 
     #[test]
     fn a_seize_of_a_claim_whose_holder_cannot_be_read_names_its_ref_and_commit() {
+        let _lock = environment_lock();
         // Given: the claim ref of a branch, holding a commit whose record
         // does not read.
         let claim = ClaimRef::new(
