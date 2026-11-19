@@ -22,7 +22,7 @@ knives start <branch> --repo <repo> --why '<PR number>: <work>'
 ```
 
 - Read each chain in full, unprefixed notes too, and check old evidence against the current tip.
-- Read knives output as printed, without `--json`, unless executed code filters, counts or joins it; keep that code in the evidence. Page clipped output in full.
+- Read knives output as printed, without `--json`, unless executed code filters, calculates or joins it; keep that code in the evidence. Page clipped output in full.
 - Prefix each new notch `placement:`, `recon:`, `rehome:`, `repair:`, `verify:`, `record:`, `decision:` or `handback:`. Add `--pr` when it is about the PR, and evidence: a commit, URL, or `file:line` at the cited commit.
 - A refusal that names another holder goes to the orchestrator. Do not `--force`.
 - `start` refuses a divergent bookmark: read [references/divergent-bookmark.md](references/divergent-bookmark.md).
