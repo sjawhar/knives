@@ -546,13 +546,16 @@ pub enum ReleaseAction {
     /// alone; each path that its text may name is held where this
     /// repository cannot measure the adopt, and where it can, each such path
     /// that the adopt's own tree holds. Where this repository cannot measure
-    /// the adopt and that text does not read whole, REV is refused, naming
-    /// the adopt, and the fetch of its commit where this repository does not
-    /// hold it and a remote has a branch or tag at it, else `--allow-drop`
-    /// alone: a list of more than 16 pieces, or a list of files resolved by
-    /// hand that another part follows, which may end there or name a path
-    /// that holds that part. A repository that does not hold the newest
-    /// write is refused and told to fetch it.
+    /// the adopt and that text does not read whole (a list of more than 16
+    /// pieces, or a list of files resolved by hand that another part
+    /// follows, which may end there or name a path that holds that part),
+    /// REV is refused, naming the adopt, and the fetch of its commit where
+    /// this repository does not hold it and origin or the publish remote has
+    /// a branch or tag at it, else `--allow-drop` alone. `--allow-drop` is
+    /// the last resort there: it also waives the checks of each recorded
+    /// member, of the newest recorded write and of each other fix by hand. A
+    /// repository that does not hold the newest write is refused and told to
+    /// fetch it.
     /// In a stacked series that write, a successor of it or a copy with its
     /// tree must be on its first-parent line. The ledger event records its
     /// members: in a stacked series the side parents on its first-parent

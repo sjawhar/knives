@@ -33,11 +33,12 @@
 //! read whole there, nor does a list of files resolved by hand that another
 //! part follows, as the list may end there or name a path that holds that
 //! part, so the record is refused, naming the adopt, and its fetch where a
-//! remote has a branch or tag at it, else `--allow-drop` alone; or recorded
-//! under `--allow-drop` with the drop stated. A record that lacks a file
-//! with no reference here is told to fetch the write where the walk for
-//! that reference stopped where a remote has it, and keeps the adopt of the
-//! new content where none does.
+//! remote has a branch or tag at it, else `--allow-drop` alone, and saying
+//! that `--allow-drop` is the last resort, as it waives the record's other
+//! checks too; or recorded under `--allow-drop` with the drop stated. A
+//! record that lacks a file with no reference here is told to fetch the
+//! write where the walk for that reference stopped where a remote has it,
+//! and keeps the adopt of the new content where none does.
 //! A published name that the publish remote lacks is not recorded until it
 //! is pushed, and the refusal gives the commands. A printed command quotes
 //! the name for the shell.
@@ -4584,6 +4585,14 @@ fn a_clone_without_the_adopts_commit_holds_a_deleted_path_as_absent_until_a_writ
     }
 }
 
+/// How the closing line of a refused record that holds a fix whose files
+/// this repository cannot read whole ends: `--allow-drop` goes past that fix
+/// only by waiving every other check of the gate too, so it is the last
+/// resort.
+const LAST_RESORT: &str = "; --allow-drop is the last resort: it also waives the checks of each \
+                           recorded member, of the newest recorded write and of each other fix \
+                           by hand";
+
 #[test]
 fn an_older_adopt_of_two_thousand_files_is_refused_in_a_clone_without_its_commit_and_goes_ahead_under_allow_drop()
  {
@@ -4642,7 +4651,8 @@ fn an_older_adopt_of_two_thousand_files_is_refused_in_a_clone_without_its_commit
     // more than 16, which the text does not give, so the clone cannot read
     // the fix's files whole, and it reads none of them. Origin, the one
     // remote read, has no branch or tag at the adopt, so no fetch brings it,
-    // and the remedy gives `--allow-drop` alone and says why.
+    // and the remedy gives `--allow-drop` alone, says why, and says that it
+    // is the last resort, as it also waives the record's other checks.
     let out = text(&refused);
     assert_eq!(refused.status.code(), Some(3), "{out}");
     assert!(
@@ -4661,7 +4671,7 @@ fn an_older_adopt_of_two_thousand_files_is_refused_in_a_clone_without_its_commit
         out.contains(&format!(
             "\n  nothing was recorded; re-run with --allow-drop to state the drop is intended: \
              nothing in this repository can hold a release against the fix by hand of \
-             {RELEASE}'s adopt {adopt}, as origin has no branch or tag at {adopt}\n",
+             {RELEASE}'s adopt {adopt}, as origin has no branch or tag at {adopt}{LAST_RESORT}\n",
             adopt = adopt.short()
         )),
         "{out}"
@@ -4768,15 +4778,15 @@ fn an_older_adopt_past_the_piece_bound_is_refused_naming_the_branch_that_origin_
     );
 
     // Then: it is refused, and its remedy names origin's branch at the
-    // adopt, with its fetch, then a commit that carries the fix; and nothing
-    // is written.
+    // adopt, with its fetch, then a commit that carries the fix, and says
+    // that `--allow-drop` is the last resort; and nothing is written.
     let out = text(&refused);
     assert_eq!(refused.status.code(), Some(3), "{out}");
     assert!(
         out.contains(&format!(
             "\n  nothing was recorded; fetch origin's refs/heads/{RELEASE}, which holds {}, then \
              record a commit that carries that fix, or re-run with --allow-drop to state the drop \
-             is intended\n",
+             is intended{LAST_RESORT}\n",
             adopt.short()
         )),
         "{out}"
@@ -4951,7 +4961,8 @@ fn an_older_adopt_whose_resolved_list_a_reason_follows_is_refused_where_its_comm
     // at `; why: ` or name a path that holds it, and the reading that ends
     // it there may hold less. The registry's origin cannot be read here, so
     // no fetch is named: the remedy gives `--allow-drop` alone, says that no
-    // remote could be read, and names that remote.
+    // remote could be read, names that remote, and says that `--allow-drop`
+    // is the last resort.
     let out = text(&refused);
     assert_eq!(refused.status.code(), Some(3), "{out}");
     assert!(
@@ -4970,7 +4981,7 @@ fn an_older_adopt_whose_resolved_list_a_reason_follows_is_refused_where_its_comm
             "\n  nothing was recorded; re-run with --allow-drop to state the drop is intended: \
              nothing in this repository can hold a release against the fix by hand of \
              {RELEASE}'s adopt {adopt}, as no remote could be read for a branch or tag at \
-             {adopt}; origin could not be read\n",
+             {adopt}; origin could not be read{LAST_RESORT}\n",
             adopt = adopt.short()
         )),
         "{out}"

@@ -1292,14 +1292,17 @@ fn unmeasured_why(why: release::Unmeasured, commit: &CommitId) -> String {
 /// hold it, or a write that a lacked file's reference needs or an adopt
 /// whose files nothing here reads whole, where one of `remotes` has a
 /// branch or tag at it ([`unread_fetch`]). A cut gets back a member of the
-/// previous cut with `include`. A member only the newest write holds, a
-/// write off the cut's line or not held here, and a fix that the newest
-/// write carries and the cut lacks mean the release here is older than that
-/// write, as on a machine that has not fetched it: so the cut is made again
-/// once that write's release is moved to it, after the fetch of each write
-/// that [`unread_fetch`] names, and an `include` on the older commit would
-/// write a second, divergent write. A write not held here may be one no
-/// fetch brings, so both refusals then name `adopt` too ([`adopt_remedy`]).
+/// previous cut with `include`, first, except where the fetch of an adopt
+/// whose files nothing here reads whole is named ([`FixRemedy::FetchAdopt`]):
+/// that fetch then comes first, and `include` follows the move it leads. A
+/// member only the newest write holds, a write off the cut's line or not
+/// held here, and a fix that the newest write carries and the cut lacks
+/// mean the release here is older than that write, as on a machine that
+/// has not fetched it: so the cut is made again once that write's release
+/// is moved to it, after the fetch of each write that [`unread_fetch`]
+/// names, and an `include` on the older commit would write a second,
+/// divergent write. A write not held here may be one no fetch brings, so
+/// both refusals then name `adopt` too ([`adopt_remedy`]).
 /// A fix that the subject changes on purpose is kept by an `adopt` of the
 /// new content ([`fix_adopt_remedy`]); a fix whose files nothing here reads
 /// whole has no files to keep, so it alone asks for no such adopt. A fix
@@ -1310,13 +1313,16 @@ fn unmeasured_why(why: release::Unmeasured, commit: &CommitId) -> String {
 /// a fix only where a commit can carry it ([`FixRemedy::commit_carries`]): a
 /// fix whose every lacked file has no reference here keeps the adopt of the
 /// new content, which gives those files one. What each fix asks for is
-/// [`fix_remedy`]'s, read once for the refusal.
+/// [`fix_remedy`]'s, read once for the refusal. A refusal that holds a fix
+/// whose files nothing here reads whole ends saying that `--allow-drop` is
+/// the last resort ([`last_resort`]).
 fn refusal_remedy(
     held: HeldRecords<'_>,
     (sources, found, fixes): (&[HeldRecord<'_>], WriteFindings<'_>, &[release::LackedFix]),
     (on_drop, remotes): (DropDisposition, &Remotes<'_>),
 ) -> String {
     let asks: Vec<FixRemedy<'_>> = fixes.iter().map(|fix| fix_remedy(fix, remotes)).collect();
+    let last = last_resort(held, fixes);
     let unheld: Vec<String> = fixes
         .iter()
         .zip(&asks)
@@ -1337,7 +1343,7 @@ fn refusal_remedy(
         return closing_line(
             "nothing was recorded",
             &remedies,
-            (&unheld, remotes.unread()),
+            (&unheld, remotes.unread(), last),
         );
     }
     let outcome = match on_drop {
@@ -1346,15 +1352,22 @@ fn refusal_remedy(
             "nothing was recorded"
         }
     };
-    let mut remedies = Vec::new();
-    if sources
+    // The fetch of an adopt whose files nothing here reads whole leads, so
+    // `include` follows the move that it starts; elsewhere `include` leads,
+    // as it always has.
+    let fetch_first = asks
+        .iter()
+        .any(|ask| matches!(ask, FixRemedy::FetchAdopt(_)));
+    let mut restore = sources
         .iter()
         .any(|source| matches!(source, HeldRecord::PreviousCut(_)))
-    {
-        remedies.push(
+        .then(|| {
             "`knives release include <branch>` restores a member the previous cut recorded"
-                .to_owned(),
-        );
+                .to_owned()
+        });
+    let mut remedies = Vec::new();
+    if !fetch_first {
+        remedies.extend(restore.take());
     }
     let newer = sources
         .iter()
@@ -1384,11 +1397,12 @@ fn refusal_remedy(
             shell_word(commit)
         ));
     }
+    remedies.extend(restore);
     if let Some(write) = found.absent {
         remedies.push(adopt_remedy(write));
     }
     remedies.extend(adopt_fixes);
-    closing_line(outcome, &remedies, (&unheld, remotes.unread()))
+    closing_line(outcome, &remedies, (&unheld, remotes.unread(), last))
 }
 
 /// What a refusal asks for about a fix by hand that the subject lacks
@@ -1560,11 +1574,13 @@ fn unheld_fix(
 /// ([`FixRemedy::has_step`]), each of `unheld` ([`unheld_fix`]), the line
 /// gives the remedies of the other findings first, if any, then
 /// `--allow-drop` as the one way on, and says why. Where a remote could not
-/// be read for a fetch, `unread` names it last.
+/// be read for a fetch, `unread` names it. `last` ends the line: where the
+/// refusal holds a fix whose files nothing here reads whole, that
+/// `--allow-drop` is the last resort ([`last_resort`]).
 fn closing_line(
     outcome: &str,
     remedies: &[String],
-    (unheld, unread): (&[String], &[&str]),
+    (unheld, unread, last): (&[String], &[&str], &str),
 ) -> String {
     const ALLOW: &str = "re-run with --allow-drop to state the drop is intended";
     let unread = if unread.is_empty() {
@@ -1573,7 +1589,10 @@ fn closing_line(
         format!("; {} could not be read", unread.join(" and "))
     };
     if unheld.is_empty() {
-        return format!("  {outcome}; {}, or {ALLOW}{unread}", remedies.join("; "));
+        return format!(
+            "  {outcome}; {}, or {ALLOW}{unread}{last}",
+            remedies.join("; ")
+        );
     }
     let then = if remedies.is_empty() {
         String::new()
@@ -1582,9 +1601,36 @@ fn closing_line(
     };
     format!(
         "  {outcome}; {then}{ALLOW}: nothing in this repository can hold a release against \
-         {}{unread}",
+         {}{unread}{last}",
         unheld.join(" and ")
     )
+}
+
+/// What a refusal says last where it holds a fix whose files nothing here
+/// reads whole ([`release::FixLack::Unread`]), whatever that fix's remedy
+/// ([`closing_line`]). `--allow-drop` goes past that fix only by going past
+/// every finding of the gate ([`release::CompositionCheck::refuses`]) too:
+/// each recorded member that the subject lacks, the newest recorded write
+/// off its line or not held here, and each other fix by hand; and for a
+/// knives cut, `held` with no record, the commits reachable only from the
+/// previous release as well ([`report_orphaned_cut`]). So it is the last
+/// resort, and the line says what else it waives. Empty where the refusal
+/// holds no such fix, whose line stays as it was.
+fn last_resort(held: HeldRecords<'_>, fixes: &[release::LackedFix]) -> &'static str {
+    const RECORD: &str = "; --allow-drop is the last resort: it also waives the checks of each \
+                          recorded member, of the newest recorded write and of each other fix by \
+                          hand";
+    const CUT: &str = "; --allow-drop is the last resort: it also waives the checks of each \
+                       recorded member, of the newest recorded write, of each other fix by hand \
+                       and of the commits reachable only from the previous release";
+    let unread = fixes
+        .iter()
+        .any(|fix| matches!(fix.lacks, release::FixLack::Unread { .. }));
+    match (unread, held.record.is_some()) {
+        (false, _) => "",
+        (true, true) => RECORD,
+        (true, false) => CUT,
+    }
 }
 
 /// What a refused record asks for ([`refusal_remedy`]) about the members
@@ -3368,6 +3414,17 @@ mod tests {
     const HOSTILE: &str = "x\u{1b}]0;pwned\u{7}\u{9b}2J";
     const ESCAPED: &str = "x\u{fffd}]0;pwned\u{fffd}\u{fffd}2J";
 
+    /// How the closing line of a refused record that holds a fix whose files
+    /// nothing here reads whole ends.
+    const RECORD_LAST_RESORT: &str = "; --allow-drop is the last resort: it also waives the \
+                                      checks of each recorded member, of the newest recorded \
+                                      write and of each other fix by hand";
+    /// How the closing line of a refused cut that holds such a fix ends.
+    const CUT_LAST_RESORT: &str = "; --allow-drop is the last resort: it also waives the checks \
+                                   of each recorded member, of the newest recorded write, of \
+                                   each other fix by hand and of the commits reachable only \
+                                   from the previous release";
+
     fn assert_escaped(lines: &[String]) {
         for line in lines {
             assert!(!line.chars().any(char::is_control), "{line:?}");
@@ -3731,7 +3788,7 @@ mod tests {
                 format!(
                     "  nothing was recorded; fetch origin's refs/heads/release/{ESCAPED}, which \
                      holds {short}, then record a commit that carries that fix, or re-run with \
-                     --allow-drop to state the drop is intended"
+                     --allow-drop to state the drop is intended{RECORD_LAST_RESORT}"
                 ),
             ]
         );
@@ -3751,7 +3808,7 @@ mod tests {
                      which holds {short}, then move release/2026-11-13 to bbbb, its newest \
                      recorded write: `jj bookmark set release/2026-11-13 -r bbbb \
                      --allow-backwards`, or re-run with --allow-drop to state the drop is \
-                     intended"
+                     intended{CUT_LAST_RESORT}"
                 )
                 .as_str()
             )
@@ -3821,50 +3878,53 @@ mod tests {
         // names that tag, peeled, from the full commit that the short one
         // starts; where the publish remote could not be read, the line says
         // that origin has none, then names the publish remote; and where no
-        // remote could be read, it says so, then names origin.
+        // remote could be read, it says so, then names origin. Each line ends
+        // saying that `--allow-drop` is the last resort and what else it
+        // waives.
         let ending = "re-run with --allow-drop to state the drop is intended: nothing in this \
                       repository can hold a release against the fix by hand of \
                       release/2026-11-12's adopt 0123456789ab, as";
         assert_eq!(
             record.last(),
             Some(&format!(
-                "  nothing was recorded; {ending} origin has no branch or tag at 0123456789ab"
+                "  nothing was recorded; {ending} origin has no branch or tag at \
+                 0123456789ab{RECORD_LAST_RESORT}"
             ))
         );
         assert_eq!(
             cut.last(),
             Some(&format!(
                 "  the candidate was discarded; {ending} origin has no branch or tag at \
-                 0123456789ab"
+                 0123456789ab{CUT_LAST_RESORT}"
             ))
         );
         assert_eq!(
             neither.last(),
             Some(&format!(
                 "  nothing was recorded; {ending} neither origin nor release has a branch or tag \
-                 at 0123456789ab"
+                 at 0123456789ab{RECORD_LAST_RESORT}"
             ))
         );
         assert_eq!(
-            fetched.last().map(String::as_str),
-            Some(
+            fetched.last(),
+            Some(&format!(
                 "  nothing was recorded; fetch origin's refs/tags/kept, which holds 0123456789ab, \
                  then record a commit that carries that fix, or re-run with --allow-drop to state \
-                 the drop is intended"
-            )
+                 the drop is intended{RECORD_LAST_RESORT}"
+            ))
         );
         assert_eq!(
             half.last(),
             Some(&format!(
                 "  nothing was recorded; {ending} origin has no branch or tag at 0123456789ab; \
-                 release could not be read"
+                 release could not be read{RECORD_LAST_RESORT}"
             ))
         );
         assert_eq!(
             blind.last(),
             Some(&format!(
                 "  nothing was recorded; {ending} no remote could be read for a branch or tag at \
-                 0123456789ab; origin could not be read"
+                 0123456789ab; origin could not be read{RECORD_LAST_RESORT}"
             ))
         );
     }
@@ -3938,7 +3998,7 @@ mod tests {
                 format!(
                     "  nothing was recorded; fetch origin's refs/heads/release/{ESCAPED}, which \
                      holds {short}, then record a commit that carries that fix, or re-run with \
-                     --allow-drop to state the drop is intended"
+                     --allow-drop to state the drop is intended{RECORD_LAST_RESORT}"
                 ),
             ]
         );
@@ -4011,7 +4071,8 @@ mod tests {
         // against it; its remedy asks for no fetch and no commit, says that
         // nothing here can hold a release against the fix, and gives
         // `--allow-drop`; and the adopt this repository does not hold is
-        // still fetched from origin.
+        // still fetched from origin. Each line ends saying that
+        // `--allow-drop` is the last resort and what else it waives.
         let (short, ending) = (ids_prefix(ESCAPED), unheld_ending());
         assert_eq!(
             record,
@@ -4024,19 +4085,21 @@ mod tests {
                      a list of more than 16 pieces, which may name a path of more pieces than \
                      this repository reads"
                 ),
-                format!("  nothing was recorded; {ending}"),
+                format!("  nothing was recorded; {ending}{RECORD_LAST_RESORT}"),
             ]
         );
         assert_eq!(
             cut.last(),
-            Some(&format!("  the candidate was discarded; {ending}"))
+            Some(&format!(
+                "  the candidate was discarded; {ending}{CUT_LAST_RESORT}"
+            ))
         );
         assert_eq!(
             absent.last(),
             Some(&format!(
                 "  nothing was recorded; fetch origin's refs/heads/release/{ESCAPED}, which holds \
                  {short}, then record a commit that carries that fix, or re-run with --allow-drop \
-                 to state the drop is intended"
+                 to state the drop is intended{RECORD_LAST_RESORT}"
             ))
         );
     }
@@ -4058,7 +4121,9 @@ mod tests {
 
         // Then: the other fix keeps its remedies, the commit or the move and
         // the adopt of the new content, and `--allow-drop` follows them for
-        // the fix that nothing here can hold a release against.
+        // the fix that nothing here can hold a release against; the line
+        // ends saying that `--allow-drop` is the last resort and what else
+        // it waives, the other fix among them.
         let (ending, keep) = (
             unheld_ending(),
             "to keep the new content of those files, edit release/2026-11-13 by hand to hold it \
@@ -4068,7 +4133,7 @@ mod tests {
             record.last(),
             Some(&format!(
                 "  nothing was recorded; record a commit that carries that fix; {keep}; then \
-                 {ending}"
+                 {ending}{RECORD_LAST_RESORT}"
             ))
         );
         assert_eq!(
@@ -4076,9 +4141,123 @@ mod tests {
             Some(&format!(
                 "  the candidate was discarded; fetch, then move release/2026-11-13 to bbbb, its \
                  newest recorded write: `jj bookmark set release/2026-11-13 -r bbbb \
-                 --allow-backwards`; {keep}; then {ending}"
+                 --allow-backwards`; {keep}; then {ending}{CUT_LAST_RESORT}"
             ))
         );
+    }
+
+    #[test]
+    fn a_refusal_over_a_fix_nothing_here_reads_whole_ends_with_allow_drop_as_the_last_resort() {
+        // Given: the newest write, `release/2026-11-13`'s cut `bbbb`, which
+        // records the member `feat/alpha@abab`; the previous cut,
+        // `release/2026-11-10`'s `cccc`, which records `feat/alpha@cdcd`; the
+        // fix by hand of an adopt that this repository does not hold, whose
+        // files nothing here reads whole, where origin has a branch at the
+        // adopt; and the fix by hand of another adopt at a file whose
+        // reference is the newest write.
+        let write = RecordedCut {
+            kind: RecordedWriteKind::Cut,
+            name: "release/2026-11-13".to_owned(),
+            commit: CommitId::new("bbbb"),
+            members: vec![CommitId::new("abab")],
+        };
+        let previous = RecordedCut {
+            kind: RecordedWriteKind::Cut,
+            name: "release/2026-11-10".to_owned(),
+            commit: CommitId::new("cccc"),
+            members: vec![CommitId::new("cdcd")],
+        };
+        let at = CommitId::new("eeee");
+        let record = HeldRecords {
+            first: HeldRecord::NewestWrite(&write),
+            other: None,
+            record: Some(("release/2026-11-14", &at)),
+            stacked: false,
+        };
+        let cut = HeldRecords {
+            record: None,
+            ..record
+        };
+        let after_cut = HeldRecords {
+            first: HeldRecord::PreviousCut(&previous),
+            other: Some(HeldRecord::NewestWrite(&write)),
+            ..cut
+        };
+        let lacking = |member: &str, fixes: Vec<LackedFix>| CompositionCheck {
+            dropped: vec![RecordedMember {
+                commit: CommitId::new(member),
+                name: format!("feat/alpha@{member}"),
+            }],
+            dropped_fixes: fixes,
+            ..CompositionCheck::default()
+        };
+        let origin = origin_has(&format!("refs/heads/release/{HOSTILE}"), HOSTILE);
+        let repo = RepoName::new("demo");
+        let refuse = |held: HeldRecords<'_>, check: &CompositionCheck| {
+            let on_drop = if held.record.is_some() {
+                DropDisposition::RefuseRecordingNothing
+            } else {
+                DropDisposition::RefuseDiscardingCandidate
+            };
+            let lines = uncarried_cut_lines(&repo, held, check, (on_drop, &origin));
+            assert_escaped(&lines);
+            lines.last().cloned()
+        };
+
+        // When: the gate refuses a record and a cut that lack the member of
+        // the newest write and the first fix, a record and a cut that lack
+        // that member and the other fix, and a cut that lacks the member of
+        // the previous cut and either fix.
+        let unread = lacking("abab", vec![beyond_bound(release::Unmeasured::Absent)]);
+        let other = lacking("abab", vec![held_fix()]);
+        let (record_unread, cut_unread) = (refuse(record, &unread), refuse(cut, &unread));
+        let (record_other, cut_other) = (refuse(record, &other), refuse(cut, &other));
+        let restored_unread = refuse(
+            after_cut,
+            &lacking("cdcd", vec![beyond_bound(release::Unmeasured::Absent)]),
+        );
+        let restored_other = refuse(after_cut, &lacking("cdcd", vec![held_fix()]));
+
+        // Then: beside the member, each refusal that holds the first fix
+        // names the adopt's fetch first, before `include` too, and ends
+        // saying that `--allow-drop` is the last resort, as it also waives
+        // the check of that member, of the newest write and of each other
+        // fix, and for a cut of the commits only the previous release
+        // reaches; each refusal that holds the other fix alone ends as
+        // before, `include` first.
+        let short = ids_prefix(ESCAPED);
+        let fetch = format!("fetch origin's refs/heads/release/{ESCAPED}, which holds {short}");
+        let allow = "or re-run with --allow-drop to state the drop is intended";
+        let moved = "move release/2026-11-13 to bbbb, its newest recorded write: `jj bookmark set \
+                     release/2026-11-13 -r bbbb --allow-backwards`";
+        let include = "`knives release include <branch>` restores a member the previous cut \
+                       recorded";
+        let keep = "to keep the new content of those files, edit release/2026-11-13 by hand to \
+                    hold it and run `knives release adopt release/2026-11-13`";
+        let (recorded, discarded) = ("  nothing was recorded", "  the candidate was discarded");
+        let wanted = [
+            format!(
+                "{recorded}; {fetch}, then record a commit that carries each of them and each \
+                 fix, {allow}{RECORD_LAST_RESORT}"
+            ),
+            format!("{discarded}; {fetch}, then {moved}, {allow}{CUT_LAST_RESORT}"),
+            format!("{discarded}; {fetch}, then {moved}; {include}, {allow}{CUT_LAST_RESORT}"),
+            format!(
+                "{recorded}; record a commit that carries each of them and each fix; {keep}, \
+                 {allow}"
+            ),
+            format!("{discarded}; fetch, then {moved}; {keep}, {allow}"),
+            format!("{discarded}; {include}; fetch, then {moved}; {keep}, {allow}"),
+        ];
+        let got = [
+            record_unread,
+            cut_unread,
+            restored_unread,
+            record_other,
+            cut_other,
+            restored_other,
+        ];
+        assert_eq!(got, wanted.map(Some));
     }
 
     #[test]
