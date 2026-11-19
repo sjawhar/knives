@@ -13,7 +13,7 @@ use crate::ids::{
     BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, is_our_release, is_release_name,
 };
 use crate::jj::{self, Repo};
-use crate::ledger::{Entry, Kind, RecordedParent};
+use crate::ledger::{Entry, FixFile, Kind, RecordedParent};
 use crate::pins::{Pin, scan};
 /// Scan evidence for one consumer's fetched pin texts.
 #[derive(Debug, Default)]
@@ -1400,7 +1400,7 @@ pub fn adopted_fix_replaces<'a>(entry: &'a Entry, release: &str) -> Option<&'a s
 }
 
 /// The files that an `adopt` event names as its fix by hand
-/// ([`adopted_fix_files`]).
+/// ([`AdoptedFixText::files`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AdoptedFixFiles {
     /// The files resolved by hand, then those changed beyond the baseline's
@@ -1411,12 +1411,11 @@ pub struct AdoptedFixFiles {
     /// a `fix_files` list ([`Entry::fix_files`]), which an older knives
     /// writes. The text joins a list's files with `, ` and ends the list at
     /// `; ` or ` (why: `, so it cannot tell a path that holds one of those
-    /// from two paths, and it names no path that it cannot read whole
-    /// ([`adopted_fix_files`]). A reader that measures the adopt holds only
-    /// those of [`Self::files`] that the adopt's own tree holds, beside the
-    /// files that its change changes; a reader that cannot measure it holds
-    /// each of them, where the text reads whole
-    /// ([`adopted_fix_files_whole`]).
+    /// from two paths ([`adopted_fix_text`]). A reader that measures the
+    /// adopt holds only those of [`Self::files`] that the adopt's own tree
+    /// holds, beside the files that its change changes; a reader that cannot
+    /// measure it holds each of them, where the text reads whole
+    /// ([`AdoptedFixText::unread`]).
     pub from_text: bool,
 }
 
@@ -1426,7 +1425,7 @@ const TEXT_SEPARATORS: [&str; 3] = [", ", "; ", " (why: "];
 
 /// The most pieces that a path read from a list of an `adopt` event's text
 /// joins ([`text_paths`]), and that a list read whole has
-/// ([`adopted_fix_files_whole`]).
+/// ([`AdoptedFixText::unread`]).
 ///
 /// A path that holds up to 15 separators reads back whole; a path that
 /// holds more is not read, as a path that a person names holds a few
@@ -1497,99 +1496,185 @@ fn text_paths<'a>(lists: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     paths
 }
 
-/// The files that an `adopt` event of `release` names as its fix by hand,
-/// each path once.
+/// What an `adopt` event of `release` names as the files of its fix by
+/// hand, read once.
 ///
-/// They are the files it resolved by hand ([`ADOPTED_RESOLVED`]), then the
-/// files it changed beyond the baseline's conflicts ([`ADOPTED_BEYOND`]), as
-/// `adopt` measured them where it ran. Empty for every event that
+/// It gives the files ([`AdoptedFixText::files`]), and whether a reader
+/// that cannot measure the adopt reads them whole, and why not
+/// ([`AdoptedFixText::unread`]).
+///
+/// The files are those it resolved by hand ([`ADOPTED_RESOLVED`]), then
+/// those it changed beyond the baseline's conflicts ([`ADOPTED_BEYOND`]), as
+/// `adopt` measured them where it ran. It names none for every event that
 /// [`adopted_fix_replaces`] reads as no fix.
 ///
 /// The event's `fix_files` list holds each path whole
 /// ([`Entry::fix_files`]), and a reader takes it first. An event without
 /// the list, as an older knives writes one, names the files in its text
 /// alone ([`AdoptedFixFiles::from_text`]): each list as its files joined by
-/// `, `, then the event's other parts after `; `, and its parents last,
-/// after `; parents: `. The resolved list ends where the other list begins,
-/// at the first `; changed beyond the baseline's conflicts: `, or, where
-/// no other list follows, at the first `; why: `, `; carriers: ` or
+/// `, `, then the event's other parts after `; `, in the order that `adopt`
+/// writes them ([`RESOLVED_LIST_ENDS`]), and its parents last, after
+/// `; parents: `. Every `adopt` event ends with its parents, which name
+/// refs and commits, so the last `; parents: ` is the one that `adopt`
+/// wrote. The resolved list ends where the other list begins, at the first
+/// `; changed beyond the baseline's conflicts: `, or, where no other list
+/// follows, at the first `; why: `, `; carriers: ` or
 /// `; added lines absent: `. The other list ends where its reason begins,
-/// at its last ` (why: `, or else at the next `; `. A path that holds a
-/// separator does not read back whole from a list, so each list gives every
-/// path of at most [`TEXT_PATH_PIECES`] pieces that it may name
-/// ([`text_paths`]). So the text names no file resolved by hand whose path
-/// holds one of those parts that ends its list, and no path of more pieces;
-/// a list of more pieces does not read whole ([`adopted_fix_files_whole`]).
-/// The `fix_files` list has neither limit.
-pub fn adopted_fix_files(entry: &Entry, release: &str) -> AdoptedFixFiles {
-    let Some((_, parts)) = adopted_fix_parts(entry, release) else {
-        return AdoptedFixFiles::default();
-    };
-    if !entry.fix_files.is_empty() {
-        let mut listed = HashSet::new();
-        return AdoptedFixFiles {
-            files: entry
-                .fix_files
-                .iter()
-                .filter(|file| listed.insert(file.path.as_str()))
-                .map(|file| file.path.clone())
-                .collect(),
-            from_text: false,
-        };
-    }
-    let (resolved, beyond) = text_lists(parts);
-    AdoptedFixFiles {
-        files: text_paths(std::iter::once(resolved).chain(beyond))
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-        from_text: true,
-    }
-}
-
-/// Whether a reader that cannot measure the adopt that `entry`, an `adopt`
-/// event of `release`, records reads the files of its fix whole
-/// ([`adopted_fix_files`]).
+/// at its last ` (why: `, or else at the next `; `, so it reads at least
+/// whole. A path that holds a separator does not read back whole from a
+/// list, so each list gives every path of at most [`TEXT_PATH_PIECES`]
+/// pieces that it may name ([`text_paths`]).
 ///
-/// An event with its `fix_files` list names each file whole, and an event
-/// that records no fix names none. An event without the list, as an older
-/// knives writes it, reads whole where each list of its text has at most
-/// [`TEXT_PATH_PIECES`] pieces ([`text_pieces`]): every path such a list
-/// may name is then one that the text gives. A list of more pieces may name
-/// a path of more pieces, which the text does not give, so such a reader
-/// cannot tell what the fix holds.
-pub fn adopted_fix_files_whole(entry: &Entry, release: &str) -> bool {
+/// The text reads whole where each path that its lists may name is one that
+/// the text gives. It does not where the text after [`ADOPTED_RESOLVED`]
+/// holds one of the parts that `adopt` writes after that list, once or
+/// more: a path and a reason are free text, so the list may end there or
+/// name a path that holds that part, the text reads two ways, and the
+/// reading that ends the list there may name fewer files
+/// ([`UnreadFixText::Marker`]). Nor does it where a list has more than
+/// [`TEXT_PATH_PIECES`] pieces, as such a list may name a path of more
+/// pieces, which the text does not give ([`UnreadFixText::Pieces`]). The
+/// `fix_files` list reads whole at any length.
+pub fn adopted_fix_text<'a>(entry: &'a Entry, release: &str) -> AdoptedFixText<'a> {
     let Some((_, parts)) = adopted_fix_parts(entry, release) else {
-        return true;
+        return AdoptedFixText(FixNames::Nothing);
     };
     if !entry.fix_files.is_empty() {
-        return true;
+        return AdoptedFixText(FixNames::Listed(&entry.fix_files));
     }
-    let (resolved, beyond) = text_lists(parts);
-    std::iter::once(resolved)
-        .chain(beyond)
-        .all(|list| text_pieces(list).nth(TEXT_PATH_PIECES).is_none())
-}
-
-/// The lists of files that `parts`, an `adopt` event's parts after its
-/// baseline ([`adopted_fix_parts`]), name in its text: the files resolved
-/// by hand, empty where it resolved none, then the files changed beyond the
-/// baseline's conflicts, where it changed any. Its parents come last, after
-/// `; parents: `. The resolved list ends where the other list begins, at
-/// the first `; changed beyond the baseline's conflicts: `, or, where no
-/// other list follows, at the next part that knives writes
-/// ([`resolved_list`]). The other list ends where its reason begins, at its
-/// last ` (why: `, or else at the next `; ` ([`adopted_fix_files`]).
-fn text_lists(parts: &str) -> (&str, Option<&str>) {
     let parts = parts
         .rsplit_once("; parents: ")
         .map_or(parts, |(parts, _)| parts);
-    let marker = format!("; {ADOPTED_BEYOND}");
+    let marker = parts.strip_prefix(ADOPTED_RESOLVED).and_then(|resolved| {
+        RESOLVED_LIST_ENDS
+            .iter()
+            .filter_map(|&end| resolved.find(end).map(|at| (at, end)))
+            .min_by_key(|&(at, _)| at)
+            .map(|(_, end)| end)
+    });
+    let (resolved, beyond) = text_lists(parts);
+    let unread = marker.map(UnreadFixText::Marker).or_else(|| {
+        std::iter::once(resolved)
+            .chain(beyond)
+            .any(|list| text_pieces(list).nth(TEXT_PATH_PIECES).is_some())
+            .then_some(UnreadFixText::Pieces)
+    });
+    AdoptedFixText(FixNames::Text {
+        resolved,
+        beyond,
+        unread,
+    })
+}
+
+/// What an `adopt` event names as the files of its fix by hand, read once
+/// ([`adopted_fix_text`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdoptedFixText<'a>(FixNames<'a>);
+
+/// Where an `adopt` event names the files of its fix ([`AdoptedFixText`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixNames<'a> {
+    /// Nowhere: the event records no fix by hand.
+    Nothing,
+    /// Its `fix_files` list ([`Entry::fix_files`]).
+    Listed(&'a [FixFile]),
+    /// Its text alone, as an older knives writes it: the files resolved by
+    /// hand, then those changed beyond the baseline's conflicts
+    /// ([`text_lists`]), and why the text does not read whole, where it
+    /// does not.
+    Text {
+        resolved: &'a str,
+        beyond: Option<&'a str>,
+        unread: Option<UnreadFixText>,
+    },
+}
+
+impl AdoptedFixText<'_> {
+    /// Why a reader that cannot measure the adopt cannot read the files of
+    /// its fix whole from its event, or `None` where it can
+    /// ([`adopted_fix_text`]).
+    pub const fn unread(&self) -> Option<UnreadFixText> {
+        match self.0 {
+            FixNames::Text { unread, .. } => unread,
+            FixNames::Nothing | FixNames::Listed(_) => None,
+        }
+    }
+
+    /// The files of the fix, each path once: the `fix_files` list, or every
+    /// path that the text's lists may name ([`text_paths`]), at most
+    /// [`TEXT_PATH_PIECES`] for each piece of a list.
+    pub fn files(&self) -> AdoptedFixFiles {
+        match self.0 {
+            FixNames::Nothing => AdoptedFixFiles::default(),
+            FixNames::Listed(listed) => {
+                let mut named = HashSet::new();
+                AdoptedFixFiles {
+                    files: listed
+                        .iter()
+                        .filter(|file| named.insert(file.path.as_str()))
+                        .map(|file| file.path.clone())
+                        .collect(),
+                    from_text: false,
+                }
+            }
+            FixNames::Text {
+                resolved, beyond, ..
+            } => AdoptedFixFiles {
+                files: text_paths(std::iter::once(resolved).chain(beyond))
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                from_text: true,
+            },
+        }
+    }
+}
+
+/// Why an older `adopt` event's text does not read whole
+/// ([`adopted_fix_text`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreadFixText {
+    /// The text after its list of files resolved by hand opens holds this
+    /// part, one of [`RESOLVED_LIST_ENDS`]: the list may end there or name a
+    /// path that holds it.
+    Marker(&'static str),
+    /// A list of its files has more than [`TEXT_PATH_PIECES`] pieces.
+    Pieces,
+}
+
+/// The parts that `adopt` writes after an event's list of files resolved by
+/// hand, each after `; `, in their order: the files changed beyond the
+/// baseline's conflicts ([`ADOPTED_BEYOND`]), or else the reason, then the
+/// carriers, then the added lines absent from the resolution.
+const RESOLVED_LIST_ENDS: [&str; 4] = [
+    "; changed beyond the baseline's conflicts: ",
+    "; why: ",
+    "; carriers: ",
+    "; added lines absent: ",
+];
+
+/// The lists of files that `parts`, an `adopt` event's parts after its
+/// baseline ([`adopted_fix_parts`]), up to its parents, name in its text:
+/// the files resolved by hand, empty where it resolved none, then the files
+/// changed beyond the baseline's conflicts, where it changed any. The
+/// resolved list ends where the other list begins, at the first
+/// `; changed beyond the baseline's conflicts: `, or, where no other list
+/// follows, at the first of the other parts that `adopt` writes after it
+/// ([`RESOLVED_LIST_ENDS`]). The other list ends where its reason begins,
+/// at its last ` (why: `, or else at the next `; ` ([`adopted_fix_text`]).
+fn text_lists(parts: &str) -> (&str, Option<&str>) {
+    let [beyond_part, after @ ..] = RESOLVED_LIST_ENDS;
     let (resolved, beyond) = parts.strip_prefix(ADOPTED_RESOLVED).map_or_else(
         || ("", parts.strip_prefix(ADOPTED_BEYOND)),
         |resolved| {
-            resolved.split_once(marker.as_str()).map_or_else(
-                || (resolved_list(resolved), None),
+            resolved.split_once(beyond_part).map_or_else(
+                || {
+                    let end = after.iter().filter_map(|part| resolved.find(part)).min();
+                    (
+                        end.and_then(|end| resolved.get(..end)).unwrap_or(resolved),
+                        None,
+                    )
+                },
                 |(list, beyond)| (list, Some(beyond)),
             )
         },
@@ -1601,18 +1686,6 @@ fn text_lists(parts: &str) -> (&str, Option<&str>) {
             .map_or(beyond, |(list, _)| list)
     });
     (resolved, beyond)
-}
-
-/// The resolved list of an `adopt` event's text that no other list
-/// follows: `resolved`, the text after [`ADOPTED_RESOLVED`], up to the next
-/// part that knives writes, `why: `, `carriers: ` or `added lines absent: `.
-fn resolved_list(resolved: &str) -> &str {
-    ["; why: ", "; carriers: ", "; added lines absent: "]
-        .iter()
-        .filter_map(|part| resolved.find(part))
-        .min()
-        .and_then(|end| resolved.get(..end))
-        .unwrap_or(resolved)
 }
 
 /// The replaced write's commit prefix and the parts after the baseline of
@@ -2686,10 +2759,16 @@ mod adopted_fix_tests {
     use std::collections::HashSet;
 
     use super::{
-        AdoptedFixFiles, CommitId, TEXT_PATH_PIECES, adopted_fix_files, adopted_fix_files_whole,
-        adopted_fix_replaces, carrier_tests::event,
+        AdoptedFixFiles, CommitId, TEXT_PATH_PIECES, UnreadFixText, adopted_fix_replaces,
+        adopted_fix_text, carrier_tests::event,
     };
     use crate::ledger::{Entry, FixChange, FixFile};
+
+    /// The files that `entry` names as its fix by hand, as an `adopt` event
+    /// of `release` ([`adopted_fix_text`]).
+    fn named_files(entry: &Entry, release: &str) -> AdoptedFixFiles {
+        adopted_fix_text(entry, release).files()
+    }
 
     /// An `adopt` event of `integration` whose delta after its baseline says
     /// `parts`, as `adopt` writes one.
@@ -2745,7 +2824,7 @@ mod adopted_fix_tests {
             // holds it, and never a word of its reason, its carriers or its
             // parents; and it names the write it replaced exactly when it
             // names a file.
-            let named = adopted_fix_files(&entry, "integration");
+            let named = named_files(&entry, "integration");
             assert_eq!(named.files, files, "{parts}");
             assert_eq!(named.from_text, !files.is_empty(), "{parts}");
             assert_eq!(
@@ -2755,7 +2834,7 @@ mod adopted_fix_tests {
             );
             // And: another release's name reads no fix in it.
             assert_eq!(
-                adopted_fix_files(&entry, "release/2026-08-04"),
+                named_files(&entry, "release/2026-08-04"),
                 AdoptedFixFiles::default()
             );
         }
@@ -2786,8 +2865,8 @@ mod adopted_fix_tests {
         };
 
         // When: each event's files are read.
-        let whole = adopted_fix_files(&listed, "integration");
-        let pieces = adopted_fix_files(&older, "integration");
+        let whole = named_files(&listed, "integration");
+        let pieces = named_files(&older, "integration");
 
         // Then: the list gives each path whole; the text gives every path
         // that it may name, each whole path among them, and says that it
@@ -2822,7 +2901,7 @@ mod adopted_fix_tests {
         let pieces = many.len() + 16 + 17;
 
         // When: its files are read.
-        let named = adopted_fix_files(&entry, "integration");
+        let named = named_files(&entry, "integration");
 
         // Then: they are at most 16 paths for each piece of the list, each
         // once, and they hold each file that joins 16 pieces or fewer, but
@@ -2856,26 +2935,23 @@ mod adopted_fix_tests {
         };
         let (sixteen, seventeen) = (joined(16), joined(17));
         let cases = [
-            (format!("resolved by hand: {sixteen}"), true),
+            (format!("resolved by hand: {sixteen}"), None),
             (
-                format!(
-                    "resolved by hand: {sixteen}; changed beyond the baseline's conflicts: \
-                     {sixteen} (why: {seventeen})"
-                ),
-                true,
+                format!("changed beyond the baseline's conflicts: {sixteen} (why: {seventeen})"),
+                None,
             ),
-            (format!("resolved by hand: {seventeen}"), false),
             (
-                format!(
-                    "resolved by hand: a.txt; changed beyond the baseline's conflicts: \
-                     {seventeen} (why: a fix)"
-                ),
-                false,
+                format!("resolved by hand: {seventeen}"),
+                Some(UnreadFixText::Pieces),
             ),
-            ("why: nothing changed".to_owned(), true),
+            (
+                format!("changed beyond the baseline's conflicts: {seventeen} (why: a fix)"),
+                Some(UnreadFixText::Pieces),
+            ),
+            ("why: nothing changed".to_owned(), None),
         ];
 
-        for (parts, whole) in cases {
+        for (parts, unread) in cases {
             let entry = adopted(&parts);
 
             // When: a reader asks whether the event reads whole.
@@ -2883,15 +2959,13 @@ mod adopted_fix_tests {
             // pieces, whatever its reason holds; a list of 16 pieces reads
             // whole, and its files are read, the path of 16 pieces among them.
             assert_eq!(
-                adopted_fix_files_whole(&entry, "integration"),
-                whole,
+                adopted_fix_text(&entry, "integration").unread(),
+                unread,
                 "{parts}"
             );
-            if whole && parts.contains(&sixteen) {
+            if unread.is_none() && parts.contains(&sixteen) {
                 assert!(
-                    adopted_fix_files(&entry, "integration")
-                        .files
-                        .contains(&sixteen),
+                    named_files(&entry, "integration").files.contains(&sixteen),
                     "{parts}"
                 );
             }
@@ -2905,7 +2979,89 @@ mod adopted_fix_tests {
             }],
             ..adopted(&format!("resolved by hand: {seventeen}"))
         };
-        assert!(adopted_fix_files_whole(&listed, "integration"));
+        assert_eq!(adopted_fix_text(&listed, "integration").unread(), None);
+    }
+
+    #[test]
+    fn an_older_adopt_events_resolved_list_that_another_part_follows_does_not_read_whole() {
+        // Given: adopts that resolved `notes/a` by hand, whose text, as a
+        // knives from before the `fix_files` list writes it, follows that
+        // list with each part that `adopt` writes after it: the files changed
+        // beyond the baseline's conflicts, a reason, carriers, and added
+        // lines absent. Each reads as one path that holds the part too.
+        let cases = [
+            (
+                "resolved by hand: notes/a; changed beyond the baseline's conflicts: b.txt (why: \
+                 a fix)",
+                "; changed beyond the baseline's conflicts: ",
+            ),
+            (
+                "resolved by hand: notes/a; why: b.md; why: kept the fix",
+                "; why: ",
+            ),
+            (
+                "resolved by hand: notes/a; carriers: 0123456789ab",
+                "; carriers: ",
+            ),
+            (
+                "resolved by hand: notes/a; added lines absent: feat/x 1 of 2 in notes/a",
+                "; added lines absent: ",
+            ),
+            (
+                "resolved by hand: notes/a; carriers: 0123456789ab; why: b.md",
+                "; carriers: ",
+            ),
+        ];
+
+        for (parts, marker) in cases {
+            let entry = adopted(parts);
+
+            // When: a reader that cannot measure the adopt asks whether the
+            // event reads whole.
+            // Then: it does not, and names the first such part: the list may
+            // end there or name a path that holds it.
+            assert_eq!(
+                adopted_fix_text(&entry, "integration").unread(),
+                Some(UnreadFixText::Marker(marker)),
+                "{parts}"
+            );
+
+            // And: the same event with its `fix_files` list reads whole.
+            let listed = Entry {
+                fix_files: vec![FixFile {
+                    path: "notes/a".to_owned(),
+                    change: FixChange::Resolved,
+                }],
+                ..entry
+            };
+            assert_eq!(adopted_fix_text(&listed, "integration").unread(), None);
+        }
+
+        // And: a resolved list that no other part follows reads whole, a
+        // path that holds `; parents: ` among its files, as every event ends
+        // at its last `; parents: `; and so does a text with no resolved
+        // list, whose list changed beyond the baseline's conflicts reads up
+        // to its last ` (why: `, a path that holds `; why: ` among its files.
+        for (parts, path) in [
+            ("resolved by hand: notes/a, b.txt", "notes/a, b.txt"),
+            (
+                "resolved by hand: notes/a; parents: b.md",
+                "notes/a; parents: b.md",
+            ),
+            (
+                "changed beyond the baseline's conflicts: notes/a; why: b.md (why: kept the fix); \
+                 carriers: 0123456789ab",
+                "notes/a; why: b.md",
+            ),
+        ] {
+            let entry = adopted(parts);
+            let text = adopted_fix_text(&entry, "integration");
+            assert_eq!(text.unread(), None, "{parts}");
+            assert!(
+                text.files().files.iter().any(|file| file == path),
+                "{parts}"
+            );
+        }
     }
 }
 

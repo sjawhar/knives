@@ -291,7 +291,7 @@ pub struct Entry {
     /// beyond its baseline's conflicts. `adopt` writes the list beside its
     /// text, which names the same files joined by `, ` and so gives back a
     /// path that holds a separator in pieces
-    /// ([`crate::release_model::adopted_fix_files`]). Empty on every other
+    /// ([`crate::release_model::adopted_fix_text`]). Empty on every other
     /// entry, on an adopt that changed no file, and on every adopt an older
     /// knives wrote: a reader then reads the files from the text.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

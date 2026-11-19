@@ -546,9 +546,10 @@ pub enum ReleaseAction {
     /// alone; each path that its text may name is held where this
     /// repository cannot measure the adopt, and where it can, each such path
     /// that the adopt's own tree holds. Where this repository cannot measure
-    /// the adopt and a list of that text has more than 16 pieces, the list
-    /// does not read whole, and REV is refused, naming the adopt, and the
-    /// fetch of its commit where this repository does not hold it. A
+    /// the adopt and that text does not read whole, REV is refused, naming
+    /// the adopt, and the fetch of its commit where this repository does not
+    /// hold it: a list of more than 16 pieces, or a list of files resolved
+    /// by hand that another part follows, which the list may hold. A
     /// repository that does not hold the newest write is refused and told to
     /// fetch it.
     /// In a stacked series that write, a successor of it or a copy with its

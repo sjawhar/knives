@@ -15,9 +15,9 @@ use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, 
 use knives::ledger::{Draft, Ledger, inline_human_text, problem_human_text, shell_word};
 use knives::release_model::{
     CompositionBaseline, EarlierWrites, PreviousRelease, RecordedCut, RecordedWriteKind,
-    StackedHistoryContext, carried_branches, members_event_text, previous_release_for_cut,
-    previous_release_for_record, previous_release_label, series_members, trunk_positions,
-    trunk_positions_in, trunk_reaches,
+    StackedHistoryContext, UnreadFixText, carried_branches, members_event_text,
+    previous_release_for_cut, previous_release_for_record, previous_release_label, series_members,
+    trunk_positions, trunk_positions_in, trunk_reaches,
 };
 
 use super::release_edit::{
@@ -1025,7 +1025,7 @@ fn uncarried_cut_lines(
             "  {}{}: carry check inconclusive (the cut leaves those files conflicted; resolve them \
              in place, then run `knives release adopt`)",
             fix_title((&fix.name, &fix.commit), inline_human_text),
-            fix_files(&fix.files, inline_human_text)
+            fix_files(fix.files(), inline_human_text)
         ));
     }
     let off_line = held.newest_write().filter(|_| check.off_line);
@@ -1100,7 +1100,7 @@ struct WriteFindings<'a> {
 /// lacks it ([`fix_files`]) and what held those files where nothing here
 /// can measure the fix ([`unmeasured_fix`]), against `held`'s newest write.
 /// A fix whose files nothing here reads whole names no file: the subject
-/// cannot be held against it ([`past_bound_fix`]). `allowed` says whether
+/// cannot be held against it ([`unread_fix`]). `allowed` says whether
 /// `--allow-drop` lets the subject go ahead.
 fn fix_lines(
     repo: &RepoName,
@@ -1112,26 +1112,33 @@ fn fix_lines(
     let mut lines = Vec::new();
     for fix in fixes {
         let title = fix_title((&fix.name, &fix.commit), inline_human_text);
-        if fix.past_bound {
-            lines.push(if allowed {
-                format!(
-                    "{repo}: --allow-drop: {} without holding it against {title}, {UNREAD_FILES}",
-                    held.doing()
-                )
-            } else {
-                format!(
-                    "{} cannot be held against {title}: {}",
-                    held.refusing(repo),
-                    past_bound_fix(fix)
-                )
-            });
-            continue;
-        }
+        let (lacked, unmeasured) = match &fix.lacks {
+            release::FixLack::Unread { unmeasured, why } => {
+                lines.push(if allowed {
+                    format!(
+                        "{repo}: --allow-drop: {} without holding it against {title}, \
+                         {UNREAD_FILES}",
+                        held.doing()
+                    )
+                } else {
+                    format!(
+                        "{} cannot be held against {title}: {}",
+                        held.refusing(repo),
+                        unread_fix(&fix.commit, (*unmeasured, *why))
+                    )
+                });
+                continue;
+            }
+            release::FixLack::Files {
+                files: lacked,
+                unmeasured,
+            } => (lacked, unmeasured),
+        };
         let named = format!(
             "{title}{}{}",
-            fix_files(&fix.files, inline_human_text),
-            fix.unmeasured.map_or_else(String::new, |why| {
-                unmeasured_fix((why, &fix.commit), (newest, &fix.files))
+            fix_files(lacked, inline_human_text),
+            unmeasured.map_or_else(String::new, |why| {
+                unmeasured_fix((why, &fix.commit), (newest, lacked))
             })
         );
         lines.push(if allowed {
@@ -1144,23 +1151,33 @@ fn fix_lines(
 }
 
 /// What the `--allow-drop` line and the cut event say of a fix by hand
-/// whose files nothing here reads whole
-/// ([`release::LackedFix::past_bound`]), after its title.
+/// whose files nothing here reads whole ([`release::FixLack::Unread`]),
+/// after its title.
 const UNREAD_FILES: &str = "whose files this repository cannot read whole";
 
-/// What a refusal says of `fix`, a fix by hand whose files nothing here
-/// reads whole ([`release::LackedFix::past_bound`]): why nothing here can
-/// measure it ([`unmeasured_why`]), and that its event names its files in a
-/// list of more than [`knives::release_model::TEXT_PATH_PIECES`] pieces,
-/// which this repository cannot read whole.
-fn past_bound_fix(fix: &release::LackedFix) -> String {
-    let why = fix.unmeasured.map_or_else(String::new, |why| {
-        format!("{}, and ", unmeasured_why(why, &fix.commit))
-    });
+/// What a refusal says of the fix by hand of the adopt `commit`, whose
+/// files nothing here reads whole ([`release::FixLack::Unread`]): why
+/// nothing here can measure it, `unmeasured` ([`unmeasured_why`]), and why
+/// its event's text does not read whole, `why`: it names the files of the
+/// fix in a list of more than [`knives::release_model::TEXT_PATH_PIECES`]
+/// pieces, which this repository cannot read whole, or in a list that holds
+/// a part that `adopt` writes after that list, which it cannot read one way.
+fn unread_fix(
+    commit: &CommitId,
+    (unmeasured, why): (release::Unmeasured, UnreadFixText),
+) -> String {
+    let list = match why {
+        UnreadFixText::Pieces => format!(
+            "a list of more than {} pieces, which this repository cannot read whole",
+            knives::release_model::TEXT_PATH_PIECES
+        ),
+        UnreadFixText::Marker(part) => {
+            format!("a list that holds `{part}`, which this repository cannot read one way")
+        }
+    };
     format!(
-        "{why}the adopt's event names the files of the fix in a list of more than {} pieces, \
-         which this repository cannot read whole",
-        knives::release_model::TEXT_PATH_PIECES
+        "{}, and the adopt's event names the files of the fix in {list}",
+        unmeasured_why(unmeasured, commit)
     )
 }
 
@@ -1269,12 +1286,13 @@ fn unmeasured_why(why: release::Unmeasured, commit: &CommitId) -> String {
 /// an `adopt` of the new content ([`fix_adopt_remedy`]); a fix whose files
 /// nothing here reads whole has no files to keep, so it alone asks for no
 /// such adopt. A fix that nothing here can hold a subject against
-/// ([`unholdable`]) asks for no step at all: no fetch and no commit meets
-/// it, so the line says so and gives `--allow-drop`, after the remedies of
-/// the other findings ([`closing_line`]). A record is asked for a commit
-/// that carries a fix only where a commit can carry it
-/// ([`commit_carries`]): a fix whose every lacked file has no reference at
-/// all keeps the adopt of the new content, which gives those files one.
+/// ([`FixRemedy::Unholdable`]) asks for no step at all: no fetch and no
+/// commit meets it, so the line says so and gives `--allow-drop`, after the
+/// remedies of the other findings ([`closing_line`]). A record is asked for
+/// a commit that carries a fix only where a commit can carry it
+/// ([`FixRemedy::commit_carries`]): a fix whose every lacked file has no
+/// reference at all keeps the adopt of the new content, which gives those
+/// files one. What each fix asks for is [`fix_remedy`]'s.
 fn refusal_remedy(
     held: HeldRecords<'_>,
     (sources, found, fixes): (&[HeldRecord<'_>], WriteFindings<'_>, &[release::LackedFix]),
@@ -1282,12 +1300,16 @@ fn refusal_remedy(
 ) -> String {
     let unheld: Vec<String> = fixes
         .iter()
-        .filter(|fix| unholdable(fix))
+        .filter(|fix| fix_remedy(fix) == FixRemedy::Unholdable)
         .map(|fix| fix_title((&fix.name, &fix.commit), inline_human_text))
         .collect();
     let adopt_fixes = held
         .newest_write()
-        .filter(|_| fixes.iter().any(|fix| !fix.past_bound))
+        .filter(|_| {
+            fixes
+                .iter()
+                .any(|fix| matches!(fix_remedy(fix), FixRemedy::Files { .. }))
+        })
         .map(fix_adopt_remedy);
     if held.record.is_some() {
         let remedies: Vec<String> = record_remedy(held, (sources, found, fixes))
@@ -1319,8 +1341,11 @@ fn refusal_remedy(
         .or(found.off_line)
         .or(found.absent)
         .or_else(|| {
-            held.newest_write()
-                .filter(|_| fixes.iter().any(|fix| !unholdable(fix)))
+            held.newest_write().filter(|_| {
+                fixes
+                    .iter()
+                    .any(|fix| fix_remedy(fix) != FixRemedy::Unholdable)
+            })
         });
     if let Some(write) = newer {
         let recorded = write.recorded();
@@ -1347,39 +1372,74 @@ fn refusal_remedy(
     closing_line(outcome, &remedies, &unheld)
 }
 
-/// Whether nothing in this repository can hold a subject against `fix`,
-/// a fix by hand that the subject lacks: nothing here reads its files
-/// whole ([`release::LackedFix::past_bound`]), and this repository holds
-/// its adopt but cannot read it as a release of the series
-/// ([`release::Unmeasured::Unread`]). No fetch brings what reads it, and no
-/// commit carries it here, so only `--allow-drop` goes past it.
-fn unholdable(fix: &release::LackedFix) -> bool {
-    fix.past_bound && fix.unmeasured == Some(release::Unmeasured::Unread)
+/// What a refusal asks for about a fix by hand that the subject lacks
+/// ([`fix_remedy`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FixRemedy {
+    /// A commit that carries the fix at the files that the subject lacks,
+    /// where `commit` says that a commit can, and the adopt that keeps the
+    /// subject's new content there instead ([`fix_adopt_remedy`]).
+    Files { commit: bool },
+    /// The fetch of the adopt, whose own commit reads the files of its fix
+    /// whole ([`unread_fetch`]), then a commit that carries the fix.
+    FetchAdopt,
+    /// No step: nothing in this repository can hold a subject against the
+    /// fix, so only `--allow-drop` goes past it ([`closing_line`]).
+    Unholdable,
 }
 
-/// Whether a commit can carry `fix`, a fix by hand that a record lacks, so
-/// that the record's remedy may ask for one ([`record_remedy`]). It cannot
-/// where nothing here can hold a subject against the fix
-/// ([`unholdable`]), nor where each file that the record lacks has no
-/// reference at all ([`release::FixReference::Conflicted`]) and is no file
-/// of the adopt's change ([`release::HeldFile::replayed`]): no commit
-/// carries such a file until an adopt gives it a reference
-/// ([`fix_adopt_remedy`]). A file of the adopt's change is carried by a
-/// commit that the change replays empty onto, so it keeps the commit step.
-fn commit_carries(fix: &release::LackedFix) -> bool {
-    let unreferenced = !fix.files.is_empty()
-        && fix.files.iter().all(|file| {
-            !file.replayed && matches!(file.reference, release::FixReference::Conflicted)
-        });
-    !unholdable(fix) && !unreferenced
+impl FixRemedy {
+    /// Whether a commit can carry the fix, so that a record's remedy may
+    /// ask for one ([`record_remedy`]).
+    const fn commit_carries(self) -> bool {
+        matches!(self, Self::FetchAdopt | Self::Files { commit: true })
+    }
+}
+
+/// What a refusal asks for about `fix`, a fix by hand that the subject
+/// lacks: the one place that reads the shape of a lacked fix for its
+/// remedy ([`refusal_remedy`]).
+///
+/// Where nothing here reads the files of the fix whole
+/// ([`release::FixLack::Unread`]), there are no files to keep. Where this
+/// repository does not hold the adopt ([`release::Unmeasured::Absent`]),
+/// its fetch reads them whole, and a commit then carries the fix. Where it
+/// holds the adopt but cannot read it as a release of the series
+/// ([`release::Unmeasured::Unread`]), no fetch brings what reads it, and no
+/// commit carries it here. A fix lacked at its files keeps the adopt of
+/// the subject's new content there. A commit carries it, except where each
+/// file that the subject lacks has no reference at all
+/// ([`release::FixReference::Conflicted`]) and is no file of the adopt's
+/// change ([`release::HeldFile::replayed`]): no commit carries such a file
+/// until an adopt gives it a reference. A file of the adopt's change is
+/// carried by a commit that the change replays empty onto, so it keeps the
+/// commit step.
+fn fix_remedy(fix: &release::LackedFix) -> FixRemedy {
+    match &fix.lacks {
+        release::FixLack::Unread {
+            unmeasured: release::Unmeasured::Absent,
+            ..
+        } => FixRemedy::FetchAdopt,
+        release::FixLack::Unread {
+            unmeasured: release::Unmeasured::Unread,
+            ..
+        } => FixRemedy::Unholdable,
+        release::FixLack::Files { files, .. } => FixRemedy::Files {
+            commit: files.is_empty()
+                || files.iter().any(|file| {
+                    file.replayed || !matches!(file.reference, release::FixReference::Conflicted)
+                }),
+        },
+    }
 }
 
 /// The last line of a refusal ([`refusal_remedy`]): `outcome`, then
 /// `remedies`, what the refused findings ask for, `or` the `--allow-drop`
 /// that states the drop. Where the subject lacks a fix that nothing here can
-/// hold it against ([`unholdable`]), each of `unheld` by its title, no step
-/// meets that fix, so the line gives the remedies of the other findings
-/// first, if any, then `--allow-drop` as the one way on, and says why.
+/// hold it against ([`FixRemedy::Unholdable`]), each of `unheld` by its
+/// title, no step meets that fix, so the line gives the remedies of the
+/// other findings first, if any, then `--allow-drop` as the one way on, and
+/// says why.
 fn closing_line(outcome: &str, remedies: &[String], unheld: &[String]) -> String {
     const ALLOW: &str = "re-run with --allow-drop to state the drop is intended";
     if unheld.is_empty() {
@@ -1401,13 +1461,16 @@ fn closing_line(outcome: &str, remedies: &[String], unheld: &[String]) -> String
 /// `fixes`, the fixes by hand it lacks, after the fetch of each write that
 /// a lacked file's reference or a fix read whole needs ([`unread_fetch`]).
 /// It asks for a commit that carries a fix only where a commit can carry it
-/// ([`commit_carries`]), so `None` where nothing else is lacked: the adopt
-/// of the new content, or `--allow-drop`, is then the way on.
+/// ([`FixRemedy::commit_carries`]), so `None` where nothing else is lacked:
+/// the adopt of the new content, or `--allow-drop`, is then the way on.
 fn record_remedy(
     held: HeldRecords<'_>,
     (sources, found, fixes): (&[HeldRecord<'_>], WriteFindings<'_>, &[release::LackedFix]),
 ) -> Option<String> {
-    let holdable = fixes.iter().filter(|fix| commit_carries(fix)).count();
+    let holdable = fixes
+        .iter()
+        .filter(|fix| fix_remedy(fix).commit_carries())
+        .count();
     let remedy = match (found.absent, found.off_line) {
         (Some(write), _) if held.stacked => format!(
             "fetch, then build the commit on {} and record that one; {}",
@@ -1446,18 +1509,18 @@ fn record_remedy(
 /// that it does not hold ([`release::FixReference::Unread`]): no commit
 /// carries such a file until this repository holds that write. The other
 /// is the adopt of a fix whose files nothing here reads whole, where this
-/// repository does not hold the adopt ([`release::LackedFix::past_bound`],
-/// [`release::Unmeasured::Absent`]): its own commit reads them whole. So it
-/// names each such write once, with its release, and its fetch: `fetch
-/// NAME's recorded write COMMIT, which this repository does not hold, then
-/// `. Empty where no fix needs such a write. The release and the commit are
-/// a ledger entry's subject and evidence, so escaped.
+/// repository does not hold the adopt ([`FixRemedy::FetchAdopt`]): its own
+/// commit reads them whole. So it names each such write once, with its
+/// release, and its fetch: `fetch NAME's recorded write COMMIT, which this
+/// repository does not hold, then `. Empty where no fix needs such a write.
+/// The release and the commit are a ledger entry's subject and evidence, so
+/// escaped.
 fn unread_fetch(fixes: &[release::LackedFix]) -> String {
     let mut unread: Vec<(&str, &CommitId)> = Vec::new();
     for fix in fixes {
-        let adopt = (fix.past_bound && fix.unmeasured == Some(release::Unmeasured::Absent))
-            .then_some((fix.name.as_str(), &fix.commit));
-        let references = fix.files.iter().filter_map(|file| match &file.reference {
+        let adopt =
+            (fix_remedy(fix) == FixRemedy::FetchAdopt).then_some((fix.name.as_str(), &fix.commit));
+        let references = fix.files().iter().filter_map(|file| match &file.reference {
             release::FixReference::Unread { name, commit } => Some((name.as_str(), commit)),
             release::FixReference::Write(_) | release::FixReference::Conflicted => None,
         });
@@ -1754,10 +1817,13 @@ fn restated_delta(held: Option<HeldRecords<'_>>, check: &release::CompositionChe
         .iter()
         .map(|fix| {
             let title = fix_title((&fix.name, &fix.commit), str::to_owned);
-            if fix.past_bound {
-                format!("; not held against {title}, {UNREAD_FILES}")
-            } else {
-                format!("; without {title}{}", fix_files(&fix.files, str::to_owned))
+            match &fix.lacks {
+                release::FixLack::Unread { .. } => {
+                    format!("; not held against {title}, {UNREAD_FILES}")
+                }
+                release::FixLack::Files { files, .. } => {
+                    format!("; without {title}{}", fix_files(files, str::to_owned))
+                }
             }
         })
         .collect();
@@ -1770,7 +1836,7 @@ fn restated_delta(held: Option<HeldRecords<'_>>, check: &release::CompositionChe
             format!(
                 "{}{}",
                 fix_title((&fix.name, &fix.commit), str::to_owned),
-                fix_files(&fix.files, str::to_owned)
+                fix_files(fix.files(), str::to_owned)
             )
         }))
         .collect();
@@ -3066,7 +3132,7 @@ fn print_previous_release_position(opened: &knives::jj::Repo, entry: &knives::co
 mod tests {
     use super::*;
     use knives::commands::release::{
-        CompositionCheck, FixReference, HeldFile, LackedFix, ReapReport, RecordedMember,
+        CompositionCheck, FixLack, FixReference, HeldFile, LackedFix, ReapReport, RecordedMember,
     };
     use knives::ids::CommitId;
 
@@ -3201,12 +3267,13 @@ mod tests {
             dropped_fixes: vec![LackedFix {
                 name: format!("release/{HOSTILE}"),
                 commit: CommitId::new(HOSTILE),
-                files: vec![held_file(
-                    &format!("fix{HOSTILE}.txt"),
-                    FixReference::Conflicted,
-                )],
-                unmeasured: None,
-                past_bound: false,
+                lacks: FixLack::Files {
+                    files: vec![held_file(
+                        &format!("fix{HOSTILE}.txt"),
+                        FixReference::Conflicted,
+                    )],
+                    unmeasured: None,
+                },
             }],
             ..CompositionCheck::default()
         };
@@ -3270,12 +3337,13 @@ mod tests {
             dropped_fixes: vec![LackedFix {
                 name: "release/2026-11-12".to_owned(),
                 commit: CommitId::new("aaaa"),
-                files: vec![
-                    held_file("fix.txt", unread.clone()),
-                    held_file("other.txt", unread),
-                ],
-                unmeasured: None,
-                past_bound: false,
+                lacks: FixLack::Files {
+                    files: vec![
+                        held_file("fix.txt", unread.clone()),
+                        held_file("other.txt", unread),
+                    ],
+                    unmeasured: None,
+                },
             }],
             ..CompositionCheck::default()
         };
@@ -3332,9 +3400,10 @@ mod tests {
             dropped_fixes: vec![LackedFix {
                 name: format!("release/{HOSTILE}"),
                 commit: adopt.clone(),
-                files: Vec::new(),
-                unmeasured: Some(release::Unmeasured::Absent),
-                past_bound: true,
+                lacks: FixLack::Unread {
+                    unmeasured: release::Unmeasured::Absent,
+                    why: UnreadFixText::Pieces,
+                },
             }],
             ..CompositionCheck::default()
         };
@@ -3435,9 +3504,10 @@ mod tests {
         LackedFix {
             name: format!("release/{HOSTILE}"),
             commit: CommitId::new(HOSTILE),
-            files: Vec::new(),
-            unmeasured: Some(unmeasured),
-            past_bound: true,
+            lacks: FixLack::Unread {
+                unmeasured,
+                why: UnreadFixText::Pieces,
+            },
         }
     }
 
@@ -3447,13 +3517,52 @@ mod tests {
         LackedFix {
             name: "release/2026-11-12".to_owned(),
             commit: CommitId::new("aaaa"),
-            files: vec![held_file(
-                "fix.txt",
-                FixReference::Write(CommitId::new("bbbb")),
-            )],
-            unmeasured: None,
-            past_bound: false,
+            lacks: FixLack::Files {
+                files: vec![held_file(
+                    "fix.txt",
+                    FixReference::Write(CommitId::new("bbbb")),
+                )],
+                unmeasured: None,
+            },
         }
+    }
+
+    #[test]
+    fn a_fix_whose_event_text_reads_two_ways_is_refused_naming_the_part_it_holds() {
+        // Given: the fix by hand of an adopt that this repository does not
+        // hold, whose event, as an older knives writes it, follows its list
+        // of files resolved by hand with `; why: `.
+        let fix = LackedFix {
+            lacks: FixLack::Unread {
+                unmeasured: release::Unmeasured::Absent,
+                why: UnreadFixText::Marker("; why: "),
+            },
+            ..beyond_bound(release::Unmeasured::Absent)
+        };
+
+        // When: the gate refuses a record that lacks it.
+        let lines = fix_refusal(true, vec![fix]);
+
+        // Then: the refusal names the adopt and the part, and its remedy is
+        // that of a list past the bound: the adopt's fetch, then a commit.
+        let short = ids_prefix(ESCAPED);
+        assert_eq!(
+            lines,
+            [
+                format!(
+                    "demo: refusing to record release/2026-11-14 at eeee: it cannot be held \
+                     against the fix by hand of release/{ESCAPED}'s adopt {short}: this \
+                     repository does not hold {short}, and the adopt's event names the files of \
+                     the fix in a list that holds `; why: `, which this repository cannot read \
+                     one way"
+                ),
+                format!(
+                    "  nothing was recorded; fetch release/{ESCAPED}'s recorded write {short}, \
+                     which this repository does not hold, then record a commit that carries that \
+                     fix, or re-run with --allow-drop to state the drop is intended"
+                ),
+            ]
+        );
     }
 
     /// The gate's lines for a subject that lacks `fixes`, held against the
@@ -3591,7 +3700,10 @@ mod tests {
         // reference that the adopt's change changes; and the first beside
         // the fix of another adopt that a commit can carry.
         let fix = |files: Vec<HeldFile>| LackedFix {
-            files,
+            lacks: FixLack::Files {
+                files,
+                unmeasured: None,
+            },
             ..held_fix()
         };
         let unreferenced = || held_file("fix.txt", FixReference::Conflicted);
@@ -3710,12 +3822,13 @@ mod tests {
             dropped_fixes: vec![LackedFix {
                 name: "release/2026-08-04".to_owned(),
                 commit: CommitId::new("aaaa"),
-                files: vec![
-                    held_file("x, y.txt", FixReference::Conflicted),
-                    held_file("z.txt", FixReference::Conflicted),
-                ],
-                unmeasured: Some(release::Unmeasured::Absent),
-                past_bound: false,
+                lacks: FixLack::Files {
+                    files: vec![
+                        held_file("x, y.txt", FixReference::Conflicted),
+                        held_file("z.txt", FixReference::Conflicted),
+                    ],
+                    unmeasured: Some(release::Unmeasured::Absent),
+                },
             }],
             ..CompositionCheck::default()
         };

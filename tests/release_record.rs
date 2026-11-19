@@ -30,12 +30,14 @@
 //! whole, so a path that holds a separator reads back whole; an older adopt
 //! event names them in its text alone, and such a clone holds each path
 //! that a list of up to 16 pieces may name. A list of more pieces does not
-//! read whole there, so the record is refused, naming the adopt and its
-//! fetch, or recorded under `--allow-drop` with the drop stated. A record
-//! that lacks a file with no reference here is told to fetch the write
-//! where the walk for that reference stopped. A published name that the
-//! publish remote lacks is not recorded until it is pushed, and the refusal
-//! gives the commands. A printed command quotes the name for the shell.
+//! read whole there, nor does a list of files resolved by hand that another
+//! part follows, as the list may hold that part, so the record is refused,
+//! naming the adopt and its fetch, or recorded under `--allow-drop` with the
+//! drop stated. A record that lacks a file with no reference here is told
+//! to fetch the write where the walk for that reference stopped. A
+//! published name that the publish remote lacks is not recorded until it is
+//! pushed, and the refusal gives the commands. A printed command quotes the
+//! name for the shell.
 
 #![allow(
     clippy::expect_used,
@@ -4766,6 +4768,185 @@ fn an_older_adopt_of_a_path_of_sixteen_pieces_holds_that_path_whole_in_a_clone_w
     );
     assert!(!out.contains("cannot read whole"), "{out}");
     assert_eq!(ledger_entries(&home), entries, "{out}");
+}
+
+/// The changelog that [`resolved_changelog_lab`]'s fix by hand writes: each
+/// member's block, `feat/beta`'s with its final newline first, then
+/// `feat/alpha`'s, which has none, at the end of the file.
+const BOTH_BLOCKS: &str = "# Changelog\n## b\n- b\n## a\n- a";
+
+/// `CHANGELOG.md` on the trunk; RELEASE cut of `feat/alpha`, which appends
+/// a block with no final newline to it, and `feat/beta`, which appends one
+/// with a final newline, so the cut leaves the changelog conflicted: the
+/// union never writes a block with no final newline above another. The
+/// conflict resolved by hand in place to [`BOTH_BLOCKS`] and adopted with
+/// `--why`, its event as a knives from before the `fix_files` list writes
+/// it, so its text follows its list of files resolved by hand with
+/// `; why: `; then the next release cut on it, which carries the fix; the
+/// two branches and the next release pushed, the adopt's commit never; and
+/// the second clone fetched. Returns the adopt's commit.
+fn resolved_changelog_lab() -> (Lab, tempfile::TempDir, CommitId) {
+    let lab = Lab::new();
+    lab.upstream_trunk_file("CHANGELOG.md", "# Changelog\n");
+    lab.mirror_upstream_trunk_to_origin();
+    lab.branch("feat/alpha", "CHANGELOG.md", "# Changelog\n## a\n- a");
+    lab.branch("feat/beta", "CHANGELOG.md", "# Changelog\n## b\n- b\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert!(matches!(cut.status.code(), Some(0 | 1)), "{}", text(&cut));
+    assert_eq!(
+        knives::jj::conflicted_files(lab.work_path(), RELEASE).expect("list conflicts"),
+        ["CHANGELOG.md"],
+        "{}",
+        text(&cut)
+    );
+    let adopt = fix_by_hand(
+        (&lab, &home),
+        RELEASE,
+        &[("CHANGELOG.md", Some(BOTH_BLOCKS))],
+        "kept both blocks",
+    );
+    let event = newest_event(&home, RELEASE);
+    assert!(
+        event
+            .text
+            .contains("; resolved by hand: CHANGELOG.md; why: kept both blocks"),
+        "{}",
+        event.text
+    );
+    without_fix_files(&home, RELEASE);
+    let next = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(matches!(next.status.code(), Some(0 | 1)), "{}", text(&next));
+    let next = commit_at(&lab, "release/2026-08-05");
+    for branch in ["feat/alpha", "feat/beta", "release/2026-08-05"] {
+        lab.push_branch(branch);
+    }
+    fetch_second_clone(&lab);
+    assert!(
+        !second_clone_holds(&lab, &adopt) && second_clone_holds(&lab, &next),
+        "the second clone holds the next release and not the adopt's commit"
+    );
+    (lab, home, adopt)
+}
+
+#[test]
+fn an_older_adopt_whose_resolved_list_a_reason_follows_is_refused_where_its_commit_is_absent() {
+    // Given: RELEASE's changelog conflict resolved by hand and adopted with
+    // `--why`, its event as a knives from before the `fix_files` list writes
+    // it, `…; resolved by hand: CHANGELOG.md; why: kept both blocks`, which
+    // also reads as one file `CHANGELOG.md; why: kept both blocks`; the next
+    // release cut on it; a second clone that holds the next release and not
+    // the adopt's commit; and the third release merged by hand there, which
+    // holds the fix.
+    let (lab, home, adopt) = resolved_changelog_lab();
+    lab.jj_at(
+        &lab.second,
+        [
+            "new",
+            "-r",
+            "feat/alpha@origin",
+            "-r",
+            "feat/beta@origin",
+            "-m",
+            "the third release, merged by hand",
+        ],
+    );
+    std::fs::write(lab.second.join("CHANGELOG.md"), BOTH_BLOCKS).expect("resolve the changelog");
+    lab.jj_at(&lab.second, ["new"]);
+    let commit = CommitId::new(lab.revision(&lab.second, "@-", "commit_id").trim());
+    let entries = ledger_entries(&home);
+
+    // When: it is recorded in the second clone.
+    let refused = cut_in_second_clone(
+        &lab,
+        &home,
+        &["release/2026-08-06", "--at", commit.as_str()],
+    );
+
+    // Then: it is refused, naming the adopt, its release and its commit, and
+    // the part that its list holds, with the fetch of that commit, and
+    // nothing is written: the clone cannot tell which reading the adopt
+    // wrote, and the one that ends the list at `; why: ` may hold less.
+    let out = text(&refused);
+    assert_eq!(refused.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to record release/2026-08-06 at {}: it cannot be held against the fix \
+             by hand of {RELEASE}'s adopt {adopt}: this repository does not hold {adopt}, and the \
+             adopt's event names the files of the fix in a list that holds `; why: `, which this \
+             repository cannot read one way\n",
+            commit.short(),
+            adopt = adopt.short()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "\n  nothing was recorded; fetch {RELEASE}'s recorded write {}, which this repository \
+             does not hold, then record a commit that carries that fix, or re-run with \
+             --allow-drop to state the drop is intended\n",
+            adopt.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+
+    // When: the same record runs with `--allow-drop`.
+    let allowed = cut_in_second_clone(
+        &lab,
+        &home,
+        &[
+            "release/2026-08-06",
+            "--at",
+            commit.as_str(),
+            "--allow-drop",
+        ],
+    );
+
+    // Then: it is recorded, and both its line and its event name the adopt
+    // that it was not held against.
+    let out = text(&allowed);
+    assert_eq!(allowed.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: --allow-drop: recording release/2026-08-06 at {} without holding it against \
+             the fix by hand of {RELEASE}'s adopt {}, whose files this repository cannot read \
+             whole\n",
+            commit.short(),
+            adopt.short()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&recorded_line("release/2026-08-06", &commit)),
+        "{out}"
+    );
+    let event = newest_event(&home, "release/2026-08-06");
+    assert!(
+        event.text.contains(&format!(
+            "; not held against the fix by hand of {RELEASE}'s adopt {}, whose files this \
+             repository cannot read whole",
+            adopt.short()
+        )),
+        "{event:?}"
+    );
+
+    // When: in a lab built the same way, the third release is merged by hand
+    // in the work checkout, which holds the adopt's commit, and recorded
+    // there.
+    let (lab, home, _adopt) = resolved_changelog_lab();
+    let commit = merged_with(&lab, &[("CHANGELOG.md", BOTH_BLOCKS)]);
+    let measured = record(&lab, &home, "release/2026-08-06", &commit);
+
+    // Then: it measures the fix from the adopt's change, as it always did,
+    // and records the commit, which carries it.
+    let out = text(&measured);
+    assert_eq!(measured.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains(&recorded_line("release/2026-08-06", &commit)),
+        "{out}"
+    );
+    assert!(!out.contains("cannot be held against"), "{out}");
 }
 
 /// A commit that no repository here holds: a write that a peer recorded and
