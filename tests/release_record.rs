@@ -4045,3 +4045,79 @@ fn a_listed_fix_file_that_names_no_repository_path_ends_its_hold() {
         "{out}"
     );
 }
+
+#[test]
+fn a_record_that_resolves_an_advance_conflict_against_an_adopted_fix_is_refused() {
+    // Given: shared.txt on the trunk; RELEASE cut of `feat/alpha` and
+    // `feat/beta`, which changes its line 5; RELEASE fixed by hand in place on
+    // line 2 and adopted; the next release cut on it, which carries the fix;
+    // then `feat/beta` changes line 2 as well, and `advance` writes the
+    // release in hand with that line conflicted; and the third release merged
+    // by hand of the two branches, which resolves line 2 to `feat/beta`'s
+    // line, without the fix.
+    let lab = Lab::new();
+    lab.upstream_trunk_file("shared.txt", "l1\nl2\nl3\nl4\nl5\n");
+    lab.mirror_upstream_trunk_to_origin();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "shared.txt", "l1\nl2\nl3\nl4\nl5-beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    lab.jj_work(["new", "-r", RELEASE]);
+    std::fs::write(
+        lab.work_path().join("shared.txt"),
+        "l1\nl2-fixed\nl3\nl4\nl5-beta\n",
+    )
+    .expect("write the fix");
+    lab.jj_work(["squash", "--into", RELEASE]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let adopted = knives_release(&lab, &home, &["adopt", RELEASE, "--why", "a fix by hand"]);
+    assert_eq!(adopted.status.code(), Some(0), "{}", text(&adopted));
+    let adopt = commit_at(&lab, RELEASE);
+    let next = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(matches!(next.status.code(), Some(0 | 1)), "{}", text(&next));
+    lab::extend_branch(
+        &lab,
+        "feat/beta",
+        "shared.txt",
+        "l1\nl2-beta\nl3\nl4\nl5-beta\n",
+    );
+    let advanced = knives_release(&lab, &home, &["advance", "feat/beta"]);
+    assert!(
+        matches!(advanced.status.code(), Some(0 | 1)),
+        "{}",
+        text(&advanced)
+    );
+    lab.jj_work([
+        "new",
+        "-r",
+        "feat/alpha",
+        "-r",
+        "feat/beta",
+        "-m",
+        "the third release, merged by hand",
+    ]);
+    std::fs::write(
+        lab.work_path().join("shared.txt"),
+        "l1\nl2-beta\nl3\nl4\nl5-beta\n",
+    )
+    .expect("resolve line 2 to feat/beta's");
+    lab.jj_work(["new"]);
+    let commit = commit_of(&lab, "@-");
+    let entries = ledger_entries(&home);
+
+    // When: it is recorded.
+    let recorded = knives_release(
+        &lab,
+        &home,
+        &["cut", "release/2026-08-06", "--at", commit.as_str()],
+    );
+
+    // Then: it is refused, naming the adopt whose fix it drops, and nothing
+    // is written: a write that left the fixed line conflicted did not remove
+    // the fix, so the hold on it stands until an adopt states otherwise.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(3), "{out}");
+    assert!(out.contains(adopt.short()), "{out}");
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+}
