@@ -748,3 +748,40 @@ fn an_include_puts_a_members_entries_under_a_heading_the_release_already_has_in_
         "{verified}"
     );
 }
+
+#[test]
+fn a_first_cut_of_two_members_puts_their_entries_under_one_heading() {
+    // Given: a trunk whose changelog's `[Unreleased]` section is empty, and
+    // two members that each add one entry under `### Fixed` there.
+    let (trunk, alpha, beta) = (
+        with_unreleased(""),
+        with_unreleased("### Fixed\n\n- Alpha's fix.\n\n"),
+        with_unreleased("### Fixed\n\n- Beta's fix.\n\n"),
+    );
+    let lab = trunk_with(&[("CHANGELOG.md", trunk.as_str())]);
+    member(&lab, "feat/alpha", &[("CHANGELOG.md", alpha.as_str())]);
+    member(&lab, "feat/beta", &[("CHANGELOG.md", beta.as_str())]);
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: the release is cut of both at once.
+    let cut = release_ok(&lab, &home, &["cut", RELEASE]);
+
+    // Then: no conflict is left, and `[Unreleased]` holds `### Fixed` once,
+    // with both members' entries in its one list, each line unchanged. The
+    // order of the two entries is not part of the rule.
+    assert_eq!(conflicts(&lab), Vec::<String>::new(), "{cut}");
+    let log = file_at_revision(&lab, RELEASE, "CHANGELOG.md");
+    let unreleased = log
+        .split_once("## [Unreleased]\n")
+        .and_then(|(_, rest)| rest.split_once("## [1.0.0]"))
+        .map(|(section, _)| section)
+        .expect("an [Unreleased] section before [1.0.0]");
+    assert_eq!(unreleased.matches("### Fixed\n").count(), 1, "{log}");
+    let list = unreleased
+        .split_once("### Fixed\n\n")
+        .map(|(_, rest)| rest.split("\n\n").next().unwrap_or(""))
+        .expect("a ### Fixed list");
+    let mut entries: Vec<&str> = list.lines().collect();
+    entries.sort_unstable();
+    assert_eq!(entries, ["- Alpha's fix.", "- Beta's fix."], "{log}");
+}
