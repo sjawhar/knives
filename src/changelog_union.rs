@@ -36,8 +36,8 @@
 //! in a file's one `[Unreleased]` section, each block is written whole, and
 //! [`Union::left_twice`] names each `### ` heading that two of the blocks
 //! there leave in one section, for a person to join. A heading that one
-//! block written whole holds twice stays as that block wrote it, and that
-//! line does not name it.
+//! block written whole holds more than once stays as that block wrote it,
+//! and that line does not name it.
 //!
 //! After every release write and every `adopt` that records a tree, knives
 //! reads each release log in the tree that the command writes or records,

@@ -343,7 +343,8 @@ fn newest_release_but(
     }
 }
 
-/// Every commit one of our release refs names, with the refs naming it.
+/// Every commit one of our release refs names, with each ref naming it as a
+/// line prints it (`release/2026-08-04@origin`).
 ///
 /// Local refs and refs on the publish remote count; `origin` release-shaped
 /// refs in a split-release repository and upstream's own cuts do not, the same
@@ -352,29 +353,71 @@ pub fn release_refs_by_commit(
     tips: &BookmarkTips,
     scheme: &ReleaseScheme,
     publish_remote: &str,
-) -> BTreeMap<CommitId, Vec<BookmarkRef>> {
-    let mut by_commit: BTreeMap<CommitId, Vec<BookmarkRef>> = BTreeMap::new();
+) -> BTreeMap<CommitId, Vec<String>> {
+    let mut by_commit: BTreeMap<CommitId, Vec<String>> = BTreeMap::new();
     for (reference, commit) in tips {
         if is_our_release(reference, scheme, publish_remote) {
             by_commit
                 .entry(commit.clone())
                 .or_default()
-                .push(reference.clone());
+                .push(reference.to_string());
         }
     }
     by_commit
 }
 
+/// Every commit a release of any series of `entry` names, with the names a
+/// finding prints.
+///
+/// Each series' release refs name their commits ([`release_refs_by_commit`]
+/// of its scheme and publish remote). At a commit no ref names, each release
+/// of a stacked series that `ledger` records a write of there names it: the
+/// reap forgets the refs of a stacked series' superseded release and keeps
+/// its commit, so a branch built on the previous release still names it. A
+/// fork without a stacked series reads no ledger for it: `ledger` may be
+/// empty there.
+pub fn releases_of_every_series(
+    tips: &BookmarkTips,
+    entry: &RepoEntry,
+    ledger: &[Entry],
+) -> BTreeMap<CommitId, Vec<String>> {
+    let mut by_commit: BTreeMap<CommitId, Vec<String>> = BTreeMap::new();
+    let mut recorded: BTreeMap<CommitId, BTreeSet<&str>> = BTreeMap::new();
+    for series in entry.all_series() {
+        let scheme = series.release_scheme();
+        for (commit, names) in release_refs_by_commit(tips, &scheme, series.publish_remote()) {
+            by_commit.entry(commit).or_default().extend(names);
+        }
+        if series.stacked() {
+            for name in recorded_release_names(ledger, &scheme) {
+                for write in recorded_writes(ledger, name) {
+                    recorded.entry(write.commit).or_default().insert(name);
+                }
+            }
+        }
+    }
+    for (commit, names) in recorded {
+        by_commit
+            .entry(commit)
+            .or_insert_with(|| names.into_iter().map(str::to_owned).collect());
+    }
+    by_commit
+}
+
 /// What every stacked-history check in one run shares: the repository, the
-/// trunk positions to measure past, which commits our release refs name, and
-/// what the release already carries.
+/// trunk positions to measure past, which commits a release names, and what
+/// the release already carries.
 #[derive(Clone, Copy)]
 pub struct StackedHistoryContext<'a> {
     pub repo: &'a Repo,
     /// Every known trunk position ([`trunk_positions`]): a merge counts only
     /// when it joins lines none of them reaches.
     pub trunks: &'a [CommitId],
-    pub releases: &'a BTreeMap<CommitId, Vec<BookmarkRef>>,
+    /// Which commits a release names, with the names a finding prints: our
+    /// release refs ([`release_refs_by_commit`]), or those of every series
+    /// with the writes the ledger records of a stacked series' release whose
+    /// refs the reap forgot ([`releases_of_every_series`]).
+    pub releases: &'a BTreeMap<CommitId, Vec<String>>,
     /// Commits whose history the release already carries: the release's
     /// members for an edit (less any it replaces), the other members for a
     /// member of it. Empty where a branch stands alone (a first cut, a pull
@@ -475,10 +518,11 @@ pub enum MemberHistory {
 ///
 /// `None` when the history is linear, or when every merge joins only lines the
 /// release already carries ([`member_history`]). The finding names the merges
-/// and, for each that one of our release refs names, which release it is. A
-/// merge no release ref names may be upstream's own, visible only because
-/// every local view of the trunk is behind the branch's base; the finding says
-/// so, since the local repository cannot exclude it without fetching.
+/// and, for each that a release names ([`StackedHistoryContext::releases`]),
+/// which release it is. A merge no release names may be upstream's own,
+/// visible only because every local view of the trunk is behind the branch's
+/// base; the finding says so, since the local repository cannot exclude it
+/// without fetching.
 pub fn stacked_history(
     context: StackedHistoryContext<'_>,
     branch: &str,
@@ -513,10 +557,10 @@ pub fn member_history(
     let mut named: Vec<String> = merges
         .iter()
         .filter_map(|merge| {
-            context.releases.get(merge).map(|refs| {
-                let names: Vec<String> = refs.iter().map(ToString::to_string).collect();
-                format!("{} ({})", names.join(", "), merge.short())
-            })
+            context
+                .releases
+                .get(merge)
+                .map(|names| format!("{} ({})", names.join(", "), merge.short()))
         })
         .collect();
     if !context.carried.is_empty() {

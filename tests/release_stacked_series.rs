@@ -25,6 +25,8 @@
     reason = "a fixture or assertion that cannot proceed IS the test failure"
 )]
 
+#[path = "common/forge_shim.rs"]
+mod forge_shim;
 #[path = "common/lab.rs"]
 mod lab;
 
@@ -2032,6 +2034,102 @@ fn preflight_names_the_stacked_release_a_member_is_built_on_as_it_names_a_defaul
     let line = history_line(&out, "m5");
     assert!(
         line.contains(&format!("releases in that history: {PREVIOUS}")),
+        "{out}"
+    );
+    assert!(!line.contains("knives sync"), "{out}");
+}
+
+/// The whole `!!` line preflight prints for a branch `branch` whose history
+/// past the trunk carries one merge, the release `named` names.
+fn one_release_line(branch: &str, named: &str) -> String {
+    format!(
+        "  !! branch {branch}'s history past the trunk carries 1 merge commit(s), so it \
+         carries everything those merges carried; releases in that history: {named}"
+    )
+}
+
+#[test]
+fn preflight_names_an_unstacked_series_release_and_keeps_the_default_release_line() {
+    // Given: a release of the default series, a merge of `feat/alpha` and
+    // `feat/beta`, and `m5` built on it.
+    let flat = Lab::new();
+    flat.branch("feat/alpha", "alpha.txt", "alpha\n");
+    flat.branch("feat/beta", "beta.txt", "beta\n");
+    flat.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    branch_on(&flat, "release/2026-08-04", "m5", "m5.txt");
+    let (flat_home, _consumer) = release_test_home(&flat);
+
+    // When: preflight reads that fork.
+    let out = text(&lab::knives(
+        &flat,
+        &flat_home,
+        &["--text", "preflight", "demo"],
+    ));
+
+    // Then: its line for `m5` names that release and its commit, and nothing
+    // more.
+    let release = commit_at(&flat, "release/2026-08-04");
+    assert_eq!(
+        history_line(&out, "m5"),
+        one_release_line("m5", &format!("release/2026-08-04 ({})", release.short())),
+        "{out}"
+    );
+
+    // Given: a series `old` without `stacked`, whose first cut, pushed to
+    // origin, has `m5` built on it.
+    let (lab, home) = previous_release_lab(false);
+
+    // When: preflight reads that fork.
+    let out = text(&lab::knives(&lab, &home, &["--text", "preflight", "demo"]));
+
+    // Then: its line for `m5` names that cut, local and on origin, and its
+    // commit, as for the default series, not upstream merges for `knives
+    // sync`.
+    let previous = commit_at(&lab, PREVIOUS);
+    assert_eq!(
+        history_line(&out, "m5"),
+        one_release_line(
+            "m5",
+            &format!("{PREVIOUS}, {PREVIOUS}@origin ({})", previous.short())
+        ),
+        "{out}"
+    );
+}
+
+#[test]
+fn status_names_the_stacked_release_a_member_with_an_open_pull_request_is_built_on() {
+    // Given: a stacked series whose published first cut is the previous
+    // release, with `m5` built on it, the next cut, which includes `m5`, and
+    // an open pull request from `m5`.
+    let (lab, home) = previous_release_lab(true);
+    let previous = commit_at(&lab, PREVIOUS);
+    release_ok(&lab, &home, &["cut", NEXT]);
+    release_ok(&lab, &home, &["include", "m5"]);
+    let shim = tempfile::tempdir().expect("create forge shim directory");
+    let pulls = format!("[{}]", forge_shim::pull_record(7, "OPEN", "m5", None));
+    forge_shim::install_snapshot_gh(shim.path(), &pulls, &[]);
+
+    // When: status reads that fork, one line per finding.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "status", "demo", "--no-landed", "--verbose"])
+        .current_dir(lab.work_path())
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("XDG_CACHE_HOME", shim.path().join("cache"))
+        .env("PATH", forge_shim::path_with_gh_shim(shim.path()))
+        .output()
+        .expect("run status with a forge shim");
+
+    // Then: its stacked-history line for `m5` names the previous release and
+    // its commit, as preflight does, though the next cut forgot its refs, and
+    // does not send m5 to `knives sync`.
+    let out = text(&output);
+    let line = history_line(&out, "m5");
+    assert!(
+        line.ends_with(&format!(
+            "; releases in that history: {PREVIOUS} ({})",
+            previous.short()
+        )),
         "{out}"
     );
     assert!(!line.contains("knives sync"), "{out}");

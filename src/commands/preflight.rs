@@ -404,7 +404,7 @@ fn branch_states_with_findings(
     let trunks = crate::release_model::trunk_positions(&repo, entry)?;
     if !trunks.is_empty() {
         let releases =
-            crate::release_model::release_refs_by_commit(&tips, &scheme, entry.publish_remote());
+            crate::release_model::releases_of_every_series(&tips, entry, &stacked.ledger);
         let context = crate::release_model::StackedHistoryContext {
             repo: &repo,
             trunks: &trunks,

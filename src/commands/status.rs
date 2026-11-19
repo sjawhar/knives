@@ -630,11 +630,10 @@ fn settle_rows_after_phases(
     })?);
     let trunks = crate::release_model::trunk_positions(input.repo, entry)?;
     if !trunks.is_empty() {
-        let releases = crate::release_model::release_refs_by_commit(
-            input.tips,
-            &scheme,
-            entry.publish_remote(),
-        );
+        // The store already read the fork's ledger: it names a stacked
+        // series' release whose refs the reap forgot.
+        let releases =
+            crate::release_model::releases_of_every_series(input.tips, entry, input.notches);
         findings.extend(stacked_pull_findings(
             report,
             crate::release_model::StackedHistoryContext {
