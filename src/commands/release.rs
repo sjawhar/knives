@@ -3706,8 +3706,9 @@ pub struct CompositionCheck {
     pub absent_write: bool,
     /// The fixes by hand that the series holds and the subject lacks at one
     /// of their files or more ([`CompositionDelta::fixes`]), each with the
-    /// files it lacks, none of them a file that the subject leaves
-    /// conflicted.
+    /// files it lacks. A file that the subject leaves conflicted is here too,
+    /// unless the newest recorded write is conflicted there as well
+    /// ([`Self::inconclusive_fixes`]).
     pub dropped_fixes: Vec<LackedFix>,
     /// The fixes by hand that the series holds at a file that the subject
     /// and the newest recorded write both leave conflicted, each with those files: unanswerable until the
@@ -3738,8 +3739,10 @@ impl CompositionCheck {
     }
 }
 
-/// A fix by hand that the series holds and the cut subject lacks
-/// ([`CompositionCheck::dropped_fixes`]).
+/// A fix by hand that the series holds and the cut subject lacks, or
+/// leaves inconclusive, at the files it names
+/// ([`CompositionCheck::dropped_fixes`],
+/// [`CompositionCheck::inconclusive_fixes`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LackedFix {
     /// The release the adopt recorded.
@@ -4202,10 +4205,12 @@ pub struct CompositionDelta<'a> {
 /// whatever the subject's ancestry. A fix the subject lacks at a file is
 /// named by its adopt, with each file it lacks
 /// ([`CompositionCheck::dropped_fixes`]); at a file that the subject leaves
-/// conflicted, as a knives cut over a conflicted write does, the fix is
-/// inconclusive instead and refuses nothing
-/// ([`CompositionCheck::inconclusive_fixes`]), so the cut goes ahead with
-/// the conflict for the person to resolve in place and `adopt`.
+/// conflicted, where the newest recorded write is conflicted there too, as
+/// a knives cut over a conflicted write is, the fix is inconclusive instead
+/// and refuses nothing ([`CompositionCheck::inconclusive_fixes`]), so the
+/// cut goes ahead with the conflict for the person to resolve in place and
+/// `adopt`. A file the subject leaves conflicted where the newest write is
+/// not, as on a bookmark left behind a later adopt, is lacked.
 pub fn uncarried_recorded_members(
     repo: &Repo,
     path: &Path,
@@ -4355,7 +4360,8 @@ fn fix_findings(
 /// nothing here measures is held by that test alone, and a file with no
 /// reference by the replay alone. So a subject that holds a file that the
 /// fix deleted lacks the fix there, and so does one that leaves the file
-/// conflicted, which the caller reports as inconclusive.
+/// conflicted; the caller reports that file as inconclusive where the
+/// newest recorded write is conflicted there too ([`fix_findings`]).
 ///
 /// Only the subject's own tree counts: the candidate a cut builds, or the
 /// commit a record names. A subject with the adopt on its first-parent line

@@ -277,10 +277,12 @@ pub(crate) fn run_release(
         // recorded or published. In a stacked series that write must also be
         // on the line of the commit the cut starts on, its first parent. Each
         // fix by hand that the series holds, an `adopt` of any of its
-        // releases, is held file by file at each file where that write still
-        // holds it, by the candidate's own tree. What this repository cannot
-        // read is never held to less: a newest write it lacks refuses the
-        // cut, and a fix it cannot measure is held to what that write holds.
+        // releases, is held file by file, each file against its reference,
+        // the newest recorded write that holds it with no conflict, where
+        // that reference still holds the fix, by the candidate's own tree.
+        // What this repository cannot read is never held to less: a newest
+        // write it lacks refuses the cut, and a fix it cannot measure is
+        // held to what each file's reference holds.
         let (baseline, fixes) =
             CompositionGate::read_baseline((&opened, entry), (&ledger, &tips), None)?;
         let gate = CompositionGate {
@@ -1070,8 +1072,8 @@ fn uncarried_cut_lines(
             )
         });
     }
-    // A fix that nothing here can measure was held against the newest
-    // write's content.
+    // A fix that nothing here can measure was held against each file's
+    // reference, which may be an older write than the newest one.
     let holder = held.newest_write();
     lines.extend(fix_lines(
         repo,
@@ -1544,8 +1546,9 @@ fn record_cut_event(
 /// then `; without the fix by hand of <release>'s adopt <commit>, in <n>
 /// file(s): <files>` for each fix by hand that `--allow-drop` let the
 /// subject go ahead without, with the files where it lacks it
-/// ([`fix_title`]), then the unverified members. Empty when the ledger
-/// records neither. The event keeps each name and path raw.
+/// ([`fix_title`]), then the unverified members and each fix by hand left
+/// inconclusive. Empty when the ledger records neither. The event keeps
+/// each name and path raw.
 fn restated_delta(held: Option<HeldRecords<'_>>, check: &release::CompositionCheck) -> String {
     let Some(held) = held else {
         return String::new();
