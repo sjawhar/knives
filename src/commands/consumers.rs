@@ -519,6 +519,11 @@ mod tests {
 
     #[test]
     fn a_malformed_lock_fragment_makes_the_consumer_incomplete_instead_of_current() {
+        // `consumer_row` runs `git` from `PATH` to read the consumer's origin
+        // trunk, and other tests of this process swap `PATH` under the
+        // environment lock; without it, `git` may not run, and the row gains
+        // a problem this test does not expect.
+        let _lock = crate::config::test_support::environment_lock();
         let consumer = tempfile::tempdir().expect("create consumer");
         std::fs::write(
             consumer.path().join("uv.lock"),
