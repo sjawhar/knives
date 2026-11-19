@@ -1197,6 +1197,7 @@ mod tests {
         knives::jj::UnionedFile {
             path: path.to_owned(),
             first_lines: vec![first_line.to_owned()],
+            left_twice: Vec::new(),
         }
     }
 

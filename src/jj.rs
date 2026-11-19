@@ -2945,6 +2945,11 @@ pub struct UnionedFile {
     /// Read as UTF-8 with replacement, because these only name the blocks to
     /// a reader; the file holds the bytes verbatim.
     pub first_lines: Vec<String>,
+    /// Each `### ` heading the union left in more than one block of one
+    /// section, where the blocks at a place are not plain `### ` lists in
+    /// `[Unreleased]` ([`changelog_union::Union::left_twice`]). Read as UTF-8
+    /// with replacement, as `first_lines` is.
+    pub left_twice: Vec<String>,
 }
 
 /// The commit a release write replaced under its name.
@@ -3634,6 +3639,11 @@ fn union_release_logs(
                 .first_lines
                 .iter()
                 .map(|line| String::from_utf8_lossy(line).into_owned())
+                .collect(),
+            left_twice: union
+                .left_twice
+                .iter()
+                .map(|heading| String::from_utf8_lossy(heading).into_owned())
                 .collect(),
         });
         let resolved = TreeValue::File {

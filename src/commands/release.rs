@@ -4812,9 +4812,12 @@ pub fn check_test_count(fork: &Fork<'_>, cut: &CommitId, parent: &CommitId) -> T
 /// `RELEASE_NOTES.md` where every side only inserted its own block
 /// ([`crate::changelog_union`]). That resolution is the same every time, so a
 /// person writing it by hand adds nothing. Each unioned file is named with the
-/// first line of every block, in the order written: the union is verbatim and
-/// never renumbers, so two blocks claiming one version read as two such lines,
-/// and settling that is a person's.
+/// first line of every block, in the order written: the union never
+/// renumbers, so two blocks claiming one version read as two such lines, and
+/// settling that is a person's. Where the blocks at a place are not plain
+/// `### ` lists in `[Unreleased]`, the union writes each of them whole, and
+/// one line for the file names each `### ` heading they leave twice in one
+/// section, for a person to join.
 ///
 /// Every other conflict stays a person's. Independent branches that each
 /// append a config key land in the same regions, so a real cut carries real
@@ -4832,8 +4835,8 @@ pub fn conflict_guidance(release: &str, files: &[String], unions: &[jj::UnionedF
     let mut lines = Vec::new();
     if !unions.is_empty() {
         lines.push(format!(
-            "  {} release log(s) written as the union of their sides, every block verbatim \
-             and in this order:",
+            "  {} release log(s) written as the union of their sides, each block named by its \
+             first line, in this order:",
             unions.len()
         ));
         // A path read from the tree, and each block's first line as a
@@ -4852,6 +4855,21 @@ pub fn conflict_guidance(release: &str, files: &[String], unions: &[jj::UnionedF
              renumber by hand and record it with `knives release adopt --why`"
                 .to_owned(),
         );
+        // A path read from the tree, and each heading as a member's file
+        // holds it.
+        for union in unions.iter().filter(|union| !union.left_twice.is_empty()) {
+            let headings: Vec<String> = union
+                .left_twice
+                .iter()
+                .map(|heading| format!("`{}`", inline_human_text(heading)))
+                .collect();
+            lines.push(format!(
+                "  {}: left {} twice: a block there is not plain `### ` lists in [Unreleased]; \
+                 join them by hand",
+                inline_human_text(&union.path),
+                headings.join(", ")
+            ));
+        }
     }
     if files.is_empty() {
         lines.push(if unions.is_empty() {
@@ -4961,6 +4979,38 @@ mod conflict_tests {
             ),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn a_heading_left_twice_is_named_with_its_file_and_escaped() {
+        // Given: a release log that a write unioned whole, which leaves in two
+        // blocks of one section a heading with a control character, and a
+        // release log whose lists the write joined.
+        let left = jj::UnionedFile {
+            path: "CHANGELOG.md".to_owned(),
+            first_lines: vec!["### Fixed\u{1b}[2J".to_owned(); 2],
+            left_twice: vec!["### Fixed\u{1b}[2J".to_owned()],
+        };
+        let joined = jj::UnionedFile {
+            path: "RELEASE_NOTES.md".to_owned(),
+            first_lines: vec!["### Fixed".to_owned()],
+            left_twice: Vec::new(),
+        };
+
+        // When: its guidance is rendered.
+        let rendered = conflict_guidance("release/2026-08-30", &[], &[left, joined]);
+
+        // Then: one line names the first file and its heading, escaped, and
+        // no line names the joined file so.
+        assert!(
+            rendered.contains(
+                "\n  CHANGELOG.md: left `### Fixed\u{fffd}[2J` twice: a block there is not plain \
+                 `### ` lists in [Unreleased]; join them by hand\n"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains('\u{1b}'), "{rendered}");
+        assert_eq!(rendered.matches(" twice: ").count(), 1, "{rendered}");
     }
 }
 
