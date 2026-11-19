@@ -140,7 +140,9 @@ fn encode(branch: &str) -> String {
 /// Who holds a claim, as its claim commit records it in `claim.toml`.
 ///
 /// Read with unknown keys ignored, so a later knives may add one and every
-/// knives before it still reads the claim.
+/// knives before it still reads the claim. The file also names the entry
+/// that recorded the change ([`write_claim`]), which no reader needs to
+/// know who holds the branch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimRecord {
     /// The fork's upstream, `<owner>/<name>`.
@@ -157,9 +159,22 @@ pub struct ClaimRecord {
     pub place: Option<String>,
     /// The `knives.machine` of the ledger git directory that took it.
     pub machine: String,
-    /// The file name of the ledger entry that recorded the change.
-    pub entry: String,
 }
+
+/// `claim.toml` as a claim commit holds it: the record, then the file name
+/// of the ledger entry that recorded the change.
+#[derive(Serialize)]
+struct Stored<'a> {
+    #[serde(flatten)]
+    record: &'a ClaimRecord,
+    entry: &'a str,
+}
+
+/// The most bytes a `claim.toml` is read at: far more than any record
+/// knives writes, whose fields and reason come to a few hundred bytes. A
+/// claim ref is anything any writer of the ledger sets it to, so its record
+/// is weighed before it is read.
+const MAX_RECORD: u64 = 64 * 1024;
 
 /// A claim ref's commit, as a read found it on the remote.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,18 +187,23 @@ pub struct HeldClaim {
 }
 
 /// Write the claim commit of `record`, a commit with no parent whose tree
-/// holds exactly `claim.toml`; its id.
+/// holds exactly `claim.toml`: the record, and `entry`, the file name of the
+/// ledger entry that recorded the change. Its id.
 ///
 /// Plumbing only, as [`super::commit_pending`] commits: a blob, a tree and a
 /// commit, never an index. The record's machine is author and committer,
 /// with an empty email, and the commit is never signed, as a machine's own
 /// commits are. It has no parent because a claim is replaced, never
-/// extended: the lease that replaces it names this commit alone. The
-/// record's entry name is unique to the nanosecond, so no two claim commits
-/// are one, and a lease meant for one claim never matches an older one.
-pub fn write_claim(repository: &Repository, record: &ClaimRecord) -> Result<CommitId, ClaimError> {
+/// extended: the lease that replaces it names this commit alone. The entry's
+/// name is unique to the nanosecond, so no two claim commits are one, and a
+/// lease meant for one claim never matches an older one.
+pub fn write_claim(
+    repository: &Repository,
+    record: &ClaimRecord,
+    entry: &str,
+) -> Result<CommitId, ClaimError> {
     let machine = machine_component(&record.machine)?;
-    let text = toml::to_string(record).map_err(|source| ClaimError::Record {
+    let text = toml::to_string(&Stored { record, entry }).map_err(|source| ClaimError::Record {
         repo: record.repo.clone(),
         branch: record.branch.clone(),
         source,
@@ -292,7 +312,9 @@ pub(super) fn remote_refs(
         .ok_or_else(|| output_error(&command, "an object id and a ref name per line"))
 }
 
-/// The record `commit` carries, or why it carries none that reads.
+/// The record `commit` carries, or why it carries none that reads: one
+/// larger than [`MAX_RECORD`] is not read at all, its size asked of git
+/// first.
 fn record_of(
     repository: &Repository,
     commit: &CommitId,
@@ -310,6 +332,18 @@ fn record_of(
         .ok_or_else(|| output_error(&command, "`<mode> <type> <id>\\t<path>` records"))?;
     if item.mode != Mode::File {
         return Ok(Err(format!("its {RECORD} is not a regular file")));
+    }
+    let mut command = repository.git();
+    command.args(["cat-file", "-s", item.oid.as_str()]);
+    let answer = run(&mut command)?;
+    let size = std::str::from_utf8(&answer)
+        .ok()
+        .and_then(|text| text.trim_end().parse::<u64>().ok())
+        .ok_or_else(|| output_error(&command, "a size in bytes"))?;
+    if size > MAX_RECORD {
+        return Ok(Err(format!(
+            "its {RECORD} is {size} bytes, more than the {MAX_RECORD} a claim record may be"
+        )));
     }
     let mut command = repository.git();
     command.args(["cat-file", "blob", item.oid.as_str()]);
@@ -348,34 +382,30 @@ pub struct ClaimPush<'a> {
     pub after: &'a CommitId,
 }
 
-/// The remote's claim ref, as read just after a claim push that did not
-/// land.
+/// The remote's claim ref, as read just after a claim push git refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimSeen {
-    /// The read failed, with this text: what the ref holds is not known.
-    Unread(String),
+    /// The read failed: what the ref holds is not known.
+    Unread,
     Absent,
     At(CommitId),
 }
 
-/// Why git refused a claim push that applied nothing, as git's words say.
+/// Which ref git refused a claim push that applied nothing on, as git's
+/// words say.
 ///
 /// Whether the claim was lost is the caller's to judge from [`ClaimSeen`],
 /// what the remote's claim ref holds now: git words a lost lease
 /// differently by version and by server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// The claim ref was not what the lease expected: stale, already
-    /// there, at another commit, gone, or the ref of an atomic transaction
-    /// that failed.
-    Lease,
     /// This machine's ref was refused as not a fast-forward, or created
     /// first by another push: another machine may be committing under the
     /// same name, as [`GitError::MachineNameCollision`] says.
     MachineRef,
-    /// Anything else that applied nothing: a hook that declined, a remote
-    /// that could not be reached or refused access, a pre-push hook here
-    /// that refused.
+    /// Anything else that applied nothing: a claim ref that was not what the
+    /// lease expected, a hook that declined, a remote that could not be
+    /// reached or refused access, a pre-push hook here that refused.
     Other,
 }
 
@@ -395,7 +425,6 @@ pub enum ClaimPushed {
     /// The remote may have applied the push or not. This machine's ref stays
     /// at N.
     Unknown {
-        claim: ClaimSeen,
         /// git's own account, to show escaped: it quotes the remote.
         account: String,
     },
@@ -472,24 +501,19 @@ pub fn push_claim(repository: &Repository, push: &ClaimPush<'_>) -> Result<Claim
     {
         return sent();
     }
-    let seen = remote_now.map_or_else(
-        |error| ClaimSeen::Unread(error.to_string()),
-        |mut refs| refs.remove(claim).map_or(ClaimSeen::Absent, ClaimSeen::At),
-    );
     let account = transcript.account(&command);
-    if let Verdict::Refused(refusal) = verdict {
-        restore_machine_ref(repository, push.machine, push.before, push.after)?;
-        Ok(ClaimPushed::Refused {
-            refusal,
-            claim: seen,
-            account,
-        })
-    } else {
-        Ok(ClaimPushed::Unknown {
-            claim: seen,
-            account,
-        })
-    }
+    let Verdict::Refused(refusal) = verdict else {
+        return Ok(ClaimPushed::Unknown { account });
+    };
+    let seen = remote_now.map_or(ClaimSeen::Unread, |mut refs| {
+        refs.remove(claim).map_or(ClaimSeen::Absent, ClaimSeen::At)
+    });
+    restore_machine_ref(repository, push.machine, push.before, push.after)?;
+    Ok(ClaimPushed::Refused {
+        refusal,
+        claim: seen,
+        account,
+    })
 }
 
 /// Move this machine's ref back from `after` (N) to `before` (P), or delete
@@ -553,18 +577,6 @@ const COLLISION: &[&str] = &[
     "reference already exists",
     " but expected ",
 ];
-/// Reasons a refused claim ref gives when it was not what the lease expected,
-/// as git and GitHub word them. Under `--atomic` git marks every ref of a
-/// failed transaction `(atomic transaction failed)`, naming the cause only on
-/// a `remote:` line.
-const LEASE: &[&str] = &[
-    "(stale info)",
-    "reference already exists",
-    " but expected ",
-    "unable to resolve reference",
-    "(atomic transaction failed)",
-    "(failed)",
-];
 /// What git says when the connection broke after the remote may have taken
 /// the push.
 const HUNG_UP: &[&str] = &[
@@ -600,7 +612,7 @@ fn verdict(said: Said<'_>, claim: &str, machine: &str) -> Verdict {
         return Verdict::Unknown;
     }
     if statuses.iter().any(|status| status.flag == '!') {
-        return Verdict::Refused(refusal(&statuses, said.stderr, claim, machine));
+        return Verdict::Refused(refusal(&statuses, said.stderr, machine));
     }
     let reported = |name: &str| statuses.iter().any(|status| status.to == name);
     if said.code == Some(0) && reported(claim) && reported(machine) {
@@ -632,24 +644,20 @@ fn statuses(stdout: &str) -> Vec<Status<'_>> {
         .collect()
 }
 
-/// Which ref a refused claim push was refused on, as git's words say.
-fn refusal(statuses: &[Status<'_>], stderr: &str, claim: &str, machine: &str) -> Refusal {
-    let refused = |name: &str, reasons: &[&str]| {
-        statuses.iter().any(|status| {
-            status.flag == '!'
-                && status.to == name
-                && reasons.iter().any(|reason| status.summary.contains(reason))
-        })
-    };
+/// Whether a refused claim push was refused on this machine's ref, as git's
+/// words say.
+fn refusal(statuses: &[Status<'_>], stderr: &str, machine: &str) -> Refusal {
+    let collided = |reason: &str| COLLISION.iter().any(|words| reason.contains(words));
     let lock = format!("cannot lock ref '{machine}': ");
     let machine_lock_lost = stderr.lines().any(|line| {
         line.split_once(&lock)
-            .is_some_and(|(_, reason)| COLLISION.iter().any(|words| reason.contains(words)))
+            .is_some_and(|(_, reason)| collided(reason))
     });
-    if machine_lock_lost || refused(machine, COLLISION) {
+    let machine_refused = statuses
+        .iter()
+        .any(|status| status.flag == '!' && status.to == machine && collided(status.summary));
+    if machine_lock_lost || machine_refused {
         Refusal::MachineRef
-    } else if refused(claim, LEASE) {
-        Refusal::Lease
     } else {
         Refusal::Other
     }
@@ -818,7 +826,21 @@ mod tests {
                 [UpstreamName::new(FORK)],
             )
             .unwrap();
-            let commit = write_claim(&remote, record).unwrap();
+            let commit = write_claim(&remote, record, ENTRY_TWO).unwrap();
+            git(&self.remote, &["update-ref", CLAIM, commit.as_str()]);
+            commit
+        }
+
+        /// A claim commit at the claim ref on the remote whose `claim.toml`
+        /// is `text`, as any writer of the ledger can set it.
+        fn held_text(&self, text: &[u8]) -> CommitId {
+            let blob = git_in(&self.remote, &["hash-object", "-w", "--stdin"], text);
+            let tree = git_in(
+                &self.remote,
+                &["mktree"],
+                format!("100644 blob {blob}\tclaim.toml\n").as_bytes(),
+            );
+            let commit = CommitId::new(git(&self.remote, &["commit-tree", "-m", "claim", &tree]));
             git(&self.remote, &["update-ref", CLAIM, commit.as_str()]);
             commit
         }
@@ -837,7 +859,7 @@ mod tests {
         }
     }
 
-    fn record(machine: &str, owner: &str, entry: &str) -> ClaimRecord {
+    fn record(machine: &str, owner: &str) -> ClaimRecord {
         ClaimRecord {
             repo: FORK.to_owned(),
             branch: "feat/a".to_owned(),
@@ -847,7 +869,6 @@ mod tests {
             started: "2026-11-16T08:00:00Z".to_owned(),
             place: Some("box-one/4026531836".to_owned()),
             machine: machine.to_owned(),
-            entry: entry.to_owned(),
         }
     }
 
@@ -993,14 +1014,18 @@ mod tests {
     #[test]
     fn a_record_reads_back_as_it_was_written() {
         for record in [
-            record("machine-one", "owner-one", ENTRY_ONE),
+            record("machine-one", "owner-one"),
             ClaimRecord {
                 place: None,
                 kind: OwnerKind::OsUser,
-                ..record("machine-one", "owner-one", ENTRY_ONE)
+                ..record("machine-one", "owner-one")
             },
         ] {
-            let text = toml::to_string(&record).unwrap();
+            let text = toml::to_string(&Stored {
+                record: &record,
+                entry: ENTRY_ONE,
+            })
+            .unwrap();
             assert_eq!(parse_record(text.as_bytes()), Ok(record));
         }
     }
@@ -1023,7 +1048,7 @@ mod tests {
             Ok(ClaimRecord {
                 kind: OwnerKind::WorkspaceDerived,
                 place: None,
-                ..record("machine-one", "owner-one", ENTRY_ONE)
+                ..record("machine-one", "owner-one")
             })
         );
     }
@@ -1033,10 +1058,10 @@ mod tests {
         // Given: machine one's claim record.
         let lab = Lab::new();
         let one = lab.machine("one");
-        let record = record("machine-one", "owner-one", ENTRY_ONE);
+        let record = record("machine-one", "owner-one");
 
-        // When: its claim commit is written.
-        let commit = write_claim(&one, &record).unwrap();
+        // When: its claim commit is written, for the entry that records it.
+        let commit = write_claim(&one, &record, ENTRY_ONE).unwrap();
 
         // Then: the commit has no parent, and the machine with an empty email
         // wrote it.
@@ -1059,7 +1084,8 @@ mod tests {
             raw.ends_with("\n\nmachine-one: claim example/fork feat/a"),
             "{raw}"
         );
-        // And: its tree is `claim.toml` alone, a regular file holding the record.
+        // And: its tree is `claim.toml` alone, a regular file holding the
+        // record and naming the entry.
         let tree = git(one.git_dir(), &["ls-tree", commit.as_str()]);
         let items: Vec<&str> = tree.lines().collect();
         assert_eq!(items.len(), 1, "{tree}");
@@ -1072,6 +1098,12 @@ mod tests {
             &["cat-file", "blob", &format!("{commit}:claim.toml")],
         );
         assert_eq!(parse_record(text.as_bytes()), Ok(record));
+        let stored: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(
+            stored.get("entry").and_then(toml::Value::as_str),
+            Some(ENTRY_ONE),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1086,7 +1118,7 @@ mod tests {
         // Given: machine two's claim on the remote, and machine one's git
         // directory configured to copy every remote ref it fetches.
         let lab = Lab::new();
-        let theirs = record("machine-two", "owner-two", ENTRY_TWO);
+        let theirs = record("machine-two", "owner-two");
         let held = lab.held(&theirs);
         let one = lab.machine("one");
         git(
@@ -1125,18 +1157,7 @@ mod tests {
     fn a_claim_whose_record_is_not_toml_is_still_a_claim_with_the_reason() {
         // Given: a claim commit on the remote whose `claim.toml` is not TOML.
         let lab = Lab::new();
-        let blob = git_in(
-            &lab.remote,
-            &["hash-object", "-w", "--stdin"],
-            b"owner = = ?\n",
-        );
-        let tree = git_in(
-            &lab.remote,
-            &["mktree"],
-            format!("100644 blob {blob}\tclaim.toml\n").as_bytes(),
-        );
-        let held = CommitId::new(git(&lab.remote, &["commit-tree", "-m", "claim", &tree]));
-        git(&lab.remote, &["update-ref", CLAIM, held.as_str()]);
+        let held = lab.held_text(b"owner = = ?\n");
         let one = lab.machine("one");
 
         // When: it is read.
@@ -1152,12 +1173,60 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_whose_record_is_over_64_kib_is_still_a_claim_with_its_size_the_reason() {
+        // Given: machine two's record, padded with a comment to a length.
+        let lab = Lab::new();
+        let one = lab.machine("one");
+        let theirs = record("machine-two", "owner-two");
+        let text = toml::to_string(&Stored {
+            record: &theirs,
+            entry: ENTRY_TWO,
+        })
+        .unwrap();
+        let padded = |bytes: u64| {
+            let bytes = usize::try_from(bytes).unwrap();
+            format!("{text}#{}\n", "x".repeat(bytes - text.len() - 2))
+        };
+
+        // When: the claim commit holds the most bytes a `claim.toml` is read
+        // at.
+        let at_bound = lab.held_text(padded(MAX_RECORD).as_bytes());
+        let read = read_claim(&one, "origin", &claim_ref()).unwrap();
+
+        // Then: it reads as the record.
+        assert_eq!(
+            read,
+            Some(HeldClaim {
+                commit: at_bound,
+                record: Ok(theirs)
+            })
+        );
+
+        // When: it holds one byte more.
+        let over = lab.held_text(padded(MAX_RECORD + 1).as_bytes());
+        let read = read_claim(&one, "origin", &claim_ref()).unwrap();
+
+        // Then: it is still a claim, whose record does not read, and the
+        // reason names its size.
+        assert_eq!(
+            read,
+            Some(HeldClaim {
+                commit: over,
+                record: Err(
+                    "its claim.toml is 65537 bytes, more than the 65536 a claim record may be"
+                        .to_owned()
+                )
+            })
+        );
+    }
+
+    #[test]
     fn a_take_lands_the_claim_and_the_machine_ref_together() {
         // Given: no claim on the remote, and machine one's ref moved to N.
         let lab = Lab::new();
         let one = lab.machine("one");
         let moved = commit_entries(&one, "entry one");
-        let mine = write_claim(&one, &record("machine-one", "owner-one", ENTRY_ONE)).unwrap();
+        let mine = write_claim(&one, &record("machine-one", "owner-one"), ENTRY_ONE).unwrap();
 
         // When: it pushes the take.
         let pushed = push(&one, None, Some(&mine), &moved);
@@ -1173,18 +1242,18 @@ mod tests {
     fn a_take_of_a_claim_another_machine_holds_is_refused_and_changes_nothing() {
         // Given: machine two's claim on the remote.
         let lab = Lab::new();
-        let theirs = lab.held(&record("machine-two", "owner-two", ENTRY_TWO));
+        let theirs = lab.held(&record("machine-two", "owner-two"));
         let one = lab.machine("one");
         let moved = commit_entries(&one, "entry one");
-        let mine = write_claim(&one, &record("machine-one", "owner-one", ENTRY_ONE)).unwrap();
+        let mine = write_claim(&one, &record("machine-one", "owner-one"), ENTRY_ONE).unwrap();
 
         // When: machine one pushes a take, leasing on no claim.
         let pushed = push(&one, None, Some(&mine), &moved);
 
-        // Then: it is refused on the lease, naming the claim the remote holds.
+        // Then: it is refused, naming the claim the remote holds.
         assert_eq!(
             refused(pushed),
-            (Refusal::Lease, ClaimSeen::At(theirs.clone()))
+            (Refusal::Other, ClaimSeen::At(theirs.clone()))
         );
         // And: the remote holds what it held, and nothing else.
         assert_eq!(refs(&lab.remote), [CLAIM]);
@@ -1198,12 +1267,12 @@ mod tests {
     fn a_seize_leasing_on_the_claim_it_read_lands() {
         // Given: machine two's claim, as machine one read it.
         let lab = Lab::new();
-        let theirs = lab.held(&record("machine-two", "owner-two", ENTRY_TWO));
+        let theirs = lab.held(&record("machine-two", "owner-two"));
         let one = lab.machine("one");
         let read = read_claim(&one, "origin", &claim_ref()).unwrap().unwrap();
         assert_eq!(read.commit, theirs);
         let moved = commit_entries(&one, "entry one");
-        let mine = write_claim(&one, &record("machine-one", "owner-one", ENTRY_ONE)).unwrap();
+        let mine = write_claim(&one, &record("machine-one", "owner-one"), ENTRY_ONE).unwrap();
 
         // When: machine one pushes its seize, leasing on that commit.
         let pushed = push(&one, Some(&read.commit), Some(&mine), &moved);
@@ -1218,11 +1287,11 @@ mod tests {
     fn a_seize_whose_lease_is_stale_is_refused() {
         // Given: machine two's claim, and a lease on another commit.
         let lab = Lab::new();
-        let theirs = lab.held(&record("machine-two", "owner-two", ENTRY_TWO));
+        let theirs = lab.held(&record("machine-two", "owner-two"));
         let one = lab.machine("one");
-        let stale = write_claim(&one, &record("machine-three", "owner-three", ENTRY_TWO)).unwrap();
+        let stale = write_claim(&one, &record("machine-three", "owner-three"), ENTRY_TWO).unwrap();
         let moved = commit_entries(&one, "entry one");
-        let mine = write_claim(&one, &record("machine-one", "owner-one", ENTRY_ONE)).unwrap();
+        let mine = write_claim(&one, &record("machine-one", "owner-one"), ENTRY_ONE).unwrap();
 
         // When: machine one seizes, leasing on the stale commit.
         let pushed = push(&one, Some(&stale), Some(&mine), &moved);
@@ -1230,7 +1299,7 @@ mod tests {
         // Then: it is refused, the remote unchanged.
         assert_eq!(
             refused(pushed),
-            (Refusal::Lease, ClaimSeen::At(theirs.clone()))
+            (Refusal::Other, ClaimSeen::At(theirs.clone()))
         );
         assert_eq!(refs(&lab.remote), [CLAIM]);
         assert_eq!(at(&lab.remote, CLAIM), Some(theirs));
@@ -1243,7 +1312,7 @@ mod tests {
         let lab = Lab::new();
         let one = lab.machine("one");
         let taken = commit_entries(&one, "entry one");
-        let mine = write_claim(&one, &record("machine-one", "owner-one", ENTRY_ONE)).unwrap();
+        let mine = write_claim(&one, &record("machine-one", "owner-one"), ENTRY_ONE).unwrap();
         assert_eq!(push(&one, None, Some(&mine), &taken), ClaimPushed::Landed);
 
         // When: it releases, leasing on its claim commit.
@@ -1266,7 +1335,7 @@ mod tests {
         git(&lab.remote, &["update-ref", MACHINE, elsewhere.as_str()]);
         let one = lab.machine("one");
         let moved = commit_entries(&one, "entry one");
-        let mine = write_claim(&one, &record("machine-one", "owner-one", ENTRY_ONE)).unwrap();
+        let mine = write_claim(&one, &record("machine-one", "owner-one"), ENTRY_ONE).unwrap();
 
         // When: machine one pushes a take.
         let pushed = push(&one, None, Some(&mine), &moved);
@@ -1296,7 +1365,7 @@ mod tests {
         assert_eq!(at(&lab.remote, "refs/heads/probe"), Some(sent));
         let one = lab.machine("one");
         let moved = commit_entries(&one, "entry one");
-        let mine = write_claim(&one, &record("machine-one", "owner-one", ENTRY_ONE)).unwrap();
+        let mine = write_claim(&one, &record("machine-one", "owner-one"), ENTRY_ONE).unwrap();
 
         // When: machine one pushes a take.
         let pushed = push(&one, None, Some(&mine), &moved);
@@ -1315,7 +1384,7 @@ mod tests {
         lab.hook("pre-receive", "#!/bin/sh\nkill -9 \"$PPID\"\n");
         let one = lab.machine("one");
         let moved = commit_entries(&one, "entry one");
-        let mine = write_claim(&one, &record("machine-one", "owner-one", ENTRY_ONE)).unwrap();
+        let mine = write_claim(&one, &record("machine-one", "owner-one"), ENTRY_ONE).unwrap();
 
         // When: machine one pushes a take.
         let pushed = push(&one, None, Some(&mine), &moved);
@@ -1326,8 +1395,7 @@ mod tests {
         match pushed {
             // Unknown: machine one keeps N, a fast-forward of anything the
             // remote may still apply.
-            ClaimPushed::Unknown { claim, .. } => {
-                assert_eq!(claim, ClaimSeen::Absent);
+            ClaimPushed::Unknown { .. } => {
                 assert_eq!(at(one.git_dir(), MACHINE), Some(moved.1));
             }
             ClaimPushed::Refused { claim, .. } => {
@@ -1411,7 +1479,7 @@ mod tests {
                 "Done\n",
             ),
             stderr: "error: failed to push some refs to 'https://example.invalid/example/ledger.git'\n",
-            verdict: Verdict::Refused(Refusal::Lease),
+            verdict: Verdict::Refused(Refusal::Other),
         },
         Case {
             shape: "GitHub, a seize whose claim was deleted first",
@@ -1422,7 +1490,7 @@ mod tests {
                 "Done\n",
             ),
             stderr: "error: failed to push some refs to 'https://example.invalid/example/ledger.git'\n",
-            verdict: Verdict::Refused(Refusal::Lease),
+            verdict: Verdict::Refused(Refusal::Other),
         },
         Case {
             shape: "GitHub, a release whose claim was seized first",
@@ -1433,7 +1501,7 @@ mod tests {
                 "Done\n",
             ),
             stderr: "error: failed to push some refs to 'https://example.invalid/example/ledger.git'\n",
-            verdict: Verdict::Refused(Refusal::Lease),
+            verdict: Verdict::Refused(Refusal::Other),
         },
         Case {
             shape: "GitHub, a lease git found stale before sending",
@@ -1444,7 +1512,7 @@ mod tests {
                 "Done\n",
             ),
             stderr: "error: failed to push some refs to 'https://example.invalid/example/ledger.git'\n",
-            verdict: Verdict::Refused(Refusal::Lease),
+            verdict: Verdict::Refused(Refusal::Other),
         },
         Case {
             shape: "GitHub, the loser of an atomic race, its other ref marked new though nothing was applied",
@@ -1456,7 +1524,7 @@ mod tests {
                 "Done\n",
             ),
             stderr: "error: failed to push some refs to 'https://example.invalid/example/ledger.git'\n",
-            verdict: Verdict::Refused(Refusal::Lease),
+            verdict: Verdict::Refused(Refusal::Other),
         },
         Case {
             shape: "GitHub, the loser of an atomic race, with the remote's own errors",
@@ -1472,7 +1540,7 @@ mod tests {
                 "remote: fatal: unable to rename temporary '*.pack' file to '/data/repositories/5/nw/58/16/7e/1180229016/1318902388.git/objects/ghq_okafifNViSh/pack/pack-daf6b323ce72245687e45f7d4ccc1ec9025719fe.pack'        \n",
                 "error: failed to push some refs to 'https://example.invalid/example/ledger.git'\n",
             ),
-            verdict: Verdict::Refused(Refusal::Lease),
+            verdict: Verdict::Refused(Refusal::Other),
         },
         Case {
             shape: "GitHub, the winner of an atomic race",
@@ -1522,7 +1590,7 @@ mod tests {
                 "Done\n",
             ),
             stderr: "error: failed to push some refs to 'https://example.invalid/example/ledger.git'\n",
-            verdict: Verdict::Refused(Refusal::Lease),
+            verdict: Verdict::Refused(Refusal::Other),
         },
         Case {
             shape: "a remote rejection `(missing necessary objects)`",
@@ -1590,7 +1658,7 @@ mod tests {
                 "fatal: the remote end hung up unexpectedly\n",
                 "error: failed to push some refs to '/tmp/.tmpXYvBbh/ledger.git'\n",
             ),
-            verdict: Verdict::Refused(Refusal::Lease),
+            verdict: Verdict::Refused(Refusal::Other),
         },
         Case {
             shape: "a release of a claim already gone",
@@ -1606,7 +1674,7 @@ mod tests {
                 "fatal: the remote end hung up unexpectedly\n",
                 "error: failed to push some refs to '/tmp/.tmpXYvBbh/ledger.git'\n",
             ),
-            verdict: Verdict::Refused(Refusal::Lease),
+            verdict: Verdict::Refused(Refusal::Other),
         },
         Case {
             shape: "a lost create race on the claim ref, named only on a remote line",
@@ -1621,7 +1689,7 @@ mod tests {
                 "remote: error: cannot lock ref 'refs/knives-claims/example/fork/feat%2Fa': reference already exists        \n",
                 "error: failed to push some refs to '/tmp/.tmpXYvBbh/ledger.git'\n",
             ),
-            verdict: Verdict::Refused(Refusal::Lease),
+            verdict: Verdict::Refused(Refusal::Other),
         },
         Case {
             shape: "a seize whose claim moved after git read it",
@@ -1636,7 +1704,7 @@ mod tests {
                 "remote: error: cannot lock ref 'refs/knives-claims/example/fork/feat%2Fa': is at 314374c7a2b93018c0c8b6d3fdf692d5762ce325 but expected 55db826db2327be9af9bfbbf9afc9480431a6f94        \n",
                 "error: failed to push some refs to '/tmp/.tmpXYvBbh/ledger.git'\n",
             ),
-            verdict: Verdict::Refused(Refusal::Lease),
+            verdict: Verdict::Refused(Refusal::Other),
         },
         Case {
             shape: "a lost create race on the machine ref, named only on a remote line",

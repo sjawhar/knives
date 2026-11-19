@@ -38,7 +38,8 @@ mod pulled;
 mod sent;
 
 pub use claim::{
-    ClaimChange, ClaimChanged, ClaimOutcome, LedgerFailure, NotApplied, change_claim, read_claim,
+    Becomes, ClaimChange, ClaimChanged, ClaimOutcome, LedgerFailure, NotApplied, Released,
+    change_claim, read_claim,
 };
 pub use destinations::{
     Destination, Destinations, SharedFork, Unreached, destinations, ledger_of, ledger_repositories,

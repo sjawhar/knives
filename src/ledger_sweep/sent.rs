@@ -481,7 +481,7 @@ mod tests {
                 shared: &shared,
                 claim: &claim,
                 expected: None,
-                becomes: Some(ClaimRecord {
+                becomes: ClaimRecord {
                     repo: FORK.to_owned(),
                     branch: "feat/a".to_owned(),
                     owner: "owner-one".to_owned(),
@@ -490,8 +490,7 @@ mod tests {
                     started: "2026-11-16T08:00:00Z".to_owned(),
                     place: None,
                     machine: "machine-one".to_owned(),
-                    entry: String::new(),
-                }),
+                },
             },
             || {
                 scribe
@@ -500,7 +499,7 @@ mod tests {
             },
         );
         assert!(
-            matches!(changed.outcome, ClaimOutcome::Landed { .. }),
+            matches!(changed.outcome, ClaimOutcome::Landed(_)),
             "{:?}",
             changed.outcome
         );

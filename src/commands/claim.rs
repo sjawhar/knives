@@ -17,8 +17,8 @@ use crate::commands::hook::owner_for;
 use crate::config::Registry;
 use crate::ids::{BranchName, BranchTarget, CommitId, UpstreamName};
 use crate::ledger::{Draft, Scribe, inline_human_text, problem_human_text};
-use crate::ledger_git::{ClaimRecord, ClaimRef, HeldClaim, Refusal};
-use crate::ledger_sweep::{self, ClaimOutcome, LedgerFailure, NotApplied, SharedFork};
+use crate::ledger_git::{ClaimRecord, ClaimRef, HeldClaim};
+use crate::ledger_sweep::{self, Becomes, ClaimOutcome, LedgerFailure, NotApplied, SharedFork};
 use crate::store::{Claim, OwnerKind};
 
 /// The registry the current directory was bound against, and the fork it is
@@ -645,16 +645,13 @@ pub fn unwritten(shared: &SharedFork, cause: &str) -> String {
 /// another machine may be committing under its name and how to rename it.
 pub fn unapplied_cause(shared: &SharedFork, why: &NotApplied, failure: &LedgerFailure) -> String {
     match why {
-        NotApplied::Refused {
-            refusal: Refusal::MachineRef,
-            ..
-        } => format!(
+        NotApplied::MachineRef => format!(
             "git refused this machine's ref refs/knives/{} on origin: {} ({})",
             shared.destination.machine,
             crate::ledger_git::machine_collision_remedy(shared.destination.repository.git_dir()),
             failure.cause
         ),
-        _ => failure.cause.clone(),
+        NotApplied::Lost { .. } | NotApplied::Failed => failure.cause.clone(),
     }
 }
 
@@ -680,11 +677,11 @@ pub fn unreadable_holder(
 /// [`ledger_sweep::change_claim`] with the entry `draft`, written by
 /// `scribe`; the problems its commit passed over go to stderr, one line
 /// each, as a sweep's report shows them.
-pub fn change_on_ledger(
-    change: ledger_sweep::ClaimChange<'_>,
+pub fn change_on_ledger<B: Becomes>(
+    change: ledger_sweep::ClaimChange<'_, B>,
     scribe: &Scribe,
     draft: &Draft<'_>,
-) -> ClaimOutcome {
+) -> ClaimOutcome<B::Landed> {
     let changed =
         ledger_sweep::change_claim(change, || scribe.record_to(draft).map(|(_, path)| path));
     for problem in &changed.problems {

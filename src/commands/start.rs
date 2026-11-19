@@ -34,7 +34,7 @@ use crate::ledger::{
     ClaimChange, Displaced, Draft, Ledger, Scribe, default_ledger_root, inline_human_text,
     problem_human_text,
 };
-use crate::ledger_git::{ClaimError, ClaimRecord, ClaimRef, ClaimSeen, HeldClaim};
+use crate::ledger_git::{ClaimError, ClaimRecord, ClaimRef, HeldClaim};
 use crate::ledger_sweep::{self, ClaimOutcome, LedgerFailure, NotApplied, SharedFork};
 use crate::release_model::newest_release;
 use crate::seen;
@@ -1102,13 +1102,13 @@ impl OnLedger<'_> {
         &self.shared.destination.machine
     }
 
-    /// A change of the claim from `expected` to `becomes`, `None` releasing
-    /// it.
-    const fn change<'b>(
+    /// A change of the claim from `expected` to what it `becomes`: a claim
+    /// commit of a record, or none ([`ledger_sweep::Released`]).
+    const fn change<'b, B>(
         &'b self,
         expected: Option<&'b CommitId>,
-        becomes: Option<ClaimRecord>,
-    ) -> ledger_sweep::ClaimChange<'b> {
+        becomes: B,
+    ) -> ledger_sweep::ClaimChange<'b, B> {
         ledger_sweep::ClaimChange {
             shared: self.shared,
             claim: &self.claim,
@@ -1130,7 +1130,6 @@ fn record_of(claim: &Claim, here: &str) -> ClaimRecord {
         started: claim.started.clone(),
         place: claim.place.clone(),
         machine: claimed_on(claim, here).to_owned(),
-        entry: String::new(),
     }
 }
 
@@ -1146,7 +1145,6 @@ fn new_record(context: &StartContext<'_>, on: &OnLedger<'_>, reason: &str) -> Cl
         started: jiff::Timestamp::now().to_string(),
         place: Some(crate::liveness::this_place()),
         machine: on.machine().to_owned(),
-        entry: String::new(),
     }
 }
 
@@ -1497,7 +1495,7 @@ fn take_shared(context: &mut StartContext<'_>, on: &OnLedger<'_>) -> anyhow::Res
     };
     let draft =
         event_draft(context, event).about_claim(Some(ClaimChange::Claimed), Some(reason), None);
-    let (commit, copy) = match land(context, on, new_record(context, on, reason), &draft)? {
+    let (commit, copy) = match land(context, on, new_record(context, on, reason), &draft) {
         Ok(landed) => landed,
         Err(exit) => return Ok(exit),
     };
@@ -1561,7 +1559,7 @@ fn seize_shared(
         Some(reason),
         displaced.as_ref(),
     );
-    let (commit, copy) = match land(context, on, new_record(context, on, reason), &draft)? {
+    let (commit, copy) = match land(context, on, new_record(context, on, reason), &draft) {
         Ok(landed) => landed,
         Err(exit) => return Ok(exit),
     };
@@ -1657,7 +1655,7 @@ fn resume_shared(
             why: why.to_owned(),
             ..record_of(held, on.machine())
         };
-        match land(context, on, record, &draft)? {
+        match land(context, on, record, &draft) {
             Ok((_, copy)) => copy,
             Err(exit) => return Ok(exit),
         }
@@ -1696,71 +1694,58 @@ fn land(
     on: &OnLedger<'_>,
     record: ClaimRecord,
     draft: &Draft<'_>,
-) -> anyhow::Result<Result<(CommitId, Claim), Exit>> {
+) -> Result<(CommitId, Claim), Exit> {
     let branch = context.branch;
-    let change = on.change(on.read.as_ref(), Some(record.clone()));
-    Ok(
-        match change_on_ledger(change, &scribe_for(context), draft) {
-            ClaimOutcome::Landed {
-                claim: Some(commit),
-                ..
-            } => {
-                let target = BranchTarget::new(context.fork.upstream.clone(), branch.clone());
-                let copy = copy_of(&target, &commit, record);
-                Ok((commit, copy))
-            }
-            ClaimOutcome::Landed { claim: None, .. } => {
-                anyhow::bail!(
-                    "the ledger took the claim of {branch} and holds no claim commit for it"
-                )
-            }
-            ClaimOutcome::NotApplied { why, failure } => Err(lost(context, on, &why, &failure)),
-            ClaimOutcome::Unknown { failure, .. } => {
-                eprintln!(
-                    "the claim of {branch} was pushed to the ledger {} ({}), and whether it landed \
+    let change = on.change(on.read.as_ref(), record.clone());
+    match change_on_ledger(change, &scribe_for(context), draft) {
+        ClaimOutcome::Landed(commit) => {
+            let target = BranchTarget::new(context.fork.upstream.clone(), branch.clone());
+            let copy = copy_of(&target, &commit, record);
+            Ok((commit, copy))
+        }
+        ClaimOutcome::NotApplied { why, failure } => Err(lost(context, on, &why, &failure)),
+        ClaimOutcome::Unknown { failure } => {
+            eprintln!(
+                "the claim of {branch} was pushed to the ledger {} ({}), and whether it landed \
                  is unknown: {}; nothing is recorded on this machine, and `knives start \
                  {branch}` reads the claim again",
-                    on.shared.ledger,
-                    git_dir_of(on.shared),
-                    problem_human_text(&failure.cause)
-                );
-                Err(Exit::Incomplete)
-            }
-        },
-    )
+                on.shared.ledger,
+                git_dir_of(on.shared),
+                problem_human_text(&failure.cause)
+            );
+            Err(Exit::Incomplete)
+        }
+    }
 }
 
 /// What a claim push that applied nothing comes to: the exit after saying
 /// so.
 ///
-/// Where the ledger's claim ref now holds another commit than this `start`
-/// read, another machine took or changed the claim meanwhile
-/// ([`taken_meanwhile`]); where it holds none though one was read, the claim
-/// was released meanwhile. Otherwise nothing was claimed, for why the push
-/// applied nothing ([`unapplied_cause`]): exit 3.
+/// Where the claim was lost ([`NotApplied::Lost`]), to a claim commit this
+/// `start` did not read, another machine took or changed the claim meanwhile
+/// ([`taken_meanwhile`]); where to no claim, it was released meanwhile.
+/// Otherwise nothing was claimed, for why the push applied nothing
+/// ([`unapplied_cause`]): exit 3.
 fn lost(
     context: &StartContext<'_>,
     on: &OnLedger<'_>,
     why: &NotApplied,
     failure: &LedgerFailure,
 ) -> Exit {
-    if let NotApplied::Refused { claim, .. } = why {
-        match claim {
-            ClaimSeen::At(now) if Some(now) != on.read.as_ref() => {
-                return taken_meanwhile(context, on);
-            }
-            ClaimSeen::Absent if on.read.is_some() => {
-                eprintln!("{}", released_meanwhile(context.branch, on));
-                return Exit::Incomplete;
-            }
-            _ => {}
+    match why {
+        NotApplied::Lost { now: Some(_) } => taken_meanwhile(context, on),
+        NotApplied::Lost { now: None } => {
+            eprintln!("{}", released_meanwhile(context.branch, on));
+            Exit::Incomplete
+        }
+        NotApplied::MachineRef | NotApplied::Failed => {
+            eprintln!(
+                "nothing was claimed: {}",
+                unwritten(on.shared, &unapplied_cause(on.shared, why, failure))
+            );
+            Exit::Incomplete
         }
     }
-    eprintln!(
-        "nothing was claimed: {}",
-        unwritten(on.shared, &unapplied_cause(on.shared, why, failure))
-    );
-    Exit::Incomplete
 }
 
 /// A lost lease: another machine took or changed the claim between this
@@ -1836,17 +1821,21 @@ fn release_unopened(
         Some(&why),
         None,
     );
-    let outcome = change_on_ledger(on.change(Some(commit), None), &scribe_for(context), &draft);
+    let outcome = change_on_ledger(
+        on.change(Some(commit), ledger_sweep::Released),
+        &scribe_for(context),
+        &draft,
+    );
     eprintln!(
         "knives start could not open the workspace of {branch}: {}",
         problem_human_text(&cause)
     );
     match outcome {
-        ClaimOutcome::Landed { .. } => eprintln!(
+        ClaimOutcome::Landed(()) => eprintln!(
             "its claim is released on the ledger {}, so nothing is claimed",
             on.shared.ledger
         ),
-        ClaimOutcome::NotApplied { failure, .. } | ClaimOutcome::Unknown { failure, .. } => {
+        ClaimOutcome::NotApplied { failure, .. } | ClaimOutcome::Unknown { failure } => {
             eprintln!(
                 "the claim of {branch} is held on the ledger {} with no workspace, since its \
                  release could not be sent ({}): {}; `knives finish {branch}` releases it",

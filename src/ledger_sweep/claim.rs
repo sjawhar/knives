@@ -17,11 +17,11 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use super::kept::keep_discards;
-use super::{Destination, REMOTE, SharedFork, SweepError, Tally, filtered_pending};
+use super::{Destination, REMOTE, SharedFork, Tally, filtered_pending};
 use crate::ids::CommitId;
 use crate::ledger::LedgerError;
 use crate::ledger_git::{
-    self, ClaimPush, ClaimPushed, ClaimRecord, ClaimRef, ClaimSeen, GitError, HeldClaim, Refusal,
+    self, ClaimPush, ClaimPushed, ClaimRecord, ClaimRef, ClaimSeen, HeldClaim, Refusal, Repository,
 };
 use crate::lock::{FileLock, LockWait};
 
@@ -56,24 +56,75 @@ pub fn read_claim(
         .map_err(|error| failed(&error))
 }
 
-/// One change of a claim on a shared fork: a take, a seize, a restate or a
-/// release.
+/// One change of a claim on a shared fork: a take, a seize or a restate,
+/// which `becomes` a [`ClaimRecord`], or a release, which `becomes`
+/// [`Released`].
 #[derive(Debug)]
-pub struct ClaimChange<'a> {
+pub struct ClaimChange<'a, B> {
     pub shared: &'a SharedFork,
     pub claim: &'a ClaimRef,
     /// The claim commit the remote must hold for the change to land, as the
     /// caller read it; `None` for a take, which lands only on no claim.
     pub expected: Option<&'a CommitId>,
-    /// What the claim becomes, its `entry` set here to the file name of the
-    /// entry that records the change; `None` releases it.
-    pub becomes: Option<ClaimRecord>,
+    pub becomes: B,
 }
 
-/// What came of a [`change_claim`].
+/// What a claim becomes in a [`ClaimChange`]: what the claim ref is to
+/// hold, written before the push, and what a change that landed carries.
+pub trait Becomes {
+    /// What a change that landed carries: its claim commit, or nothing.
+    type Landed;
+
+    /// Write what the claim ref is to hold, for the change the entry at
+    /// `entry` records; why not, where it could not be written.
+    fn write(self, repository: &Repository, entry: &Path) -> Result<Self::Landed, String>;
+
+    /// The commit the claim ref is to hold; `None` deletes it.
+    fn commit(landed: &Self::Landed) -> Option<&CommitId>;
+}
+
+/// A take, a seize or a restate: a claim commit of this record, naming the
+/// file name of the entry that records the change.
+impl Becomes for ClaimRecord {
+    type Landed = CommitId;
+
+    fn write(self, repository: &Repository, entry: &Path) -> Result<CommitId, String> {
+        let name = entry.file_name().and_then(OsStr::to_str).ok_or_else(|| {
+            format!(
+                "the entry {} has no file name for a claim commit to name",
+                entry.display()
+            )
+        })?;
+        ledger_git::write_claim(repository, &self, name).map_err(|error| error.to_string())
+    }
+
+    fn commit(landed: &CommitId) -> Option<&CommitId> {
+        Some(landed)
+    }
+}
+
+/// A release: the claim ref goes, and a release that landed carries
+/// nothing.
+#[derive(Debug, Clone, Copy)]
+pub struct Released;
+
+impl Becomes for Released {
+    type Landed = ();
+
+    fn write(self, _: &Repository, _: &Path) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn commit((): &()) -> Option<&CommitId> {
+        None
+    }
+}
+
+/// What came of a [`change_claim`] whose landing carries `L`
+/// ([`Becomes::Landed`]).
 #[derive(Debug)]
-pub struct ClaimChanged {
-    pub outcome: ClaimOutcome,
+pub struct ClaimChanged<L> {
+    pub outcome: ClaimOutcome<L>,
     /// What the commit's check passed over ([`filtered_pending`]), each line
     /// naming the destination, and what could not be put back or kept: to
     /// print as a sweep prints its problems. None of them stopped the change.
@@ -82,14 +133,13 @@ pub struct ClaimChanged {
 
 /// Whether a claim's change reached the ledger's remote.
 #[derive(Debug)]
-pub enum ClaimOutcome {
-    /// The claim ref holds `claim`, or is gone when `claim` is `None`, and
-    /// this machine's ref on the remote carries the entry at `path`, which
-    /// is out of [`crate::ledger::appended`]: no send has it to carry.
-    Landed {
-        claim: Option<CommitId>,
-        path: PathBuf,
-    },
+pub enum ClaimOutcome<L> {
+    /// The claim ref holds what the change made of it, which this carries:
+    /// the claim commit of a take, a seize or a restate, and nothing of a
+    /// release, whose claim ref is gone. This machine's ref on the remote
+    /// carries the entry that records the change, which is out of
+    /// [`crate::ledger::appended`]: no send has it to carry.
+    Landed(L),
     /// The remote applied nothing, and everything here is as before the
     /// change: this machine's ref holds what it held, and the entry is gone
     /// from disk and from [`crate::ledger::appended`].
@@ -99,28 +149,28 @@ pub enum ClaimOutcome {
         failure: LedgerFailure,
     },
     /// The remote may have applied the change or not: this machine's ref
-    /// stays at the commit carrying the entry at `path`, which a later send
-    /// pushes either way. `claim` is the claim ref as read just after.
-    Unknown {
-        claim: ClaimSeen,
-        path: PathBuf,
-        failure: LedgerFailure,
-    },
+    /// stays at the commit carrying the entry, which stays listed in
+    /// [`crate::ledger::appended`], and a later send pushes it either way.
+    Unknown { failure: LedgerFailure },
 }
 
 /// Why a claim's change applied nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotApplied {
-    /// git refused the push ([`Refusal`]). `claim` is what the remote's claim
-    /// ref held just after: another commit than the lease expected means the
-    /// claim was taken or changed while this ran.
-    Refused { refusal: Refusal, claim: ClaimSeen },
-    /// The remote has this machine's ref and this checkout never committed
-    /// as the machine ([`GitError::NotOwn`]): nothing was committed or sent.
-    NotOwn,
-    /// Something here failed before anything was sent: a lock, the entry,
-    /// its commit, or the claim commit.
-    Unsent,
+    /// The claim was lost: git refused the push, and just after it the
+    /// claim ref held `now` (`None`: no claim), not the claim commit the
+    /// change expected. Another machine took, changed or released the claim
+    /// while this ran.
+    Lost { now: Option<CommitId> },
+    /// git refused this machine's ref ([`Refusal::MachineRef`]): another
+    /// machine may be committing under the same name.
+    MachineRef,
+    /// Anything else: git refused the push for another reason, or could not
+    /// reach the remote; the remote has this machine's ref and this checkout
+    /// never committed as the machine; or something here failed before
+    /// anything was sent: a lock, the entry, its commit, or the claim
+    /// commit.
+    Failed,
 }
 
 /// Change a claim on a shared fork as `change` says, with the entry
@@ -135,8 +185,8 @@ pub enum NotApplied {
 /// 2. what is pending is committed to this machine's ref as a sweep commits
 ///    it ([`filtered_pending`]), moving it from P to a new commit N that
 ///    carries the entry;
-/// 3. a take, seize or restate writes the claim commit, its `entry` the
-///    entry's file name;
+/// 3. what the claim becomes is written ([`Becomes::write`]): for a take, a
+///    seize or a restate, the claim commit, naming the entry's file name;
 /// 4. the claim and this machine's ref go in one atomic push, leased on
 ///    `expected` ([`ledger_git::push_claim`]).
 ///
@@ -144,18 +194,21 @@ pub enum NotApplied {
 /// [`crate::ledger::appended`], so the send before the command exits has
 /// nothing of it to look for. Where nothing was applied, this machine's ref
 /// goes back to P and the entry goes ([`ClaimOutcome::NotApplied`]); where
-/// the outcome is unknown, both stay ([`ClaimOutcome::Unknown`]). Whatever
-/// the outcome, the repeated transitions the commit discarded go to the
-/// sweep record, as a sweep's do, so `knives status` still names them.
-pub fn change_claim(
-    change: ClaimChange<'_>,
+/// the outcome is unknown, both stay ([`ClaimOutcome::Unknown`]). Where git
+/// refused the push, whether the claim was lost is judged here, from the
+/// claim ref as read just after it ([`NotApplied::Lost`]), and no caller
+/// judges it again. Whatever the outcome, the repeated transitions the
+/// commit discarded go to the sweep record, as a sweep's do, so `knives
+/// status` still names them.
+pub fn change_claim<B: Becomes>(
+    change: ClaimChange<'_, B>,
     record: impl FnOnce() -> Result<PathBuf, LedgerError>,
-) -> ClaimChanged {
+) -> ClaimChanged<B::Landed> {
     let shared = change.shared;
     let root = shared.root.as_path();
     let unsent = |cause: String| ClaimChanged {
         outcome: ClaimOutcome::NotApplied {
-            why: NotApplied::Unsent,
+            why: NotApplied::Failed,
             failure: LedgerFailure { cause },
         },
         problems: Vec::new(),
@@ -179,13 +232,11 @@ pub fn change_claim(
     let mut tally = Tally::of(&shared.destination);
     let mut problems = Vec::new();
     let outcome = match send(change, &path, &mut tally, &mut problems) {
-        Sent::Landed(claim) => {
+        Sent::Landed(landed) => {
             crate::ledger::forget_appended(&path);
-            ClaimOutcome::Landed { claim, path }
+            ClaimOutcome::Landed(landed)
         }
-        Sent::Unknown { claim, cause } => ClaimOutcome::Unknown {
-            claim,
-            path,
+        Sent::Unknown { cause } => ClaimOutcome::Unknown {
             failure: LedgerFailure { cause },
         },
         Sent::NotApplied { why, cause, moved } => {
@@ -207,9 +258,9 @@ pub fn change_claim(
 type Moved = (Option<CommitId>, CommitId);
 
 /// What [`send`] came to.
-enum Sent {
-    /// Both refs moved; the claim ref holds this commit, or is gone.
-    Landed(Option<CommitId>),
+enum Sent<L> {
+    /// Both refs moved, the claim ref to what the change made of it.
+    Landed(L),
     /// Nothing was applied. `moved`: this machine's ref is still at N, to go
     /// back to P; `None` when it never moved, or the push moved it back.
     NotApplied {
@@ -218,84 +269,83 @@ enum Sent {
         moved: Option<Moved>,
     },
     Unknown {
-        claim: ClaimSeen,
         cause: String,
     },
 }
 
 /// Steps 2 to 4 of [`change_claim`], for the entry at `path`; the problems
 /// the commit's check found go to `problems`, naming the destination.
-fn send(
-    change: ClaimChange<'_>,
+fn send<B: Becomes>(
+    change: ClaimChange<'_, B>,
     path: &Path,
     tally: &mut Tally,
     problems: &mut Vec<String>,
-) -> Sent {
-    let destination = &change.shared.destination;
+) -> Sent<B::Landed> {
+    let ClaimChange {
+        shared,
+        claim,
+        expected,
+        becomes,
+    } = change;
+    let destination = &shared.destination;
     let repository = &destination.repository;
+    let failed = |cause: String, moved: Option<Moved>| Sent::NotApplied {
+        why: NotApplied::Failed,
+        cause,
+        moved,
+    };
     let moved = match commit(destination, path, tally, problems) {
         Ok(moved) => moved,
-        Err((why, cause)) => {
-            return Sent::NotApplied {
-                why,
-                cause,
-                moved: None,
-            };
-        }
+        Err(cause) => return failed(cause, None),
     };
-    let written = change
-        .becomes
-        .map(|mut record| {
-            path.file_name()
-                .and_then(OsStr::to_str)
-                .unwrap_or_default()
-                .clone_into(&mut record.entry);
-            ledger_git::write_claim(repository, &record)
-        })
-        .transpose();
-    let new = match written {
-        Ok(new) => new,
-        Err(error) => {
-            return Sent::NotApplied {
-                why: NotApplied::Unsent,
-                cause: error.to_string(),
-                moved: Some(moved),
-            };
-        }
+    let landed = match becomes.write(repository, path) {
+        Ok(landed) => landed,
+        Err(cause) => return failed(cause, Some(moved)),
     };
     let pushed = ledger_git::push_claim(
         repository,
         &ClaimPush {
             remote: REMOTE,
             machine: &destination.machine,
-            claim: change.claim,
-            expected: change.expected,
-            new: new.as_ref(),
+            claim,
+            expected,
+            new: B::commit(&landed),
             before: moved.0.as_ref(),
             after: &moved.1,
         },
     );
     match pushed {
-        Ok(ClaimPushed::Landed) => Sent::Landed(new),
+        Ok(ClaimPushed::Landed) => Sent::Landed(landed),
         Ok(ClaimPushed::Refused {
             refusal,
-            claim,
+            claim: seen,
             account,
         }) => Sent::NotApplied {
-            why: NotApplied::Refused { refusal, claim },
+            why: why_refused(refusal, seen, expected),
             cause: account,
             moved: None,
         },
-        Ok(ClaimPushed::Unknown { claim, account }) => Sent::Unknown {
-            claim,
-            cause: account,
-        },
+        Ok(ClaimPushed::Unknown { account }) => Sent::Unknown { cause: account },
         // The push may have reached the remote before this failed here (the
         // record of the remote's copy, or the move back of this machine's
         // ref), so nothing is put back.
         Err(error) => Sent::Unknown {
-            claim: ClaimSeen::Unread(error.to_string()),
             cause: error.to_string(),
+        },
+    }
+}
+
+/// Why a push git refused applied nothing: the claim was lost where the
+/// claim ref, as read just after it (`seen`), holds another commit than
+/// `expected`, or none where the change expected one; else the ref git
+/// refused.
+fn why_refused(refusal: Refusal, seen: ClaimSeen, expected: Option<&CommitId>) -> NotApplied {
+    match seen {
+        ClaimSeen::At(now) if Some(&now) != expected => NotApplied::Lost { now: Some(now) },
+        ClaimSeen::Absent if expected.is_some() => NotApplied::Lost { now: None },
+        ClaimSeen::At(_) | ClaimSeen::Absent | ClaimSeen::Unread => match refusal {
+            Refusal::MachineRef => NotApplied::MachineRef,
+            Refusal::Other => NotApplied::Failed,
         },
     }
 }
@@ -304,23 +354,16 @@ fn send(
 /// `destination` as a sweep commits it, which must take in the entry at
 /// `path`; this machine's ref before and after. The problems the commit's
 /// check found go to `problems`, naming the destination. When this fails,
-/// with why and what failed, nothing was sent and this machine's ref has not
-/// moved.
+/// with what failed, nothing was sent and this machine's ref has not moved.
 fn commit(
     destination: &Destination,
     path: &Path,
     tally: &mut Tally,
     problems: &mut Vec<String>,
-) -> Result<Moved, (NotApplied, String)> {
+) -> Result<Moved, String> {
     let repository = &destination.repository;
-    let unsent = |cause: String| (NotApplied::Unsent, cause);
-    let (pending, lines) = match filtered_pending(destination, tally) {
-        Ok(filtered) => filtered,
-        Err(SweepError::Git(error @ GitError::NotOwn { .. })) => {
-            return Err((NotApplied::NotOwn, error.to_string()));
-        }
-        Err(error) => return Err(unsent(error.to_string())),
-    };
+    let (pending, lines) =
+        filtered_pending(destination, tally).map_err(|error| error.to_string())?;
     problems.extend(
         lines
             .into_iter()
@@ -330,17 +373,17 @@ fn commit(
         .relative(path)
         .is_some_and(|relative| pending.added().contains(&relative));
     if !committed {
-        return Err(unsent(format!(
+        return Err(format!(
             "the entry {} is not one {} would commit",
             path.display(),
             destination.describe()
-        )));
+        ));
     }
     let before = pending.previous().cloned();
     match ledger_git::commit_pending(repository, &destination.machine, pending) {
         Ok(Some(after)) => Ok((before, after)),
-        Ok(None) => Err(unsent("there was nothing to commit".to_owned())),
-        Err(error) => Err(unsent(error.to_string())),
+        Ok(None) => Err("there was nothing to commit".to_owned()),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -388,7 +431,6 @@ mod tests {
     use super::*;
     use crate::ids::{BranchName, UpstreamName};
     use crate::ledger::{Draft, Ledger, Scribe};
-    use crate::ledger_git::Repository;
     use crate::ledger_sweep::lab::{self, FORK, at, git};
     use crate::ledger_sweep::shared_fork;
     use crate::store::OwnerKind;
@@ -409,7 +451,6 @@ mod tests {
             started: "2026-11-16T08:00:00Z".to_owned(),
             place: Some("box-one 4026531836".to_owned()),
             machine: machine.to_owned(),
-            entry: String::new(),
         }
     }
 
@@ -467,19 +508,20 @@ mod tests {
         }
 
         /// Change the claim of `claim` as a command does, with an entry of
-        /// its own recording it.
-        fn change(
+        /// its own recording it; what came of it, and that entry.
+        fn change<B: Becomes>(
             &self,
             claim: &ClaimRef,
             expected: Option<&CommitId>,
-            becomes: Option<ClaimRecord>,
-        ) -> ClaimChanged {
+            becomes: B,
+        ) -> (ClaimChanged<B::Landed>, PathBuf) {
             let scribe = Scribe::unanchored(
                 Ledger::at(self.root.join(FORK)),
                 UpstreamName::new(FORK),
                 "owner-one".to_owned(),
             );
-            change_claim(
+            let mut written = None;
+            let changed = change_claim(
                 ClaimChange {
                     shared: &self.shared,
                     claim,
@@ -487,31 +529,28 @@ mod tests {
                     becomes,
                 },
                 || {
-                    scribe
-                        .record_to(&Draft::event(
-                            Some("feat/a"),
-                            "a claim's change".into(),
-                            None,
-                        ))
-                        .map(|(_, path)| path)
+                    let (_, path) = scribe.record_to(&Draft::event(
+                        Some("feat/a"),
+                        "a claim's change".into(),
+                        None,
+                    ))?;
+                    written = Some(path.clone());
+                    Ok(path)
                 },
-            )
+            );
+            (changed, written.unwrap())
         }
 
         /// A take of `branch` by machine one that must land; its claim
         /// commit and entry.
         fn taken(&self, branch: &str) -> (CommitId, PathBuf) {
-            let changed = self.change(
+            let (changed, path) = self.change(
                 &claim_of(branch),
                 None,
-                Some(record(branch, "machine-one", "owner-one")),
+                record(branch, "machine-one", "owner-one"),
             );
             match changed.outcome {
-                ClaimOutcome::Landed {
-                    claim: Some(claim),
-                    path,
-                    ..
-                } => (claim, path),
+                ClaimOutcome::Landed(claim) => (claim, path),
                 other => panic!("the take did not land: {other:?}"),
             }
         }
@@ -525,7 +564,9 @@ mod tests {
                 [UpstreamName::new(FORK)],
             )
             .unwrap();
-            let commit = ledger_git::write_claim(&remote, record).unwrap();
+            let commit =
+                ledger_git::write_claim(&remote, record, "20261116T080000.000000002Z-c3d4.md")
+                    .unwrap();
             git(
                 &self.remote,
                 &["update-ref", claim.as_str(), commit.as_str()],
@@ -547,14 +588,11 @@ mod tests {
         }
     }
 
-    /// The why and the claim seen of a change that must have been refused.
-    fn refused(changed: ClaimChanged) -> (Refusal, ClaimSeen) {
+    /// Why a change that must have applied nothing did not.
+    fn why_not<L: std::fmt::Debug>(changed: ClaimChanged<L>) -> NotApplied {
         match changed.outcome {
-            ClaimOutcome::NotApplied {
-                why: NotApplied::Refused { refusal, claim },
-                ..
-            } => (refusal, claim),
-            other => panic!("not refused: {other:?}"),
+            ClaimOutcome::NotApplied { why, .. } => why,
+            other => panic!("applied, or unknown: {other:?}"),
         }
     }
 
@@ -565,19 +603,12 @@ mod tests {
         let claim = claim_of("feat/a");
 
         // When: it takes the branch.
-        let changed = lab.change(
-            &claim,
-            None,
-            Some(record("feat/a", "machine-one", "owner-one")),
-        );
+        let (changed, path) =
+            lab.change(&claim, None, record("feat/a", "machine-one", "owner-one"));
 
         // Then: it landed, and the claim ref holds its claim commit.
         assert!(changed.problems.is_empty(), "{:?}", changed.problems);
-        let ClaimOutcome::Landed {
-            claim: Some(taken),
-            path,
-        } = changed.outcome
-        else {
+        let ClaimOutcome::Landed(taken) = changed.outcome else {
             panic!("{:?}", changed.outcome);
         };
         assert_eq!(at(&lab.remote, claim.as_str()), Some(taken.clone()));
@@ -593,12 +624,24 @@ mod tests {
             panic!("{entries:?}");
         };
         assert_eq!(entry.text, "a claim's change");
-        // And: the claim commit names that entry, and reads back.
+        // And: the claim commit reads back as the record, and names that
+        // entry.
         let held = read_claim(&lab.shared, &claim).unwrap().unwrap();
-        assert_eq!(held.commit, taken);
         assert_eq!(
-            held.record.unwrap().entry,
-            path.file_name().unwrap().to_str().unwrap()
+            held,
+            HeldClaim {
+                commit: taken.clone(),
+                record: Ok(record("feat/a", "machine-one", "owner-one"))
+            }
+        );
+        let stored: toml::Table = toml::from_str(&git(
+            &lab.remote,
+            &["cat-file", "blob", &format!("{taken}:claim.toml")],
+        ))
+        .unwrap();
+        assert_eq!(
+            stored.get("entry").and_then(toml::Value::as_str),
+            path.file_name().and_then(OsStr::to_str)
         );
     }
 
@@ -613,16 +656,15 @@ mod tests {
         let theirs = lab.held(&claim, &record("feat/a", "machine-two", "owner-two"));
 
         // When: this machine takes the branch, as though it read no claim.
-        let changed = lab.change(
-            &claim,
-            None,
-            Some(record("feat/a", "machine-one", "owner-one")),
-        );
+        let (changed, _) = lab.change(&claim, None, record("feat/a", "machine-one", "owner-one"));
 
-        // Then: it was refused on the lease, and names the claim there now.
-        let (refusal, seen) = refused(changed);
-        assert_eq!(refusal, Refusal::Lease);
-        assert_eq!(seen, ClaimSeen::At(theirs.clone()));
+        // Then: the claim was lost to the claim there now.
+        assert_eq!(
+            why_not(changed),
+            NotApplied::Lost {
+                now: Some(theirs.clone())
+            }
+        );
         // And: the remote is as it was, this machine's ref is back at P, and
         // the entry is gone from disk and from the list, the earlier one
         // staying on disk.
@@ -647,15 +689,12 @@ mod tests {
         let claim = claim_of("feat/a");
 
         // When: this checkout takes the branch.
-        let changed = lab.change(
-            &claim,
-            None,
-            Some(record("feat/a", "machine-one", "owner-one")),
-        );
+        let (changed, _) = lab.change(&claim, None, record("feat/a", "machine-one", "owner-one"));
 
-        // Then: it is refused as not its own, before anything was sent.
+        // Then: it failed before anything was sent, saying the ref is not
+        // its own.
         let ClaimOutcome::NotApplied {
-            why: NotApplied::NotOwn,
+            why: NotApplied::Failed,
             failure,
         } = changed.outcome
         else {
@@ -689,19 +728,14 @@ mod tests {
         assert_eq!(read.commit, theirs);
 
         // When: it seizes the claim, leasing on that commit.
-        let changed = lab.change(
+        let (changed, path) = lab.change(
             &claim,
             Some(&read.commit),
-            Some(record("feat/a", "machine-one", "owner-one")),
+            record("feat/a", "machine-one", "owner-one"),
         );
 
         // Then: the claim is this machine's, with its entry on the remote.
-        let ClaimOutcome::Landed {
-            claim: Some(mine),
-            path,
-            ..
-        } = changed.outcome
-        else {
+        let ClaimOutcome::Landed(mine) = changed.outcome else {
             panic!("{:?}", changed.outcome);
         };
         assert_ne!(mine, theirs);
@@ -719,15 +753,14 @@ mod tests {
         let (taken, _) = lab.taken("feat/a");
 
         // When: it releases the claim, leasing on its commit.
-        let changed = lab.change(&claim, Some(&taken), None);
+        let (changed, path) = lab.change(&claim, Some(&taken), Released);
 
         // Then: the claim ref is gone, and the release's entry was sent.
-        let ClaimOutcome::Landed {
-            claim: None, path, ..
-        } = changed.outcome
-        else {
-            panic!("{:?}", changed.outcome);
-        };
+        assert!(
+            matches!(changed.outcome, ClaimOutcome::Landed(())),
+            "{:?}",
+            changed.outcome
+        );
         assert_eq!(at(&lab.remote, claim.as_str()), None);
         assert!(lab.sent(&path));
         assert_eq!(read_claim(&lab.shared, &claim).unwrap(), None);
@@ -744,12 +777,15 @@ mod tests {
         let theirs = lab.held(&claim, &record("feat/a", "machine-two", "owner-two"));
 
         // When: this machine releases, leasing on its own commit.
-        let changed = lab.change(&claim, Some(&taken), None);
+        let (changed, _) = lab.change(&claim, Some(&taken), Released);
 
-        // Then: the release is refused on the lease, naming the claim there.
-        let (refusal, seen) = refused(changed);
-        assert_eq!(refusal, Refusal::Lease);
-        assert_eq!(seen, ClaimSeen::At(theirs.clone()));
+        // Then: the claim was lost to the claim there now.
+        assert_eq!(
+            why_not(changed),
+            NotApplied::Lost {
+                now: Some(theirs.clone())
+            }
+        );
         // And: nothing was removed on the remote, and here everything is back.
         assert_eq!(at(&lab.remote, claim.as_str()), Some(theirs));
         assert_eq!(at(&lab.remote, MACHINE), Some(before.clone()));
@@ -762,6 +798,32 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn a_seize_of_a_claim_released_meanwhile_is_lost_with_no_claim_there() {
+        // Given: another machine's claim as this machine read it, which that
+        // machine has since released.
+        let lab = Lab::new();
+        let claim = claim_of("feat/a");
+        let theirs = lab.held(&claim, &record("feat/a", "machine-two", "owner-two"));
+        let read = read_claim(&lab.shared, &claim).unwrap().unwrap();
+        assert_eq!(read.commit, theirs);
+        git(&lab.remote, &["update-ref", "-d", claim.as_str()]);
+
+        // When: this machine seizes the claim, leasing on the commit it read.
+        let (changed, path) = lab.change(
+            &claim,
+            Some(&read.commit),
+            record("feat/a", "machine-one", "owner-one"),
+        );
+
+        // Then: the claim was lost, with no claim there now.
+        assert_eq!(why_not(changed), NotApplied::Lost { now: None });
+        // And: the remote holds no claim, and the entry is gone.
+        assert_eq!(at(&lab.remote, claim.as_str()), None);
+        assert!(!path.exists());
+        assert_eq!(listed_under(&lab.root), Vec::<PathBuf>::new());
     }
 
     #[test]
@@ -788,20 +850,15 @@ mod tests {
         let claim = claim_of("feat/a");
 
         // When: this machine takes the branch.
-        let changed = lab.change(
-            &claim,
-            None,
-            Some(record("feat/a", "machine-one", "owner-one")),
-        );
+        let (changed, path) =
+            lab.change(&claim, None, record("feat/a", "machine-one", "owner-one"));
 
         // Then: the outcome is unknown, and the remote holds nothing.
-        let ClaimOutcome::Unknown {
-            claim: seen, path, ..
-        } = changed.outcome
-        else {
-            panic!("{:?}", changed.outcome);
-        };
-        assert_eq!(seen, ClaimSeen::Absent);
+        assert!(
+            matches!(changed.outcome, ClaimOutcome::Unknown { .. }),
+            "{:?}",
+            changed.outcome
+        );
         assert_eq!(git(&lab.remote, &["for-each-ref"]), "");
         // And: this machine's ref stays at the commit carrying the entry,
         // which stays on disk and listed, for a later send.
@@ -831,10 +888,10 @@ mod tests {
         std::fs::write(&broken, "not an entry\n").unwrap();
 
         // When: this machine takes a branch.
-        let changed = lab.change(
+        let (changed, path) = lab.change(
             &claim_of("feat/a"),
             None,
-            Some(record("feat/a", "machine-one", "owner-one")),
+            record("feat/a", "machine-one", "owner-one"),
         );
 
         // Then: the change said so, naming the destination, and went on: the
@@ -846,9 +903,11 @@ mod tests {
             "{:?}",
             changed.problems
         );
-        let ClaimOutcome::Landed { path, .. } = changed.outcome else {
-            panic!("{:?}", changed.outcome);
-        };
+        assert!(
+            matches!(changed.outcome, ClaimOutcome::Landed(_)),
+            "{:?}",
+            changed.outcome
+        );
         assert!(lab.sent(&path));
         assert!(!lab.sent(&broken));
         assert!(broken.is_file());

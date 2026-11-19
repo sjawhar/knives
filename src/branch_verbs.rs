@@ -34,7 +34,7 @@ use knives::ledger::{
     ClaimChange, Displaced, Draft, Entry, LedgerError, Scribe, Stated, default_ledger_root,
     inline_human_text, problem_human_text,
 };
-use knives::ledger_git::{ClaimError, ClaimRef, ClaimSeen, HeldClaim};
+use knives::ledger_git::{ClaimError, ClaimRef, HeldClaim};
 use knives::ledger_sweep::{self, ClaimOutcome, NotApplied, SharedFork};
 use knives::seen::LastSeen;
 use knives::statement::{Statement, StatementKind};
@@ -419,27 +419,15 @@ fn release_on_ledger(
         shared: &ledger.shared,
         claim: &ledger.claim,
         expected: Some(commit),
-        becomes: None,
+        becomes: ledger_sweep::Released,
     };
     let branch = &ledger.target.branch;
     match change_on_ledger(change, scribe, draft) {
-        ClaimOutcome::Landed { .. } => Ok(()),
+        ClaimOutcome::Landed(()) => Ok(()),
         ClaimOutcome::NotApplied {
-            why:
-                NotApplied::Refused {
-                    claim: ClaimSeen::Absent,
-                    ..
-                },
+            why: NotApplied::Lost { .. },
             ..
         } => Err(changed_meanwhile(ledger)),
-        ClaimOutcome::NotApplied {
-            why:
-                NotApplied::Refused {
-                    claim: ClaimSeen::At(now),
-                    ..
-                },
-            ..
-        } if now != *commit => Err(changed_meanwhile(ledger)),
         ClaimOutcome::NotApplied { why, failure } => {
             eprintln!(
                 "nothing was released: {}; run `knives finish {branch}` again",
@@ -450,7 +438,7 @@ fn release_on_ledger(
             );
             Err(Exit::Incomplete)
         }
-        ClaimOutcome::Unknown { failure, .. } => {
+        ClaimOutcome::Unknown { failure } => {
             eprintln!(
                 "the release of the claim of {branch} was pushed to the ledger {} ({}), and \
                  whether it landed is unknown: {}; this machine's state file and the workspace \

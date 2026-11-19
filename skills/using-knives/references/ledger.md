@@ -265,7 +265,7 @@ The record:
 - The ref holds a commit with no parent. Its tree holds one regular file, `claim.toml`.
 - Its keys are `repo` (the upstream name), `branch`, `owner`, `kind` (`harness-session`, `workspace-derived` or `os-user`), `why`, `started` (RFC 3339 UTC), `place` (absent when not recorded), `machine` (the `knives.machine` that took it) and `entry` (the file name of the entry that recorded the change).
 - Author and committer are the machine, with an empty email. The message is `<machine>: claim <repo> <branch>`.
-- A reader ignores a key that it does not know. A commit whose `claim.toml` does not read is still a claim. `start` refuses it with exit `2`, and names the ref, the commit and why the holder cannot be read. `start --force --why` replaces it, and `finish --force --why` deletes it.
+- A reader ignores a key that it does not know. A commit whose `claim.toml` does not read is still a claim, and so is one whose `claim.toml` is larger than 64 KiB, which is not read. `start` refuses it with exit `2`, and names the ref, the commit and why the holder cannot be read. `start --force --why` replaces it, and `finish --force --why` deletes it.
 - The record is in the claim commit, so entries gain no kind and no key, and `ledger-sweep.json` keeps its schema.
 - `state.json` keeps a copy of each ledger claim that this machine took or resumed, with two more keys: `machine` and `ledger_commit` (the claim commit). `status`, the session hook and preflight read the copy, so they list this machine's claims only. The copy decides nothing. Each `start` and `finish` of the branch replaces it with the ledger's claim, or removes it.
 
