@@ -169,6 +169,46 @@ fn pr_view_injects_a_bookmark_that_is_ahead_of_its_remote() {
 }
 
 #[test]
+fn pr_view_injects_a_bookmark_whose_name_jj_quotes() {
+    // Given: the working copy is a bookmarked change whose name, a branch git
+    // takes, jj prints quoted, as a revset must spell it: `"feat/wip-"`.
+    let lab = lab::Lab::new();
+    lab.branch("\"feat/wip-\"", "wip.txt", "wip\n");
+    lab.jj_work(["edit", "\"feat/wip-\""]);
+    assert_eq!(
+        lab.jj_work_output([
+            "log",
+            "-r",
+            "@",
+            "--no-graph",
+            "-T",
+            "local_bookmarks.map(|bookmark| bookmark.name())",
+        ]),
+        "\"feat/wip-\""
+    );
+    let (dir, log) = fake_gh();
+
+    // When: gh pr view has no positional target.
+    let output = knives_cmd(dir.path())
+        .args(["gh", "--", "pr", "view", "--json", "title"])
+        .current_dir(&lab.work)
+        .env("KNIVES_REAL_GH", dir.path().join("gh"))
+        .env("FAKE_GH_LOG", &log)
+        .output()
+        .expect("run knives gh");
+
+    // Then: the bookmark's name itself is injected, without jj's quotes.
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recorded = fs::read_to_string(&log).expect("fake gh ran");
+    let lines: Vec<&str> = recorded.lines().collect();
+    assert_eq!(&lines[..5], &["pr", "view", "feat/wip-", "--json", "title"]);
+}
+
+#[test]
 fn spawn_failure_cleans_up_the_git_wrapper_tempdir() {
     // Given: a bookmarked jj repo and a TMPDIR-local nonexistent real gh.
     let lab = lab::Lab::new();

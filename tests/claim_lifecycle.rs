@@ -17,8 +17,9 @@
 #[path = "common/lab.rs"]
 mod lab;
 
+use knives::ids::WorkspaceName;
 use knives::jj::Repo;
-use lab::{Lab, operation_ids, release_test_home};
+use lab::{Lab, commit_at, operation_ids, release_test_home};
 use serde_json::Value;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
@@ -206,6 +207,138 @@ fn start_resumes_the_same_harness_sessions_claim_without_mutating_it() {
         "events: {}",
         String::from_utf8_lossy(&events.stdout)
     );
+}
+
+/// The workspace names the lab checkout's repository registers, each the
+/// name itself rather than the quoted spelling a revset would need.
+fn registered_workspaces(lab: &Lab) -> Vec<String> {
+    lab.jj_work_output([
+        "--ignore-working-copy",
+        "workspace",
+        "list",
+        "-T",
+        r#"stringify(name) ++ "\n""#,
+    ])
+    .lines()
+    .map(str::to_owned)
+    .collect()
+}
+
+#[test]
+fn a_branch_whose_name_jj_would_quote_starts_resumes_and_finishes() {
+    // jj writes a workspace name that is not a bare revset symbol quoted
+    // (`"feat-a%2Fb"`): a `%`, a non-ASCII letter. Looked up by that
+    // spelling, the workspace `start` had just made was never found, and
+    // `start` failed, leaving its directory behind.
+
+    // Given: a fork that shares no ledger, and branches nobody holds whose
+    // workspace names jj quotes.
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let base = commit_at(&lab, "main@upstream");
+    for (branch, workspace) in [
+        ("feat/a%2Fb", "feat-a%2Fb"),
+        ("feat/100%", "feat-100%"),
+        ("feat/é", "feat-é"),
+    ] {
+        let directory = lab.work.parent().expect("parent").join(workspace);
+
+        // When: the branch is started.
+        let started = tried(
+            &lab,
+            home.path(),
+            "agent-one",
+            &[
+                "--text", "start", branch, "--repo", "demo", "--why", "port it",
+            ],
+        );
+
+        // Then: it exits 0, and its directory is the fork's workspace named
+        // for the branch, registered, with its working copy on the base.
+        assert_eq!(
+            started.status.code(),
+            Some(0),
+            "{branch}: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        assert!(
+            knives::jj::is_workspace_named(&directory, &lab.work, &WorkspaceName::new(workspace)),
+            "{} is not the checkout's workspace {workspace}",
+            directory.display()
+        );
+        assert!(
+            registered_workspaces(&lab)
+                .iter()
+                .any(|name| name == workspace),
+            "{branch}: {:?}",
+            registered_workspaces(&lab)
+        );
+        assert_eq!(lab.revision(&directory, "@-", "commit_id"), base.as_str());
+
+        // And: status shows the workspace on the branch's row.
+        let status = ran(
+            &lab,
+            home.path(),
+            "agent-one",
+            &["--json", "status", "demo", "--no-github", "--no-landed"],
+        );
+        let report: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+        let row = report["branches"]
+            .as_array()
+            .expect("branches")
+            .iter()
+            .find(|row| row["name"] == branch)
+            .unwrap_or_else(|| panic!("no {branch} row: {report}"));
+        assert_eq!(row["workspace"], workspace, "row: {row}");
+
+        // When: it is started again.
+        let names = registered_workspaces(&lab);
+        let change = lab.revision(&directory, "@", "change_id");
+        let resumed = tried(
+            &lab,
+            home.path(),
+            "agent-one",
+            &["--text", "start", branch, "--repo", "demo"],
+        );
+
+        // Then: it resumes that workspace, and makes nothing new.
+        let stdout = String::from_utf8_lossy(&resumed.stdout);
+        assert_eq!(
+            resumed.status.code(),
+            Some(0),
+            "{branch}: {}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        assert!(stdout.contains("resumed"), "{branch}: {stdout}");
+        assert_eq!(registered_workspaces(&lab), names);
+        assert_eq!(lab.revision(&directory, "@", "change_id"), change);
+
+        // When: it is finished.
+        let finished = tried(
+            &lab,
+            home.path(),
+            "agent-one",
+            &["--text", "finish", branch, "--repo", "demo"],
+        );
+
+        // Then: it exits 0, and leaves no workspace directory, no workspace
+        // registration and no claim.
+        assert_eq!(
+            finished.status.code(),
+            Some(0),
+            "{branch}: {}",
+            String::from_utf8_lossy(&finished.stderr)
+        );
+        assert!(!directory.exists(), "{} survived", directory.display());
+        assert!(
+            !registered_workspaces(&lab)
+                .iter()
+                .any(|name| name == workspace),
+            "{branch}: {:?}",
+            registered_workspaces(&lab)
+        );
+        assert_eq!(claim_of(home.path(), branch), Value::Null);
+    }
 }
 
 /// The whole claim on `demo/<branch>` in `home`'s state, or `Value::Null`

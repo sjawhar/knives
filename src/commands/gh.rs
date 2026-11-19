@@ -575,8 +575,10 @@ fn die_no_bookmark() -> ! {
 ///
 /// Names only: rendering the bookmark objects themselves appends jj's status marks
 /// (`feat/x*` for a bookmark ahead of its remote, `feat/x??` for a conflicted one), and
-/// the charset check below would then read a real bookmark as none. Local bookmarks
-/// only: a remote-only `feat/x@origin` on `@` is not a head gh can name.
+/// the charset check below would then read a real bookmark as none. The names come as
+/// JSON: printed as text, jj writes each as a revset must spell it, quoted where its
+/// grammar needs (`"feat/wip-"`), which the check read as no bookmark either. Local
+/// bookmarks only: a remote-only `feat/x@origin` on `@` is not a head gh can name.
 pub(crate) fn current_bookmark(cwd: &Path) -> Option<String> {
     let output = Command::new("jj")
         .current_dir(cwd)
@@ -587,23 +589,19 @@ pub(crate) fn current_bookmark(cwd: &Path) -> Option<String> {
             "@",
             "--no-graph",
             "-T",
-            r#"local_bookmarks.map(|bookmark| bookmark.name()).join(" ")"#,
+            "json(local_bookmarks.map(|bookmark| bookmark.name()))",
         ])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let bookmark = std::str::from_utf8(&output.stdout)
-        .ok()?
-        .split_whitespace()
-        .next()?;
-    bookmark
-        .chars()
-        .all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '/' | '-')
-        })
-        .then(|| bookmark.to_owned())
+    let names: Vec<String> = serde_json::from_slice(&output.stdout).ok()?;
+    let bookmark = names.into_iter().next()?;
+    let safe = bookmark.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '/' | '-')
+    });
+    safe.then_some(bookmark)
 }
 
 /// The `gh pr <subcommand>` this invocation is, skipping flags (shim lines 308-329).

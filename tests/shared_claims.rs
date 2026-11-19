@@ -48,6 +48,10 @@
 //!   and their guard,
 //!   `a_machine_named_by_hand_keeps_its_name_in_a_harness_session`, which
 //!   passes at that commit, as it must;
+//! - this fails too, for a cause of its own: knives read workspace names in
+//!   jj's revset quoting, so it never found the workspace a start of such a
+//!   branch made:
+//!   `a_branch_whose_name_jj_would_quote_is_claimed_on_the_ledger_and_released_by_finish`;
 //! - these pass at both: the two controls,
 //!   R2 `a_push_that_does_not_compare_the_old_value_lets_two_machines_hold_one_branch`
 //!   and R5 `a_claim_shaped_ref_under_refs_knives_fails_the_whole_sweep_naming_its_path`,
@@ -2050,6 +2054,63 @@ fn claim_refs_stay_outside_the_machine_refs_and_another_machine_reads_the_ledger
     assert_eq!(report["outcome"], "swept", "{report}");
     assert!(report.get("problems").is_none(), "{report}");
     assert_eq!(two.entries(), shared.listed("machine-one"));
+}
+
+#[test]
+fn a_branch_whose_name_jj_would_quote_is_claimed_on_the_ledger_and_released_by_finish() {
+    // Given: machine one sharing the lab fork's ledger, and branches nobody
+    // holds whose workspace names jj quotes in a revset (`"feat-a%2Fb"`).
+    let shared = Shared::new();
+    for (branch, reference) in [
+        ("feat/a%2Fb", "refs/knives-claims/acme/demo/feat%2Fa%252Fb"),
+        ("feat/é", "refs/knives-claims/acme/demo/feat%2Fé"),
+    ] {
+        assert_eq!(claim_ref(branch), reference);
+        let workspace = shared.one.workspace(branch);
+
+        // When: owner one starts the branch.
+        let started = shared.one.tried(
+            "owner-one",
+            &[
+                "--text", "start", branch, "--repo", "demo", "--why", "port it",
+            ],
+        );
+
+        // Then: it exits 0, its claim reached the remote under the branch's
+        // claim ref, and its workspace is there.
+        assert_eq!(
+            started.status.code(),
+            Some(0),
+            "{branch}: {}",
+            stderr_of(&started)
+        );
+        assert_eq!(shared.refs("refs/knives-claims/"), [reference]);
+        let held = shared.claim(branch).expect("the claim reached the remote");
+        assert_eq!(held.get("branch"), branch);
+        assert_eq!(held.get("owner"), "owner-one");
+        assert!(
+            workspace.join(".jj").is_dir(),
+            "no workspace at {}",
+            workspace.display()
+        );
+
+        // When: owner one finishes it.
+        let finished = shared
+            .one
+            .tried("owner-one", &["--text", "finish", branch, "--repo", "demo"]);
+
+        // Then: it exits 0, the claim ref is gone from the remote, and the
+        // workspace is gone.
+        assert_eq!(
+            finished.status.code(),
+            Some(0),
+            "{branch}: {}",
+            stderr_of(&finished)
+        );
+        assert_eq!(shared.refs("refs/knives-claims/"), Vec::<String>::new());
+        assert_eq!(shared.one.claim(branch), Value::Null);
+        assert!(!workspace.exists(), "{} survived", workspace.display());
+    }
 }
 
 #[test]
