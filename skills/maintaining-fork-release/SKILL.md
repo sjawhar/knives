@@ -9,17 +9,14 @@ If this skill disagrees with the code, a command's output or its `--help`, follo
 
 You own the requested outcome, not only the dispatched PRs.
 
-- A PR-only request ends at verified PR maintenance. Do not turn it into a release or deployment change.
-- A request to address upstream debt or to make releases good also needs step 5.
+- A PR-only request ends at verified PR maintenance: no release or deployment change. Upstream debt or good releases also need step 5.
 - Obey explicit exclusions, for example "no deployment".
-- `fork-work` governs workspace entry. `using-knives` governs command semantics and flags. `using-jj` governs version control.
+- `fork-work` governs workspace entry, `using-knives` command semantics, `using-jj` version control.
 
 ## 1. Read `knives notch` first
 
-- `knives notch` is the read/write record of this work: decisions, maintainer promises, rejections, release changes and evidence. Read it before you decide, dispatch or repair.
-- There is no separate estate document or Markdown inventory. Do not find or create one. Record new branch and release decisions in `knives notch`.
-- Map the requested repositories through `knives repos` and `~/.config/knives/repos.toml`. The upstream slug is the entry's `upstream` URL without `.git`. It is not the registry name.
-- A project skill can name a library family and its consumer requirements. It does not replace the live records.
+- The notches are the record of this work. There is no separate inventory document; do not make one.
+- Map the requested repositories with `knives repos` and `~/.config/knives/repos.toml`. The upstream slug is the entry's `upstream` URL without `.git`, not the registry name.
 - Read in this order, with names from the output before:
 
   ```sh
@@ -30,144 +27,80 @@ You own the requested outcome, not only the dispatched PRs.
   knives notch <release> --repo <repo>
   knives notch <branch> --repo <repo>
   knives notch --pr <number> --repo <repo>
+  knives notch --verify <subject> --repo <repo>
   ```
 
-- Bare `notch` shows only recent context. Read every relevant branch and release chain in full. `--pr` also finds a PR's former branches.
-- Notes without this workflow's prefixes are valid context. Never discard them.
-- Verify each note's time, anchors and evidence against the current head. A later note can supersede it. A recorded requirement still holds when a later release lost its implementation.
-- Run `knives notch --verify <subject> --repo <repo>` and investigate each discrepancy. An old assertion is not current proof.
-- Read output as the commands print it, with no `--json`, whenever you read it yourself. A field lookup, a saved capture and a JSON final report are still reading it yourself.
-- Use `--json` only when executed code filters, counts or joins it, and keep that consumer with the evidence. `jq .`, a reprint wrapper or a `.json` file name is not such a need. Do not invent a parser step.
-- Save native output unchanged. JSON does not prevent truncation: recover the full capture or page the saved file, and never conclude from an elision.
-- Read upstream contribution files and workflows for current gates. Read project guidance for consumer wiring.
+- Bare `notch` shows only recent context: read each relevant chain in full. `--pr` also finds a PR's former branches.
+- Unprefixed notes are valid context. A later note can supersede one. A recorded requirement still holds when a later release lost its implementation.
+- Read output as printed, without `--json`, whenever you read it yourself. Use `--json` only when executed code filters, counts or joins it. Page a truncated capture in full.
+- Read upstream contribution files and workflows for the gates, and project guidance for consumer wiring.
 
-**Done when:** you know each requested repository's identity, you read its relevant notch chains, and you separate inherited obligations from stale assertions.
+**Done when:** you read each repository's relevant chains and separate inherited obligations from stale assertions.
 
 ## 2. Account for release members and open PRs
 
-- The population is the **union of release members and open PR branches**. Maintain an open PR outside the release. Account for a release member without a PR. Count an overlapping branch once, with both identities.
-- Deduplicate PR aliases by upstream slug and PR number. Identify release-only members by release parent commit.
-- When release parent, branch tip and PR head differ, keep all three in the row. That is a composition gap, not a duplicate.
-- Use current `knives status <repo>`, `knives release --repo <repo> members`, `knives audit <repo>` and `knives consumers <repo>`. Reconcile the open-head discrepancies of the audit before you claim full coverage.
-- Read a member's notch chain before you classify it. A merged or closed PR does not prove that a release no longer needs its delta.
-- `status` exit 1 means findings. Exit 3 or `problems` means unanswered data. A missing checkout, forge, record or page is not zero work. Keep counts provisional, investigate that source, and continue on complete repositories.
-- A search result corroborates. It does not replace the registry and release membership.
+- The population is the union of release members and open PR branches. Count an overlapping branch once, with both identities. Match PRs by upstream slug and number, release-only members by parent commit.
+- When release parent, branch tip and PR head differ, keep all three in the row: a composition gap, not a duplicate.
+- Use `knives status`, `knives release members`, `knives audit` and `knives consumers` for each repo. Reconcile the audit's open-head discrepancies before you claim full coverage.
+- A merged or closed PR does not prove that a release no longer needs its delta.
+- Exit `3`, `problems`, or a missing checkout, forge, record or page is not zero work: keep counts provisional and investigate.
 - List repositories outside the requested set once. Do not dispatch them.
-- Make one scratch directory, `~/.cache/knives-sweep/<unique-run>/`, never in a workspace or `/tmp`. Use a run-unique suffix, not only the date. Make `<repo>/pr-<number>/` per PR and `<repo>/release/`.
-- Save pre/post output, diffs, drafts and gate logs there in native formats. Name the paths in dispatches and reports. Scratch is working material. Notches and published PRs are the record.
+- Keep scratch in `~/.cache/knives-sweep/<unique-run>/<repo>/pr-<number>/` and `.../<repo>/release/`, never in a workspace or `/tmp`. Save outputs, diffs, drafts and gate logs there unchanged, and name the paths.
 - The report starts: `Population: <p> open PRs and <r> release-only members, <u> distinct work items across <n> requested forks; coverage complete|incomplete (<timestamp>)`. Name every incomplete source.
-- A PR-only report labels release-only items as outside its repair scope. It does not claim them verified.
 
-**Done when:** you account for every union member, every count cites saved output, and each missing observation is explicit.
+**Done when:** every union member is accounted for and each count cites saved output.
 
 ## 3. Dispatch one owner per PR
 
-- Give each PR one `maintaining-fork-pr` owner, end to end. Keep at most eight owners active, and dispatch at most eight at a time.
-- See each start's claim or refusal before the next batch. Claim-lock waits are normal. Free the slot on handback, but stay responsible for the PR until merge or reassignment.
-- **Owners and the step 4 reviewers run on a strong model, never the default fast tier**. A fast model works the steps as a checklist: it posts replies nobody needed and reopens settled threads and decisions.
-- Before the first dispatch, find the model of the generic task agent. If it is fast, select a strong agent or model override and name it in the dispatch record. Only read-only recon that an owner judges again can use a fast tier.
-- Respect a claim held outside this sweep. Report its `why` text and continue other work. A quiet `seen` field does not prove the holder died.
-- If an owner stops, find its state through coordination and its claim and workspace. Then use the supported claim-recovery procedure. Never force a claim or restore the shared jj operation log.
+- Give each PR one `maintaining-fork-pr` owner, at most eight active. See each start's claim or refusal before the next batch. The PR stays yours until merge or reassignment.
+- Run owners and their reviewers on a strong model, not a fast tier, which works the steps as a checklist.
+- A claim held outside this sweep: report its `why` and continue. A quiet `seen` does not prove the holder died. Never force a claim or restore the jj operation log.
+- Read [references/owners.md](references/owners.md) before you dispatch an owner: what each dispatch holds.
 
-Each dispatch holds, in order:
+Release-only members are yours, with the same claim, evidence and independent review as an owner's PR:
 
-1. The whole shipped `maintaining-fork-pr` skill, its `references/` files included.
-2. Registry name, upstream slug, PR number and URL, branch, and its current status row as captured. For a release-member branch, also the member row and parent commit. The owner gets the PR head from the forge. It reports original PR head, expected branch/bookmark head and candidate head as separate revisions.
-3. The relevant `knives notch` history: promises, decisions, membership evidence and open obligations. Give full entries or a readable saved path, never your summary. The owner refreshes it before it acts.
-4. Upstream and project guidance with source paths, and recorded publication constraints. The owner derives the gates from current repository files. Also the registry's configured `forbidden` terms and outbound-prose rules. If none are configured, say so and invent none. An empty list is not a privacy waiver.
-5. The whole shipped `pr-preflight` skill, your reviewer-relay address and the per-PR scratch path.
-6. The branch's `placement:` notch, or a statement that none exists. Before you dispatch upstream-bound work that you propose, complete the challenge in `fork-work`.
+- Claim a named branch before anyone edits it. An anonymous member (a release parent no branch names) gets no new branch.
+- Before any drop, read [references/drop-sweep.md](references/drop-sweep.md) and follow it.
+- Classify with evidence (supplied upstream, proposed upstream, downstream configuration, obsolete) in `knives notch <branch> -m ... --evidence ...`, or on the release for an anonymous member.
+- Invent no PRs. Do not include an open PR in a release automatically.
 
-Release-only members:
-
-- Handle them yourself with the same claim, evidence and independent-review discipline. Do not invent PR numbers or open PRs to fill the inventory.
-- Claim a named branch before anyone edits it. Carry, drop or classify an anonymous member (a release parent no branch names) from release evidence and notches. Do not make a branch for it. Before a drop, follow [references/drop-sweep.md](references/drop-sweep.md).
-- Give a bounded branch implementation to one owner only when the requested scope authorizes it.
-- Classify with evidence: supplied upstream, still proposed upstream, downstream configuration, or obsolete. Record reason and disposition with `knives notch <branch> -m ... --evidence ...`, or on the release or repo subject for an anonymous member.
-- Do not include an open PR in a release automatically. A branch with no upstream PR yet still needs one.
-
-**Done when:** each open PR has one owner or a named blocker. Each release-only item has an owner or a disposition that fits the scope.
+**Done when:** each open PR has an owner or a named blocker, and each release-only item an owner or a disposition.
 
 ## 4. Review, record and coordinate integration
 
-### Reviewer relay
+- When an owner sends a packet, a handback or a `decision:`, read [references/owners.md](references/owners.md): the relay checks, accepted dispositions, and which questions reach the human.
+- The claim holder writes the branch. A lone branch's rebase follows `fork-work`. A release-member rebase is yours.
+- Before a release-wide write (a release rebase, a `rehome needed` handback, a hand resolution on the release commit), read [references/release-wide-writes.md](references/release-wide-writes.md): the claim barrier, the per-member checks and the `adopt` record.
+- A stacked series (`stacked = true`): read `using-knives`' stacked-series reference (`references/stacked-series.md`).
+- Record a release composed outside knives with `knives release cut <release> --at <commit>`: `using-knives`' hand-cut reference (`references/hand-cut.md`).
 
-- When an owner sends its packet path, verify its repo/PR identity, original PR head, expected head and candidate head against the dispatch.
-- Send a packet back to recon when it has no `placement:` notch or uses approval or tests in place of evidence.
-- Send it back when its PR evidence is a first page or truncated. Comments, reviews, threads, CI runs and workflow runs must be complete for the judged head. A `null` thread count, elided output or `first:100` with more pages is incomplete.
-- Dispatch the reviewers `maintaining-fork-pr` step 6 names, each fresh and each with the packet unedited. The fresh-context reviewer's verdict is `PASS (no repairs)`, `PASS per fix (k/k)` or `FAIL: fix|body|drift|placement`, with evidence for each question.
-- Each reviewer examines the **whole PR diff**, not only the owner's findings, even when recon found nothing.
-- Relay each verdict verbatim within 20 minutes. Do not use your judgment in its place or soften a FAIL. Send a malformed verdict back to the reviewer.
-- After 30 minutes, the owner records `handback: reviewer verdict outstanding; repair commits <ids>; bookmark not moved` and hands back. Then the verdict is your work, not the human's. Get it and resume the owner at verification, with its original, expected and candidate revisions.
-
-### Notches are the handback record
-
-- Read each owner's records yourself: `knives notch <branch> --repo <repo>` and `knives status <repo>`.
-- New entries use `placement:`, `recon:`, `rehome:`, `repair:`, `record:`, `verify:`, `decision:` and `handback:`, each with `--evidence`. Read older formats too.
-- `handback:` and a released claim end the worker's ownership, not the task.
-- Accept a thread disposition only with evidence: `-> <commit>`, `declined: <reason>` or `already answered <reply-url>`.
-- Record open promises with the reply URL. Do not count them as done. Verify that new replies are published before you report them as addressed.
-
-### Decisions that reach the human
-
-You are the last filter before a question reaches the maintainer of record. Before you forward an owner's `decision:`:
-
-- Read the whole chain of the branch. If an earlier note answers it, write a `decision:` notch that quotes that note and re-dispatch the owner with the answer. Never show the human the question.
-- Read the maintainer's words, not the owner's summary. Quote the ask when you show it to the human.
-- Bring a position: the quoted ask, the record, what you would do and why, and what changes under the alternative. Use the repository's terms and expand every identifier on first use.
-- A design or scope question goes to the human only when it needs authority you lack. Examples: money, an upstream commitment, or removal of what the human asked for. Missing confidence is your work.
-- Record the ruling as a `decision:` notch on the branch, with its full reasoning. When the ruling sets a standing rule, record it also with `knives notch --repo <repo>`, which every dispatch reads.
-
-### Single writer and release-wide changes
-
-- The claim holder writes the branch. Owners add repair commits and never rewrite shared ancestry. A lone branch's rebase follows `fork-work`. A release-member rebase is yours.
-- The release claim is the write lease for release refs and release-wide changes. It does not let you push an owner's PR head.
-- Before a release-wide write, stop admitting owners for that repo and wait until **every affected member claim is released**. Hold the release claim while you integrate. Verify again just before the write that no claim exists. If a new external claim appears, back off. Other repositories continue.
-- Select the rebase target from the need: `knives release --repo <repo> rebase [<target>]`. Bare rebase uses the merged-PR target and can need an explicit one. Record `rehome:` with the target and resulting release commit.
-- Exit 0 is not sufficient. Verify that each affected member is on the target, kept its patch and has no conflicts. Use `knives release --repo <repo> members <release> --verify`. A member still on the old base is unresolved work.
-- Also run `jj -R <checkout> --ignore-working-copy log -r '<target> ~ ::<member-commit>' --no-graph` per member. Empty output means the target is an ancestor. Content carriage does not prove that each member moved.
-- **A member with no conflict left is not yet a member that works**. At each rebased tip, conflicted or clean, run the type checker and its own tests. Audit the new trunk call sites against what the member changed. Repair a break on the member, not the release commit. Then call the rehome resolved.
-- A fork whose releases each build on the previous release, such as a frozen version line, uses a **stacked series** (`stacked = true` on the series in the registry). Each release is then one merge of the previous release and its new members. Cut the next name on the published previous release, then `include` each member; a member can be built on the previous release. `knives release rebase` refuses in such a series, because there is no base to move: rebase the member by hand, then `advance` it. `adopt` counts only the members' lines, so a member's deletion of the previous release's lines is no lost line. The reap forgets the previous release's name and keeps its commit. Read `using-knives`, releases reference, "Stacked series", before you work on such a series.
-- knives writes one resolution itself at every release write: the union of `CHANGELOG.md` and `RELEASE_NOTES.md` where each member only inserted its own block. A block with no newline after its last line is unioned only where it ends the file. Every other release conflict, a renumber of two blocks that claim one version, and a repair of the composition are yours, on the release commit.
-- Record each such hand change with `knives release adopt <release>` before the next release write. Add `--why` for a change outside the conflicted paths. `cut`, `include`, `drop`, `advance` and `rebase` refuse until then, and each refusal names the command. `adopt` exits `1` only when it measured against a recorded write, never against a fresh merge, and found a member's added line lost from a file the baseline left without a conflict that is not a release log, or none of a member's blocks left in a release log or a conflicted file; a block cut down there is reported and exits `0`. Read its counts either way: a heading line that you renumbered is expected, and any other missing line is a lost change to repair.
-- A release that a person or a script composed outside knives, such as a compose script's chain of merges, has no recorded write, so `adopt` has nothing to replace. Record it as its name's cut with `knives release cut <release> --at <commit>`, which makes no commit, before any other write. Record the older name first: the name must sort after every other release of the series. A chain records only in a stacked series. `using-knives`, releases reference, "`knives release cut NAME --at REV`", has the gates.
-- When `adopt` says that the release's members differ from every recorded write, the membership changed outside knives. Follow its remedy: make the change with `knives release include`, `drop` or `advance` (for a member added by hand, drop it, then include it). That write records the new composition, marked unchecked. Then run `knives release adopt <release>` to end the mark (`using-knives`, releases reference, "When knives cannot check the release in hand").
-- When a refusal says that the release is published, so a hand edit cannot be recorded under it, follow the published remedy that it prints, step by step and in its order. Its new dated cut can exit `1` once, as expected (`using-knives`, releases reference, "The published remedy").
-- Resume verification for **all affected PR heads**. Never push a rewritten head without its claim and fresh verification. Keep its original, expected and candidate heads separate in the re-dispatch.
-- If an external actor moves a branch under an owner, inspect the content from old to new. You can rule on trunk-only movement: record the original head, the new head and the reparented candidate commits. Then the owner reviews and tests again before it pushes.
-- A conflict with the user's intent needs a real decision. Never use a verdict again for a different tree.
-
-**Done when:** each packet has a verdict, each handback agrees with notches and current state, and each integration change has one owner and preserved-content evidence.
+**Done when:** each packet has a verdict, each handback agrees with notches and current state, and each integration change has preserved-content evidence.
 
 ## 5. Finish release and consumer verification
 
-Do this step when the request includes releases, upstream debt or consumption. PR-only scope does not authorize release edits or deployment.
+Do this step when the request includes releases, upstream debt or consumption.
 
-Read and follow [references/release-and-consumers.md](references/release-and-consumers.md) whenever you do this step. Its five steps (reconcile intended content, compose the intended release, verify the composed candidate, verify the consumer chain, publish and consume deliberately) each hold checks that a release skipping them ships without.
+- Classify each member in the release notch before you compose it:
+  - `upstream-PR <url>`: an open or merged upstream PR carries it.
+  - `upstream-pending, placement <notch anchor or commit>`: its `placement:` notch and commit body record the UPSTREAM verdict, the defect or gap, and the reproduction or red→green test its upstream PR opens from.
+  - `neither`: drop it or return it to its author. Never compose it.
+- A classification is disclosure, not a gate: an `upstream-pending` member ships when the release is gated and published.
+- Read [references/release-and-consumers.md](references/release-and-consumers.md) whenever you do this step, and do its five stages in order.
+- An external prerequisite blocks publication or consumption: record the exact blocker and report the stage **blocked**.
+- Decide membership, naming, rehome and compatible repairs yourself. Ask the human only for missing authority, a change of direction or a conflict with stated intent.
 
-When a real external prerequisite blocks publication or consumption, finish other work, record the exact blocker and report the stage **blocked**. Do not report it ready with a follow-up.
-
-Decide ordinary membership, naming, rehome and compatible-repair questions from evidence and earlier notches. Ask the human only for missing authority, a change in direction, or a conflict with stated intent.
-
-**Done when:** intended content is verified in the release and at the requested consumer or runtime boundary, or you report that boundary blocked with evidence. A PR push alone cannot finish this step.
+**Done when:** intended content is verified in the release and at the requested consumer or runtime boundary, or that boundary is reported blocked with evidence.
 
 ## 6. Report verified outcomes
 
-- Build the report from saved observations and `knives notch` chains. Refresh the population for PRs that moved or merged. Reconcile them, and never lose a row.
-- Every original item keeps a disposition. Account for every new in-scope obligation.
-- Per PR: maintainer asks, each repair or disposition with evidence, verification on the exact head, unresolved threads, remaining forbidden hits with reasons, real blockers.
-- Per release-only member: owner or disposition, carriage evidence and verification. Do not pretend a PR review occurred.
-- Per release: intended composition, candidate/published/consumed revisions, absolute capability and runtime evidence, and any unmet boundary.
-- Use separate statuses: **accounted for**, **verified**, **published**, **consumed**, **blocked**. A handback or full inventory proves only accounting. A decision note is not a repair.
-- Never report a skipped gate, an unstarted workflow or a unit suite as end-to-end verification.
+- Build the report from saved observations and notches. Refresh the population for PRs that moved or merged; never lose a row or an original item's disposition.
+- Statuses stay separate: **accounted for**, **verified**, **published**, **consumed**, **blocked**. A handback proves only accounting. A skipped gate or a unit suite is not end-to-end verification.
 - Each cell cites a notch or saved observation:
 
-  `<repo>#<n>: CI <head-specific run conclusions/pending> / review comments <unresolved, dispositions> / review <fresh-context verdict> / e2e <actual surface evidence or not run> / forbidden <remaining hits>`
+  `<repo>#<n>: CI <head-specific run conclusions/pending> / review comments <unresolved, dispositions> / review <fresh-context verdict> / e2e <surface evidence or not run> / forbidden <remaining hits>`
 
   `<repo>/<release>: composition <verified|blocked> / published <revision|not published> / consumers <resolved revisions|blocked> / runtime <evidence|not run>`
 
-- Pending executable CI stays yours after handback. Watch it with a real background watcher or event subscription, and repair failures before you call the PR verified.
-- Approval-gated `action_required` stays **unrun**. Reproduce the job locally and state the limit. Never ask maintainers to approve workflows.
-- Continue other work while an item waits. Upstream PRs stay yours after handback. Release verification does not wait for an upstream merge.
-- Do not open unsolicited PRs or issues, go around credential gates, or change shared or global configuration to make a gate green.
-- Evidence and the requested boundary decide completion, not the number of handbacks.
+- A release-only member row gives its owner or disposition, carriage and verification, with no claimed PR review.
+- Pending CI stays yours after handback: watch it with a background watcher and repair failures. Approval-gated `action_required` stays **unrun**: reproduce the job locally. Do not ask maintainers to approve workflows.
+- Do not open unsolicited PRs or issues, go around credential gates, or change shared configuration to make a gate green.
