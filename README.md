@@ -108,22 +108,32 @@ ledger belongs to (`ledger = "<owner>/<name>"`), and a git directory over the le
 repository as its `origin` and names this machine (`knives.machine`): the root's own `.git`, or
 one in `~/.config/knives/ledger-repositories/`, one per repository the ledgers travel through.
 Where no git directory has that `origin`, knives makes one in `ledger-repositories/` the first
-time it needs one, and says so on stderr. Every write sends its entries before the command exits:
-it commits them to the machine's own ref, pulls every other machine's, and pushes. A write whose
-entries did not reach the ledger names the ledger and exits `3`. The entries stay on the machine,
-and `knives ledger sweep` sends them. One sweep or send runs at a time, each waits for
-the one already running, and nothing ever rebases. A command that decides from the ledger
-(`status`, `sync`, `audit`, `pushed`, the release plan, cut and edits, `release members` without
-a `REF`) pulls it first, and says so in its problems when it cannot.
+time it needs one, and says so on stderr. Every write sends its entries once it has decided,
+before the command exits: it commits them to the machine's own ref, pulls every other machine's,
+and pushes. A write whose entries did not reach the ledger, a `knives notch` note among them,
+exits `3` after one line per fork:
+
+```
+<fork>: <n> ledger entries this command wrote did not reach the ledger <ledger> (<git dir>): <cause>; `knives ledger sweep` sends them
+```
+
+The entries stay on the machine, and `knives ledger sweep` sends them. One sweep or send runs at a
+time: each waits up to a minute for `ledger.lock`, beside the ledger root, while another holds it.
+A sweep passes over every git directory until a pass finds nothing new, and nothing ever rebases.
+`ledger-sweep.log`, beside `ledger.lock`, holds the problems of the last sweep or send, and exists
+only while it failed. A command that decides from the ledger (`status`, `sync`, `audit`, `pushed`,
+the release plan, cut and edits, `release members` without a `REF`) pulls it first, and says so in
+its problems when it cannot pull it, or cannot join it.
 When two machines both sync after one merge, the second does not record it again; only two that
 each commit it before either pulls keep both.
 
 On such a fork, a branch's claim is a ref on the ledger's repository, so it holds on every machine
-that shares the ledger and runs a knives that reads claim refs. `start` and `finish` read it before
-they decide, and change it in one push with the entry that records the change. When they cannot
-read it or push the change, they exit `3`: `start` records no claim and opens no workspace, and
-`finish` leaves the state file and the workspace as they were. The `using-knives` skill's ledger
-reference has the setup, and its shared-claims reference the claim refs.
+that shares the ledger and runs a knives that reads claim refs. `start` and `finish` pull no
+ledger, but they read the claim before they decide, and change it in one push with the entry that
+records the change. When they cannot read it or push the change, they exit `3`: `start` records no
+claim and opens no workspace, and `finish` leaves the state file and the workspace as they were.
+The `using-knives` skill's ledger reference has the setup, and
+[docs/shared-claims.md](docs/shared-claims.md) describes the claim refs.
 
 An older knives kept branch statements in `state.json` and filed each fork's ledger under its
 registry key. This one refuses such a state file or ledger, naming `knives ledger migrate`, which
