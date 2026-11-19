@@ -2001,6 +2001,75 @@ fn a_non_fast_forward_push_names_a_machine_name_collision() {
 }
 
 #[test]
+fn an_entry_a_name_collision_left_unsent_reaches_the_remote_after_the_rename_it_names() {
+    // Given: two config homes committing as one machine name, `duplicate`.
+    // The first pushed its ref; the second took that ref up, as a join of
+    // the same session takes up its own ref, and pushed on top of it.
+    let first = a_repo_home();
+    let second = a_repo_home();
+    let (_remote_dir, remote) = lab::bare_remote();
+    let first_root = share(first.path(), "duplicate", &remote);
+    let second_root = share(second.path(), "duplicate", &remote);
+    append(&first_root, "acme/a-repo", 1);
+    let (code, report) = sweep_report(first.path());
+    assert_eq!(code, Some(0), "{report}");
+    lab::git_output(
+        &second_root,
+        [
+            "fetch",
+            "--quiet",
+            remote.to_str().expect("utf-8"),
+            "refs/knives/duplicate:refs/knives/duplicate",
+        ],
+    );
+    append(&second_root, "acme/a-repo", 1);
+    let (code, report) = sweep_report(second.path());
+    assert_eq!(code, Some(0), "{report}");
+
+    // When: the first writes again, its push is refused as a name
+    // collision, and the first is renamed as that refusal says.
+    let entries = |root: &Path| -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(root.join("acme/a-repo"))
+            .expect("read the fork's entries")
+            .map(|dirent| {
+                format!(
+                    "acme/a-repo/{}",
+                    dirent.expect("an entry").file_name().to_string_lossy()
+                )
+            })
+            .filter(|path| lab::is_entry(path))
+            .collect()
+    };
+    let before = entries(&first_root);
+    append(&first_root, "acme/a-repo", 1);
+    let refused: Vec<String> = entries(&first_root).difference(&before).cloned().collect();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    let (code, report) = sweep_report(first.path());
+    assert_eq!(code, Some(3), "{report}");
+    assert!(
+        problems_of(&report).contains("give each machine a unique knives.machine"),
+        "{report}"
+    );
+    lab::git_output(&first_root, ["config", "knives.machine", "renamed"]);
+    let (code, report) = sweep_report(first.path());
+
+    // Then: that sweep sends the entry the refused push left, under the
+    // new name, and leaves nothing unsent: a write that did not reach the
+    // ledger can be sent again, by the remedy knives itself gives.
+    assert_eq!(code, Some(0), "{report}");
+    assert_eq!(report["destinations"][0]["unsent"], 0, "{report}");
+    let on_remote: Vec<String> = listed_on(&remote, "duplicate")
+        .into_iter()
+        .chain(listed_on(&remote, "renamed"))
+        .collect();
+    assert!(
+        on_remote.contains(&refused[0]),
+        "{} is on no ref of the remote: {on_remote:?}",
+        refused[0]
+    );
+}
+
+#[test]
 fn a_peer_ref_that_moved_backward_keeps_out_only_that_machines_entries() {
     // Given: three machines sharing one ledger remote. beta has fetched
     // gamma's ref at its second commit, and then the remote's copy of
