@@ -1958,6 +1958,62 @@ fn a_branch_no_claim_ref_can_name_is_refused_before_the_ledger_is_joined() {
 }
 
 #[test]
+fn a_branch_whose_whole_claim_ref_passes_255_bytes_is_refused_before_the_ledger_is_joined() {
+    // Given: a machine whose registry shares the lab fork's ledger, with no
+    // ledger git directory, whose git reaches the ledger's repository
+    // through the URL rule its session hands it, and a branch whose claim
+    // ref's last component, `feat%2F` and 220 bytes more, is 227 bytes:
+    // within the 255 a ref component may hold, while the whole claim ref is
+    // 256 bytes. GitHub refuses every ref longer than 255 bytes ("GH005:
+    // Sorry, refs longer than 255 bytes are not allowed"), so no claim of
+    // this branch could ever be taken there, and a push of it fails on
+    // every try.
+    let lab = forge_lab();
+    let (_remote_root, remote) = lab::bare_remote();
+    let one = Machine::on_lab(&lab, "machine-one", Ledger::Unjoined);
+    let branch = format!("feat/{}", "a".repeat(220));
+    assert_eq!(claim_ref(&branch).len(), 256);
+
+    // When: owner one starts it.
+    let refused = one.tried_joining(
+        &remote,
+        "owner-one",
+        &[
+            "--text", "start", &branch, "--repo", "demo", "--why", "port it",
+        ],
+    );
+
+    // Then: it is refused with exit 2, as a branch no claim ref can name,
+    // and wrote nothing: no git directory joining the ledger, no claim here
+    // or on the remote, no entry, no workspace.
+    let stderr = stderr_of(&refused);
+    assert_eq!(refused.status.code(), Some(2), "{stderr}");
+    assert!(
+        !one.home.path().join("ledger-repositories").exists(),
+        "{stderr}"
+    );
+    assert_eq!(one.claim(&branch), Value::Null);
+    assert!(claim_on(&remote, &branch).is_none(), "{stderr}");
+    assert_eq!(one.entries(), Vec::<String>::new());
+    assert!(!one.workspace(&branch).exists());
+
+    // And: one byte shorter, the whole claim ref is 255 bytes, which GitHub
+    // holds, so that branch is taken and its claim reaches the remote.
+    let longest = format!("feat/{}", "a".repeat(219));
+    assert_eq!(claim_ref(&longest).len(), 255);
+    let taken = one.tried_joining(
+        &remote,
+        "owner-one",
+        &[
+            "--text", "start", &longest, "--repo", "demo", "--why", "port it",
+        ],
+    );
+    assert_eq!(taken.status.code(), Some(0), "{}", stderr_of(&taken));
+    let held = claim_on(&remote, &longest).expect("the claim reached the remote");
+    assert_eq!(held.get("owner"), "owner-one");
+}
+
+#[test]
 fn claim_refs_stay_outside_the_machine_refs_and_another_machine_reads_the_ledger() {
     // Given: owner one's claim of a branch, taken on machine one.
     let shared = Shared::new();
