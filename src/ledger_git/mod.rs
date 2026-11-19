@@ -49,6 +49,13 @@ use tree::{
 const OWN: &str = "refs/knives/";
 /// Where a fetch leaves every machine's ref: `refs/knives-remotes/<remote>/<machine>`.
 const FETCHED: &str = "refs/knives-remotes/";
+/// The longest, in bytes, a ref this machine pushes to a ledger's remote may
+/// be, all of it: its own ref and each claim ref. GitHub, where a ledger's
+/// repository is kept, refuses every longer ref ("refs longer than 255 bytes
+/// are not allowed"), so a push of one would fail on every try. A ref's last
+/// component, a strict part of it, is then shorter than the 255 bytes a file
+/// name may hold, as its loose ref's file must be.
+const MAX_REF: usize = 255;
 
 /// One machine's ref as a fetch found it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,6 +292,12 @@ pub enum GitError {
         "refusing {role} name {name:?}: it must be one git ref name component, with no `/` and no leading `-`"
     )]
     Name { role: &'static str, name: String },
+    #[error(
+        "refusing machine name {name:?}: its ref, refs/knives/<machine>, would be {bytes} bytes, \
+         more than the {} a ref may be on the ledger's remote",
+        MAX_REF
+    )]
+    MachineRefTooLong { name: String, bytes: usize },
     #[error(
         "refusing fork name {name:?}: it must be two directory names in the ledger root, \
          <owner>/<name>, neither of them .git"
@@ -930,9 +943,17 @@ fn occupant(repository: &Repository, relative: &Path) -> Result<Occupant, GitErr
     }
 }
 
-/// `refs/knives/<machine>`, for a machine name that spells exactly that ref.
-fn own_ref(machine: &str) -> Result<String, GitError> {
-    Ok(format!("{OWN}{}", ref_component("machine", machine)?))
+/// `refs/knives/<machine>`, for a machine name that spells exactly that ref,
+/// in no more than [`MAX_REF`] bytes: a longer one could never be pushed.
+pub(crate) fn own_ref(machine: &str) -> Result<String, GitError> {
+    let reference = format!("{OWN}{}", ref_component("machine", machine)?);
+    if reference.len() > MAX_REF {
+        return Err(GitError::MachineRefTooLong {
+            name: machine.to_owned(),
+            bytes: reference.len(),
+        });
+    }
+    Ok(reference)
 }
 
 /// `name` when it can stand as exactly one component of a ref name.
@@ -1066,6 +1087,22 @@ mod tests {
                 "{name:?} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn a_machine_whose_ref_passes_255_bytes_is_refused() {
+        // Given: `refs/knives/` is 12 bytes, so 243 are left for the name.
+        let longest = "a".repeat(243);
+
+        // Then: a machine whose ref is 255 bytes has it.
+        let reference = own_ref(&longest).unwrap();
+        assert_eq!(reference, format!("refs/knives/{longest}"));
+        assert_eq!(reference.len(), 255);
+        // And: one byte more is refused, naming the 256 its ref would be.
+        assert!(matches!(
+            own_ref(&"a".repeat(244)),
+            Err(GitError::MachineRefTooLong { bytes: 256, .. })
+        ));
     }
 
     #[test]

@@ -205,7 +205,8 @@ struct Identity {
 /// [`Identity`] of the git directory `git_dir`.
 ///
 /// Refused, with the command that fixes it: a machine name that cannot spell
-/// this machine's ref (`refs/knives/<machine>`) as one component, found
+/// this machine's ref (`refs/knives/<machine>`) as one component, or spells
+/// one longer than the ledger's remote holds ([`ledger_git::own_ref`]), found
 /// otherwise only when a sweep commits and failing there instead. Any other
 /// `knives.*` key is one a newer knives may read: it is reported and passed
 /// over, since machines sharing a ledger, and sessions on one machine, run
@@ -225,7 +226,7 @@ fn identity(git_dir: &Path) -> Result<Identity, SweepError> {
     for (key, value) in ledger_git::local_config(git_dir, &pattern)? {
         match key.as_str() {
             "knives.machine" => {
-                if let Err(error) = ledger_git::ref_component("machine", &value) {
+                if let Err(error) = ledger_git::own_ref(&value) {
                     return Err(refused(format!(
                         "{error}. Name this machine again, uniquely among every machine sharing \
                          {REMOTE}: git --git-dir={} config knives.machine <name>",
@@ -266,12 +267,12 @@ fn identity(git_dir: &Path) -> Result<Identity, SweepError> {
 /// machine named is a ledger nobody set up to share: no destination, and
 /// nothing to report. A candidate naming a machine and carrying no fork is a
 /// destination that carries nothing. Refused, each with what fixes it: a
-/// machine name no ref can spell ([`identity`]), forks carried with no machine
-/// name, two candidates whose `origin` is one repository, since which of
-/// them a fork's entries go through would be a guess, and a fork whose
-/// registry key's directory still holds the entries an older knives filed
-/// there ([`crate::ledger::LedgerError::FormerName`]), which no sweep would
-/// carry until `knives ledger migrate` moves them.
+/// machine name no ref the ledger's remote holds can spell ([`identity`]),
+/// forks carried with no machine name, two candidates whose `origin` is one
+/// repository, since which of them a fork's entries go through would be a
+/// guess, and a fork whose registry key's directory still holds the entries
+/// an older knives filed there ([`crate::ledger::LedgerError::FormerName`]),
+/// which no sweep would carry until `knives ledger migrate` moves them.
 pub fn destinations(root: &Path, registry: &Registry) -> Result<Destinations, SweepError> {
     destinations_telling(root, registry, &mut std::io::stderr())
 }

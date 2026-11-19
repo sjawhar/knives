@@ -182,7 +182,7 @@ Routing:
 - knives refuses these, and names the directory and the remedy:
   - two git directories with one `origin`,
   - a directory that carries forks but names no machine,
-  - a `knives.machine` that is not one ref name component (no `/`, no leading `-` or `.`, no `..`), because it spells `refs/knives/<machine>`.
+  - a `knives.machine` that is not one ref name component (no `/`, no leading `-` or `.`, no `..`), or that is longer than 243 bytes, because it spells `refs/knives/<machine>`, and GitHub refuses every ref longer than 255 bytes.
 - Another `knives.*` key, for a newer knives, is not refused. `status` notes it and `ledger sweep` lists it under `notes`, each with the command that removes it.
 
 ### The sweep

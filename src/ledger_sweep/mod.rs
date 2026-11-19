@@ -640,26 +640,35 @@ mod tests {
     #[test]
     fn a_machine_name_no_ref_can_spell_is_refused_with_the_command_that_names_one() {
         // Given: a repository carrying a fork, naming this machine `dev/box`,
-        // which would nest under another machine's ref.
-        let (_home, root) = ledger_root();
-        registry(&root, &[("a-repo", Some("acme/ledger"))]);
-        origin_at(&root, "/nonexistent/remote.git");
-        git(&root.join(".git"), &["config", "knives.machine", "dev/box"]);
+        // which would nest under another machine's ref, or a name of 244
+        // bytes, whose ref would be 256, longer than the ledger's remote
+        // holds.
+        let long = "a".repeat(244);
+        for (name, why) in [
+            ("dev/box", "it must be one git ref name component"),
+            (long.as_str(), "would be 256 bytes, more than the 255"),
+        ] {
+            let (_home, root) = ledger_root();
+            registry(&root, &[("a-repo", Some("acme/ledger"))]);
+            origin_at(&root, "/nonexistent/remote.git");
+            git(&root.join(".git"), &["config", "knives.machine", name]);
 
-        // When: where the ledger travels is read, as every sweep and pull does
-        // before it fetches.
-        let error = destinations(&root, &loaded(&root)).unwrap_err().to_string();
+            // When: where the ledger travels is read, as every sweep and pull
+            // does before it fetches.
+            let error = destinations(&root, &loaded(&root)).unwrap_err().to_string();
 
-        // Then: it is refused there, naming the name and the command that
-        // sets another, rather than failing later mid-sweep.
-        assert!(error.contains("\"dev/box\""), "was: {error}");
-        assert!(
-            error.contains(&format!(
-                "git --git-dir={} config knives.machine <name>",
-                root.join(".git").display()
-            )),
-            "was: {error}"
-        );
+            // Then: it is refused there, naming the name, why, and the command
+            // that sets another, rather than failing later mid-sweep.
+            assert!(error.contains(&format!("{name:?}")), "was: {error}");
+            assert!(error.contains(why), "was: {error}");
+            assert!(
+                error.contains(&format!(
+                    "git --git-dir={} config knives.machine <name>",
+                    root.join(".git").display()
+                )),
+                "was: {error}"
+            );
+        }
     }
 
     #[test]

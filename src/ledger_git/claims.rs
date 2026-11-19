@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use super::run::{invocation, output_error, run, run_with_input, succeeded, transport_transcript};
 use super::tree::{Mode, ObjectId, tree_item};
-use super::{GitError, Repository, fork_directory, own_ref, record_sent, ref_component};
+use super::{GitError, MAX_REF, Repository, fork_directory, own_ref, record_sent, ref_component};
 use crate::ids::{BranchName, CommitId, UpstreamName};
 use crate::store::OwnerKind;
 
@@ -35,13 +35,6 @@ use crate::store::OwnerKind;
 const CLAIMS: &str = "refs/knives-claims/";
 /// The one file a claim commit's tree holds.
 const RECORD: &str = "claim.toml";
-/// The longest a claim ref may be, in bytes, all of it: GitHub, where a
-/// ledger's repository is kept, refuses every longer ref ("refs longer than
-/// 255 bytes are not allowed"), so a claim under a longer ref could never be
-/// taken there. The branch's component, a strict part of the ref, is then
-/// shorter than the 255 bytes a file name may hold, as its loose ref's file
-/// must be.
-const MAX_REF: usize = 255;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClaimError {
@@ -188,7 +181,8 @@ pub struct HeldClaim {
 /// record's entry name is unique to the nanosecond, so no two claim commits
 /// are one, and a lease meant for one claim never matches an older one.
 pub fn write_claim(repository: &Repository, record: &ClaimRecord) -> Result<CommitId, ClaimError> {
-    let machine = ref_component("machine", &record.machine)?;
+    own_ref(&record.machine)?;
+    let machine = record.machine.as_str();
     let text = toml::to_string(record).map_err(|source| ClaimError::Record {
         repo: record.repo.clone(),
         branch: record.branch.clone(),
