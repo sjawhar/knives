@@ -56,7 +56,7 @@ Shipping a fork member is part of the same work:
 3. The consumer pins the published name and deploys. The member carries the change until upstream ships it.
 
 - A member's PR on the fork remote is for review only. Base it on its series' base, never on a `release/…` cut: merging into a cut fast-forwards that published ref away from the tree consumers pinned. Only `knives release` puts a member in a release.
-- The release owner's process opens the upstream PR (`pr-preflight`) once the `placement:` notch records UPSTREAM. It gates nothing: not the release, the pin or the deploy. Ask nobody; wait for no approval.
+- The release owner's process opens the upstream PR (`pr-preflight`) from a signed commit with an `Omp-Session` trailer, once the `placement:` notch says UPSTREAM. It gates nothing: not the release, the pin or the deploy. Ask nobody; wait for no approval.
 - After it opens, its review rounds, body edits, rebases and close are the owning session's work, not a human's.
 
 ## 5. Get your workspace with `knives start`

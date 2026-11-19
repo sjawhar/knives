@@ -21,7 +21,7 @@ Run `knives ledger migrate` once on each machine. Until then, commands that read
 6. A missing observation is not clearance. Absent, `null`, `0` and `UNKNOWN` differ. Read `problems`.
 7. Keep dependencies. Never keep a dependent in a release and drop its requirement.
 8. One branch is both release member and PR head. Never make a "release-lineage" or sibling copy so that it composes: move the release.
-9. Change releases only with `knives release` verbs. Release names come only from `release cut`. `--allow-drop` states an intended drop; it is not a way past a refusal.
+9. Make release names only with `release cut`, never by hand. `--allow-drop` states an intended drop; it is not a way past a refusal.
 10. After any hand change on a release commit, run `knives release adopt <name>` before the next release write.
 11. Before a raw `jj rebase` of a branch, run fork-work's bidirectional gate (§7).
 
@@ -66,7 +66,7 @@ Reports are TOON when an agent is detected or stdout is not a terminal. `--json`
 |---|---|
 | `0` | No findings. Not a readiness verdict. |
 | `1` | Findings. |
-| `2` | Usage error, or a `start` or `finish` refusal. |
+| `2` | Usage error, or a `start` or `finish` refusal. A `finish` refused because another owner took your claim exits `1`. |
 | `3` | Incomplete: something could not be answered. Release writes also refuse with `3`. |
 
 An incomplete report can still hold useful observations.
