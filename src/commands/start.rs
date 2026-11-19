@@ -14,8 +14,9 @@ use crate::cli::Exit;
 use crate::commands::claim::{
     Bound, ClaimContext, ClaimDecision, Identity, SharedClaims, Sighting, both_anonymous,
     change_on_ledger, claimed_on, copy_of, current_identity, decide, git_dir_of, owner_kind_label,
-    refusing, render_claim_context, render_shared_claim_context, sighting_provenance,
-    unapplied_cause, unread_claim, unreadable_activity, unreadable_holder, unwritten,
+    refusing, render_claim_context, render_seized, render_seized_unread,
+    render_shared_claim_context, render_shared_seized, sighting_provenance, unapplied_cause,
+    unread_claim, unreadable_activity, unreadable_holder, unwritten,
 };
 use crate::commands::release::shared_base;
 use crate::commands::wip::workspace_for;
@@ -485,8 +486,8 @@ fn force_claim(
         displaced.as_ref(),
     )?;
     println!(
-        "seized {}\n{workspace_notice}",
-        render_claim_context(previous, last_seen, jiff::Timestamp::now()),
+        "{}\n{workspace_notice}",
+        render_seized(previous, last_seen, jiff::Timestamp::now()),
     );
     Ok(Exit::Ok)
 }
@@ -1572,15 +1573,9 @@ fn seize_shared(
     match opened {
         Ok(line) => {
             let seized = previous.map_or_else(
-                || {
-                    format!(
-                        "the claim {} at {}, whose holder could not be read",
-                        on.claim,
-                        on.read.as_ref().map_or("", CommitId::as_str)
-                    )
-                },
+                || render_seized_unread(&on.claim, on.read.as_ref()),
                 |claim| {
-                    render_shared_claim_context(
+                    render_shared_seized(
                         claim,
                         claimed_on(claim, on.machine()),
                         last_seen,
@@ -1588,7 +1583,7 @@ fn seize_shared(
                     )
                 },
             );
-            println!("seized {seized}\n{line}");
+            println!("{seized}\n{line}");
             Ok(Exit::Ok)
         }
         Err(error) => Ok(release_unopened(context, on, &commit, &error)),

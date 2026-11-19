@@ -1012,18 +1012,45 @@ fn visible_contains(visible: &BTreeSet<String>, token: &str) -> bool {
         .next()
         .is_some_and(|id| id.starts_with(token))
 }
+
+/// How long ago `ts` was, as a bare age: the shortest form that is still
+/// true, `now`, `12m`, `4h`, `3d`. A sentence says it with [`ago`].
+///
+/// `None` when the timestamp does not parse.
 pub fn age(ts: &str, now: jiff::Timestamp) -> Option<String> {
+    Some(whole_units(seconds_since(ts, now)?).unwrap_or_else(|| "now".to_owned()))
+}
+
+/// [`age`] as a sentence says it: `just now` under a minute, else `12m ago`,
+/// `4h ago`, `3d ago`. A bare age with " ago" after it would read `now ago`.
+///
+/// `None` when the timestamp does not parse.
+pub fn ago(ts: &str, now: jiff::Timestamp) -> Option<String> {
+    Some(
+        whole_units(seconds_since(ts, now)?)
+            .map_or_else(|| "just now".to_owned(), |age| format!("{age} ago")),
+    )
+}
+
+/// The seconds from `ts` to `now`: never negative, since a clock that ran
+/// backwards is not a negative age.
+fn seconds_since(ts: &str, now: jiff::Timestamp) -> Option<i64> {
     let then = ts.parse::<jiff::Timestamp>().ok()?;
-    let seconds = now.as_second().saturating_sub(then.as_second()).max(0);
-    Some(if seconds < 60 {
-        "now".to_owned()
+    Some(now.as_second().saturating_sub(then.as_second()).max(0))
+}
+
+/// `seconds` in its largest whole unit, `12m`, `4h`, `3d`; `None` under a
+/// minute, which has none.
+fn whole_units(seconds: i64) -> Option<String> {
+    if seconds < 60 {
+        None
     } else if seconds < 3600 {
-        format!("{}m", seconds / 60)
+        Some(format!("{}m", seconds / 60))
     } else if seconds < 86_400 {
-        format!("{}h", seconds / 3600)
+        Some(format!("{}h", seconds / 3600))
     } else {
-        format!("{}d", seconds / 86_400)
-    })
+        Some(format!("{}d", seconds / 86_400))
+    }
 }
 
 /// Render ledger text for an inline human terminal field.
@@ -2357,6 +2384,25 @@ mod tests {
         assert_eq!(age("2026-08-15T12:00:30Z", now).as_deref(), Some("now"));
         // Only reachable for an entry assembled by hand: `entries` rejects these.
         assert_eq!(age("last tuesday", now), None);
+    }
+
+    #[test]
+    fn a_sentence_says_an_age_under_a_minute_as_just_now_and_never_now_ago() {
+        let now: jiff::Timestamp = "2026-08-15T12:00:00Z".parse().unwrap();
+        assert_eq!(
+            ago("2026-08-15T11:59:31Z", now).as_deref(),
+            Some("just now")
+        );
+        assert_eq!(ago("2026-08-15T11:59:00Z", now).as_deref(), Some("1m ago"));
+        assert_eq!(ago("2026-08-15T11:48:00Z", now).as_deref(), Some("12m ago"));
+        assert_eq!(ago("2026-08-15T08:00:00Z", now).as_deref(), Some("4h ago"));
+        assert_eq!(ago("2026-08-12T12:00:00Z", now).as_deref(), Some("3d ago"));
+        // A clock that ran backwards is not a negative age.
+        assert_eq!(
+            ago("2026-08-15T12:00:30Z", now).as_deref(),
+            Some("just now")
+        );
+        assert_eq!(ago("last tuesday", now), None);
     }
 
     #[test]

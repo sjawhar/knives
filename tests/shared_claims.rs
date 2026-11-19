@@ -1413,13 +1413,13 @@ fn a_claim_taken_on_another_machine_is_seized_with_force_and_why() {
         ],
     );
 
-    // Then: it names the claim it seized, as taken when that claim's record
-    // says, on a line of its own after whatever it said of the checkout
-    // first; the claim ref holds owner two's claim, taken on machine two,
-    // and machine two holds its copy.
+    // Then: it names the claim it seized and the holder it took it from, as
+    // taken when that claim's record says, on a line of its own after
+    // whatever it said of the checkout first; the claim ref holds owner
+    // two's claim, taken on machine two, and machine two holds its copy.
     let stdout = stdout_of(&seized);
     let seized_line = format!(
-        "seized {FORK}/{BRANCH} is claimed by owner-one (harness-session) on machine machine-one, \
+        "seized {FORK}/{BRANCH} from owner-one (harness-session) on machine machine-one, \
          taken {} (",
         before.as_ref().map_or("", |held| held.get("started"))
     );
