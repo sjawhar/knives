@@ -691,7 +691,7 @@ mod tests {
         let (changed, _) = lab.change(&claim, None, &record("feat/a", "machine-one", "owner-one"));
 
         // Then: it failed before anything was sent, saying the ref is not
-        // its own.
+        // its own and how to rename this machine.
         let ClaimOutcome::NotApplied {
             why: NotApplied::Failed,
             failure,
@@ -703,6 +703,15 @@ mod tests {
             failure
                 .cause
                 .contains("this checkout never committed as it"),
+            "{}",
+            failure.cause
+        );
+        assert!(
+            failure.cause.contains(&format!(
+                "give each machine a unique knives.machine with `git --git-dir={} config \
+                 knives.machine <unique-name>`",
+                lab.git_dir().display()
+            )),
             "{}",
             failure.cause
         );

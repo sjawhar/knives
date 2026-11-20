@@ -356,9 +356,14 @@ pub enum GitError {
     #[error("{path:?} is a file on disk and a directory in this machine's ref, or the reverse")]
     Shape { path: PathBuf },
     #[error(
-        "refusing to write as {machine}: {remote} has its ref but this checkout never committed as it, so the name is another machine's"
+        "refusing to write as {machine}: {remote} has its ref but this checkout never committed as it, so {}",
+        machine_collision_remedy(git_dir)
     )]
-    NotOwn { machine: String, remote: String },
+    NotOwn {
+        machine: String,
+        remote: String,
+        git_dir: PathBuf,
+    },
 }
 
 /// What to do when git refuses this machine's ref through `git_dir` as
@@ -519,6 +524,7 @@ pub fn pending(repository: &Repository, machine: &str) -> Result<Pending, GitErr
         return Err(GitError::NotOwn {
             machine: machine.to_owned(),
             remote,
+            git_dir: repository.git_dir().to_owned(),
         });
     }
     let mut added = local_entries(repository)?;
@@ -617,6 +623,7 @@ pub fn push(repository: &Repository, remote: &str, machine: &str) -> Result<bool
             Err(GitError::NotOwn {
                 machine: machine.to_owned(),
                 remote: remote.to_owned(),
+                git_dir: repository.git_dir().to_owned(),
             })
         } else {
             Ok(false)

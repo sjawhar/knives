@@ -15,19 +15,15 @@
 //! session's own history, taken up before the directory is in place
 //! ([`make`]), so a config home made again resumes the claims it took
 //! rather than refuse its own ref. A caller in no harness session names it
-//! for the host, as the host's own config home is named when it is set up
-//! by hand; a name the remote already holds may be that config home's,
-//! still in use, so the join takes random digits instead and takes nothing
-//! up. Only the remote is asked, so a config home set up by hand whose ref
-//! is not there yet can share the name, and whichever of the two pushes
-//! second is refused as another writer of that ref: as a name that is
-//! another machine's ([`GitError::NotOwn`]), or, where it has committed as
-//! the machine, with the command that renames it
-//! ([`GitError::MachineNameCollision`]). A directory already at that path
-//! is never touched, and a dry run joins nothing.
-//!
-//! [`GitError::NotOwn`]: crate::ledger_git::GitError::NotOwn
-//! [`GitError::MachineNameCollision`]: crate::ledger_git::GitError::MachineNameCollision
+//! for the host and eight random digits, written once to the config home's
+//! git directory: random, so that two config homes of one host that both
+//! join before either pushes never share a name, which asking the remote,
+//! holding neither's ref yet, could not prevent. A name the remote already
+//! holds is another config home's, so the join draws other digits and
+//! takes nothing up. A git directory made by hand or by an installer keeps
+//! the `knives.machine` it was given; a join in another config home picks
+//! random digits, so the two cannot share a name. A directory already at
+//! that path is never touched, and a dry run joins nothing.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -161,14 +157,14 @@ fn join(
 /// ([`crate::ledger_git::take_up_own_ref`]): made without that history,
 /// this one would refuse its own ref at the first write, and the claims
 /// taken under it could be released only from another machine. A
-/// [`Name::Host`] it holds may be another config home's of this host, still
-/// in use: taken up, that ref would have two writers, and the first push of
-/// either would leave the other refused at every write after. So nothing is
-/// taken up, and the directory names this machine [`machine_name`] with
-/// random digits in place of the machine id's. A remote that cannot be
-/// asked, or a fetch that fails, makes nothing, so the next command asks
-/// again rather than find a git directory that refuses its own ref or
-/// shares a live one's.
+/// [`Name::Host`] it holds is another config home's, which drew the same
+/// digits or was given the name by hand, and may still be in use: taken
+/// up, that ref would have two writers, and the first push of either would
+/// leave the other refused at every write after. So nothing is taken up,
+/// and the directory names this machine [`machine_name`] with other random
+/// digits. A remote that cannot be asked, or a fetch that fails, makes
+/// nothing, so the next command asks again rather than find a git
+/// directory that refuses its own ref or shares a live one's.
 fn make(root: &Path, git_dir: &Path, url: &str, name: &Name) -> Result<Option<String>, String> {
     let shown = crate::remote_url::without_userinfo(url);
     let failed = |cause: String| {
@@ -212,11 +208,7 @@ fn make(root: &Path, git_dir: &Path, url: &str, name: &Name) -> Result<Option<St
         Name::Host(machine) => {
             crate::ledger_git::remote_has_machine_ref(&repository, REMOTE, machine).map(|held| {
                 if held {
-                    machine_name(
-                        &crate::liveness::host_name(),
-                        None,
-                        crate::lock::random_u64(),
-                    )
+                    machine_name(&crate::liveness::host_name(), crate::lock::random_u64())
                 } else {
                     machine.clone()
                 }
@@ -280,9 +272,10 @@ enum Name {
     /// other session has it, so the ref the remote holds under it is this
     /// session's own, from an earlier config home of it.
     Session(String),
-    /// [`machine_name`]'s, for a caller in no harness session: the name the
-    /// host's own config home has when it is set up by hand, so the ref the
-    /// remote holds under it may be that config home's, still in use.
+    /// [`machine_name`]'s, for a caller in no harness session: random
+    /// digits, so the ref the remote holds under it is never this config
+    /// home's but another's, which drew the same digits or was given the
+    /// name by hand, and may still be in use.
     Host(String),
 }
 
@@ -290,35 +283,29 @@ enum Name {
 /// ([`make`]): for a caller in a harness session
 /// ([`crate::commands::claim::harness_session`]), [`session_machine_name`]
 /// of its host name, its `/etc/machine-id` and that session; else
-/// [`machine_name`] of its host name, its `/etc/machine-id` and a random
-/// number.
+/// [`machine_name`] of its host name and a random number.
 fn this_machine() -> Name {
     let host = crate::liveness::host_name();
-    let id = std::fs::read_to_string("/etc/machine-id").ok();
     crate::commands::claim::harness_session().map_or_else(
-        || {
-            Name::Host(machine_name(
-                &host,
-                id.as_deref(),
-                crate::lock::random_u64(),
-            ))
+        || Name::Host(machine_name(&host, crate::lock::random_u64())),
+        |(_, owner)| {
+            let id = std::fs::read_to_string("/etc/machine-id").ok();
+            Name::Session(session_machine_name(&host, id.as_deref(), &owner))
         },
-        |(_, owner)| Name::Session(session_machine_name(&host, id.as_deref(), &owner)),
     )
 }
 
-/// `<short host name>-<8 hex digits>`, as machines set up by hand to share
-/// a ledger are named: the host name as [`named`] keeps it, and the first
-/// eight characters of `machine_id` when they are hex digits, else eight
-/// from `random`. The name of a machine that joins in no harness session,
-/// and, with no machine id, of one whose name the remote already holds
-/// ([`make`]).
-fn machine_name(host: &str, machine_id: Option<&str>, random: u64) -> String {
-    let digits = machine_id
-        .and_then(|id| id.get(..8))
-        .filter(|id| id.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .map_or_else(|| format!("{:08x}", random & 0xffff_ffff), str::to_owned);
-    named(host, &digits)
+/// `<short host name>-<8 hex digits>`, in the form machines set up by hand
+/// to share a ledger are named: the host name as [`named`] keeps it, and
+/// the low 32 bits of `random` as eight hex digits. The name of a machine
+/// that joins in no harness session, and of one whose first name the
+/// remote already holds ([`make`]).
+///
+/// The digits are random, not the machine id's: two config homes of one
+/// host that join before either pushes would otherwise share a name, and
+/// the second of them to push would be refused at every write.
+fn machine_name(host: &str, random: u64) -> String {
+    named(host, &format!("{:08x}", random & 0xffff_ffff))
 }
 
 /// `<short host name>-<8 hex digits>` for a machine that joins in the
@@ -715,8 +702,8 @@ mod tests {
     fn a_join_in_no_session_whose_name_the_remote_holds_takes_another_and_takes_up_nothing() {
         // Given: a caller in no harness session, a new machine whose registry
         // shares a fork's ledger, and a remote that already holds a commit
-        // under the name this host's machine id gives, as the host's own
-        // config home, still in use, leaves it.
+        // under the name this join is to take, as another config home of
+        // this host, still in use, leaves it.
         let remote = Remote::reached_in("https://forge.invalid/acme/ledger", None);
         let (_home, root, registry) = new_machine(&[(
             "a-repo",
@@ -724,7 +711,7 @@ mod tests {
             Some("acme/ledger"),
         )]);
         assert!(matches!(this_machine(), Name::Host(_)));
-        let host = machine_name(&crate::liveness::host_name(), Some(MACHINE_ID), 0);
+        let host = machine_name(&crate::liveness::host_name(), 0x0123_abcd);
         let theirs = format!("refs/knives/{host}");
         let commit = remote.commit_at(&theirs);
 
@@ -740,11 +727,11 @@ mod tests {
         .unwrap();
 
         // Then: the git directory names another machine of this host, with
-        // random digits in place of the machine id's, and says so.
+        // other random digits, and says so.
         let git_dir = joined_git_dir(&root, "acme/ledger");
         let machine = config(&git_dir, "knives.machine").unwrap();
         assert_ne!(machine, host);
-        let short = host.strip_suffix(MACHINE_ID.get(..8).unwrap()).unwrap();
+        let short = host.strip_suffix("0123abcd").unwrap();
         let digits = machine.strip_prefix(short).unwrap();
         assert!(
             digits.len() == 8 && digits.bytes().all(|byte| byte.is_ascii_hexdigit()),
@@ -782,41 +769,44 @@ mod tests {
     }
 
     #[test]
-    fn a_join_in_no_session_whose_name_the_remote_lacks_keeps_the_machine_id_name() {
-        // Given: a caller in no harness session, a new machine whose registry
-        // shares a fork's ledger, and a remote that holds nothing.
+    fn two_joins_in_no_session_on_one_host_take_two_random_names_neither_the_machine_ids() {
+        // Given: a caller in no harness session, two new config homes on
+        // this host whose registries share a fork's ledger, and a remote
+        // that holds nothing.
         let remote = Remote::reached_in("https://forge.invalid/acme/ledger", None);
-        let (_home, root, registry) = new_machine(&[(
-            "a-repo",
-            "https://forge.invalid/ours/a-repo",
-            Some("acme/ledger"),
-        )]);
-        assert!(matches!(this_machine(), Name::Host(_)));
-        let host = machine_name(&crate::liveness::host_name(), Some(MACHINE_ID), 0);
+        let homes = [(); 2].map(|()| {
+            new_machine(&[(
+                "a-repo",
+                "https://forge.invalid/ours/a-repo",
+                Some("acme/ledger"),
+            )])
+        });
 
-        // When: the ledger is joined under the name this host's machine id
-        // gives.
-        let said = join(
-            &root,
-            &registry,
-            "acme/ledger",
-            &["acme/a-repo"],
-            &Name::Host(host.clone()),
-        )
-        .unwrap()
-        .unwrap();
+        // When: where the ledger travels is read in each, as a sweep or a
+        // pull does, before either has sent anything.
+        let names = homes.each_ref().map(|(_, root, registry)| {
+            destinations(root, registry).unwrap();
+            config(&joined_git_dir(root, "acme/ledger"), "knives.machine").unwrap()
+        });
 
-        // Then: the git directory names the machine by it, and says so.
-        let git_dir = joined_git_dir(&root, "acme/ledger");
-        assert_eq!(config(&git_dir, "knives.machine"), Some(host.clone()));
-        assert_eq!(
-            said,
-            format!(
-                "joined the ledger acme/ledger: made {} as machine {host}, carrying acme/a-repo",
-                git_dir.display()
-            )
-        );
-        // And: the join sent nothing.
+        // Then: each git directory names a machine of this host with eight
+        // hex digits, none of them the first eight of its machine id.
+        let host = crate::liveness::host_name();
+        let id = std::fs::read_to_string("/etc/machine-id").unwrap_or_default();
+        for machine in &names {
+            let digits = machine
+                .rsplit_once('-')
+                .map_or(machine.as_str(), |(_, digits)| digits);
+            assert!(
+                digits.len() == 8 && digits.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "{machine}"
+            );
+            assert_eq!(machine, &named(&host, digits));
+            assert!(!id.starts_with(digits), "{machine}: {id}");
+        }
+        // And: the two names differ, and neither join sent anything.
+        let [one, two] = &names;
+        assert_ne!(one, two);
         assert_eq!(lab::git(&remote.git_dir, &["for-each-ref"]), "");
     }
 
@@ -1123,21 +1113,14 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_is_named_for_its_short_host_name_and_its_machine_id() {
-        // A readable machine id gives its first eight characters.
+    fn a_machine_is_named_for_its_short_host_name_and_eight_random_digits() {
+        // The digits are the low 32 bits of the random number, as eight
+        // hex digits, zero-padded.
         assert_eq!(
-            machine_name("box-one.example.invalid", Some(MACHINE_ID), 0),
-            "box-one-0123abcd"
+            machine_name("box-one.example.invalid", 0x1234_5678_9abc_def0),
+            "box-one-9abcdef0"
         );
-        // An id that is missing, short or not hex gives eight random digits.
-        for id in [None, Some("0123abc"), Some("0123abcz4567ef89"), Some("")] {
-            assert_eq!(
-                machine_name("box-one", id, 0x1234_5678_9abc_def0),
-                "box-one-9abcdef0",
-                "{id:?}"
-            );
-        }
-        assert_eq!(machine_name("box-one", None, 7), "box-one-00000007");
+        assert_eq!(machine_name("box-one", 7), "box-one-00000007");
         // A host name character no ref component holds becomes `-`, and the
         // name never starts with one.
         for (host, name) in [
@@ -1150,7 +1133,7 @@ mod tests {
             (".hidden", "0123abcd"),
             ("", "0123abcd"),
         ] {
-            let named = machine_name(host, Some("0123abcd"), 0);
+            let named = machine_name(host, 0x0123_abcd);
             assert_eq!(named, name, "{host:?}");
             crate::ledger_git::ref_component("machine", &named).unwrap();
         }
@@ -1212,7 +1195,7 @@ mod tests {
         let id = std::fs::read_to_string("/etc/machine-id").ok();
 
         // In no harness session, the name is the host's: its host name and
-        // its machine id, with random digits when the id does not read.
+        // eight random digits.
         let Name::Host(named) = this_machine() else {
             panic!("a caller in no harness session joins under a session's name");
         };
@@ -1222,11 +1205,7 @@ mod tests {
             .map_or(named.as_str(), |(_, digits)| digits);
         assert_eq!(
             named,
-            machine_name(
-                &host,
-                id.as_deref(),
-                u64::from_str_radix(digits, 16).unwrap()
-            )
+            machine_name(&host, u64::from_str_radix(digits, 16).unwrap())
         );
 
         // In one, it is that session's on this host.

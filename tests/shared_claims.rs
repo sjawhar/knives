@@ -9,9 +9,10 @@
 //! fork into a scan root of its own. Both run in this place (one host, one
 //! process namespace), so only their names on the ledger tell them apart,
 //! and every owner is named by `KNIVES_OWNER`, but in the tests of an Oh My
-//! Pi session, named by `PI_SESSION_ID`. A config home that joins the
-//! ledger itself names its machine for the session that joins it, so two
-//! config homes here that join it in two sessions are two machines.
+//! Pi session, named by `PI_SESSION_ID`, and of no harness session, named
+//! by none. A config home that joins the ledger itself names its machine
+//! for the session that joins it, or, in no harness session, with random
+//! digits, so two config homes here that join it are two machines.
 //!
 //! Every test here drives the `knives` binary, raw git and
 //! `tests/common/lab.rs` alone, so this file also runs, unchanged, against
@@ -386,6 +387,19 @@ impl Machine {
     fn tried_joining(&self, remote: &Path, owner: &str, args: &[&str]) -> Output {
         lab::with_git_rule(
             &mut self.command(owner, args),
+            &format!("url.{}.insteadOf", remote.display()),
+            JOINED_URL,
+        )
+        .output()
+        .expect("run knives")
+    }
+
+    /// `knives <args>` from this machine's checkout in no harness session,
+    /// its git reaching [`JOINED_URL`] at `remote` as [`Self::tried_joining`]
+    /// reaches it; run to completion, whatever it comes to.
+    fn tried_joining_in_no_session(&self, remote: &Path, args: &[&str]) -> Output {
+        lab::with_git_rule(
+            &mut lab::knives_command(&self.checkout, self.home.path(), &self.scan, args),
             &format!("url.{}.insteadOf", remote.display()),
             JOINED_URL,
         )
@@ -2071,6 +2085,70 @@ fn two_sessions_on_one_host_join_as_two_machines_and_each_takes_its_branch() {
             listed_on(&remote, machine),
             [format!("{FORK}/{}", held.get("entry"))]
         );
+    }
+}
+
+#[test]
+fn two_config_homes_on_one_host_in_no_session_join_before_either_pushes_and_both_write() {
+    // Given: two config homes on this host, each in no harness session and
+    // with no ledger git directory yet.
+    let lab = forge_lab();
+    let (_remote_root, remote) = lab::bare_remote();
+    let one = Machine::on_lab(&lab, "machine-one", Ledger::Unjoined);
+    let two = Machine::cloned(&lab, "machine-two", Ledger::Unjoined);
+    let machines = [&one, &two];
+
+    // When: each sweeps, with nothing to send, before either has pushed
+    // anything.
+    let swept = machines.map(|machine| {
+        machine.tried_joining_in_no_session(&remote, &["--json", "ledger", "sweep"])
+    });
+
+    // Then: each sweep joined the ledger, and the remote holds no machine's
+    // ref yet.
+    for (machine, output) in machines.into_iter().zip(&swept) {
+        assert_eq!(output.status.code(), Some(0), "{}", shown(&swept));
+        assert!(machine.joined_as().is_some(), "{}", shown(&swept));
+    }
+    assert_eq!(
+        git_in(&remote, &["for-each-ref", "refs/knives/"]).as_deref(),
+        Some("")
+    );
+
+    // When: each writes a note, home one first.
+    let notes = ["a note from home one", "a note from home two"];
+    let wrote = [(&one, notes[0]), (&two, notes[1])].map(|(machine, note)| {
+        machine.tried_joining_in_no_session(
+            &remote,
+            &["--text", "notch", "-m", note, "--repo", "demo"],
+        )
+    });
+
+    // Then: both writes exit 0, and neither is told to rename its machine.
+    for output in &wrote {
+        assert_eq!(output.status.code(), Some(0), "{}", shown(&wrote));
+        assert!(
+            !stderr_of(output).contains("knives.machine"),
+            "{}",
+            shown(&wrote)
+        );
+    }
+    // And: the two joined under two names, and each note is on the remote
+    // under its own machine's ref, the one entry there.
+    let names = machines.map(|machine| {
+        machine
+            .joined_as()
+            .expect("the joined git directory names a machine")
+    });
+    assert_ne!(names[0], names[1]);
+    for ((machine, note), name) in machines.into_iter().zip(notes).zip(&names) {
+        let own: Vec<String> = machine
+            .entries()
+            .into_iter()
+            .filter(|path| machine.recorded(path).text.contains(note))
+            .collect();
+        assert_eq!(own.len(), 1, "{own:?}");
+        assert_eq!(listed_on(&remote, name), own, "{name}");
     }
 }
 
