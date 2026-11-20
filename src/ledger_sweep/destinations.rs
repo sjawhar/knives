@@ -48,8 +48,9 @@ pub struct Destinations {
     pub found: Vec<Destination>,
     /// Each fork whose registry entry names a repository its ledger belongs
     /// to that no destination here is: its entries travel to and from no
-    /// other machine from this one. Outside a dry run, only a fork whose
-    /// ledger could not be joined.
+    /// other machine from this one. For a read that routes forks
+    /// ([`destinations_telling`]), it holds only the routed forks. Outside a
+    /// dry run, only a fork whose ledger could not be joined.
     pub unreached: BTreeMap<UpstreamName, Unreached>,
     /// A problem for each directory under the root holding entries that no
     /// fork is kept under ([`crate::ledger::unclaimed_problems`]): nothing
@@ -328,12 +329,12 @@ pub(super) fn destinations_telling(
     // A ledger still unreached once joined is one whose directory was
     // already there, its origin another repository's.
     assemble(root, registry, reached, |ledger| {
-        joined.contains(ledger).then(|| {
+        Some(
             failed
                 .get(ledger)
                 .cloned()
-                .unwrap_or_else(|| occupied(root, ledger))
-        })
+                .unwrap_or_else(|| occupied(root, ledger)),
+        )
     })
 }
 

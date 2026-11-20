@@ -15,15 +15,15 @@
 //! session's own history, taken up before the directory is in place
 //! ([`make`]), so a config home made again resumes the claims it took
 //! rather than refuse its own ref. A caller in no harness session names it
-//! for the host and eight random digits, written once to the config home's
-//! git directory: random, so that two config homes of one host that both
+//! for the host and eight random digits, written once to each git directory
+//! the join makes: random, so that two config homes of one host that both
 //! join before either pushes never share a name, which asking the remote,
 //! holding neither's ref yet, could not prevent. A name the remote already
 //! holds is another config home's, so the join draws other digits and
 //! takes nothing up. A git directory made by hand or by an installer keeps
 //! the `knives.machine` it was given; a join in another config home picks
-//! random digits, so the two cannot share a name. A directory already at
-//! that path is never touched, and a dry run joins nothing.
+//! digits of its own, so the two cannot share a name. A directory already
+//! at that path is never touched, and a dry run joins nothing.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;

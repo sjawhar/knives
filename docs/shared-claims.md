@@ -114,10 +114,11 @@ owner is: [design.md, Harness adapters](design.md#harness-adapters). This file h
   [harness session variables](design.md#harness-adapters) is set and not blank), the digits are
   the first 8 of the SHA-256 of `/etc/machine-id` and the session's owner name, so two sessions on
   one host, each with its own config home, are two machines. In no harness session, the digits are
-  random, drawn once per config home and drawn again where the ledger's repository already holds
-  `refs/knives/<machine>`, which is another config home's ([design.md](design.md#knives-start)).
-  A git directory made by hand or by an installer keeps the `knives.machine` it was given; a join
-  in another config home picks random digits, so the two cannot share a name.
+  random, drawn once each time a command joins, for every git directory it makes then, and drawn
+  again where the ledger's repository already holds `refs/knives/<machine>`, which is another
+  config home's ([design.md](design.md#knives-start)). A git directory made by hand or by an
+  installer keeps the `knives.machine` it was given; a join in another config home picks digits of
+  its own, so the two cannot share a name.
 - A git directory set up by hand before the first join chooses the URL and the machine name: knives
   joins only a ledger no git directory has as its `origin`, and never changes a git directory it did
   not make. One already at the join's path with another `origin` is a problem naming both fixes:

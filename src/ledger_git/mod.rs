@@ -366,9 +366,11 @@ pub enum GitError {
     },
 }
 
-/// What to do when git refuses this machine's ref through `git_dir` as
-/// another writer's: the remote holds a history this checkout did not
-/// commit, so another machine may be committing under the same name.
+/// What to do when this machine's ref through `git_dir` is refused as
+/// another writer's: by git ([`GitError::MachineNameCollision`]), or by
+/// knives before any push ([`GitError::NotOwn`]). Either way the remote
+/// holds a history this checkout did not commit, so another machine may be
+/// committing under the same name.
 pub(crate) fn machine_collision_remedy(git_dir: &Path) -> String {
     format!(
         "another machine may be committing under the same name; give each machine a unique \
