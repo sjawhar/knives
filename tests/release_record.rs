@@ -5247,3 +5247,100 @@ fn an_older_adopt_of_a_path_past_the_piece_bound_is_refused_in_a_clone_without_i
     assert!(out.contains(adopt.short()), "{out}");
     assert_eq!(ledger_entries(&home), entries, "{out}");
 }
+
+#[test]
+fn a_cut_in_a_clone_without_an_older_adopt_past_the_piece_bound_is_refused_naming_its_fetch() {
+    // Given: RELEASE fixed by hand with one new file whose path joins 17
+    // pieces with `, `, one more than an older event's text is read for, and
+    // adopted, its event as a knives from before the `fix_files` list writes
+    // it; the next release cut on it, which holds the file, pushed and
+    // published by a note, so a cut that starts identical to it is the
+    // composition to edit and goes on to the gate; a second clone that holds
+    // the next release and not the adopt's commit; and RELEASE then pushed
+    // at the adopt, so origin, which the registry reaches, holds it.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    let seventeen = (1..=17)
+        .map(|piece| format!("p{piece:02}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let adopt = fix_by_hand(
+        (&lab, &home),
+        RELEASE,
+        &[(seventeen.as_str(), Some("fixed by hand\n"))],
+        "a fix by hand",
+    );
+    without_fix_files(&home, RELEASE);
+    let next = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+    assert!(matches!(next.status.code(), Some(0 | 1)), "{}", text(&next));
+    let next = commit_at(&lab, "release/2026-08-05");
+    for branch in ["feat/alpha", "feat/beta", "release/2026-08-05"] {
+        lab.push_branch(branch);
+    }
+    mark_published(&lab, &home, "release/2026-08-05");
+    fetch_second_clone(&lab);
+    lab.jj_work([
+        "bookmark",
+        "set",
+        RELEASE,
+        "-r",
+        adopt.as_str(),
+        "--allow-backwards",
+    ]);
+    lab.push_branch(RELEASE);
+    with_lab_origin(&lab, home.path());
+    assert!(
+        !second_clone_holds(&lab, &adopt) && second_clone_holds(&lab, &next),
+        "the second clone holds the next release and not the adopt's commit"
+    );
+    let entries = ledger_entries(&home);
+
+    // When: the third release is cut in the second clone, with no `--at`.
+    let refused = cut_in_second_clone(&lab, &home, &["release/2026-08-06"]);
+
+    // Then: it is refused, naming the adopt, its release and its commit, and
+    // that the adopt's event is an older one whose list of more than 16
+    // pieces the clone cannot read whole; its remedy names origin's branch
+    // at the adopt, with its fetch, and says that `--allow-drop` is the last
+    // resort; and nothing is written: no ledger entry, and no
+    // release/2026-08-06.
+    let out = text(&refused);
+    assert_eq!(refused.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut: this cut cannot be held against the fix by hand of \
+             {RELEASE}'s adopt {adopt}: this repository does not hold {adopt}, and the adopt's \
+             event is an older one that names the files of the fix in its text alone, in a list \
+             of more than 16 pieces, which may name a path of more pieces than this repository \
+             reads\n",
+            adopt = adopt.short()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "\n  the candidate was discarded; fetch origin's refs/heads/{RELEASE}, which holds \
+             {adopt}, then move release/2026-08-05 to {next}, its newest recorded write: `jj \
+             bookmark set release/2026-08-05 -r {next} --allow-backwards`, or re-run with \
+             --allow-drop to state the drop is intended; --allow-drop is the last resort: it \
+             also waives the checks of each recorded member, of the newest recorded write, of \
+             each other fix by hand and of the commits reachable only from the previous \
+             release\n",
+            adopt = adopt.short(),
+            next = next.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(ledger_entries(&home), entries, "{out}");
+    assert!(
+        knives::jj::Repo::open(&lab.second)
+            .expect("open the second clone")
+            .resolve_commit("release/2026-08-06")
+            .is_err(),
+        "{out}"
+    );
+}
