@@ -1853,6 +1853,65 @@ fn a_rebase_leaves_a_pushed_older_release_where_it_was() {
 }
 
 #[test]
+fn a_rebase_whose_record_fails_still_abandons_the_rebased_copy_of_a_pushed_release() {
+    // Given: two releases of alpha and beta, the older pushed, which the
+    // move rewrites; an advanced upstream; and a state file nobody can read,
+    // which the re-describe reads to name who records its event, after the
+    // move and before the cleanup of the copies the move made.
+    let lab = Lab::new();
+    let older_name = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus(older_name, "feat/alpha", "feat/beta");
+    lab.push_branch(older_name);
+    lab.octopus("release/2026-08-05", "feat/alpha", "feat/beta");
+    let older = commit_at(&lab, older_name);
+    let (home, _consumer) = release_test_home(&lab);
+    lab.advance_upstream("advance\n");
+    std::fs::write(home.path().join("state.json"), "{not json").expect("corrupt state");
+
+    // When: an anonymous terminal user rebases the release in hand.
+    let output = lab::without_harness_session(&mut release_command(
+        &lab,
+        &home,
+        ReleaseOutput::Text,
+        &["rebase", "main@upstream"],
+    ))
+    .env_remove("KNIVES_OWNER")
+    .output()
+    .expect("run knives release rebase");
+
+    // Then: the command exits with the record's failure, the pushed release
+    // keeps its commit, and the copy the move made of it is abandoned, said
+    // so, as a rebase whose record succeeds does.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stderr.contains("state.json"), "{stderr}");
+    assert_eq!(commit_at(&lab, older_name), older, "{stdout}");
+    assert_eq!(
+        copies_of(&lab, &older),
+        Vec::<String>::new(),
+        "the rebased copy of the pushed release is left visible\nstdout: {stdout}\nstderr: \
+         {stderr}"
+    );
+    let abandoned = format!(
+        ", the rebased copy of {} ({older_name}); the original keeps its name",
+        older.short()
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("demo: abandoned ") && line.ends_with(&abandoned)),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
 fn a_rebase_takes_a_never_pushed_older_release_along() {
     // Given/When: an older release nobody pushed, then the release in hand
     // rebased.
