@@ -1011,6 +1011,132 @@ fn a_rebase_whose_re_describe_fails_after_its_move_names_a_heading_held_twice_on
     );
 }
 
+/// Put a `jj` in `shim`, ahead of the real one on `PATH`, that moves the
+/// release on `jj rebase -b` as asked, then adds in `work` an operation
+/// concurrent with the move: made at the operation before it, it sets
+/// `release` to `elsewhere`. The next opening merges the two, so the name
+/// `release` is conflicted and a read of it fails. Every other call reaches
+/// the real `jj`.
+fn install_jj_conflicting_the_moved_name(
+    shim: &std::path::Path,
+    work: &std::path::Path,
+    release: &str,
+    elsewhere: &str,
+) {
+    let real = std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+        .map(|directory| directory.join("jj"))
+        .find(|candidate| candidate.is_file())
+        .expect("find jj on PATH");
+    let (real, work) = (real.display(), work.display());
+    let jj = shim.join("jj");
+    std::fs::write(
+        &jj,
+        format!(
+            "#!/bin/sh\nseen=\nfor argument in \"$@\"; do\n  if [ \"$seen\" = rebase ] && [ \
+             \"$argument\" = -b ]; then\n    before=$('{real}' --repository '{work}' \
+             --ignore-working-copy op log --limit 1 --no-graph -T id) || exit\n    '{real}' \
+             \"$@\" || exit\n    exec '{real}' --repository '{work}' --ignore-working-copy \
+             --at-op \"$before\" bookmark set '{release}' -r '{elsewhere}' --allow-backwards\n  \
+             fi\n  [ \"$argument\" = rebase ] && seen=rebase\ndone\nexec '{real}' \"$@\"\n"
+        ),
+    )
+    .expect("write the jj shim");
+    let mut permissions = std::fs::metadata(&jj)
+        .expect("read the jj shim's permissions")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&jj, permissions).expect("make the jj shim executable");
+}
+
+#[test]
+fn a_rebase_whose_moved_name_is_conflicted_keeps_a_pushed_release_and_names_the_moved_headings() {
+    // Given: two releases of alpha and beta, each with the trunk as its
+    // first parent, so the rebase sheds it in a write of its own before it
+    // moves; the older one pushed, which the move rewrites; beta, whose
+    // changelog's one `[Unreleased]` section holds `### Added` twice; an
+    // upstream advance that adds release notes holding `### Added` twice
+    // too, so the tree the move leaves names two files and the shed's tree
+    // names one; and a `jj` that, after the move, sets the release's name
+    // elsewhere in an operation concurrent with it, so a read of the name
+    // after the move fails.
+    let lab = Lab::new();
+    let (older_name, release) = ("release/2026-08-04", "release/2026-08-05");
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch(
+        "feat/beta",
+        "CHANGELOG.md",
+        "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Beta's addition.\n\n### Added\n\n\
+         - An earlier addition.\n",
+    );
+    lab.octopus(older_name, "feat/alpha", "feat/beta");
+    lab.push_branch(older_name);
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let older = commit_at(&lab, older_name);
+    let (home, _consumer) = release_test_home(&lab);
+    lab.upstream_trunk_file(
+        "RELEASE_NOTES.md",
+        "# Release notes\n\n## [Unreleased]\n\n### Added\n\n- A trunk note.\n\n### Added\n\n\
+         - Another trunk note.\n",
+    );
+    let shim = tempfile::tempdir().expect("create the shim directory");
+    install_jj_conflicting_the_moved_name(shim.path(), &lab.work, release, "feat/alpha");
+
+    // When: the rebase sheds the trunk parent, writing the release, moves
+    // it, and reads the release the move left.
+    let output = release_command(
+        &lab,
+        &home,
+        ReleaseOutput::Text,
+        &["rebase", "main@upstream"],
+    )
+    .env("PATH", path_with_gh_shim(shim.path()))
+    .output()
+    .expect("run knives release rebase");
+
+    // Then: the command exits with the failure; the pushed older release is
+    // back on its commit, and said so; and the headings that print are those
+    // of the tree the move left, one line for each of its two files, not
+    // those of the shed's tree.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("Name `{release}` is conflicted")),
+        "{stderr}"
+    );
+    assert_eq!(
+        commit_at(&lab, older_name),
+        older,
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "demo: {older_name} stays at {}: it is pushed or published, and a rebase moves \
+             only the release in hand and its members\n",
+            older.short()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("[Unreleased] holds").count(), 2, "{stdout}");
+    for file in ["CHANGELOG.md", "RELEASE_NOTES.md"] {
+        assert!(
+            stdout.contains(&format!(
+                "  {file}: [Unreleased] holds `### Added` twice; knives changed no line for it; \
+                 join them by hand before you push\n"
+            )),
+            "{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("could not read the release logs"),
+        "{stdout}"
+    );
+}
+
 /// Every event the fork's ledger records about `name`, oldest first.
 fn events_about(home: &tempfile::TempDir, name: &str) -> Vec<knives::ledger::Entry> {
     knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
