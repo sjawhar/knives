@@ -22,6 +22,7 @@
     clippy::panic,
     reason = "a fixture or assertion that cannot proceed IS the test failure"
 )]
+// allow: SIZE_OK: 1097 lines - real-binary release-log union scenarios share one set of changelog fixtures and helpers.
 
 #[path = "common/lab.rs"]
 mod lab;

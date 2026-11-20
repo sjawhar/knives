@@ -1676,10 +1676,10 @@ fn a_stacked_cut_below_a_recorded_chain_names_its_members_and_its_write() {
     );
     assert!(
         out.contains(&format!(
-            "  the candidate was discarded; `knives release include <branch>` restores a member \
-             the previous cut recorded; fetch, then move {NEXT} to {}, its newest recorded \
-             write: `jj bookmark set {NEXT} -r {} --allow-backwards`, or re-run with \
-             --allow-drop to state the drop is intended\n",
+            "  the candidate was discarded; fetch, then move {NEXT} to {}, its newest recorded \
+             write: `jj bookmark set {NEXT} -r {} --allow-backwards`; `knives release include \
+             <branch>` restores a member the previous cut recorded, or re-run with --allow-drop \
+             to state the drop is intended\n",
             next.short(),
             next.short()
         )),

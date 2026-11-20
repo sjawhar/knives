@@ -947,13 +947,14 @@ fn drop_landed_members_in(
         inline_human_text(&delta)
     );
     report_replaced(repo, release_name, &written);
-    match knives::jj::conflicted_files(path, created.as_str()) {
-        Ok(files) => println!(
-            "{}",
-            release::conflict_guidance(release_name, &files, &written.unions)
-        ),
-        Err(error) => println!("  could not list conflicts: {error}"),
-    }
+    println!(
+        "{}",
+        release::conflict_report(
+            release_name,
+            knives::jj::conflicted_files(path, created.as_str()).as_deref(),
+            &written.unions
+        )
+    );
     Ok(Ok(created))
 }
 
@@ -1035,13 +1036,10 @@ fn report_rebased_release(
         rebased.onto.short(),
         new_parents.len()
     );
-    match conflicts {
-        Ok(files) => println!(
-            "{}",
-            release::conflict_guidance(rebased.name, &files, &unions)
-        ),
-        Err(error) => println!("  could not list conflicts: {error}"),
-    }
+    println!(
+        "{}",
+        release::conflict_report(rebased.name, conflicts.as_deref(), &unions)
+    );
     Ok(())
 }
 

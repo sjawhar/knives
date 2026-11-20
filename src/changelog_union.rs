@@ -241,7 +241,7 @@ fn place_blocks<'a>(
         if let Some(blocks) = plain {
             return (joined_blocks(&blocks), true);
         }
-        name_left_twice(inserted, above.fence, &mut union.left_twice);
+        name_left_twice(inserted, above.section.fence, &mut union.left_twice);
     }
     (
         inserted.iter().map(|block| Cow::Borrowed(*block)).collect(),
@@ -282,13 +282,8 @@ fn name_left_twice(blocks: &[&[u8]], mut fence: Fence, left_twice: &mut Vec<Vec<
 struct Above {
     /// How much of the text is read: up to the end of its last whole line.
     read: usize,
-    /// The code fence open after the text read.
-    fence: Fence,
-    /// How many `## [Unreleased]` heading lines the text read holds.
-    unreleased: usize,
-    /// Whether the nearest `#` or `##` heading or setext underline in the
-    /// text read is a `## [Unreleased]` heading line.
-    in_unreleased: bool,
+    /// What the text read says about its one `[Unreleased]` section.
+    section: UnreleasedReader,
 }
 
 impl Above {
@@ -305,16 +300,49 @@ impl Above {
                 break;
             }
             self.read += line.len();
-            if self.fence.read(line) == Kind::Section {
-                let unreleased = is_unreleased_heading(line);
-                self.unreleased += usize::from(unreleased);
-                self.in_unreleased = unreleased;
-            }
+            self.section.read(line);
         }
         self.read == written.len()
-            && self.fence.0.is_none()
-            && self.unreleased == 1
-            && self.in_unreleased
+            && self.section.fence.0.is_none()
+            && self.section.one()
+            && self.section.inside
+    }
+}
+
+/// A release log's one `[Unreleased]` section, read line by line: the one
+/// reader of where that section is ([`Above::reads_unreleased`],
+/// [`unreleased_runs`], [`repeated_headings`]). A section runs from a
+/// `## [Unreleased]` heading line ([`is_unreleased_heading`]) to the next
+/// `#` or `##` heading or setext underline, outside code fences
+/// ([`Fence::read`]). A log has one such section only where it holds
+/// exactly one such heading line.
+#[derive(Default)]
+struct UnreleasedReader {
+    /// The code fence open after the lines read.
+    fence: Fence,
+    /// How many `## [Unreleased]` heading lines the lines read hold.
+    headings: usize,
+    /// Whether the nearest `#` or `##` heading or setext underline in the
+    /// lines read is a `## [Unreleased]` heading line.
+    inside: bool,
+}
+
+impl UnreleasedReader {
+    /// What `line`, the line after those read so far, is ([`Fence::read`]),
+    /// with a `## [Unreleased]` heading line counted.
+    fn read(&mut self, line: &[u8]) -> Kind {
+        let kind = self.fence.read(line);
+        if kind == Kind::Section {
+            self.inside = is_unreleased_heading(line);
+            self.headings += usize::from(self.inside);
+        }
+        kind
+    }
+
+    /// Whether the lines read hold exactly one `## [Unreleased]` heading
+    /// line.
+    const fn one(&self) -> bool {
+        self.headings == 1
     }
 }
 
@@ -691,35 +719,30 @@ struct Run<'a> {
 }
 
 /// The runs of `target`'s lines under each `### ` heading of its one
-/// `[Unreleased]` section, or `None` where `target` holds no
-/// `## [Unreleased]` heading line or more than one
-/// ([`is_unreleased_heading`]). The section runs from that heading line to
-/// the next `#` or `##` heading or setext underline, and a `### ` heading at
-/// the start of a line opens a list there ([`Fence::read`]). A run is lines
-/// of one list outside any code fence: a fence ends a run, and the list's
-/// lines after it start another. Any other heading ends the list. A list
-/// with no lines is one empty run, so its heading is still read.
+/// `[Unreleased]` section ([`UnreleasedReader`]), or `None` where `target`
+/// holds no `## [Unreleased]` heading line or more than one. A `### `
+/// heading at the start of a line opens a list there ([`Fence::read`]). A
+/// run is lines of one list outside any code fence: a fence ends a run, and
+/// the list's lines after it start another. Any other heading ends the
+/// list. A list with no lines is one empty run, so its heading is still
+/// read.
 fn unreleased_runs(target: &[u8]) -> Option<Vec<Run<'_>>> {
-    let mut fence = Fence::default();
-    let mut headings = 0_usize;
-    let mut inside = false;
+    let mut section = UnreleasedReader::default();
     let mut runs: Vec<Run<'_>> = Vec::new();
     // The heading of the list that the next line stands in, and whether a
     // fence since its last line makes that line start a run of its own.
     let mut list: Option<&[u8]> = None;
     let mut split = false;
     for line in target.split_inclusive(|byte| *byte == b'\n') {
-        match fence.read(line) {
+        match section.read(line) {
             Kind::Section => {
-                inside = is_unreleased_heading(line);
-                headings += usize::from(inside);
-                if headings > 1 {
+                if section.headings > 1 {
                     return None;
                 }
                 list = None;
             }
             Kind::List => {
-                list = inside.then(|| first_line(line));
+                list = section.inside.then(|| first_line(line));
                 if let Some(heading) = list {
                     runs.push(Run {
                         heading,
@@ -746,49 +769,40 @@ fn unreleased_runs(target: &[u8]) -> Option<Vec<Run<'_>>> {
             }
         }
     }
-    (headings == 1).then_some(runs)
+    section.one().then_some(runs)
 }
 
 /// Each `### ` heading line that the one `[Unreleased]` section of
 /// `content`, a release log, holds more than once, and how many times.
 ///
 /// A heading is its line without the line terminator ([`first_line`]), in
-/// the order the section first holds each. The section is read as
-/// [`unreleased_runs`] reads it ([`Fence::read`]): a `### ` line inside a
-/// code fence is no heading, and a file with no `## [Unreleased]` heading
-/// line, or more than one, has no one section and holds none. Every `### `
-/// heading in the section is a sibling of the others, as markdownlint's
-/// `MD024` rule with `siblings_only` reads them. A heading is the same only
-/// where its text is the same: one that differs by case or by a trailing
-/// space is another heading. Whoever placed the lines, a union, a clean
-/// merge, a member or a person, every release write and every `adopt` that
-/// records a tree names each heading here and changes no line for it
-/// ([`crate::jj::repeated_headings`]).
+/// the order the section first holds each. The section is the one that
+/// [`UnreleasedReader`] reads, as for [`unreleased_runs`]: a `### ` line
+/// inside a code fence is no heading, and a file with no `## [Unreleased]`
+/// heading line, or more than one, has no one section and holds none.
+/// Every `### ` heading in the section is a sibling of the others, as
+/// markdownlint's `MD024` rule with `siblings_only` reads them. A heading
+/// is the same only where its text is the same: one that differs by case
+/// or by a trailing space is another heading. Whoever placed the lines, a
+/// union, a clean merge, a member or a person, every release write and
+/// every `adopt` that records a tree names each heading here and changes no
+/// line for it ([`crate::jj::repeated_headings`]).
 pub fn repeated_headings(content: &[u8]) -> Vec<(&[u8], usize)> {
-    let mut fence = Fence::default();
-    let mut unreleased = 0_usize;
-    let mut inside = false;
+    let mut section = UnreleasedReader::default();
     let mut counts: HashMap<&[u8], usize> = HashMap::new();
     // Each heading once, in the order the section first holds it.
     let mut order: Vec<&[u8]> = Vec::new();
     for line in content.split_inclusive(|byte| *byte == b'\n') {
-        match fence.read(line) {
-            Kind::Section => {
-                inside = is_unreleased_heading(line);
-                unreleased += usize::from(inside);
+        if section.read(line) == Kind::List && section.inside {
+            let heading = first_line(line);
+            let count = counts.entry(heading).or_insert(0);
+            if *count == 0 {
+                order.push(heading);
             }
-            Kind::List if inside => {
-                let heading = first_line(line);
-                let count = counts.entry(heading).or_insert(0);
-                if *count == 0 {
-                    order.push(heading);
-                }
-                *count += 1;
-            }
-            Kind::List | Kind::Code | Kind::Text => {}
+            *count += 1;
         }
     }
-    if unreleased != 1 {
+    if !section.one() {
         return Vec::new();
     }
     order

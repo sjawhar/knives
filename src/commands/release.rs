@@ -9,7 +9,7 @@
 //! as their union, and refuses while the release in hand carries a change
 //! knives did not write or adopt, printing the steps that record it. Every one
 //! of them writes locally only, and none of them pushes.
-// allow: SIZE_OK: 5470 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
+// allow: SIZE_OK: 5575 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -4945,23 +4945,89 @@ pub fn conflict_guidance(release: &str, files: &[String], unions: &[jj::UnionedF
     lines.join("\n")
 }
 
+/// What a release write prints about the tree it wrote.
+///
+/// That tree is `commit`, written under `release` with `unions`, read from
+/// one opening of the repository at `path`: the conflict report
+/// ([`conflict_report`]), then a line for each `### ` heading that a
+/// release log of the tree holds more than once in its one `[Unreleased]`
+/// section ([`report_repeated_headings`]). A command that writes the
+/// release more than once prints the conflict report of each write, and
+/// those headings once, after its last write.
+pub fn written_report(
+    path: &Path,
+    release: &str,
+    commit: &CommitId,
+    unions: &[jj::UnionedFile],
+) -> String {
+    let revision = commit.as_str();
+    let (mut report, headings) = match Repo::open(path) {
+        Ok(opened) => (
+            conflict_report(
+                release,
+                opened.conflicted_files(revision).as_deref(),
+                unions,
+            ),
+            heading_report(opened.repeated_headings(revision).as_deref()),
+        ),
+        Err(error) => (
+            conflict_report(release, Err(&error), unions),
+            heading_report(Err(&error)),
+        ),
+    };
+    for line in headings {
+        report.push('\n');
+        report.push_str(&line);
+    }
+    report
+}
+
+/// The lines a release write prints about the files its tree leaves
+/// conflicted.
+///
+/// They are `conflicts` as jj read them, in [`conflict_guidance`]'s words,
+/// or the error jj gave. The error is escaped: it quotes jj, the store and
+/// the paths in the tree.
+pub fn conflict_report(
+    release: &str,
+    conflicts: Result<&[String], &jj::JjError>,
+    unions: &[jj::UnionedFile],
+) -> String {
+    match conflicts {
+        Ok(files) => conflict_guidance(release, files, unions),
+        Err(error) => format!(
+            "  could not list conflicts: {}",
+            crate::ledger::problem_human_text(&error.to_string())
+        ),
+    }
+}
+
 /// Print one line for each `### ` heading that a release log of `commit`'s
 /// tree holds more than once in its one `[Unreleased]` section.
 ///
 /// A release command calls it after it wrote or recorded that tree
-/// ([`jj::repeated_headings`]). Every release log in the tree is read,
-/// changed or not, and whoever placed its lines: a clean merge, a member or
-/// a person. A heading that the union's own line names as left twice
-/// inside that one `[Unreleased]` section is named here too. knives changes
-/// no line for it: a person joins the lists before the release is pushed.
+/// ([`jj::repeated_headings`]), or prints the lines in its
+/// [`written_report`]. Every release log in the tree is read, changed or
+/// not, and whoever placed its lines: a clean merge, a member or a person.
+/// A heading that the union's own line names as left twice inside that one
+/// `[Unreleased]` section is named here too. knives changes no line for it:
+/// a person joins the lists before the release is pushed.
 pub fn report_repeated_headings(path: &Path, commit: &CommitId) {
-    match jj::repeated_headings(path, commit.as_str()) {
-        Ok(repeated) => {
-            for line in repeated_heading_lines(&repeated) {
-                println!("{line}");
-            }
-        }
-        Err(error) => println!("  could not read the release logs for repeated headings: {error}"),
+    for line in heading_report(jj::repeated_headings(path, commit.as_str()).as_deref()) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`report_repeated_headings`] prints: those of `repeated` as jj
+/// read them ([`repeated_heading_lines`]), or the error jj gave, escaped as
+/// [`conflict_report`] escapes it.
+fn heading_report(repeated: Result<&[jj::RepeatedHeadings], &jj::JjError>) -> Vec<String> {
+    match repeated {
+        Ok(repeated) => repeated_heading_lines(repeated),
+        Err(error) => vec![format!(
+            "  could not read the release logs for repeated headings: {}",
+            crate::ledger::problem_human_text(&error.to_string())
+        )],
     }
 }
 
@@ -5133,6 +5199,31 @@ mod conflict_tests {
                 "  docs/RELEASE_NOTES.md: [Unreleased] holds `### Fixed` twice; knives changed no \
                  line for it; join them by hand before you push",
             ]
+        );
+    }
+
+    #[test]
+    fn a_jj_error_in_the_conflict_report_reaches_the_terminal_escaped() {
+        // Given: an error jj gave, whose text holds an escape sequence and a
+        // bell, as the store's text or a path in the tree may.
+        let error = jj::JjError::Revision {
+            revision: "release/2026-08-30".to_owned(),
+            detail: "no such commit\u{1b}[2J\u{7}".to_owned(),
+        };
+
+        // When: the conflict report and the repeated-heading lines name it.
+        let conflicts = conflict_report("release/2026-08-30", Err(&error), &[]);
+        let headings = heading_report(Err(&error));
+
+        // Then: each names the error with its control characters escaped.
+        let shown =
+            "could not resolve revision `release/2026-08-30`: no such commit\u{fffd}[2J\u{fffd}";
+        assert_eq!(conflicts, format!("  could not list conflicts: {shown}"));
+        assert_eq!(
+            headings,
+            [format!(
+                "  could not read the release logs for repeated headings: {shown}"
+            )]
         );
     }
 }

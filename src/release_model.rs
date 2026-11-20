@@ -389,10 +389,8 @@ pub fn releases_of_every_series(
             by_commit.entry(commit).or_default().extend(names);
         }
         if series.stacked() {
-            for name in recorded_release_names(ledger, &scheme) {
-                for write in recorded_writes(ledger, name) {
-                    recorded.entry(write.commit).or_default().insert(name);
-                }
+            for write in series_writes(ledger, &scheme, None) {
+                recorded.entry(write.commit).or_default().insert(write.name);
             }
         }
     }

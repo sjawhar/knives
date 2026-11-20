@@ -2158,9 +2158,9 @@ fn a_cut_names_include_for_a_previous_cut_member_and_the_newest_write_for_one_on
     let output = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
 
     // Then: it is refused, naming `feat/gamma` with the previous cut and
-    // `feat/beta` with the newest write, and each one's remedy: `include`
-    // for the previous cut's member, and the move to the newest write,
-    // named, for the member only that write holds.
+    // `feat/beta` with the newest write, and each one's remedy: the move to
+    // the newest write, named, for the member only that write holds, then
+    // `include` for the previous cut's member.
     let out = both_streams(&output);
     assert_eq!(output.status.code(), Some(3), "{out}");
     assert!(
@@ -2181,15 +2181,46 @@ fn a_cut_names_include_for_a_previous_cut_member_and_the_newest_write_for_one_on
     );
     assert!(
         out.contains(&format!(
-            "  the candidate was discarded; `knives release include <branch>` restores a member \
-             the previous cut recorded; fetch, then move release/2026-08-04 to {}, its newest \
-             recorded write: `jj bookmark set release/2026-08-04 -r {} --allow-backwards`, or \
+            "  the candidate was discarded; fetch, then move release/2026-08-04 to {}, its newest \
+             recorded write: `jj bookmark set release/2026-08-04 -r {} --allow-backwards`; \
+             `knives release include <branch>` restores a member the previous cut recorded, or \
              re-run with --allow-drop to state the drop is intended\n",
             newest.short(),
             newest.short()
         )),
         "{out}"
     );
+
+    // When: the remedy is followed in the order it is printed: the release
+    // moved to its newest write, then `feat/gamma` included.
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "release/2026-08-04",
+        "-r",
+        newest.as_str(),
+        "--allow-backwards",
+    ]);
+    let restored = knives_release(&lab, &home, &["include", "feat/gamma"]);
+
+    // Then: the include is written on the newest write, not beside it, so
+    // the release holds all three members.
+    assert!(restored.status.success(), "{}", both_streams(&restored));
+    let members = ["feat/alpha", "feat/beta", "feat/gamma"].map(|branch| commit_at(&lab, branch));
+    let parents = release_parents(&lab, "release/2026-08-04");
+    assert_eq!(parents.len(), 3, "{parents:?}");
+    assert!(
+        members.iter().all(|member| parents.contains(member)),
+        "{parents:?}"
+    );
+
+    // When: the next release is cut again.
+    let again = knives_release(&lab, &home, &["cut", "release/2026-08-05"]);
+
+    // Then: it goes ahead, with the three members.
+    assert!(again.status.success(), "{}", both_streams(&again));
+    let cut = release_parents(&lab, "release/2026-08-05");
+    assert!(members.iter().all(|member| cut.contains(member)), "{cut:?}");
 }
 
 #[test]

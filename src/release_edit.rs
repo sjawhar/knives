@@ -853,14 +853,10 @@ fn apply_edit(
         inline_human_text(delta)
     );
     report_replaced(repo, &release.name, &written);
-    match knives::jj::conflicted_files(&fork.checkout.path, created.as_str()) {
-        Ok(files) => println!(
-            "{}",
-            release::conflict_guidance(&release.name, &files, &written.unions)
-        ),
-        Err(error) => println!("  could not list conflicts: {error}"),
-    }
-    release::report_repeated_headings(&fork.checkout.path, created);
+    println!(
+        "{}",
+        release::written_report(&fork.checkout.path, &release.name, created, &written.unions)
+    );
     Ok(Exit::Ok)
 }
 
