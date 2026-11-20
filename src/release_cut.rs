@@ -436,35 +436,47 @@ pub(crate) fn run_release(
         // The publish rebuilds the audited tree, so the candidate's unions are
         // what ships.
         let unions = candidate.unions().to_vec();
-        let published = release::publish_cut(
-            candidate,
-            &request.name,
-            &scheme,
-            (previous_writes.commits(), Some(entry.publish_remote())),
-        )?;
-        let created = published.commit;
-        let completed = CompletedCut {
-            name: &name,
-            request: &request,
-            created: &created,
-            audit: &audit,
-            scheme: &scheme,
-            held: gate.held(),
-            check: &check,
-            stated_drop: orphaned.as_ref(),
-            unions: &unions,
-            unchecked: &unchecked,
-            composition: None,
-        };
-        record_cut_event(fork, &completed, bound)?;
-        worst = worst.worst(report_completed_cut(fork, &opened, &completed, bound)?);
-        report_hidden(
-            repo,
-            previous
-                .as_ref()
-                .map_or(name.as_str(), |(reference, _)| reference.branch().as_str()),
-            &published.hidden,
-        );
+        // The publish is the cut's write, read as soon as it is done: its
+        // repeated headings print with its report, or once after a step
+        // before the report that fails.
+        worst = release::with_last_write_headings(|last| {
+            let published = release::publish_cut(
+                candidate,
+                &request.name,
+                &scheme,
+                (previous_writes.commits(), Some(entry.publish_remote())),
+            )?;
+            let created = published.commit;
+            *last = Some(release::ReportedWrite::read(path, created.clone()));
+            let completed = CompletedCut {
+                name: &name,
+                request: &request,
+                created: &created,
+                audit: &audit,
+                scheme: &scheme,
+                held: gate.held(),
+                check: &check,
+                stated_drop: orphaned.as_ref(),
+                unions: &unions,
+                unchecked: &unchecked,
+                composition: None,
+            };
+            record_cut_event(fork, &completed, bound)?;
+            let exit = worst.worst(report_completed_cut(
+                fork,
+                &opened,
+                &completed,
+                (bound, last),
+            )?);
+            report_hidden(
+                repo,
+                previous
+                    .as_ref()
+                    .map_or(name.as_str(), |(reference, _)| reference.branch().as_str()),
+                &published.hidden,
+            );
+            Ok(exit)
+        })?;
     }
     Ok(worst)
 }
@@ -2241,7 +2253,9 @@ fn checked_committed_cut(
 /// release than that one is refused, however many levels of the stack it
 /// leaves out. Each refusal writes nothing. Only then is the local
 /// bookmark made, where no ref of the name exists, and the event recorded,
-/// which the process sends to a shared ledger before it exits.
+/// which the process sends to a shared ledger before it exits; the
+/// commit's repeated headings print once after them, even where the
+/// record fails after the bookmark was made ([`write_hand_cut`]).
 fn record_hand_cut(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
@@ -2316,9 +2330,6 @@ fn record_hand_cut(
         Ok(checked) => checked,
         Err(exit) => return Ok(exit),
     };
-    if !held.named {
-        knives::jj::set_bookmark(&fork.checkout.path, name, commit.as_str())?;
-    }
     // The event records the reading made above: a stacked release's previous
     // release first, under its label, then the members, never a parent the
     // trunk holds.
@@ -2328,34 +2339,58 @@ fn record_hand_cut(
         .map(PreviousRelease::labelled)
         .chain(composed.members.iter().cloned())
         .collect();
-    record_cut_event(
-        fork,
-        &CompletedCut {
-            name,
-            request: &release::Cut::from_carried(name.to_owned(), &composed.members),
-            created: commit,
-            audit: &checked.audit,
-            scheme: &entry.release_scheme(),
-            held: gate.held(),
-            check: &checked.check,
-            stated_drop: None,
-            // Recorded, not written: knives unioned nothing.
-            unions: &[],
-            unchecked: "",
-            composition: Some(&composition),
-        },
-        bound,
-    )?;
-    let publish_remote = entry.publish_remote();
+    let cut = CompletedCut {
+        name,
+        request: &release::Cut::from_carried(name.to_owned(), &composed.members),
+        created: commit,
+        audit: &checked.audit,
+        scheme: &entry.release_scheme(),
+        held: gate.held(),
+        check: &checked.check,
+        stated_drop: None,
+        // Recorded, not written: knives unioned nothing.
+        unions: &[],
+        unchecked: "",
+        composition: Some(&composition),
+    };
+    let unpushed = held.published.is_none();
+    release::with_last_write_headings(|last| {
+        write_hand_cut(fork, &cut, (held.named, unpushed), (bound, last))
+    })
+}
+
+/// The writes of `cut NAME --at REV` once every gate passed: the local
+/// bookmark at the commit where no ref of the name exists (`named` false),
+/// then the event; then the line that says so, with the push where the
+/// publish remote does not hold the name (`unpushed`). The first of those
+/// writes is read into `last` as soon as it is done
+/// ([`release::ReportedWrite`]), so the commit's repeated headings print
+/// once after the steps, even where the record after the bookmark fails.
+fn write_hand_cut(
+    fork: &Fork<'_>,
+    cut: &CompletedCut<'_>,
+    (named, unpushed): (bool, bool),
+    (bound, last): (Bound<'_>, &mut Option<release::ReportedWrite>),
+) -> anyhow::Result<Exit> {
+    let path = &fork.checkout.path;
+    let reported = || release::ReportedWrite::read(path, cut.created.clone());
+    if !named {
+        knives::jj::set_bookmark(path, cut.name, cut.created.as_str())?;
+        *last = Some(reported());
+    }
+    record_cut_event(fork, cut, bound)?;
+    // Where a ref of the name was there already, the record is the write.
+    if last.is_none() {
+        *last = Some(reported());
+    }
     println!(
         "{}",
         recorded_hand_cut_line(
-            repo,
-            (name, commit),
-            held.published.is_none().then_some(publish_remote)
+            &fork.name,
+            (cut.name, cut.created),
+            unpushed.then_some(fork.entry.publish_remote())
         )
     );
-    release::report_repeated_headings(&fork.checkout.path, commit);
     // A commit with no conflict leaves no replay inconclusive.
     Ok(Exit::Ok)
 }
@@ -2828,11 +2863,16 @@ fn stacked_setting(fork: &Fork<'_>) -> String {
     )
 }
 
+/// What a published and recorded cut prints, and the exit of its checks
+/// and its reap. `last` holds the cut's write, read as soon as the publish
+/// was done ([`release::with_last_write_headings`]): the report takes it out
+/// where it prints the write's conflicts and repeated headings, so those
+/// headings print there once, whatever fails after.
 fn report_completed_cut(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
     cut: &CompletedCut<'_>,
-    bound: Bound<'_>,
+    (bound, last): (Bound<'_>, &mut Option<release::ReportedWrite>),
 ) -> anyhow::Result<Exit> {
     let entry = fork.entry;
     let mut post_cut_exit = if cut.audit.inconclusive.is_empty() && !cut.check.is_inconclusive() {
@@ -2847,10 +2887,12 @@ fn report_completed_cut(
         cut.created.short(),
         cut.request.parents.len()
     );
-    println!(
-        "{}",
-        release::written_report(&fork.checkout.path, cut.name, cut.created, cut.unions)
-    );
+    if let Some(written) = last.take() {
+        println!(
+            "{}",
+            release::written_report(&written, cut.name, cut.unions)
+        );
+    }
     if let Some(first) = cut.request.parents.first() {
         let test_count = release::check_test_count(fork, cut.created, first);
         println!("{}", test_count.render());

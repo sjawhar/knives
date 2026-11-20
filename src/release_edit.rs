@@ -775,7 +775,14 @@ fn edit_release(
             uncarried,
         } => (parents, delta, uncarried),
     };
-    apply_edit(&context, fork, (&parents, &delta, uncarried.as_deref()))
+    release::with_last_write_headings(|last| {
+        apply_edit(
+            &context,
+            fork,
+            (&parents, &delta, uncarried.as_deref()),
+            last,
+        )
+    })
 }
 
 /// Write the edited release — duplicated onto its new parent set, described,
@@ -790,10 +797,17 @@ fn edit_release(
 /// history carries. Whether the release lost that content is read from the
 /// written tree: jj merges the remaining parents over their real merge base,
 /// so the content can survive, and then the drop says so instead of a loss.
+/// The release it writes is read through one opening as soon as the write
+/// is done ([`release::ReportedWrite`]) and left in `last`, the command's
+/// last write: its conflict report prints from that reading, and its
+/// repeated headings print once after the command's steps, whether the
+/// record after the write fails or not
+/// ([`release::with_last_write_headings`]).
 fn apply_edit(
     context: &EditContext<'_>,
     fork: &Fork<'_>,
     (new_parents, delta, uncarried): (&[knives::ids::CommitId], &str, Option<&str>),
+    last: &mut Option<release::ReportedWrite>,
 ) -> anyhow::Result<Exit> {
     let (repo, opened, release) = (context.repo, context.opened, context.release);
     let entry = fork.entry;
@@ -814,7 +828,11 @@ fn apply_edit(
             operation: &format!("knives: {}: {delta}", release.name),
         },
     )?;
-    let created = &written.commit;
+    let reported = &*last.insert(release::ReportedWrite::read(
+        &fork.checkout.path,
+        written.commit.clone(),
+    ));
+    let created = reported.commit();
     record_edit_event(
         fork,
         opened,
@@ -855,7 +873,7 @@ fn apply_edit(
     report_replaced(repo, &release.name, &written);
     println!(
         "{}",
-        release::written_report(&fork.checkout.path, &release.name, created, &written.unions)
+        release::conflict_report(&release.name, reported.conflicts(), &written.unions)
     );
     Ok(Exit::Ok)
 }

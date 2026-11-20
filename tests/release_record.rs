@@ -268,6 +268,63 @@ fn recording_an_absent_name_makes_its_bookmark_at_the_commit() {
 }
 
 #[test]
+fn a_record_whose_event_fails_after_it_made_the_bookmark_names_a_heading_held_twice_once() {
+    // Given: alpha, and beta, whose changelog's one `[Unreleased]` section
+    // holds `### Added` twice, merged by hand at a commit no ref names; and
+    // a state file nobody can read, which the record reads to name who
+    // records its event, after it made the bookmark.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch(
+        "feat/beta",
+        "CHANGELOG.md",
+        "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Beta's addition.\n\n### Added\n\n\
+         - An earlier addition.\n",
+    );
+    lab.jj_work([
+        "new",
+        "-r",
+        "feat/alpha",
+        "-r",
+        "feat/beta",
+        "-m",
+        "merged by hand",
+    ]);
+    lab.jj_work(["new"]);
+    let commit = commit_of(&lab, "@-");
+    let (home, _consumer) = release_test_home(&lab);
+    std::fs::write(home.path().join("state.json"), "{not json").expect("corrupt state");
+
+    // When: an anonymous terminal user records it as a name no ref holds.
+    let output = lab::without_harness_session(&mut lab::release_command(
+        &lab,
+        &home,
+        lab::ReleaseOutput::Text,
+        &["cut", RELEASE, "--at", commit.as_str()],
+    ))
+    .env_remove("KNIVES_OWNER")
+    .output()
+    .expect("run knives release cut --at");
+
+    // Then: the command exits with the record's failure, the bookmark it
+    // made names the commit, and one line names the file and the heading,
+    // for that commit.
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    assert!(out.contains("state.json"), "{out}");
+    assert_eq!(commit_at(&lab, RELEASE), commit, "{out}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches("[Unreleased] holds").count(), 1, "{out}");
+    assert!(
+        stdout.contains(
+            "  CHANGELOG.md: [Unreleased] holds `### Added` twice; knives changed no line for \
+             it; join them by hand before you push\n"
+        ),
+        "{out}"
+    );
+}
+
+#[test]
 fn the_push_a_record_prints_quotes_a_name_the_shell_would_read_apart() {
     // Given: a release merged by hand that no ref names, and a name whose
     // label holds a quote and a dollar sign, as the series' grammar allows.

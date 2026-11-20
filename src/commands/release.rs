@@ -9,7 +9,7 @@
 //! as their union, and refuses while the release in hand carries a change
 //! knives did not write or adopt, printing the steps that record it. Every one
 //! of them writes the release locally only, and none of them pushes it.
-// allow: SIZE_OK: 5636 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
+// allow: SIZE_OK: 5674 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -4951,24 +4951,48 @@ pub fn conflict_guidance(release: &str, files: &[String], unions: &[jj::UnionedF
     lines.join("\n")
 }
 
-/// What a release write prints about the tree it wrote.
+/// Run the steps of a command that writes the release, then print the
+/// repeated `### ` headings of its last write once.
 ///
-/// That tree is `commit`, written under `release` with `unions`, read
-/// through one opening of the repository at `path` ([`ReportedWrite`]): the
+/// `steps` gets the slot for the command's last write. Each write is read
+/// into it as soon as it is done ([`ReportedWrite::read`]), so a step after
+/// the write that fails still leaves it there. A step that prints the
+/// write's report with its headings takes the write out of the slot
+/// ([`written_report`]). After the steps, whether they end or fail, the
+/// write still in the slot prints a line for each `### ` heading that a
+/// release log of its tree holds more than once in its one `[Unreleased]`
+/// section ([`report_repeated_headings`]). The steps' result is returned as
+/// it is. So a command prints those headings once, for the release its
+/// last write left.
+pub fn with_last_write_headings<T>(
+    steps: impl FnOnce(&mut Option<ReportedWrite>) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut last = None;
+    let finished = steps(&mut last);
+    if let Some(last) = &last {
+        last.report_headings();
+    }
+    finished
+}
+
+/// What a cut prints about the tree it wrote.
+///
+/// That tree is `written`'s, written under `release` with `unions` and read
+/// through the one opening made after the write ([`ReportedWrite`]): the
 /// conflict report ([`conflict_report`]), then a line for each `### `
 /// heading that a release log of the tree holds more than once in its one
-/// `[Unreleased]` section ([`report_repeated_headings`]). A command that
-/// writes the release more than once prints those headings once, after its
-/// last write, and the conflict report of each write it reads through
-/// [`ReportedWrite`]; a rebase reports the unions of its first write, the
-/// shed of stale bases, in the report of the release it re-describes.
+/// `[Unreleased]` section ([`report_repeated_headings`]). The cut takes its
+/// write out of the slot of [`with_last_write_headings`] to print it, so
+/// those headings print here and not again. A command that writes the
+/// release more than once prints the conflict report of each write it
+/// reads through [`ReportedWrite`], and the headings of its last write
+/// only; a rebase reports the unions of its first write, the shed of stale
+/// bases, in the report of the release it re-describes.
 pub fn written_report(
-    path: &Path,
+    written: &ReportedWrite,
     release: &str,
-    commit: &CommitId,
     unions: &[jj::UnionedFile],
 ) -> String {
-    let written = ReportedWrite::read(path, commit.clone());
     let mut report = conflict_report(release, written.conflicts(), unions);
     for line in written.heading_lines() {
         report.push('\n');
@@ -4977,32 +5001,46 @@ pub fn written_report(
     report
 }
 
-/// A release a command wrote, read through one opening of the repository
-/// after the write.
+/// A release a command wrote, read through one opening of the repository as
+/// soon as the write is done.
 ///
-/// The opening lists the files its tree leaves conflicted, which the
-/// write's own report prints ([`conflict_report`]), and reads its repeated
-/// `### ` headings when they are asked for, which a command prints once,
-/// after its last write ([`report_repeated_headings`]). [`written_report`]
-/// reads the write of a cut or an edit through it, and a rebase the release
-/// it re-describes after the move and the release its drop writes.
+/// The opening lists the files its tree leaves conflicted when they are
+/// asked for, which the write's own report prints ([`conflict_report`]),
+/// and reads its repeated `### ` headings, which a command prints once, for
+/// its last write ([`with_last_write_headings`]). A cut and an edit read
+/// their write through it; a rebase its shed of stale bases, the release
+/// its move leaves, the release it re-describes after the move and the
+/// release its drop writes; and `cut --at` the commit it records.
 #[derive(Debug)]
 pub struct ReportedWrite {
     commit: CommitId,
-    /// The opening with the conflicted files read through it, or the error
-    /// the opening gave.
-    read: Result<(Repo, Result<Vec<String>, jj::JjError>), jj::JjError>,
+    /// The opening, or the error it gave.
+    opened: Result<Repo, jj::JjError>,
+    /// The files the tree leaves conflicted, listed through the opening
+    /// the first time they are asked for, or the error jj gave.
+    conflicts: std::cell::OnceCell<Result<Vec<String>, jj::JjError>>,
 }
 
 impl ReportedWrite {
-    /// Open the repository at `path` once, after the write of `commit`, and
-    /// list the files its tree leaves conflicted.
+    /// Open the repository at `path` once, after the write of `commit`.
     pub fn read(path: &Path, commit: CommitId) -> Self {
-        let read = Repo::open(path).map(|opened| {
-            let conflicts = opened.conflicted_files(commit.as_str());
-            (opened, conflicts)
-        });
-        Self { commit, read }
+        Self {
+            commit,
+            opened: Repo::open(path),
+            conflicts: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Open the repository at `path` once, after a write that moved `name`,
+    /// and read the commit `name` holds through that opening.
+    pub fn read_name(path: &Path, name: &str) -> Result<Self, jj::JjError> {
+        let opened = Repo::open(path)?;
+        let commit = opened.resolve_commit(name)?;
+        Ok(Self {
+            commit,
+            opened: Ok(opened),
+            conflicts: std::cell::OnceCell::new(),
+        })
     }
 
     /// The commit the write made.
@@ -5011,21 +5049,22 @@ impl ReportedWrite {
     }
 
     /// The repository as the write left it, or the error its opening gave.
-    pub fn opened(&self) -> Result<&Repo, &jj::JjError> {
-        self.read.as_ref().map(|(opened, _)| opened)
+    pub const fn opened(&self) -> Result<&Repo, &jj::JjError> {
+        self.opened.as_ref()
     }
 
     /// The files the tree leaves conflicted, or the error jj gave.
     pub fn conflicts(&self) -> Result<&[String], &jj::JjError> {
-        self.read
-            .as_ref()
-            .and_then(|(_, conflicts)| conflicts.as_deref())
+        let opened = self.opened.as_ref()?;
+        self.conflicts
+            .get_or_init(|| opened.conflicted_files(self.commit.as_str()))
+            .as_deref()
     }
 
     /// Print a line for each `### ` heading that a release log of the tree
     /// holds more than once in its one `[Unreleased]` section, read through
     /// the same opening.
-    pub fn report_headings(&self) {
+    fn report_headings(&self) {
         for line in self.heading_lines() {
             println!("{line}");
         }
@@ -5033,10 +5072,8 @@ impl ReportedWrite {
 
     /// The lines [`Self::report_headings`] prints ([`heading_report`]).
     fn heading_lines(&self) -> Vec<String> {
-        match &self.read {
-            Ok((opened, _)) => {
-                heading_report(opened.repeated_headings(self.commit.as_str()).as_deref())
-            }
+        match &self.opened {
+            Ok(opened) => heading_report(opened.repeated_headings(self.commit.as_str()).as_deref()),
             Err(error) => heading_report(Err(error)),
         }
     }
@@ -5065,13 +5102,14 @@ pub fn conflict_report(
 /// Print one line for each `### ` heading that a release log of `commit`'s
 /// tree holds more than once in its one `[Unreleased]` section.
 ///
-/// A release command calls it after it wrote or recorded that tree
-/// ([`jj::repeated_headings`]), or prints the lines in its
-/// [`written_report`]. Every release log in the tree is read, changed or
-/// not, and whoever placed its lines: a clean merge, a member or a person.
-/// A heading that the union's own line names as left twice inside that one
-/// `[Unreleased]` section is named here too. knives changes no line for it:
-/// a person joins the lists before the release is pushed.
+/// `adopt` and the record of a published composition call it after they
+/// recorded that tree ([`jj::repeated_headings`]); a command that writes
+/// the release prints the same lines for its last write
+/// ([`with_last_write_headings`]). Every release log in the tree is read,
+/// changed or not, and whoever placed its lines: a clean merge, a member or
+/// a person. A heading that the union's own line names as left twice inside
+/// that one `[Unreleased]` section is named here too. knives changes no line
+/// for it: a person joins the lists before the release is pushed.
 pub fn report_repeated_headings(path: &Path, commit: &CommitId) {
     for line in heading_report(jj::repeated_headings(path, commit.as_str()).as_deref()) {
         println!("{line}");

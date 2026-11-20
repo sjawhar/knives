@@ -906,6 +906,111 @@ fn a_rebase_whose_move_fails_after_its_shed_write_names_a_heading_held_twice_onc
     );
 }
 
+/// Put a `jj` in `shim`, ahead of the real one on `PATH`, that moves the
+/// release on `jj rebase -b` as asked, then tags the release it moved in
+/// `work`. jj's default rule pins a tagged commit, so the re-describe that
+/// follows the move refuses to rewrite it. Every other call reaches the
+/// real `jj`.
+fn install_jj_pinning_the_moved_release(
+    shim: &std::path::Path,
+    work: &std::path::Path,
+    release: &str,
+) {
+    let real = std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+        .map(|directory| directory.join("jj"))
+        .find(|candidate| candidate.is_file())
+        .expect("find jj on PATH");
+    let (real, work) = (real.display(), work.display());
+    let jj = shim.join("jj");
+    std::fs::write(
+        &jj,
+        format!(
+            "#!/bin/sh\nseen=\nfor argument in \"$@\"; do\n  if [ \"$seen\" = rebase ] && [ \
+             \"$argument\" = -b ]; then\n    '{real}' \"$@\" || exit\n    exec '{real}' \
+             --repository '{work}' tag set planted-pin -r '{release}'\n  fi\n  [ \"$argument\" \
+             = rebase ] && seen=rebase\ndone\nexec '{real}' \"$@\"\n"
+        ),
+    )
+    .expect("write the jj shim");
+    let mut permissions = std::fs::metadata(&jj)
+        .expect("read the jj shim's permissions")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&jj, permissions).expect("make the jj shim executable");
+}
+
+#[test]
+fn a_rebase_whose_re_describe_fails_after_its_move_names_a_heading_held_twice_once() {
+    // Given: a release whose parents are its members alone, so the rebase
+    // writes nothing before it moves; beta, whose changelog's one
+    // `[Unreleased]` section holds `### Added` twice; an advanced upstream;
+    // and a `jj` that tags the release once it moved it, so the re-describe
+    // after the move fails.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch(
+        "feat/beta",
+        "CHANGELOG.md",
+        "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Beta's addition.\n\n### Added\n\n\
+         - An earlier addition.\n",
+    );
+    lab.jj_work(["new", "-r", "feat/alpha", "-r", "feat/beta", "-m", release]);
+    lab.jj_work(["bookmark", "create", release, "-r", "@"]);
+    lab.jj_work(["new"]);
+    let (home, _consumer) = release_test_home(&lab);
+    lab.advance_upstream("upstream advance\n");
+    let before = release_parents(&lab, release);
+    let shim = tempfile::tempdir().expect("create the shim directory");
+    install_jj_pinning_the_moved_release(shim.path(), &lab.work, release);
+
+    // When: the rebase moves the release, and the re-describe refuses it.
+    let output = release_command(
+        &lab,
+        &home,
+        ReleaseOutput::Text,
+        &["rebase", "main@upstream"],
+    )
+    .env("PATH", path_with_gh_shim(shim.path()))
+    .output()
+    .expect("run knives release rebase");
+
+    // Then: the command exits with the failure; the release is the one the
+    // move left, on the moved members and never re-described; and one line
+    // names the file and the heading, for that release.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stderr.contains("pinned by tag planted-pin"), "{stderr}");
+    let moved = vec![commit_at(&lab, "feat/alpha"), commit_at(&lab, "feat/beta")];
+    assert_eq!(release_parents(&lab, release), moved, "{stdout}");
+    assert!(
+        moved.iter().all(|member| !before.contains(member)),
+        "{stdout}"
+    );
+    assert!(
+        !lab.revision(&lab.work, release, "description")
+            .contains("rebased onto"),
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("[Unreleased] holds").count(),
+        1,
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(
+            "  CHANGELOG.md: [Unreleased] holds `### Added` twice; knives changed no line for \
+             it; join them by hand before you push\n"
+        ),
+        "{stdout}"
+    );
+}
+
 /// Every event the fork's ledger records about `name`, oldest first.
 fn events_about(home: &tempfile::TempDir, name: &str) -> Vec<knives::ledger::Entry> {
     knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))

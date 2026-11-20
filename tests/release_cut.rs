@@ -548,6 +548,61 @@ fn a_release_plan_reads_nothing_about_who_is_asking() {
 }
 
 #[test]
+fn a_cut_whose_record_fails_after_its_write_names_a_heading_held_twice_once() {
+    // Given: alpha; beta, whose changelog's one `[Unreleased]` section holds
+    // `### Added` twice; and a state file nobody can read, which the cut
+    // reads to name who records its event, after it wrote the release.
+    let lab = lab::Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch(
+        "feat/beta",
+        "CHANGELOG.md",
+        "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Beta's addition.\n\n### Added\n\n\
+         - An earlier addition.\n",
+    );
+    let (home, _consumer) = release_test_home(&lab);
+    std::fs::write(home.path().join("state.json"), "{not json").expect("corrupt state");
+
+    // When: an anonymous terminal user cuts the release.
+    let output = lab::without_harness_session(&mut release_command(
+        &lab,
+        &home,
+        ReleaseOutput::Text,
+        &["cut", release],
+    ))
+    .env_remove("KNIVES_OWNER")
+    .output()
+    .expect("run knives release cut");
+
+    // Then: the command exits with the record's failure, the release is the
+    // cut's write, and one line names the file and the heading, for it.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stderr.contains("state.json"), "{stderr}");
+    let parents = release_parents(&lab, release);
+    assert_eq!(parents.len(), 2, "{stdout}");
+    assert!(parents.contains(&commit_at(&lab, "feat/beta")), "{stdout}");
+    assert_eq!(
+        stdout.matches("[Unreleased] holds").count(),
+        1,
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(
+            "  CHANGELOG.md: [Unreleased] holds `### Added` twice; knives changed no line for \
+             it; join them by hand before you push\n"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn the_base_parent_is_not_stale_when_a_member_rebases_onto_the_advanced_trunk() {
     // Given: a release whose first parent is the bookmarkless shared base, and
     // one member rebased past it onto the advanced upstream — legitimate
