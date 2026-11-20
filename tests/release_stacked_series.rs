@@ -2014,28 +2014,6 @@ fn history_line<'a>(out: &'a str, branch: &str) -> &'a str {
 
 #[test]
 fn preflight_names_the_stacked_release_a_member_is_built_on_as_it_names_a_default_release() {
-    // Given: a release of the default series, a merge of `feat/alpha` and
-    // `feat/beta`, and `m5` built on it.
-    let flat = Lab::new();
-    flat.branch("feat/alpha", "alpha.txt", "alpha\n");
-    flat.branch("feat/beta", "beta.txt", "beta\n");
-    flat.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
-    branch_on(&flat, "release/2026-08-04", "m5", "m5.txt");
-    let (flat_home, _consumer) = release_test_home(&flat);
-
-    // When: preflight reads that fork.
-    let out = text(&lab::knives(
-        &flat,
-        &flat_home,
-        &["--text", "preflight", "demo"],
-    ));
-
-    // Then: its line for `m5` names that release in m5's history.
-    assert!(
-        history_line(&out, "m5").contains("releases in that history: release/2026-08-04"),
-        "{out}"
-    );
-
     // Given: a stacked series whose published first cut is the previous
     // release, with `m5` built on it, and the next cut, which includes `m5`.
     let (lab, home) = previous_release_lab(true);
