@@ -9,7 +9,7 @@
 //! as their union, and refuses while the release in hand carries a change
 //! knives did not write or adopt, printing the steps that record it. Every one
 //! of them writes the release locally only, and none of them pushes it.
-// allow: SIZE_OK: 5674 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
+// allow: SIZE_OK: 5673 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -4952,18 +4952,13 @@ pub fn conflict_guidance(release: &str, files: &[String], unions: &[jj::UnionedF
 }
 
 /// Run the steps of a command that writes the release, then print the
-/// repeated `### ` headings of its last write once.
+/// repeated `### ` headings of its last write once (README.md, "Release workflow").
 ///
-/// `steps` gets the slot for the command's last write. Each write is read
-/// into it as soon as it is done ([`ReportedWrite::read`]), so a step after
-/// the write that fails still leaves it there. A step that prints the
-/// write's report with its headings takes the write out of the slot
-/// ([`written_report`]). After the steps, whether they end or fail, the
-/// write still in the slot prints a line for each `### ` heading that a
-/// release log of its tree holds more than once in its one `[Unreleased]`
-/// section ([`report_repeated_headings`]). The steps' result is returned as
-/// it is. So a command prints those headings once, for the release its
-/// last write left.
+/// `steps` gets the slot for the command's last write ([`ReportedWrite`]).
+/// A step that prints a write's report with its headings takes the write out
+/// of the slot. After the steps, whether they end or fail, the write still
+/// in the slot prints its headings, and the steps' result is returned as it
+/// is.
 pub fn with_last_write_headings<T>(
     steps: impl FnOnce(&mut Option<ReportedWrite>) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
@@ -4983,11 +4978,7 @@ pub fn with_last_write_headings<T>(
 /// heading that a release log of the tree holds more than once in its one
 /// `[Unreleased]` section ([`report_repeated_headings`]). The cut takes its
 /// write out of the slot of [`with_last_write_headings`] to print it, so
-/// those headings print here and not again. A command that writes the
-/// release more than once prints the conflict report of each write it
-/// reads through [`ReportedWrite`], and the headings of its last write
-/// only; a rebase reports the unions of its first write, the shed of stale
-/// bases, in the report of the release it re-describes.
+/// those headings print here and not again.
 pub fn written_report(
     written: &ReportedWrite,
     release: &str,
@@ -5006,11 +4997,9 @@ pub fn written_report(
 ///
 /// The opening lists the files its tree leaves conflicted when they are
 /// asked for, which the write's own report prints ([`conflict_report`]),
-/// and reads its repeated `### ` headings, which a command prints once, for
-/// its last write ([`with_last_write_headings`]). A cut and an edit read
-/// their write through it; a rebase its shed of stale bases, the release
-/// its move leaves, the release it re-describes after the move and the
-/// release its drop writes; and `cut --at` the commit it records.
+/// and reads its repeated `### ` headings ([`with_last_write_headings`]).
+/// Each release write is read through it as soon as it is written; when
+/// those headings print is README.md's rule ("Release workflow").
 #[derive(Debug)]
 pub struct ReportedWrite {
     /// The opening and the commit read through it, or the error that the

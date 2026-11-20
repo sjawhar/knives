@@ -186,15 +186,11 @@ pub(crate) fn run_rebase(
         println!("{repo}: {shown_release} has no member parents to move; nothing to rebase");
         return Ok(Exit::Incomplete);
     }
-    // Every refusal is behind. From here on the command writes, and each step
-    // runs with its last write in `last` ([`release::with_last_write_headings`]):
-    // the write that sheds the stale bases and leaves the carriers out, when
-    // there is one; the release the move leaves; the release the re-describe
-    // writes; the drop's, once that write is done. Each is read as soon as it
-    // is written, and at the end the repeated headings of the last of them
-    // print once, whether the steps end or fail. Only the re-describe and the
-    // drop print a conflict report; the re-describe reports the shed write's
-    // unions.
+    // Every refusal is behind. From here on the command writes; each write is
+    // read into `last` as soon as it is written, and its headings print as
+    // README.md's "Release workflow" says ([`release::with_last_write_headings`]).
+    // Only the re-describe and the drop print a conflict report; the
+    // re-describe reports the shed write's unions.
     release::with_last_write_headings(|last| {
         let shed_write = shed_stale_bases(
             (fork, &mut *last),
