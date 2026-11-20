@@ -302,7 +302,7 @@ pub(crate) fn run_rebase(
                 inline_human_text(name)
             );
         }
-        let (rebased_commit, rebased) = report_rebased_release(
+        let (rebased_commit, rebased, recorded) = report_rebased_release(
             fork,
             RebasedRelease {
                 name: &release_name,
@@ -316,8 +316,11 @@ pub(crate) fn run_rebase(
             bound,
             last,
         )?;
-        // After the provenance is recorded, so a failed cleanup cannot leave
-        // the rebased release described with its pre-rebase parents.
+        // After the re-describe, so a failed cleanup cannot leave the rebased
+        // release described with its pre-rebase parents. The cleanup runs
+        // even when the record of the re-describe's event failed; that error
+        // is returned after it, before the drop, with the cleanup's error
+        // added when the cleanup fails too.
         let mut originals = tagged;
         for commit in restored
             .iter()
@@ -331,29 +334,43 @@ pub(crate) fn run_rebase(
         // The release and its earlier writes as the rebase's write left
         // them, read through the opening its conflict report read: nothing
         // wrote to the repository since.
-        let rebased_repo = rebased
+        let cleaned = rebased
             .opened()
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-        let cleaned = knives::jj::abandon_tagged_copies(
-            path,
-            &originals,
-            (
-                &onto,
-                knives::jj::RebasedName {
-                    name: &release_name,
-                    publish_remote: entry.publish_remote(),
-                    commit: &rebased_commit,
-                    earlier: EarlierWrites::read(
-                        rebased_repo,
-                        &release_name,
-                        &ledger,
-                        plan.published.as_ref(),
-                    )?
-                    .commits(),
-                },
-            ),
-            &format!("knives: {release_name}: abandon rebased copies of earlier releases"),
-        )?;
+            .map_err(|error| anyhow::anyhow!("{error}"))
+            .and_then(|rebased_repo| {
+                let earlier = EarlierWrites::read(
+                    rebased_repo,
+                    &release_name,
+                    &ledger,
+                    plan.published.as_ref(),
+                )?;
+                Ok(knives::jj::abandon_tagged_copies(
+                    path,
+                    &originals,
+                    (
+                        &onto,
+                        knives::jj::RebasedName {
+                            name: &release_name,
+                            publish_remote: entry.publish_remote(),
+                            commit: &rebased_commit,
+                            earlier: earlier.commits(),
+                        },
+                    ),
+                    &format!("knives: {release_name}: abandon rebased copies of earlier releases"),
+                )?)
+            });
+        let cleaned = match cleaned {
+            Ok(cleaned) => cleaned,
+            Err(cleanup) => {
+                return Err(match recorded {
+                    Ok(()) => cleanup,
+                    Err(recorded) => recorded.context(format!(
+                        "could not clean up the rebase's copies: {cleanup:#}; before that, \
+                         could not record the rebase"
+                    )),
+                });
+            }
+        };
         report_tagged_copies(
             repo,
             &cleaned.copies,
@@ -361,6 +378,7 @@ pub(crate) fn run_rebase(
             &release_name,
         );
         report_hidden(repo, &release_name, &cleaned.hidden);
+        recorded?;
         if no_drop {
             return Ok(Exit::Ok);
         }
@@ -1007,17 +1025,23 @@ struct RebasedRelease<'a> {
 
 /// Re-describe the rebased release so the recorded provenance names the
 /// rewritten parents, writing in the same operation the union of each release
-/// log the rebase left conflicted, and report what moved. The release it
-/// writes is read through one opening as soon as the write is done
-/// ([`release::ReportedWrite`]) and left in `last`, the command's last
+/// log the rebase left conflicted, record its event, and report what moved.
+/// The release it writes is read through one opening as soon as the write is
+/// done ([`release::ReportedWrite`]) and left in `last`, the command's last
 /// write, so a step after the write that fails still leaves it there; it
-/// gives that write's commit and its reading.
+/// gives that write's commit, its reading, and the record's result. A failed
+/// record stops neither the report nor the caller's cleanup of the rebase's
+/// copies: the caller returns its error after that cleanup.
 fn report_rebased_release<'w>(
     fork: &Fork<'_>,
     rebased: RebasedRelease<'_>,
     bound: Bound<'_>,
     last: &'w mut Option<release::ReportedWrite>,
-) -> anyhow::Result<(knives::ids::CommitId, &'w release::ReportedWrite)> {
+) -> anyhow::Result<(
+    knives::ids::CommitId,
+    &'w release::ReportedWrite,
+    anyhow::Result<()>,
+)> {
     let repo = &fork.name;
     let entry = fork.entry;
     let path = &fork.checkout.path;
@@ -1046,7 +1070,7 @@ fn report_rebased_release<'w>(
     // branch from a stranger.
     // `describe` keeps the change id the rebased release already had.
     let change = reopened.change_id_of(created.as_str())?;
-    record_edit_event(
+    let recorded = record_edit_event(
         fork,
         &reopened,
         &EditRecord {
@@ -1059,7 +1083,7 @@ fn report_rebased_release<'w>(
             unchecked: rebased.unchecked,
         },
         bound,
-    )?;
+    );
     let stale_bases = if rebased.shed > 0 {
         format!(", {} stale base parent(s) shed", rebased.shed)
     } else {
@@ -1078,7 +1102,7 @@ fn report_rebased_release<'w>(
         "{}",
         release::conflict_report(rebased.name, written.conflicts(), &unions)
     );
-    Ok((described, written))
+    Ok((described, written, recorded))
 }
 
 /// What a rebase unioned, said once for its two writes: every union the
