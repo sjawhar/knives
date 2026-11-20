@@ -981,6 +981,55 @@ mod tests {
     }
 
     #[test]
+    fn a_routed_read_lists_as_unreached_only_the_forks_it_routes() {
+        // Given: a new machine whose registry shares one fork's ledger with
+        // acme/ledger and another fork's with acme/elsewhere, both on a forge
+        // whose host does not resolve.
+        let (_home, root, registry) = new_machine(&[
+            (
+                "a-repo",
+                "https://forge.invalid/ours/a-repo",
+                Some("acme/ledger"),
+            ),
+            (
+                "b-repo",
+                "https://forge.invalid/ours/b-repo",
+                Some("acme/elsewhere"),
+            ),
+        ]);
+        let a_repo = UpstreamName::new("acme/a-repo");
+        // The lock keeps both remotes unreachable: no other test's `Remote`
+        // reaches forge.invalid while it is held.
+        let _lock = crate::config::test_support::environment_lock();
+
+        // When: where the ledger travels is read for the first fork alone,
+        // as `start`, a pull of that fork and a send of its entries do.
+        let found = super::super::destinations::destinations_telling(
+            &root,
+            &registry,
+            Some(&[&a_repo]),
+            &mut std::io::sink(),
+        )
+        .unwrap();
+
+        // Then: the first fork is unreached, with why its ledger could not be
+        // joined; the other fork is not listed at all, since nothing tried to
+        // join its ledger and this is no dry run.
+        assert_eq!(
+            found.unreached.keys().collect::<Vec<_>>(),
+            vec![&a_repo],
+            "{:?}",
+            found.unreached
+        );
+        let why = found
+            .unreached
+            .get(&a_repo)
+            .and_then(|unreached| unreached.join_failed.as_deref())
+            .unwrap();
+        assert!(why.starts_with("could not make "), "{why}");
+    }
+
+    #[test]
     fn a_write_sends_through_its_own_ledger_alone_and_asks_no_other() {
         // Given: a new machine whose registry shares one fork's ledger with
         // acme/ledger, whose remote answers, and another fork's with

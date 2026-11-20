@@ -2058,13 +2058,10 @@ fn an_entry_a_name_collision_left_unsent_reaches_the_remote_after_the_rename_it_
     // ledger can be sent again, by the remedy knives itself gives.
     assert_eq!(code, Some(0), "{report}");
     assert_eq!(report["destinations"][0]["unsent"], 0, "{report}");
-    let on_remote: Vec<String> = listed_on(&remote, "duplicate")
-        .into_iter()
-        .chain(listed_on(&remote, "renamed"))
-        .collect();
+    let on_renamed = listed_on(&remote, "renamed");
     assert!(
-        on_remote.contains(&refused[0]),
-        "{} is on no ref of the remote: {on_remote:?}",
+        on_renamed.contains(&refused[0]),
+        "{} is not on the remote's renamed ref: {on_renamed:?}",
         refused[0]
     );
 }

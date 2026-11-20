@@ -49,9 +49,7 @@ pub struct Destinations {
     /// Each fork whose registry entry names a repository its ledger belongs
     /// to that no destination here is: its entries travel to and from no
     /// other machine from this one. Outside a dry run, only a fork whose
-    /// ledger could not be joined, or, for a read that routes other forks
-    /// ([`shared_fork`], [`super::pull_at`], [`super::send_now`]), whose
-    /// ledger it did not join.
+    /// ledger could not be joined.
     pub unreached: BTreeMap<UpstreamName, Unreached>,
     /// A problem for each directory under the root holding entries that no
     /// fork is kept under ([`crate::ledger::unclaimed_problems`]): nothing
@@ -70,8 +68,7 @@ pub struct Unreached {
     /// The `<owner>/<name>` of the repository its ledger belongs to.
     pub ledger: String,
     /// Why joining that ledger failed; `None` where nothing tried to join
-    /// it: under a dry run, which writes nothing, and for a read that routes
-    /// other forks, which joins their ledgers alone.
+    /// it: under a dry run, which writes nothing.
     pub join_failed: Option<String>,
 }
 
@@ -287,8 +284,9 @@ pub fn destinations(root: &Path, registry: &Registry) -> Result<Destinations, Sw
 /// A command that routes one fork joins that fork's ledger alone. A ledger
 /// that cannot be joined is tried again on every read, so joining the
 /// ledger of a fork it does not route would make it wait on that one, up to
-/// the transport deadline, while it holds its own fork's lock. A ledger it
-/// does not join is [`Destinations::unreached`] with nothing tried.
+/// the transport deadline, while it holds its own fork's lock. Its
+/// [`Destinations::unreached`] names only forks of `routed`: of another
+/// fork's ledger, which it did not try to join, it has nothing true to say.
 pub(super) fn destinations_telling(
     root: &Path,
     registry: &Registry,
@@ -321,6 +319,11 @@ pub(super) fn destinations_telling(
         if failed.len() < joined.len() {
             reached = reach(root, registry)?;
         }
+    }
+    // A fork it does not route is left out: its entry would say nothing
+    // tried to join its ledger, which only a dry run's entries say.
+    if let Some(forks) = routed {
+        reached.unreached.retain(|fork, _| forks.contains(&fork));
     }
     // A ledger still unreached once joined is one whose directory was
     // already there, its origin another repository's.
