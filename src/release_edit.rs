@@ -832,7 +832,7 @@ fn apply_edit(
         &fork.checkout.path,
         written.commit.clone(),
     ));
-    let created = reported.commit();
+    let created = &written.commit;
     record_edit_event(
         fork,
         opened,

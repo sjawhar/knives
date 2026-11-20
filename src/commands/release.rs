@@ -25,8 +25,8 @@ use crate::detect::{
     stale_parents,
 };
 use crate::ids::{
-    BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, is_our_dated_cut, is_our_release,
-    is_release_name,
+    BookmarkRef, BranchName, ChangeId, CommitId, ReleaseScheme, RemoteName, is_our_dated_cut,
+    is_our_release, is_release_name,
 };
 use crate::jj::{self, Repo};
 use crate::ledger::{Entry, Kind, Ledger, RecordedParent};
@@ -5013,9 +5013,9 @@ pub fn written_report(
 /// release its drop writes; and `cut --at` the commit it records.
 #[derive(Debug)]
 pub struct ReportedWrite {
-    commit: CommitId,
-    /// The opening, or the error it gave.
-    opened: Result<Repo, jj::JjError>,
+    /// The opening and the commit read through it, or the error that the
+    /// opening, or the lookup of a moved release's commit through it, gave.
+    reading: Result<(Repo, CommitId), jj::JjError>,
     /// The files the tree leaves conflicted, listed through the opening
     /// the first time they are asked for, or the error jj gave.
     conflicts: std::cell::OnceCell<Result<Vec<String>, jj::JjError>>,
@@ -5025,39 +5025,47 @@ impl ReportedWrite {
     /// Open the repository at `path` once, after the write of `commit`.
     pub fn read(path: &Path, commit: CommitId) -> Self {
         Self {
-            commit,
-            opened: Repo::open(path),
+            reading: Repo::open(path).map(|opened| (opened, commit)),
             conflicts: std::cell::OnceCell::new(),
         }
     }
 
-    /// Open the repository at `path` once, after a write that moved `name`,
-    /// and read the commit `name` holds through that opening.
-    pub fn read_name(path: &Path, name: &str) -> Result<Self, jj::JjError> {
-        let opened = Repo::open(path)?;
-        let commit = opened.resolve_commit(name)?;
-        Ok(Self {
-            commit,
-            opened: Ok(opened),
+    /// Open the repository at `path` once, after a move that rewrote the
+    /// release under `change`, and find through that opening the one
+    /// visible commit of `change`: the release the move left. The lookup
+    /// reads no name, so a release name that a concurrent operation left
+    /// conflicted does not stop it. No visible commit of `change`, or more
+    /// than one, is an error that the reading keeps, as it keeps the
+    /// opening's.
+    pub fn read_moved(path: &Path, change: &ChangeId) -> Self {
+        Self {
+            reading: Repo::open(path).and_then(|opened| {
+                let visible = opened.visible_commits_of_change(change.as_str())?;
+                let [commit] = <[CommitId; 1]>::try_from(visible).map_err(|visible| {
+                    jj::JjError::Revision {
+                        revision: change.as_str().to_owned(),
+                        detail: format!(
+                            "the move left {} visible commits of the release's change, not one",
+                            visible.len()
+                        ),
+                    }
+                })?;
+                Ok((opened, commit))
+            }),
             conflicts: std::cell::OnceCell::new(),
-        })
+        }
     }
 
-    /// The commit the write made.
-    pub const fn commit(&self) -> &CommitId {
-        &self.commit
-    }
-
-    /// The repository as the write left it, or the error its opening gave.
-    pub const fn opened(&self) -> Result<&Repo, &jj::JjError> {
-        self.opened.as_ref()
+    /// The repository as the write left it, or the error its reading gave.
+    pub fn opened(&self) -> Result<&Repo, &jj::JjError> {
+        self.reading.as_ref().map(|(opened, _)| opened)
     }
 
     /// The files the tree leaves conflicted, or the error jj gave.
     pub fn conflicts(&self) -> Result<&[String], &jj::JjError> {
-        let opened = self.opened.as_ref()?;
+        let (opened, commit) = self.reading.as_ref()?;
         self.conflicts
-            .get_or_init(|| opened.conflicted_files(self.commit.as_str()))
+            .get_or_init(|| opened.conflicted_files(commit.as_str()))
             .as_deref()
     }
 
@@ -5072,8 +5080,10 @@ impl ReportedWrite {
 
     /// The lines [`Self::report_headings`] prints ([`heading_report`]).
     fn heading_lines(&self) -> Vec<String> {
-        match &self.opened {
-            Ok(opened) => heading_report(opened.repeated_headings(self.commit.as_str()).as_deref()),
+        match &self.reading {
+            Ok((opened, commit)) => {
+                heading_report(opened.repeated_headings(commit.as_str()).as_deref())
+            }
             Err(error) => heading_report(Err(error)),
         }
     }

@@ -217,13 +217,16 @@ pub(crate) fn run_rebase(
             &reopened
         };
         let after_shed = opened.resolve_commit(&release_name)?;
+        // The change the move rewrites the release under: the reading after
+        // the move finds the release by it, not by its name.
+        let release_change = opened.change_id_of(after_shed.as_str())?;
         // Every earlier write of the name still visible, other than the
         // release in hand and the write just made, is one more commit the
         // rebase may copy: a carrier a conflicted write left visible, which
         // nothing hid. Its copy is cleaned up as a tagged release's is.
         let releases_own = [
             opened.change_id_of(release_commit.as_str())?,
-            opened.change_id_of(after_shed.as_str())?,
+            release_change.clone(),
         ];
         let mut earlier_originals = Vec::new();
         for earlier in
@@ -276,10 +279,13 @@ pub(crate) fn run_rebase(
         }
         let tagged = knives::jj::tagged_commits_a_rebase_copies(path, &release_name, &onto)?;
         knives::jj::rebase_branch_onto(path, &release_name, &onto)?;
-        // The move rewrote the release: the release it left is the last write
-        // until the re-describe, so a step before that which fails names its
-        // headings.
-        *last = Some(release::ReportedWrite::read_name(path, &release_name)?);
+        // The move rewrote the release under its change: the release it left
+        // is the last write until the re-describe, so a step before that which
+        // fails names its headings. It is read by that change, not by its
+        // name, which a concurrent operation can leave conflicted, and the
+        // reading keeps any error it meets: nothing that can fail comes
+        // between the move and the restore of the pushed release names.
+        *last = Some(release::ReportedWrite::read_moved(path, &release_change));
         let restored = knives::jj::restore_local_bookmarks(
             path,
             &kept_releases,
@@ -300,7 +306,7 @@ pub(crate) fn run_rebase(
                 inline_human_text(name)
             );
         }
-        let rebased = report_rebased_release(
+        let (rebased_commit, rebased) = report_rebased_release(
             fork,
             RebasedRelease {
                 name: &release_name,
@@ -340,7 +346,7 @@ pub(crate) fn run_rebase(
                 knives::jj::RebasedName {
                     name: &release_name,
                     publish_remote: entry.publish_remote(),
-                    commit: rebased.commit(),
+                    commit: &rebased_commit,
                     earlier: EarlierWrites::read(
                         rebased_repo,
                         &release_name,
@@ -967,7 +973,7 @@ fn drop_landed_members_in(
         &EditRecord {
             release: release_name,
             delta: &delta,
-            created: dropped.commit(),
+            created: &written.commit,
             change: &written.change,
             provenance: &provenance,
             unions: &written.unions,
@@ -1009,13 +1015,13 @@ struct RebasedRelease<'a> {
 /// writes is read through one opening as soon as the write is done
 /// ([`release::ReportedWrite`]) and left in `last`, the command's last
 /// write, so a step after the write that fails still leaves it there; it
-/// gives that write.
+/// gives that write's commit and its reading.
 fn report_rebased_release<'w>(
     fork: &Fork<'_>,
     rebased: RebasedRelease<'_>,
     bound: Bound<'_>,
     last: &'w mut Option<release::ReportedWrite>,
-) -> anyhow::Result<&'w release::ReportedWrite> {
+) -> anyhow::Result<(knives::ids::CommitId, &'w release::ReportedWrite)> {
     let repo = &fork.name;
     let entry = fork.entry;
     let path = &fork.checkout.path;
@@ -1032,7 +1038,7 @@ fn report_rebased_release<'w>(
         &message,
         &format!("knives: {}: record rebased provenance", rebased.name),
     )?;
-    let written = &*last.insert(release::ReportedWrite::read(path, described));
+    let written = &*last.insert(release::ReportedWrite::read(path, described.clone()));
     let unions = rebase_unions(
         rebased.shed_unions,
         described_unions,
@@ -1050,7 +1056,7 @@ fn report_rebased_release<'w>(
         &EditRecord {
             release: rebased.name,
             delta: &delta,
-            created: written.commit(),
+            created: &described,
             change: &change,
             provenance: &provenance,
             unions: &unions,
@@ -1076,7 +1082,7 @@ fn report_rebased_release<'w>(
         "{}",
         release::conflict_report(rebased.name, written.conflicts(), &unions)
     );
-    Ok(written)
+    Ok((described, written))
 }
 
 /// What a rebase unioned, said once for its two writes: every union the
