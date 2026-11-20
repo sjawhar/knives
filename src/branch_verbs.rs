@@ -5,25 +5,40 @@
 //! `depends` records that a branch cannot land before something else does.
 //! Each records one ledger event, and a statement rides on that event;
 //! `finish` also writes the released claim to the state file.
+//!
+//! On a fork that shares its ledger, the ledger's claim ref says who holds
+//! the branch, on every machine that shares it. `finish` reads it under the
+//! fork's lock, decides from it as `start` does, and releases it with one
+//! push, leased on the claim commit it read, that carries the entry
+//! recording the release; the state file and the workspace are touched only
+//! once the ledger took that push, so a release the ledger did not take
+//! releases nothing here.
 
 use std::path::{Path, PathBuf};
 
 use knives::bind::Fork;
 use knives::cli::Exit;
 use knives::commands::claim::{
-    Bound, ClaimContext, ClaimDecision, Identity, current_identity, decide, last_seen_provenance,
-    possession_permits_release, render_claim_context,
+    Bound, ClaimContext, ClaimDecision, Identity, SharedClaims, Sighting, change_on_ledger,
+    claimed_on, copy_of, current_identity, decide, git_dir_of, possession_permits_release,
+    refusing, render_claim_context, sighting_provenance, unapplied_cause, unread_claim,
+    unreadable_activity, unreadable_holder, unwritten,
 };
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
-use knives::ids::{BranchName, BranchTarget, Requirement, UpstreamName};
+use knives::config::Registry;
+use knives::ids::{BranchName, BranchTarget, CommitId, Requirement, UpstreamName};
 use knives::jj::{
     Repo, StaleRegistration, WorkspaceIdentity, path_occupant, remove_finished_worktree,
 };
 use knives::ledger::{
-    ClaimChange, Displaced, Draft, Entry, LedgerError, Stated, inline_human_text,
+    ClaimChange, Displaced, Draft, Entry, LedgerError, Scribe, Stated, default_ledger_root,
+    inline_human_text, problem_human_text,
 };
+use knives::ledger_git::{ClaimError, ClaimRef, HeldClaim};
+use knives::ledger_sweep::{self, ClaimOutcome, NotApplied, SharedFork};
+use knives::seen::LastSeen;
 use knives::statement::{Statement, StatementKind};
-use knives::store::{Store, default_state_path};
+use knives::store::{Claim, Store, default_state_path};
 
 use super::scribe_for;
 
@@ -32,27 +47,36 @@ use super::scribe_for;
 /// Releasing a claim and recording a supersession are two acts and either can
 /// happen alone: a `finish` on an unheld branch releases no claim, and one with
 /// `--superseded-by` still records where the work went.
-fn release_event(had: bool, superseded_by: Option<&str>) -> Option<String> {
-    match (had, superseded_by) {
-        (true, Some(replacement)) => Some(format!("claim released; superseded by {replacement}")),
-        (true, None) => Some("claim released".to_owned()),
-        (false, Some(replacement)) => Some(format!("superseded by {replacement}")),
-        (false, None) => None,
+///
+/// The reason `--why` gave is recorded whatever the finish did. Where a claim
+/// was released it is the released claim's own field (`claim_change_why`),
+/// so the text does not repeat it; where none was, the text carries it: a
+/// supersession ends with it, and a finish that did neither records it on
+/// an entry of its own, which changes no claim.
+fn release_event(had: bool, superseded_by: Option<&str>, why: Option<&str>) -> Option<String> {
+    match (had, superseded_by, why) {
+        (true, Some(replacement), _) => {
+            Some(format!("claim released; superseded by {replacement}"))
+        }
+        (true, None, _) => Some("claim released".to_owned()),
+        (false, Some(replacement), None) => Some(format!("superseded by {replacement}")),
+        (false, Some(replacement), Some(why)) => {
+            Some(format!("superseded by {replacement}: {why}"))
+        }
+        (false, None, Some(why)) => Some(format!("finished with no claim held: {why}")),
+        (false, None, None) => None,
     }
 }
 
-/// The durable provenance required when a claim is released by force.
-fn forced_release_event(
-    claim: &knives::store::Claim,
-    last_seen: knives::seen::LastSeen,
-    why: &str,
-) -> String {
+/// The durable provenance required when a claim is released by force: whose
+/// claim it was, how its owner was named, when it was taken, and its
+/// `sighting` ([`sighting_provenance`]).
+fn forced_release_event(claim: &Claim, sighting: &str, why: &str) -> String {
     format!(
-        "released {}'s claim by force ({}, claimed {}, last seen {}): {why}",
+        "released {}'s claim by force ({}, claimed {}, {sighting}): {why}",
         claim.owner,
         knives::commands::claim::owner_kind_label(claim.kind),
         claim.started,
-        last_seen_provenance(last_seen),
     )
 }
 
@@ -65,18 +89,27 @@ pub(crate) struct FinishOptions<'a> {
 
 enum FinishClaimGate {
     Continue(Released),
-    /// Another owner took or released the caller's own claim and nobody
-    /// holds the branch now. The caller has been told so; its own workspace
-    /// is still disposed of, and the finish exits with the worse of a
-    /// finding and what that disposal gives: `2` where a live process
-    /// refuses the removal, `3` where jj cannot read the workspace state or
-    /// snapshot the working copy.
+    /// Nobody holds the branch now, though the caller had a claim on it:
+    /// another owner took or released the caller's own claim, or the ledger
+    /// no longer holds the claim this machine's state file keeps a copy of.
+    /// The caller has been told so; its own workspace is still disposed of,
+    /// and the finish exits with the worse of a finding and what that
+    /// disposal gives: `2` where a live process refuses the removal, `3`
+    /// where jj cannot read the workspace state or snapshot the working
+    /// copy. The finish releases no claim: what the state file holds of the
+    /// branch, if anything, is no claim of the caller's now.
     Lost,
+    /// The ledger holds another owner's claim in place of the caller's own,
+    /// which this machine's state file still keeps a copy of. The caller has
+    /// been told who holds it; the copy is removed, nothing else changes,
+    /// and the finish exits 1.
+    StaleCopy,
     /// The gate has said everything there is to say; exit with this.
     Refuse(Exit),
 }
 
-/// What the claim gate leaves for the entry `finish` writes.
+/// What the claim gate leaves for the entry `finish` writes and the release
+/// it makes.
 ///
 /// The gate is the one place that reads the claim before `release_claim`
 /// removes it, and the one place that looks up its last sighting, so what
@@ -86,12 +119,33 @@ enum FinishClaimGate {
 struct Released {
     /// The prose a forced release carries; absent when nothing forced it.
     text: Option<String>,
-    /// The `--why` that forced the release, which the entry records as the
-    /// reason the claim changed hands.
-    why: Option<String>,
     /// The holder this release displaced, where another owner name held the
     /// claim.
     displaced: Option<Displaced>,
+    /// On a fork that shares its ledger, the commit of the ledger's claim
+    /// this finish releases, as the gate read it: the release is leased on
+    /// it, so it lands only on the claim the gate decided from.
+    on_ledger: Option<CommitId>,
+}
+
+/// What a `finish` was asked, of which branch: the fork, the branch, the
+/// options and the cwd binding, and where the fork shares its ledger, the
+/// branch's claim ref there.
+#[derive(Clone, Copy)]
+struct Finishing<'a> {
+    fork: &'a Fork<'a>,
+    target: &'a BranchTarget,
+    options: &'a FinishOptions<'a>,
+    bound: Bound<'a>,
+    ledger: Option<&'a Ledgered<'a>>,
+}
+
+/// A fork that shares its ledger, and the claim ref on it of the branch a
+/// `finish` is for.
+struct Ledgered<'a> {
+    shared: SharedFork,
+    claim: ClaimRef,
+    target: &'a BranchTarget,
 }
 
 /// Hand a branch back and remove its workspace. The inverse of `start`.
@@ -105,6 +159,9 @@ struct Released {
 /// A release that displaced another owner removes nothing and forgets
 /// nothing: that directory is the displaced owner's, and so is the work in
 /// it jj never tracked.
+/// On a fork that shares its ledger the claim is the ledger's, and it is
+/// released there first ([`release_on_ledger`]): a release the ledger did
+/// not take leaves the state file and the workspace as they were.
 /// `bound` is the registry and the fork the current directory is inside, by
 /// the name its claims are kept under, which names a terminal user acting
 /// from a fork's workspace.
@@ -143,13 +200,28 @@ pub(crate) fn run_finish(
         &bound.registry.former_names(),
         &[&fork.upstream],
     )?;
+    // A fork that shares its ledger hands back the ledger's claim, which is
+    // read under the fork's lock by the gate below.
+    let ledger = match ledgered(fork, target, bound.registry)? {
+        Ok(ledger) => ledger,
+        Err(exit) => return Ok(exit),
+    };
+    let finishing = Finishing {
+        fork,
+        target,
+        options,
+        bound,
+        ledger: ledger.as_ref(),
+    };
     // Who may hand the claim back is settled before anything is read from the
     // workspace: a caller the gate refuses reads no directory and scans no
     // process table, and a workspace whose state jj cannot read no longer
     // hides the claim question from a caller that does not hold the claim.
-    let (released, floor) = match finish_claim_gate(fork, target, &store, options, bound)? {
-        FinishClaimGate::Continue(released) => (released, Exit::Ok),
-        FinishClaimGate::Lost => (Released::default(), Exit::Findings),
+    let gate = claim_gate(&finishing, &store)?;
+    let (released, lost) = match gate {
+        FinishClaimGate::Continue(released) => (released, false),
+        FinishClaimGate::Lost => (Released::default(), true),
+        FinishClaimGate::StaleCopy => return forget_stale_copy(store, target),
         FinishClaimGate::Refuse(exit) => return Ok(exit),
     };
     // Everything past the gate reads the ledger's statements and writes an
@@ -174,41 +246,16 @@ pub(crate) fn run_finish(
     } else {
         keep_working_copy(fork, branch, cleared.working_copy.as_deref())
     };
-    // The reason a forced release changed the claim. The live-process gate
-    // is the one force the claim gate does not see: the claim's own holder
-    // passing it leaves the gate's `why` empty.
-    let why = released.why.or_else(|| {
-        cleared
-            .over_live_users
-            .as_ref()
-            .and(options.why)
-            .map(str::to_owned)
-    });
-    let forced = joined(released.text, cleared.over_live_users);
-    let had = store.release_claim(target);
-    let pr = store.tracked_pull(target);
-    // Persist the immutable explanation before the mutable claim state. A failed
-    // append then leaves the old claim in place instead of silently releasing or
-    // seizing work without the provenance that explains why.
-    let provenance = finish_provenance(forced, had, options.superseded_by);
-    if let Some(text) = provenance {
-        // `--superseded-by` always leaves provenance to carry it: the replacement
-        // rides on the one entry that already names it.
-        scribe_for(fork, bound)?.record(&Draft {
-            statement: options.superseded_by.map(|replacement| Stated {
-                statement: Statement {
-                    kind: StatementKind::Superseded,
-                    value: Some(replacement.to_owned()),
-                },
-                replaces: store.statement_stamp(target, StatementKind::Superseded),
-            }),
-            ..Draft::event(Some(branch.as_str()), text, pr).about_claim(
-                had.then_some(ClaimChange::Released),
-                why.as_deref(),
-                released.displaced.as_ref(),
-            )
-        })?;
-    }
+    // The live-process gate is the one force the claim gate does not see, so
+    // its prose joins the gate's.
+    let released = Released {
+        text: joined(released.text, cleared.over_live_users),
+        ..released
+    };
+    let had = match record_finish(&finishing, &mut store, &released, lost)? {
+        Ok(had) => had,
+        Err(exit) => return Ok(exit),
+    };
     store.save()?;
 
     let claim = if had { "released" } else { "was not held" };
@@ -244,7 +291,251 @@ pub(crate) fn run_finish(
         )?
     };
     println!("{}/{branch}: claim {claim}; {disposal}", fork.name);
-    Ok(floor)
+    Ok(if lost { Exit::Findings } else { Exit::Ok })
+}
+
+/// Where a `finish` of `target` releases its claim on the ledger, when its
+/// fork shares one: the destination that carries the fork, a ledger no git
+/// directory here reaches joined first, and the branch's claim ref. `Err`
+/// is the exit after saying why nothing was released: a ledger that cannot
+/// be joined is no ledger to release a claim on.
+///
+/// A branch no claim ref can name ([`ClaimRef::new`]: its claim ref would
+/// be longer than the ledger's remote holds, or git refuses it as a ref
+/// name) is one `start` refuses on a shared fork, so it has never been
+/// claimed on any ledger, and its finish is that of a fork that shares none.
+fn ledgered<'a>(
+    fork: &Fork<'_>,
+    target: &'a BranchTarget,
+    registry: &Registry,
+) -> anyhow::Result<Result<Option<Ledgered<'a>>, Exit>> {
+    let Some(ledger) = ledger_sweep::ledger_of(registry, &fork.upstream) else {
+        return Ok(Ok(None));
+    };
+    let shared =
+        match ledger_sweep::shared_fork(&default_ledger_root(), registry, &fork.upstream, ledger) {
+            Ok(shared) => shared,
+            Err(error) => {
+                eprintln!(
+                    "nothing was released: {}",
+                    problem_human_text(&error.to_string())
+                );
+                return Ok(Err(Exit::Incomplete));
+            }
+        };
+    match ClaimRef::new(&target.repo, &target.branch) {
+        Ok(claim) => Ok(Ok(Some(Ledgered {
+            shared,
+            claim,
+            target,
+        }))),
+        Err(ClaimError::TooLong { .. } | ClaimError::Refused { .. }) => Ok(Ok(None)),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Remove this machine's copy of the caller's claim, which the ledger holds
+/// another owner's claim in place of ([`FinishClaimGate::StaleCopy`]), and
+/// nothing else: exit 1.
+fn forget_stale_copy(mut store: Store, target: &BranchTarget) -> anyhow::Result<Exit> {
+    store.release_claim(target);
+    store.save()?;
+    Ok(Exit::Findings)
+}
+
+/// Release the claim the gate let go of, and write the entry a `finish`
+/// leaves where it has one to leave; whether a claim was released, or the
+/// exit after saying why nothing was, with the state file left unsaved.
+///
+/// The immutable explanation goes before the mutable claim state: a failed
+/// append leaves the old claim in place instead of silently releasing or
+/// seizing work without the provenance that explains why. Where the gate
+/// found the ledger's claim, the entry goes in the one push that deletes it
+/// ([`release_on_ledger`]); anywhere else it is appended here, and the send
+/// before the command exits carries it to a ledger the fork shares.
+///
+/// `lost` is whether the gate found the caller's claim lost
+/// ([`FinishClaimGate::Lost`]): what the state file holds of the branch
+/// then is no claim of the caller's, and removing it releases none.
+fn record_finish(
+    finishing: &Finishing<'_>,
+    store: &mut Store,
+    released: &Released,
+    lost: bool,
+) -> anyhow::Result<Result<bool, Exit>> {
+    let Finishing {
+        fork,
+        target,
+        options,
+        bound,
+        ledger,
+    } = *finishing;
+    let removed = store.release_claim(target);
+    let had = released.on_ledger.is_some() || (removed && !lost);
+    let pr = store.tracked_pull(target);
+    let Some(text) = finish_provenance(
+        released.text.as_deref(),
+        had,
+        options.superseded_by,
+        options.why,
+    ) else {
+        return Ok(Ok(had));
+    };
+    // `--superseded-by` always leaves provenance to carry it: the replacement
+    // rides on the one entry that already names it.
+    let draft = Draft {
+        statement: options.superseded_by.map(|replacement| Stated {
+            statement: Statement {
+                kind: StatementKind::Superseded,
+                value: Some(replacement.to_owned()),
+            },
+            replaces: store.statement_stamp(target, StatementKind::Superseded),
+        }),
+        ..Draft::event(Some(target.branch.as_str()), text, pr).about_claim(
+            had.then_some(ClaimChange::Released),
+            options.why,
+            released.displaced.as_ref(),
+        )
+    };
+    let scribe = scribe_for(fork, bound)?;
+    if let (Some(ledger), Some(commit)) = (ledger, released.on_ledger.as_ref()) {
+        return Ok(release_on_ledger(ledger, commit, &scribe, &draft).map(|()| had));
+    }
+    scribe.record(&draft)?;
+    Ok(Ok(had))
+}
+
+/// Delete the ledger's claim of the branch, leased on `commit`, the claim
+/// commit the gate read, in one push with the entry `draft` that `scribe`
+/// writes; `Err` is the exit after saying why nothing was released, with
+/// nothing here changed.
+///
+/// A claim another machine changed meanwhile is read again and named, as
+/// the gate names it, and one it released meanwhile is named as no claim
+/// with no read, since the push already found none (exit 1). A ledger that
+/// could not be written releases nothing (exit 3). A push whose outcome is
+/// unknown may have landed or not, so it leaves the state file and the
+/// workspace as they were, and the next `finish` reads the claim again
+/// (exit 3).
+fn release_on_ledger(
+    ledger: &Ledgered<'_>,
+    commit: &CommitId,
+    scribe: &Scribe,
+    draft: &Draft<'_>,
+) -> Result<(), Exit> {
+    let change = ledger_sweep::ClaimChange {
+        shared: &ledger.shared,
+        claim: &ledger.claim,
+        expected: Some(commit),
+        becomes: ledger_sweep::NoClaim,
+    };
+    let branch = &ledger.target.branch;
+    match change_on_ledger(change, scribe, draft) {
+        ClaimOutcome::Landed(()) => Ok(()),
+        ClaimOutcome::NotApplied {
+            why: NotApplied::Lost { held },
+            ..
+        } => Err(changed_meanwhile(ledger, held)),
+        ClaimOutcome::NotApplied { why, failure } => {
+            eprintln!(
+                "nothing was released: {}; run `knives finish {branch}` again",
+                unwritten(
+                    &ledger.shared,
+                    &unapplied_cause(&ledger.shared, &why, &failure)
+                )
+            );
+            Err(Exit::Incomplete)
+        }
+        ClaimOutcome::Unknown { failure } => {
+            eprintln!(
+                "the release of the claim of {branch} was pushed to the ledger {} ({}), and \
+                 whether it landed is unknown: {}; this machine's state file and the workspace \
+                 are left as they were, and `knives finish {branch}` reads the claim again",
+                ledger.shared.ledger,
+                git_dir_of(&ledger.shared),
+                problem_human_text(&failure.cause)
+            );
+            Err(Exit::Incomplete)
+        }
+    }
+}
+
+/// A lost lease: the ledger's claim changed between this `finish`'s read
+/// and its push, so nothing was released or removed. Where another claim
+/// holds the branch now (`held`), it is read again and named, as the gate
+/// names it; where none does, that is said with no read (exit 1).
+fn changed_meanwhile(ledger: &Ledgered<'_>, held: bool) -> Exit {
+    let target = ledger.target;
+    let here = ledger.shared.destination.machine.as_str();
+    let read = if held {
+        ledger_sweep::read_claim(&ledger.shared, &ledger.claim)
+    } else {
+        Ok(None)
+    };
+    let now = match read {
+        Err(failure) => {
+            eprintln!(
+                "nothing was released: {}",
+                unread_claim(&target.branch, &ledger.shared, &failure)
+            );
+            return Exit::Incomplete;
+        }
+        Ok(None) => no_claim_now(&target.branch),
+        Ok(Some(HeldClaim {
+            commit,
+            record: Err(cause),
+        })) => unreadable_holder(target, &ledger.claim, &commit, &cause),
+        // Changed after this config home read it, so it recorded nothing of
+        // it: its activity cannot be read here.
+        Ok(Some(HeldClaim {
+            commit,
+            record: Ok(record),
+        })) => {
+            let claim = copy_of(target, &commit, record);
+            shared_holder(&claim, claimed_on(&claim, here), here, None)
+        }
+    };
+    eprintln!(
+        "nothing was released: the claim of {} changed on the ledger while this finish ran\n{now}",
+        target.branch
+    );
+    Exit::Findings
+}
+
+/// What `finish` says where the ledger holds no claim of `branch` now,
+/// though this machine recorded one or this finish read one: another
+/// machine ended it, and a sweep brings that machine's entries here.
+fn no_claim_now(branch: &BranchName) -> String {
+    format!(
+        "the ledger holds no claim of {branch} now; it was released or taken on another \
+         machine; run `knives ledger sweep` then `knives notch {branch}` to read by whom"
+    )
+}
+
+/// `claim`, taken on machine `machine`, as `finish` names its holder on a
+/// fork that shares its ledger, `here` being this machine: in `start`'s
+/// words ([`render_claim_context`]), with its sighting where its
+/// activity can be read here (`last_seen`), else with why it cannot
+/// ([`unreadable_activity`]).
+fn shared_holder(claim: &Claim, machine: &str, here: &str, last_seen: Option<LastSeen>) -> String {
+    let context = render_claim_context(claim, Some(machine), last_seen, jiff::Timestamp::now());
+    if last_seen.is_some() {
+        context
+    } else {
+        format!("{context}\n{}", unreadable_activity(claim, machine, here))
+    }
+}
+
+/// What `finish` says where the ledger holds another owner's claim,
+/// `holder` ([`shared_holder`]), in place of the caller's own, which this
+/// machine's state file keeps a copy of.
+fn copy_superseded(branch: &BranchName, holder: &str) -> String {
+    format!(
+        "the ledger holds another owner's claim of {branch} in place of yours\n{holder}\nthis \
+         machine's record of your claim is removed, and nothing else was changed: the \
+         workspace and its registration stay as they are\nuse `knives start {branch} --force \
+         --why \"…\"` to take the branch back"
+    )
 }
 
 /// Forgets this branch's workspace and removes its directory, and says what
@@ -384,18 +675,23 @@ fn joined(first: Option<String>, second: Option<String>) -> Option<String> {
 
 /// The prose the one entry a `finish` writes carries, or nothing when it has
 /// nothing to record: what forced the finish, what the branch was superseded
-/// by, and whether a claim was released at all.
+/// by, whether a claim was released at all, and the reason `why` where no
+/// claim was released ([`release_event`]). Forced prose already ends with
+/// the reason that forced it.
 fn finish_provenance(
-    forced: Option<String>,
+    forced: Option<&str>,
     had: bool,
     superseded_by: Option<&str>,
+    why: Option<&str>,
 ) -> Option<String> {
     forced
-        .map(|text| match superseded_by {
-            Some(replacement) => format!("{text}; superseded by {replacement}"),
-            None => text,
+        .map(|text| {
+            superseded_by.map_or_else(
+                || text.to_owned(),
+                |replacement| format!("{text}; superseded by {replacement}"),
+            )
         })
-        .or_else(|| release_event(had, superseded_by))
+        .or_else(|| release_event(had, superseded_by, why))
 }
 
 /// What is at the branch's workspace path, and what the read-only checks
@@ -674,78 +970,262 @@ fn release_registration(
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the fork, the branch, the store, the finish options and the cwd binding are independent inputs"
-)]
-fn finish_claim_gate(
-    fork: &Fork<'_>,
-    target: &BranchTarget,
-    store: &Store,
-    options: &FinishOptions<'_>,
-    bound: Bound<'_>,
-) -> anyhow::Result<FinishClaimGate> {
-    let Some(claim) = store
-        .claims(Some(&target.repo))
-        .into_iter()
-        .find(|claim| claim.branch == target.branch.as_str())
-        .cloned()
-    else {
-        return unheld_gate(target, store, options, bound);
+/// The claim gate of a fork that shares no ledger, where the claim is this
+/// machine's state file's alone.
+fn finish_claim_gate(finishing: &Finishing<'_>, store: &Store) -> anyhow::Result<FinishClaimGate> {
+    let Finishing {
+        fork,
+        target,
+        options,
+        bound,
+        ..
+    } = *finishing;
+    let Some(claim) = store.claim_of(target) else {
+        return unheld_gate(finishing, store);
     };
     let cwd = std::env::current_dir()?;
     let identity = current_identity(bound)?;
-    let decision = match decide(&ClaimContext {
-        held: Some(&claim),
+    let (decision, refused) = release_decision(&ClaimContext {
+        held: vec![claim],
         identity: &identity,
         in_claimed_workspace: possesses(&cwd, fork, &target.branch),
-    }) {
-        // Standing in the directory is evidence enough to take work up again,
-        // never to hand back a claim taken under another name: after a takeover
-        // the directory belongs to the new holder, and the finish an agent runs
-        // from inside it would otherwise release that holder's claim and remove
-        // the directory under it.
-        ClaimDecision::Resume { possession: true }
-            if !possession_permits_release(&claim, &identity) =>
-        {
-            ClaimDecision::RefuseHeld
-        }
-        decision => decision,
+        machine: None,
+    });
+    let Some(refused) = refused else {
+        return Ok(holder_place_gate(finishing, store, claim, None));
     };
-    match decision {
-        ClaimDecision::Resume { .. } | ClaimDecision::Take => {
-            // The holder's finish is a release, which writes the ledger: with
-            // the ledger unreadable it goes on only to fail on that in
-            // `run_finish`, naming it as it always has, rather than being
-            // refused for the place first.
-            if store.unreadable(&target.repo).is_some() {
-                return Ok(FinishClaimGate::Continue(Released::default()));
-            }
-            Ok(place_gate(&claim, target, options))
+    let last_seen = knives::seen::last_seen_in(refused, &fork.checkout.path, &knives::seen::load());
+    if !options.force {
+        return Ok(refuse_held(&Refusal {
+            target,
+            ledger: read_ledger(store, &target.repo),
+            identity: &identity,
+            claim: refused,
+            context: render_claim_context(refused, None, Some(last_seen), jiff::Timestamp::now()),
+            anonymous: decision == ClaimDecision::RefuseAnonymous,
+        }));
+    }
+    let why = forced_why(options)?;
+    Ok(FinishClaimGate::Continue(forced_release(
+        refused,
+        &identity,
+        Sighting::Seen(last_seen),
+        why,
+    )))
+}
+
+/// The gate of the claim's own holder handing it back: refused where it
+/// was taken in a place whose processes this one cannot see ([`place_gate`]).
+/// Where it goes on, the release is leased on `lease`, the ledger's claim
+/// commit as the gate read it, where the fork shares its ledger and it
+/// holds one.
+fn holder_place_gate(
+    finishing: &Finishing<'_>,
+    store: &Store,
+    claim: &Claim,
+    lease: Option<CommitId>,
+) -> FinishClaimGate {
+    // The holder's finish is a release, which writes the ledger: with the
+    // fork's ledger unreadable here it goes on only to fail on that in
+    // `run_finish`, naming it as it always has, rather than being refused
+    // for the place first.
+    if store.unreadable(&finishing.target.repo).is_some() {
+        return FinishClaimGate::Continue(Released {
+            on_ledger: lease,
+            ..Released::default()
+        });
+    }
+    place_gate(claim, finishing.target, finishing.options, lease)
+}
+
+/// The reason a forced finish gives, which `--force` requires.
+fn forced_why<'o>(options: &FinishOptions<'o>) -> anyhow::Result<&'o str> {
+    options
+        .why
+        .ok_or_else(|| anyhow::anyhow!("--force requires --why"))
+}
+
+/// [`decide`] for a caller handing back the claims `weighed` holds, with
+/// the claim that refuses it, where one does.
+///
+/// Standing in the directory is evidence enough to take work up again,
+/// never to hand back a claim taken under another name: after a takeover
+/// the directory belongs to the new holder, and the finish an agent runs
+/// from inside it would otherwise release that holder's claim and remove
+/// the directory under it ([`possession_permits_release`]).
+fn release_decision<'a>(weighed: &ClaimContext<'a>) -> (ClaimDecision, Option<&'a Claim>) {
+    match decide(weighed) {
+        ClaimDecision::Resume { possession: true } => weighed
+            .held
+            .iter()
+            .copied()
+            .find(|claim| !possession_permits_release(claim, weighed.identity))
+            .map_or(
+                (ClaimDecision::Resume { possession: true }, None),
+                |claim| (ClaimDecision::RefuseHeld, Some(claim)),
+            ),
+        decision @ (ClaimDecision::RefuseAnonymous | ClaimDecision::RefuseHeld) => {
+            (decision, refusing(weighed))
         }
-        ClaimDecision::RefuseAnonymous | ClaimDecision::RefuseHeld => {
-            let last_seen =
-                knives::seen::last_seen_in(&claim, &fork.checkout.path, &knives::seen::load());
-            if !options.force {
-                return Ok(refuse_held(&Refusal {
-                    target,
-                    ledger: read_ledger(store, &target.repo),
-                    identity: &identity,
-                    claim: &claim,
-                    last_seen,
-                    anonymous: decision == ClaimDecision::RefuseAnonymous,
-                }));
-            }
-            let why = options
-                .why
-                .ok_or_else(|| anyhow::anyhow!("--force requires --why"))?;
-            Ok(FinishClaimGate::Continue(Released {
-                text: Some(forced_release_event(&claim, last_seen, why)),
-                why: Some(why.to_owned()),
-                displaced: Displaced::over(&claim, &identity, last_seen),
-            }))
+        decision @ (ClaimDecision::Resume { possession: false } | ClaimDecision::Take) => {
+            (decision, None)
         }
     }
+}
+
+/// What a forced release of `claim`, another owner's, leaves for the
+/// entry: whose claim it ended, with its `sighting` ([`sighting_provenance`]),
+/// and the holder it displaced, with that sighting only where its activity
+/// can be read here.
+fn forced_release(
+    claim: &Claim,
+    identity: &Identity,
+    sighting: Sighting<'_>,
+    why: &str,
+) -> Released {
+    Released {
+        text: Some(forced_release_event(
+            claim,
+            &sighting_provenance(sighting),
+            why,
+        )),
+        displaced: Displaced::over(claim, identity, sighting.last_seen()),
+        ..Released::default()
+    }
+}
+
+/// The claim gate of a `finish`. On a fork that shares no ledger it is that
+/// of this machine's state file ([`finish_claim_gate`]); on one that shares
+/// its ledger, it weighs the ledger's claim, read under the fork's lock,
+/// and a local claim an older knives left in this machine's state file, as
+/// `start` weighs them ([`SharedClaims`], [`release_decision`]).
+///
+/// A read that fails releases and removes nothing (exit 3). This machine's
+/// copy of a ledger claim decides nothing: where the ledger holds no claim
+/// now, the copy is removed and the caller's workspace disposed of, as for
+/// a claim another owner ended; where the ledger holds another owner's
+/// claim in place of the caller's own copy, the caller is told who holds
+/// it and only the copy is removed. A holder is named as `start` names it
+/// ([`shared_holder`]).
+fn claim_gate(finishing: &Finishing<'_>, store: &Store) -> anyhow::Result<FinishClaimGate> {
+    let Finishing {
+        fork,
+        target,
+        options,
+        bound,
+        ledger,
+    } = *finishing;
+    let Some(ledger) = ledger else {
+        return finish_claim_gate(finishing, store);
+    };
+    let held = match ledger_sweep::read_claim(&ledger.shared, &ledger.claim) {
+        Ok(held) => held,
+        Err(failure) => {
+            eprintln!(
+                "nothing was released: {}",
+                unread_claim(&target.branch, &ledger.shared, &failure)
+            );
+            return Ok(FinishClaimGate::Refuse(Exit::Incomplete));
+        }
+    };
+    let claims = SharedClaims::new(target, held, store.claim_of(target).cloned());
+    let lease = claims.commit();
+    let stale = claims.recorded.as_ref().filter(|copy| {
+        copy.ledger_commit.is_some() && copy.ledger_commit.as_deref() != lease.map(CommitId::as_str)
+    });
+    if stale.is_some() && lease.is_none() {
+        eprintln!("{}", no_claim_now(&target.branch));
+        return Ok(FinishClaimGate::Lost);
+    }
+    if let Some((commit, Err(cause))) = &claims.ledger
+        && !options.force
+    {
+        eprintln!(
+            "{}\nuse `knives finish {} --force --why \"…\"` to release the claim",
+            unreadable_holder(target, &ledger.claim, commit, cause),
+            target.branch
+        );
+        return Ok(FinishClaimGate::Refuse(Exit::Usage));
+    }
+    let here = ledger.shared.destination.machine.as_str();
+    let identity = current_identity(bound)?;
+    let cwd = std::env::current_dir()?;
+    let (decision, refused) = release_decision(&ClaimContext {
+        held: claims.present(),
+        identity: &identity,
+        in_claimed_workspace: possesses(&cwd, fork, &target.branch),
+        machine: Some(here),
+    });
+    let Some(claim) = refused else {
+        return holder_gate(finishing, store, &claims, ledger);
+    };
+    let machine = claimed_on(claim, here);
+    let last_seen = claims
+        .readable(claim, here)
+        .then(|| knives::seen::last_seen_in(claim, &fork.checkout.path, &knives::seen::load()));
+    if options.force {
+        let why = forced_why(options)?;
+        let sighting = last_seen.map_or_else(|| Sighting::Elsewhere(machine), Sighting::Seen);
+        return Ok(FinishClaimGate::Continue(Released {
+            on_ledger: lease.cloned(),
+            ..forced_release(claim, &identity, sighting, why)
+        }));
+    }
+    if claim.ledger_commit.is_some() && stale.is_some_and(|copy| copy.owner == identity.owner) {
+        eprintln!(
+            "{}",
+            copy_superseded(
+                &target.branch,
+                &shared_holder(claim, machine, here, last_seen)
+            )
+        );
+        return Ok(FinishClaimGate::StaleCopy);
+    }
+    Ok(refuse_held(&Refusal {
+        target,
+        ledger: read_ledger(store, &target.repo),
+        identity: &identity,
+        claim,
+        context: shared_holder(claim, machine, here, last_seen),
+        anonymous: decision == ClaimDecision::RefuseAnonymous,
+    }))
+}
+
+/// The gate of a caller that every claim present on a fork that shares its
+/// ledger permits to hand back: the holder's own finish, judged by where
+/// the ledger's claim was taken, or the local claim where only that is
+/// present ([`place_gate`]). With no claim whose holder can be read, a
+/// claim commit on the ledger whose record does not read is released by
+/// force, which the gate asked for, and with no claim at all this is a
+/// finish of nothing ([`unheld_gate`]). A release it lets go on is leased
+/// on the ledger's claim commit as the gate read it.
+fn holder_gate(
+    finishing: &Finishing<'_>,
+    store: &Store,
+    claims: &SharedClaims,
+    ledger: &Ledgered<'_>,
+) -> anyhow::Result<FinishClaimGate> {
+    let Some(claim) = claims.on_ledger().or_else(|| claims.local()) else {
+        let Some(commit) = claims.commit() else {
+            return unheld_gate(finishing, store);
+        };
+        let why = forced_why(finishing.options)?;
+        return Ok(FinishClaimGate::Continue(Released {
+            text: Some(format!(
+                "released the claim {} at {}, whose holder could not be read, by force: {why}",
+                ledger.claim,
+                commit.as_str()
+            )),
+            on_ledger: Some(commit.clone()),
+            ..Released::default()
+        }));
+    };
+    Ok(holder_place_gate(
+        finishing,
+        store,
+        claim,
+        claims.commit().cloned(),
+    ))
 }
 
 /// A branch nobody holds: an ordinary finish of nothing, unless this fork's
@@ -758,12 +1238,13 @@ fn finish_claim_gate(
 /// search is what would tell the caller that its claim was ended, and a
 /// finish of nothing without it would report a claim that "was not held" and
 /// remove the workspace of an owner that was never told why.
-fn unheld_gate(
-    target: &BranchTarget,
-    store: &Store,
-    options: &FinishOptions<'_>,
-    bound: Bound<'_>,
-) -> anyhow::Result<FinishClaimGate> {
+fn unheld_gate(finishing: &Finishing<'_>, store: &Store) -> anyhow::Result<FinishClaimGate> {
+    let Finishing {
+        target,
+        options,
+        bound,
+        ..
+    } = *finishing;
     if options.force {
         return Ok(FinishClaimGate::Continue(Released::default()));
     }
@@ -801,8 +1282,11 @@ struct Refusal<'a> {
     /// be read, where it could not: the refusal is given without the search.
     ledger: Result<&'a [Entry], &'a LedgerError>,
     identity: &'a Identity,
-    claim: &'a knives::store::Claim,
-    last_seen: knives::seen::LastSeen,
+    claim: &'a Claim,
+    /// The claim's holder as the refusal names it, with its last sighting:
+    /// [`render_claim_context`] on a fork that shares no ledger, and on one
+    /// that does, the words `start` names it in ([`shared_holder`]).
+    context: String,
     /// Both sides resolved to an OS user name, which can never match.
     anonymous: bool,
 }
@@ -825,7 +1309,7 @@ struct Refusal<'a> {
 /// can run over more than one line, so it goes out escaped
 /// ([`knives::ledger::problem_human_text`]).
 fn refuse_held(refusal: &Refusal<'_>) -> FinishClaimGate {
-    let context = render_claim_context(refusal.claim, refusal.last_seen, jiff::Timestamp::now());
+    let context = &refusal.context;
     let branch = &refusal.target.branch;
     // The branch is one shell word inside each command a person pastes.
     let word = knives::ledger::shell_word(branch.as_str());
@@ -950,18 +1434,22 @@ fn place_gate(
     claim: &knives::store::Claim,
     target: &BranchTarget,
     options: &FinishOptions<'_>,
+    lease: Option<CommitId>,
 ) -> FinishClaimGate {
     let here = knives::liveness::this_place();
     let Some(taken) = claim.place.as_deref().filter(|taken| *taken != here) else {
-        return FinishClaimGate::Continue(Released::default());
+        return FinishClaimGate::Continue(Released {
+            on_ledger: lease,
+            ..Released::default()
+        });
     };
     if let Some(why) = options.why.filter(|_| options.force) {
         return FinishClaimGate::Continue(Released {
             text: Some(format!(
                 "finished by force from {here}, not {taken} where the claim was taken: {why}"
             )),
-            why: Some(why.to_owned()),
-            displaced: None,
+            on_ledger: lease,
+            ..Released::default()
         });
     }
     eprintln!(
@@ -1194,9 +1682,13 @@ fn with_requirements(required: &[Requirement], added: &[Requirement]) -> Vec<Str
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Place, Registration, left_to_its_owner, removal_note, spoken, with_requirements};
+    use super::{
+        Place, Registration, finish_provenance, left_to_its_owner, removal_note, shared_holder,
+        spoken, with_requirements,
+    };
     use knives::ids::Requirement;
     use knives::jj::WorkspaceIdentity;
+    use knives::store::{Claim, OwnerKind};
 
     #[test]
     fn track_prose_preserves_the_established_human_output() {
@@ -1293,5 +1785,122 @@ mod tests {
         assert!(!line.contains('\u{7}'), "{line}");
         assert!(line.contains("/forks/work/feat-b\u{fffd}[31m"), "{line}");
         assert!(line.contains("agent\u{fffd}-two"), "{line}");
+    }
+
+    #[test]
+    fn a_released_claim_carries_the_reason_in_its_field_and_the_text_stays_as_it_was() {
+        // Given: a finish that released a claim, with a reason
+        // When: its entry's text is written, with and without a supersession
+        let plain = finish_provenance(None, true, None, Some("the port landed"));
+        let superseded = finish_provenance(None, true, Some("feat/next"), Some("the port landed"));
+
+        // Then: the text is what a finish with no reason writes, since the
+        // reason is the released claim's own field
+        assert_eq!(plain.as_deref(), Some("claim released"));
+        assert_eq!(
+            superseded.as_deref(),
+            Some("claim released; superseded by feat/next")
+        );
+    }
+
+    #[test]
+    fn a_finish_that_released_no_claim_ends_its_text_with_the_reason() {
+        // Given: a finish of a branch nobody held, with a reason
+        // When: its entry's text is written, with and without a supersession
+        let superseded = finish_provenance(None, false, Some("feat/next"), Some("moved on"));
+        let plain = finish_provenance(None, false, None, Some("moved on"));
+
+        // Then: the supersession ends with the reason, and a finish that did
+        // nothing else records the reason on its own entry
+        assert_eq!(
+            superseded.as_deref(),
+            Some("superseded by feat/next: moved on")
+        );
+        assert_eq!(
+            plain.as_deref(),
+            Some("finished with no claim held: moved on")
+        );
+    }
+
+    #[test]
+    fn a_finish_with_no_reason_writes_what_it_always_wrote() {
+        assert_eq!(
+            finish_provenance(None, true, None, None).as_deref(),
+            Some("claim released")
+        );
+        assert_eq!(
+            finish_provenance(None, false, Some("feat/next"), None).as_deref(),
+            Some("superseded by feat/next")
+        );
+        assert_eq!(finish_provenance(None, false, None, None), None);
+    }
+
+    #[test]
+    fn forced_prose_already_carries_the_reason_that_forced_it() {
+        let forced = "finished by force while in use by pid 7 (sleep 120): the box is gone";
+        assert_eq!(
+            finish_provenance(Some(forced), false, None, Some("the box is gone")).as_deref(),
+            Some(forced)
+        );
+        assert_eq!(
+            finish_provenance(
+                Some(forced),
+                true,
+                Some("feat/next"),
+                Some("the box is gone")
+            )
+            .as_deref(),
+            Some(
+                "finished by force while in use by pid 7 (sleep 120): the box is gone; \
+                 superseded by feat/next"
+            )
+        );
+    }
+
+    /// Owner one's claim on the ledger, taken on machine one, its owner and
+    /// reason holding terminal control characters.
+    fn ledger_claim() -> Claim {
+        Claim {
+            repo: "acme/demo".into(),
+            branch: "feat/alpha".into(),
+            owner: "owner\u{1b}[2J-one".into(),
+            kind: OwnerKind::HarnessSession,
+            why: "port\u{7} the parser".into(),
+            started: "2026-11-16T08:00:00Z".into(),
+            files: Vec::new(),
+            place: Some("box-one 4026531836".into()),
+            machine: Some("machine-one".into()),
+            ledger_commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
+        }
+    }
+
+    #[test]
+    fn a_holder_whose_activity_cannot_be_read_here_is_named_with_its_machine_and_when_taken() {
+        // Given: owner one's claim, taken on machine one
+        let claim = ledger_claim();
+
+        // When: a finish on machine two names its holder
+        let holder = shared_holder(&claim, "machine-one", "machine-two", None);
+
+        // Then: owner, machine, when it was taken and its reason, escaped,
+        // then why its activity cannot be read here, and no sighting
+        let (context, unreadable) = holder.split_once('\n').expect("two lines");
+        assert!(
+            context.starts_with(
+                "acme/demo/feat/alpha is claimed by owner\u{fffd}[2J-one (harness-session) on \
+                 machine machine-one, taken 2026-11-16T08:00:00Z ("
+            ),
+            "{holder}"
+        );
+        assert!(
+            context.ends_with("ago): port\u{fffd} the parser"),
+            "{holder}"
+        );
+        assert_eq!(
+            unreadable,
+            "its activity cannot be read from this machine (machine-two): its sightings and its \
+             processes are on machine machine-one"
+        );
+        assert!(!holder.contains("no activity observed"), "{holder}");
     }
 }

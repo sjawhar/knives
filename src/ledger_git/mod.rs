@@ -29,10 +29,19 @@ use std::time::Duration;
 
 use crate::ids::{CommitId, UpstreamName};
 
+mod claims;
 mod run;
 mod tree;
 
-use run::{invocation, output_error, run, run_with_input, succeeded, transport};
+#[cfg(test)]
+pub(crate) use claims::stored_entry;
+pub use claims::{
+    ClaimError, ClaimPush, ClaimPushed, ClaimRecord, ClaimRef, ClaimSeen, HeldClaim, Refusal,
+    push_claim, read_claim, restore_machine_ref, write_claim,
+};
+
+pub(crate) use run::run;
+use run::{invocation, output_error, run_with_input, succeeded, transport};
 use tree::{
     Mode, ObjectId, TreeItem, batch_blobs, check_entry, commit_tree, hash_objects, references,
     tree_items, write_tree,
@@ -42,6 +51,13 @@ use tree::{
 const OWN: &str = "refs/knives/";
 /// Where a fetch leaves every machine's ref: `refs/knives-remotes/<remote>/<machine>`.
 const FETCHED: &str = "refs/knives-remotes/";
+/// The longest, in bytes, a ref this machine pushes to a ledger's remote may
+/// be, all of it: its own ref and each claim ref. GitHub, where a ledger's
+/// repository is kept, refuses every longer ref ("refs longer than 255 bytes
+/// are not allowed"), so a push of one would fail on every try. A ref's last
+/// component, a strict part of it, is then shorter than the 255 bytes a file
+/// name may hold, as its loose ref's file must be.
+const MAX_REF: usize = 255;
 
 /// One machine's ref as a fetch found it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,6 +238,16 @@ impl Repository {
         })
     }
 
+    /// `path`, made absolute, relative to the ledger root; `None` for a
+    /// path outside the root, or one that cannot be made absolute.
+    pub fn relative(&self, path: &Path) -> Option<PathBuf> {
+        std::path::absolute(path)
+            .ok()?
+            .strip_prefix(&self.work_tree)
+            .ok()
+            .map(Path::to_path_buf)
+    }
+
     /// `git` on this repository.
     ///
     /// `--git-dir` and `--work-tree` leave nothing to discovery, and
@@ -232,9 +258,9 @@ impl Repository {
     /// `include.path` of credential and URL rules), and without it a fetch or
     /// push falls back to whatever credential the user's own configuration
     /// names, acting on the forge as that user. No terminal prompt: a ledger
-    /// command has nobody to answer one, whether it is a sweep running
-    /// detached or a pull a report is waiting on, and a credential prompt
-    /// would hold the ledger's lock until someone noticed.
+    /// command has nobody to answer one, whether it is a write sending its
+    /// entries as it exits or a pull a report is waiting on, and a credential
+    /// prompt would hold the ledger's lock until someone noticed.
     fn git(&self) -> Command {
         let mut command = crate::bind::git_command();
         for (name, value) in std::env::vars_os() {
@@ -269,6 +295,12 @@ pub enum GitError {
     )]
     Name { role: &'static str, name: String },
     #[error(
+        "refusing machine name {name:?}: its ref, refs/knives/<machine>, would be {bytes} bytes, \
+         more than the {} a ref may be on the ledger's remote",
+        MAX_REF
+    )]
+    MachineRefTooLong { name: String, bytes: usize },
+    #[error(
         "refusing fork name {name:?}: it must be two directory names in the ledger root, \
          <owner>/<name>, neither of them .git"
     )]
@@ -289,11 +321,9 @@ pub enum GitError {
     #[error("{invocation} failed: {stderr}")]
     Failed { invocation: String, stderr: String },
     #[error(
-        "git rejected this machine's ref {machine} on {remote} as non-fast-forward: another \
-         machine may be committing under the same name; give each machine a unique \
-         knives.machine with `git --git-dir={} config knives.machine <unique-name>` \
+        "git rejected this machine's ref {machine} on {remote} as non-fast-forward: {} \
          ({invocation} failed: {stderr})",
-        git_dir.display()
+        machine_collision_remedy(git_dir)
     )]
     MachineNameCollision {
         machine: String,
@@ -326,26 +356,48 @@ pub enum GitError {
     #[error("{path:?} is a file on disk and a directory in this machine's ref, or the reverse")]
     Shape { path: PathBuf },
     #[error(
-        "refusing to write as {machine}: {remote} has its ref but this checkout never committed as it, so the name is another machine's"
+        "refusing to write as {machine}: {remote} has its ref but this checkout never committed as it, so {}",
+        machine_collision_remedy(git_dir)
     )]
-    NotOwn { machine: String, remote: String },
+    NotOwn {
+        machine: String,
+        remote: String,
+        git_dir: PathBuf,
+    },
+}
+
+/// What to do when this machine's ref through `git_dir` is refused as
+/// another writer's: by git ([`GitError::MachineNameCollision`]), or by
+/// knives before any push ([`GitError::NotOwn`]). Either way the remote
+/// holds a history this checkout did not commit, so another machine may be
+/// committing under the same name.
+pub(crate) fn machine_collision_remedy(git_dir: &Path) -> String {
+    format!(
+        "another machine may be committing under the same name; give each machine a unique \
+         knives.machine with `git --git-dir={} config knives.machine <unique-name>`",
+        git_dir.display()
+    )
 }
 
 /// Commit what `pending` found as `machine` to `refs/knives/<machine>`, as
 /// a child of the commit that ref holds now.
 ///
-/// That is every entry in the forks `repository` carries that no knives ref
-/// carries yet, less any the caller [`Pending::forget`]s in between.
+/// That is every entry in the forks `repository` carries that neither this
+/// machine's ref nor a fetched copy of a ref on the ledger's remote carries
+/// yet, less any the caller [`Pending::forget`]s in between.
 ///
 /// An entry is a regular file named as one
 /// ([`crate::ledger::is_entry_file_name`]) directly inside a carried fork's
 /// `<owner>/<repository>/` directory, the files
 /// [`crate::ledger::Ledger::read`] reads. No other fork's directory is
 /// read, however the root is shared.
-/// "Carried" counts every ref under `refs/knives/` and `refs/knives-remotes/`,
-/// so an entry materialised from a peer is not committed again as this
-/// machine's own. `Ok(None)` when nothing is new, and the ref is then
-/// untouched.
+/// "Carried" counts `refs/knives/<machine>` and every ref under
+/// `refs/knives-remotes/`, so an entry materialised from a peer is not
+/// committed again as this machine's own. No other ref under `refs/knives/`
+/// counts: it is this checkout's history under a name it no longer commits
+/// as, which nothing pushes any more, so an entry only it carries is
+/// committed under the current name ([`pending`]). `Ok(None)` when nothing is
+/// new, and the ref is then untouched.
 ///
 /// The ref moves by compare-and-swap against the value [`pending`] read, so
 /// a second writer for the same machine racing this one fails loudly rather
@@ -392,10 +444,18 @@ pub struct Pending {
 }
 
 impl Pending {
-    /// Every entry, relative to the root, that no knives ref carries yet:
-    /// what this machine wrote and has not committed.
+    /// Every entry, relative to the root, that neither this machine's ref
+    /// nor a fetched copy carries yet ([`pending`]): what this machine wrote
+    /// that it has not committed under its name and the ledger's remote was
+    /// not seen holding.
     pub const fn added(&self) -> &BTreeSet<PathBuf> {
         &self.added
+    }
+
+    /// What this machine's ref holds before the commit, the commit's
+    /// parent: `None` when this checkout never committed as the machine.
+    pub const fn previous(&self) -> Option<&CommitId> {
+        self.previous.as_ref()
     }
 
     /// Leave out an entry that is no longer on disk.
@@ -410,9 +470,21 @@ impl Pending {
 /// name is another machine's, or this checkout was recreated; either way a
 /// commit here would start a second history that the push then rejects, so
 /// the call refuses with [`GitError::NotOwn`] instead, as [`push`] does.
+///
+/// An entry counts as carried, and is not added, when this machine's own
+/// ref carries it, or when a copy of some machine's ref that a [`fetch`] or
+/// this machine's [`push`] left under `refs/knives-remotes/<remote>/` does:
+/// what the ledger's remote was last seen holding. So an entry materialised
+/// from a peer is never committed again as this machine's own. No other ref
+/// under `refs/knives/` counts. Only this machine writes there ([`push`]),
+/// so another name's ref here is this machine's own history under a name it
+/// no longer commits as: `knives.machine` changed, as the refusal of a push
+/// whose name another machine also commits under says to change it. Nothing
+/// pushes that ref any more, so an entry in it that no fetched copy carries
+/// has not reached the ledger, and is committed again under the current name.
 pub fn pending(repository: &Repository, machine: &str) -> Result<Pending, GitError> {
     let reference = own_ref(machine)?;
-    let refs = references(repository, &[OWN, FETCHED])?;
+    let refs = references(repository, &[&reference, FETCHED])?;
     let previous = refs
         .iter()
         .find(|(name, _)| *name == reference)
@@ -454,6 +526,7 @@ pub fn pending(repository: &Repository, machine: &str) -> Result<Pending, GitErr
         return Err(GitError::NotOwn {
             machine: machine.to_owned(),
             remote,
+            git_dir: repository.git_dir().to_owned(),
         });
     }
     let mut added = local_entries(repository)?;
@@ -523,13 +596,15 @@ pub fn fetched(repository: &Repository, remote: &str) -> Result<Vec<MachineRef>,
 /// writes only its own ref" holds. The refspec is spelled from the machine name
 /// alone and never forced, and a name that could spell any other ref (a glob,
 /// a second refspec, a nested path) is refused before git runs. Only
-/// [`commit_pending`] writes under `refs/knives/`, so
+/// [`commit_pending`], or a join taking up this machine's own ref from the
+/// remote ([`take_up_own_ref`]), writes under `refs/knives/`, so
 /// `refs/knives/<machine>` exists here only if this checkout committed as that
-/// machine. A machine `remote` has but this checkout never committed as is a
-/// peer, and pushing it is refused; a machine neither side has has nothing to
-/// send, and neither does one `remote` was last seen holding at this commit,
-/// which is what a sweep with nothing new to commit finds. git rejecting the
-/// push means some other writer moved this machine's ref on `remote`.
+/// machine, or took up what an earlier checkout of it committed. A machine
+/// `remote` has but this checkout has no ref of is a peer, and pushing it is
+/// refused; a machine neither side has has nothing to send, and neither does
+/// one `remote` was last seen holding at this commit, which is what a sweep
+/// with nothing new to commit finds. git rejecting the push means some other
+/// writer moved this machine's ref on `remote`.
 ///
 /// Once `remote` has taken the commit, it is recorded as `remote`'s copy,
 /// where [`fetch`] leaves copies, so the next call knows it was sent without
@@ -550,6 +625,7 @@ pub fn push(repository: &Repository, remote: &str, machine: &str) -> Result<bool
             Err(GitError::NotOwn {
                 machine: machine.to_owned(),
                 remote: remote.to_owned(),
+                git_dir: repository.git_dir().to_owned(),
             })
         } else {
             Ok(false)
@@ -579,10 +655,91 @@ pub fn push(repository: &Repository, remote: &str, machine: &str) -> Result<bool
         }
         Err(error) => return Err(error),
     }
-    run(repository
-        .git()
-        .args(["update-ref", &fetched, commit.as_str()]))?;
+    record_sent(repository, remote, machine, commit)?;
     Ok(true)
+}
+
+/// Record `commit` as `remote`'s copy of `machine`'s ref, where [`fetch`]
+/// leaves copies: what a push `remote` took leaves, so the next call knows
+/// it was sent without asking the remote again.
+fn record_sent(
+    repository: &Repository,
+    remote: &str,
+    machine: &str,
+    commit: &CommitId,
+) -> Result<(), GitError> {
+    run(repository.git().args([
+        "update-ref",
+        &format!("{FETCHED}{remote}/{machine}"),
+        commit.as_str(),
+    ]))?;
+    Ok(())
+}
+
+/// Take up `machine`'s ref from `remote` into `repository`, a git directory
+/// that has committed nothing yet, when `remote` has it.
+///
+/// A machine whose git directory is made again, its disk lost or its config
+/// home deleted, comes back under the same name, and `remote` still holds
+/// the history it committed there. With no `refs/knives/<machine>` here,
+/// [`pending`] and [`push`] would refuse that name as another machine's, and
+/// nothing it wrote could be sent. So the ref is fetched, unforced, both to
+/// `refs/knives/<machine>` and to `remote`'s copy of it, where [`fetch`]
+/// leaves copies: the next commit is a child of that history, as the git
+/// directory that wrote it would have made, and the copy says `remote`
+/// already holds it. A git directory that has committed nothing loses nothing
+/// by it.
+///
+/// `remote` is asked first for exactly that ref ([`remote_has_machine_ref`]),
+/// and one that has none leaves `repository` as it is. A remote that cannot
+/// be asked, or a fetch that fails, is an error, so a caller making the git
+/// directory can make nothing rather than one that refuses its own ref later.
+pub fn take_up_own_ref(
+    repository: &Repository,
+    remote: &str,
+    machine: &str,
+) -> Result<(), GitError> {
+    let Some((reference, remote)) = held_machine_ref(repository, remote, machine)? else {
+        return Ok(());
+    };
+    transport(repository.git().args([
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--no-write-fetch-head",
+        remote,
+        &format!("{reference}:{reference}"),
+        &format!("{reference}:{FETCHED}{remote}/{machine}"),
+    ]))?;
+    Ok(())
+}
+
+/// Whether `remote` holds `machine`'s ref, `refs/knives/<machine>`, asked for
+/// exactly that ref and nothing fetched.
+///
+/// What a git directory being made asks before it commits as `machine`: a
+/// name the remote holds already committed there, from this machine's own
+/// earlier git directory ([`take_up_own_ref`]) or from another's.
+pub fn remote_has_machine_ref(
+    repository: &Repository,
+    remote: &str,
+    machine: &str,
+) -> Result<bool, GitError> {
+    Ok(held_machine_ref(repository, remote, machine)?.is_some())
+}
+
+/// `machine`'s ref, `refs/knives/<machine>`, and `remote`, each as git
+/// takes it, where `remote` holds that ref; `None` where it does not.
+fn held_machine_ref<'r>(
+    repository: &Repository,
+    remote: &'r str,
+    machine: &str,
+) -> Result<Option<(String, &'r str)>, GitError> {
+    let reference = own_ref(machine)?;
+    let remote = ref_component("remote", remote)?;
+    let held =
+        claims::remote_refs(repository, remote, &[reference.as_str()])?.contains_key(&reference);
+    Ok(held.then_some((reference, remote)))
 }
 
 /// Whether `git push` rejected its only ref because the remote had already
@@ -841,9 +998,24 @@ fn occupant(repository: &Repository, relative: &Path) -> Result<Occupant, GitErr
     }
 }
 
-/// `refs/knives/<machine>`, for a machine name that spells exactly that ref.
+/// `refs/knives/<machine>`, for a machine name [`machine_component`] takes.
 fn own_ref(machine: &str) -> Result<String, GitError> {
-    Ok(format!("{OWN}{}", ref_component("machine", machine)?))
+    Ok(format!("{OWN}{}", machine_component(machine)?))
+}
+
+/// `machine` when it spells exactly one component of this machine's ref,
+/// `refs/knives/<machine>`, and that ref is no more than [`MAX_REF`] bytes:
+/// a longer one could never be pushed.
+pub(crate) fn machine_component(machine: &str) -> Result<&str, GitError> {
+    let machine = ref_component("machine", machine)?;
+    let bytes = OWN.len() + machine.len();
+    if bytes > MAX_REF {
+        return Err(GitError::MachineRefTooLong {
+            name: machine.to_owned(),
+            bytes,
+        });
+    }
+    Ok(machine)
 }
 
 /// `name` when it can stand as exactly one component of a ref name.
@@ -977,6 +1149,22 @@ mod tests {
                 "{name:?} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn a_machine_whose_ref_passes_255_bytes_is_refused() {
+        // Given: `refs/knives/` is 12 bytes, so 243 are left for the name.
+        let longest = "a".repeat(243);
+
+        // Then: a machine whose ref is 255 bytes has it.
+        let reference = own_ref(&longest).unwrap();
+        assert_eq!(reference, format!("refs/knives/{longest}"));
+        assert_eq!(reference.len(), 255);
+        // And: one byte more is refused, naming the 256 its ref would be.
+        assert!(matches!(
+            own_ref(&"a".repeat(244)),
+            Err(GitError::MachineRefTooLong { bytes: 256, .. })
+        ));
     }
 
     #[test]
@@ -1202,5 +1390,73 @@ mod tests {
                 "{case}: {stderr}"
             );
         }
+    }
+
+    /// A bare git directory in `dir` over the ledger root beside it,
+    /// carrying `example/fork`.
+    fn ledger_repository(dir: &Path) -> Repository {
+        let git_dir = dir.join("ledger.git");
+        let status = crate::bind::git_command()
+            .args(["init", "--quiet", "--bare"])
+            .arg(&git_dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init --bare {}", git_dir.display());
+        Repository::new(
+            &git_dir,
+            &dir.join("ledger"),
+            [UpstreamName::new("example/fork")],
+        )
+        .unwrap()
+    }
+
+    /// The entry `name` written into the fork's directory, as a write on
+    /// this machine leaves it; its path relative to the root.
+    fn written(repository: &Repository, name: &str) -> PathBuf {
+        let relative = Path::new("example/fork").join(name);
+        let path = repository.work_tree().join(&relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("+++\n+++\n{name}\n")).unwrap();
+        relative
+    }
+
+    /// What is pending committed as `machine`, which must commit something.
+    fn committed(repository: &Repository, machine: &str) -> CommitId {
+        let pending = pending(repository, machine).unwrap();
+        commit_pending(repository, machine, pending)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn an_entry_only_a_former_name_of_this_machine_carries_is_added_under_its_new_name() {
+        let _lock = crate::config::test_support::environment_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let repository = ledger_repository(dir.path());
+        // Given: two entries this machine committed as machine-one. The
+        // remote took the first, so the copy of machine-one's ref a push
+        // leaves carries it; the push of the second was refused, so only
+        // this checkout's own refs/knives/machine-one carries that one.
+        written(&repository, "20261116T080000.000000001Z-a1b2.md");
+        let sent = committed(&repository, "machine-one");
+        record_sent(&repository, "origin", "machine-one", &sent).unwrap();
+        let refused = written(&repository, "20261116T080000.000000002Z-c3d4.md");
+        committed(&repository, "machine-one");
+        // And: a peer's entry, written in from the copy of machine-two's ref
+        // a fetch left.
+        let peer = written(&repository, "20261116T080000.000000003Z-e5f6.md");
+        let blobs = hash_objects(&repository, [peer.as_path()], true).unwrap();
+        let tree = write_tree(&repository, Vec::new(), std::iter::once(peer).zip(blobs)).unwrap();
+        let theirs = commit_tree(&repository, "machine-two", &tree, None).unwrap();
+        record_sent(&repository, "origin", "machine-two", &theirs).unwrap();
+
+        // When: this machine is renamed machine-renamed, as a refused push
+        // says to, and a commit under the new name is worked out.
+        let renamed = pending(&repository, "machine-renamed").unwrap();
+
+        // Then: it adds the entry the refused push left, and neither the one
+        // the remote's copy of the former name carries nor the peer's.
+        assert_eq!(renamed.added(), &BTreeSet::from([refused]));
+        assert_eq!(renamed.previous(), None);
     }
 }

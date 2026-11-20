@@ -287,7 +287,7 @@ fn a_sighting_inside_the_claimed_workspace_reaches_the_notice() {
     let notice = session_start_notice(home.path(), &lab.work);
     assert!(
         notice.contains("feat/gamma (agent-one, harness-session, claimed ")
-            && notice.contains(" ago, last seen "),
+            && notice.contains(", last seen "),
         "notice: {notice}"
     );
 }

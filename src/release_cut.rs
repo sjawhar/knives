@@ -2238,7 +2238,7 @@ fn checked_committed_cut(
 /// release than that one is refused, however many levels of the stack it
 /// leaves out. Each refusal writes nothing. Only then is the local
 /// bookmark made, where no ref of the name exists, and the event recorded,
-/// which starts the background ledger sweep.
+/// which the process sends to a shared ledger before it exits.
 fn record_hand_cut(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,

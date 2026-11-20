@@ -43,7 +43,8 @@ impl LockWait {
     /// One minute, for a ledger repository's transport lock: a sweep's pass
     /// holds it across a fetch and a push, so a command pulling before it
     /// decides waits out one network round trip rather than failing on it.
-    /// A sweep run by hand waits as long for the ledger's own lock.
+    /// A sweep, and a write sending what it wrote, wait as long for the
+    /// ledger's own lock.
     pub(crate) const TRANSPORT: Self = Self {
         deadline: Duration::from_secs(60),
         floor: Duration::from_millis(20),
@@ -350,9 +351,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_lock_held_by_a_killed_process_is_free_at_once() {
+        use std::io::BufRead as _;
+        let _environment = crate::config::test_support::environment_lock();
         // Given: another process holds the lock and is killed with SIGKILL, so
         // nothing of its own runs at exit.
-        use std::io::BufRead as _;
         let dir = tempfile::tempdir().expect("state dir");
         let path = dir.path().join("state.json");
         let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
@@ -430,17 +432,21 @@ mod tests {
 
     #[test]
     fn trying_a_held_lock_answers_at_once_and_a_free_one_is_taken() {
+        // A child another test starts holds a copy of the lock until it execs.
+        let _environment = crate::config::test_support::environment_lock();
+        // Given: a lock this thread took with a try, so a try that waited for
+        // its release would never return.
         let dir = tempfile::tempdir().expect("state dir");
         let path = dir.path().join("ledger");
-        let first = FileLock::try_acquire(&path)
+        let held = FileLock::try_acquire(&path)
             .expect("try")
             .expect("a free lock is taken");
 
-        let started = std::time::Instant::now();
+        // When / Then: a try of it answers that it is held.
         assert!(FileLock::try_acquire(&path).expect("try").is_none());
-        assert!(started.elapsed() < Duration::from_millis(100));
 
-        drop(first);
+        // When / Then: once it is let go, a try takes it.
+        drop(held);
         assert!(FileLock::try_acquire(&path).expect("try").is_some());
     }
 

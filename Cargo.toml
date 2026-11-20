@@ -1,6 +1,6 @@
 [package]
 name = "knives"
-version = "4.0.1"
+version = "5.0.0"
 description = "Multi-fork, multi-agent maintenance"
 edition = "2024"
 rust-version = "1.90"
@@ -46,6 +46,10 @@ jiff = "0.2"
 rustix = { version = "1", features = ["process", "system"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# SHA-256, for the name a machine joining a ledger in a harness session takes
+# (`src/ledger_sweep/join.rs`). No default features: `oid` would add a crate;
+# the digest alone is already in the tree through jj-lib.
+sha2 = { version = "0.11", default-features = false }
 tempfile = "3"
 thiserror = "2"
 toml = "0.9"

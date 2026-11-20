@@ -5,11 +5,11 @@
     reason = "a fixture or assertion that cannot proceed IS the test failure"
 )]
 
-//! `knives ledger sweep`, the hand-off every write makes to it, and the pull
-//! a deciding command makes first, through the real binary: a config home
-//! whose registry shares a fork's ledger with a repository, and whose ledger
-//! root is a git repository with that repository as its `origin`, as a
-//! machine set up to share its ledger has.
+//! `knives ledger sweep`, the send every write makes before it exits, and
+//! the pull a deciding command makes first, through the real binary: a
+//! config home whose registry shares a fork's ledger with a repository, and
+//! whose ledger root is a git repository with that repository as its
+//! `origin`, as a machine set up to share its ledger has.
 
 #[path = "common/forge_shim.rs"]
 mod forge_shim;
@@ -137,8 +137,9 @@ fn git_in(git_dir: &Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-/// How many entry files `machine`'s ref holds on `remote`; `0` before it has one.
-fn entries_on(remote: &Path, machine: &str) -> usize {
+/// Each entry file `machine`'s ref holds on `remote`, by its path under the
+/// ledger root; none before it has one.
+fn listed_on(remote: &Path, machine: &str) -> Vec<String> {
     git_in(
         remote,
         &[
@@ -148,9 +149,39 @@ fn entries_on(remote: &Path, machine: &str) -> usize {
             &format!("refs/knives/{machine}"),
         ],
     )
-    .map_or(0, |listing| {
-        listing.lines().filter(|path| lab::is_entry(path)).count()
+    .map_or_else(Vec::new, |listing| {
+        listing
+            .lines()
+            .filter(|path| lab::is_entry(path))
+            .map(str::to_owned)
+            .collect()
     })
+}
+
+/// How many entry files `machine`'s ref holds on `remote`; `0` before it has one.
+fn entries_on(remote: &Path, machine: &str) -> usize {
+    listed_on(remote, machine).len()
+}
+
+/// Each entry file in `home`'s ledger of the lab fork, by its path under the
+/// ledger root.
+fn entries_in(home: &Path) -> Vec<String> {
+    let directory = home.join("ledger").join(FORK);
+    let mut names: Vec<String> = std::fs::read_dir(&directory)
+        .map(|listing| {
+            listing
+                .map(|dirent| {
+                    format!(
+                        "{FORK}/{}",
+                        dirent.expect("an entry").file_name().to_string_lossy()
+                    )
+                })
+                .filter(|path| lab::is_entry(path))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
 }
 
 fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
@@ -175,13 +206,6 @@ fn held(path: &Path) -> bool {
         Err(TryLockError::WouldBlock) => true,
         Err(TryLockError::Error(error)) => panic!("locking {}: {error}", path.display()),
     }
-}
-
-/// Wait until no sweep holds `home`'s ledger lock, so none outlives the test.
-fn settle(home: &Path) {
-    wait_until("the last sweep to finish", || {
-        !held(&home.join("ledger.lock"))
-    });
 }
 
 #[test]
@@ -249,32 +273,48 @@ fn a_burst_of_concurrent_sweeps_makes_one_commit_and_no_error() {
 }
 
 #[test]
-fn a_handed_off_sweep_that_finds_the_lock_held_leaves_at_once_as_busy() {
-    // Given: a machine with an entry to send, and its ledger lock held, as
-    // a running sweep holds it.
-    let home = a_repo_home();
+fn a_write_that_finds_the_ledger_lock_held_waits_for_it_and_then_sends() {
+    // Given: a managed fork on a machine that shares its ledger, and its
+    // ledger lock held, as a running sweep or another write's send holds it.
+    let lab = lab::Lab::new();
+    let home = shared_home(&lab);
     let (_remote_dir, remote) = lab::bare_remote();
-    let root = share(home.path(), "alpha", &remote);
-    append(&root, "acme/a-repo", 1);
+    share(home.path(), "alpha", &remote);
     let held = hold_sweep_lock(home.path());
 
-    // When: the sweep a write hands off runs.
-    let swept = lab::knives_command(
+    // When: a note is written, and the holder lets go a moment later.
+    let mut child = lab::knives_command(
+        &lab.work,
         home.path(),
-        home.path(),
-        home.path(),
-        &["--json", "ledger", "sweep"],
+        lab.temp_path(),
+        &[
+            "--text",
+            "notch",
+            "-m",
+            "after the holder",
+            "--repo",
+            "demo",
+        ],
     )
-    .env(knives::ledger_sweep::HANDED_OFF, "1")
-    .output()
-    .expect("run the handed-off sweep");
-
-    // Then: it succeeds as busy, having sent nothing for the holder to race.
-    assert!(swept.status.success(), "{swept:?}");
-    let report: serde_json::Value = serde_json::from_slice(&swept.stdout).expect("JSON");
-    assert_eq!(report["outcome"], "busy", "{report}");
-    assert_eq!(entries_on(&remote, "alpha"), 0);
+    .env("KNIVES_OWNER", "ses_fff688")
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .expect("start knives notch");
+    std::thread::sleep(Duration::from_secs(2));
+    let early = child.try_wait().expect("look at the write");
     drop(held);
+    let wrote = child.wait_with_output().expect("wait for the write");
+
+    // Then: it waited for the holder rather than leave its note behind, and
+    // the note is on the remote when it exits.
+    let stderr = String::from_utf8_lossy(&wrote.stderr);
+    assert!(
+        early.is_none(),
+        "the write exited under the held lock: {stderr}"
+    );
+    assert!(wrote.status.success(), "{stderr}");
+    assert_eq!(entries_on(&remote, "alpha"), 1);
 }
 
 #[test]
@@ -333,15 +373,30 @@ fn a_sweep_run_by_hand_while_another_holds_the_lock_waits_and_reports_its_own_fa
 /// A bare remote whose every push is refused, with the directory holding it.
 fn refusing_remote() -> (tempfile::TempDir, PathBuf) {
     let (remote_dir, remote) = lab::bare_remote();
-    let hook = remote.join("hooks").join("pre-receive");
-    std::fs::write(
-        &hook,
+    refuse_pushes(&remote);
+    (remote_dir, remote)
+}
+
+/// Make `remote` refuse every push, saying so, until [`accept_pushes`].
+fn refuse_pushes(remote: &Path) {
+    remote_hook(
+        remote,
         "#!/bin/sh\necho 'push refused by the test' >&2\nexit 1\n",
-    )
-    .expect("write the pre-receive hook");
+    );
+}
+
+/// Take back what [`refuse_pushes`] did.
+fn accept_pushes(remote: &Path) {
+    std::fs::remove_file(remote.join("hooks").join("pre-receive"))
+        .expect("remove the pre-receive hook");
+}
+
+/// Run `script` as `remote`'s `pre-receive` hook, before every push.
+fn remote_hook(remote: &Path, script: &str) {
+    let hook = remote.join("hooks").join("pre-receive");
+    std::fs::write(&hook, script).expect("write the pre-receive hook");
     std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .expect("make the hook executable");
-    (remote_dir, remote)
 }
 
 #[test]
@@ -466,10 +521,11 @@ fn a_sweep_reaches_the_remote_through_the_git_config_its_session_hands_it() {
             .env_remove("GIT_CONFIG_VALUE_0")
             .env("GIT_DIR", elsewhere.path().join(".git"));
         if let Some(include) = include {
-            command
-                .env("GIT_CONFIG_COUNT", "1")
-                .env("GIT_CONFIG_KEY_0", "include.path")
-                .env("GIT_CONFIG_VALUE_0", include);
+            lab::with_git_rule(
+                &mut command,
+                "include.path",
+                include.to_str().expect("utf-8 path"),
+            );
         }
         command.output().expect("run knives ledger sweep")
     };
@@ -565,9 +621,11 @@ fn a_destination_with_forks_but_no_machine_name_fails_naming_the_fix() {
 }
 
 #[test]
-fn a_fork_whose_ledger_belongs_elsewhere_is_carried_nowhere_and_said_so() {
+fn a_fork_whose_ledger_no_git_directory_reaches_is_joined_and_its_sweep_names_that_ledger() {
     // Given: a registry sharing a fork's ledger with one repository, a root
-    // whose origin is another, and an entry of that fork's on disk.
+    // whose origin is another, an entry of that fork's on disk, and the
+    // ledger's own remote, which git reaches only through the URL rule the
+    // sweep's session hands it, and which refuses every push.
     let home = tempfile::tempdir().expect("config home");
     std::fs::write(
         home.path().join("repos.toml"),
@@ -578,19 +636,74 @@ fn a_fork_whose_ledger_belongs_elsewhere_is_carried_nowhere_and_said_so() {
     let (_remote_dir, remote) = lab::bare_remote();
     let root = share(home.path(), "alpha", &remote);
     append(&root, "acme/a-repo", 1);
+    let (_elsewhere_dir, elsewhere) = refusing_remote();
 
     // When: a sweep runs.
-    let swept = sweep(home.path());
+    let swept = lab::with_git_rule(
+        &mut lab::knives_command(
+            home.path(),
+            home.path(),
+            home.path(),
+            &["--json", "ledger", "sweep"],
+        ),
+        &format!("url.{}.insteadOf", elsewhere.display()),
+        "https://forge.invalid/acme/elsewhere",
+    )
+    .output()
+    .expect("run knives ledger sweep");
 
-    // Then: it fails naming the repository the registry says, carries the
-    // entry nowhere, and leaves the reason in the log.
+    // Then: it joined the ledger the registry names, with a git directory
+    // over the root whose origin is that ledger on the fork's forge and
+    // which names this machine, and said so in one line.
+    let joined = home
+        .path()
+        .join("ledger-repositories")
+        .join("acme--elsewhere.git");
+    let config = |key: &str| git_in(&joined, &["config", "--get", key]);
+    let machine = config("knives.machine").expect("the joined git directory names a machine");
+    let stderr = String::from_utf8_lossy(&swept.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "joined the ledger acme/elsewhere: made {} as machine {machine}, carrying \
+             acme/a-repo\n",
+            joined.display()
+        )),
+        "{stderr}"
+    );
+    assert_eq!(
+        config("remote.origin.url").as_deref(),
+        Some("https://forge.invalid/acme/elsewhere")
+    );
+    assert_eq!(config("core.bare").as_deref(), Some("false"));
+    assert_eq!(config("core.worktree"), Some(root.display().to_string()));
+    // And: the sweep carries the fork through that directory alone, and
+    // fails there, since the ledger refuses the push, naming the directory
+    // (`acme--elsewhere.git`, the ledger's) and git's cause; it carries the
+    // entry to the root's remote no more than before, and leaves the reason
+    // in the log.
     assert_eq!(swept.status.code(), Some(3), "{swept:?}");
     let report: serde_json::Value = serde_json::from_slice(&swept.stdout).expect("JSON");
-    let said = "repos.toml says its ledger belongs to acme/elsewhere";
-    assert!(report["problems"].to_string().contains(said), "{report}");
+    let carrying: Vec<&serde_json::Value> = report["destinations"]
+        .as_array()
+        .expect("destinations")
+        .iter()
+        .filter(|destination| destination["forks"] != serde_json::json!([]))
+        .collect();
+    assert!(
+        matches!(carrying.as_slice(), [destination]
+            if destination["git_dir"] == joined.display().to_string()
+                && destination["forks"] == serde_json::json!(["acme/a-repo"])),
+        "{report}"
+    );
+    let problems = report["problems"].to_string();
+    let through = format!("origin ({})", joined.display());
+    assert!(
+        problems.contains(&through) && problems.contains("push refused by the test"),
+        "{report}"
+    );
     assert_eq!(entries_on(&remote, "alpha"), 0);
     let log = std::fs::read_to_string(home.path().join("ledger-sweep.log")).expect("a log");
-    assert!(log.contains(said), "{log}");
+    assert!(log.contains(&through), "{log}");
 }
 
 #[test]
@@ -691,57 +804,30 @@ fn one_ledger_root_sweeps_each_fork_to_the_repository_it_names_and_no_other() {
 }
 
 #[test]
-fn a_write_hands_off_to_a_sweep_and_does_not_wait_for_it() {
-    // Given: a managed fork on a machine that shares its ledger, with the
-    // ledger repository's transport lock held, so any sweep stalls in its
-    // first pass until the test lets go.
+fn a_write_on_a_fork_with_no_ledger_exits_0_and_makes_no_network_call() {
+    // Given: a managed fork whose registry entry names no ledger.
     let lab = lab::Lab::new();
-    let home = shared_home(&lab);
-    let (_remote_dir, remote) = lab::bare_remote();
-    let root = share(home.path(), "alpha", &remote);
-    let transport = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(root.join(".git").join("knives-transport.lock"))
-        .expect("open the transport lock");
-    transport.lock().expect("hold the transport lock");
+    let (home, _consumer) = lab::release_test_home(&lab);
 
     // When: a note is written.
-    let started = Instant::now();
-    let wrote = lab::knives_command(
-        &lab.work,
+    let wrote = knives_on(
+        &lab,
         home.path(),
-        lab.temp_path(),
-        &["--text", "notch", "-m", "handed off", "--repo", "demo"],
-    )
-    .env("KNIVES_OWNER", "ses_fff688")
-    .output()
-    .expect("run knives notch");
-    let took = started.elapsed();
+        &["--text", "notch", "-m", "kept here", "--repo", "demo"],
+    );
 
-    // Then: the write returned while its sweep was still stalled, holding
-    // the ledger's lock: it did not wait for the sweep.
+    // Then: it succeeded and said nothing on stderr, and nothing was set up
+    // to carry the note anywhere: no git directory over the ledger, none
+    // joined, and the ledger's lock never taken.
     assert!(
-        wrote.status.success(),
+        wrote.status.success() && wrote.stderr.is_empty(),
         "{}",
         String::from_utf8_lossy(&wrote.stderr)
     );
-    assert!(took < Duration::from_secs(30), "the write took {took:?}");
-    wait_until("the handed-off sweep to take the ledger lock", || {
-        held(&home.path().join("ledger.lock"))
-    });
-    assert_eq!(entries_on(&remote, "alpha"), 0);
-
-    // When: the transport lock is let go.
-    drop(transport);
-
-    // Then: the sweep carries the note to the remote.
-    wait_until("the note to reach the remote", || {
-        entries_on(&remote, "alpha") == 1
-    });
-    settle(home.path());
+    assert!(home.path().join("ledger").is_dir());
+    assert!(!home.path().join("ledger").join(".git").exists());
+    assert!(!home.path().join("ledger-repositories").exists());
+    assert!(!home.path().join("ledger.lock").exists());
     assert!(!home.path().join("ledger-sweep.log").exists());
 }
 
@@ -754,7 +840,7 @@ fn a_burst_of_concurrent_writes_reaches_the_remote_without_a_failure() {
     let (_remote_dir, remote) = lab::bare_remote();
     share(home.path(), "alpha", &remote);
 
-    // When: sixteen notes are written at once, each handing off.
+    // When: sixteen notes are written at once, each sending its own.
     let children: Vec<_> = (0..WRITES)
         .map(|index| {
             lab::knives_command(
@@ -777,6 +863,8 @@ fn a_burst_of_concurrent_writes_reaches_the_remote_without_a_failure() {
             .expect("start a write")
         })
         .collect();
+
+    // Then: every write succeeds and says nothing on stderr.
     for child in children {
         let output = child.wait_with_output().expect("wait for a write");
         assert!(
@@ -785,19 +873,10 @@ fn a_burst_of_concurrent_writes_reaches_the_remote_without_a_failure() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-
-    // Then: every note reaches the remote, in fewer commits than writes, and
-    // no sweep left a failure behind.
-    wait_until("every note to reach the remote", || {
-        entries_on(&remote, "alpha") == WRITES
-    });
-    settle(home.path());
+    // And: when the last one has exited, every note is on the remote, and
+    // no send left a failure behind.
+    assert_eq!(entries_on(&remote, "alpha"), WRITES);
     assert!(!home.path().join("ledger-sweep.log").exists());
-    let commits: usize = git_in(&remote, &["rev-list", "--count", "refs/knives/alpha"])
-        .expect("a ref")
-        .parse()
-        .expect("a count");
-    assert!(commits < WRITES, "{commits} commits for {WRITES} writes");
 }
 
 /// `knives <args>` from `lab`'s work checkout, as the machine whose config
@@ -846,8 +925,8 @@ fn a_statement_made_on_one_machine_shows_in_status_on_another_after_a_sweep() {
     share(alpha.path(), "alpha", &remote);
     share(beta.path(), "beta", &remote);
 
-    // When: alpha states the branch's pull request, and the sweep that write
-    // handed off has carried it to the remote.
+    // When: alpha states the branch's pull request, which is on the remote
+    // when the write exits.
     let tracked = knives_on(
         &lab,
         alpha.path(),
@@ -858,10 +937,7 @@ fn a_statement_made_on_one_machine_shows_in_status_on_another_after_a_sweep() {
         "{}",
         String::from_utf8_lossy(&tracked.stderr)
     );
-    wait_until("alpha's statement to reach the remote", || {
-        entries_on(&remote, "alpha") == 1
-    });
-    settle(alpha.path());
+    assert_eq!(entries_on(&remote, "alpha"), 1);
     assert!(
         !beta.path().join("ledger").join(FORK).exists(),
         "beta had alpha's entry before it asked"
@@ -917,10 +993,7 @@ fn a_new_machine_with_no_ledger_root_yet_pulls_what_another_stated() {
         "{}",
         String::from_utf8_lossy(&tracked.stderr)
     );
-    wait_until("alpha's statement to reach the remote", || {
-        entries_on(&remote, "alpha") == 1
-    });
-    settle(alpha.path());
+    assert_eq!(entries_on(&remote, "alpha"), 1);
     assert!(!beta.path().join("ledger").exists());
 
     // When: beta's status runs, pulling first.
@@ -971,7 +1044,7 @@ fn a_status_with_nothing_to_pull_leaves_a_missing_ledger_root_missing() {
 #[test]
 fn a_finish_run_from_inside_the_workspace_it_removes_still_sends_its_release() {
     // Given: a machine joined as the installer joins one, and a branch it
-    // started into a workspace, whose claim the start's sweep has carried.
+    // started into a workspace, whose claim is on the remote.
     let lab = lab::Lab::new();
     let home = shared_home(&lab);
     let (_remote_dir, remote) = lab::bare_remote();
@@ -1000,13 +1073,10 @@ fn a_finish_run_from_inside_the_workspace_it_removes_still_sends_its_release() {
         "no workspace at {}",
         workspace.display()
     );
-    wait_until("the claim to reach the remote", || {
-        entries_on(&remote, "alpha") == 1
-    });
-    settle(home.path());
+    assert_eq!(entries_on(&remote, "alpha"), 1);
 
     // When: the branch is finished from inside that workspace, which the
-    // finish removes before it hands off its sweep.
+    // finish removes before it sends its release.
     let finished = lab::knives_command(
         &workspace,
         home.path(),
@@ -1023,16 +1093,12 @@ fn a_finish_run_from_inside_the_workspace_it_removes_still_sends_its_release() {
     );
     assert!(!workspace.exists(), "the workspace survived the finish");
 
-    // Then: the sweep it handed off carries the release to the remote, and
-    // leaves no failure behind.
+    // Then: the release is on the remote when the finish exits, and no
+    // failure is left behind.
     let log = home.path().join("ledger-sweep.log");
-    wait_until("the handed-off sweep to carry the release or fail", || {
-        recorded_on(&remote, "claim released") == 1 || log.exists()
-    });
-    settle(home.path());
     assert!(
         !log.exists(),
-        "the handed-off sweep failed: {}",
+        "the send failed: {}",
         std::fs::read_to_string(&log).unwrap_or_default()
     );
     assert_eq!(recorded_on(&remote, "claim released"), 1);
@@ -1146,10 +1212,7 @@ fn a_dependency_stated_on_another_machine_survives_a_second_machines_depends() {
         "{}",
         String::from_utf8_lossy(&stated.stderr)
     );
-    wait_until("alpha's statement to reach the remote", || {
-        entries_on(&remote, "alpha") == 1
-    });
-    settle(alpha.path());
+    assert_eq!(entries_on(&remote, "alpha"), 1);
 
     // When: beta states another dependency of the same branch.
     let stated = knives_on(
@@ -1162,7 +1225,6 @@ fn a_dependency_stated_on_another_machine_survives_a_second_machines_depends() {
         "{}",
         String::from_utf8_lossy(&stated.stderr)
     );
-    settle(beta.path());
 
     // Then: beta's statement, the newest, lists both.
     let entries = Ledger::at(beta.path().join("ledger").join(FORK))
@@ -1175,34 +1237,34 @@ fn a_dependency_stated_on_another_machine_survives_a_second_machines_depends() {
 
 #[test]
 fn dependencies_two_machines_state_at_once_both_survive() {
-    // Given: two machines sharing one ledger remote, each with its sweep held
-    // off, so neither has the other's statement when it states its own.
+    // Given: two machines sharing one ledger remote, which refuses every
+    // push for now, so neither has the other's statement when it states its
+    // own.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let alpha = shared_home(&lab);
     let beta = second_machine(alpha.path());
-    let (_remote_dir, remote) = lab::bare_remote();
+    let (_remote_dir, remote) = refusing_remote();
     share(alpha.path(), "alpha", &remote);
     share(beta.path(), "beta", &remote);
-    let alpha_held = hold_sweep_lock(alpha.path());
-    let beta_held = hold_sweep_lock(beta.path());
 
-    // When: each states a different dependency of the same branch, and then
-    // each sweeps until it has the other's.
+    // When: each states a different dependency of the same branch, which
+    // stays on its machine, then the remote takes pushes again, and each
+    // sweeps until it has the other's.
     for (home, on) in [(&alpha, "demo#1"), (&beta, "demo#2")] {
         let stated = knives_on(
             &lab,
             home.path(),
             &["--text", "depends", "feat/alpha", "--on", on],
         );
+        let stderr = String::from_utf8_lossy(&stated.stderr);
+        assert_eq!(stated.status.code(), Some(3), "{stderr}");
         assert!(
-            stated.status.success(),
-            "{}",
-            String::from_utf8_lossy(&stated.stderr)
+            stderr.contains("1 ledger entry this command wrote did not reach the ledger"),
+            "{stderr}"
         );
     }
-    drop(alpha_held);
-    drop(beta_held);
+    accept_pushes(&remote);
     for home in [&alpha, &beta, &alpha] {
         let swept = sweep(home.path());
         assert!(
@@ -1210,7 +1272,6 @@ fn dependencies_two_machines_state_at_once_both_survive() {
             "{}",
             String::from_utf8_lossy(&swept.stdout)
         );
-        settle(home.path());
     }
 
     // Then: both dependencies are live on both machines.
@@ -1275,8 +1336,8 @@ fn a_track_from_a_machine_whose_clock_runs_behind_wins_over_the_statement_it_rep
     };
     assert_eq!(pr_on(beta.path()), 12, "beta did not pull alpha's #12");
 
-    // When: beta states #13, replacing the #12 it read, and its sweep
-    // carries the statement to the remote.
+    // When: beta states #13, replacing the #12 it read, which is on the
+    // remote when the write exits.
     let tracked = knives_on(
         &lab,
         beta.path(),
@@ -1287,10 +1348,7 @@ fn a_track_from_a_machine_whose_clock_runs_behind_wins_over_the_statement_it_rep
         "{}",
         String::from_utf8_lossy(&tracked.stderr)
     );
-    wait_until("beta's statement to reach the remote", || {
-        entries_on(&remote, "beta") == 1
-    });
-    settle(beta.path());
+    assert_eq!(entries_on(&remote, "beta"), 1);
 
     // Then: #13 is live on beta, and on alpha once it pulls.
     assert_eq!(pr_on(beta.path()), 13);
@@ -1300,22 +1358,25 @@ fn a_track_from_a_machine_whose_clock_runs_behind_wins_over_the_statement_it_rep
 #[test]
 fn a_forget_with_nothing_stated_leaves_a_peers_unsent_statement_standing() {
     // Given: two machines sharing one ledger remote, and a pull request
-    // alpha stated whose sweep has not yet carried it.
+    // alpha stated while its pushes went to a repository that does not
+    // exist, so the statement stayed on alpha.
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let alpha = shared_home(&lab);
     let beta = second_machine(alpha.path());
     let (_remote_dir, remote) = lab::bare_remote();
-    share(alpha.path(), "alpha", &remote);
+    let alpha_root = share(alpha.path(), "alpha", &remote);
     share(beta.path(), "beta", &remote);
-    let held = hold_sweep_lock(alpha.path());
+    let nowhere = "url./nonexistent/ledger.git.pushInsteadOf";
+    lab::git_output(&alpha_root, ["config", nowhere, LEDGER_URL]);
     let tracked = knives_on(
         &lab,
         alpha.path(),
         &["--text", "track", "feat/alpha", "--pr", "1234"],
     );
-    assert!(
-        tracked.status.success(),
+    assert_eq!(
+        tracked.status.code(),
+        Some(3),
         "{}",
         String::from_utf8_lossy(&tracked.stderr)
     );
@@ -1332,10 +1393,8 @@ fn a_forget_with_nothing_stated_leaves_a_peers_unsent_statement_standing() {
         "{}",
         String::from_utf8_lossy(&forgot.stderr)
     );
-    settle(beta.path());
-    drop(held);
+    lab::git_output(&alpha_root, ["config", "--unset", nowhere]);
     assert!(sweep(alpha.path()).status.success());
-    settle(alpha.path());
 
     // Then: beta wrote no forget, so once it pulls, alpha's #1234 is live
     // on beta too.
@@ -1390,48 +1449,60 @@ fn a_depends_or_a_forget_is_refused_when_the_ledger_cannot_be_pulled() {
     }
 
     // And: stating a pull request, which replaces nothing it read, still
-    // records.
+    // records, and exits 3 naming the ledger its entry did not reach.
     let tracked = knives_on(
         &lab,
         home.path(),
         &["--text", "track", "feat/alpha", "--pr", "7"],
     );
+    let stderr = String::from_utf8_lossy(&tracked.stderr);
+    assert_eq!(tracked.status.code(), Some(3), "{stderr}");
     assert!(
-        tracked.status.success(),
-        "{}",
-        String::from_utf8_lossy(&tracked.stderr)
+        stderr.contains(&format!(
+            "{FORK}: 1 ledger entry this command wrote did not reach the ledger {LEDGER}"
+        )),
+        "{stderr}"
     );
-    settle(home.path());
+    assert_eq!(entries_in(home.path()).len(), 1);
 }
 
 #[test]
-fn a_handed_off_sweep_whose_ledger_remote_stalls_lets_the_lock_go_within_a_bound() {
+fn a_write_whose_ledger_remote_stalls_exits_3_within_a_bound_naming_the_ledger() {
     // Given: a managed fork on a machine whose ledger remote accepts the
     // connection and never answers.
     let lab = lab::Lab::new();
     let home = shared_home(&lab);
-    share_at(home.path(), "alpha", &stalled_remote());
+    let root = share_at(home.path(), "alpha", &stalled_remote());
 
-    // When: a note is written, handing off a sweep.
+    // When: a note is written.
+    let started = Instant::now();
     let wrote = knives_on(
         &lab,
         home.path(),
         &["--text", "notch", "-m", "stalled", "--repo", "demo"],
     );
-    assert!(
-        wrote.status.success(),
-        "{}",
-        String::from_utf8_lossy(&wrote.stderr)
-    );
 
-    // Then: within a minute the sweep has given up, recorded why in the
-    // sweep log, and let the ledger's lock go.
-    let log = home.path().join("ledger-sweep.log");
-    wait_until("the stalled sweep to give up", || {
-        log.exists() && !held(&home.path().join("ledger.lock"))
-    });
-    let recorded = std::fs::read_to_string(&log).expect("read the sweep log");
+    // Then: it exits 3 well inside a minute, naming the ledger and the git
+    // directory its note did not reach, records why in the sweep log, and
+    // no longer holds the ledger's lock.
+    let stderr = String::from_utf8_lossy(&wrote.stderr);
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "the write hung for {:?}",
+        started.elapsed()
+    );
+    assert_eq!(wrote.status.code(), Some(3), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "{FORK}: 1 ledger entry this command wrote did not reach the ledger {LEDGER} ({}): ",
+            root.join(".git").display()
+        )),
+        "{stderr}"
+    );
+    let recorded =
+        std::fs::read_to_string(home.path().join("ledger-sweep.log")).expect("read the sweep log");
     assert!(recorded.contains("origin"), "{recorded}");
+    assert!(!held(&home.path().join("ledger.lock")));
 }
 
 #[test]
@@ -1517,10 +1588,7 @@ fn status_names_the_peer_entries_a_machine_does_not_carry_the_fork_for() {
         "{}",
         String::from_utf8_lossy(&wrote.stderr)
     );
-    wait_until("alpha's note to reach the remote", || {
-        entries_on(&remote, "alpha") == 1
-    });
-    settle(alpha.path());
+    assert_eq!(entries_on(&remote, "alpha"), 1);
 
     // When: beta sweeps.
     let swept = sweep(beta.path());
@@ -1537,7 +1605,7 @@ fn status_names_the_peer_entries_a_machine_does_not_carry_the_fork_for() {
     assert!(!beta.path().join("ledger").join(FORK).exists());
 
     // And: beta's status of the lab fork says where that entry is and why
-    // it is not read, though no sweep's output reaches anyone.
+    // it is not read.
     let (code, status) = status_on(&lab, beta.path());
     assert_eq!(code, Some(0), "{status}");
     let through = format!(
@@ -1646,7 +1714,6 @@ fn release_members_pulls_first_and_says_when_it_could_not() {
         "{}",
         String::from_utf8_lossy(&cut.stdout)
     );
-    settle(home.path());
     let reached = remote.to_str().expect("utf-8");
     lab::git_output(
         &root,
@@ -1690,7 +1757,6 @@ fn each_release_edit_is_refused_when_the_ledger_cannot_be_pulled() {
         "{}",
         String::from_utf8_lossy(&cut.stdout)
     );
-    settle(home.path());
     let reached = remote.to_str().expect("utf-8");
     lab::git_output(
         &root,
@@ -1915,6 +1981,72 @@ fn a_non_fast_forward_push_names_a_machine_name_collision() {
 }
 
 #[test]
+fn an_entry_a_name_collision_left_unsent_reaches_the_remote_after_the_rename_it_names() {
+    // Given: two config homes committing as one machine name, `duplicate`.
+    // The first pushed its ref; the second took that ref up, as a join of
+    // the same session takes up its own ref, and pushed on top of it.
+    let first = a_repo_home();
+    let second = a_repo_home();
+    let (_remote_dir, remote) = lab::bare_remote();
+    let first_root = share(first.path(), "duplicate", &remote);
+    let second_root = share(second.path(), "duplicate", &remote);
+    append(&first_root, "acme/a-repo", 1);
+    let (code, report) = sweep_report(first.path());
+    assert_eq!(code, Some(0), "{report}");
+    lab::git_output(
+        &second_root,
+        [
+            "fetch",
+            "--quiet",
+            remote.to_str().expect("utf-8"),
+            "refs/knives/duplicate:refs/knives/duplicate",
+        ],
+    );
+    append(&second_root, "acme/a-repo", 1);
+    let (code, report) = sweep_report(second.path());
+    assert_eq!(code, Some(0), "{report}");
+
+    // When: the first writes again, its push is refused as a name
+    // collision, and the first is renamed as that refusal says.
+    let entries = |root: &Path| -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(root.join("acme/a-repo"))
+            .expect("read the fork's entries")
+            .map(|dirent| {
+                format!(
+                    "acme/a-repo/{}",
+                    dirent.expect("an entry").file_name().to_string_lossy()
+                )
+            })
+            .filter(|path| lab::is_entry(path))
+            .collect()
+    };
+    let before = entries(&first_root);
+    append(&first_root, "acme/a-repo", 1);
+    let refused: Vec<String> = entries(&first_root).difference(&before).cloned().collect();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    let (code, report) = sweep_report(first.path());
+    assert_eq!(code, Some(3), "{report}");
+    assert!(
+        problems_of(&report).contains("give each machine a unique knives.machine"),
+        "{report}"
+    );
+    lab::git_output(&first_root, ["config", "knives.machine", "renamed"]);
+    let (code, report) = sweep_report(first.path());
+
+    // Then: that sweep sends the entry the refused push left, under the
+    // new name, and leaves nothing unsent: a write that did not reach the
+    // ledger can be sent again, by the remedy knives itself gives.
+    assert_eq!(code, Some(0), "{report}");
+    assert_eq!(report["destinations"][0]["unsent"], 0, "{report}");
+    let on_renamed = listed_on(&remote, "renamed");
+    assert!(
+        on_renamed.contains(&refused[0]),
+        "{} is not on the remote's renamed ref: {on_renamed:?}",
+        refused[0]
+    );
+}
+
+#[test]
 fn a_peer_ref_that_moved_backward_keeps_out_only_that_machines_entries() {
     // Given: three machines sharing one ledger remote. beta has fetched
     // gamma's ref at its second commit, and then the remote's copy of
@@ -1974,39 +2106,6 @@ fn a_peer_ref_that_moved_backward_keeps_out_only_that_machines_entries() {
     assert_eq!(beta_entries(), 4);
 }
 
-/// Push to `remote`, as `machine`'s ref, one commit carrying `contents` at
-/// `path` under the ledger root: what a machine running another knives, or
-/// a broken one, could send.
-fn push_as_peer(remote: &Path, machine: &str, path: &str, contents: &str) {
-    let scratch = tempfile::tempdir().expect("peer checkout");
-    let root = scratch.path().join("peer");
-    lab::git_repository(&root, &[]);
-    let file = root.join(path);
-    std::fs::create_dir_all(file.parent().expect("an entry's directory")).expect("mkdir");
-    std::fs::write(&file, contents).expect("write the peer's entry");
-    lab::git_output(&root, ["add", "--all"]);
-    lab::git_output(
-        &root,
-        [
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--quiet",
-            "-m",
-            "peer",
-        ],
-    );
-    lab::git_output(
-        &root,
-        [
-            "push",
-            "--quiet",
-            remote.to_str().expect("utf-8"),
-            &format!("HEAD:refs/knives/{machine}"),
-        ],
-    );
-}
-
 #[test]
 fn a_peer_directory_named_with_control_characters_is_refused_and_reaches_the_terminal_escaped() {
     // Given: a machine carrying one fork, and a peer's ref on the remote
@@ -2017,7 +2116,7 @@ fn a_peer_directory_named_with_control_characters_is_refused_and_reaches_the_ter
     let (_remote_dir, remote) = lab::bare_remote();
     share(home.path(), "alpha", &remote);
     let owner = "\u{1b}]0;pwned\u{7}";
-    push_as_peer(
+    lab::push_as_peer(
         &remote,
         "mallory",
         &format!("{owner}/repo/20261011T120000.000000000Z-0000.md"),
@@ -2062,7 +2161,7 @@ fn a_peer_entry_of_a_kind_this_knives_does_not_know_leaves_notch_and_status_read
     let (_remote_dir, remote) = lab::bare_remote();
     share(beta.path(), "beta", &remote);
     let name = "20261011T120000.000000000Z-0000.md";
-    push_as_peer(
+    lab::push_as_peer(
         &remote,
         "alpha",
         &format!("{FORK}/{name}"),
@@ -2115,7 +2214,7 @@ fn a_peer_entry_that_does_not_parse_is_kept_out_and_named_on_every_pull() {
     let (_remote_dir, remote) = lab::bare_remote();
     share(beta.path(), "beta", &remote);
     let path = format!("{FORK}/20261011T120000.000000000Z-dead.md");
-    push_as_peer(&remote, "alpha", &path, "not an entry\n");
+    lab::push_as_peer(&remote, "alpha", &path, "not an entry\n");
 
     for round in ["the first pull", "the next pull"] {
         // When: status pulls.
@@ -2173,8 +2272,8 @@ fn two_peers_carrying_different_entries_at_one_path_write_neither_and_say_so() {
     let (_remote_dir, remote) = lab::bare_remote();
     share(beta.path(), "beta", &remote);
     let path = format!("{FORK}/20261011T120000.000000000Z-0000.md");
-    push_as_peer(&remote, "alpha", &path, &peer_entry("alpha's account"));
-    push_as_peer(&remote, "gamma", &path, &peer_entry("gamma's account"));
+    lab::push_as_peer(&remote, "alpha", &path, &peer_entry("alpha's account"));
+    lab::push_as_peer(&remote, "gamma", &path, &peer_entry("gamma's account"));
     let on_disk = beta.path().join("ledger").join(&path);
 
     // When: status pulls.
@@ -2213,7 +2312,7 @@ fn a_peer_entry_that_differs_from_the_file_here_leaves_the_file_and_says_so() {
     std::fs::create_dir_all(on_disk.parent().expect("the fork's directory")).expect("mkdir");
     let ours = peer_entry("this machine's account");
     std::fs::write(&on_disk, &ours).expect("write this machine's file");
-    push_as_peer(&remote, "alpha", &path, &peer_entry("alpha's account"));
+    lab::push_as_peer(&remote, "alpha", &path, &peer_entry("alpha's account"));
 
     // When: status pulls.
     let (code, report) = status_on(&lab, beta.path());
@@ -2241,8 +2340,8 @@ fn two_peers_carrying_the_same_entry_at_one_path_write_it_once_and_say_nothing()
     share(beta.path(), "beta", &remote);
     let path = format!("{FORK}/20261011T120000.000000000Z-0000.md");
     let entry = peer_entry("one account");
-    push_as_peer(&remote, "alpha", &path, &entry);
-    push_as_peer(&remote, "gamma", &path, &entry);
+    lab::push_as_peer(&remote, "alpha", &path, &entry);
+    lab::push_as_peer(&remote, "gamma", &path, &entry);
     let on_disk = beta.path().join("ledger").join(&path);
 
     for round in [
@@ -2370,6 +2469,18 @@ fn hold_sweep_lock(home: &Path) -> File {
     file
 }
 
+/// Run `write` on the machine whose ledger root is `root` while its git
+/// directory names no machine, as one not yet set up to share names none:
+/// every pull and send there is refused before it starts, so what `write`
+/// writes stays uncommitted, as a write whose send never ran leaves it.
+fn with_no_machine_name<T>(root: &Path, write: impl FnOnce() -> T) -> T {
+    let machine = lab::git_output(root, ["config", "--get", "knives.machine"]);
+    lab::git_output(root, ["config", "--unset", "knives.machine"]);
+    let output = write();
+    lab::git_output(root, ["config", "knives.machine", &machine]);
+    output
+}
+
 #[test]
 fn a_second_machine_syncing_the_same_merge_writes_no_second_event() {
     // Given: two machines sharing one ledger remote, both of which saw #7 open.
@@ -2377,8 +2488,8 @@ fn a_second_machine_syncing_the_same_merge_writes_no_second_event() {
     let (_remote_dir, remote) = lab::bare_remote();
     let (alpha, beta) = two_machines_that_saw_seven_open(&lab, &remote, &remote);
 
-    // When: the forge reports #7 merged, alpha syncs and its sweep carries
-    // the event, and then beta syncs with no sweep of its own able to run.
+    // When: the forge reports #7 merged, alpha syncs, which sends its event,
+    // and then beta syncs.
     let merged = forge_reporting("MERGED");
     let synced = sync_on(&lab, alpha.path(), merged.path());
     assert_eq!(
@@ -2387,11 +2498,7 @@ fn a_second_machine_syncing_the_same_merge_writes_no_second_event() {
         "{}",
         String::from_utf8_lossy(&synced.stdout)
     );
-    wait_until("alpha's event to reach the remote", || {
-        recorded_on(&remote, MERGED) == 1
-    });
-    settle(alpha.path());
-    let held = hold_sweep_lock(beta.path());
+    assert_eq!(recorded_on(&remote, MERGED), 1);
     let synced = sync_on(&lab, beta.path(), merged.path());
     assert_eq!(
         synced.status.code(),
@@ -2401,18 +2508,22 @@ fn a_second_machine_syncing_the_same_merge_writes_no_second_event() {
     );
 
     // Then: beta's sync pulled alpha's event and wrote none of its own, so
-    // no sweep had anything to discard.
+    // its send had nothing to discard.
     assert_eq!(recorded_in(beta.path(), MERGED), 1);
+    let (code, report) = status_on(&lab, beta.path());
+    assert_eq!(code, Some(0), "{report}");
+    assert!(
+        !notes(&report).iter().any(|note| note.contains("discarded")),
+        "{report}"
+    );
 
     // And: once beta sweeps, the remote has the merge once.
-    drop(held);
     let swept = sweep(beta.path());
     assert!(
         swept.status.success(),
         "{}",
         String::from_utf8_lossy(&swept.stdout)
     );
-    settle(beta.path());
     assert_eq!(recorded_in(beta.path(), MERGED), 1);
     assert_eq!(recorded_on(&remote, MERGED), 1);
     assert_eq!(entries_on(&remote, "beta"), 0);
@@ -2420,20 +2531,21 @@ fn a_second_machine_syncing_the_same_merge_writes_no_second_event() {
 
 #[test]
 fn a_sweep_discards_its_own_uncommitted_repeat_of_a_transition_it_pulled() {
-    // Given: two machines that saw #7 open, and beta's sweep held off, so
-    // what beta writes stays uncommitted.
+    // Given: two machines that saw #7 open.
     let lab = lab::Lab::new();
     let (_remote_dir, remote) = lab::bare_remote();
     let (alpha, beta) = two_machines_that_saw_seven_open(&lab, &remote, &remote);
-    let held = hold_sweep_lock(beta.path());
 
-    // When: beta syncs the merge before alpha's event exists, then alpha
-    // syncs it and its sweep carries it, and then beta sweeps.
+    // When: beta syncs the merge before alpha's event exists, while its
+    // send cannot start, so its event stays uncommitted; then alpha syncs
+    // it, which sends it, and then beta sweeps.
     let merged = forge_reporting("MERGED");
-    let synced = sync_on(&lab, beta.path(), merged.path());
+    let synced = with_no_machine_name(&beta.path().join("ledger"), || {
+        sync_on(&lab, beta.path(), merged.path())
+    });
     assert_eq!(
         synced.status.code(),
-        Some(0),
+        Some(3),
         "{}",
         String::from_utf8_lossy(&synced.stdout)
     );
@@ -2445,18 +2557,13 @@ fn a_sweep_discards_its_own_uncommitted_repeat_of_a_transition_it_pulled() {
         "{}",
         String::from_utf8_lossy(&synced.stdout)
     );
-    wait_until("alpha's event to reach the remote", || {
-        recorded_on(&remote, MERGED) == 1
-    });
-    settle(alpha.path());
-    drop(held);
+    assert_eq!(recorded_on(&remote, MERGED), 1);
     let swept = sweep(beta.path());
     assert!(
         swept.status.success(),
         "{}",
         String::from_utf8_lossy(&swept.stdout)
     );
-    settle(beta.path());
 
     // Then: beta's repeat is gone before any commit, it holds alpha's event
     // alone, and the remote has the merge once.
@@ -2466,26 +2573,26 @@ fn a_sweep_discards_its_own_uncommitted_repeat_of_a_transition_it_pulled() {
 }
 
 #[test]
-fn status_names_the_repeated_transitions_a_handed_off_sweep_discarded() {
-    // Given: two machines that saw #7 open, and beta's sweep held off while
-    // it syncs the merge, so its event stays uncommitted.
+fn status_names_the_repeated_transitions_a_writes_send_discarded() {
+    // Given: two machines that saw #7 open, and beta's sync of the merge
+    // while its send cannot start, so its event stays uncommitted.
     let lab = lab::Lab::new();
     let (_remote_dir, remote) = lab::bare_remote();
     let (alpha, beta) = two_machines_that_saw_seven_open(&lab, &remote, &remote);
-    let held = hold_sweep_lock(beta.path());
     let merged = forge_reporting("MERGED");
-    let synced = sync_on(&lab, beta.path(), merged.path());
+    let synced = with_no_machine_name(&beta.path().join("ledger"), || {
+        sync_on(&lab, beta.path(), merged.path())
+    });
     assert_eq!(
         synced.status.code(),
-        Some(0),
+        Some(3),
         "{}",
         String::from_utf8_lossy(&synced.stdout)
     );
     assert_eq!(recorded_in(beta.path(), MERGED), 1, "beta wrote its own");
 
-    // When: alpha's event reaches the remote first, and then a note beta
-    // writes hands off the sweep that discards beta's repeat, a sweep whose
-    // output goes nowhere.
+    // When: alpha's event reaches the remote first, and then beta writes a
+    // note, whose send discards beta's repeat and says nothing of it.
     let synced = sync_on(&lab, alpha.path(), merged.path());
     assert_eq!(
         synced.status.code(),
@@ -2493,28 +2600,21 @@ fn status_names_the_repeated_transitions_a_handed_off_sweep_discarded() {
         "{}",
         String::from_utf8_lossy(&synced.stdout)
     );
-    wait_until("alpha's event to reach the remote", || {
-        recorded_on(&remote, MERGED) == 1
-    });
-    settle(alpha.path());
-    drop(held);
+    assert_eq!(recorded_on(&remote, MERGED), 1);
     let wrote = knives_on(
         &lab,
         beta.path(),
         &["--text", "notch", "-m", "after the merge", "--repo", "demo"],
     );
     assert!(
-        wrote.status.success(),
+        wrote.status.success() && wrote.stderr.is_empty(),
         "{}",
         String::from_utf8_lossy(&wrote.stderr)
     );
-    wait_until("beta's note to reach the remote", || {
-        entries_on(&remote, "beta") == 1
-    });
-    settle(beta.path());
+    assert_eq!(entries_on(&remote, "beta"), 1);
     assert_eq!(recorded_on(&remote, MERGED), 1);
 
-    // Then: beta's status says its sweep discarded the repeat.
+    // Then: beta's status says its send discarded the repeat.
     let (code, report) = status_on(&lab, beta.path());
     assert_eq!(code, Some(0), "{report}");
     assert!(
@@ -2535,20 +2635,26 @@ fn a_repeated_transition_two_machines_committed_is_never_removed() {
     let beta_view = remote_dir.path().join("beta-view.git");
     let (alpha, beta) = two_machines_that_saw_seven_open(&lab, &alpha_view, &beta_view);
 
-    // When: each syncs the merge, and its sweep commits the event to its own
+    // When: each syncs the merge, and its send commits the event to its own
     // ref but cannot push it.
     let merged = forge_reporting("MERGED");
     for (home, machine) in [(&alpha, "alpha"), (&beta, "beta")] {
-        let _ = sync_on(&lab, home.path(), merged.path());
+        let synced = sync_on(&lab, home.path(), merged.path());
+        assert_eq!(
+            synced.status.code(),
+            Some(3),
+            "{}",
+            String::from_utf8_lossy(&synced.stderr)
+        );
         let git_dir = home.path().join("ledger").join(".git");
-        wait_until("the event to be committed", || {
+        assert!(
             git_in(
                 &git_dir,
                 &["rev-parse", "--verify", &format!("refs/knives/{machine}")],
             )
-            .is_some()
-        });
-        settle(home.path());
+            .is_some(),
+            "{machine}'s event was not committed"
+        );
     }
     // And: the remote becomes reachable, and each machine sweeps until it
     // has the other's.
@@ -2560,7 +2666,6 @@ fn a_repeated_transition_two_machines_committed_is_never_removed() {
         assert!(swept.status.success(), "{stdout}");
         let report: serde_json::Value = serde_json::from_str(&stdout).expect("a sweep report");
         assert_eq!(report["destinations"][0]["discarded"], 0, "{report}");
-        settle(home.path());
     }
 
     // Then: both committed events stay, on each machine and on the remote.

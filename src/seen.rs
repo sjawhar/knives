@@ -399,6 +399,8 @@ mod tests {
             started: started.to_owned(),
             files: Vec::new(),
             place: None,
+            machine: None,
+            ledger_commit: None,
         }
     }
 

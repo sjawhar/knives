@@ -1736,7 +1736,7 @@ dependencies = [
 
 [[package]]
 name = "knives"
-version = "4.0.1"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1748,6 +1748,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "toml",

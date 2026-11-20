@@ -551,9 +551,6 @@ fn a_read_never_asks_who_is_reading_and_a_write_is_stopped_by_an_unreadable_stat
             checkout.path(),
             args,
         )
-        .env_remove("KNIVES_OWNER")
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("OMP_SESSION_ID")
         .output()
         .expect("run knives")
     };

@@ -202,7 +202,7 @@ fn canonical_existing_parent(path: &Path) -> Option<PathBuf> {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use crate::config::{Registry, RepoEntry, TrustRules};
+    use crate::config::{Registry, RepoEntry, TrustRules, test_support::environment_lock};
     use crate::ids::{RepoName, UpstreamName};
 
     use super::{Managed, argument_paths, match_checkout};
@@ -318,6 +318,7 @@ mod tests {
 
     #[test]
     fn a_path_outside_every_repository_does_not_match() {
+        let _lock = environment_lock();
         // Given: a trusted repository and a sibling directory sharing its name as a prefix.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("repo");
@@ -336,6 +337,7 @@ mod tests {
 
     #[test]
     fn the_nearest_repository_wins_for_nested_checkouts() {
+        let _lock = environment_lock();
         // Given: an inner checkout nested in an outer checkout, only the inner
         // one under a trusted owner.
         let dir = tempfile::tempdir().unwrap();
@@ -360,6 +362,7 @@ mod tests {
 
     #[test]
     fn nonexistent_leaves_resolve_through_their_existing_parent() {
+        let _lock = environment_lock();
         // Given: an existing root and a not-yet-created descendant.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("r");
@@ -381,6 +384,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlinked_path_that_escapes_the_root_is_outside() {
+        let _lock = environment_lock();
         // Given: a symlink under a trusted root that points to an outside directory.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
@@ -400,6 +404,7 @@ mod tests {
 
     #[test]
     fn a_repo_under_a_trust_root_is_trusted_without_readable_remotes() {
+        let _lock = environment_lock();
         // Given: a checkout under a trusted subtree whose `.git` is an empty
         // directory git cannot read, never registered.
         let dir = tempfile::tempdir().unwrap();
@@ -422,6 +427,7 @@ mod tests {
 
     #[test]
     fn a_repo_declaring_a_trusted_owner_is_trusted_through_its_remotes() {
+        let _lock = environment_lock();
         // Given: two unregistered clones, one whose origin names a trusted owner.
         let dir = tempfile::tempdir().unwrap();
         let ours = dir.path().join("elsewhere/tool");
@@ -450,6 +456,7 @@ mod tests {
 
     #[test]
     fn a_sibling_of_a_trust_root_sharing_its_name_prefix_is_outside() {
+        let _lock = environment_lock();
         // Given: `agent-c-2`, a sibling whose string prefix matches a trusted root.
         let dir = tempfile::tempdir().unwrap();
         let outside = dir.path().join("agent-c-2/repo");
@@ -465,6 +472,7 @@ mod tests {
 
     #[test]
     fn managed_and_trusted_are_decided_independently() {
+        let _lock = environment_lock();
         // Given: a registry entry and a trust rule that cover different remotes,
         // and three clones: a fork under a stranger's account, the same fork
         // pushed to our own account, and a clone of the maintained repository.
@@ -520,6 +528,7 @@ mod tests {
 
     #[test]
     fn a_checkout_with_an_entrys_origin_and_another_upstream_matches_as_a_disagreement() {
+        let _lock = environment_lock();
         // Given: the registry's `tool` entry, and a checkout whose `origin` is
         // that entry's but whose `upstream` remote still spells the
         // repository's former name.
@@ -570,6 +579,7 @@ mod tests {
 
     #[test]
     fn a_jj_without_a_git_is_not_a_repository() {
+        let _lock = environment_lock();
         // Given: a trusted clone, and a tree beside it carrying a `.jj/repo`
         // pointer file that names the clone's store, plus a `.jj`-only store —
         // content any tree can carry — with no `.git` of their own.
@@ -597,6 +607,7 @@ mod tests {
 
     #[test]
     fn an_unrelated_path_does_not_hide_a_later_match() {
+        let _lock = environment_lock();
         // Given: an unresolved path before a repository under a trusted root.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("trusted/repo");

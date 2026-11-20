@@ -634,6 +634,7 @@ mod tests {
 
     #[test]
     fn an_off_scheme_lock_pin_is_reported_instead_of_reading_as_unpinned() {
+        let _lock = crate::config::test_support::environment_lock();
         let consumer = tempfile::tempdir().expect("create consumer");
         std::fs::write(
             consumer.path().join("uv.lock"),

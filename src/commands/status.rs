@@ -1195,6 +1195,8 @@ mod tests {
             started: "2026-08-01T00:00:00Z".to_owned(),
             files: Vec::new(),
             place: None,
+            machine: None,
+            ledger_commit: None,
         };
 
         assert_eq!(
@@ -1313,6 +1315,7 @@ mod tests {
 
     #[test]
     fn a_branch_whose_path_diff_errors_is_unanswered() {
+        let _lock = crate::config::test_support::environment_lock();
         let scratch = tempfile::tempdir().expect("temporary non-repository");
         let mut row = BranchRow::bare(BranchName::new("feat/unresolvable"));
         row.tip = Some("0700338c".to_owned());

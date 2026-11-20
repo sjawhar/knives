@@ -49,18 +49,73 @@ use release_rebase::run_rebase;
 
 fn main() -> ExitCode {
     let exit = match dispatch() {
-        Ok(exit) => ExitCode::from(exit.code()),
+        Ok(exit) => exit,
         Err(error) => {
             eprintln!("{}", error_line(&error));
-            ExitCode::from(Exit::Incomplete.code())
+            Exit::Incomplete
         }
     };
-    // Once, after whatever the command wrote, however it ended: one hand-off
-    // per process rather than per entry, and every write path reaches it.
-    if knives::ledger::appended() {
-        knives::ledger_sweep::hand_off();
+    ExitCode::from(send_what_was_written(exit).code())
+}
+
+/// Send every entry the command appended to the ledger its fork shares,
+/// once, after whatever the command did, however it ended; `exit`, or 3
+/// when an entry did not reach its ledger, after a line on stderr for each
+/// fork it stayed behind for ([`knives::ledger_sweep::Unsent`]). A sweep
+/// log the send could not write is said in one `!!` line, as a claim's
+/// change says its problems, since it is the one problem of the send that
+/// log cannot hold; it changes no exit.
+///
+/// Every writer appends through a [`Scribe`], which lists the entry
+/// ([`knives::ledger::appended`]), so every write path reaches this; an
+/// entry of a fork that shares no ledger is not sent anywhere
+/// ([`knives::ledger_sweep::send_now`]). The registry is read again, since
+/// `dispatch` hands its copy to the command. A command can remove the
+/// directory it ran in (`finish` run from inside the workspace it removes),
+/// and git runs in no directory that is gone, so the send then runs in the
+/// config home, which holds the ledger.
+fn send_what_was_written(exit: Exit) -> Exit {
+    let appended = knives::ledger::appended();
+    if appended.is_empty() {
+        return exit;
     }
-    exit
+    let started = std::time::Instant::now();
+    if std::env::current_dir().is_err() {
+        let _ = std::env::set_current_dir(knives::config::default_config_home());
+    }
+    let sent = match load(&default_config_path()) {
+        Ok(registry) => knives::ledger_sweep::send_now(
+            &knives::ledger::default_ledger_root(),
+            &registry,
+            &appended,
+        ),
+        Err(error) => {
+            eprintln!(
+                "{}",
+                error_line(&anyhow::Error::new(error).context(format!(
+                    "could not read the registry to send the {} ledger entr{} this command \
+                     wrote, which `knives ledger sweep` sends",
+                    appended.len(),
+                    if appended.len() == 1 { "y" } else { "ies" }
+                )))
+            );
+            return exit.worst(Exit::Incomplete);
+        }
+    };
+    for unsent in &sent.unsent {
+        eprintln!("{unsent}");
+    }
+    if let Some(unlogged) = &sent.unlogged {
+        eprintln!("!! {}", knives::ledger::problem_human_text(unlogged));
+    }
+    if knives::timing::enabled() {
+        eprintln!("timing ledger send {}us", started.elapsed().as_micros());
+    }
+    if sent.unsent.is_empty() {
+        exit
+    } else {
+        exit.worst(Exit::Incomplete)
+    }
 }
 
 /// The one line a failed command writes to the terminal.

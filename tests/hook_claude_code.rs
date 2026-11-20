@@ -4,7 +4,7 @@
     clippy::unreachable,
     reason = "fixture setup failures and JSON shape mismatches are test failures"
 )]
-// allow: SIZE_OK: 997 lines - real-binary adapter scenarios share one fixture and process harness.
+// allow: SIZE_OK: 1367 lines - real-binary adapter scenarios share one fixture and process harness.
 
 #[path = "common/lab.rs"]
 mod lab;

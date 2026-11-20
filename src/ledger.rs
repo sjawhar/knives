@@ -1,4 +1,4 @@
-// allow: SIZE_OK: 2989 lines - entry type, storage, filters, and writer are one domain.
+// allow: SIZE_OK: 3124 lines - entry type, storage, filters, and writer are one domain.
 //! What agents did and decided here, in order, forever.
 //!
 //! [`crate::store`] holds current intent and is rewritten whole on every change:
@@ -22,7 +22,8 @@ use std::ffi::OsStr;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
@@ -86,13 +87,44 @@ pub fn is_fork_directory(name: &str) -> bool {
     })
 }
 
-/// Set once this process has appended an entry; see [`appended`].
-static APPENDED: AtomicBool = AtomicBool::new(false);
+/// One entry this process appended: the fork it is about, and its file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Appended {
+    pub fork: UpstreamName,
+    pub path: PathBuf,
+}
 
-/// Whether this process has appended an entry to any ledger, so that it has
-/// something to hand to [`crate::ledger_sweep::hand_off`] before it exits.
-pub fn appended() -> bool {
-    APPENDED.load(Ordering::Relaxed)
+/// Every entry this process has appended through a [`Scribe`], in order;
+/// see [`appended`].
+static APPENDED: Mutex<Vec<Appended>> = Mutex::new(Vec::new());
+
+/// [`APPENDED`], held. A writer that panicked holding it left a whole list
+/// behind, since each change is one push or one removal, so a poisoned lock
+/// is taken as it is.
+fn appended_list() -> MutexGuard<'static, Vec<Appended>> {
+    APPENDED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Every entry this process has appended, in the order it appended them:
+/// what the process sends before it exits
+/// ([`crate::ledger_sweep::send_now`]). A copy, so the list goes on growing
+/// behind it.
+pub fn appended() -> Vec<Appended> {
+    appended_list().clone()
+}
+
+/// Take the entry at `path` out of [`appended`], once; whether it was there.
+///
+/// For an entry no send is to report or carry: the one a claim's change
+/// wrote before a push that applied nothing, which its writer removed
+/// again, and the one a claim's push already put on the ledger's remote,
+/// which no send has to look for there.
+pub fn forget_appended(path: &Path) -> bool {
+    let mut list = appended_list();
+    list.iter()
+        .position(|appended| appended.path == path)
+        .map(|index| list.remove(index))
+        .is_some()
 }
 
 /// Who put an entry there.
@@ -197,19 +229,20 @@ pub struct Displaced {
     pub kind: String,
     pub started: String,
     /// The last sighting of its work
-    /// ([`crate::commands::claim::last_seen_provenance`]).
-    pub last_seen: String,
+    /// ([`crate::commands::claim::last_seen_provenance`]); `None` where its
+    /// activity cannot be read here, so this machine has no sighting of it.
+    pub last_seen: Option<String>,
     /// The displaced owner's own reason for the claim.
     pub why: String,
 }
 
 impl Displaced {
-    pub fn of(claim: &crate::store::Claim, last_seen: crate::seen::LastSeen) -> Self {
+    pub fn of(claim: &crate::store::Claim, last_seen: Option<crate::seen::LastSeen>) -> Self {
         Self {
             owner: claim.owner.clone(),
             kind: crate::commands::claim::owner_kind_label(claim.kind).to_owned(),
             started: claim.started.clone(),
-            last_seen: crate::commands::claim::last_seen_provenance(last_seen),
+            last_seen: last_seen.map(crate::commands::claim::last_seen_provenance),
             why: claim.why.clone(),
         }
     }
@@ -219,7 +252,7 @@ impl Displaced {
     pub fn over(
         claim: &crate::store::Claim,
         identity: &crate::commands::claim::Identity,
-        last_seen: crate::seen::LastSeen,
+        last_seen: Option<crate::seen::LastSeen>,
     ) -> Option<Self> {
         (claim.owner != identity.owner).then(|| Self::of(claim, last_seen))
     }
@@ -757,7 +790,6 @@ impl Ledger {
                 reason,
             })?;
         persist_entry(temporary, path.clone())?;
-        APPENDED.store(true, Ordering::Relaxed);
         Ok(path)
     }
 
@@ -1020,18 +1052,45 @@ fn visible_contains(visible: &BTreeSet<String>, token: &str) -> bool {
         .next()
         .is_some_and(|id| id.starts_with(token))
 }
+
+/// How long ago `ts` was, as a bare age: the shortest form that is still
+/// true, `now`, `12m`, `4h`, `3d`. A sentence says it with [`ago`].
+///
+/// `None` when the timestamp does not parse.
 pub fn age(ts: &str, now: jiff::Timestamp) -> Option<String> {
+    Some(whole_units(seconds_since(ts, now)?).unwrap_or_else(|| "now".to_owned()))
+}
+
+/// [`age`] as a sentence says it: `just now` under a minute, else `12m ago`,
+/// `4h ago`, `3d ago`. A bare age with " ago" after it would read `now ago`.
+///
+/// `None` when the timestamp does not parse.
+pub fn ago(ts: &str, now: jiff::Timestamp) -> Option<String> {
+    Some(
+        whole_units(seconds_since(ts, now)?)
+            .map_or_else(|| "just now".to_owned(), |age| format!("{age} ago")),
+    )
+}
+
+/// The seconds from `ts` to `now`: never negative, since a clock that ran
+/// backwards is not a negative age.
+fn seconds_since(ts: &str, now: jiff::Timestamp) -> Option<i64> {
     let then = ts.parse::<jiff::Timestamp>().ok()?;
-    let seconds = now.as_second().saturating_sub(then.as_second()).max(0);
-    Some(if seconds < 60 {
-        "now".to_owned()
+    Some(now.as_second().saturating_sub(then.as_second()).max(0))
+}
+
+/// `seconds` in its largest whole unit, `12m`, `4h`, `3d`; `None` under a
+/// minute, which has none.
+fn whole_units(seconds: i64) -> Option<String> {
+    if seconds < 60 {
+        None
     } else if seconds < 3600 {
-        format!("{}m", seconds / 60)
+        Some(format!("{}m", seconds / 60))
     } else if seconds < 86_400 {
-        format!("{}h", seconds / 3600)
+        Some(format!("{}h", seconds / 3600))
     } else {
-        format!("{}d", seconds / 86_400)
-    })
+        Some(format!("{}d", seconds / 86_400))
+    }
 }
 
 /// Render ledger text for an inline human terminal field.
@@ -1209,7 +1268,7 @@ impl<'a> Draft<'a> {
             previous_owner: displaced.map(|previous| previous.owner.clone()),
             previous_kind: displaced.map(|previous| previous.kind.clone()),
             previous_started: displaced.map(|previous| previous.started.clone()),
-            previous_last_seen: displaced.map(|previous| previous.last_seen.clone()),
+            previous_last_seen: displaced.and_then(|previous| previous.last_seen.clone()),
             previous_why: displaced.map(|previous| previous.why.clone()),
             ..self
         }
@@ -1264,7 +1323,8 @@ impl Scribe {
         &self.ledger
     }
 
-    /// Append `draft`, stamping the fields no caller supplies.
+    /// Append `draft`, stamping the fields no caller supplies, and list it
+    /// among what this process appended ([`appended`]).
     pub fn record(&self, draft: &Draft<'_>) -> Result<Entry, LedgerError> {
         self.record_to(draft).map(|(entry, _)| entry)
     }
@@ -1301,6 +1361,10 @@ impl Scribe {
             previous_why: draft.previous_why.clone(),
         };
         let path = self.ledger.append(&entry)?;
+        appended_list().push(Appended {
+            fork: self.repo.clone(),
+            path: path.clone(),
+        });
         Ok((entry, path))
     }
 
@@ -1617,6 +1681,50 @@ mod tests {
         assert_eq!(read[0].subject.as_deref(), Some("feat/alpha"));
         assert_eq!(read[0].kind, Kind::Note);
         assert_eq!(read[0].anchor.as_deref(), Some("6c42fe71"));
+    }
+
+    #[test]
+    fn each_entry_a_scribe_appends_is_listed_in_order_and_one_can_be_taken_out() {
+        let _lock = crate::config::test_support::environment_lock();
+        // Given: writers for two forks, appending three entries between them.
+        let dir = tempfile::tempdir().unwrap();
+        let scribe = |name: &str| {
+            Scribe::unanchored(
+                Ledger::at(dir.path().join(name)),
+                UpstreamName::new(name),
+                "ses_fff688".to_owned(),
+            )
+        };
+        let (one, two) = (scribe("acme/one"), scribe("acme/two"));
+        let mut wrote = Vec::new();
+        for (scribe, text) in [(&one, "first"), (&two, "second"), (&one, "third")] {
+            let (_, path) = scribe
+                .record_to(&Draft::event(None, text.to_owned(), None))
+                .unwrap();
+            wrote.push(Appended {
+                fork: scribe.repo().clone(),
+                path,
+            });
+        }
+        // Other tests in this process may append too: only this one's
+        // entries are looked at.
+        let mine = || -> Vec<Appended> {
+            appended()
+                .into_iter()
+                .filter(|appended| appended.path.starts_with(dir.path()))
+                .collect()
+        };
+
+        // Then: the list holds each, with its fork, in the order appended.
+        assert_eq!(mine(), wrote);
+
+        // When: the second is taken out.
+        assert!(forget_appended(&wrote[1].path));
+
+        // Then: it alone went, and a second removal finds nothing to take.
+        assert_eq!(mine(), [wrote[0].clone(), wrote[2].clone()]);
+        assert!(!forget_appended(&wrote[1].path));
+        assert!(wrote[1].path.is_file(), "the list is not the file");
     }
 
     #[test]
@@ -2467,6 +2575,25 @@ mod tests {
     }
 
     #[test]
+    fn a_sentence_says_an_age_under_a_minute_as_just_now_and_never_now_ago() {
+        let now: jiff::Timestamp = "2026-08-15T12:00:00Z".parse().unwrap();
+        assert_eq!(
+            ago("2026-08-15T11:59:31Z", now).as_deref(),
+            Some("just now")
+        );
+        assert_eq!(ago("2026-08-15T11:59:00Z", now).as_deref(), Some("1m ago"));
+        assert_eq!(ago("2026-08-15T11:48:00Z", now).as_deref(), Some("12m ago"));
+        assert_eq!(ago("2026-08-15T08:00:00Z", now).as_deref(), Some("4h ago"));
+        assert_eq!(ago("2026-08-12T12:00:00Z", now).as_deref(), Some("3d ago"));
+        // A clock that ran backwards is not a negative age.
+        assert_eq!(
+            ago("2026-08-15T12:00:30Z", now).as_deref(),
+            Some("just now")
+        );
+        assert_eq!(ago("last tuesday", now), None);
+    }
+
+    #[test]
     fn every_control_character_is_escaped_and_only_a_body_keeps_its_line_feeds() {
         // A C1 control is a control character a terminal reading UTF-8 as
         // ISO 2022 acts on: U+009B is CSI and U+009D is OSC, so an escaper
@@ -2521,6 +2648,7 @@ mod tests {
 
     #[test]
     fn entries_written_back_to_back_read_back_in_write_order() {
+        let _lock = crate::config::test_support::environment_lock();
         // One hundred writes as fast as the machine can make them: equal
         // wall-clock stamps would hand the order to the random suffix, and the
         // monotonic bump is what forbids equal stamps within a process.
@@ -2542,6 +2670,8 @@ mod tests {
         let wanted: Vec<String> = (0..100).map(|index| format!("entry {index}")).collect();
         assert_eq!(texts, wanted);
     }
+
+    /// A scribe for a checkout that is no repository; its writes run git for the writer's email.
     fn scribe(dir: &std::path::Path) -> Scribe {
         Scribe::new(
             Ledger::at(dir.join("ledger").join("a-repo")),
@@ -2553,6 +2683,7 @@ mod tests {
 
     #[test]
     fn an_event_stamps_the_fields_no_caller_supplies() {
+        let _lock = crate::config::test_support::environment_lock();
         let dir = tempfile::tempdir().unwrap();
         let scribe = scribe(dir.path());
 
@@ -2579,6 +2710,7 @@ mod tests {
 
     #[test]
     fn an_entry_carries_the_writers_git_email_and_none_when_git_has_none() {
+        let _lock = crate::config::test_support::environment_lock();
         // Given: a checkout whose own config names its committer.
         let dir = tempfile::tempdir().unwrap();
         let checkout = dir.path().join("checkout");
@@ -2622,6 +2754,7 @@ mod tests {
 
     #[test]
     fn an_anchor_is_omitted_when_the_subject_does_not_resolve() {
+        let _lock = crate::config::test_support::environment_lock();
         // A branch deleted since, a reaped release ref, or a path that is not a
         // repository. None of them invalidates the entry, so none of them may
         // fail the write.
@@ -2634,6 +2767,7 @@ mod tests {
 
     #[test]
     fn a_note_carries_its_evidence_and_a_repo_level_entry_has_no_subject() {
+        let _lock = crate::config::test_support::environment_lock();
         let dir = tempfile::tempdir().unwrap();
         let written = scribe(dir.path())
             .record(&Draft {
@@ -2650,6 +2784,7 @@ mod tests {
 
     #[test]
     fn an_append_that_cannot_be_written_is_an_error_rather_than_a_shrug() {
+        let _lock = crate::config::test_support::environment_lock();
         // A ledger append failure fails its command loudly: the ledger and the
         // state file live in one config home, and a write that can fail one
         // can fail the other. Here a stray file squats on the directory name.

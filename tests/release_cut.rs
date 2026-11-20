@@ -513,12 +513,10 @@ fn a_release_plan_reads_nothing_about_who_is_asking() {
     std::fs::write(home.path().join("state.json"), "{not json").expect("corrupt state");
 
     // When: the plan is asked for by an anonymous terminal user.
-    let output = release_command(&lab, &home, ReleaseOutput::Text, &[])
-        .env_remove("KNIVES_OWNER")
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("OMP_SESSION_ID")
-        .output()
-        .expect("run knives release");
+    let output =
+        lab::without_harness_session(&mut release_command(&lab, &home, ReleaseOutput::Text, &[]))
+            .output()
+            .expect("run knives release");
     let text = String::from_utf8_lossy(&output.stdout);
     let errors = String::from_utf8_lossy(&output.stderr);
 
@@ -536,15 +534,12 @@ fn a_release_plan_reads_nothing_about_who_is_asking() {
     );
 
     // And: a cut, which writes the ledger in the asker's name, is stopped by it.
-    let cut = release_command(
+    let cut = lab::without_harness_session(&mut release_command(
         &lab,
         &home,
         ReleaseOutput::Text,
         &["cut", "release/2026-08-05"],
-    )
-    .env_remove("KNIVES_OWNER")
-    .env_remove("CLAUDE_CODE_SESSION_ID")
-    .env_remove("OMP_SESSION_ID")
+    ))
     .output()
     .expect("run knives release cut");
     let errors = String::from_utf8_lossy(&cut.stderr);
