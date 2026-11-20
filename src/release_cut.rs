@@ -2205,7 +2205,7 @@ fn checked_committed_cut(
 
 /// `knives release cut NAME --at REV`: record the commit `at` names, a
 /// release cut outside knives, as `name`'s cut. No commit is made, and no
-/// orphan gate, reap, signing or push runs.
+/// orphan gate, reap, signing or push of the release runs.
 ///
 /// The name and the pulled plan are gated before this ([`requested_cut`],
 /// [`release_plan_exit`]), and the commit and its name here
