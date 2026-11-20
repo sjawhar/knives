@@ -37,7 +37,7 @@ Run `knives ledger migrate` once on each machine. Until then, commands that read
 
 ## What changes state
 
-- Local writes: `sync`, `start`, `finish`, `track`, `depends`, `notch -m`, release edits. A ledger write starts a background sweep that pushes a shared ledger.
+- Local writes: `sync`, `start`, `finish`, `track`, `depends`, `notch -m`, release edits. A ledger write sends its entries to a shared ledger before it exits; when they do not arrive, it exits `3`, and `knives ledger sweep` sends them later.
 - `repos`, `consumers`, `pushed`, `audit`, `status` and `pr` never repair, remove, push or open PRs.
 - Release commands never push. Publish as [references/releases.md](references/releases.md#publishing) says.
 - `knives hook claude-code|opencode` is harness plumbing. Do not run it.

@@ -21,7 +21,7 @@ knives notch --verify '#4545'
 - `--repo <name>` records about a library fork while you stand in its consumer.
 - `--verify` re-checks commit evidence and anchors against the repository as it is now. It checks evidence, not judgment, and never edits an entry.
 - Record events and decisions. Do not copy what a detector computes.
-- Exits: `0` done, `1` `--verify` flags, `2` usage, `3` an unreadable directory or entry. No ledger yet: `0`, `no notches yet`.
+- Exits: `0` done, `1` `--verify` flags, `2` usage, `3` an unreadable directory or entry, or a note that did not reach a shared ledger. No ledger yet: `0`, `no notches yet`.
 
 ## Entry fields
 
@@ -42,7 +42,7 @@ knives notch --verify '#4545'
 ## Storage
 
 - File name `YYYYMMDDTHHMMSS.nnnnnnnnnZ-xxxx.md`; TOML frontmatter between `+++` fences, then prose. Name order is time order.
-- knives never rewrites an entry. Only `ledger migrate` (it moves files) and a sweep discarding this machine's uncommitted repeat removes one.
+- knives never rewrites an entry. Only `ledger migrate` (it moves files), the discard of this machine's uncommitted repeat, and the undo of a claim push the ledger's repository did not take remove one.
 - Another `*.md` in a fork directory, or an entry that does not parse, is a problem naming the file (exit `3`). A multi-fork `status`, `audit` or `sync` marks that fork `ledger unavailable: …` and reports the rest.
 - An entry of an unknown `kind`, from a newer knives, is left out of reads and stops nothing.
 
@@ -70,14 +70,14 @@ git --git-dir ~/.config/knives/ledger-repositories/<dir> config knives.machine <
 ```
 
 - `knives.machine` is unique among the machines that share that repository, and is one ref name component: it spells `refs/knives/<machine>`.
-- Never `git clone` a ledger repository into `ledger/`. knives reads only `refs/knives/*`; the clone's `main` is an old snapshot that every read refuses.
-- Each git directory carries only the forks whose `ledger` names its `origin`. A `ledger` no `origin` names travels nowhere, and is a problem.
+- Never `git clone` a ledger repository into `ledger/`. knives reads only `refs/knives/*` and `refs/knives-claims/*`; the clone's `main` is an old snapshot that every read refuses.
+- Each git directory carries only the forks whose `ledger` names its `origin`. For a `ledger` no `origin` names, knives makes a git directory in `ledger-repositories/` the first time it needs one and says so on stderr; one it cannot make is a problem (docs/shared-claims.md, "Joining a ledger").
 
 ### The sweep
 
-- Every command that writes an entry starts `knives ledger sweep` in the background. Per git directory, it fetches every machine's ref, writes in entries the root lacks, commits this machine's new entries to `refs/knives/<machine>`, and pushes only that ref. It never rebases.
+- Every command that writes an entry sends it before it exits; when it does not arrive, the command exits `3` and names the cause, and `knives ledger sweep` sends it later. Per git directory, a sweep fetches every machine's ref, writes in entries the root lacks, commits this machine's new entries to `refs/knives/<machine>`, and pushes only that ref. It never rebases.
 - Run by hand, a sweep waits up to a minute for one already running, then reports its own pass. Any problem exits `3`.
-- `ledger-sweep.log` beside the state file exists only while the last sweep failed. `unsent` counts this machine's entries that no fetched ref holds.
+- `ledger-sweep.log` beside the state file exists only while the last sweep or send failed. `unsent` counts this machine's entries that no fetched ref holds.
 - `sync` pulls first and skips a transition the ledger already holds as that PR's newest. Two machines that both committed one before either pulled keep both.
 
 ### Which commands pull first
