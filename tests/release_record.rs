@@ -54,10 +54,8 @@
 #[path = "common/lab.rs"]
 mod lab;
 
-use std::fs::{File, TryLockError};
 use std::path::Path;
 use std::process::{Output, Stdio};
-use std::time::{Duration, Instant};
 
 use knives::ids::CommitId;
 use knives::ledger::{Entry, Kind, Ledger, RecordedParent};
@@ -1876,7 +1874,7 @@ const LEDGER: &str = "acme/ledger";
 /// bare remote through `insteadOf`.
 const LEDGER_URL: &str = "https://forge.invalid/acme/ledger";
 
-// From here to `settle`, every helper but `with_lab_origin` is
+// From here to `sweep`, every helper but `with_lab_origin` is
 // tests/ledger_sweep.rs's, copied: they are private to that file.
 
 /// A config home whose registry calls the lab fork `demo`, with [`UPSTREAM`]
@@ -1953,38 +1951,6 @@ fn sweep(home: &Path) -> Output {
         .expect("run knives ledger sweep")
 }
 
-/// Wait for `ready`, up to a minute.
-fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !ready() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// Whether some process holds the lock file at `path`.
-fn held(path: &Path) -> bool {
-    let file = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .expect("open a lock file");
-    match file.try_lock() {
-        Ok(()) => false,
-        Err(TryLockError::WouldBlock) => true,
-        Err(TryLockError::Error(error)) => panic!("locking {}: {error}", path.display()),
-    }
-}
-
-/// Wait until no sweep holds `home`'s ledger lock, so none outlives the test.
-fn settle(home: &Path) {
-    wait_until("the last sweep to finish", || {
-        !held(&home.join("ledger.lock"))
-    });
-}
-
 /// `knives --json audit demo --no-github` as the machine whose config home
 /// is `home`, parsed.
 fn audit_on(lab: &Lab, home: &Path) -> serde_json::Value {
@@ -2048,10 +2014,8 @@ fn another_machine_reads_the_record_after_a_sweep() {
         ],
     );
     assert_eq!(recorded.status.code(), Some(0), "{}", text(&recorded));
-    settle(alpha.path());
     let swept = sweep(alpha.path());
     assert!(swept.status.success(), "{}", text(&swept));
-    settle(alpha.path());
 
     // Then: the second machine's audit read everything but pull heads, and
     // reads the name as recorded: no note that it has no record or was

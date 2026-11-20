@@ -2013,7 +2013,7 @@ fn history_line<'a>(out: &'a str, branch: &str) -> &'a str {
 }
 
 #[test]
-fn preflight_names_the_stacked_release_a_member_is_built_on_as_it_names_a_default_release() {
+fn preflight_names_the_stacked_release_a_member_is_built_on() {
     // Given: a stacked series whose published first cut is the previous
     // release, with `m5` built on it, and the next cut, which includes `m5`.
     let (lab, home) = previous_release_lab(true);
@@ -2024,8 +2024,8 @@ fn preflight_names_the_stacked_release_a_member_is_built_on_as_it_names_a_defaul
     let out = text(&lab::knives(&lab, &home, &["--text", "preflight", "demo"]));
 
     // Then: its line for `m5` names the previous release, the stacked
-    // series' release in m5's history, as for the default series, and does
-    // not send m5 to `knives sync` for upstream merges.
+    // series' release in m5's history, and so does not send m5 to `knives
+    // sync` for upstream merges.
     let line = history_line(&out, "m5");
     assert!(
         line.contains(&format!("releases in that history: {PREVIOUS}")),
