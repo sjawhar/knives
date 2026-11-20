@@ -38,8 +38,8 @@
 //! as it waives the record's other checks too; or recorded under
 //! `--allow-drop` with the drop stated. A record that lacks a file with no
 //! reference here is told to fetch the write where the walk for that
-//! reference stopped where a remote has it, and keeps the adopt of the new
-//! content where none does.
+//! reference stopped where origin or the publish remote has it, and keeps
+//! the adopt of the new content where neither does.
 //! A published name that the publish remote lacks is not recorded until it
 //! is pushed, and the refusal gives the commands. A printed command quotes
 //! the name for the shell.

@@ -1672,10 +1672,11 @@ fn record_remedy(
 }
 
 /// What a refusal says first where a fix needs a commit that this
-/// repository does not hold and a remote has: each fetch that `asks`, what
-/// each fix asks for ([`fix_remedy`]), names. One is the fetch of the write
-/// where the walk for the reference of a file that the subject lacks
-/// stopped, a recorded write that this repository does not hold
+/// repository does not hold and origin or the publish remote has: each
+/// fetch that `asks`, what each fix asks for ([`fix_remedy`]), names. One
+/// is the fetch of the write where the walk for the reference of a file
+/// that the subject lacks stopped, a recorded write that this repository
+/// does not hold
 /// ([`release::FixReference::Unread`]): no commit carries such a file until
 /// this repository holds that write. The other is the fetch of the adopt of
 /// a fix whose files nothing here reads whole, where this repository does
@@ -3658,8 +3659,8 @@ mod tests {
         let refuse = DropDisposition::RefuseRecordingNothing;
 
         // When: the gate refuses the record where origin has a branch at
-        // that write, a ref that a remote names, and where no remote has
-        // one.
+        // that write, a ref that a remote names, and where neither origin
+        // nor the publish remote has one.
         let advertised = origin_has(&format!("refs/heads/release/{HOSTILE}.2"), HOSTILE);
         let fetched =
             uncarried_cut_lines(&RepoName::new("demo"), held, &check, (refuse, &advertised));
