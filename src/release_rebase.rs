@@ -186,8 +186,9 @@ pub(crate) fn run_rebase(
         println!("{repo}: {shown_release} has no member parents to move; nothing to rebase");
         return Ok(Exit::Incomplete);
     }
-    // Every refusal is behind. From here on the command writes; each write is
-    // read into `last` as soon as it is written, and its headings print as
+    // Every refusal is behind. From here on the command writes; each write of
+    // the release (the shed, the move, the re-describe and the drop) is read
+    // into `last` as soon as it is written, and its headings print as
     // README.md's "Release workflow" says ([`release::with_last_write_headings`]).
     // Only the re-describe and the drop print a conflict report; the
     // re-describe reports the shed write's unions.
