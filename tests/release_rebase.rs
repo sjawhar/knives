@@ -813,6 +813,99 @@ fn a_bare_rebase_whose_drop_fails_names_a_heading_held_twice_once_for_the_releas
     );
 }
 
+/// Put a `jj` in `shim`, ahead of the real one on `PATH`, that refuses the
+/// move of a rebase, `jj rebase -b`. That call comes after the write that
+/// sheds the release's stale bases and before the write that re-describes
+/// it. Every other call reaches the real `jj`.
+fn install_jj_refusing_the_move(shim: &std::path::Path) {
+    let real = std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+        .map(|directory| directory.join("jj"))
+        .find(|candidate| candidate.is_file())
+        .expect("find jj on PATH");
+    let jj = shim.join("jj");
+    std::fs::write(
+        &jj,
+        format!(
+            "#!/bin/sh\nseen=\nfor argument in \"$@\"; do\n  if [ \"$seen\" = rebase ] && [ \
+             \"$argument\" = -b ]; then\n    echo 'planted: the move is refused' >&2; exit 1\n  \
+             fi\n  [ \"$argument\" = rebase ] && seen=rebase\ndone\nexec '{}' \"$@\"\n",
+            real.display()
+        ),
+    )
+    .expect("write the jj shim");
+    let mut permissions = std::fs::metadata(&jj)
+        .expect("read the jj shim's permissions")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&jj, permissions).expect("make the jj shim executable");
+}
+
+#[test]
+fn a_rebase_whose_move_fails_after_its_shed_write_names_a_heading_held_twice_once() {
+    // Given: a release whose first parent is the trunk, a stale base the
+    // rebase sheds in a write of its own before it moves; beta, whose
+    // changelog's one `[Unreleased]` section holds `### Added` twice; an
+    // advanced upstream; and a `jj` that refuses the move, which comes after
+    // the shed write.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch(
+        "feat/beta",
+        "CHANGELOG.md",
+        "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Beta's addition.\n\n### Added\n\n\
+         - An earlier addition.\n",
+    );
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.advance_upstream("upstream advance\n");
+    let before = commit_at(&lab, release);
+    let shim = tempfile::tempdir().expect("create the shim directory");
+    install_jj_refusing_the_move(shim.path());
+
+    // When: the rebase sheds the trunk parent, writing the release, and its
+    // move fails before the re-describe writes.
+    let output = release_command(
+        &lab,
+        &home,
+        ReleaseOutput::Text,
+        &["rebase", "main@upstream"],
+    )
+    .env("PATH", path_with_gh_shim(shim.path()))
+    .output()
+    .expect("run knives release rebase");
+
+    // Then: the command exits with the failure, the release is the shed
+    // write, whose parents are its members alone, and one line names the
+    // file and the heading, for that release.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stderr.contains("planted: the move is refused"), "{stderr}");
+    assert_ne!(commit_at(&lab, release), before, "{stdout}");
+    assert_eq!(
+        release_parents(&lab, release),
+        vec![commit_at(&lab, "feat/alpha"), commit_at(&lab, "feat/beta")],
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("[Unreleased] holds").count(),
+        1,
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(
+            "  CHANGELOG.md: [Unreleased] holds `### Added` twice; knives changed no line for \
+             it; join them by hand before you push\n"
+        ),
+        "{stdout}"
+    );
+}
+
 /// Every event the fork's ledger records about `name`, oldest first.
 fn events_about(home: &tempfile::TempDir, name: &str) -> Vec<knives::ledger::Entry> {
     knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
