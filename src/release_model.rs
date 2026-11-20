@@ -371,7 +371,8 @@ pub fn release_refs_by_commit(
 ///
 /// Each series' release refs name their commits ([`release_refs_by_commit`]
 /// of its scheme and publish remote). At a commit no ref names, each release
-/// of a stacked series that `ledger` records a write of there names it: the
+/// of a stacked series that `ledger` records a write of there, under a name
+/// that sorts in that series ([`series_writes`]), names it: the
 /// reap forgets the refs of a stacked series' superseded release and keeps
 /// its commit, so a branch built on the previous release still names it. A
 /// fork without a stacked series reads no ledger for it: `ledger` may be

@@ -535,7 +535,10 @@ pub enum LedgerAction {
 
 #[derive(Debug, Subcommand)]
 pub enum ReleaseAction {
-    /// Name a new cut of the composition in hand, verbatim. Never pushes.
+    /// Name a new cut of the composition in hand, verbatim. Never pushes the release.
+    ///
+    /// On a fork that shares its ledger, the cut's ledger event is pushed
+    /// there before the command exits.
     ///
     /// With `--at`, record a release cut outside knives instead: the commit
     /// REV becomes NAME's recorded cut, and no commit is made. NAME must sort
@@ -576,7 +579,8 @@ pub enum ReleaseAction {
     /// tree must be on its first-parent line. The ledger event records its
     /// members: in a stacked series the side parents on its first-parent
     /// line, with its previous release labelled as no member. No reap runs,
-    /// and nothing is signed or pushed.
+    /// and the release is not signed or pushed; its ledger event is pushed
+    /// as a cut's is.
     Cut {
         /// The dated release name, `release/[<series>/]YYYY-MM-DD[.N|-<label>]`.
         /// It must sort after the newest release of the series. Omit it for a
