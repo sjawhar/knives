@@ -33,8 +33,8 @@
 //! read whole there, nor does a list of files resolved by hand that another
 //! part follows, as the list may end there or name a path that holds that
 //! part, so the record is refused, naming the adopt, and its fetch where
-//! origin or the publish remote has a branch or tag at it, else
-//! `--allow-drop` alone, and saying that `--allow-drop` is the last resort,
+//! this repository does not hold the adopt and origin or the publish remote
+//! has a branch or tag at it, else `--allow-drop` alone, and saying that `--allow-drop` is the last resort,
 //! as it waives the record's other checks too; or recorded under
 //! `--allow-drop` with the drop stated. A record that lacks a file with no
 //! reference here is told to fetch the write where the walk for that

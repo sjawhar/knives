@@ -800,8 +800,9 @@ impl ForkLock {
     /// # Errors
     ///
     /// [`LockError::Held`] when another command still holds it after the
-    /// wait, naming the holder; [`LockError::Io`] when its file cannot be
-    /// opened.
+    /// wait, naming the holder's pid where the lock file holds one, else
+    /// how long ago the lock was written; [`LockError::Io`] when its file
+    /// cannot be opened.
     pub fn acquire(repo: &UpstreamName) -> Result<Self, LockError> {
         Ok(Self {
             _held: lock_forks(&default_state_path(), &[repo])?,
