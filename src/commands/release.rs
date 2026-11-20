@@ -5018,10 +5018,13 @@ pub fn report_repeated_headings(path: &Path, commit: &CommitId) {
     }
 }
 
-/// The lines [`report_repeated_headings`] prints: those of `repeated` as jj
-/// read them ([`repeated_heading_lines`]), or the error jj gave, escaped as
-/// [`conflict_report`] escapes it.
-fn heading_report(repeated: Result<&[jj::RepeatedHeadings], &jj::JjError>) -> Vec<String> {
+/// The lines [`report_repeated_headings`] prints.
+///
+/// They are those of `repeated` as jj read them ([`repeated_heading_lines`]),
+/// or the error jj gave, escaped as [`conflict_report`] escapes it. A command
+/// that read its write's conflicts through one opening of the repository
+/// reads `repeated` through that opening too, as [`written_report`] does.
+pub fn heading_report(repeated: Result<&[jj::RepeatedHeadings], &jj::JjError>) -> Vec<String> {
     match repeated {
         Ok(repeated) => repeated_heading_lines(repeated),
         Err(error) => vec![format!(
