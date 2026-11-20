@@ -22,7 +22,7 @@
     clippy::panic,
     reason = "a fixture or assertion that cannot proceed IS the test failure"
 )]
-// allow: SIZE_OK: 1097 lines - real-binary release-log union scenarios share one set of changelog fixtures and helpers.
+// allow: SIZE_OK: 1144 lines - real-binary release-log union scenarios share one set of changelog fixtures and helpers.
 
 #[path = "common/lab.rs"]
 mod lab;
@@ -880,6 +880,53 @@ fn a_first_cut_writes_lists_beside_a_code_fence_whole_and_names_the_heading_left
 const LEFT_FIXED_TWICE: &str = "\n  CHANGELOG.md: left `### Fixed` twice: knives joins only plain \
                                 `### ` lists in a file's one [Unreleased] section; join them by \
                                 hand\n";
+
+/// The line a write prints for a `CHANGELOG.md` whose one `[Unreleased]`
+/// section holds `### Fixed` twice.
+const FIXED_TWICE: &str = "\n  CHANGELOG.md: [Unreleased] holds `### Fixed` twice; knives changed no \
+                           line for it; join them by hand before you push\n";
+
+#[test]
+fn a_first_cut_names_a_heading_its_union_left_twice_as_held_twice_too_each_line_once() {
+    // Given: a trunk whose changelog's `[Unreleased]` section is empty; a
+    // member that adds a `### Fixed` entry with a fenced TOML sample whose
+    // first line is a `#` comment; and a member that adds a `### Fixed`
+    // entry of its own, so the union writes the two blocks whole and leaves
+    // `### Fixed` twice in that section.
+    let fenced = "### Fixed\n\n- Alpha's fix, with a new key:\n\n```toml\n# the new key\nkey = 1\n\
+                  ```\n\n";
+    let plain = "### Fixed\n\n- Beta's fix.\n\n";
+    let (trunk, alpha, beta) = (
+        with_unreleased(""),
+        with_unreleased(fenced),
+        with_unreleased(plain),
+    );
+    let lab = trunk_with(&[("CHANGELOG.md", trunk.as_str())]);
+    member(&lab, "feat/alpha", &[("CHANGELOG.md", alpha.as_str())]);
+    member(&lab, "feat/beta", &[("CHANGELOG.md", beta.as_str())]);
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: the release is cut of both at once.
+    let cut = release_ok(&lab, &home, &["cut", RELEASE]);
+
+    // Then: no conflict is left, the changelog's `[Unreleased]` section
+    // holds `### Fixed` twice, and one line names that heading there as held
+    // twice, with no line changed for it, although the union's own line
+    // names it too.
+    assert_eq!(conflicts(&lab), Vec::<String>::new(), "{cut}");
+    assert_release_file(
+        &lab,
+        "CHANGELOG.md",
+        &with_unreleased(&format!("{fenced}{plain}")),
+    );
+    assert!(cut.contains(FIXED_TWICE), "{cut}");
+    assert_eq!(cut.matches(FIXED_TWICE.trim()).count(), 1, "{cut}");
+
+    // And: the union's own line names `### Fixed` as a heading left twice,
+    // once.
+    assert!(cut.contains(LEFT_FIXED_TWICE), "{cut}");
+    assert_eq!(cut.matches(LEFT_FIXED_TWICE.trim()).count(), 1, "{cut}");
+}
 
 /// A changelog whose `[Unreleased]` section holds `unreleased`, above a
 /// published release that lists `- Bump dependencies.` under `### Changed`.
