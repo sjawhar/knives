@@ -46,8 +46,9 @@
 //! `## [Unreleased]` heading. For each `### ` heading that the `[Unreleased]`
 //! section holds more than once ([`repeated_headings`]), it prints one line
 //! that names the file and the heading, once for each file and heading. It
-//! names a heading that [`Union::left_twice`] names too. It changes no line
-//! for it: a clean merge can leave such a heading, and a person joins it.
+//! names a heading that [`Union::left_twice`] names inside that one
+//! `[Unreleased]` section too. It changes no line for it: a clean merge can
+//! leave such a heading, and a person joins it.
 //!
 //! One insertion is left to a person too: a side's block whose last line has
 //! no newline, where something would follow it. Written verbatim, that line

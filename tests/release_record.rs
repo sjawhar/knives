@@ -32,13 +32,14 @@
 //! that a list of up to 16 pieces may name. A list of more pieces does not
 //! read whole there, nor does a list of files resolved by hand that another
 //! part follows, as the list may end there or name a path that holds that
-//! part, so the record is refused, naming the adopt, and its fetch where a
-//! remote has a branch or tag at it, else `--allow-drop` alone, and saying
-//! that `--allow-drop` is the last resort, as it waives the record's other
-//! checks too; or recorded under `--allow-drop` with the drop stated. A
-//! record that lacks a file with no reference here is told to fetch the
-//! write where the walk for that reference stopped where a remote has it,
-//! and keeps the adopt of the new content where none does.
+//! part, so the record is refused, naming the adopt, and its fetch where
+//! origin or the publish remote has a branch or tag at it, else
+//! `--allow-drop` alone, and saying that `--allow-drop` is the last resort,
+//! as it waives the record's other checks too; or recorded under
+//! `--allow-drop` with the drop stated. A record that lacks a file with no
+//! reference here is told to fetch the write where the walk for that
+//! reference stopped where a remote has it, and keeps the adopt of the new
+//! content where none does.
 //! A published name that the publish remote lacks is not recorded until it
 //! is pushed, and the refusal gives the commands. A printed command quotes
 //! the name for the shell.

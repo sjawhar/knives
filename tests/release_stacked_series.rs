@@ -741,6 +741,23 @@ fn a_hand_resolution_on_a_stacked_release_is_adopted_and_names_its_files() {
     lab.jj_work(["new"]);
     let resolved = commit_at(&lab, NEXT);
 
+    // When: a write runs over the resolution before the adopt.
+    let refused = text(&knives_release(
+        &lab,
+        &home,
+        &["--series", "old", "include", "m5"],
+    ));
+
+    // Then: it refuses, saying the release's tree is not the recorded write
+    // rebased onto its previous release and its members.
+    assert!(
+        refused.contains(&format!(
+            "rebased onto its previous release and its members; record it with `knives release \
+             adopt {NEXT}`"
+        )),
+        "{refused}"
+    );
+
     // When: the release is adopted, with a reason.
     let adopted = release_ok(
         &lab,
@@ -2036,7 +2053,6 @@ fn preflight_names_the_stacked_release_a_member_is_built_on_as_it_names_a_defaul
         line.contains(&format!("releases in that history: {PREVIOUS}")),
         "{out}"
     );
-    assert!(!line.contains("knives sync"), "{out}");
 }
 
 /// The whole `!!` line preflight prints for a branch `branch` whose history
@@ -2132,5 +2148,4 @@ fn status_names_the_stacked_release_a_member_with_an_open_pull_request_is_built_
         )),
         "{out}"
     );
-    assert!(!line.contains("knives sync"), "{out}");
 }

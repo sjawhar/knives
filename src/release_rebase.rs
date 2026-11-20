@@ -307,6 +307,7 @@ pub(crate) fn run_rebase(
         }
     }
     let rebased = knives::jj::Repo::open(path)?;
+    let rebased_commit = rebased.resolve_commit(&release_name)?;
     let cleaned = knives::jj::abandon_tagged_copies(
         path,
         &originals,
@@ -315,7 +316,7 @@ pub(crate) fn run_rebase(
             knives::jj::RebasedName {
                 name: &release_name,
                 publish_remote: entry.publish_remote(),
-                commit: &rebased.resolve_commit(&release_name)?,
+                commit: &rebased_commit,
                 earlier: EarlierWrites::read(
                     &rebased,
                     &release_name,
@@ -334,12 +335,17 @@ pub(crate) fn run_rebase(
         &release_name,
     );
     report_hidden(repo, &release_name, &cleaned.hidden);
-    if no_drop {
-        return Ok(Exit::Ok);
-    }
-    // What it drops next is dropped from the rebase's own write, so its event
-    // carries the same mark as the rebase's.
-    drop_landed_members(fork, (&release_name, &destination), (bound, &unchecked))
+    let (exit, last) = if no_drop {
+        (Exit::Ok, rebased_commit)
+    } else {
+        // What it drops next is dropped from the rebase's own write, so its
+        // event carries the same mark as the rebase's.
+        drop_landed_members(fork, (&release_name, &destination), (bound, &unchecked))?
+            .map_or_else(|exit| (exit, rebased_commit), |dropped| (Exit::Ok, dropped))
+    };
+    // Once for the command, for the release its last write left.
+    release::report_repeated_headings(path, &last);
+    Ok(exit)
 }
 
 fn frozen_rebase_exit(
@@ -576,17 +582,21 @@ fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option
         inline_human_text(release_name),
         destination.reference
     );
-    let exit = if no_drop {
-        Exit::Ok
-    } else {
-        drop_landed_members_in(
-            fork,
-            (opened, writes),
-            (release_name, destination),
-            (bound, unchecked),
-        )?
+    if no_drop {
+        return Ok(Some(Exit::Ok));
+    }
+    let dropped = match drop_landed_members_in(
+        fork,
+        (opened, writes),
+        (release_name, destination),
+        (bound, unchecked),
+    )? {
+        Ok(dropped) => dropped,
+        Err(exit) => return Ok(Some(exit)),
     };
-    Ok(Some(exit))
+    // The drop is the command's one write.
+    release::report_repeated_headings(&fork.checkout.path, &dropped);
+    Ok(Some(Exit::Ok))
 }
 
 /// The commit a rebase moves onto, with the label the report and provenance use.
@@ -820,9 +830,9 @@ fn drop_landed_members(
     fork: &Fork<'_>,
     (release_name, destination): (&str, &RebaseDestination),
     (bound, unchecked): (Bound<'_>, &str),
-) -> anyhow::Result<Exit> {
+) -> anyhow::Result<Result<knives::ids::CommitId, Exit>> {
     if destination.landed.is_empty() {
-        return Ok(Exit::Ok);
+        return Ok(Err(Exit::Ok));
     }
     let opened = knives::jj::Repo::open(&fork.checkout.path)?;
     let release_parents = opened.parent_commits(release_name)?;
@@ -831,7 +841,7 @@ fn drop_landed_members(
             .local_bookmark_tip(&pull.head_ref_name)
             .is_some_and(|tip| release_parents.contains(&tip))
     }) {
-        return Ok(Exit::Ok);
+        return Ok(Err(Exit::Ok));
     }
     let writes = release_writes(fork, &opened, release_name)?;
     drop_landed_members_in(
@@ -851,13 +861,14 @@ fn drop_landed_members(
 /// leaves out the release's carriers, as every write composing from its
 /// parents does. `opened` is the repository as it is now, and `writes` the
 /// release's earlier writes read from it. `unchecked` is the mark its event
-/// ends with ([`release::unchecked_suffix`]).
+/// ends with ([`release::unchecked_suffix`]). It gives the release it wrote,
+/// or the exit where it wrote nothing.
 fn drop_landed_members_in(
     fork: &Fork<'_>,
     (opened, writes): (&knives::jj::Repo, &EarlierWrites),
     (release_name, destination): (&str, &RebaseDestination),
     (bound, unchecked): (Bound<'_>, &str),
-) -> anyhow::Result<Exit> {
+) -> anyhow::Result<Result<knives::ids::CommitId, Exit>> {
     let repo = &fork.name;
     let entry = fork.entry;
     let path = &fork.checkout.path;
@@ -887,7 +898,7 @@ fn drop_landed_members_in(
         ));
     }
     if deltas.is_empty() {
-        return Ok(Exit::Ok);
+        return Ok(Err(Exit::Ok));
     }
     let shown_release = inline_human_text(release_name);
     if kept.is_empty() {
@@ -895,7 +906,7 @@ fn drop_landed_members_in(
             "{repo}: every member of {shown_release} landed; dropping them all would leave it \
              without a parent, so nothing was dropped"
         );
-        return Ok(Exit::Incomplete);
+        return Ok(Err(Exit::Incomplete));
     }
     let release = opened.resolve_commit(release_name)?;
     let provenance = release::parent_sources(opened, entry, &entry.release_scheme(), &kept)?;
@@ -943,8 +954,7 @@ fn drop_landed_members_in(
         ),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
-    release::report_repeated_headings(path, &created);
-    Ok(Exit::Ok)
+    Ok(Ok(created))
 }
 
 /// A composition rebase that just happened: what moved, and onto what.
@@ -1032,7 +1042,6 @@ fn report_rebased_release(
         ),
         Err(error) => println!("  could not list conflicts: {error}"),
     }
-    release::report_repeated_headings(path, &described);
     Ok(())
 }
 

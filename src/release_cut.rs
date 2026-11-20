@@ -1613,10 +1613,11 @@ fn closing_line(
 /// every finding of the gate ([`release::CompositionCheck::refuses`]) too:
 /// each recorded member that the subject lacks, the newest recorded write
 /// off its line or not held here, and each other fix by hand; and for a
-/// knives cut, `held` with no record, the commits reachable only from the
-/// previous release as well ([`report_orphaned_cut`]). So it is the last
-/// resort, and the line says what else it waives. Empty where the refusal
-/// holds no such fix, whose line stays as it was.
+/// knives cut outside a stacked series, `held` with no record, the commits
+/// reachable only from the previous release as well
+/// ([`report_orphaned_cut`]). So it is the last resort, and the line says
+/// what else it waives. Empty where the refusal holds no such fix, whose
+/// line stays as it was.
 fn last_resort(held: HeldRecords<'_>, fixes: &[release::LackedFix]) -> &'static str {
     const RECORD: &str = "; --allow-drop is the last resort: it also waives the checks of each \
                           recorded member, of the newest recorded write and of each other fix by \
@@ -1629,8 +1630,8 @@ fn last_resort(held: HeldRecords<'_>, fixes: &[release::LackedFix]) -> &'static 
         .any(|fix| matches!(fix.lacks, release::FixLack::Unread { .. }));
     match (unread, held.record.is_some()) {
         (false, _) => "",
-        (true, true) => RECORD,
-        (true, false) => CUT,
+        (true, false) if !held.stacked => CUT,
+        (true, _) => RECORD,
     }
 }
 
@@ -4261,6 +4262,40 @@ mod tests {
             restored_other,
         ];
         assert_eq!(got, wanted.map(Some));
+    }
+
+    #[test]
+    fn a_refused_stacked_cut_names_no_check_of_the_commits_only_the_previous_release_reaches() {
+        // Given: the newest write, `release/2026-11-13`'s cut `bbbb`, which
+        // records the member `feat/alpha@abab`; the fix by hand of an adopt
+        // whose files nothing here reads whole; and the records a cut holds
+        // in a stacked series and outside one.
+        let write = RecordedCut {
+            kind: RecordedWriteKind::Cut,
+            name: "release/2026-11-13".to_owned(),
+            commit: CommitId::new("bbbb"),
+            members: vec![CommitId::new("abab")],
+        };
+        let stacked = HeldRecords {
+            first: HeldRecord::NewestWrite(&write),
+            other: None,
+            record: None,
+            stacked: true,
+        };
+        let flat = HeldRecords {
+            stacked: false,
+            ..stacked
+        };
+        let fixes = [beyond_bound(release::Unmeasured::Absent)];
+
+        // When: each refusal's last words are read.
+        let (stacked_last, flat_last) = (last_resort(stacked, &fixes), last_resort(flat, &fixes));
+
+        // Then: the stacked cut, which runs no orphan check, ends as a
+        // record does; only the cut outside a stacked series names the
+        // commits reachable only from the previous release.
+        assert_eq!(stacked_last, RECORD_LAST_RESORT);
+        assert_eq!(flat_last, CUT_LAST_RESORT);
     }
 
     #[test]

@@ -659,6 +659,61 @@ fn a_bare_rebase_drops_a_member_whose_pull_request_landed() {
     );
 }
 
+#[test]
+fn a_bare_rebase_that_drops_a_landed_member_names_a_heading_held_twice_once() {
+    // Given: alpha merged upstream by a merge commit, and beta still open,
+    // whose changelog's one `[Unreleased]` section holds `### Added` twice.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch(
+        "feat/beta",
+        "CHANGELOG.md",
+        "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Beta's addition.\n\n### Added\n\n\
+         - An earlier addition.\n",
+    );
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.publish_pull("feat/alpha", 7);
+    lab.merge_pull_with_merge_commit(7);
+    let merged_at = commit_at(&lab, "main@upstream");
+    let pulls = format!(
+        "[{},{}]",
+        pull_record(7, "MERGED", "feat/alpha", Some(merged_at.as_str())),
+        pull_record(8, "OPEN", "feat/beta", None)
+    );
+
+    // When: the bare rebase moves the release onto the merge commit, then
+    // drops alpha, so the command writes the release twice.
+    let output = knives_release_with_forge(&lab, &home, &pulls, &["rebase"]);
+
+    // Then: one line names the file and the heading, for the release the
+    // drop left.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "rebase failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("dropped feat/alpha: landed upstream as #7"),
+        "missing drop report: {stdout}"
+    );
+    assert_eq!(
+        release_parents(&lab, release),
+        vec![commit_at(&lab, "feat/beta")],
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("[Unreleased] holds").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains(
+            "  CHANGELOG.md: [Unreleased] holds `### Added` twice; knives changed no line for \
+             it; join them by hand before you push\n"
+        ),
+        "{stdout}"
+    );
+}
+
 /// Every event the fork's ledger records about `name`, oldest first.
 fn events_about(home: &tempfile::TempDir, name: &str) -> Vec<knives::ledger::Entry> {
     knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))

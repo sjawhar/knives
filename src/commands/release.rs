@@ -1070,11 +1070,13 @@ pub enum InHandWrite {
     /// It holds no change of its own that knives did not write or adopt: it
     /// is a recorded write, or one re-signed or metaedited
     /// ([`Repo::is_metadata_rewrite`]), or its tree is the matched write
-    /// rebased onto its members ([`Repo::holds_rebased_write`]).
+    /// rebased onto its previous release, where it has one, and its members
+    /// ([`Repo::holds_rebased_write`]).
     Recorded,
     /// It carries a change no knives write or adopt recorded: its tree is not
     /// `write`, the matched write ([`matched_write`]), rebased onto its
-    /// members. Every write refuses it until `adopt` records it.
+    /// previous release, where it has one, and its members. Every write
+    /// refuses it until `adopt` records it.
     Unrecorded { write: RecordedWrite },
     /// Nothing here can measure the release against the writes the ledger
     /// records of its name ([`Unchecked`]). A write over it proceeds and says
@@ -1668,8 +1670,9 @@ pub fn in_hand_refusal(
         ledger,
         name,
         commit,
+        writes,
         published,
-        ..
+        tips,
     } = *release;
     let write = match standing {
         InHandWrite::Unrecorded { write } => write,
@@ -1688,9 +1691,19 @@ pub fn in_hand_refusal(
     // The release is a name read from the repository: escaped in prose, and
     // one shell word inside the command.
     let shown = crate::ledger::inline_human_text(name);
+    // A stacked release that has a previous release is measured with it
+    // ([`in_hand_write`]).
+    let onto = if entry.stacked()
+        && release_reading(repo, entry, (ledger, tips), (writes, commit))?
+            .is_ok_and(|reading| reading.previous.is_some())
+    {
+        "its previous release and its members"
+    } else {
+        "its members"
+    };
     Ok(Some(format!(
         "{shown} at {} carries a change no knives write or adopt recorded: its tree is not {} \
-         rebased onto its members; record it with `knives release adopt {}` (adopt asks for \
+         rebased onto {onto}; record it with `knives release adopt {}` (adopt asks for \
          --why only for a change outside the conflicts)",
         commit.short(),
         described_write(write),
@@ -4115,11 +4128,12 @@ impl FixReferences<'_> {
 /// than [`crate::release_model::TEXT_PATH_PIECES`] pieces, so it may name a
 /// path of more pieces, which the text does not give. The fix is then held
 /// at no file, no path of the text is read for it, and the gate refuses
-/// every subject, naming the adopt and, where origin or the publish remote
-/// has a branch or tag at it, its fetch, else `--allow-drop` alone (the
-/// binary's `release_cut::fix_remedy`). The `fix_files` list of a newer
-/// event reads whole. A string that is no repository path, as a peer's
-/// ledger may carry, is no file of the fix ([`jj::is_repository_path`]).
+/// every subject, naming the adopt and, where this repository does not hold
+/// it and origin or the publish remote has a branch or tag at it, its fetch,
+/// else `--allow-drop` alone (the binary's `release_cut::fix_remedy`). The
+/// `fix_files` list of a newer event reads whole. A string that is no
+/// repository path, as a peer's ledger may carry, is no file of the fix
+/// ([`jj::is_repository_path`]).
 fn adopted_fix(
     repo: &Repo,
     (entry, (ledger, tips), writes): (&RepoEntry, (&[Entry], &BookmarkTips), &EarlierWrites),
@@ -4937,9 +4951,9 @@ pub fn conflict_guidance(release: &str, files: &[String], unions: &[jj::UnionedF
 /// A release command calls it after it wrote or recorded that tree
 /// ([`jj::repeated_headings`]). Every release log in the tree is read,
 /// changed or not, and whoever placed its lines: a clean merge, a member or
-/// a person. A heading that the union's own line names as left twice is
-/// named here too. knives changes no line for it: a person joins the lists
-/// before the release is pushed.
+/// a person. A heading that the union's own line names as left twice
+/// inside that one `[Unreleased]` section is named here too. knives changes
+/// no line for it: a person joins the lists before the release is pushed.
 pub fn report_repeated_headings(path: &Path, commit: &CommitId) {
     match jj::repeated_headings(path, commit.as_str()) {
         Ok(repeated) => {
