@@ -1072,30 +1072,19 @@ pub fn session_start(home: &Path, cwd: &Path, session_id: &str) -> std::process:
 }
 
 /// One note an older knives filed in `home`'s ledger directory `fork`,
-/// written at `ts`; the path of its file.
+/// written at `ts`; the path of its file. The entry is built from its
+/// serialized form, so this compiles against every knives whatever fields
+/// a later one adds.
 pub fn note(home: &Path, fork: &str, ts: &str, text: &str) -> PathBuf {
+    let entry: knives::ledger::Entry = serde_json::from_value(serde_json::json!({
+        "ts": ts,
+        "owner": "ses_older",
+        "kind": knives::ledger::Kind::Note,
+        "text": text,
+    }))
+    .expect("build a note");
     knives::ledger::Ledger::at(home.join("ledger").join(fork))
-        .append(&knives::ledger::Entry {
-            ts: ts.to_owned(),
-            owner: "ses_older".to_owned(),
-            email: None,
-            subject: None,
-            kind: knives::ledger::Kind::Note,
-            disposition: None,
-            statement: None,
-            text: text.to_owned(),
-            evidence: Vec::new(),
-            anchor: None,
-            pr: None,
-            parents: Vec::new(),
-            claim_change: None,
-            claim_change_why: None,
-            previous_owner: None,
-            previous_kind: None,
-            previous_started: None,
-            previous_last_seen: None,
-            previous_why: None,
-        })
+        .append(&entry)
         .expect("append a note")
 }
 

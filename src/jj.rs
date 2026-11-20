@@ -38,7 +38,7 @@ use thiserror::Error;
 
 use crate::changelog_union;
 use crate::detect::landed::RebaseOutcome;
-use crate::detect::stale_parents::{BookmarkTips, ReleaseParent};
+use crate::detect::stale_parents::{BookmarkTips, ReleaseParent, release_parents};
 use crate::ids::{
     BookmarkRef, BranchName, ChangeId, CommitId, ReleaseScheme, RemoteName, WorkspaceName,
     is_our_release, pull_number_from_bookmark, short_id,
@@ -613,19 +613,10 @@ impl Repo {
     /// The parents of `revision`, each with the bookmarks that sit on it. The
     /// bookmark view is read once for every parent.
     pub fn parents_of(&self, revision: &str) -> Result<Vec<ReleaseParent>, JjError> {
-        let tips = self.bookmark_tips()?;
-        Ok(self
-            .parent_commits(revision)?
-            .into_iter()
-            .map(|commit| {
-                let bookmarks = tips
-                    .iter()
-                    .filter(|(_, tip)| **tip == commit)
-                    .map(|(bookmark, _)| bookmark.clone())
-                    .collect();
-                ReleaseParent { commit, bookmarks }
-            })
-            .collect())
+        Ok(release_parents(
+            &self.bookmark_tips()?,
+            &self.parent_commits(revision)?,
+        ))
     }
 
     /// The parent commits of `revision`, in jj's parent order.
@@ -778,8 +769,19 @@ impl Repo {
     /// trunk itself when the histories criss-cross to several, as
     /// `uncarried_recorded_members` takes a member's base.
     pub fn fork_point(&self, revision: &CommitId, trunk: &CommitId) -> Result<CommitId, JjError> {
+        self.fork_point_of(std::slice::from_ref(revision), trunk)
+    }
+
+    /// [`Self::fork_point`] of every one of `commits` together: the one
+    /// commit all of them and `trunk` reach, or the trunk itself, as a first
+    /// cut takes its members' base.
+    pub fn fork_point_of(
+        &self,
+        commits: &[CommitId],
+        trunk: &CommitId,
+    ) -> Result<CommitId, JjError> {
         Ok(self
-            .common_ancestor(std::slice::from_ref(revision), trunk)?
+            .common_ancestor(commits, trunk)?
             .unwrap_or_else(|| trunk.clone()))
     }
 
@@ -814,28 +816,31 @@ impl Repo {
         }
         let mut tx = self.repo.start_transaction();
         let tree = replayed_tree(&base.tree(), revision.tree(), &onto.tree())?;
-        let synthetic = block_on(
-            tx.repo_mut()
-                .new_commit(vec![base.id().clone()], tree)
-                .write(),
-        )
-        .map_err(|error| store_error(&error))?;
-        let replayed = block_on(rebase_commit(
-            tx.repo_mut(),
-            synthetic,
-            vec![onto.id().clone()],
-        ))
-        .map_err(|error| store_error(&error))?;
-        let outcome = if replayed.has_conflict() {
-            RebaseOutcome::Conflicted
-        } else if block_on(replayed.is_empty(tx.repo())).map_err(|error| store_error(&error))? {
-            RebaseOutcome::Empty
-        } else {
-            RebaseOutcome::CleanNonEmpty
-        };
+        let outcome = replayed_outcome(&mut tx, (base.id(), tree), onto.id());
         // Dropped, never committed: the probe leaves no trace in the op log.
         drop(tx);
-        Ok(outcome)
+        outcome
+    }
+
+    /// The paths of the change `resolution` holds against `baseline` that
+    /// `onto`, a commit, does not carry ([`uncarried_change`]), in a scratch
+    /// transaction that is dropped unwritten.
+    pub fn uncarried_resolution_paths(
+        &self,
+        baseline: ResolutionBaseline<'_>,
+        resolution: &CommitId,
+        onto: &CommitId,
+    ) -> Result<Vec<String>, JjError> {
+        let (resolution, onto) = (
+            self.commit(resolution.as_str())?,
+            self.commit(onto.as_str())?,
+        );
+        let base = baseline_tree(self, baseline)?;
+        let mut tx = self.repo.start_transaction();
+        let uncarried = uncarried_change(&mut tx, (base, &resolution), &onto);
+        // Dropped, never committed: the probe leaves no trace in the op log.
+        drop(tx);
+        uncarried
     }
 
     /// [`Self::is_ancestor`] by backend id, saving the hex round-trip.
@@ -942,6 +947,26 @@ impl Repo {
             [only] => Ok(Some(commit_id(only))),
             _ => Ok(None),
         }
+    }
+
+    /// Whether `commit` and `tip` share history: some commit other than the
+    /// root commit, which every commit descends from, is an ancestor of both.
+    /// The root commit shares none with any commit, and neither does a
+    /// commit made on the root apart from `tip`'s line.
+    pub fn shares_history(&self, commit: &CommitId, tip: &CommitId) -> Result<bool, JjError> {
+        let commit = self.commit(commit.as_str())?.id().clone();
+        let tip = self.commit(tip.as_str())?.id().clone();
+        let common = block_on(
+            self.repo
+                .index()
+                .common_ancestors(std::slice::from_ref(&commit), std::slice::from_ref(&tip)),
+        )
+        .map_err(|error| JjError::Revision {
+            revision: commit.to_string(),
+            detail: error.to_string(),
+        })?;
+        let root = self.repo.store().root_commit_id();
+        Ok(common.iter().any(|ancestor| ancestor != root))
     }
 
     /// Bookmarks whose history includes `commit`, excluding any pointing exactly at it.
@@ -1055,6 +1080,43 @@ impl Repo {
         conflicted_paths(&self.commit(revision)?.tree())
     }
 
+    /// Each release log in `revision`'s tree whose one `[Unreleased]`
+    /// section holds a `### ` heading more than once, in path order.
+    ///
+    /// Every file that [`changelog_union::eligible`] names is read
+    /// ([`changelog_union::repeated_headings`]), whether the command that
+    /// wrote or recorded the tree changed it or not, and whoever placed its
+    /// lines: the union ([`union_release_logs`]), a clean merge, a member or
+    /// a person. A log that the tree leaves conflicted, or holds as no
+    /// regular file, is not read: its conflict is a person's already.
+    /// Reading writes nothing.
+    pub fn repeated_headings(&self, revision: &str) -> Result<Vec<RepeatedHeadings>, JjError> {
+        let tree = self.commit(revision)?.tree();
+        let store = self.repo.store();
+        let mut repeated = Vec::new();
+        for (path, value) in tree.entries() {
+            if !changelog_union::eligible(path.as_internal_file_string()) {
+                continue;
+            }
+            let value = value.map_err(|error| store_error(&error))?;
+            let Some(content) = regular_file_content(store, &path, &value)? else {
+                continue;
+            };
+            let headings = changelog_union::repeated_headings(&content);
+            if headings.is_empty() {
+                continue;
+            }
+            repeated.push(RepeatedHeadings {
+                path: path.as_internal_file_string().to_owned(),
+                headings: headings
+                    .into_iter()
+                    .map(|(heading, count)| (String::from_utf8_lossy(heading).into_owned(), count))
+                    .collect(),
+            });
+        }
+        Ok(repeated)
+    }
+
     /// The bytes `path` (repository-internal, `/`-separated) holds at
     /// `revision`, or `None` where it holds no one resolved regular file:
     /// absent, a symlink, a directory, a conflict. Read in-process, so a file
@@ -1082,6 +1144,34 @@ impl Repo {
             block_on(tree.path_value(path)).map_err(|error| store_error(&error))
         };
         Ok(value(first)? == value(second)?)
+    }
+
+    /// Whether `revision` holds a conflict at `path` (repository-internal,
+    /// `/`-separated). A file, symlink or directory there is no conflict,
+    /// and neither is nothing at all.
+    pub fn conflicted_at(&self, revision: &CommitId, path: &str) -> Result<bool, JjError> {
+        let path = internal_path(path)?;
+        let tree = self.commit(revision.as_str())?.tree();
+        let value = block_on(tree.path_value(path)).map_err(|error| store_error(&error))?;
+        Ok(!value.is_resolved())
+    }
+
+    /// The paths of `paths` (repository-internal, `/`-separated) at which
+    /// `revision` holds anything: a file, symlink, directory or conflict
+    /// ([`tree_holds`]).
+    pub fn held_paths(
+        &self,
+        revision: &CommitId,
+        paths: &[String],
+    ) -> Result<Vec<String>, JjError> {
+        let tree = self.commit(revision.as_str())?.tree();
+        let mut held = Vec::new();
+        for path in paths {
+            if tree_holds(&tree, path)? {
+                held.push(path.clone());
+            }
+        }
+        Ok(held)
     }
 
     /// The visible commits that share `revision`'s change id, other than
@@ -1114,6 +1204,48 @@ impl Repo {
             .collect())
     }
 
+    /// Whether `visible` stands for `commit`, a recorded write or member: it
+    /// is `commit`, a successor of it, or a commit with its tree.
+    ///
+    /// A successor is jj's rewrite of it: `commit` is among `visible`'s
+    /// predecessors, transitively, as the operation log records them
+    /// ([`jj_lib::evolution::walk_predecessors`]). jj leaves one when it
+    /// rebases a release over a member rewritten in place. A commit with its
+    /// tree carries its content whatever its change id, as a fast-forward
+    /// copy pushed from another clone does, whose rewrite this repository
+    /// never recorded, or a `jj duplicate` of it, which has a new change id.
+    /// A commit that only shares the change id stands for nothing: the
+    /// commit an `adopt` replaced has the adopt's change id, and lacks its
+    /// fix.
+    pub fn stands_for(&self, visible: &CommitId, commit: &CommitId) -> Result<bool, JjError> {
+        let (visible, commit) = (
+            self.commit(visible.as_str())?,
+            self.commit(commit.as_str())?,
+        );
+        if visible.id() == commit.id() || visible.tree_ids() == commit.tree_ids() {
+            return Ok(true);
+        }
+        is_predecessor(&self.repo, commit.id(), visible.id()).map_err(|detail| JjError::Revision {
+            revision: visible.id().to_string(),
+            detail,
+        })
+    }
+
+    /// The visible rewrites of `commit` ([`Self::rewrites_of`]) that stand
+    /// for it ([`Self::stands_for`]): its successors and its copies that keep
+    /// its change id, never a commit it replaced. A copy with a new change id
+    /// is no rewrite; a caller that holds copies too compares trees
+    /// ([`crate::release_model::on_first_parent_line`]).
+    pub fn standing_rewrites_of(&self, commit: &CommitId) -> Result<Vec<CommitId>, JjError> {
+        let mut standing = Vec::new();
+        for rewrite in self.rewrites_of(commit.as_str())? {
+            if self.stands_for(&rewrite, commit)? {
+                standing.push(rewrite);
+            }
+        }
+        Ok(standing)
+    }
+
     /// The visible commits whose change id begins with `change`, the
     /// 12-character prefix a ledger event records (`ids::short_id`).
     ///
@@ -1142,7 +1274,8 @@ impl Repo {
     }
 
     /// Whether `release`'s tree is exactly `write`'s own change rebased onto
-    /// `members` ([`Self::rebased_write`]).
+    /// `members` ([`Self::rebased_write`]); `composed` is what `write`
+    /// composes.
     ///
     /// That is the tree a release holds when nothing but knives and jj
     /// changed it since the write: jj's own rebase of the write over a
@@ -1151,12 +1284,12 @@ impl Repo {
     /// counts. A tree with conflicts compares by its ids like any other.
     pub fn holds_rebased_write(
         &self,
-        (write, write_carriers): (&CommitId, &[CommitId]),
+        (write, composed): (&CommitId, &[CommitId]),
         members: &[CommitId],
         release: &CommitId,
     ) -> Result<bool, JjError> {
         let release = self.commit(release.as_str())?;
-        let (rebased, written) = self.rebased_write((write, write_carriers), members)?;
+        let (rebased, written) = self.rebased_write((write, composed), members)?;
         if rebased.tree_ids() == release.tree_ids() {
             return Ok(true);
         }
@@ -1169,52 +1302,50 @@ impl Repo {
     /// release-log union ([`union_release_logs`]).
     fn rebuilt_write(
         &self,
-        (write, write_carriers): (&CommitId, &[CommitId]),
+        (write, composed): (&CommitId, &[CommitId]),
         members: &[CommitId],
     ) -> Result<MergedTree, JjError> {
-        let (rebased, written) = self.rebased_write((write, write_carriers), members)?;
+        let (rebased, written) = self.rebased_write((write, composed), members)?;
         Ok(union_release_logs(rebased, Some(&written))?.0)
     }
 
     /// `write`'s own change rebased onto `members`: merge(`members`) +
-    /// `write` - merge(`write`'s parents other than `write_carriers`), the
-    /// step a release write takes ([`duplicated_without_carriers`]), and
-    /// `write`'s own tree, which a union puts under the blocks the members
-    /// bring in.
+    /// `write` - merge(`composed`), the step a release write takes
+    /// ([`duplicated_from`]), and `write`'s own tree, which a union puts
+    /// under the blocks the members bring in.
+    ///
+    /// `composed` is what `write` composes: its parents less its carriers,
+    /// or, for a release of a stacked series, its previous release and its
+    /// members. A release made as a chain of merges, one member each, holds
+    /// what each inner merge resolved, and that is its own change only
+    /// against the merge of all it composes, never against its own parents.
     ///
     /// Built in a transaction that is dropped, never committed, so it leaves
     /// nothing an operation names; the trees it wrote stay readable from the
     /// store.
     fn rebased_write(
         &self,
-        (write, write_carriers): (&CommitId, &[CommitId]),
+        (write, composed): (&CommitId, &[CommitId]),
         members: &[CommitId],
     ) -> Result<(MergedTree, MergedTree), JjError> {
         let write = self.commit(write.as_str())?;
-        let member_ids = members
-            .iter()
-            .map(|member| Ok(self.commit(member.as_str())?.id().clone()))
-            .collect::<Result<Vec<_>, JjError>>()?;
-        let write_members: Vec<JjCommitId> = write
-            .parent_ids()
-            .iter()
-            .filter(|parent| !write_carriers.contains(&commit_id(parent)))
-            .cloned()
-            .collect();
+        let ids = |commits: &[CommitId]| {
+            commits
+                .iter()
+                .map(|commit| Ok(self.commit(commit.as_str())?.id().clone()))
+                .collect::<Result<Vec<_>, JjError>>()
+        };
+        let member_ids = ids(members)?;
+        let composed_ids = ids(composed)?;
         let mut tx = self.repo.start_transaction();
-        // A write whose every parent is an earlier write of its name has no
-        // members to stand on; its own parents are then what it is measured
-        // from, as a duplicate of it would be.
-        let source = if write_members.is_empty() || write_members.len() == write.parent_ids().len()
-        {
+        // A write whose every parent is an earlier write of its name composes
+        // nothing; its own parents are then what it is measured from, as a
+        // duplicate of it would be.
+        let source = if composed_ids.is_empty() || composed_ids.as_slice() == write.parent_ids() {
             write.clone()
         } else {
-            block_on(
-                tx.repo_mut()
-                    .new_commit(write_members, write.tree())
-                    .write(),
-            )
-            .map_err(|error| store_error(&error))?
+            block_on(tx.repo_mut().new_commit(composed_ids, write.tree()).write())
+                .map_err(|error| store_error(&error))?
         };
         let stats = block_on(duplicate_commits(
             tx.repo_mut(),
@@ -1883,6 +2014,99 @@ fn replayed_tree(
     block_on(builder.write_tree()).map_err(|error| store_error(&error))
 }
 
+/// A scratch child of `base` with `tree`, rebased onto `onto` in `tx`, which
+/// the caller drops unwritten.
+fn replayed_commit(
+    tx: &mut Transaction,
+    (base, tree): (&JjCommitId, MergedTree),
+    onto: &JjCommitId,
+) -> Result<jj_lib::commit::Commit, JjError> {
+    let synthetic = block_on(tx.repo_mut().new_commit(vec![base.clone()], tree).write())
+        .map_err(|error| store_error(&error))?;
+    block_on(rebase_commit(tx.repo_mut(), synthetic, vec![onto.clone()]))
+        .map_err(|error| store_error(&error))
+}
+
+/// The replay of [`replayed_commit`]: empty when `onto` already holds the
+/// change `tree` makes to `base`, else conflicted or clean and non-empty.
+fn replayed_outcome(
+    tx: &mut Transaction,
+    (base, tree): (&JjCommitId, MergedTree),
+    onto: &JjCommitId,
+) -> Result<RebaseOutcome, JjError> {
+    let replayed = replayed_commit(tx, (base, tree), onto)?;
+    Ok(if replayed.has_conflict() {
+        RebaseOutcome::Conflicted
+    } else if block_on(replayed.is_empty(tx.repo())).map_err(|error| store_error(&error))? {
+        RebaseOutcome::Empty
+    } else {
+        RebaseOutcome::CleanNonEmpty
+    })
+}
+
+/// The paths of the change `resolution` holds against `base`, the tree of
+/// its baseline ([`baseline_tree`]), that `onto` does not carry, each
+/// repository-internal, replayed in `tx`, which the caller drops unwritten.
+/// Each path is judged on its own: `onto` carries a path when the replay
+/// leaves it as `onto` holds it there, whatever the replay does at another
+/// path.
+///
+/// A path that the baseline left conflicted and the resolution holds
+/// otherwise is a conflict resolved by hand. No three-way replay over a
+/// conflict can read it, so `onto` carries it when it holds the
+/// resolution's value there. Every other path replays: `base`, with each
+/// resolved path set to the resolution's value, becomes a scratch commit on
+/// `resolution`'s parents, and the replay runs from it as a replay of a
+/// range does ([`Repo::net_diff_outcome`]), with a release log `onto` holds
+/// as a union left out ([`replayed_tree`]). A path where the replayed tree
+/// differs from `onto`'s, a conflict included, is one `onto` does not
+/// carry.
+fn uncarried_change(
+    tx: &mut Transaction,
+    (base, resolution): (MergedTree, &jj_lib::commit::Commit),
+    onto: &jj_lib::commit::Commit,
+) -> Result<Vec<String>, JjError> {
+    let (revision, target) = (resolution.tree(), onto.tree());
+    let mut uncarried = Vec::new();
+    let mut resolved: Vec<(RepoPathBuf, MergedTreeValue)> = Vec::new();
+    for entry in collect_stream(base.diff_stream(&revision, &EverythingMatcher)) {
+        let values = entry.values.map_err(|error| store_error(&error))?;
+        if values.before.is_resolved() {
+            continue;
+        }
+        let held = block_on(target.path_value(&entry.path)).map_err(|error| store_error(&error))?;
+        if held != values.after {
+            uncarried.push(entry.path.as_internal_file_string().to_owned());
+        }
+        resolved.push((entry.path, values.after));
+    }
+    let base = if resolved.is_empty() {
+        base
+    } else {
+        let mut builder = MergedTreeBuilder::new(base);
+        for (path, value) in resolved {
+            builder.set_or_remove(path, value);
+        }
+        block_on(builder.write_tree()).map_err(|error| store_error(&error))?
+    };
+    let tree = replayed_tree(&base, revision, &target)?;
+    let base = block_on(
+        tx.repo_mut()
+            .new_commit(resolution.parent_ids().to_vec(), base)
+            .write(),
+    )
+    .map_err(|error| store_error(&error))?;
+    let replayed = replayed_commit(tx, (base.id(), tree), onto.id())?.tree();
+    for entry in collect_stream(target.diff_stream(&replayed, &EverythingMatcher)) {
+        entry.values.map_err(|error| store_error(&error))?;
+        let path = entry.path.as_internal_file_string().to_owned();
+        if !uncarried.contains(&path) {
+            uncarried.push(path);
+        }
+    }
+    Ok(uncarried)
+}
+
 /// The content `value` holds at `path` when it is one resolved regular file,
 /// or `None` for anything else: absent, a symlink, a directory, a conflict.
 fn regular_file_content(
@@ -1918,6 +2142,30 @@ fn internal_path(path: &str) -> Result<&RepoPath, JjError> {
         revision: path.to_owned(),
         detail: error.to_string(),
     })
+}
+
+/// Whether `path` names a file that a tree can hold.
+///
+/// It must be a repository-internal path, `/`-separated, that jj can read,
+/// and not the root. A string with an empty component, such as `a//b`, `/x`
+/// or `x/`, names no file, and nothing holds it.
+pub fn is_repository_path(path: &str) -> bool {
+    RepoPath::from_internal_string(path).is_ok_and(|path| !path.is_root())
+}
+
+/// Whether `tree` holds anything at `path` (repository-internal,
+/// `/`-separated): a file, symlink, directory or conflict. A string that
+/// names no file, the empty one or one jj cannot read as a path, is held by
+/// nothing.
+fn tree_holds(tree: &MergedTree, path: &str) -> Result<bool, JjError> {
+    let Ok(path) = RepoPath::from_internal_string(path) else {
+        return Ok(false);
+    };
+    if path.is_root() {
+        return Ok(false);
+    }
+    let value = block_on(tree.path_value(path)).map_err(|error| store_error(&error))?;
+    Ok(!value.is_absent())
 }
 
 /// Replays `base..revision` onto a target and classifies the resulting content.
@@ -2645,12 +2893,8 @@ pub struct ReleaseWrite<'a> {
     /// merge of exactly `parents`.
     pub source: Option<&'a CommitId>,
     pub parents: &'a [CommitId],
-    /// The parents of `source` that are earlier writes of the name, never
-    /// members ([`crate::release_model::carriers`]). With any, the source is
-    /// first written again on its other parents with its own tree
-    /// ([`duplicated_without_carriers`]), so what the source resolved over a
-    /// carrier becomes its own change and the duplicate keeps it.
-    pub carriers: &'a [CommitId],
+    /// What the source's own change is measured against ([`Measured`]).
+    pub measured: Measured<'a>,
     /// `None` keeps the source's own message (fresh merges must name one).
     pub message: Option<&'a str>,
     /// Point this bookmark at the written commit, sideways moves allowed —
@@ -2672,6 +2916,29 @@ pub struct ReleaseWrite<'a> {
     pub earlier: &'a [CommitId],
     /// The operation-log description, `knives: …` by convention.
     pub operation: &'a str,
+}
+
+/// What a release write's source is measured against: the merge its own
+/// change, its tree against that merge, is taken from ([`duplicated_from`]).
+/// A fresh merge, which has no source, reads neither.
+#[derive(Debug, Clone, Copy)]
+pub enum Measured<'a> {
+    /// Its own parents less these, the parents that are earlier writes of
+    /// the name, never members
+    /// ([`crate::release_model::EarlierWrites::carriers`]). With any, the
+    /// source is first written again on its other parents with its own tree,
+    /// so what the source resolved over a carrier becomes its own change and
+    /// the duplicate keeps it.
+    WithoutCarriers(&'a [CommitId]),
+    /// What it composes, never its own parents, its carriers left out. A
+    /// release of a stacked series composes its previous release and its
+    /// members. Made as a chain of merges, one member each, it holds what
+    /// each inner merge resolved, and none of that is its top commit's own
+    /// change. So the source is first written again on these with its own
+    /// tree, and that in-between commit is duplicated: the write keeps every
+    /// resolution the chain holds. A source whose own parents are these is
+    /// duplicated as it is.
+    Composed(&'a [CommitId]),
 }
 
 /// What a release write made, and what became of the commit it replaced.
@@ -2715,6 +2982,27 @@ pub struct UnionedFile {
     /// Read as UTF-8 with replacement, because these only name the blocks to
     /// a reader; the file holds the bytes verbatim.
     pub first_lines: Vec<String>,
+    /// Each `### ` heading the union left in more than one block of one
+    /// section, where the blocks at a place are not plain `### ` lists in a
+    /// file's one `[Unreleased]` section
+    /// ([`changelog_union::Union::left_twice`]). Read as UTF-8 with
+    /// replacement, as `first_lines` is.
+    pub left_twice: Vec<String>,
+}
+
+/// A release log whose one `[Unreleased]` section holds a `### ` heading
+/// more than once ([`repeated_headings`]).
+///
+/// It is in a tree that a release command writes or records, whoever placed
+/// its lines. The command changes no line for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepeatedHeadings {
+    /// The repository-internal path, `/`-separated.
+    pub path: String,
+    /// Each such heading line, without its line terminator, and how many
+    /// times the section holds it, in the order the section first holds each.
+    /// Read as UTF-8 with replacement, as [`UnionedFile::first_lines`] is.
+    pub headings: Vec<(String, usize)>,
 }
 
 /// The commit a release write replaced under its name.
@@ -2757,11 +3045,11 @@ pub struct ReplacedRelease {
 /// the union.
 ///
 /// A source with carriers is duplicated from an in-between commit on its
-/// other parents ([`duplicated_without_carriers`]), which the same operation
-/// abandons, so the write still leaves one new visible commit. Abandoning the
-/// source can leave a carrier, or what sat behind one, a visible head nothing
-/// holds; the same operation hides each such head that is an earlier write of
-/// the name or superseded ([`hide_exposed`]).
+/// other parents ([`duplicated_from`]), which the same operation abandons, so
+/// the write still leaves one new visible commit. Abandoning the source can
+/// leave a carrier, or what sat behind one, a visible head nothing holds; the
+/// same operation hides each such head that is an earlier write of the name
+/// or superseded ([`hide_exposed`]).
 pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWritten, JjError> {
     validate_parents(write.source, write.parents)?;
     let repo = Repo::open_to_write(repo)?;
@@ -2769,12 +3057,12 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
     let mut tx = repo.repo.start_transaction();
     let (written, source, unions) = if let Some(source) = write.source {
         let source = repo.commit(source.as_str())?;
-        let (written, unions) = duplicated_without_carriers(
-            &mut tx,
-            (&source, write.message),
-            write.carriers,
-            &parent_ids,
-        )?;
+        let measured = match write.measured {
+            Measured::Composed(composed) => resolved_parents(&repo, composed)?.1,
+            Measured::WithoutCarriers(carriers) => without_carriers(&source, carriers),
+        };
+        let (written, unions) =
+            duplicated_from(&mut tx, (&source, write.message), measured, &parent_ids)?;
         (written, Some(source), unions)
     } else {
         let (written, unions) = merged_release(
@@ -2977,10 +3265,9 @@ fn holds_in_view(
 /// was pushed comes back under the next fast-forward rebase as an older
 /// version beside the newer one, and the newer one is the one that rewrote
 /// nothing. So each other visible commit of the change is walked back
-/// through the operation log ([`jj_lib::evolution::walk_predecessors`]),
-/// stopping at the first entry that lists `commit` as a predecessor. The walk
-/// reads the repository the transaction began from, so a rewrite made in
-/// this same transaction is not seen and its commit is kept.
+/// through the operation log ([`is_predecessor`]). The walk reads the
+/// repository the transaction began from, so a rewrite made in this same
+/// transaction is not seen and its commit is kept.
 fn successor_of(
     tx: &Transaction,
     commit: &jj_lib::commit::Commit,
@@ -3002,20 +3289,35 @@ fn successor_of(
         .filter(|id| id != commit.id())
         .collect();
     for sibling in siblings {
-        let mut walk = std::pin::pin!(jj_lib::evolution::walk_predecessors(
-            tx.base_repo(),
-            std::slice::from_ref(&sibling),
-        ));
-        while let Some(entry) = block_on(std::future::poll_fn(|context| {
-            walk.as_mut().poll_next(context)
-        })) {
-            let entry = entry.map_err(|error| walk_error(error.to_string()))?;
-            if entry.predecessor_ids().contains(commit.id()) {
-                return Ok(Some(sibling));
-            }
+        if is_predecessor(tx.base_repo(), commit.id(), &sibling).map_err(walk_error)? {
+            return Ok(Some(sibling));
         }
     }
     Ok(None)
+}
+
+/// Whether `commit` is among `successor`'s predecessors, transitively, as
+/// `repo`'s operation log records them: `successor` is walked back
+/// ([`jj_lib::evolution::walk_predecessors`]), stopping at the first entry
+/// that lists `commit` as a predecessor. `Err` is the walk's error, said.
+fn is_predecessor(
+    repo: &Arc<ReadonlyRepo>,
+    commit: &JjCommitId,
+    successor: &JjCommitId,
+) -> Result<bool, String> {
+    let mut walk = std::pin::pin!(jj_lib::evolution::walk_predecessors(
+        repo,
+        std::slice::from_ref(successor),
+    ));
+    while let Some(entry) = block_on(std::future::poll_fn(|context| {
+        walk.as_mut().poll_next(context)
+    })) {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry.predecessor_ids().contains(commit) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Which of `candidates` are visible heads nothing rests on ([`what_keeps`]),
@@ -3231,37 +3533,45 @@ fn merged_release(
     Ok((commit, unions))
 }
 
-/// [`duplicated_release`] of `source` with `carriers`, its parents that are
-/// earlier writes of its name, left out of what the duplicate measures it
-/// against.
+/// `source`'s parents with `carriers`, its parents that are earlier writes of
+/// its name, left out: what a duplicate of it measures it against
+/// ([`duplicated_from`]).
+fn without_carriers(source: &jj_lib::commit::Commit, carriers: &[CommitId]) -> Vec<JjCommitId> {
+    source
+        .parent_ids()
+        .iter()
+        .filter(|parent| !carriers.contains(&commit_id(parent)))
+        .cloned()
+        .collect()
+}
+
+/// [`duplicated_release`] of `source`, its own change measured against the
+/// merge of `measured`: its parents less its carriers ([`without_carriers`]),
+/// or what it composes ([`Measured::Composed`]).
 ///
 /// A duplicate replays the source's own change, its tree against the merge
 /// of its parents, onto the new parents. With a carrier among those parents
 /// the merge already holds every resolution the carrier holds, so the
 /// source's own change is empty there and a duplicate onto the members alone
-/// loses them. So the source is first written again as an in-between commit
-/// on its other parents with its own tree, description and author, which
-/// makes those resolutions its own change; that commit is duplicated; and it
-/// is recorded abandoned in the same transaction, so the write still leaves
-/// one new visible commit. A new commit, never a rewrite of the source: a
-/// rewrite would record the source rewritten and move everything resting on
-/// it, a working copy included.
-fn duplicated_without_carriers(
+/// loses them; a chain of merges holds what each inner merge resolved, which
+/// is no change of its top commit's own. So a source whose parents are not
+/// `measured` is first written again as an in-between commit on `measured`
+/// with its own tree, description and author, which makes those resolutions
+/// its own change; that commit is duplicated; and it is recorded abandoned in
+/// the same transaction, so the write still leaves one new visible commit. A
+/// new commit, never a rewrite of the source: a rewrite would record the
+/// source rewritten and move everything resting on it, a working copy
+/// included.
+fn duplicated_from(
     tx: &mut Transaction,
     (source, message): (&jj_lib::commit::Commit, Option<&str>),
-    carriers: &[CommitId],
+    measured: Vec<JjCommitId>,
     parent_ids: &[JjCommitId],
 ) -> Result<(jj_lib::commit::Commit, Vec<UnionedFile>), JjError> {
-    if carriers.is_empty() {
+    if measured.as_slice() == source.parent_ids() {
         return duplicated_release(tx, (source, message), parent_ids);
     }
-    let members: Vec<JjCommitId> = source
-        .parent_ids()
-        .iter()
-        .filter(|parent| !carriers.contains(&commit_id(parent)))
-        .cloned()
-        .collect();
-    if members.is_empty() {
+    if measured.is_empty() {
         return Err(JjError::Revision {
             revision: source.id().to_string(),
             detail: "every parent of the release is an earlier write of it, so there is no \
@@ -3271,7 +3581,7 @@ fn duplicated_without_carriers(
     }
     let in_between = block_on(
         tx.repo_mut()
-            .new_commit(members, source.tree())
+            .new_commit(measured, source.tree())
             .set_description(source.description())
             .set_author(source.author().clone())
             .write(),
@@ -3383,6 +3693,11 @@ fn union_release_logs(
                 .iter()
                 .map(|line| String::from_utf8_lossy(line).into_owned())
                 .collect(),
+            left_twice: union
+                .left_twice
+                .iter()
+                .map(|heading| String::from_utf8_lossy(heading).into_owned())
+                .collect(),
         });
         let resolved = TreeValue::File {
             id,
@@ -3400,6 +3715,11 @@ fn union_release_logs(
     }
     let tree = block_on(builder.write_tree()).map_err(|error| store_error(&error))?;
     Ok((tree, unions))
+}
+
+/// [`Repo::repeated_headings`] in the repository at `repo` as it stands now.
+pub fn repeated_headings(repo: &Path, revision: &str) -> Result<Vec<RepeatedHeadings>, JjError> {
+    Repo::open(repo)?.repeated_headings(revision)
 }
 
 /// A conflict whose every term is a regular file of one mode: the terms'
@@ -3447,13 +3767,15 @@ pub enum ResolutionBaseline<'a> {
     Written(&'a CommitId),
     /// A recorded write this repository holds, rebuilt on the resolution's
     /// `members` as a knives write onto them builds it: `write`'s own change,
-    /// its `carriers` left out, rebased onto them with the release-log
-    /// union, the tree [`Repo::holds_rebased_write`] reads. A member
-    /// rewritten in place, which makes jj rebase the release, is then no
-    /// change of the resolution's.
+    /// its tree against the merge of `composed`, what it composes (its
+    /// parents less its carriers, or a stacked write's previous release and
+    /// members), rebased onto them with the release-log union, the tree
+    /// [`Repo::holds_rebased_write`] reads. A member rewritten in place,
+    /// which makes jj rebase the release, is then no change of the
+    /// resolution's.
     Rebuilt {
         write: &'a CommitId,
-        carriers: &'a [CommitId],
+        composed: &'a [CommitId],
         members: &'a [CommitId],
     },
     /// A fresh flat merge of these parents with the release-log union, as a
@@ -3479,28 +3801,22 @@ pub struct ResolutionChanges {
     pub baseline: BTreeMap<String, Vec<Vec<u8>>>,
 }
 
-/// Every path whose content differs between `baseline` and `resolution`,
-/// sorted by whether the baseline held a conflict there, with the content the
-/// baseline held at each.
+/// The tree `baseline` stands for: the written commit's, the write rebuilt
+/// on the members ([`Repo::rebuilt_write`]), or a fresh automerge of the
+/// parents with the release-log union ([`merged_release`]).
 ///
 /// A rebuilt write and the automerge are built in scratch transactions that
-/// are dropped unwritten, so measuring a resolution writes nothing an
-/// operation names. Their union is the one every release write makes, so a
-/// release log the union resolves is no conflict of the baseline, and a log a
-/// person changed past it is a change beyond the conflicts.
-pub fn resolution_changes(
-    repo: &Repo,
-    baseline: ResolutionBaseline<'_>,
-    resolution: &CommitId,
-) -> Result<ResolutionChanges, JjError> {
-    let resolution = repo.commit(resolution.as_str())?.tree();
-    let baseline = match baseline {
+/// are dropped unwritten, so reading a baseline writes nothing an operation
+/// names; the trees they wrote stay readable from the store. Their union is
+/// the one every release write makes.
+fn baseline_tree(repo: &Repo, baseline: ResolutionBaseline<'_>) -> Result<MergedTree, JjError> {
+    Ok(match baseline {
         ResolutionBaseline::Written(commit) => repo.commit(commit.as_str())?.tree(),
         ResolutionBaseline::Rebuilt {
             write,
-            carriers,
+            composed,
             members,
-        } => repo.rebuilt_write((write, carriers), members)?,
+        } => repo.rebuilt_write((write, composed), members)?,
         ResolutionBaseline::Automerge(parents) => {
             validate_parents(None, parents)?;
             let (parent_commits, parent_ids) = resolved_parents(repo, parents)?;
@@ -3508,7 +3824,24 @@ pub fn resolution_changes(
             let (merged, _) = merged_release(&mut scratch, (&parent_commits, parent_ids), "")?;
             merged.tree()
         }
-    };
+    })
+}
+
+/// Every path whose content differs between `baseline` ([`baseline_tree`])
+/// and `resolution`, sorted by whether the baseline held a conflict there,
+/// with the content the baseline held at each.
+///
+/// Measuring a resolution writes nothing an operation names. The baseline's
+/// union is the one every release write makes, so a release log the union
+/// resolves is no conflict of the baseline, and a log a person changed past
+/// it is a change beyond the conflicts.
+pub fn resolution_changes(
+    repo: &Repo,
+    baseline: ResolutionBaseline<'_>,
+    resolution: &CommitId,
+) -> Result<ResolutionChanges, JjError> {
+    let resolution = repo.commit(resolution.as_str())?.tree();
+    let baseline = baseline_tree(repo, baseline)?;
     let store = repo.repo.store();
     let mut changes = ResolutionChanges::default();
     for entry in collect_stream(baseline.diff_stream(&resolution, &EverythingMatcher)) {
@@ -3541,8 +3874,8 @@ pub struct CutSpec {
     pub source: Option<CommitId>,
     pub parents: Vec<CommitId>,
     /// The parents of `source` that are earlier writes of its name, left out
-    /// of what the duplicate measures it against
-    /// ([`duplicated_without_carriers`]).
+    /// of what the duplicate measures it against ([`without_carriers`],
+    /// [`duplicated_from`]).
     pub carriers: Vec<CommitId>,
     pub message: String,
 }
@@ -3592,8 +3925,8 @@ pub fn candidate_release(repo: &Path, spec: CutSpec) -> Result<Candidate, JjErro
 
 /// The release commit `spec` describes, written into `tx`, and the release
 /// logs it unioned. A source with carriers goes through the in-between commit
-/// a release write uses ([`duplicated_without_carriers`]), in the audited
-/// candidate and in the published rebuild alike, so both hold the same tree.
+/// a release write uses ([`duplicated_from`]), in the audited candidate and in
+/// the published rebuild alike, so both hold the same tree.
 fn spec_commit(
     repo: &Repo,
     tx: &mut Transaction,
@@ -3602,10 +3935,10 @@ fn spec_commit(
     let (parent_commits, parent_ids) = resolved_parents(repo, &spec.parents)?;
     if let Some(source) = &spec.source {
         let source = repo.commit(source.as_str())?;
-        duplicated_without_carriers(
+        duplicated_from(
             tx,
             (&source, Some(&spec.message)),
-            &spec.carriers,
+            without_carriers(&source, &spec.carriers),
             &parent_ids,
         )
     } else {
@@ -3655,28 +3988,33 @@ impl Candidate {
             return Ok(RebaseOutcome::Empty);
         }
         let tree = replayed_tree(&base.tree(), revision.tree(), &self.commit.tree())?;
-        let synthetic = block_on(
-            self.tx
-                .repo_mut()
-                .new_commit(vec![base.id().clone()], tree)
-                .write(),
-        )
-        .map_err(|error| store_error(&error))?;
-        let replayed = block_on(rebase_commit(
-            self.tx.repo_mut(),
-            synthetic,
-            vec![self.commit.id().clone()],
-        ))
-        .map_err(|error| store_error(&error))?;
-        Ok(if replayed.has_conflict() {
-            RebaseOutcome::Conflicted
-        } else if block_on(replayed.is_empty(self.tx.repo()))
-            .map_err(|error| store_error(&error))?
-        {
-            RebaseOutcome::Empty
-        } else {
-            RebaseOutcome::CleanNonEmpty
-        })
+        replayed_outcome(&mut self.tx, (base.id(), tree), self.commit.id())
+    }
+
+    /// The paths of the change `resolution` holds against `baseline`, the
+    /// change [`resolution_changes`] measures, that the candidate does not
+    /// carry, replayed onto it in its own scratch transaction
+    /// ([`uncarried_change`]).
+    pub fn uncarried_resolution_paths(
+        &mut self,
+        baseline: ResolutionBaseline<'_>,
+        resolution: &CommitId,
+    ) -> Result<Vec<String>, JjError> {
+        let resolution = self.repo.commit(resolution.as_str())?;
+        let base = baseline_tree(&self.repo, baseline)?;
+        uncarried_change(&mut self.tx, (base, &resolution), &self.commit)
+    }
+
+    /// Whether the candidate holds the same value as `other` at `path`
+    /// (repository-internal, `/`-separated): the same file, symlink,
+    /// directory or conflict, or nothing at either.
+    pub fn same_path_value(&self, other: &CommitId, path: &str) -> Result<bool, JjError> {
+        let path = internal_path(path)?;
+        let theirs = self.repo.commit(other.as_str())?.tree();
+        let held =
+            block_on(self.commit.tree().path_value(path)).map_err(|error| store_error(&error))?;
+        let wanted = block_on(theirs.path_value(path)).map_err(|error| store_error(&error))?;
+        Ok(held == wanted)
     }
 
     /// Paths whose content differs between `previous` and the candidate.
@@ -4477,6 +4815,26 @@ pub fn forget_and_abandon(
     )?;
     commit_mutation(&repo, tx, operation)?;
     Ok(outcome)
+}
+
+/// Forget every ref of each of `names`, locally and on every remote, as ONE
+/// operation, and abandon nothing.
+///
+/// The reap of a stacked series retires a superseded name this way when the
+/// live release descends from its commit: the commit stays, reachable from
+/// the live release, and only the name goes. Nothing changes on any remote; a
+/// later fetch re-materializes whatever still exists there, as after
+/// [`forget_and_abandon`].
+pub fn forget_bookmarks(repo: &Path, names: &[String], operation: &str) -> Result<(), JjError> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let repo = Repo::open_to_write(repo)?;
+    let mut tx = repo.repo.start_transaction();
+    for name in names {
+        forget_refs(tx.repo_mut(), name);
+    }
+    commit_mutation(&repo, tx, operation)
 }
 
 /// Refuse to abandon a commit that a local bookmark still names, other than a

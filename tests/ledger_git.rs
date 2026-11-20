@@ -87,29 +87,17 @@ fn append_padded(ledger: &Ledger, owner: &str, count: usize, padding: usize) {
     static STAMP: AtomicUsize = AtomicUsize::new(0);
     for index in 0..count {
         let nanosecond = STAMP.fetch_add(1, Ordering::Relaxed);
-        ledger
-            .append(&Entry {
-                ts: format!("2026-10-08T12:00:00.{nanosecond:09}Z"),
-                owner: owner.to_owned(),
-                email: None,
-                subject: Some("feat/transport".to_owned()),
-                kind: Kind::Note,
-                disposition: None,
-                statement: None,
-                text: format!("{owner} learned thing {index}\n{}", "x".repeat(padding)),
-                evidence: Vec::new(),
-                anchor: None,
-                pr: None,
-                parents: Vec::new(),
-                claim_change: None,
-                claim_change_why: None,
-                previous_owner: None,
-                previous_kind: None,
-                previous_started: None,
-                previous_last_seen: None,
-                previous_why: None,
-            })
-            .expect("append an entry");
+        // Built from its serialized form, so it names no field a later
+        // knives adds.
+        let entry: Entry = serde_json::from_value(serde_json::json!({
+            "ts": format!("2026-10-08T12:00:00.{nanosecond:09}Z"),
+            "owner": owner,
+            "subject": "feat/transport",
+            "kind": Kind::Note,
+            "text": format!("{owner} learned thing {index}\n{}", "x".repeat(padding)),
+        }))
+        .expect("build an entry");
+        ledger.append(&entry).expect("append an entry");
     }
 }
 

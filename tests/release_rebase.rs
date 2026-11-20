@@ -24,11 +24,11 @@ mod lab;
 #[path = "common/release_forge.rs"]
 mod release_forge;
 
-use forge_shim::pull_record;
+use forge_shim::{install_snapshot_gh, path_with_gh_shim, pull_record};
 use knives::jj::Repo;
 use lab::{
     Lab, ReleaseOutput, commit_at, extend_branch, file_at_revision, knives_release, knives_start,
-    release_parents, release_test_home, release_test_home_pinned,
+    release_command, release_parents, release_test_home, release_test_home_pinned,
 };
 use release_forge::{
     ReleaseWithSnapshotForgeInput, knives_release_with_forge, release_with_snapshot_forge,
@@ -656,6 +656,484 @@ fn a_bare_rebase_drops_a_member_whose_pull_request_landed() {
         lab.revision(&lab.work, release, "description")
             .contains("dropped feat/alpha: landed upstream as #7"),
         "the release description must record the drop"
+    );
+}
+
+#[test]
+fn a_bare_rebase_that_drops_a_landed_member_names_a_heading_held_twice_once() {
+    // Given: alpha merged upstream by a merge commit, and beta still open,
+    // whose changelog's one `[Unreleased]` section holds `### Added` twice.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch(
+        "feat/beta",
+        "CHANGELOG.md",
+        "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Beta's addition.\n\n### Added\n\n\
+         - An earlier addition.\n",
+    );
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.publish_pull("feat/alpha", 7);
+    lab.merge_pull_with_merge_commit(7);
+    let merged_at = commit_at(&lab, "main@upstream");
+    let pulls = format!(
+        "[{},{}]",
+        pull_record(7, "MERGED", "feat/alpha", Some(merged_at.as_str())),
+        pull_record(8, "OPEN", "feat/beta", None)
+    );
+
+    // When: the bare rebase moves the release onto the merge commit, then
+    // drops alpha, so the command writes the release twice.
+    let output = knives_release_with_forge(&lab, &home, &pulls, &["rebase"]);
+
+    // Then: one line names the file and the heading, for the release the
+    // drop left.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "rebase failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("dropped feat/alpha: landed upstream as #7"),
+        "missing drop report: {stdout}"
+    );
+    assert_eq!(
+        release_parents(&lab, release),
+        vec![commit_at(&lab, "feat/beta")],
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("[Unreleased] holds").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains(
+            "  CHANGELOG.md: [Unreleased] holds `### Added` twice; knives changed no line for \
+             it; join them by hand before you push\n"
+        ),
+        "{stdout}"
+    );
+}
+
+/// Put a `jj` in `shim`, ahead of the real one on `PATH`, that refuses the
+/// read by which the drop of a landed member asks whether it carries work
+/// past the target: `jj log` with the template that asks whether each
+/// commit of a range is empty. That read comes after the rebase's write and
+/// before the drop's. Every other call reaches the real `jj`.
+fn install_jj_refusing_the_landed_read(shim: &std::path::Path) {
+    let real = std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+        .map(|directory| directory.join("jj"))
+        .find(|candidate| candidate.is_file())
+        .expect("find jj on PATH");
+    let jj = shim.join("jj");
+    std::fs::write(
+        &jj,
+        format!(
+            "#!/bin/sh\nfor argument in \"$@\"; do\n  case \"$argument\" in\n    'empty ++ '*) \
+             echo 'planted: the landed read is refused' >&2; exit 1 ;;\n  esac\ndone\nexec '{}' \
+             \"$@\"\n",
+            real.display()
+        ),
+    )
+    .expect("write the jj shim");
+    let mut permissions = std::fs::metadata(&jj)
+        .expect("read the jj shim's permissions")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&jj, permissions).expect("make the jj shim executable");
+}
+
+#[test]
+fn a_bare_rebase_whose_drop_fails_names_a_heading_held_twice_once_for_the_release_it_wrote() {
+    // Given: alpha merged upstream by a merge commit, and beta still open,
+    // whose changelog's one `[Unreleased]` section holds `### Added` twice;
+    // and a `jj` that refuses the read of whether alpha carries work past
+    // the target, which comes after the rebase's write.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch(
+        "feat/beta",
+        "CHANGELOG.md",
+        "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Beta's addition.\n\n### Added\n\n\
+         - An earlier addition.\n",
+    );
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.publish_pull("feat/alpha", 7);
+    lab.merge_pull_with_merge_commit(7);
+    let merged_at = commit_at(&lab, "main@upstream");
+    let pulls = format!(
+        "[{},{}]",
+        pull_record(7, "MERGED", "feat/alpha", Some(merged_at.as_str())),
+        pull_record(8, "OPEN", "feat/beta", None)
+    );
+    let before = commit_at(&lab, release);
+    let shim = tempfile::tempdir().expect("create the shim directory");
+    install_snapshot_gh(shim.path(), &pulls, &[]);
+    install_jj_refusing_the_landed_read(shim.path());
+
+    // When: the bare rebase moves the release onto the merge commit, writes
+    // and records it, and the drop of alpha fails before it writes.
+    let output = release_command(&lab, &home, ReleaseOutput::Text, &["rebase"])
+        .env("XDG_CACHE_HOME", shim.path().join("cache"))
+        .env("PATH", path_with_gh_shim(shim.path()))
+        .output()
+        .expect("run knives release rebase");
+
+    // Then: the command exits with the failure, and one line names the file
+    // and the heading, for the release the rebase wrote.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("planted: the landed read is refused"),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("demo: {release} rebased onto ")),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("dropped feat/alpha"), "{stdout}");
+    assert_ne!(commit_at(&lab, release), before, "{stdout}");
+    assert_eq!(
+        stdout.matches("[Unreleased] holds").count(),
+        1,
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(
+            "  CHANGELOG.md: [Unreleased] holds `### Added` twice; knives changed no line for \
+             it; join them by hand before you push\n"
+        ),
+        "{stdout}"
+    );
+}
+
+/// Put a `jj` in `shim`, ahead of the real one on `PATH`, that refuses the
+/// move of a rebase, `jj rebase -b`. That call comes after the write that
+/// sheds the release's stale bases and before the write that re-describes
+/// it. Every other call reaches the real `jj`.
+fn install_jj_refusing_the_move(shim: &std::path::Path) {
+    let real = std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+        .map(|directory| directory.join("jj"))
+        .find(|candidate| candidate.is_file())
+        .expect("find jj on PATH");
+    let jj = shim.join("jj");
+    std::fs::write(
+        &jj,
+        format!(
+            "#!/bin/sh\nseen=\nfor argument in \"$@\"; do\n  if [ \"$seen\" = rebase ] && [ \
+             \"$argument\" = -b ]; then\n    echo 'planted: the move is refused' >&2; exit 1\n  \
+             fi\n  [ \"$argument\" = rebase ] && seen=rebase\ndone\nexec '{}' \"$@\"\n",
+            real.display()
+        ),
+    )
+    .expect("write the jj shim");
+    let mut permissions = std::fs::metadata(&jj)
+        .expect("read the jj shim's permissions")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&jj, permissions).expect("make the jj shim executable");
+}
+
+#[test]
+fn a_rebase_whose_move_fails_after_its_shed_write_names_a_heading_held_twice_once() {
+    // Given: a release whose first parent is the trunk, a stale base the
+    // rebase sheds in a write of its own before it moves; beta, whose
+    // changelog's one `[Unreleased]` section holds `### Added` twice; an
+    // advanced upstream; and a `jj` that refuses the move, which comes after
+    // the shed write.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch(
+        "feat/beta",
+        "CHANGELOG.md",
+        "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Beta's addition.\n\n### Added\n\n\
+         - An earlier addition.\n",
+    );
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.advance_upstream("upstream advance\n");
+    let before = commit_at(&lab, release);
+    let shim = tempfile::tempdir().expect("create the shim directory");
+    install_jj_refusing_the_move(shim.path());
+
+    // When: the rebase sheds the trunk parent, writing the release, and its
+    // move fails before the re-describe writes.
+    let output = release_command(
+        &lab,
+        &home,
+        ReleaseOutput::Text,
+        &["rebase", "main@upstream"],
+    )
+    .env("PATH", path_with_gh_shim(shim.path()))
+    .output()
+    .expect("run knives release rebase");
+
+    // Then: the command exits with the failure, the release is the shed
+    // write, whose parents are its members alone, and one line names the
+    // file and the heading, for that release.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stderr.contains("planted: the move is refused"), "{stderr}");
+    assert_ne!(commit_at(&lab, release), before, "{stdout}");
+    assert_eq!(
+        release_parents(&lab, release),
+        vec![commit_at(&lab, "feat/alpha"), commit_at(&lab, "feat/beta")],
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("[Unreleased] holds").count(),
+        1,
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(
+            "  CHANGELOG.md: [Unreleased] holds `### Added` twice; knives changed no line for \
+             it; join them by hand before you push\n"
+        ),
+        "{stdout}"
+    );
+}
+
+/// Put a `jj` in `shim`, ahead of the real one on `PATH`, that moves the
+/// release on `jj rebase -b` as asked, then tags the release it moved in
+/// `work`. jj's default rule pins a tagged commit, so the re-describe that
+/// follows the move refuses to rewrite it. Every other call reaches the
+/// real `jj`.
+fn install_jj_pinning_the_moved_release(
+    shim: &std::path::Path,
+    work: &std::path::Path,
+    release: &str,
+) {
+    let real = std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+        .map(|directory| directory.join("jj"))
+        .find(|candidate| candidate.is_file())
+        .expect("find jj on PATH");
+    let (real, work) = (real.display(), work.display());
+    let jj = shim.join("jj");
+    std::fs::write(
+        &jj,
+        format!(
+            "#!/bin/sh\nseen=\nfor argument in \"$@\"; do\n  if [ \"$seen\" = rebase ] && [ \
+             \"$argument\" = -b ]; then\n    '{real}' \"$@\" || exit\n    exec '{real}' \
+             --repository '{work}' tag set planted-pin -r '{release}'\n  fi\n  [ \"$argument\" \
+             = rebase ] && seen=rebase\ndone\nexec '{real}' \"$@\"\n"
+        ),
+    )
+    .expect("write the jj shim");
+    let mut permissions = std::fs::metadata(&jj)
+        .expect("read the jj shim's permissions")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&jj, permissions).expect("make the jj shim executable");
+}
+
+#[test]
+fn a_rebase_whose_re_describe_fails_after_its_move_names_a_heading_held_twice_once() {
+    // Given: a release whose parents are its members alone, so the rebase
+    // writes nothing before it moves; beta, whose changelog's one
+    // `[Unreleased]` section holds `### Added` twice; an advanced upstream;
+    // and a `jj` that tags the release once it moved it, so the re-describe
+    // after the move fails.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch(
+        "feat/beta",
+        "CHANGELOG.md",
+        "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Beta's addition.\n\n### Added\n\n\
+         - An earlier addition.\n",
+    );
+    lab.jj_work(["new", "-r", "feat/alpha", "-r", "feat/beta", "-m", release]);
+    lab.jj_work(["bookmark", "create", release, "-r", "@"]);
+    lab.jj_work(["new"]);
+    let (home, _consumer) = release_test_home(&lab);
+    lab.advance_upstream("upstream advance\n");
+    let before = release_parents(&lab, release);
+    let shim = tempfile::tempdir().expect("create the shim directory");
+    install_jj_pinning_the_moved_release(shim.path(), &lab.work, release);
+
+    // When: the rebase moves the release, and the re-describe refuses it.
+    let output = release_command(
+        &lab,
+        &home,
+        ReleaseOutput::Text,
+        &["rebase", "main@upstream"],
+    )
+    .env("PATH", path_with_gh_shim(shim.path()))
+    .output()
+    .expect("run knives release rebase");
+
+    // Then: the command exits with the failure; the release is the one the
+    // move left, on the moved members and never re-described; and one line
+    // names the file and the heading, for that release.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stderr.contains("pinned by tag planted-pin"), "{stderr}");
+    let moved = vec![commit_at(&lab, "feat/alpha"), commit_at(&lab, "feat/beta")];
+    assert_eq!(release_parents(&lab, release), moved, "{stdout}");
+    assert!(
+        moved.iter().all(|member| !before.contains(member)),
+        "{stdout}"
+    );
+    assert!(
+        !lab.revision(&lab.work, release, "description")
+            .contains("rebased onto"),
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("[Unreleased] holds").count(),
+        1,
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(
+            "  CHANGELOG.md: [Unreleased] holds `### Added` twice; knives changed no line for \
+             it; join them by hand before you push\n"
+        ),
+        "{stdout}"
+    );
+}
+
+/// Put a `jj` in `shim`, ahead of the real one on `PATH`, that moves the
+/// release on `jj rebase -b` as asked, then adds in `work` an operation
+/// concurrent with the move: made at the operation before it, it sets
+/// `release` to `elsewhere`. The next opening merges the two, so the name
+/// `release` is conflicted and a read of it fails. Every other call reaches
+/// the real `jj`.
+fn install_jj_conflicting_the_moved_name(
+    shim: &std::path::Path,
+    work: &std::path::Path,
+    release: &str,
+    elsewhere: &str,
+) {
+    let real = std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+        .map(|directory| directory.join("jj"))
+        .find(|candidate| candidate.is_file())
+        .expect("find jj on PATH");
+    let (real, work) = (real.display(), work.display());
+    let jj = shim.join("jj");
+    std::fs::write(
+        &jj,
+        format!(
+            "#!/bin/sh\nseen=\nfor argument in \"$@\"; do\n  if [ \"$seen\" = rebase ] && [ \
+             \"$argument\" = -b ]; then\n    before=$('{real}' --repository '{work}' \
+             --ignore-working-copy op log --limit 1 --no-graph -T id) || exit\n    '{real}' \
+             \"$@\" || exit\n    exec '{real}' --repository '{work}' --ignore-working-copy \
+             --at-op \"$before\" bookmark set '{release}' -r '{elsewhere}' --allow-backwards\n  \
+             fi\n  [ \"$argument\" = rebase ] && seen=rebase\ndone\nexec '{real}' \"$@\"\n"
+        ),
+    )
+    .expect("write the jj shim");
+    let mut permissions = std::fs::metadata(&jj)
+        .expect("read the jj shim's permissions")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&jj, permissions).expect("make the jj shim executable");
+}
+
+#[test]
+fn a_rebase_whose_moved_name_is_conflicted_keeps_a_pushed_release_and_names_the_moved_headings() {
+    // Given: two releases of alpha and beta, each with the trunk as its
+    // first parent, so the rebase sheds it in a write of its own before it
+    // moves; the older one pushed, which the move rewrites; beta, whose
+    // changelog's one `[Unreleased]` section holds `### Added` twice; an
+    // upstream advance that adds release notes holding `### Added` twice
+    // too, so the tree the move leaves names two files and the shed's tree
+    // names one; and a `jj` that, after the move, sets the release's name
+    // elsewhere in an operation concurrent with it, so a read of the name
+    // after the move fails.
+    let lab = Lab::new();
+    let (older_name, release) = ("release/2026-08-04", "release/2026-08-05");
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch(
+        "feat/beta",
+        "CHANGELOG.md",
+        "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Beta's addition.\n\n### Added\n\n\
+         - An earlier addition.\n",
+    );
+    lab.octopus(older_name, "feat/alpha", "feat/beta");
+    lab.push_branch(older_name);
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let older = commit_at(&lab, older_name);
+    let (home, _consumer) = release_test_home(&lab);
+    lab.upstream_trunk_file(
+        "RELEASE_NOTES.md",
+        "# Release notes\n\n## [Unreleased]\n\n### Added\n\n- A trunk note.\n\n### Added\n\n\
+         - Another trunk note.\n",
+    );
+    let shim = tempfile::tempdir().expect("create the shim directory");
+    install_jj_conflicting_the_moved_name(shim.path(), &lab.work, release, "feat/alpha");
+
+    // When: the rebase sheds the trunk parent, writing the release, moves
+    // it, and reads the release the move left.
+    let output = release_command(
+        &lab,
+        &home,
+        ReleaseOutput::Text,
+        &["rebase", "main@upstream"],
+    )
+    .env("PATH", path_with_gh_shim(shim.path()))
+    .output()
+    .expect("run knives release rebase");
+
+    // Then: the command exits with the failure; the pushed older release is
+    // back on its commit, and said so; and the headings that print are those
+    // of the tree the move left, one line for each of its two files, not
+    // those of the shed's tree.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("Name `{release}` is conflicted")),
+        "{stderr}"
+    );
+    assert_eq!(
+        commit_at(&lab, older_name),
+        older,
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "demo: {older_name} stays at {}: it is pushed or published, and a rebase moves \
+             only the release in hand and its members\n",
+            older.short()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("[Unreleased] holds").count(), 2, "{stdout}");
+    for file in ["CHANGELOG.md", "RELEASE_NOTES.md"] {
+        assert!(
+            stdout.contains(&format!(
+                "  {file}: [Unreleased] holds `### Added` twice; knives changed no line for it; \
+                 join them by hand before you push\n"
+            )),
+            "{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("could not read the release logs"),
+        "{stdout}"
     );
 }
 
@@ -1372,6 +1850,65 @@ fn a_rebase_leaves_a_pushed_older_release_where_it_was() {
         "{stdout}"
     );
     assert_eq!(copies_of(&lab, &older), Vec::<String>::new(), "{stdout}");
+}
+
+#[test]
+fn a_rebase_whose_record_fails_still_abandons_the_rebased_copy_of_a_pushed_release() {
+    // Given: two releases of alpha and beta, the older pushed, which the
+    // move rewrites; an advanced upstream; and a state file nobody can read,
+    // which the re-describe reads to name who records its event, after the
+    // move and before the cleanup of the copies the move made.
+    let lab = Lab::new();
+    let older_name = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus(older_name, "feat/alpha", "feat/beta");
+    lab.push_branch(older_name);
+    lab.octopus("release/2026-08-05", "feat/alpha", "feat/beta");
+    let older = commit_at(&lab, older_name);
+    let (home, _consumer) = release_test_home(&lab);
+    lab.advance_upstream("advance\n");
+    std::fs::write(home.path().join("state.json"), "{not json").expect("corrupt state");
+
+    // When: an anonymous terminal user rebases the release in hand.
+    let output = lab::without_harness_session(&mut release_command(
+        &lab,
+        &home,
+        ReleaseOutput::Text,
+        &["rebase", "main@upstream"],
+    ))
+    .env_remove("KNIVES_OWNER")
+    .output()
+    .expect("run knives release rebase");
+
+    // Then: the command exits with the record's failure, the pushed release
+    // keeps its commit, and the copy the move made of it is abandoned, said
+    // so, as a rebase whose record succeeds does.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stderr.contains("state.json"), "{stderr}");
+    assert_eq!(commit_at(&lab, older_name), older, "{stdout}");
+    assert_eq!(
+        copies_of(&lab, &older),
+        Vec::<String>::new(),
+        "the rebased copy of the pushed release is left visible\nstdout: {stdout}\nstderr: \
+         {stderr}"
+    );
+    let abandoned = format!(
+        ", the rebased copy of {} ({older_name}); the original keeps its name",
+        older.short()
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("demo: abandoned ") && line.ends_with(&abandoned)),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
 }
 
 #[test]

@@ -116,28 +116,19 @@ fn a_second_migration_writes_nothing_and_leaves_one_entry_per_statement() {
     // request exactly as the state file does.
     let home = legacy_home();
     std::fs::write(home.path().join("state.json"), LEGACY_STATE).expect("write state");
+    // Built from its serialized form, so it names no field a later knives
+    // adds.
+    let prose: Entry = serde_json::from_value(serde_json::json!({
+        "ts": "2026-08-15T22:14:03Z",
+        "owner": "ses_older",
+        "subject": "feat/alpha",
+        "kind": knives::ledger::Kind::Event,
+        "text": "stated as #4545",
+        "pr": 4545,
+    }))
+    .expect("build the prose event");
     Ledger::at(home.path().join("ledger").join("a-repo"))
-        .append(&Entry {
-            ts: "2026-08-15T22:14:03Z".to_owned(),
-            owner: "ses_older".to_owned(),
-            email: None,
-            subject: Some("feat/alpha".to_owned()),
-            kind: knives::ledger::Kind::Event,
-            disposition: None,
-            statement: None,
-            text: "stated as #4545".to_owned(),
-            evidence: Vec::new(),
-            anchor: None,
-            pr: Some(4545),
-            parents: Vec::new(),
-            claim_change: None,
-            claim_change_why: None,
-            previous_owner: None,
-            previous_kind: None,
-            previous_started: None,
-            previous_last_seen: None,
-            previous_why: None,
-        })
+        .append(&prose)
         .expect("append the prose event");
     lab::state_on_ledger(
         home.path(),

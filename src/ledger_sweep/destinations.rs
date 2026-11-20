@@ -197,9 +197,9 @@ fn candidates(root: &Path) -> Result<Vec<PathBuf>, SweepError> {
 /// What a git directory's own config says: `knives.machine`,
 /// `remote.origin.url`, and a line for each `knives.*` key this knives does
 /// not read.
-struct Identity {
+pub(super) struct Identity {
     machine: Option<String>,
-    origin: Option<String>,
+    pub(super) origin: Option<String>,
     ignored: Vec<String>,
 }
 
@@ -212,7 +212,7 @@ struct Identity {
 /// commits and failing there instead. Any other `knives.*` key is one a newer
 /// knives may read: it is reported and passed over, since machines sharing a
 /// ledger, and sessions on one machine, run different versions.
-fn identity(git_dir: &Path) -> Result<Identity, SweepError> {
+pub(super) fn identity(git_dir: &Path) -> Result<Identity, SweepError> {
     let mut found = Identity {
         machine: None,
         origin: None,

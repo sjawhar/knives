@@ -1140,6 +1140,7 @@ mod repeated_transition_tests {
             anchor: None,
             pr,
             parents: Vec::new(),
+            fix_files: Vec::new(),
             claim_change: None,
             claim_change_why: None,
             previous_owner: None,

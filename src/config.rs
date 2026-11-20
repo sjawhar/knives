@@ -155,9 +155,10 @@ impl fmt::Display for Role {
 /// [`crate::bind`] finds it by its remotes.
 ///
 /// `upstream` and `origin` are required by the type, so a registry missing
-/// either fails to parse rather than failing later at the first query.
+/// either fails to parse rather than failing later at the first query. A key
+/// this type does not read is not refused: [`load`] names it in a warning and
+/// ignores it, so a shared registry can carry a key a newer knives reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RepoEntry {
     pub upstream: String,
     pub origin: String,
@@ -210,9 +211,9 @@ pub struct RepoEntry {
     pub ledger: Option<String>,
     /// Named release series beside the default one, keyed by series name. The
     /// entry's own `base` is the default series; each named series has its own
-    /// base and its own dated cuts, `release/<series>/YYYY-MM-DD[.N]`, so one
-    /// fork can carry releases on two bases at once. Absent, the fork has the
-    /// default series only.
+    /// base and its own dated cuts, `release/<series>/YYYY-MM-DD[.N|-<label>]`,
+    /// so one fork can carry releases on two bases at once. Absent, the fork
+    /// has the default series only.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub series: BTreeMap<String, SeriesEntry>,
     /// The series the release verbs act on: set by [`RepoEntry::for_series`]
@@ -251,9 +252,9 @@ impl BaseRemote {
     }
 }
 
-/// One named release series: its base, and where that base lives.
+/// One named release series: its base, and where that base lives. A key this
+/// type does not read is named in a warning and ignored, as in [`RepoEntry`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SeriesEntry {
     /// The branch this series' members fork from and its cuts are measured
     /// against, as the entry's `base` is for the default series.
@@ -261,6 +262,13 @@ pub struct SeriesEntry {
     /// The remote holding `base`. Defaults to upstream.
     #[serde(default, skip_serializing_if = "BaseRemote::is_upstream")]
     pub base_remote: BaseRemote,
+    /// Whether each release of this series stacks on the one before it. With
+    /// `true`, the series' next release is one merge of its previous release
+    /// and its new members. The previous release is the first parent, and it
+    /// is never a member. Defaults to false: a release is a flat merge of its
+    /// members.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stacked: bool,
 }
 
 impl RepoEntry {
@@ -307,6 +315,12 @@ impl RepoEntry {
     fn selected(&self) -> Option<(&SeriesName, &SeriesEntry)> {
         let name = self.selected_series.as_ref()?;
         self.series.get(name.as_str()).map(|series| (name, series))
+    }
+
+    /// Whether the selected series stacks each release on the one before it
+    /// ([`SeriesEntry::stacked`]). The default series never does.
+    pub fn stacked(&self) -> bool {
+        self.selected().is_some_and(|(_, series)| series.stacked)
     }
 
     /// The remote for a role. Total: every role resolves.
@@ -374,8 +388,9 @@ impl RepoEntry {
 
     /// The dated cuts the selected series owns, which the reaper and the
     /// superseded-cut readers enumerate. A fixed entry's default series still
-    /// owns `release/YYYY-MM-DD[.N]`: those are its leftover dated cuts from
-    /// before it moved to a fixed branch, and they are reaped as on any entry.
+    /// owns `release/YYYY-MM-DD[.N|-<label>]`: those are its leftover dated
+    /// cuts from before it moved to a fixed branch, and they are reaped as on
+    /// any entry.
     pub fn dated_scheme(&self) -> ReleaseScheme {
         match self.release_scheme() {
             ReleaseScheme::Fixed(_) => ReleaseScheme::Dated,
@@ -744,38 +759,81 @@ pub fn default_config_path() -> PathBuf {
 /// The values of [`LOCAL_OVERLAY`], beside the registry, are added to the
 /// entries it names. A missing registry is an empty registry, which the
 /// commands surface explicitly rather than treating as "nothing to do".
+///
+/// An unknown key in a `[repos.<name>]` or `[repos.<name>.series.<series>]`
+/// table is ignored, and one line on standard error names it. Standard
+/// output stays the command's own, so a JSON or TOON report is still one
+/// document.
 pub fn load(path: &Path) -> Result<Registry, ConfigError> {
+    let (registry, warnings) = read_registry(path)?;
+    for warning in warnings {
+        warn_once(warning);
+    }
+    Ok(registry)
+}
+
+/// Each warning [`load`] has written in this process. `knives gh` reads the
+/// registry again after the dispatch has read it, and says each warning once.
+static WARNED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Write `warning` to standard error, once in this process. A failed write
+/// is dropped: a warning never fails a command, and a harness may have
+/// closed a hook's standard error.
+fn warn_once(warning: String) {
+    use std::io::Write as _;
+    // The path comes from the environment and the key from the file.
+    let line = format!(
+        "knives: warning: {}",
+        crate::ledger::inline_human_text(&warning)
+    );
+    if WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(warning)
+    {
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }
+}
+
+/// [`load`], with each warning it writes returned, not written: the
+/// registry's path, then the table and the unknown key it names.
+fn read_registry(path: &Path) -> Result<(Registry, Vec<String>), ConfigError> {
     if !path.exists() {
         let mut registry = Registry::default();
         apply_local_overlay(&mut registry, path)?;
-        return Ok(registry);
+        return Ok((registry, Vec::new()));
     }
     let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
         path: path.to_owned(),
         source,
     })?;
-    let mut registry: Registry = match toml::from_str(&text) {
-        Ok(registry) => registry,
-        // A deleted field or table gets a message naming its replacement,
-        // rather than serde's "unknown field"; both are named when both remain.
-        Err(source) => {
-            let raw = raw_table(&text, path)?;
-            let rejections: Vec<String> = deleted_trusted_table(&raw)
-                .into_iter()
-                .chain(deleted_path_field(&raw))
-                .collect();
-            if rejections.is_empty() {
-                return Err(ConfigError::Parse {
-                    path: path.to_owned(),
-                    source: Box::new(source),
-                });
-            }
-            return Err(ConfigError::Invalid {
-                path: path.to_owned(),
-                detail: rejections.join("; "),
-            });
-        }
-    };
+    let raw = raw_table(&text, path)?;
+    // A deleted field or table gets a message naming its replacement, not a
+    // warning or serde's "unknown field"; both are named when both remain.
+    let rejections: Vec<String> = deleted_trusted_table(&raw)
+        .into_iter()
+        .chain(deleted_path_field(&raw))
+        .collect();
+    if !rejections.is_empty() {
+        return Err(ConfigError::Invalid {
+            path: path.to_owned(),
+            detail: rejections.join("; "),
+        });
+    }
+    let warnings = unknown_entry_keys(&raw)
+        .into_iter()
+        .map(|warning| format!("{}: {warning}", path.display()))
+        .collect();
+    // The table keeps no positions, so a failed read is read again from the
+    // text, where serde's error names the line.
+    let mut registry: Registry = toml::Value::Table(raw)
+        .try_into()
+        .or_else(|_| toml::from_str(&text))
+        .map_err(|source| ConfigError::Parse {
+            path: path.to_owned(),
+            source: Box::new(source),
+        })?;
     for (name, entry) in &registry.repos {
         // A fork whose upstream is a filesystem path is kept under its key.
         if !crate::ledger::is_ledger_component(name) {
@@ -827,7 +885,7 @@ pub fn load(path: &Path) -> Result<Registry, ConfigError> {
     for root in &mut registry.trust.roots {
         *root = expand_registry_path(root, &config_home);
     }
-    Ok(registry)
+    Ok((registry, warnings))
 }
 
 /// The file beside the registry that holds the values a shared registry should
@@ -1018,19 +1076,21 @@ fn checked_series(entry: &RepoEntry, path: &Path) -> Result<(), ConfigError> {
         if name.contains('/') || crate::ids::BranchName::parse(name).is_err() {
             return Err(invalid(format!(
                 "series {name:?} is not one branch-name segment; its cuts are named \
-                 {}{name}/YYYY-MM-DD[.N]",
-                crate::ids::RELEASE_PREFIX
+                 {}{name}/{}",
+                crate::ids::RELEASE_PREFIX,
+                crate::ids::CUT_GRAMMAR
             )));
         }
-        if let Some(why) = ref_segment_flaw(name) {
+        if let Some(why) = crate::ids::ref_segment_flaw(name) {
             return Err(invalid(format!(
                 "series {name:?} cannot name a git ref ({why}); its cuts are named \
-                 {}{name}/YYYY-MM-DD[.N]",
-                crate::ids::RELEASE_PREFIX
+                 {}{name}/{}",
+                crate::ids::RELEASE_PREFIX,
+                crate::ids::CUT_GRAMMAR
             )));
         }
         if crate::ids::ReleaseScheme::Dated
-            .dated_cut(&format!("{}{name}", crate::ids::RELEASE_PREFIX))
+            .cut_key(&format!("{}{name}", crate::ids::RELEASE_PREFIX))
             .is_some()
         {
             return Err(invalid(format!(
@@ -1062,42 +1122,6 @@ fn checked_series(entry: &RepoEntry, path: &Path) -> Result<(), ConfigError> {
         }
     }
     Ok(())
-}
-
-/// Why `segment` cannot be one component of a git ref, by git's
-/// `check-ref-format` rules; `None` when it can.
-fn ref_segment_flaw(segment: &str) -> Option<&'static str> {
-    if segment.starts_with('.') {
-        return Some("it starts with '.'");
-    }
-    if segment.ends_with('.') {
-        return Some("it ends with '.'");
-    }
-    if segment.strip_suffix(".lock").is_some() {
-        return Some("it ends with '.lock'");
-    }
-    if segment.contains("..") {
-        return Some("it contains '..'");
-    }
-    if segment.contains("@{") {
-        return Some("it contains '@{'");
-    }
-    if segment == "@" {
-        return Some("it is '@'");
-    }
-    if segment
-        .chars()
-        .any(|c| c.is_ascii_control() || c == '\u{7f}')
-    {
-        return Some("it contains a control character");
-    }
-    if segment
-        .chars()
-        .any(|c| matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
-    {
-        return Some("it contains one of space ~ ^ : ? * [ \\");
-    }
-    None
 }
 
 /// A `ledger` names a repository, so it is `<owner>/<name>`, before and after
@@ -1195,8 +1219,9 @@ fn checked_forbidden(name: &str, terms: &[String], path: &Path) -> Result<(), Co
     Ok(())
 }
 
-/// The registry as a plain TOML table, for the checks that name a deleted field
-/// or table where serde only says "unknown field".
+/// The registry as a plain TOML table: for the checks that name a deleted
+/// field or table where serde only says "unknown field", and for the keys an
+/// entry's type does not read ([`unknown_entry_keys`]).
 fn raw_table(text: &str, path: &Path) -> Result<toml::Table, ConfigError> {
     toml::from_str(text).map_err(|source| ConfigError::Parse {
         path: path.to_owned(),
@@ -1243,6 +1268,105 @@ fn deleted_path_field(raw: &toml::Table) -> Option<String> {
              by their remotes"
         )
     })
+}
+
+/// The warning for each key of a `[repos.<name>]` table, and of each of its
+/// `[repos.<name>.series.<series>]` tables, that the entry's type does not
+/// read. Such a key is ignored, not refused: a shared registry can carry a key
+/// that only a newer knives reads, and a machine that runs an older knives
+/// must still read the entry. Every other table of the registry, and every
+/// table of [`LOCAL_OVERLAY`], refuses an unknown key.
+fn unknown_entry_keys(raw: &toml::Table) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (name, entry) in subtables(raw.get("repos")) {
+        let name = header_key(name);
+        for key in unknown_keys::<RepoEntry>(entry) {
+            warnings.push(format!(
+                "[repos.{name}] has an unknown key {key}; it is ignored"
+            ));
+        }
+        for (series, table) in subtables(entry.get("series")) {
+            let series = header_key(series);
+            for key in unknown_keys::<SeriesEntry>(table) {
+                warnings.push(format!(
+                    "[repos.{name}.series.{series}] has an unknown key {key}; it is ignored"
+                ));
+            }
+        }
+    }
+    warnings
+}
+
+/// `key` as TOML writes it in a table header: bare when it holds only
+/// `A-Za-z0-9_-`, else quoted, so a series `9.2` reads as one key, not two.
+fn header_key(key: &str) -> std::borrow::Cow<'_, str> {
+    if !key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        std::borrow::Cow::Borrowed(key)
+    } else {
+        std::borrow::Cow::Owned(toml::Value::String(key.to_owned()).to_string())
+    }
+}
+
+/// Each value of the table `value` that is itself a table, with its key. A
+/// value of another type is the typed read's to refuse.
+fn subtables(value: Option<&toml::Value>) -> impl Iterator<Item = (&String, &toml::Table)> {
+    value
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, value)| value.as_table().map(|table| (key, table)))
+}
+
+/// The keys of `table` that the struct `T` does not read.
+fn unknown_keys<T: serde::de::DeserializeOwned>(
+    table: &toml::Table,
+) -> impl Iterator<Item = &String> {
+    let known = struct_keys::<T>();
+    table
+        .keys()
+        .filter(move |key| !known.contains(&key.as_str()))
+}
+
+/// The keys the struct `T` reads: the names its derived `Deserialize` hands
+/// to `deserialize_struct`, where a skipped field has none. Read from the type
+/// itself, so the list cannot drift from the fields.
+fn struct_keys<T: serde::de::DeserializeOwned>() -> &'static [&'static str] {
+    let mut probe = KeyProbe(&[]);
+    // The probe refuses every read; only the field list it is handed counts.
+    let _refused = T::deserialize(&mut probe);
+    probe.0
+}
+
+/// A deserializer that reads nothing and keeps the field names a struct's
+/// `Deserialize` asks it for ([`struct_keys`]).
+struct KeyProbe(&'static [&'static str]);
+
+impl<'de> serde::Deserializer<'de> for &mut KeyProbe {
+    type Error = serde::de::value::Error;
+
+    fn deserialize_any<V: serde::de::Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
+        Err(serde::de::Error::custom("the key probe reads no value"))
+    }
+
+    fn deserialize_struct<V: serde::de::Visitor<'de>>(
+        self,
+        _: &'static str,
+        fields: &'static [&'static str],
+        _: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.0 = fields;
+        Err(serde::de::Error::custom("the key probe reads no value"))
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple
+        tuple_struct map enum identifier ignored_any
+    }
 }
 
 /// Identity is the `upstream` remote, so two entries naming one repository
@@ -1961,19 +2085,40 @@ release = "https://example.invalid/releases.git"
     }
 
     #[test]
-    fn an_unknown_field_or_table_is_refused_by_name() {
-        // `deny_unknown_fields` on every table: a misspelt key would otherwise
-        // silently mean its default.
+    fn an_unknown_entry_or_series_key_warns_and_any_other_unknown_key_is_refused() {
+        // An entry or a series table names a key it does not read and ignores
+        // it, so a shared registry can carry a key only a newer knives reads.
+        // The warning quotes a series name that is not a bare TOML key, so it
+        // names the table the file has. Every other table keeps
+        // `deny_unknown_fields`: a misspelt key would otherwise silently mean
+        // its default.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("repos.toml");
         std::fs::write(
             &path,
-            "[repos.x]\nupstream = \"u\"\norigin = \"o\"\nreleas = \"r\"\n",
+            "[repos.x]\nupstream = \"u\"\norigin = \"o\"\nreleas = \"r\"\n\n\
+             [repos.x.series.\"9.2\"]\nbase = \"old\"\nstacked2 = true\n",
         )
         .unwrap();
-        let error = load(&path).unwrap_err().to_string();
-        assert!(error.contains("unknown field"), "{error}");
-        assert!(error.contains("releas"), "{error}");
+        let (registry, warnings) = read_registry(&path).unwrap();
+        let entry = &registry.repos["x"];
+        assert_eq!(entry.release, None);
+        assert_eq!(entry.series["9.2"].base, "old");
+        assert!(!entry.series["9.2"].stacked);
+        assert_eq!(
+            warnings,
+            [
+                format!(
+                    "{}: [repos.x] has an unknown key releas; it is ignored",
+                    path.display()
+                ),
+                format!(
+                    "{}: [repos.x.series.\"9.2\"] has an unknown key stacked2; it is ignored",
+                    path.display()
+                ),
+            ]
+        );
+        assert_eq!(load(&path).unwrap(), registry);
 
         std::fs::write(&path, "[trust]\nrepo = [\"a/b\"]\n").unwrap();
         let error = load(&path).unwrap_err().to_string();
@@ -1984,6 +2129,40 @@ release = "https://example.invalid/releases.git"
         let error = load(&path).unwrap_err().to_string();
         assert!(error.contains("unknown field"), "{error}");
         assert!(error.contains("bogus"), "{error}");
+    }
+
+    #[test]
+    fn a_series_reads_its_stacked_key_and_defaults_it_to_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "[repos.x]\nupstream = \"u\"\norigin = \"o\"\n\n\
+             [repos.x.series.on]\nbase = \"on\"\nstacked = true\n\n\
+             [repos.x.series.off]\nbase = \"off\"\n",
+        );
+        let (registry, warnings) = read_registry(&path).unwrap();
+        assert!(registry.repos["x"].series["on"].stacked);
+        assert!(!registry.repos["x"].series["off"].stacked);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_registry_that_sets_every_entry_and_series_key_warns_of_none() {
+        // The known keys are read from the types; a key they do not list
+        // would be warned of as unknown although knives reads it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "[repos.x]\nupstream = \"https://forge.example/org/x\"\norigin = \"o\"\n\
+             base = \"dev\"\nrelease = \"r\"\ntest_count_command = \"true\"\n\
+             consumers = [\"org/consumer\"]\nworkspaces = \"/w\"\nforbidden = [\"term\"]\n\
+             ledger = \"org/ledger\"\n\n\
+             [repos.x.series.old]\nbase = \"old\"\nbase_remote = \"origin\"\nstacked = true\n\n\
+             [repos.y]\nupstream = \"https://forge.example/org/y\"\norigin = \"o\"\n\
+             release_branch = \"integration\"\n",
+        );
+        let (_, warnings) = read_registry(&path).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]

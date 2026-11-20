@@ -31,7 +31,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::REMOTE;
-use super::destinations::ledger_repositories;
+use super::destinations::{identity, ledger_repositories};
 use crate::config::Registry;
 use crate::ids::UpstreamName;
 
@@ -92,7 +92,11 @@ pub(super) fn join_unreached<'a>(
 /// its origin's else its upstream's, and it commits as `name`, or as another
 /// name when the remote already holds that one and it is not this session's
 /// own ([`make`]). Nothing is made where something already stands at its
-/// path, or when the remote cannot be asked: the next command that routes
+/// path. A git directory there whose origin is `ledger` is another
+/// command's join, as when [`make`] loses its rename: `None`. One whose
+/// origin is another repository is why ([`occupied`]), and one whose config
+/// cannot be read gives that read's error ([`identity`]). Nothing is made
+/// either when the remote cannot be asked: the next command that routes
 /// `ledger` tries again.
 #[allow(
     clippy::too_many_arguments,
@@ -110,7 +114,17 @@ fn join(
         &std::path::absolute(root).map_err(|error| format!("{}: {error}", root.display()))?;
     let git_dir = joined_git_dir(root, ledger);
     if git_dir.symlink_metadata().is_ok() {
-        return Err(occupied(root, ledger));
+        let joined = identity(&git_dir)
+            .map_err(|error| error.to_string())?
+            .origin
+            .as_deref()
+            .and_then(crate::remote_url::remote_slug)
+            .is_some_and(|slug| crate::config::repository_slug(slug) == ledger);
+        return if joined {
+            Ok(None)
+        } else {
+            Err(occupied(root, ledger))
+        };
     }
     let url = registry
         .repos

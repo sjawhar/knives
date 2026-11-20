@@ -8,10 +8,10 @@
 //! Every write leaves a conflict of only added release-log sections resolved
 //! as their union, and refuses while the release in hand carries a change
 //! knives did not write or adopt, printing the steps that record it. Every one
-//! of them writes locally only, and none of them pushes.
-// allow: SIZE_OK: 4044 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
+//! of them writes the release locally only, and none of them pushes it.
+// allow: SIZE_OK: 5673 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::bind::Fork;
@@ -21,20 +21,23 @@ use crate::consumer_pins::{
     ConsumerHeadMemo, ConsumerPinSource, scan_consumer_for, scan_consumer_slug_with_heads,
 };
 use crate::detect::{
-    BookmarkTips, Finding, FindingKind, RebaseOutcome, ReleaseParent, Subject, stale_parents,
+    BookmarkTips, Finding, FindingKind, RebaseOutcome, ReleaseParent, Subject, release_parents,
+    stale_parents,
 };
 use crate::ids::{
-    BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, is_our_dated_cut, is_our_release,
-    is_release_name,
+    BookmarkRef, BranchName, ChangeId, CommitId, ReleaseScheme, RemoteName, is_our_dated_cut,
+    is_our_release, is_release_name,
 };
 use crate::jj::{self, Repo};
 use crate::ledger::{Entry, Kind, Ledger, RecordedParent};
 use crate::pins::{Pin, PinKind};
 use crate::release_model::{
-    BranchSuccessions, EarlierWrites, MemberEvidence, MemberHistory, MemberSuccession, RecordedCut,
-    RecordedWrite, StackedHistoryContext, carried_from_tips, double_cut_findings,
+    BranchSuccessions, CompositionBaseline, EarlierWrites, MemberEvidence, MemberHistory,
+    MemberSuccession, PreviousRelease, RecordedWrite, ReleaseReading, SeriesWrite,
+    StackedHistoryContext, UnexplainedCommit, carried_from_tips, double_cut_findings,
     last_recorded_parents, matched_write, member_history, member_parents, newest_release,
-    recorded_release_changes, release_refs_by_commit, repo_slug, trunk_positions,
+    on_first_parent_line, previous_release_label, read_release, recorded_release_changes,
+    release_refs_by_commit, repo_slug, trunk_positions, trunk_positions_in, with_commit,
 };
 
 /// Registered forge consumers and explicitly requested local checkout scans.
@@ -249,40 +252,72 @@ fn published_note(ledger: &[Entry], release: &str, commits: &[&CommitId]) -> Opt
     recorded.map(|commit| format!("a record: published note names {}", commit.short()))
 }
 
-/// `name`, unless it is a series' own prefix, such as `release/9.2` on an entry
-/// with series 9.2: git cannot hold that ref beside `release/9.2/<date>`.
-pub fn clear_of_series_prefixes(entry: &RepoEntry, name: String) -> Result<String, String> {
-    match entry
+/// Refuse `name` when it is a series' own prefix, such as `release/9.2` on an
+/// entry with series 9.2: git cannot hold that ref beside `release/9.2/<date>`.
+pub fn clear_of_series_prefixes(entry: &RepoEntry, name: &str) -> Result<(), String> {
+    entry
         .series
         .keys()
         .find(|series| name == format!("{}{series}", crate::ids::RELEASE_PREFIX))
-    {
-        Some(series) => Err(format!(
-            "{name} is the prefix of series {series}'s cuts ({name}/YYYY-MM-DD[.N]); git cannot \
-             hold both, so name the cut by date"
-        )),
-        None => Ok(name),
-    }
+        .map_or(Ok(()), |series| {
+            Err(format!(
+                "{name} is the prefix of series {series}'s cuts ({name}/{}); git cannot \
+                 hold both, so name the cut by date",
+                crate::ids::CUT_GRAMMAR
+            ))
+        })
 }
 
 /// The name a cut takes.
 ///
-/// A dated name must be one this series owns: a name another series owns,
-/// such as `release/9.2/<date>` cut from the default series, would be that
-/// series' newest cut, carrying this series' members.
+/// A dated name must be one this series owns and one the series' order can
+/// read ([`ReleaseScheme::cut_key`]). A name another series owns, such as
+/// `release/9.2/<date>` cut from the default series, would be that series'
+/// newest cut, carrying this series' members. A name the series owns but the
+/// order cannot read, such as `release/9.2/foo`, has no place in the order:
+/// it would never be the newest cut, and the reap would never take it. A
+/// label git cannot hold in a ref, such as `-x~1`, is one of those, and the
+/// refusal says why ([`ReleaseScheme::ref_flaw`]): no ref could publish it.
 pub fn cut_name(scheme: &ReleaseScheme, requested: Option<&str>) -> Result<String, String> {
+    let example = || {
+        scheme
+            .cut_shape()
+            .replace(crate::ids::CUT_GRAMMAR, "2026-08-03")
+    };
     match (scheme, requested) {
-        (ReleaseScheme::Dated | ReleaseScheme::Series(_), Some(name)) if scheme.owns(name) => {
+        (ReleaseScheme::Dated | ReleaseScheme::Series(_), Some(name))
+            if scheme.cut_key(name).is_some() =>
+        {
             Ok(name.to_owned())
+        }
+        (ReleaseScheme::Dated | ReleaseScheme::Series(_), Some(name)) if scheme.owns(name) => {
+            Err(scheme.ref_flaw(name).map_or_else(
+                || {
+                    format!(
+                        "{name} is not a name this series can sort; its cuts are named {}, \
+                         where the date is followed by nothing, by `.N` or by `-<label>`, e.g. {}",
+                        scheme.cut_shape(),
+                        example()
+                    )
+                },
+                |why| {
+                    format!(
+                        "{name} cannot name a git ref ({why}); its cuts are named {}, where a \
+                         `-<label>` holds nothing git refuses in a ref name, e.g. {}",
+                        scheme.cut_shape(),
+                        example()
+                    )
+                },
+            ))
         }
         (ReleaseScheme::Dated | ReleaseScheme::Series(_), Some(name)) => Err(format!(
             "{name} is not a cut of this series; its cuts are named {}, e.g. {}",
             scheme.cut_shape(),
-            scheme.cut_shape().replace("YYYY-MM-DD[.N]", "2026-08-03")
+            example()
         )),
         (ReleaseScheme::Dated | ReleaseScheme::Series(_), None) => Err(format!(
             "a dated release cut needs a name, e.g. {}",
-            scheme.cut_shape().replace("YYYY-MM-DD[.N]", "2026-08-03")
+            example()
         )),
         (ReleaseScheme::Fixed(fixed), Some(name)) if name != fixed.as_str() => Err(format!(
             "this repo cuts the fixed release branch {fixed}; drop the name or use {fixed}"
@@ -347,6 +382,29 @@ mod scheme_tests {
         assert!(cut_name(&dated, Some("release/9.2/2026-10-21")).is_err());
         let error = cut_name(&old, None).unwrap_err();
         assert!(error.contains("release/9.2/2026-08-03"), "{error}");
+        // A name the series owns but its order cannot read is refused with
+        // the grammar: it would never be the newest cut, nor ever be reaped.
+        for name in ["release/9.2/foo", "release/9.2/2026-10-21.1.2"] {
+            let error = cut_name(&old, Some(name)).unwrap_err();
+            assert!(
+                error.contains("release/9.2/YYYY-MM-DD[.N|-<label>]")
+                    && error.contains("`-<label>`"),
+                "{name}: {error}"
+            );
+        }
+        // A label git cannot hold in a ref is refused with the grammar and
+        // the rule it breaks: no ref could ever publish it.
+        let error = cut_name(&old, Some("release/9.2/2026-10-21-x~1")).unwrap_err();
+        assert!(
+            error.contains("cannot name a git ref (it contains one of space ~ ^ : ? * [ \\)")
+                && error.contains("release/9.2/YYYY-MM-DD[.N|-<label>]"),
+            "{error}"
+        );
+        // A label is a name of the series: the 9.2 line of the prover fork.
+        assert_eq!(
+            cut_name(&old, Some("release/9.2/2026-11-15-speed-8.0.9")).unwrap(),
+            "release/9.2/2026-11-15-speed-8.0.9"
+        );
     }
 }
 
@@ -362,9 +420,13 @@ pub struct Plan {
     pub published: Option<CommitId>,
     pub parents: Vec<(CommitId, Vec<String>)>,
     /// The parents that are earlier writes of the release, never members
-    /// ([`crate::release_model::carriers`]): listed among `parents`,
-    /// labelled, and read by no member check.
+    /// ([`crate::release_model::EarlierWrites::carriers`]): listed among
+    /// `parents`, labelled, and read by no member check.
     pub carriers: Vec<CommitId>,
+    /// The previous release a release of a stacked series stacks on
+    /// ([`crate::release_model::read_release`]): listed first among
+    /// `parents`, labelled, and never a member.
+    pub previous: Option<PreviousRelease>,
     pub stale: Vec<Finding>,
     pub pins: Vec<Pin>,
     /// A consumer could not be consulted, so `pins` may lack the pin that
@@ -379,34 +441,69 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Read which of `release`'s `parents` are carriers into
-    /// [`Plan::carriers`], from `ledger` and [`Plan::published`]; the
-    /// parents without them, which every member check reads.
+    /// The release's parent list as the plan shows it, and its members, the
+    /// parents every member check reads. `None` when the stacked reading
+    /// refuses the release: that is one of the plan's problems, and the
+    /// list is the release's parents.
     ///
-    /// A carrier is an earlier write of the release a fast-forward push gave
-    /// it, never a member: no member check reads it, and the parent list
-    /// labels it.
-    fn read_carriers(
+    /// The release reads as its series reads it ([`release_reading`]), its
+    /// carriers read into [`Plan::carriers`] from `ledger` and
+    /// [`Plan::published`]. A carrier is an earlier write of the release a
+    /// fast-forward push gave it, never a member: no member check reads it,
+    /// and the parent list labels it. A release of a stacked series that has
+    /// a previous release lists that release first ([`Plan::previous`]),
+    /// then its members and its carriers. Any other release lists its
+    /// parents, its carriers among them.
+    fn read_parents(
         &mut self,
-        repo: &Repo,
-        (release, parents): (&str, &[ReleaseParent]),
-        ledger: &[Entry],
-    ) -> anyhow::Result<Vec<ReleaseParent>> {
-        let commits: Vec<CommitId> = parents.iter().map(|parent| parent.commit.clone()).collect();
-        let (carriers, members) =
-            EarlierWrites::read(repo, release, ledger, self.published.as_ref())?
-                .partition(&commits);
-        self.carriers = carriers;
-        Ok(parents
-            .iter()
-            .filter(|parent| members.contains(&parent.commit))
-            .cloned()
-            .collect())
+        (repo, entry): (&Repo, &RepoEntry),
+        (ledger, tips): (&[Entry], &BookmarkTips),
+        (reference, commit): (&BookmarkRef, &CommitId),
+    ) -> anyhow::Result<Option<(Vec<ReleaseParent>, Vec<ReleaseParent>)>> {
+        let release = reference.branch().as_str();
+        let writes = EarlierWrites::read(repo, release, ledger, self.published.as_ref())?;
+        match release_reading(repo, entry, (ledger, tips), (&writes, commit))? {
+            Ok(reading) if reading.previous.is_none() => {
+                let parents = repo.parents_of(commit.as_str())?;
+                let members = parents
+                    .iter()
+                    .filter(|parent| reading.members.contains(&parent.commit))
+                    .cloned()
+                    .collect();
+                self.carriers = reading.carriers;
+                Ok(Some((parents, members)))
+            }
+            Ok(reading) => {
+                let mut listed = reading.composition();
+                listed.extend(reading.carriers.iter().cloned());
+                let members = release_parents(tips, &reading.members);
+                self.carriers = reading.carriers;
+                self.previous = reading.previous;
+                Ok(Some((release_parents(tips, &listed), members)))
+            }
+            Err(unexplained) => {
+                self.problems.push(format!("{reference}: {unexplained}"));
+                self.list_parents(repo.parents_of(commit.as_str())?);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Set [`Plan::parents`] from `parents`, each with the bookmarks on it.
+    fn list_parents(&mut self, parents: Vec<ReleaseParent>) {
+        self.parents = parents
+            .into_iter()
+            .map(|parent| {
+                let names = parent.bookmarks.iter().map(ToString::to_string).collect();
+                (parent.commit, names)
+            })
+            .collect();
     }
 
     /// The plan's parent list, one line per parent with what holds it, a
-    /// carrier of `release` labelled as one. Bookmarks are names read from
-    /// the repository, so each is escaped.
+    /// carrier of `release` and the previous release of a stacked one
+    /// labelled as such. Bookmarks are names read from the repository, so
+    /// each is escaped.
     fn parent_lines(&self, release: &str) -> Vec<String> {
         use crate::ledger::inline_human_text;
         let label =
@@ -419,15 +516,24 @@ impl Plan {
                 } else {
                     inline_human_text(&names.join(", "))
                 };
-                if self.carriers.contains(commit) {
-                    format!(
-                        "    {}  {} ({held})",
-                        commit.short(),
-                        inline_human_text(&label)
-                    )
-                } else {
-                    format!("    {}  {held}", commit.short())
-                }
+                let previous = self
+                    .previous
+                    .as_ref()
+                    .filter(|previous| previous.commit == *commit)
+                    .map(|previous| previous_release_label(&previous.name));
+                let tag = previous
+                    .as_deref()
+                    .or_else(|| self.carriers.contains(commit).then_some(label.as_str()));
+                tag.map_or_else(
+                    || format!("    {}  {held}", commit.short()),
+                    |tag| {
+                        format!(
+                            "    {}  {} ({held})",
+                            commit.short(),
+                            inline_human_text(tag)
+                        )
+                    },
+                )
             })
             .collect()
     }
@@ -631,9 +737,11 @@ pub fn superseded_cuts_of_every_series(
 /// Superseded means "not the newest dated name of this series voted by a
 /// local, `origin`, or `release` ref". The broader output excludes `upstream`
 /// and jj's `git` tracking view, but keeps historical refs on every other
-/// remote for cleanup. [`ReleaseScheme::dated_cut`] keeps upstream-style
+/// remote for cleanup. [`ReleaseScheme::cut_key`] keeps upstream-style
 /// semver names out even on our remotes, and keeps every other series' cuts
-/// out: each series' newest cut is live whatever the others' dates.
+/// out: each series' newest cut is live whatever the others' dates. A name
+/// this series owns but its order cannot read has no key, so the reap never
+/// takes it.
 pub fn superseded_dated_releases(
     tips: &BookmarkTips,
     scheme: &ReleaseScheme,
@@ -644,7 +752,7 @@ pub fn superseded_dated_releases(
         // The vote is an allowlist, so someone else's cut cannot reap ours;
         // output remains broader to clean up our historical odd-remote refs.
         .filter(|reference| is_our_release(reference, scheme, publish_remote))
-        .filter_map(|reference| scheme.dated_cut(reference.branch().as_str()))
+        .filter_map(|reference| scheme.cut_key(reference.branch().as_str()))
         .max();
     let Some(newest) = newest else {
         return Vec::new();
@@ -654,7 +762,7 @@ pub fn superseded_dated_releases(
         .filter(|(reference, _)| {
             ours_to_reap(reference)
                 && scheme
-                    .dated_cut(reference.branch().as_str())
+                    .cut_key(reference.branch().as_str())
                     .is_some_and(|parsed| parsed != newest)
         })
         .map(|(reference, commit)| (reference.clone(), commit.clone()))
@@ -663,6 +771,23 @@ pub fn superseded_dated_releases(
     // variant-major and would interleave names.
     found.sort_by(|(a, _), (b, _)| (a.branch(), a).cmp(&(b.branch(), b)));
     found
+}
+
+/// Each superseded dated cut's name ([`superseded_dated_releases`]) with the
+/// commits its refs name, each once, in ref order.
+fn superseded_by_name(
+    tips: &BookmarkTips,
+    scheme: &ReleaseScheme,
+    publish_remote: &str,
+) -> std::collections::BTreeMap<String, Vec<CommitId>> {
+    let mut by_name = std::collections::BTreeMap::<String, Vec<CommitId>>::default();
+    for (reference, commit) in superseded_dated_releases(tips, scheme, publish_remote) {
+        let targets = by_name.entry(reference.branch().to_string()).or_default();
+        if !targets.contains(&commit) {
+            targets.push(commit);
+        }
+    }
+    by_name
 }
 
 #[derive(Debug)]
@@ -675,8 +800,10 @@ pub struct ReapReport {
     /// outside the enumeration — a tag, an untracked remote bookmark, a local
     /// bookmark of another name — so it is not abandoned. The expected outcome
     /// for a tagged or retained release, not a failure: the name is gone and
-    /// the commit stays reachable by its pin. Nothing else lands here; an
-    /// abandon that failed for another reason is a note.
+    /// the commit stays reachable by its pin. In a stacked series the reap
+    /// also puts here each name the live release descends from
+    /// ([`forget_superseded_ancestors`]). Nothing else lands here; an abandon
+    /// that failed for another reason is a note.
     pub forgotten_only: Vec<(String, String)>,
     /// (name, reason) pairs that were deliberately left alone.
     pub kept: Vec<(String, String)>,
@@ -730,13 +857,7 @@ pub fn reap_superseded(
 ) -> anyhow::Result<ReapReport> {
     let repo_path = repo.path();
     let tips = repo.bookmark_tips()?;
-    let mut by_name = std::collections::BTreeMap::<String, Vec<CommitId>>::default();
-    for (reference, commit) in superseded_dated_releases(&tips, scheme, publish_remote) {
-        let targets = by_name.entry(reference.branch().to_string()).or_default();
-        if !targets.contains(&commit) {
-            targets.push(commit);
-        }
-    }
+    let by_name = superseded_by_name(&tips, scheme, publish_remote);
     if !by_name.is_empty()
         && let Some((live, commit)) = live_dated_release(&tips, scheme, publish_remote)
         && !crate::jj::conflicted_files(repo_path, commit.as_str())?.is_empty()
@@ -852,6 +973,49 @@ fn what_keeps_a_name(
     Ok(None)
 }
 
+/// Reap each superseded dated cut of a stacked series that the live release
+/// descends from, and abandon nothing.
+///
+/// Its refs are forgotten locally and on tracking remotes, as ONE operation.
+/// Each name comes back with why its commit stays: `<live> descends from it`.
+///
+/// Each release of a stacked series is one merge of the previous release
+/// and its new members, so the live release carries every earlier release
+/// on its first-parent line. Their commits stay reachable from it, and
+/// abandoning one would rewrite the live release itself; only the names go.
+/// A name with a ref at a commit the live release does not descend from is
+/// left to [`reap_superseded`], whose rules keep it when something rests on
+/// it. Like that reap, this touches no remote.
+pub fn forget_superseded_ancestors(
+    repo: &Repo,
+    scheme: &ReleaseScheme,
+    publish_remote: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let tips = repo.bookmark_tips()?;
+    let Some((live, live_commit)) = live_dated_release(&tips, scheme, publish_remote) else {
+        return Ok(Vec::new());
+    };
+    let by_name = superseded_by_name(&tips, scheme, publish_remote);
+    let mut names = Vec::new();
+    'names: for (name, targets) in by_name {
+        for target in &targets {
+            if !repo.is_ancestor(target, &live_commit)? {
+                continue 'names;
+            }
+        }
+        names.push(name);
+    }
+    crate::jj::forget_bookmarks(
+        repo.path(),
+        &names,
+        &format!("knives: reap {}", names.join(", ")),
+    )?;
+    Ok(names
+        .into_iter()
+        .map(|name| (name, format!("{live} descends from it")))
+        .collect())
+}
+
 /// The commits the ledger records knives writing under `name` that this
 /// repository holds, with every visible rewrite of each.
 ///
@@ -894,6 +1058,9 @@ pub struct InHand<'a> {
     pub writes: &'a EarlierWrites,
     /// The publish remote's commit of the name, as the caller reads that ref.
     pub published: Option<&'a CommitId>,
+    /// Every bookmark the caller read, which a stacked series reads the
+    /// release with ([`release_reading`]).
+    pub tips: &'a BookmarkTips,
 }
 
 /// How a release's commit in hand stands to the writes the ledger records
@@ -903,12 +1070,20 @@ pub enum InHandWrite {
     /// It holds no change of its own that knives did not write or adopt: it
     /// is a recorded write, or one re-signed or metaedited
     /// ([`Repo::is_metadata_rewrite`]), or its tree is the matched write
-    /// rebased onto its members ([`Repo::holds_rebased_write`]).
+    /// rebased onto its previous release, where it has one, and its members
+    /// ([`Repo::holds_rebased_write`]).
     Recorded,
     /// It carries a change no knives write or adopt recorded: its tree is not
     /// `write`, the matched write ([`matched_write`]), rebased onto its
-    /// members. Every write refuses it until `adopt` records it.
-    Unrecorded { write: RecordedWrite },
+    /// previous release, where it has one, and its members. Every write
+    /// refuses it until `adopt` records it.
+    Unrecorded {
+        write: RecordedWrite,
+        /// Whether the release has a previous release it was measured
+        /// with: a stacked release that has one, read once with its members
+        /// ([`release_reading`]).
+        onto_previous: bool,
+    },
     /// Nothing here can measure the release against the writes the ledger
     /// records of its name ([`Unchecked`]). A write over it proceeds and says
     /// so, except over a release whose every parent is an earlier write
@@ -1003,14 +1178,19 @@ pub fn unchecked_suffix(standing: &InHandWrite) -> String {
 /// `jj metaedit` re-signs it, none of which is a hand edit. Where the matched
 /// write is not here, or no recorded write has the release's members, there
 /// is nothing to build the tree from, so the release is unchecked and a write
-/// proceeds as it always has, saying so.
-pub fn in_hand_write(release: &InHand<'_>) -> Result<InHandWrite, crate::jj::JjError> {
+/// proceeds as it always has, saying so. The members a write is matched by
+/// are the release's reading in `entry`'s series ([`release_reading`]).
+pub fn in_hand_write(
+    release: &InHand<'_>,
+    entry: &RepoEntry,
+) -> Result<InHandWrite, crate::jj::JjError> {
     let InHand {
         repo,
         ledger,
         name,
         commit,
         writes,
+        tips,
         ..
     } = *release;
     let mut any = false;
@@ -1020,12 +1200,15 @@ pub fn in_hand_write(release: &InHand<'_>) -> Result<InHandWrite, crate::jj::JjE
             return Ok(unless_marked(event, write, InHandWrite::Recorded));
         }
     }
-    let parents = repo.parent_commits(commit.as_str())?;
-    let (_, members) = writes.partition(&parents);
     // A release whose every parent is a carrier has no member to compose
     // from, so the in-between commit a write builds never stands on no
-    // parent, whether or not the ledger records a write of the name.
-    if let (Some(into), true) = (parents.first(), members.is_empty()) {
+    // parent, whether or not the ledger records a write of the name. The
+    // parents are the commit's own: a stacked release that only starts on
+    // its previous release has that release as its one parent, no carrier.
+    let parents = repo.parent_commits(commit.as_str())?;
+    if let Some(into) = parents.first()
+        && parents.iter().all(|parent| writes.contains(parent))
+    {
         return Ok(InHandWrite::Unchecked(Unchecked::NoMatch(
             NoMatch::AllCarriers {
                 into: into.clone(),
@@ -1036,7 +1219,14 @@ pub fn in_hand_write(release: &InHand<'_>) -> Result<InHandWrite, crate::jj::JjE
     if !any {
         return Ok(InHandWrite::NoRecord);
     }
-    let Some(matched) = matched_write(repo, (ledger, name), writes, &members)? else {
+    // The members a recorded write is matched by are the release's reading:
+    // in a stacked series the side parents on its first-parent line, never
+    // its previous release. A release the reading refuses has no members to
+    // match.
+    let Ok(reading) = release_reading(repo, entry, (ledger, tips), (writes, commit))? else {
+        return Ok(InHandWrite::Unchecked(Unchecked::NoMatch(NoMatch::Members)));
+    };
+    let Some(matched) = matched_write(repo, (ledger, name), writes, &reading.members)? else {
         return Ok(InHandWrite::Unchecked(Unchecked::NoMatch(NoMatch::Members)));
     };
     // A write made on another machine and never fetched is not held here,
@@ -1054,17 +1244,77 @@ pub fn in_hand_write(release: &InHand<'_>) -> Result<InHandWrite, crate::jj::JjE
             reason: reason.to_owned(),
         }));
     }
-    let write_carriers =
-        writes.recorded_carriers(repo, &repo.parent_commits(matched.write.commit.as_str())?)?;
+    // A stacked release holds its previous release whole, so the write is
+    // rebased onto that release and the members, in parent order, its own
+    // change measured against all it composes: a write made as a chain of
+    // merges keeps what each inner merge resolved.
+    let composed = write_composition(repo, entry, (ledger, tips), (writes, &matched.write.commit))?;
     Ok(
-        if repo.holds_rebased_write((&matched.write.commit, &write_carriers), &members, commit)? {
+        if repo.holds_rebased_write(
+            (&matched.write.commit, &composed),
+            &reading.composition(),
+            commit,
+        )? {
             InHandWrite::Recorded
         } else {
             InHandWrite::Unrecorded {
                 write: matched.write,
+                onto_previous: reading.previous.is_some(),
             }
         },
     )
+}
+
+/// What `write`, a recorded write of a release whose earlier writes are
+/// `writes`, composes: the commits whose merge its own change is measured
+/// against ([`Repo::holds_rebased_write`]).
+///
+/// That is its own parents, its carriers left out
+/// ([`EarlierWrites::recorded_carriers`]). A write of a stacked series that
+/// has a previous release composes that release and its members
+/// ([`release_reading`], read with `tips`): made as a chain of merges, one
+/// member each, it holds what each inner merge resolved, and none of that is
+/// its own change against its own parents. A write the stacked reading
+/// refuses composes its own parents.
+pub fn write_composition(
+    repo: &Repo,
+    entry: &RepoEntry,
+    (ledger, tips): (&[Entry], &BookmarkTips),
+    (writes, write): (&EarlierWrites, &CommitId),
+) -> Result<Vec<CommitId>, crate::jj::JjError> {
+    if let Ok(reading) = release_reading(repo, entry, (ledger, tips), (writes, write))?
+        && reading.previous.is_some()
+    {
+        return Ok(reading.composition());
+    }
+    let parents = repo.parent_commits(write.as_str())?;
+    let carriers = writes.recorded_carriers(repo, &parents)?;
+    Ok(parents
+        .into_iter()
+        .filter(|parent| !carriers.contains(parent))
+        .collect())
+}
+
+/// How `commit`, a release whose earlier writes are `writes`, reads in
+/// `entry`'s series ([`read_release`]), with `tips`, the caller's bookmarks.
+///
+/// Every reader takes a release through this one wrapper. A release outside
+/// a stacked series, or one with no previous release, reads with `previous:
+/// None`, and a caller that reads such a release apart tests that. A stacked
+/// series walks the first-parent line past the trunk positions `tips` holds
+/// ([`trunk_positions_in`]); any other release reads from its own parents.
+pub fn release_reading(
+    repo: &Repo,
+    entry: &RepoEntry,
+    (ledger, tips): (&[Entry], &BookmarkTips),
+    (writes, commit): (&EarlierWrites, &CommitId),
+) -> Result<Result<ReleaseReading, UnexplainedCommit>, crate::jj::JjError> {
+    let trunks = if entry.stacked() {
+        trunk_positions_in(tips, entry)
+    } else {
+        Vec::new()
+    };
+    read_release(repo, entry, (ledger, tips, &trunks), (writes, commit))
 }
 
 /// How a release in hand measured against `write` stands (`held`), unless
@@ -1185,9 +1435,13 @@ pub fn no_match_refusal(
     };
     // A name held only as the publish remote's ref (a fresh clone of a
     // release another pod pushed) has no local bookmark for the squash to
-    // move or for adopt to read, so it is tracked first.
+    // move or for adopt to read, so it is tracked first. The name is one
+    // shell word inside the command; the remote is a registry value.
     let track = if repo.local_bookmark_tip(name).is_none() {
-        format!("track it (`jj bookmark track {shown}@{publish_remote}`), then ")
+        format!(
+            "track it (`jj bookmark track {}@{publish_remote}`), then ",
+            crate::ledger::shell_word(name)
+        )
     } else {
         String::new()
     };
@@ -1217,10 +1471,14 @@ pub fn unchecked_line(name: &str, commit: &CommitId, standing: &InHandWrite) -> 
         InHandWrite::NoRecord => None,
         InHandWrite::Recorded | InHandWrite::Unrecorded { .. } => return None,
     };
-    // The release is a name read from the repository.
+    // The release is a name read from the repository: escaped in prose, and
+    // one shell word inside the command.
     let shown = crate::ledger::inline_human_text(name);
     let at = commit.short();
-    let adopt = format!("`knives release adopt {shown}` records it");
+    let adopt = format!(
+        "`knives release adopt {}` records it",
+        crate::ledger::shell_word(name)
+    );
     let (why, remedy) = match unchecked {
         Some(Unchecked::WriteAbsent(write)) => (
             format!(
@@ -1282,7 +1540,8 @@ pub fn published_remedy_text(
     let target = on.or(published);
     let backwards = match target {
         Some(target) if repo.local_bookmark_tip(name).as_ref() == Some(commit) => format!(
-            " (`jj bookmark set {shown} -r {} --allow-backwards`)",
+            " (`jj bookmark set {} -r {} --allow-backwards`)",
+            crate::ledger::shell_word(name),
             target.short()
         ),
         _ => String::new(),
@@ -1354,8 +1613,9 @@ pub fn published_remedy_text(
         steps.push(format!("`jj abandon {}`", commit.short()));
     }
     steps.push(format!(
-        "`jj bookmark forget {shown}` (never `jj bookmark delete`, which a push would carry to \
-         the remote)"
+        "`jj bookmark forget {}` (never `jj bookmark delete`, which a push would carry to \
+         the remote)",
+        crate::ledger::shell_word(name)
     ));
     Ok(format!(
         "{shown} is published ({evidence}), so a hand edit cannot be recorded under it: {}",
@@ -1420,8 +1680,11 @@ pub fn in_hand_refusal(
         published,
         ..
     } = *release;
-    let write = match standing {
-        InHandWrite::Unrecorded { write } => write,
+    let (write, onto_previous) = match standing {
+        InHandWrite::Unrecorded {
+            write,
+            onto_previous,
+        } => (write, *onto_previous),
         InHandWrite::Unchecked(Unchecked::NoMatch(no_match @ NoMatch::AllCarriers { .. })) => {
             return Ok(Some(no_match_refusal(release, no_match, entry)?));
         }
@@ -1434,13 +1697,23 @@ pub fn in_hand_refusal(
     {
         return Ok(Some(remedy));
     }
+    // The release is a name read from the repository: escaped in prose, and
+    // one shell word inside the command.
     let shown = crate::ledger::inline_human_text(name);
+    // A stacked release that has a previous release is measured with it
+    // ([`in_hand_write`]).
+    let onto = if onto_previous {
+        "its previous release and its members"
+    } else {
+        "its members"
+    };
     Ok(Some(format!(
         "{shown} at {} carries a change no knives write or adopt recorded: its tree is not {} \
-         rebased onto its members; record it with `knives release adopt {shown}` (adopt asks for \
+         rebased onto {onto}; record it with `knives release adopt {}` (adopt asks for \
          --why only for a change outside the conflicts)",
         commit.short(),
-        described_write(write)
+        described_write(write),
+        crate::ledger::shell_word(name)
     )))
 }
 
@@ -1490,26 +1763,51 @@ pub fn carried_row(name: &str, from: CarriedFrom) -> String {
     }
 }
 
+/// What a cut's drift is measured from, which its unexplained rows name
+/// ([`unexplained_row`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriftBase {
+    /// The release the cut follows: a cut's previous release, the previous
+    /// release a stacked one stacks on, or the release a record follows.
+    PreviousRelease,
+    /// The members' fork point with the trunk: the series' first record
+    /// outside knives follows no release.
+    ForkPoint,
+}
+
+/// The row for a file the audited release changed since `base` that no
+/// member or trunk explains ([`CutAudit::unexplained`]).
+pub fn unexplained_row(file: &str, base: DriftBase) -> String {
+    // A path jj's diff named, so it reaches the terminal escaped.
+    let file = crate::ledger::inline_human_text(file);
+    let base = match base {
+        DriftBase::PreviousRelease => "the previous release",
+        DriftBase::ForkPoint => "the members' fork point with the trunk",
+    };
+    format!(
+        "  !! {file}: changed between {base} and this cut with no member or trunk \
+         explaining it"
+    )
+}
+
 /// The newest dated cut's branch name — unqualified, unlike
 /// [`previous_release_for_cut`]'s — and its live commit: the local ref when
 /// present, otherwise whichever of our remotes carries it.
+///
+/// One selection, one order: [`newest_release`] reads the same key. A fixed
+/// release has no dated cut, so it has none of these.
 pub fn live_dated_release(
     tips: &BookmarkTips,
     scheme: &ReleaseScheme,
     publish_remote: &str,
 ) -> Option<(BranchName, CommitId)> {
-    let newest = tips
-        .keys()
-        .filter(|reference| is_our_release(reference, scheme, publish_remote))
-        .filter_map(|reference| scheme.dated_cut(reference.branch().as_str()))
-        .max()?;
-    tips.iter()
-        .filter(|(reference, _)| {
-            is_our_release(reference, scheme, publish_remote)
-                && scheme.dated_cut(reference.branch().as_str()).as_ref() == Some(&newest)
-        })
-        .max_by_key(|(reference, _)| u8::from(reference.is_local()))
-        .map(|(reference, commit)| (reference.branch().clone(), commit.clone()))
+    match scheme {
+        ReleaseScheme::Dated | ReleaseScheme::Series(_) => {
+            newest_release(tips, scheme, publish_remote)
+                .map(|(reference, commit)| (reference.branch().clone(), commit))
+        }
+        ReleaseScheme::Fixed(_) => None,
+    }
 }
 
 /// Each member's history measured against the others: a merge whose side
@@ -1569,6 +1867,47 @@ fn no_cut_yet(scheme: &ReleaseScheme) -> String {
     }
 }
 
+/// The members of the release `commit` that the trunk tip does not reach:
+/// the ones every member check reads. A member it reaches is a base, and
+/// one other than the release's shared base is a superseded base, a finding
+/// of `plan`.
+fn unlanded_members(
+    repo: &Repo,
+    (commit, trunk_tip): (&CommitId, Option<&CommitId>),
+    members: &[ReleaseParent],
+    plan: &mut Plan,
+) -> anyhow::Result<Vec<ReleaseParent>> {
+    let base = match trunk_tip {
+        Some(trunk) => shared_base(repo, commit, trunk)?,
+        None => None,
+    };
+    let mut member_parents = Vec::new();
+    for parent in members {
+        let trunk_reachable = match trunk_tip {
+            Some(trunk) => repo.is_ancestor(&parent.commit, trunk)?,
+            None => false,
+        };
+        if !trunk_reachable {
+            member_parents.push(parent.clone());
+        } else if base
+            .as_ref()
+            .is_some_and(|candidate| candidate != &parent.commit)
+        {
+            plan.base_findings.push(Finding::new(
+                FindingKind::SupersededBase,
+                Subject::Commit(parent.commit.clone()),
+                format!(
+                    "parent {} is an older upstream base superseded by {}; \
+                     `knives release rebase` self-heals this",
+                    parent.commit.short(),
+                    base.as_ref().map_or("", CommitId::short),
+                ),
+            ));
+        }
+    }
+    Ok(member_parents)
+}
+
 /// The release in hand and what it does not carry.
 ///
 /// `ledger` is this repository's ledger, read by the caller: the last recorded
@@ -1608,44 +1947,29 @@ pub fn plan(
         })
         .cloned();
 
-    let parents = repo.parents_of(commit.as_str())?;
-    let members = plan.read_carriers(&repo, (reference.branch().as_str(), &parents), ledger)?;
-    let trunk_tip = repo.resolve_commit(&entry.trunk_ref()).ok();
-    let trunks = trunk_positions(&repo, entry)?;
-    let base = match &trunk_tip {
-        Some(trunk) => shared_base(&repo, &commit, trunk)?,
-        None => None,
+    let Some((parents, members)) =
+        plan.read_parents((&repo, entry), (ledger, &tips), (&reference, &commit))?
+    else {
+        add_consumer_pins(&mut plan, fork, consumers, &scheme);
+        return Ok(plan);
     };
-    let mut member_parents = Vec::new();
-    for parent in &members {
-        let trunk_reachable = match &trunk_tip {
-            Some(trunk) => repo.is_ancestor(&parent.commit, trunk)?,
-            None => false,
-        };
-        if !trunk_reachable {
-            member_parents.push(parent.clone());
-        } else if base
-            .as_ref()
-            .is_some_and(|candidate| candidate != &parent.commit)
-        {
-            plan.base_findings.push(Finding::new(
-                FindingKind::SupersededBase,
-                Subject::Commit(parent.commit.clone()),
-                format!(
-                    "parent {} is an older upstream base superseded by {}; \
-                     `knives release rebase` self-heals this",
-                    parent.commit.short(),
-                    base.as_ref().map_or("", CommitId::short),
-                ),
-            ));
-        }
-    }
+    let trunks = trunk_positions(&repo, entry)?;
+    let trunk_tip = repo.resolve_commit(&entry.trunk_ref()).ok();
+    let member_parents =
+        unlanded_members(&repo, (&commit, trunk_tip.as_ref()), &members, &mut plan)?;
     let releases = release_refs_by_commit(&tips, &scheme, publish_remote);
     let in_hand = [commit.clone()];
     let written = recorded_release_changes(&repo, ledger, &scheme);
+    // A member of a stacked release may stack on its previous release, so
+    // its history is measured past that release as past the trunk. Branch
+    // succession and the trunk's own messages still read the trunk alone.
+    let measured = with_commit(
+        &trunks,
+        plan.previous.as_ref().map(|previous| &previous.commit),
+    );
     let stacked_context = (!trunks.is_empty()).then_some(StackedHistoryContext {
         repo: &repo,
-        trunks: &trunks,
+        trunks: &measured,
         releases: &releases,
         carried: &in_hand,
         written: &written,
@@ -1670,16 +1994,11 @@ pub fn plan(
         parents: &members,
         trunks: &trunks,
         stacked: stacked_context,
+        stacked_series: entry.stacked(),
         branches: &series_branches,
         recorded: last_recorded_parents(ledger, &reference.to_string()),
     })?);
-    plan.parents = parents
-        .into_iter()
-        .map(|parent| {
-            let names = parent.bookmarks.iter().map(ToString::to_string).collect();
-            (parent.commit, names)
-        })
-        .collect();
+    plan.list_parents(parents);
 
     add_consumer_pins(&mut plan, fork, consumers, &scheme);
     Ok(plan)
@@ -1746,10 +2065,57 @@ struct LocalBranchNotes<'a> {
     parents: &'a [ReleaseParent],
     trunks: &'a [CommitId],
     stacked: Option<StackedHistoryContext<'a>>,
+    /// Whether the series is stacked ([`RepoEntry::stacked`]): its next cut
+    /// starts on the release in hand, so a branch built on that release is
+    /// that cut's to include.
+    stacked_series: bool,
     branches: &'a [(String, CommitId)],
     /// The release's last recorded parent set, for a branch the repository can
     /// no longer tie to its parent.
     recorded: &'a [RecordedParent],
+}
+
+/// The plan's note for `branch`, at `tip`, built on top of the release in
+/// hand.
+///
+/// Outside a stacked series it is neither a member nor includable as it
+/// stands: carrying it would put the cut in its own successor's ancestry. In
+/// a stacked series the release in hand is the previous release of the next
+/// cut, and such a branch is what that cut includes. So its history is
+/// measured as `include` measures it once the next release is cut: past the
+/// trunk, the release's own previous release and the release itself. A
+/// branch linear past them, or whose merges join only lines the release
+/// carries, is fit for the next release; one that carries more is refused
+/// as `include` refuses it.
+fn built_on_release_note(
+    input: &LocalBranchNotes<'_>,
+    branch: &str,
+    tip: &CommitId,
+) -> anyhow::Result<String> {
+    let reference = input.reference;
+    let Some(context) = input.stacked.filter(|_| input.stacked_series) else {
+        return Ok(format!(
+            "{branch} is stacked on {reference} rather than the trunk; rebase it off the \
+             trunk before including it"
+        ));
+    };
+    let bases = with_commit(context.trunks, Some(input.release));
+    let measured = StackedHistoryContext {
+        trunks: &bases,
+        ..context
+    };
+    Ok(match member_history(measured, branch, tip)? {
+        MemberHistory::Stacked(stacked) => format!(
+            "{}; rebase it off the trunk before including it",
+            stacked.detail
+        ),
+        MemberHistory::Linear | MemberHistory::CarriedMerges { .. } => format!(
+            "{branch} is built on {reference}, which the next cut of this stacked series starts \
+             on; `knives release cut <name>` makes that cut, and `knives release include \
+             {}` then adds it",
+            crate::ledger::shell_word(branch)
+        ),
+    })
 }
 
 /// Whether `branch`'s history carries merges the release in hand already
@@ -1827,6 +2193,7 @@ fn local_branch_notes(input: &LocalBranchNotes<'_>) -> anyhow::Result<Vec<String
         parents,
         trunks,
         stacked,
+        stacked_series: _,
         branches,
         recorded,
     } = *input;
@@ -1837,15 +2204,11 @@ fn local_branch_notes(input: &LocalBranchNotes<'_>) -> anyhow::Result<Vec<String
             continue;
         }
         // A branch built on top of the release descends from every member, which
-        // ancestry alone reads as "advanced". It is neither advanced nor
-        // includable as it stands: both verbs refuse it, because carrying it would
-        // put the cut in its own successor's ancestry. The same goes for a branch
-        // whose history carries any release merge.
+        // ancestry alone reads as "advanced". It is never advanced: carrying it
+        // would put the cut in its own successor's ancestry. Whether it is
+        // includable depends on the series ([`built_on_release_note`]).
         if repo.is_ancestor(release, tip)? {
-            notes.push(format!(
-                "{branch} is stacked on {reference} rather than the trunk; rebase it off the \
-                 trunk before including it"
-            ));
+            notes.push(built_on_release_note(input, branch, tip)?);
             continue;
         }
         let merged = match branch_history_note(stacked, branch, tip)? {
@@ -1888,27 +2251,29 @@ fn local_branch_notes(input: &LocalBranchNotes<'_>) -> anyhow::Result<Vec<String
             ));
             continue;
         }
+        // The branch is one shell word inside each command a person pastes.
+        let word = crate::ledger::shell_word(branch);
         notes.push(match (lookup.parents.first(), lookup.evidence) {
             (None, _) => {
-                format!("{branch} is not in {reference}; `knives release include {branch}` adds it")
+                format!("{branch} is not in {reference}; `knives release include {word}` adds it")
             }
             (Some(_), MemberEvidence::Succession) if integrates => format!(
                 "{branch} merges {} member(s) of {reference} and builds on them; `knives \
-                 release include {branch}` adds it beside them",
+                 release include {word}` adds it beside them",
                 lookup.parents.len()
             ),
             (Some(_), MemberEvidence::Succession) => format!(
                 "{branch} has advanced past its parent in {reference}; \
-                 `knives release advance {branch}` moves it"
+                 `knives release advance {word}` moves it"
             ),
             (Some(parent), MemberEvidence::Record) => format!(
                 "{branch} was released as {} in {reference} and has since been rebased outside \
-                 jj; `knives release advance {branch}` moves it through that record",
+                 jj; `knives release advance {word}` moves it through that record",
                 parent.short()
             ),
             (Some(parent), MemberEvidence::LandedRecord) => format!(
                 "{branch}'s released parent {} in {reference} has landed upstream and the \
-                 branch kept going; `knives release advance {branch}` moves it, \
+                 branch kept going; `knives release advance {word}` moves it, \
                  `knives release rebase` retires the landed parent",
                 parent.short()
             ),
@@ -1932,6 +2297,10 @@ fn parent_label(parent: &ReleaseParent) -> String {
 }
 
 /// One direct parent of a release, and what still identifies its commit.
+///
+/// In a stacked series, a row is one commit of the release's composition:
+/// its previous release, a member or a carrier
+/// ([`crate::release_model::read_release`]).
 #[derive(Debug, serde::Serialize)]
 pub struct MemberRow {
     pub commit: CommitId,
@@ -1944,8 +2313,13 @@ pub struct MemberRow {
     /// A trunk-reachable parent is the base of a legacy cut, not a member.
     pub base_parent: bool,
     /// An earlier write of the release a fast-forward push gave it
-    /// ([`crate::release_model::carriers`]): no member, and labelled so.
+    /// ([`crate::release_model::EarlierWrites::carriers`]): no member, and
+    /// labelled so.
     pub carrier: bool,
+    /// The name of the previous release a stacked release stacks on, when
+    /// the row is that release: no member, and labelled so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_release: Option<String>,
 }
 
 /// The structural and semantic membership of one release.
@@ -1994,13 +2368,68 @@ fn member_row(
         advanced,
         base_parent,
         carrier,
+        previous_release: None,
     })
 }
 
+/// The rows of a stacked release that has a previous release: that release
+/// on a row of its own, then each member, then each carrier. No branch is
+/// read as continuing the previous release, which every member descends
+/// from.
+fn stacked_rows(
+    opened: &Repo,
+    reading: &ReleaseReading,
+    (tips, trunk): (&BookmarkTips, Option<&CommitId>),
+    successions: &BranchSuccessions<'_>,
+) -> anyhow::Result<Vec<MemberRow>> {
+    let mut rows = Vec::new();
+    if let Some(previous) = &reading.previous {
+        let held_by = release_parents(tips, std::slice::from_ref(&previous.commit))
+            .into_iter()
+            .flat_map(|parent| parent.bookmarks)
+            .map(|bookmark| bookmark.to_string())
+            .collect();
+        rows.push(MemberRow {
+            commit: previous.commit.clone(),
+            held_by,
+            advanced: Vec::new(),
+            base_parent: false,
+            carrier: false,
+            previous_release: Some(previous.name.clone()),
+        });
+    }
+    for (commits, carrier) in [(&reading.members, false), (&reading.carriers, true)] {
+        for parent in release_parents(tips, commits) {
+            rows.push(member_row(opened, (parent, carrier), trunk, successions)?);
+        }
+    }
+    Ok(rows)
+}
+
+/// The rows of a release's direct parents, each carrier among them
+/// ([`EarlierWrites::carriers`]) labelled.
+fn parent_rows(
+    opened: &Repo,
+    (parents, writes): (Vec<ReleaseParent>, &EarlierWrites),
+    (trunk, successions): (Option<&CommitId>, &BranchSuccessions<'_>),
+) -> anyhow::Result<Vec<MemberRow>> {
+    let parent_commits: Vec<CommitId> =
+        parents.iter().map(|parent| parent.commit.clone()).collect();
+    let carriers = writes.carriers(&parent_commits);
+    parents
+        .into_iter()
+        .map(|parent| {
+            let carrier = carriers.contains(&parent.commit);
+            member_row(opened, (parent, carrier), trunk, successions)
+        })
+        .collect()
+}
+
 /// Whether a row is one the content audit holds the release to: neither a
-/// legacy cut's base nor an earlier write of the release.
+/// legacy cut's base, an earlier write of the release, nor the previous
+/// release of a stacked one.
 const fn is_member(member: &MemberRow) -> bool {
-    !member.base_parent && !member.carrier
+    !member.base_parent && !member.carrier && member.previous_release.is_none()
 }
 
 /// The label audit buckets use for a member row.
@@ -2022,9 +2451,16 @@ fn member_label(member: &MemberRow) -> String {
 ///
 /// `ledger` is the fork's ledger: the writes it records under the name, with
 /// the publish remote's commit of it, are the carriers a row labels
-/// ([`crate::release_model::carriers`]). `verify` replays the content
-/// (`--verify`) against no previous release: a member whose change the tree
-/// does not hold reads as missing, however the release came to drop it.
+/// ([`EarlierWrites`]). `verify` replays the content (`--verify`) against no
+/// previous release: a member whose change the tree does not hold reads as
+/// missing, however the release came to drop it.
+///
+/// The release reads as its series reads it ([`release_reading`]). One of a
+/// stacked series that has a previous release reads as its previous
+/// release, on a row of its own, and its members; `verify` replays each
+/// member from its fork point with the previous release, and measures the
+/// drift from it ([`audit_cut`]). A release the stacked reading refuses is a
+/// problem, and its rows are its parents, as every other release's are.
 pub fn gather_members(
     opened: &Repo,
     fork: &Fork<'_>,
@@ -2033,7 +2469,8 @@ pub fn gather_members(
 ) -> anyhow::Result<MembersReport> {
     let entry = fork.entry;
     let commit = opened.resolve_commit(name)?;
-    let parents = opened.parents_of(commit.as_str())?;
+    let parents = opened.parent_commits(commit.as_str())?;
+    let parent_count = parents.len();
     let trunk_name = entry.trunk_ref();
     let mut problems = Vec::new();
     let trunk = match opened.resolve_commit(&trunk_name) {
@@ -2055,22 +2492,28 @@ pub fn gather_members(
         branch: release.clone(),
         remote: RemoteName::new(entry.publish_remote()),
     });
-    let parent_commits: Vec<CommitId> =
-        parents.iter().map(|parent| parent.commit.clone()).collect();
-    let carriers = crate::release_model::carriers(
-        opened,
-        release.as_str(),
-        &parent_commits,
-        (ledger, published),
-    )?;
-    let members: Vec<MemberRow> = parents
-        .into_iter()
-        .map(|parent| {
-            let carrier = carriers.contains(&parent.commit);
-            member_row(opened, (parent, carrier), trunk.as_ref(), &successions)
-        })
-        .collect::<anyhow::Result<_>>()?;
-    let audit = if verify {
+    let writes = EarlierWrites::read(opened, release.as_str(), ledger, published)?;
+    let literal_rows = || {
+        parent_rows(
+            opened,
+            (release_parents(&tips, &parents), &writes),
+            (trunk.as_ref(), &successions),
+        )
+    };
+    let (members, previous, refused) =
+        match release_reading(opened, entry, (ledger, &tips), (&writes, &commit))? {
+            Ok(reading) if reading.previous.is_none() => (literal_rows()?, None, false),
+            Ok(reading) => (
+                stacked_rows(opened, &reading, (&tips, trunk.as_ref()), &successions)?,
+                reading.previous,
+                false,
+            ),
+            Err(unexplained) => {
+                problems.push(format!("{name}: {unexplained}"));
+                (literal_rows()?, None, true)
+            }
+        };
+    let audit = if verify && !refused {
         trunk
             .as_ref()
             .map(|trunk| {
@@ -2079,6 +2522,7 @@ pub fn gather_members(
                     .filter(|member| is_member(member))
                     .map(|member| (member_label(member), member.commit.clone()))
                     .collect();
+                let stacked_on = previous.as_ref().map(|previous| &previous.commit);
                 audit_cut(
                     &fork.checkout.path,
                     &members,
@@ -2086,6 +2530,8 @@ pub fn gather_members(
                     AuditContext {
                         previous: None,
                         trunk,
+                        stacked_on,
+                        drift_from: stacked_on.map(|from| (from, DriftBase::PreviousRelease)),
                     },
                 )
             })
@@ -2097,7 +2543,7 @@ pub fn gather_members(
         repo: fork.checkout.path.display().to_string(),
         release: name.to_owned(),
         commit,
-        parent_count: members.len(),
+        parent_count,
         members,
         audit,
         notes: Vec::new(),
@@ -2127,11 +2573,18 @@ pub fn render_members(report: &MembersReport) -> String {
             }
             description.push_str(&inline_human_text(&member.advanced.join(", ")));
         }
-        if member.carrier {
+        let previous = member
+            .previous_release
+            .as_deref()
+            .map(previous_release_label);
+        let tag = previous
+            .as_deref()
+            .or_else(|| member.carrier.then_some(label.as_str()));
+        if let Some(tag) = tag {
             description = if description.is_empty() {
-                inline_human_text(&label)
+                inline_human_text(tag)
             } else {
-                format!("{} ({description})", inline_human_text(&label))
+                format!("{} ({description})", inline_human_text(tag))
             };
         }
         if description.is_empty() {
@@ -2171,14 +2624,14 @@ pub fn render_members(report: &MembersReport) -> String {
                 inline_human_text(name)
             ));
         }
-        // Paths jj's diff named, so each goes out escaped.
-        for file in &audit.unexplained {
-            lines.push(format!(
-                "  !! {}: changed between the previous release and this cut \
-                 with no member or trunk explaining it",
-                inline_human_text(file)
-            ));
-        }
+        // `members --verify` measures drift only from the previous release a
+        // stacked release stacks on.
+        lines.extend(
+            audit
+                .unexplained
+                .iter()
+                .map(|file| unexplained_row(file, DriftBase::PreviousRelease)),
+        );
     }
     // A note quotes jj, the forge or a consumer's pin files; the report keeps
     // the raw text for `--json`, and this line is the one a terminal reads.
@@ -2907,13 +3360,45 @@ impl CutAudit {
     pub const fn passed(&self) -> bool {
         self.missing.is_empty() && self.unexplained.is_empty()
     }
+
+    /// Leave out of the drift each file that the composition gate after the
+    /// audit judges: each file of `fixes`, the fixes by hand that the series
+    /// holds, each at the files where its hold has not ended
+    /// ([`adopted_fixes`]).
+    ///
+    /// A fix is no member's content, so no member tip explains its loss, and
+    /// the gate, not the drift check, refuses a subject that lacks it at such
+    /// a file, once, naming the file and its adopt. A subject that carries
+    /// the fix there while the release it follows lacks it has no drift there
+    /// either: the gate finds the file carried. A file that no fix holds stays
+    /// in the drift.
+    pub fn leave_fixes_to_gate(&mut self, fixes: &[AdoptedFix]) {
+        self.unexplained.retain(|file| {
+            !fixes
+                .iter()
+                .any(|fix| fix.files.iter().any(|held| held.path == *file))
+        });
+    }
 }
 
-/// The baseline commits used to explain a cut audit's file-level drift.
+/// What a cut audit measures its members and its drift from ([`audit_cut`]).
 #[derive(Debug, Clone, Copy)]
 pub struct AuditContext<'a> {
+    /// The release a member's divergence may be carried from: a cut's
+    /// previous release. `None` carries nothing forward, so a member the
+    /// subject lacks is missing, however the subject came to drop it.
     pub previous: Option<&'a CommitId>,
+    /// What each member replays from: the members' fork point with the
+    /// trunk, or the previous release a stacked cut starts on.
     pub trunk: &'a CommitId,
+    /// The previous release a release of a stacked series stacks on
+    /// ([`crate::release_model::read_release`]): each member replays from
+    /// its fork point with it instead of from `trunk`.
+    pub stacked_on: Option<&'a CommitId>,
+    /// What the drift is measured from, and what that commit is, which the
+    /// row of a file no member explains names ([`unexplained_row`]). `None`
+    /// runs no drift check, as for a first cut.
+    pub drift_from: Option<(&'a CommitId, DriftBase)>,
 }
 
 /// Workspaces knives made for a branch that is gone and that nobody holds.
@@ -3045,6 +3530,33 @@ impl CutSubject<'_> {
         }
     }
 
+    /// The paths of the change `resolution` holds against `baseline` that
+    /// the subject does not carry, each judged on its own
+    /// ([`jj::Repo::uncarried_resolution_paths`]).
+    fn uncarried_resolution_paths(
+        &mut self,
+        repo: &Repo,
+        baseline: jj::ResolutionBaseline<'_>,
+        resolution: &CommitId,
+    ) -> anyhow::Result<Vec<String>> {
+        match self {
+            Self::Candidate(candidate) => {
+                Ok(candidate.uncarried_resolution_paths(baseline, resolution)?)
+            }
+            Self::Committed(cut) => Ok(repo.uncarried_resolution_paths(baseline, resolution, cut)?),
+        }
+    }
+
+    /// Whether the subject holds what `other` holds at `path`, a
+    /// repository-internal path: the same file, symlink, directory or
+    /// conflict, or nothing at either.
+    fn same_path_value(&self, repo: &Repo, other: &CommitId, path: &str) -> anyhow::Result<bool> {
+        match self {
+            Self::Candidate(candidate) => Ok(candidate.same_path_value(other, path)?),
+            Self::Committed(cut) => Ok(repo.same_path_value(cut, other, path)?),
+        }
+    }
+
     fn changed_files_since(
         &mut self,
         repo: &Path,
@@ -3063,15 +3575,34 @@ impl CutSubject<'_> {
 
 /// Verify the cut actually contains what it merged (spec 1.3).
 ///
-/// For each member, a scratch child of `trunk` carrying the member tip's tree
-/// — a synthetic commit whose diff is `trunk..member_tip` — is replayed onto
-/// the cut.
+/// For each member, a scratch child of `context.trunk` carrying the member
+/// tip's tree — a synthetic commit whose diff is `trunk..member_tip` — is
+/// replayed onto the cut.
 /// An empty replay means its hunks are present; a clean, non-empty replay means
 /// the cut silently lacks them. A conflicted replay is inconclusive only when
 /// the cut itself has unresolved conflicts; otherwise its tree diverges from the
-/// member and fails the audit.
-/// Changes from the previous release that no member or trunk explains are
-/// merge-invented drift.
+/// member and fails the audit, unless `context.previous` diverged from the
+/// member exactly so: that is carried forward.
+///
+/// A release of a stacked series carries its previous release whole
+/// (`context.stacked_on`), and a member may stack on it. So each member
+/// replays from its fork point with the previous release, the merge base of
+/// the two, not from `trunk`: the previous release's own content is never
+/// charged to a member. The previous release is no member, and the caller
+/// does not list it among `members`.
+///
+/// The drift is what changed since `context.drift_from`, the release the
+/// audited one follows, that no member or trunk explains: merge-invented
+/// drift. That release is a cut's `context.previous`, or the previous
+/// release a stacked one stacks on. It is apart from `context.previous`,
+/// what a member's divergence may be carried from, because a release cut
+/// outside knives has a release it follows but carries nothing forward: a
+/// member it lacks is missing. The series' first record outside knives
+/// follows no release, and its drift is measured from `context.trunk`, its
+/// members' fork point with the trunk. With no `drift_from` there is no
+/// drift check, as for a first cut. A caller that holds fixes by hand after
+/// the audit leaves their files out of the drift
+/// ([`CutAudit::leave_fixes_to_gate`]).
 ///
 /// Auditing a [`CutSubject::Candidate`] reads a merge that no other observer
 /// can see and that a failure simply drops — nothing to compensate, nothing
@@ -3084,8 +3615,17 @@ pub fn audit_cut(
 ) -> anyhow::Result<CutAudit> {
     let mut audit = CutAudit::default();
     let cut_is_conflicted = !subject.conflicted_files(repo)?.is_empty();
+    let stacked = context
+        .stacked_on
+        .map(|previous| Repo::open(repo).map(|opened| (opened, previous)))
+        .transpose()?;
     for (name, tip) in members {
-        match subject.replay_outcome(repo, context.trunk.as_str(), tip.as_str())? {
+        let fork_point = stacked
+            .as_ref()
+            .map(|(opened, previous)| opened.fork_point(tip, previous))
+            .transpose()?;
+        let base = fork_point.as_ref().unwrap_or(context.trunk);
+        match subject.replay_outcome(repo, base.as_str(), tip.as_str())? {
             RebaseOutcome::Empty => {}
             RebaseOutcome::Conflicted if cut_is_conflicted => audit.inconclusive.push(name.clone()),
             RebaseOutcome::CleanNonEmpty | RebaseOutcome::Conflicted => {
@@ -3100,7 +3640,7 @@ pub fn audit_cut(
                     Some(previous) => !matches!(
                         crate::jj::probe_net_diff(
                             repo,
-                            context.trunk.as_str(),
+                            base.as_str(),
                             tip.as_str(),
                             previous.as_str(),
                         )?,
@@ -3116,7 +3656,7 @@ pub fn audit_cut(
             }
         }
     }
-    if let Some(previous) = context.previous {
+    if let Some((previous, _)) = context.drift_from {
         let drifted = subject.changed_files_since(repo, previous)?;
         let mut explained = BTreeSet::new();
         for (_, tip) in members {
@@ -3126,11 +3666,15 @@ pub fn audit_cut(
                 tip.as_str(),
             )?);
         }
-        explained.extend(crate::jj::changed_files_between(
-            repo,
-            previous.as_str(),
-            context.trunk.as_str(),
-        )?);
+        // A stacked audit's trunk is the previous release itself, and a commit
+        // changes no file against itself.
+        if context.trunk != previous {
+            explained.extend(crate::jj::changed_files_between(
+                repo,
+                previous.as_str(),
+                context.trunk.as_str(),
+            )?);
+        }
         audit.unexplained = drifted
             .into_iter()
             .filter(|file| !explained.contains(file))
@@ -3146,34 +3690,614 @@ pub fn cut(repo: &Path, request: &Cut, scheme: &ReleaseScheme) -> anyhow::Result
     Ok(publish_cut(candidate, &request.name, scheme, (&[], None))?.commit)
 }
 
-/// A recorded member whose carry check answered nothing either way.
+/// A member the composition gate's baseline records, as the gate names it.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Unverified {
-    /// Carried into the new cut event's evidence, so the next gate rechecks it.
+pub struct RecordedMember {
+    /// The recorded commit. An unverified one is carried into the new cut
+    /// event's evidence, so the next gate rechecks it.
     pub commit: CommitId,
     /// Rendered for a human: the branch still holding the commit when one does.
     pub name: String,
 }
 
-/// How a candidate cut relates to the previous cut's recorded composition.
+/// How a candidate cut relates to the recorded composition it is held
+/// against.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CompositionCheck {
-    /// Recorded members whose content the candidate does not carry, rendered
-    /// for a human: the branch still holding the commit when one does.
-    pub dropped: Vec<String>,
+    /// Recorded members whose content the candidate does not carry.
+    pub dropped: Vec<RecordedMember>,
     /// Members whose replay conflicted while the candidate itself is
     /// conflicted: unanswerable either way, exactly as the audit reports it.
-    pub inconclusive: Vec<Unverified>,
+    pub inconclusive: Vec<RecordedMember>,
     /// Recorded members carried by another commit with exactly their tree,
     /// reachable from a parent: the member rendered for a human, and the twin.
     pub twins: Vec<(String, CommitId)>,
+    /// In a stacked series, whether the newest recorded write is off the
+    /// first-parent line of the commit the subject starts on
+    /// ([`CompositionDelta::start`]): the subject does not carry that
+    /// write's release, whatever members it carries. Only a write this
+    /// repository holds is measured so ([`Self::absent_write`]).
+    pub off_line: bool,
+    /// Whether this repository does not hold the newest recorded write
+    /// ([`CompositionBaseline::newest_write`]). Nothing here can tell what
+    /// that write carries, so the subject is refused as one that lacks it,
+    /// as a recorded member this repository cannot resolve is.
+    pub absent_write: bool,
+    /// The fixes by hand that the series holds and the subject lacks at one
+    /// of their files or more ([`CompositionDelta::fixes`]), each with the
+    /// files it lacks. A file that the subject leaves conflicted is here too,
+    /// unless the newest recorded write is conflicted there as well
+    /// ([`Self::inconclusive_fixes`]). So is each fix whose files nothing
+    /// here reads whole, with no file ([`FixLack::Unread`]): no subject
+    /// carries it here.
+    pub dropped_fixes: Vec<LackedFix>,
+    /// The fixes by hand that the series holds at a file that the subject
+    /// and the newest recorded write both leave conflicted, each with those files: unanswerable until the
+    /// conflict is resolved, as for a member whose replay conflicted
+    /// ([`Self::inconclusive`]). A knives cut then goes ahead with the
+    /// conflict for the person to resolve in place and `adopt`; the write
+    /// it makes is no reference of those files, so the fix stays held.
+    pub inconclusive_fixes: Vec<LackedFix>,
+}
+
+impl CompositionCheck {
+    /// Whether the check finds what refuses the subject unless
+    /// `--allow-drop` lets it go ahead: a recorded member it lacks, in a
+    /// stacked series the newest recorded write off its line, a newest
+    /// write that this repository does not hold, or a fix by hand it lacks
+    /// at a file or whose files nothing here reads whole.
+    pub const fn refuses(&self) -> bool {
+        !self.dropped.is_empty()
+            || self.off_line
+            || self.absent_write
+            || !self.dropped_fixes.is_empty()
+    }
+
+    /// Whether the check could not answer for a member or a fix by hand,
+    /// as the subject leaves a conflict: no refusal, but no clean result.
+    pub const fn is_inconclusive(&self) -> bool {
+        !self.inconclusive.is_empty() || !self.inconclusive_fixes.is_empty()
+    }
+}
+
+/// A fix by hand that the series holds and the cut subject lacks, or
+/// leaves inconclusive, at the files it names
+/// ([`CompositionCheck::dropped_fixes`],
+/// [`CompositionCheck::inconclusive_fixes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LackedFix {
+    /// The release the adopt recorded.
+    pub name: String,
+    /// The adopt's commit.
+    pub commit: CommitId,
+    /// What the subject lacks of the fix.
+    pub lacks: FixLack,
+}
+
+impl LackedFix {
+    /// The files of the fix that the subject does not carry: none where
+    /// nothing here reads them whole ([`FixLack::Unread`]).
+    pub fn files(&self) -> &[HeldFile] {
+        match &self.lacks {
+            FixLack::Files { files, .. } => files,
+            FixLack::Unread { .. } => &[],
+        }
+    }
+}
+
+/// What a cut subject lacks of a fix by hand ([`LackedFix`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixLack {
+    /// The files of the fix that the subject does not carry
+    /// ([`fix_lacks`]), each with the write it was held against, and why
+    /// nothing here can measure the fix, where nothing can: the subject was
+    /// then held to what each file's reference holds there.
+    Files {
+        files: Vec<HeldFile>,
+        unmeasured: Option<Unmeasured>,
+    },
+    /// Nothing here reads the files of the fix whole: nothing here can
+    /// measure the fix, as `unmeasured` says, and its event's text does
+    /// not read whole, as `why` says ([`AdoptedFix::unread`]). Nothing here
+    /// can tell whether the subject carries the fix.
+    Unread {
+        unmeasured: Unmeasured,
+        why: crate::release_model::UnreadFixText,
+    },
+}
+
+/// A file of a fix by hand that the series holds, and the recorded write
+/// that it is held against ([`FixReferences::of`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldFile {
+    /// The file, a repository path.
+    pub path: String,
+    /// What the file is held against: its reference, or why it has none.
+    pub reference: FixReference,
+    /// Whether the adopt's change against its baseline changes the file,
+    /// where this repository measures the fix: a subject then carries the
+    /// file where that change replays empty onto it there ([`fix_lacks`]).
+    pub replayed: bool,
+}
+
+/// What a file of a fix by hand that the series holds is held against
+/// ([`FixReferences::of`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixReference {
+    /// The file's reference: the newest recorded write of the series that
+    /// holds the file with no conflict, nothing there included. A write that
+    /// leaves the file conflicted is no reference.
+    Write(CommitId),
+    /// No reference here: the write where the walk for the reference
+    /// stopped, a recorded write of the release `name` that this repository
+    /// does not hold. Each newer write leaves the file conflicted, and
+    /// nothing here can read what this one holds there, so a fetch of it
+    /// may bring the reference.
+    Unread {
+        /// The release that the write wrote.
+        name: String,
+        /// The write's commit.
+        commit: CommitId,
+    },
+    /// No reference at all: every recorded write leaves the file conflicted.
+    Conflicted,
+}
+
+/// A fix by hand that the series holds: what an `adopt` of one of its
+/// releases recorded, at each file where its hold has not ended
+/// ([`adopted_fixes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptedFix {
+    /// The release the adopt recorded.
+    name: String,
+    /// The adopt's commit.
+    commit: CommitId,
+    /// The files of the fix that the series holds, each on its own and with
+    /// its reference: those that the adopt's change against its baseline
+    /// changes and whose reference still holds that change
+    /// ([`HeldFile::replayed`]), then those that its adopt event names
+    /// beyond them ([`adopted_fix`]). Empty where nothing here reads them
+    /// whole ([`Self::unread`]).
+    files: Vec<HeldFile>,
+    /// What the fix is measured against, or why nothing here can measure
+    /// it, with why nothing here reads its files whole, where nothing does:
+    /// its event, as an older knives writes it, names them in text that
+    /// does not read whole
+    /// ([`crate::release_model::AdoptedFixText::unread`]). The gate then
+    /// refuses every subject, whatever it holds ([`fix_findings`]).
+    measure: Result<FixBaseline, (Unmeasured, Option<crate::release_model::UnreadFixText>)>,
+}
+
+impl AdoptedFix {
+    /// The baseline that the fix is the adopt's change against
+    /// ([`FixBaseline::baseline`]), or `None` where nothing here can measure
+    /// the fix ([`Self::unmeasured`]).
+    fn baseline(&self) -> Option<jj::ResolutionBaseline<'_>> {
+        self.measure.as_ref().ok().map(FixBaseline::baseline)
+    }
+
+    /// Why nothing here can measure the fix, or `None` where this
+    /// repository measures it. The gate then holds each file of the fix to
+    /// what its reference holds there ([`fix_lacks`]).
+    const fn unmeasured(&self) -> Option<Unmeasured> {
+        match &self.measure {
+            Ok(_) => None,
+            Err((why, _)) => Some(*why),
+        }
+    }
+
+    /// Why nothing here can measure the fix and why nothing here reads its
+    /// files whole, or `None` where this repository measures the fix or
+    /// reads them whole.
+    const fn unread(&self) -> Option<(Unmeasured, crate::release_model::UnreadFixText)> {
+        match &self.measure {
+            Err((unmeasured, Some(why))) => Some((*unmeasured, *why)),
+            Ok(_) | Err((_, None)) => None,
+        }
+    }
+}
+
+/// Why nothing in this repository can measure a fix by hand
+/// ([`FixLack`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unmeasured {
+    /// This repository does not hold the adopt's commit.
+    Absent,
+    /// The adopt's series refuses to read its commit as a release
+    /// ([`release_reading`]).
+    Unread,
+}
+
+/// What an adopted fix is measured against, as `adopt` measured it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FixBaseline {
+    /// The write the adopt replaced and what that write composes, where it
+    /// is the baseline ([`baseline_write`]).
+    replaced: Option<(CommitId, Vec<CommitId>)>,
+    /// What the adopt composes ([`ReleaseReading::composition`]).
+    composition: Vec<CommitId>,
+}
+
+impl FixBaseline {
+    /// The replaced write rebuilt on the adopt's composition, or an
+    /// automerge of that composition where the replaced write is not the
+    /// baseline ([`resolution_baseline`]).
+    fn baseline(&self) -> jj::ResolutionBaseline<'_> {
+        resolution_baseline(
+            self.replaced
+                .as_ref()
+                .map(|(write, composed)| (write, composed.as_slice())),
+            &self.composition,
+        )
+    }
+}
+
+/// What `write`, the write that a resolution replaces, composes, where it
+/// is the baseline that the resolution is measured against.
+///
+/// It is the baseline where this repository holds it and knives checked
+/// the release it was written over: `event`, the ledger event that records
+/// it, bears no `; unchecked:` mark
+/// ([`crate::release_model::unchecked_mark`]). What it composes is read
+/// with `writes`, the release's earlier writes ([`write_composition`]).
+/// `None` where it is not the baseline, and the baseline is an automerge
+/// instead ([`resolution_baseline`]). `adopt` measures a resolution so, and
+/// the gate measures an adopted fix as `adopt` measured it
+/// ([`fix_baseline`]).
+pub fn baseline_write(
+    repo: &Repo,
+    entry: &RepoEntry,
+    (ledger, tips): (&[Entry], &BookmarkTips),
+    (writes, (event, write)): (&EarlierWrites, (&Entry, &CommitId)),
+) -> Result<Option<Vec<CommitId>>, jj::JjError> {
+    if repo.resolve_commit(write.as_str()).is_err()
+        || crate::release_model::unchecked_mark(event).is_some()
+    {
+        return Ok(None);
+    }
+    write_composition(repo, entry, (ledger, tips), (writes, write)).map(Some)
+}
+
+/// The baseline of a resolution of a commit that composes `composition`.
+///
+/// It is `replaced`, the write that the resolution replaces and what that
+/// write composes, where that write is the baseline ([`baseline_write`]),
+/// rebuilt on `composition`; else an automerge of `composition`.
+pub const fn resolution_baseline<'a>(
+    replaced: Option<(&'a CommitId, &'a [CommitId])>,
+    composition: &'a [CommitId],
+) -> jj::ResolutionBaseline<'a> {
+    match replaced {
+        Some((write, composed)) => jj::ResolutionBaseline::Rebuilt {
+            write,
+            composed,
+            members: composition,
+        },
+        None => jj::ResolutionBaseline::Automerge(composition),
+    }
+}
+
+/// The fixes by hand that the series holds, release by release, from the
+/// last name to the first, each release's newest adopt first.
+///
+/// There is one for each `adopt` that the ledger records of a release of
+/// `entry`'s series, before or after that release's cut, whose hold has not
+/// ended at one file or more. `writes` are the series' recorded writes,
+/// newest first ([`crate::release_model::series_writes`]): the first is the
+/// baseline's [`CompositionBaseline::newest_write`], the newest release's
+/// newest recorded write. Each release is read as `entry`'s series reads
+/// it, with `tips`, the caller's bookmarks. An adopt holds a fix when its
+/// event records one ([`crate::release_model::adopted_fix_replaces`]).
+///
+/// Each file of a fix is held on its own, against its reference: the
+/// newest of `writes` that holds the file with no conflict
+/// ([`FixReferences::of`]). A write that leaves the file conflicted neither
+/// ends its hold nor holds what a subject must hold there. The hold on a
+/// file ends where its reference no longer holds the adopt's content there
+/// ([`adopted_fix`]). So a fix that a later cut or edit kept stays held,
+/// however many releases later, and a later write that removes the fix
+/// from one file, or changes the fix's lines there again, ends the hold on
+/// that file alone. Where this repository does not hold the newest write,
+/// nothing here can tell what that write holds: no fix is held, and the
+/// gate refuses for that write ([`CompositionCheck::absent_write`]).
+pub fn adopted_fixes(
+    repo: &Repo,
+    entry: &RepoEntry,
+    (ledger, tips): (&[Entry], &BookmarkTips),
+    writes: &[SeriesWrite<'_>],
+) -> anyhow::Result<Vec<AdoptedFix>> {
+    if writes
+        .first()
+        .is_none_or(|newest| repo.resolve_commit(newest.commit.as_str()).is_err())
+    {
+        return Ok(Vec::new());
+    }
+    let mut references = FixReferences {
+        writes,
+        found: BTreeMap::new(),
+    };
+    let names = crate::release_model::recorded_release_names(ledger, &entry.release_scheme());
+    let mut fixes = Vec::new();
+    for name in names.into_iter().rev() {
+        let events: Vec<(&Entry, RecordedWrite)> =
+            crate::release_model::recorded_write_events(ledger, name).collect();
+        if events
+            .iter()
+            .all(|(event, _)| crate::release_model::adopted_fix_replaces(event, name).is_none())
+        {
+            continue;
+        }
+        let published = tips.get(&BookmarkRef::Remote {
+            branch: BranchName::new(name),
+            remote: RemoteName::new(entry.publish_remote()),
+        });
+        let earlier = EarlierWrites::read(repo, name, ledger, published)?;
+        for (at, (event, adopt)) in events.iter().enumerate() {
+            let Some(replaced) = crate::release_model::adopted_fix_replaces(event, name) else {
+                continue;
+            };
+            let replaced = events
+                .iter()
+                .skip(at + 1)
+                .find(|(_, older)| older.commit.short() == replaced);
+            let release = (entry, (ledger, tips), &earlier);
+            let recorded = (*event, &adopt.commit);
+            if let Some(fix) =
+                adopted_fix(repo, release, (name, recorded), (replaced, &mut references))?
+            {
+                fixes.push(fix);
+            }
+        }
+    }
+    Ok(fixes)
+}
+
+/// The reference of each file of a fix by hand ([`HeldFile::reference`]),
+/// found once for each file.
+struct FixReferences<'a> {
+    /// The series' recorded writes, newest first
+    /// ([`crate::release_model::series_writes`]).
+    writes: &'a [SeriesWrite<'a>],
+    /// Each file found so far, with its reference.
+    found: BTreeMap<String, FixReference>,
+}
+
+impl FixReferences<'_> {
+    /// The reference of `file`, a repository path: the newest of
+    /// [`Self::writes`] that holds it with no conflict, a file, a symlink, a
+    /// directory or nothing. A knives write that leaves the file conflicted
+    /// is no reference: it neither removes a fix there nor holds what a
+    /// subject must hold. The walk stops at a write that this repository
+    /// does not hold, which nothing here can read, and names it
+    /// ([`FixReference::Unread`]).
+    fn of(&mut self, repo: &Repo, file: &str) -> Result<FixReference, jj::JjError> {
+        if let Some(found) = self.found.get(file) {
+            return Ok(found.clone());
+        }
+        let mut reference = FixReference::Conflicted;
+        for write in self.writes {
+            if repo.resolve_commit(write.commit.as_str()).is_err() {
+                reference = FixReference::Unread {
+                    name: write.name.to_owned(),
+                    commit: write.commit.clone(),
+                };
+                break;
+            }
+            if !repo.conflicted_at(&write.commit, file)? {
+                reference = FixReference::Write(write.commit.clone());
+                break;
+            }
+        }
+        self.found.insert(file.to_owned(), reference.clone());
+        Ok(reference)
+    }
+}
+
+/// The fix by hand that `adopt`, a commit that `event`, an `adopt` event of
+/// `name`, recorded, holds against `replaced`, the write that event
+/// replaced, with its event, when the ledger still records it: each file of
+/// it whose hold has not ended, with its reference, which `references`
+/// finds. `None` where the hold has ended at every file. A fix whose files
+/// nothing here reads whole is held at no file, and its hold never ends
+/// here ([`AdoptedFix::unread`]).
+///
+/// Where this repository measures the fix, its files are those of the
+/// adopt's change and those that `event` names beyond them
+/// ([`measured_fix_files`]). A deletion is content: the file's absence is
+/// the fix there.
+///
+/// An adopt that this repository does not hold, or whose reading its series
+/// refuses, is a fix that nothing here can measure ([`Unmeasured`]). Its
+/// files are the ones that `event` names
+/// ([`crate::release_model::adopted_fix_text`]), and each is held to what
+/// its reference holds there. A reference that holds nothing at a file
+/// holds the fix there as an absence, as nothing here can tell a fix that
+/// deleted the file from a later write that removed it. That hold ends only
+/// where a later reference holds the file again, and the file is then held
+/// to what that reference holds. A file with no reference stays held, and
+/// no subject carries it.
+///
+/// An event without its `fix_files` list, as an older knives writes it,
+/// names its files in its text alone, which gives back a path that holds a
+/// separator in pieces ([`crate::release_model::AdoptedFixFiles::from_text`]).
+/// Where this repository measures the fix, the adopt's change gives its
+/// real files, so a path that the text may name is a file of the fix only
+/// where the adopt's own tree holds it: a piece such as `y.txt` of
+/// `x, y.txt` is no file of it. Where nothing here can measure the fix, its
+/// files are each path that the text may name, as no reading of the text
+/// can tell them apart, and each is held as any other: one that its
+/// reference does not hold is held as an absence. That may hold more than
+/// the fix. Nothing here reads the fix's files whole where the text does
+/// not read whole ([`crate::release_model::AdoptedFixText::unread`]): its
+/// list of files resolved by hand is followed by another part, so the list
+/// may end there or name a path that holds that part, or a list has more
+/// than [`crate::release_model::TEXT_PATH_PIECES`] pieces, so it may name a
+/// path of more pieces, which the text does not give. The fix is then held
+/// at no file, no path of the text is read for it, and the gate refuses
+/// every subject, naming the adopt and, where this repository does not hold
+/// it and origin or the publish remote has a branch or tag at it, its fetch,
+/// else `--allow-drop` alone (the binary's `release_cut::fix_remedy`). The
+/// `fix_files` list of a newer event reads whole. A string that is no
+/// repository path, as a peer's ledger may carry, is no file of the fix
+/// ([`jj::is_repository_path`]).
+fn adopted_fix(
+    repo: &Repo,
+    (entry, (ledger, tips), writes): (&RepoEntry, (&[Entry], &BookmarkTips), &EarlierWrites),
+    (name, (event, adopt)): (&str, (&Entry, &CommitId)),
+    (replaced, references): (Option<&(&Entry, RecordedWrite)>, &mut FixReferences<'_>),
+) -> Result<Option<AdoptedFix>, jj::JjError> {
+    let text = crate::release_model::adopted_fix_text(event, name);
+    let measure = fix_baseline(repo, (entry, (ledger, tips), writes), adopt, replaced)?
+        .map_err(|why| (why, text.unread()));
+    if matches!(measure, Err((_, Some(_)))) {
+        return Ok(Some(AdoptedFix {
+            name: name.to_owned(),
+            commit: adopt.clone(),
+            files: Vec::new(),
+            measure,
+        }));
+    }
+    let named = text.files();
+    let from_text = named.from_text;
+    let named: Vec<String> = named
+        .files
+        .into_iter()
+        .filter(|file| jj::is_repository_path(file))
+        .collect();
+    let files = if let Ok(baseline) = &measure {
+        let named = if from_text {
+            repo.held_paths(adopt, &named)?
+        } else {
+            named
+        };
+        measured_fix_files(repo, (baseline.baseline(), adopt), named, references)?
+    } else {
+        let mut files = Vec::with_capacity(named.len());
+        for path in named {
+            let reference = references.of(repo, &path)?;
+            files.push(HeldFile {
+                path,
+                reference,
+                replayed: false,
+            });
+        }
+        files
+    };
+    Ok((!files.is_empty()).then(|| AdoptedFix {
+        name: name.to_owned(),
+        commit: adopt.clone(),
+        files,
+        measure,
+    }))
+}
+
+/// The files of the fix by hand of `adopt`, which this repository measures
+/// against `baseline`, whose hold has not ended, each with its reference
+/// ([`FixReferences::of`]) and whether the adopt's change changes it
+/// ([`HeldFile::replayed`]).
+///
+/// The hold on a file of the adopt's change lasts while the change replays
+/// empty onto the file's reference there
+/// ([`jj::Repo::uncarried_resolution_paths`]), replayed once for each
+/// reference. So the hold on a file that the fix deleted lasts while the
+/// reference holds nothing there, and ends where it holds the file again.
+/// A file of `named`, the files that the adopt's event names, each once,
+/// that the change leaves out is one that nothing here measures: its hold
+/// lasts while its reference holds there what the adopt holds, nothing at
+/// both included. A file with no reference stays held.
+fn measured_fix_files(
+    repo: &Repo,
+    (baseline, adopt): (jj::ResolutionBaseline<'_>, &CommitId),
+    named: Vec<String>,
+    references: &mut FixReferences<'_>,
+) -> Result<Vec<HeldFile>, jj::JjError> {
+    let changes = jj::resolution_changes(repo, baseline, adopt)?;
+    let touched: Vec<String> = changes.resolved.into_iter().chain(changes.beyond).collect();
+    let mut uncarried: Vec<(CommitId, Vec<String>)> = Vec::new();
+    let mut files = Vec::new();
+    for path in &touched {
+        let reference = references.of(repo, path)?;
+        let held = match &reference {
+            FixReference::Unread { .. } | FixReference::Conflicted => true,
+            FixReference::Write(write) => {
+                if let Some((_, paths)) = uncarried.iter().find(|(onto, _)| onto == write) {
+                    !paths.contains(path)
+                } else {
+                    let paths = repo.uncarried_resolution_paths(baseline, adopt, write)?;
+                    let held = !paths.contains(path);
+                    uncarried.push((write.clone(), paths));
+                    held
+                }
+            }
+        };
+        if held {
+            files.push(HeldFile {
+                path: path.clone(),
+                reference,
+                replayed: true,
+            });
+        }
+    }
+    let touched: HashSet<&str> = touched.iter().map(String::as_str).collect();
+    for path in named {
+        if touched.contains(path.as_str()) {
+            continue;
+        }
+        let reference = references.of(repo, &path)?;
+        let held = match &reference {
+            FixReference::Unread { .. } | FixReference::Conflicted => true,
+            FixReference::Write(write) => repo.same_path_value(write, adopt, &path)?,
+        };
+        if held {
+            files.push(HeldFile {
+                path,
+                reference,
+                replayed: false,
+            });
+        }
+    }
+    Ok(files)
+}
+
+/// What the fix by hand of `adopt` is measured against, as `adopt`
+/// measured it ([`adopted_fix`]): the write that the adopt replaced,
+/// `replaced`, rebuilt on the adopt's composition, where that write is the
+/// baseline ([`baseline_write`]); else an automerge of that composition.
+/// Or why nothing here can measure it: this repository does not hold the
+/// adopt, or its series refuses to read it.
+fn fix_baseline(
+    repo: &Repo,
+    (entry, (ledger, tips), writes): (&RepoEntry, (&[Entry], &BookmarkTips), &EarlierWrites),
+    adopt: &CommitId,
+    replaced: Option<&(&Entry, RecordedWrite)>,
+) -> Result<Result<FixBaseline, Unmeasured>, jj::JjError> {
+    if repo.resolve_commit(adopt.as_str()).is_err() {
+        return Ok(Err(Unmeasured::Absent));
+    }
+    let Ok(reading) = release_reading(repo, entry, (ledger, tips), (writes, adopt))? else {
+        return Ok(Err(Unmeasured::Unread));
+    };
+    let replaced = match replaced {
+        Some((event, older)) => baseline_write(
+            repo,
+            entry,
+            (ledger, tips),
+            (writes, (*event, &older.commit)),
+        )?
+        .map(|composed| (older.commit.clone(), composed)),
+        None => None,
+    };
+    Ok(Ok(FixBaseline {
+        replaced,
+        composition: reading.composition(),
+    }))
 }
 
 /// What the composition gate compares: the cut's parents against the members
-/// the previous cut's ledger event recorded.
+/// its baseline records, the previous cut's and the newest write's.
 #[derive(Debug)]
 pub struct CompositionDelta<'a> {
-    pub recorded: &'a RecordedCut,
+    pub baseline: &'a CompositionBaseline,
     /// The cut's parents, for the identity and ancestry fast paths.
     pub parents: &'a [CommitId],
     /// The audit's base: what every current member forks from. A recorded
@@ -3185,18 +4309,40 @@ pub struct CompositionDelta<'a> {
     /// carries it, this cut does not, and that is a drop.
     pub trunk: &'a CommitId,
     pub tips: &'a BookmarkTips,
+    /// In a stacked series, the commit the cut subject starts on: the commit
+    /// a record names, or the first parent of a cut, the previous release it
+    /// starts on. The newest recorded write, a successor of it or a copy with
+    /// its tree must be this commit or on its first-parent line
+    /// ([`on_first_parent_line`]), so the subject carries every level of the
+    /// stack below it. `None` outside a stacked series.
+    pub start: Option<&'a CommitId>,
+    /// The fixes by hand that the series holds ([`adopted_fixes`]): each
+    /// adopt's fix, of any release of the series, at each file where its
+    /// hold has not ended, with the file's reference. The subject must
+    /// carry each such file ([`fix_lacks`]).
+    pub fixes: &'a [AdoptedFix],
 }
 
-/// Recorded members of the previous cut that the cut subject does not carry.
+/// Members the baseline records that the cut subject does not carry, in a
+/// stacked series whether it starts off the newest write's line, and the
+/// fixes by hand that the series holds that it lacks.
 ///
 /// Identity and ancestry account for a member that is still a parent, was
 /// advanced past, or entered through the cut's base. A member whose change was
 /// rewritten — `jj rebase` keeps the change id and mints a new commit — is
-/// carried when a rewrite is reachable from a parent or the base, the same
-/// succession `advance` recognises; the recorded commit itself is never an
-/// ancestor again after a rebase. A member recreated outside jj with exactly
-/// its tree is carried when that twin is reachable from a parent past the base
-/// ([`Repo::same_tree_between`]), and the twin is named. The content replay
+/// carried when a rewrite that stands for it is reachable from a parent or
+/// the base: a successor of it, or a commit with its tree
+/// ([`Repo::standing_rewrites_of`]). The recorded commit itself is never an
+/// ancestor again after a rebase. A commit that only shares its change id,
+/// such as the older version a newer member replaced, carries nothing for
+/// it here, and the checks below measure the member. The one exception is
+/// the succession the ledger records: a member of the previous cut whose
+/// change id a member of the newest write has is superseded by that member,
+/// as `advance` recorded it, and is not held; that member is. A member
+/// recreated outside jj with exactly its tree is carried when that twin is
+/// reachable
+/// from a parent past the base ([`Repo::same_tree_between`]), and the twin
+/// is named. The content replay
 /// accounts for one that landed upstream as a squash — the same measure
 /// [`audit_cut`] applies to current members, taken from the member's own fork
 /// point so a moved base is never charged to the member. A member the trunk
@@ -3204,7 +4350,26 @@ pub struct CompositionDelta<'a> {
 /// point degenerates to the member itself, and that replay would read empty
 /// without consulting the cut subject at all. A recorded commit this
 /// repository cannot resolve counts as dropped: unverifiable must not read as
-/// carried.
+/// carried. So does the newest write itself: a subject held against a write
+/// this repository does not hold is refused ([`CompositionCheck::absent_write`]),
+/// never held to less. One check of the line serves a knives cut and a
+/// record alike: the newest write, a successor of it or a copy with its tree
+/// must be [`CompositionDelta::start`] or on its first-parent line, else the
+/// subject does not carry that write's release ([`CompositionCheck::off_line`]).
+///
+/// Each fix by hand that the series holds ([`CompositionDelta::fixes`]) is
+/// held file by file, each file against its reference ([`fix_lacks`]),
+/// whatever the subject's ancestry. A fix the subject lacks at a file is
+/// named by its adopt, with each file it lacks
+/// ([`CompositionCheck::dropped_fixes`]); at a file that the subject leaves
+/// conflicted, where the newest recorded write is conflicted there too, as
+/// a knives cut over a conflicted write is, the fix is inconclusive instead
+/// and refuses nothing ([`CompositionCheck::inconclusive_fixes`]), so the
+/// cut goes ahead with the conflict for the person to resolve in place and
+/// `adopt`. A file the subject leaves conflicted where the newest write is
+/// not, as on a bookmark left behind a later adopt, is lacked. A fix whose
+/// files nothing here reads whole is lacked whatever the subject holds
+/// ([`AdoptedFix::unread`]).
 pub fn uncarried_recorded_members(
     repo: &Repo,
     path: &Path,
@@ -3212,21 +4377,56 @@ pub fn uncarried_recorded_members(
     delta: &CompositionDelta<'_>,
 ) -> anyhow::Result<CompositionCheck> {
     let mut check = CompositionCheck::default();
-    let cut_is_conflicted = !subject.conflicted_files(path)?.is_empty();
-    for member in &delta.recorded.members {
+    let conflicted = subject.conflicted_files(path)?;
+    if let Some(write) = &delta.baseline.newest_write {
+        check.absent_write = repo.resolve_commit(write.commit.as_str()).is_err();
+        if let Some(start) = delta.start.filter(|_| !check.absent_write) {
+            let line = (start, std::slice::from_ref(delta.trunk));
+            check.off_line = !on_first_parent_line(repo, &write.commit, line)?;
+        }
+        // The series holds no fix where this repository does not hold that
+        // write ([`adopted_fixes`]).
+        for fix in delta.fixes {
+            fix_findings(
+                (repo, &mut *subject),
+                fix,
+                (&write.commit, &conflicted),
+                &mut check,
+            )?;
+        }
+    }
+    // The newest write's members, by change id where this repository holds
+    // them: what a member of the previous cut is superseded by.
+    let newest = delta
+        .baseline
+        .newest_write
+        .as_ref()
+        .map_or(&[][..], |write| write.members.as_slice());
+    let mut successors = Vec::new();
+    for member in newest {
+        if repo.resolve_commit(member.as_str()).is_ok() {
+            successors.push(repo.change_id_of(member.as_str())?);
+        }
+    }
+    let cut_is_conflicted = !conflicted.is_empty();
+    for member in delta.baseline.members() {
         if delta.parents.contains(member) {
             continue;
         }
         if repo.resolve_commit(member.as_str()).is_err() {
-            check
-                .dropped
-                .push(format!("{} (not known to this repository)", member.short()));
+            check.dropped.push(RecordedMember {
+                commit: member.clone(),
+                name: format!("{} (not known to this repository)", member.short()),
+            });
+            continue;
+        }
+        if !newest.contains(member) && successors.contains(&repo.change_id_of(member.as_str())?) {
             continue;
         }
         if reaches_any(repo, member, delta)? {
             continue;
         }
-        let rewrites = repo.rewrites_of(member.as_str())?;
+        let rewrites = repo.standing_rewrites_of(member)?;
         let mut rewritten = false;
         for rewrite in &rewrites {
             if reaches_any(repo, rewrite, delta)? {
@@ -3244,24 +4444,130 @@ pub fn uncarried_recorded_members(
             continue;
         }
         if repo.is_ancestor(member, delta.trunk)? {
-            check.dropped.push(recorded_member_name(member, delta.tips));
+            check.dropped.push(recorded_member(member, delta.tips));
             continue;
         }
         let base = repo.fork_point(member, delta.trunk)?;
         match subject.replay_outcome(path, base.as_str(), member.as_str())? {
             RebaseOutcome::Empty => {}
             RebaseOutcome::Conflicted if cut_is_conflicted => {
-                check.inconclusive.push(Unverified {
-                    commit: member.clone(),
-                    name: recorded_member_name(member, delta.tips),
-                });
+                check.inconclusive.push(recorded_member(member, delta.tips));
             }
             RebaseOutcome::CleanNonEmpty | RebaseOutcome::Conflicted => {
-                check.dropped.push(recorded_member_name(member, delta.tips));
+                check.dropped.push(recorded_member(member, delta.tips));
             }
         }
     }
     Ok(check)
+}
+
+/// Record what the subject lacks of `fix`, one of the fixes by hand that the
+/// series holds ([`fix_lacks`]), in `check`: a file that the subject leaves
+/// conflicted, of `conflicted`, where `newest`, the newest recorded write,
+/// holds that conflict too, as inconclusive
+/// ([`CompositionCheck::inconclusive_fixes`]): the conflict came from a
+/// recorded write, and the person resolves it in place. Every other file
+/// it lacks as dropped ([`CompositionCheck::dropped_fixes`]), refused with
+/// the move to the newest write. A fix whose files nothing here reads whole
+/// ([`AdoptedFix::unread`]) is dropped with no file, whatever the subject
+/// holds: nothing here can tell whether the subject carries it, and the
+/// gate never holds a subject to less than the fix.
+fn fix_findings(
+    (repo, subject): (&Repo, &mut CutSubject<'_>),
+    fix: &AdoptedFix,
+    (newest, conflicted): (&CommitId, &[String]),
+    check: &mut CompositionCheck,
+) -> anyhow::Result<()> {
+    if let Some((unmeasured, why)) = fix.unread() {
+        check.dropped_fixes.push(LackedFix {
+            name: fix.name.clone(),
+            commit: fix.commit.clone(),
+            lacks: FixLack::Unread { unmeasured, why },
+        });
+        return Ok(());
+    }
+    let (mut open, mut lacked) = (Vec::new(), Vec::new());
+    for file in fix_lacks(repo, subject, fix)? {
+        if conflicted.contains(&file.path) && repo.conflicted_at(newest, &file.path)? {
+            open.push(file);
+        } else {
+            lacked.push(file);
+        }
+    }
+    for (files, found) in [
+        (lacked, &mut check.dropped_fixes),
+        (open, &mut check.inconclusive_fixes),
+    ] {
+        if !files.is_empty() {
+            found.push(LackedFix {
+                name: fix.name.clone(),
+                commit: fix.commit.clone(),
+                lacks: FixLack::Files {
+                    files,
+                    unmeasured: fix.unmeasured(),
+                },
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The files of `fix`, one of the fixes by hand that the series holds
+/// ([`AdoptedFix`]), that the cut subject does not carry, each judged on its
+/// own against its reference ([`HeldFile::reference`]).
+///
+/// The subject carries a file that the adopt's change changes where that
+/// change replays empty onto it there ([`HeldFile::replayed`]): a member
+/// that changes other lines of a file whose lines the fix changed leaves
+/// the fix there. Otherwise it carries a file where it holds exactly what
+/// the file's reference holds there, nothing at both included: a later
+/// write may change a file of the fix, a later adopt that refines it or an
+/// `include` of a member that touches it, and the replay then conflicts,
+/// as it does for any other content at a file the fix added. A file that
+/// nothing here measures is held by that test alone, and a file with no
+/// reference by the replay alone. So a subject that holds a file that the
+/// fix deleted lacks the fix there, and so does one that leaves the file
+/// conflicted; the caller reports that file as inconclusive where the
+/// newest recorded write is conflicted there too ([`fix_findings`]).
+///
+/// Only the subject's own tree counts: the candidate a cut builds, or the
+/// commit a record names. A subject with the adopt on its first-parent line
+/// carries nothing for it, as its own merge may undo the fix.
+fn fix_lacks(
+    repo: &Repo,
+    subject: &mut CutSubject<'_>,
+    fix: &AdoptedFix,
+) -> anyhow::Result<Vec<HeldFile>> {
+    let uncarried = match fix.baseline() {
+        Some(baseline) if fix.files.iter().any(|file| file.replayed) => {
+            subject.uncarried_resolution_paths(repo, baseline, &fix.commit)?
+        }
+        _ => Vec::new(),
+    };
+    let mut lacked = Vec::new();
+    for file in &fix.files {
+        if file.replayed && !uncarried.contains(&file.path) {
+            continue;
+        }
+        let held = match &file.reference {
+            FixReference::Write(reference) => {
+                subject.same_path_value(repo, reference, &file.path)?
+            }
+            FixReference::Unread { .. } | FixReference::Conflicted => false,
+        };
+        if !held {
+            lacked.push(file.clone());
+        }
+    }
+    Ok(lacked)
+}
+
+/// `commit` as the gate names it ([`recorded_member_name`]).
+fn recorded_member(commit: &CommitId, tips: &BookmarkTips) -> RecordedMember {
+    RecordedMember {
+        commit: commit.clone(),
+        name: recorded_member_name(commit, tips),
+    }
 }
 
 /// Whether the cut's base or any of its parents reaches `commit`.
@@ -3380,6 +4686,7 @@ mod cut_tests {
             anchor: None,
             pr: None,
             parents: Vec::new(),
+            fix_files: Vec::new(),
             claim_change: None,
             claim_change_why: None,
             previous_owner: None,
@@ -3552,9 +4859,12 @@ pub fn check_test_count(fork: &Fork<'_>, cut: &CommitId, parent: &CommitId) -> T
 /// `RELEASE_NOTES.md` where every side only inserted its own block
 /// ([`crate::changelog_union`]). That resolution is the same every time, so a
 /// person writing it by hand adds nothing. Each unioned file is named with the
-/// first line of every block, in the order written: the union is verbatim and
-/// never renumbers, so two blocks claiming one version read as two such lines,
-/// and settling that is a person's.
+/// first line of every block, in the order written: the union never
+/// renumbers, so two blocks claiming one version read as two such lines, and
+/// settling that is a person's. Where the blocks at a place are not plain
+/// `### ` lists in a file's one `[Unreleased]` section, the union writes each
+/// of them whole, and one line for the file names each `### ` heading that
+/// two of them leave in one section, for a person to join.
 ///
 /// Every other conflict stays a person's. Independent branches that each
 /// append a config key land in the same regions, so a real cut carries real
@@ -3572,8 +4882,8 @@ pub fn conflict_guidance(release: &str, files: &[String], unions: &[jj::UnionedF
     let mut lines = Vec::new();
     if !unions.is_empty() {
         lines.push(format!(
-            "  {} release log(s) written as the union of their sides, every block verbatim \
-             and in this order:",
+            "  {} release log(s) written as the union of their sides, each block named by its \
+             first line, in this order:",
             unions.len()
         ));
         // A path read from the tree, and each block's first line as a
@@ -3592,6 +4902,21 @@ pub fn conflict_guidance(release: &str, files: &[String], unions: &[jj::UnionedF
              renumber by hand and record it with `knives release adopt --why`"
                 .to_owned(),
         );
+        // A path read from the tree, and each heading as a member's file
+        // holds it.
+        for union in unions.iter().filter(|union| !union.left_twice.is_empty()) {
+            let headings: Vec<String> = union
+                .left_twice
+                .iter()
+                .map(|heading| format!("`{}`", inline_human_text(heading)))
+                .collect();
+            lines.push(format!(
+                "  {}: left {} twice: knives joins only plain `### ` lists in a file's one \
+                 [Unreleased] section; join them by hand",
+                inline_human_text(&union.path),
+                headings.join(", ")
+            ));
+        }
     }
     if files.is_empty() {
         lines.push(if unions.is_empty() {
@@ -3617,13 +4942,215 @@ pub fn conflict_guidance(release: &str, files: &[String], unions: &[jj::UnionedF
             .to_owned(),
     );
     lines.push("  then re-check the parent count and the test count before publishing".to_owned());
-    // The release is a name read from the repository.
+    // The release is a name read from the repository, inside a command.
     lines.push(format!(
         "  after resolving them by hand, run `knives release adopt {}` before the next write, \
          which refuses until then",
-        inline_human_text(release)
+        crate::ledger::shell_word(release)
     ));
     lines.join("\n")
+}
+
+/// Run the steps of a command that writes the release, then print the
+/// repeated `### ` headings of its last write once (README.md, "Release workflow").
+///
+/// `steps` gets the slot for the command's last write ([`ReportedWrite`]).
+/// A step that prints a write's report with its headings takes the write out
+/// of the slot. After the steps, whether they end or fail, the write still
+/// in the slot prints its headings, and the steps' result is returned as it
+/// is.
+pub fn with_last_write_headings<T>(
+    steps: impl FnOnce(&mut Option<ReportedWrite>) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut last = None;
+    let finished = steps(&mut last);
+    if let Some(last) = &last {
+        last.report_headings();
+    }
+    finished
+}
+
+/// What a cut prints about the tree it wrote.
+///
+/// That tree is `written`'s, written under `release` with `unions` and read
+/// through the one opening made after the write ([`ReportedWrite`]): the
+/// conflict report ([`conflict_report`]), then a line for each `### `
+/// heading that a release log of the tree holds more than once in its one
+/// `[Unreleased]` section ([`report_repeated_headings`]). The cut takes its
+/// write out of the slot of [`with_last_write_headings`] to print it, so
+/// those headings print here and not again.
+pub fn written_report(
+    written: &ReportedWrite,
+    release: &str,
+    unions: &[jj::UnionedFile],
+) -> String {
+    let mut report = conflict_report(release, written.conflicts(), unions);
+    for line in written.heading_lines() {
+        report.push('\n');
+        report.push_str(&line);
+    }
+    report
+}
+
+/// A release a command wrote, read through one opening of the repository as
+/// soon as the write is done.
+///
+/// The opening lists the files its tree leaves conflicted when they are
+/// asked for, which the write's own report prints ([`conflict_report`]),
+/// and reads its repeated `### ` headings ([`with_last_write_headings`]).
+/// Each release write is read through it as soon as it is written; when
+/// those headings print is README.md's rule ("Release workflow").
+#[derive(Debug)]
+pub struct ReportedWrite {
+    /// The opening and the commit read through it, or the error that the
+    /// opening, or the lookup of a moved release's commit through it, gave.
+    reading: Result<(Repo, CommitId), jj::JjError>,
+    /// The files the tree leaves conflicted, listed through the opening
+    /// the first time they are asked for, or the error jj gave.
+    conflicts: std::cell::OnceCell<Result<Vec<String>, jj::JjError>>,
+}
+
+impl ReportedWrite {
+    /// Open the repository at `path` once, after the write of `commit`.
+    pub fn read(path: &Path, commit: CommitId) -> Self {
+        Self {
+            reading: Repo::open(path).map(|opened| (opened, commit)),
+            conflicts: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Open the repository at `path` once, after a move that rewrote the
+    /// release under `change`, and find through that opening the one
+    /// visible commit of `change`: the release the move left. The lookup
+    /// reads no name, so a release name that a concurrent operation left
+    /// conflicted does not stop it. No visible commit of `change`, or more
+    /// than one, is an error that the reading keeps, as it keeps the
+    /// opening's.
+    pub fn read_moved(path: &Path, change: &ChangeId) -> Self {
+        Self {
+            reading: Repo::open(path).and_then(|opened| {
+                let visible = opened.visible_commits_of_change(change.as_str())?;
+                let [commit] = <[CommitId; 1]>::try_from(visible).map_err(|visible| {
+                    jj::JjError::Revision {
+                        revision: change.as_str().to_owned(),
+                        detail: format!(
+                            "the move left {} visible commits of the release's change, not one",
+                            visible.len()
+                        ),
+                    }
+                })?;
+                Ok((opened, commit))
+            }),
+            conflicts: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The repository as the write left it, or the error its reading gave.
+    pub fn opened(&self) -> Result<&Repo, &jj::JjError> {
+        self.reading.as_ref().map(|(opened, _)| opened)
+    }
+
+    /// The files the tree leaves conflicted, or the error jj gave.
+    pub fn conflicts(&self) -> Result<&[String], &jj::JjError> {
+        let (opened, commit) = self.reading.as_ref()?;
+        self.conflicts
+            .get_or_init(|| opened.conflicted_files(commit.as_str()))
+            .as_deref()
+    }
+
+    /// Print a line for each `### ` heading that a release log of the tree
+    /// holds more than once in its one `[Unreleased]` section, read through
+    /// the same opening.
+    fn report_headings(&self) {
+        for line in self.heading_lines() {
+            println!("{line}");
+        }
+    }
+
+    /// The lines [`Self::report_headings`] prints ([`heading_report`]).
+    fn heading_lines(&self) -> Vec<String> {
+        match &self.reading {
+            Ok((opened, commit)) => {
+                heading_report(opened.repeated_headings(commit.as_str()).as_deref())
+            }
+            Err(error) => heading_report(Err(error)),
+        }
+    }
+}
+
+/// The lines a release write prints about the files its tree leaves
+/// conflicted.
+///
+/// They are `conflicts` as jj read them, in [`conflict_guidance`]'s words,
+/// or the error jj gave. The error is escaped: it quotes jj, the store and
+/// the paths in the tree.
+pub fn conflict_report(
+    release: &str,
+    conflicts: Result<&[String], &jj::JjError>,
+    unions: &[jj::UnionedFile],
+) -> String {
+    match conflicts {
+        Ok(files) => conflict_guidance(release, files, unions),
+        Err(error) => format!(
+            "  could not list conflicts: {}",
+            crate::ledger::problem_human_text(&error.to_string())
+        ),
+    }
+}
+
+/// Print one line for each `### ` heading that a release log of `commit`'s
+/// tree holds more than once in its one `[Unreleased]` section.
+///
+/// `adopt` and the record of a published composition call it after they
+/// recorded that tree ([`jj::repeated_headings`]); a command that writes
+/// the release prints the same lines for its last write
+/// ([`with_last_write_headings`]). Every release log in the tree is read,
+/// changed or not, and whoever placed its lines: a clean merge, a member or
+/// a person. A heading that the union's own line names as left twice inside
+/// that one `[Unreleased]` section is named here too. knives changes no line
+/// for it: a person joins the lists before the release is pushed.
+pub fn report_repeated_headings(path: &Path, commit: &CommitId) {
+    for line in heading_report(jj::repeated_headings(path, commit.as_str()).as_deref()) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`report_repeated_headings`] prints: those of `repeated` as jj
+/// read them ([`repeated_heading_lines`]), or the error jj gave, escaped as
+/// [`conflict_report`] escapes it.
+fn heading_report(repeated: Result<&[jj::RepeatedHeadings], &jj::JjError>) -> Vec<String> {
+    match repeated {
+        Ok(repeated) => repeated_heading_lines(repeated),
+        Err(error) => vec![format!(
+            "  could not read the release logs for repeated headings: {}",
+            crate::ledger::problem_human_text(&error.to_string())
+        )],
+    }
+}
+
+/// The lines [`report_repeated_headings`] prints, one for each file and
+/// heading. The path is read from the tree and the heading from the file, so
+/// each reaches the terminal escaped.
+fn repeated_heading_lines(repeated: &[jj::RepeatedHeadings]) -> Vec<String> {
+    use crate::ledger::inline_human_text;
+    repeated
+        .iter()
+        .flat_map(|file| {
+            file.headings.iter().map(|(heading, count)| {
+                let times = if *count == 2 {
+                    "twice".to_owned()
+                } else {
+                    format!("{count} times")
+                };
+                format!(
+                    "  {}: [Unreleased] holds `{}` {times}; knives changed no line for it; join \
+                     them by hand before you push",
+                    inline_human_text(&file.path),
+                    inline_human_text(heading)
+                )
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -3702,6 +5229,100 @@ mod conflict_tests {
             "{rendered}"
         );
     }
+
+    #[test]
+    fn a_heading_left_twice_is_named_with_its_file_and_escaped() {
+        // Given: a release log that a write unioned whole, which leaves in two
+        // blocks of one section a heading with a control character, and a
+        // release log whose lists the write joined.
+        let left = jj::UnionedFile {
+            path: "CHANGELOG.md".to_owned(),
+            first_lines: vec!["### Fixed\u{1b}[2J".to_owned(); 2],
+            left_twice: vec!["### Fixed\u{1b}[2J".to_owned()],
+        };
+        let joined = jj::UnionedFile {
+            path: "RELEASE_NOTES.md".to_owned(),
+            first_lines: vec!["### Fixed".to_owned()],
+            left_twice: Vec::new(),
+        };
+
+        // When: its guidance is rendered.
+        let rendered = conflict_guidance("release/2026-08-30", &[], &[left, joined]);
+
+        // Then: one line names the first file and its heading, escaped, and
+        // no line names the joined file so.
+        assert!(
+            rendered.contains(
+                "\n  CHANGELOG.md: left `### Fixed\u{fffd}[2J` twice: knives joins only plain \
+                 `### ` lists in a file's one [Unreleased] section; join them by hand\n"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains('\u{1b}'), "{rendered}");
+        assert_eq!(rendered.matches(" twice: ").count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn a_repeated_heading_is_named_once_for_each_file_and_heading_escaped() {
+        // Given: a changelog whose `[Unreleased]` section holds `### Added`
+        // twice and a heading with a control character three times, and
+        // release notes that hold `### Fixed` twice.
+        let repeated = [
+            jj::RepeatedHeadings {
+                path: "CHANGELOG.md".to_owned(),
+                headings: vec![
+                    ("### Added".to_owned(), 2),
+                    ("### Fixed\u{1b}[2J".to_owned(), 3),
+                ],
+            },
+            jj::RepeatedHeadings {
+                path: "docs/RELEASE_NOTES.md".to_owned(),
+                headings: vec![("### Fixed".to_owned(), 2)],
+            },
+        ];
+
+        // When: its lines are rendered.
+        let lines = repeated_heading_lines(&repeated);
+
+        // Then: one line names each file and heading, with how many times,
+        // escaped.
+        assert_eq!(
+            lines,
+            [
+                "  CHANGELOG.md: [Unreleased] holds `### Added` twice; knives changed no line for \
+                 it; join them by hand before you push",
+                "  CHANGELOG.md: [Unreleased] holds `### Fixed\u{fffd}[2J` 3 times; knives changed \
+                 no line for it; join them by hand before you push",
+                "  docs/RELEASE_NOTES.md: [Unreleased] holds `### Fixed` twice; knives changed no \
+                 line for it; join them by hand before you push",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_jj_error_in_the_conflict_report_reaches_the_terminal_escaped() {
+        // Given: an error jj gave, whose text holds an escape sequence and a
+        // bell, as the store's text or a path in the tree may.
+        let error = jj::JjError::Revision {
+            revision: "release/2026-08-30".to_owned(),
+            detail: "no such commit\u{1b}[2J\u{7}".to_owned(),
+        };
+
+        // When: the conflict report and the repeated-heading lines name it.
+        let conflicts = conflict_report("release/2026-08-30", Err(&error), &[]);
+        let headings = heading_report(Err(&error));
+
+        // Then: each names the error with its control characters escaped.
+        let shown =
+            "could not resolve revision `release/2026-08-30`: no such commit\u{fffd}[2J\u{fffd}";
+        assert_eq!(conflicts, format!("  could not list conflicts: {shown}"));
+        assert_eq!(
+            headings,
+            [format!(
+                "  could not read the release logs for repeated headings: {shown}"
+            )]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3722,6 +5343,7 @@ mod members_tests {
             advanced: advanced.iter().map(ToString::to_string).collect(),
             base_parent,
             carrier: false,
+            previous_release: None,
         }
     }
 
@@ -3993,17 +5615,23 @@ mod members_tests {
         run_jj(&repository, &["new"]);
         let edited = at(&repository, name);
         let opened = Repo::open(&repository).expect("open test repository");
+        let entry = RepoEntry::new("upstream", "origin");
         let ledger = [cut_event(name, written.as_str(), &[member.as_str()])];
+        let tips = opened.bookmark_tips().expect("read bookmarks");
         let standing = |ledger: &[Entry], commit: &CommitId| {
             let writes = EarlierWrites::read(&opened, name, ledger, None).expect("read writes");
-            in_hand_write(&InHand {
-                repo: &opened,
-                ledger,
-                name,
-                commit,
-                writes: &writes,
-                published: None,
-            })
+            in_hand_write(
+                &InHand {
+                    repo: &opened,
+                    ledger,
+                    name,
+                    commit,
+                    writes: &writes,
+                    published: None,
+                    tips: &tips,
+                },
+                &entry,
+            )
             .expect("read the standing")
         };
         let recorded_cut = |commit: &CommitId| RecordedWrite {
@@ -4020,7 +5648,8 @@ mod members_tests {
         assert_eq!(
             standing(&ledger, &edited),
             InHandWrite::Unrecorded {
-                write: recorded_cut(&written)
+                write: recorded_cut(&written),
+                onto_previous: false,
             }
         );
         // And: a matched write this repository does not hold leaves the edit

@@ -459,12 +459,14 @@ fn adopt_refuses_a_release_with_no_recorded_write() {
     // When: it is adopted.
     let output = adopt(&lab, &home, &[]);
 
-    // Then: refused: there is no write for it to replace.
+    // Then: refused: there is no write for it to replace, and the refusal
+    // names the command that records a release cut outside knives.
     assert_eq!(output.status.code(), Some(3), "{}", text(&output));
     assert!(
         stdout(&output).contains(&format!(
             "demo: the ledger records no cut or edit of {RELEASE}, so there is no write for {} \
-             to replace; cut the release first",
+             to replace; cut the release first, or, for a release cut outside knives, \
+             `knives release cut <name> --at <commit>`",
             commit_at(&lab, RELEASE).short()
         )),
         "{}",

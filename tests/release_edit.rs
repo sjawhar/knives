@@ -178,6 +178,63 @@ fn include_adds_one_parent_and_changes_nothing_else() {
 }
 
 #[test]
+fn an_include_whose_record_fails_after_its_write_names_a_heading_held_twice_once() {
+    // Given: a cut of alpha and beta; gamma, whose changelog's one
+    // `[Unreleased]` section holds `### Added` twice; and then a state file
+    // nobody can read, which the include reads to name who records its
+    // event, after it wrote the release.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    lab.branch(
+        "feat/gamma",
+        "CHANGELOG.md",
+        "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Gamma's addition.\n\n### Added\n\n\
+         - An earlier addition.\n",
+    );
+    std::fs::write(home.path().join("state.json"), "{not json").expect("corrupt state");
+
+    // When: an anonymous terminal user includes gamma.
+    let output = lab::without_harness_session(&mut lab::release_command(
+        &lab,
+        &home,
+        lab::ReleaseOutput::Text,
+        &["include", "feat/gamma"],
+    ))
+    .env_remove("KNIVES_OWNER")
+    .output()
+    .expect("run knives release include");
+
+    // Then: the command exits with the record's failure, the release is the
+    // include's write, and one line names the file and the heading, for it.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stderr.contains("state.json"), "{stderr}");
+    assert!(
+        release_parents(&lab, "release/2026-08-04").contains(&commit_at(&lab, "feat/gamma")),
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("[Unreleased] holds").count(),
+        1,
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(
+            "  CHANGELOG.md: [Unreleased] holds `### Added` twice; knives changed no line for \
+             it; join them by hand before you push\n"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn a_release_edit_is_one_operation_described_for_the_op_log() {
     // Given: a cut release and a new branch to include. An include used to be
     // three operations (duplicate, describe, bookmark set), each described as

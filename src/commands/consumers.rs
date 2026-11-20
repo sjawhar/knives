@@ -251,9 +251,9 @@ fn newest_live(
             .iter()
             .filter_map(|(full, commit)| {
                 let name = full.strip_prefix("refs/heads/")?;
-                scheme.dated_cut(name).map(|order| (order, name, commit))
+                scheme.cut_key(name).map(|key| (key, name, commit))
             })
-            .max_by_key(|(order, _, _)| order.clone())
+            .max_by_key(|&(key, _, _)| key)
             .map(|(_, name, commit)| (name.to_owned(), commit.clone())),
         ReleaseScheme::Fixed(name) => refs
             .get(&format!("refs/heads/{name}"))
@@ -519,6 +519,10 @@ mod tests {
 
     #[test]
     fn a_malformed_lock_fragment_makes_the_consumer_incomplete_instead_of_current() {
+        // `consumer_row` runs `git` from `PATH` to read the consumer's origin
+        // trunk, and other tests of this process swap `PATH` under the
+        // environment lock; without it, `git` may not run, and the row gains
+        // a problem this test does not expect.
         let _lock = crate::config::test_support::environment_lock();
         let consumer = tempfile::tempdir().expect("create consumer");
         std::fs::write(

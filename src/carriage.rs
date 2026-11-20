@@ -22,7 +22,7 @@ use crate::bind::Fork;
 use crate::config::Role;
 use crate::detect::{BookmarkTips, RebaseOutcome};
 use crate::forge::{Forge, index_pulls};
-use crate::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, is_our_release};
+use crate::ids::{BookmarkRef, BranchName, CommitId, CutKey, ReleaseScheme, is_our_release};
 use crate::jj::Repo;
 use crate::release_model;
 use crate::snapshot::{self, SnapshotConfig};
@@ -59,9 +59,12 @@ pub enum CarryVerdict {
     /// Its net tree change leaves the target unchanged, whether the same content
     /// arrived through different commits or the revision itself has no net content.
     CarriedRewritten,
-    /// Its tree does not replay cleanly, but a rewrite of its change — same
-    /// change id, a different commit — is an ancestor of the target: the change
-    /// is carried as its author rebased it, and that rewrite is the evidence.
+    /// Its tree does not replay cleanly, but a rewrite of its change that
+    /// stands for it — a successor of it, or a commit with its tree
+    /// ([`crate::jj::Repo::standing_rewrites_of`]) — is an ancestor of the
+    /// target: the change is carried as its author rebased it, and that
+    /// rewrite is the evidence. An older version of the change, which only
+    /// shares its change id, carries nothing of what the newer one added.
     CarriedRebased,
     NotCarried,
     /// The replay conflicted while the target itself is clean: some content
@@ -680,7 +683,7 @@ fn render_check(check: &TargetCheck, indent: &str) -> String {
 /// release refs (grouped, so one name at two commits is two targets), plus the
 /// upstream trunk.
 ///
-/// Live/superseded comes from [`ReleaseScheme::dated_cut`] ordering within the
+/// Live/superseded comes from [`ReleaseScheme::cut_key`] ordering within the
 /// scheme's series; under a fixed scheme every release ref of the configured
 /// name is Live.
 pub fn targets(
@@ -693,22 +696,22 @@ pub fn targets(
         ReleaseScheme::Dated | ReleaseScheme::Series(_) => tips
             .keys()
             .filter(|reference| is_our_release(reference, scheme, publish_remote))
-            .filter_map(|reference| scheme.dated_cut(reference.branch().as_str()))
+            .filter_map(|reference| scheme.cut_key(reference.branch().as_str()))
             .max(),
         ReleaseScheme::Fixed(_) => None,
     };
     let mut grouped =
-        BTreeMap::<CommitId, (Vec<BookmarkRef>, TargetRole, Option<(String, u32)>)>::new();
+        BTreeMap::<CommitId, (Vec<BookmarkRef>, TargetRole, Option<CutKey<'_>>)>::new();
 
     for (reference, commit) in tips
         .iter()
         .filter(|(reference, _)| is_our_release(reference, scheme, publish_remote))
     {
-        let dated_name = scheme.dated_cut(reference.branch().as_str());
+        let dated_name = scheme.cut_key(reference.branch().as_str());
         let role = match scheme {
             ReleaseScheme::Dated | ReleaseScheme::Series(_)
                 if matches!(
-                    (dated_name.as_ref(), newest_release.as_ref()),
+                    (dated_name, newest_release),
                     (Some(dated_name), Some(newest_release)) if dated_name == newest_release
                 ) =>
             {
@@ -717,13 +720,11 @@ pub fn targets(
             ReleaseScheme::Dated | ReleaseScheme::Series(_) => TargetRole::SupersededRelease,
             ReleaseScheme::Fixed(_) => TargetRole::LiveRelease,
         };
-        let entry = grouped.entry(commit.clone()).or_insert_with(|| {
-            (
-                Vec::new(),
-                TargetRole::SupersededRelease,
-                dated_name.clone(),
-            )
-        });
+        let entry = grouped.entry(commit.clone()).or_insert((
+            Vec::new(),
+            TargetRole::SupersededRelease,
+            dated_name,
+        ));
         entry.0.push(reference.clone());
         if role == TargetRole::LiveRelease {
             entry.1 = TargetRole::LiveRelease;
@@ -852,7 +853,7 @@ pub fn check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryChe
         RebaseOutcome::Conflicted => CarryVerdict::Conflicted,
     };
     if verdict != CarryVerdict::CarriedRewritten {
-        for rewrite in input.repo.rewrites_of(input.tip.as_str())? {
+        for rewrite in input.repo.standing_rewrites_of(input.tip)? {
             if input.repo.is_ancestor(&rewrite, &target.commit)? {
                 return Ok(CarryCheck {
                     verdict: CarryVerdict::CarriedRebased,

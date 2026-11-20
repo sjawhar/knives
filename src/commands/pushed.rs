@@ -72,6 +72,16 @@ pub(crate) struct LiveRefs {
 }
 
 impl LiveRefs {
+    /// Live refs as [`live_refs`] reads them: `release` is `None` when the
+    /// release role is origin's own remote.
+    #[cfg(test)]
+    pub(crate) const fn new(
+        origin: BTreeMap<String, CommitId>,
+        release: Option<BTreeMap<String, CommitId>>,
+    ) -> Self {
+        Self { origin, release }
+    }
+
     pub(crate) const fn origin(&self) -> &BTreeMap<String, CommitId> {
         &self.origin
     }

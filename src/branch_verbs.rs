@@ -271,10 +271,11 @@ pub(crate) fn run_finish(
     if let Err(refused) = kept {
         eprintln!(
             "{}/{branch}: claim {claim}; jj could not snapshot all of the working copy at {}, \
-             so the workspace is kept exactly as it is and the next `knives start {branch}` \
+             so the workspace is kept exactly as it is and the next `knives start {}` \
              adopts that directory without touching what is in it\n{}",
             fork.name,
             inline_human_text(&refused.at.display().to_string()),
+            knives::ledger::shell_word(branch.as_str()),
             knives::ledger::problem_human_text(&refused.refused.to_string()),
         );
         return Ok(Exit::Incomplete);
@@ -437,11 +438,12 @@ fn release_on_ledger(
         } => Err(changed_meanwhile(ledger, held)),
         ClaimOutcome::NotApplied { why, failure } => {
             eprintln!(
-                "nothing was released: {}; run `knives finish {branch}` again",
+                "nothing was released: {}; run `knives finish {}` again",
                 unwritten(
                     &ledger.shared,
                     &unapplied_cause(&ledger.shared, &why, &failure)
-                )
+                ),
+                knives::ledger::shell_word(branch.as_str())
             );
             Err(Exit::Incomplete)
         }
@@ -449,10 +451,11 @@ fn release_on_ledger(
             eprintln!(
                 "the release of the claim of {branch} was pushed to the ledger {} ({}), and \
                  whether it landed is unknown: {}; this machine's state file and the workspace \
-                 are left as they were, and `knives finish {branch}` reads the claim again",
+                 are left as they were, and `knives finish {}` reads the claim again",
                 ledger.shared.ledger,
                 git_dir_of(&ledger.shared),
-                problem_human_text(&failure.cause)
+                problem_human_text(&failure.cause),
+                knives::ledger::shell_word(branch.as_str())
             );
             Err(Exit::Incomplete)
         }
@@ -507,7 +510,8 @@ fn changed_meanwhile(ledger: &Ledgered<'_>, held: bool) -> Exit {
 fn no_claim_now(branch: &BranchName) -> String {
     format!(
         "the ledger holds no claim of {branch} now; it was released or taken on another \
-         machine; run `knives ledger sweep` then `knives notch {branch}` to read by whom"
+         machine; run `knives ledger sweep` then `knives notch {}` to read by whom",
+        knives::ledger::shell_word(branch.as_str())
     )
 }
 
@@ -532,8 +536,9 @@ fn copy_superseded(branch: &BranchName, holder: &str) -> String {
     format!(
         "the ledger holds another owner's claim of {branch} in place of yours\n{holder}\nthis \
          machine's record of your claim is removed, and nothing else was changed: the \
-         workspace and its registration stay as they are\nuse `knives start {branch} --force \
-         --why \"…\"` to take the branch back"
+         workspace and its registration stay as they are\nuse `knives start {} --force \
+         --why \"…\"` to take the branch back",
+        knives::ledger::shell_word(branch.as_str())
     )
 }
 
@@ -861,9 +866,10 @@ fn live_users_gate(
     let shown = inline_human_text(&list);
     eprintln!(
         "{}/{branch}: {} is in use by {shown}; finishing would take the directory from under \
-         it\nuse `knives finish {branch} --force --why \"…\"` once it is done",
+         it\nuse `knives finish {} --force --why \"…\"` once it is done",
         fork.name,
-        inline_human_text(&directory.display().to_string())
+        inline_human_text(&directory.display().to_string()),
+        knives::ledger::shell_word(branch.as_str())
     );
     Err(Exit::Usage)
 }
@@ -1141,7 +1147,7 @@ fn claim_gate(finishing: &Finishing<'_>, store: &Store) -> anyhow::Result<Finish
         eprintln!(
             "{}\nuse `knives finish {} --force --why \"…\"` to release the claim",
             unreadable_holder(target, &ledger.claim, commit, cause),
-            target.branch
+            knives::ledger::shell_word(target.branch.as_str())
         );
         return Ok(FinishClaimGate::Refuse(Exit::Usage));
     }
@@ -1257,7 +1263,7 @@ fn unheld_gate(finishing: &Finishing<'_>, store: &Store) -> anyhow::Result<Finis
         "{}\nnobody holds {} now\nuse `knives start {}` to claim it again",
         displacement(target, &identity.owner, change, lost),
         target.key(),
-        target.branch,
+        knives::ledger::shell_word(target.branch.as_str()),
     );
     Ok(FinishClaimGate::Lost)
 }
@@ -1309,6 +1315,8 @@ struct Refusal<'a> {
 fn refuse_held(refusal: &Refusal<'_>) -> FinishClaimGate {
     let context = &refusal.context;
     let branch = &refusal.target.branch;
+    // The branch is one shell word inside each command a person pastes.
+    let word = knives::ledger::shell_word(branch.as_str());
     // The notice belongs to a caller another owner name displaced. A caller
     // whose own name holds the claim lost it to nobody: it is refused because
     // two identities of that name cannot be told apart, and telling it that
@@ -1319,7 +1327,7 @@ fn refuse_held(refusal: &Refusal<'_>) -> FinishClaimGate {
     {
         eprintln!(
             "{}\n{context}\nnothing was changed here: the workspace and its registration are \
-             the holder's\nuse `knives start {branch} --force --why \"…\"` to take the branch back",
+             the holder's\nuse `knives start {word} --force --why \"…\"` to take the branch back",
             displacement(refusal.target, &refusal.identity.owner, change, lost),
         );
         return FinishClaimGate::Refuse(Exit::Findings);
@@ -1337,7 +1345,7 @@ fn refuse_held(refusal: &Refusal<'_>) -> FinishClaimGate {
         )
     });
     eprintln!(
-        "{anonymous_note}{context}\n{unread}use `knives finish {branch} --force --why \"…\"` to \
+        "{anonymous_note}{context}\n{unread}use `knives finish {word} --force --why \"…\"` to \
          release the claim"
     );
     FinishClaimGate::Refuse(Exit::Usage)
@@ -1455,7 +1463,7 @@ fn place_gate(
         claim.key(),
         inline_human_text(&claim.owner),
         inline_human_text(taken),
-        target.branch,
+        knives::ledger::shell_word(target.branch.as_str()),
     );
     FinishClaimGate::Refuse(Exit::Usage)
 }
@@ -1679,10 +1687,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        Place, Registration, finish_provenance, left_to_its_owner, removal_note, shared_holder,
-        spoken, with_requirements,
+        Place, Registration, copy_superseded, finish_provenance, left_to_its_owner, no_claim_now,
+        removal_note, shared_holder, spoken, with_requirements,
     };
-    use knives::ids::Requirement;
+    use knives::ids::{BranchName, Requirement};
     use knives::jj::WorkspaceIdentity;
     use knives::store::{Claim, OwnerKind};
 
@@ -1898,5 +1906,44 @@ mod tests {
              processes are on machine machine-one"
         );
         assert!(!holder.contains("no activity observed"), "{holder}");
+    }
+
+    #[test]
+    fn a_branch_the_shell_reads_apart_is_one_quoted_word_in_the_notch_a_finish_offers() {
+        // Given: a branch whose name holds a `$`, which a shell expands
+        let branch = BranchName::new("feat/a$b");
+
+        // When: a finish says the ledger holds no claim of it now
+        let said = no_claim_now(&branch);
+
+        // Then: the `notch` it offers names the branch as one quoted word,
+        // and the prose names it as it is
+        assert_eq!(
+            said,
+            "the ledger holds no claim of feat/a$b now; it was released or taken on another \
+             machine; run `knives ledger sweep` then `knives notch 'feat/a$b'` to read by whom"
+        );
+    }
+
+    #[test]
+    fn a_branch_the_shell_reads_apart_is_one_quoted_word_in_the_start_a_finish_offers() {
+        // Given: a branch whose name holds a `$`, which a shell expands, and
+        // the holder of the claim that replaced the caller's
+        let branch = BranchName::new("feat/a$b");
+        let holder = "acme/demo/feat/a$b is claimed by owner-two";
+
+        // When: a finish says another owner's claim replaced the caller's
+        let said = copy_superseded(&branch, holder);
+
+        // Then: the `start --force` it offers names the branch as one quoted
+        // word, and the prose names it as it is
+        assert_eq!(
+            said,
+            "the ledger holds another owner's claim of feat/a$b in place of yours\n\
+             acme/demo/feat/a$b is claimed by owner-two\n\
+             this machine's record of your claim is removed, and nothing else was changed: the \
+             workspace and its registration stay as they are\n\
+             use `knives start 'feat/a$b' --force --why \"…\"` to take the branch back"
+        );
     }
 }

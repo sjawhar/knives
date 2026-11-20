@@ -457,8 +457,10 @@ pub enum Command {
         consumer: Vec<PathBuf>,
         /// The release series to act on, one of the entry's `[repos.<name>.series]`.
         /// Omitted, the default series: the entry's own `base` and its
-        /// `release/YYYY-MM-DD[.N]` cuts. Every subcommand sees only that
-        /// series' cuts and the branches that fork from its base.
+        /// `release/YYYY-MM-DD[.N|-<label>]` cuts. Every subcommand sees only
+        /// that series' cuts and the branches that fork from its base. Each
+        /// series has one order: by date, then by the rest of the name in
+        /// version order, so a later name on a date supersedes an earlier one.
         #[arg(long, global = true)]
         series: Option<String>,
     },
@@ -533,15 +535,75 @@ pub enum LedgerAction {
 
 #[derive(Debug, Subcommand)]
 pub enum ReleaseAction {
-    /// Name a new cut of the composition in hand, verbatim. Never pushes.
+    /// Name a new cut of the composition in hand, verbatim. Never pushes the release.
+    ///
+    /// On a fork that shares its ledger, the cut's ledger event is pushed
+    /// there before the command exits.
+    ///
+    /// With `--at`, record a release cut outside knives instead: the commit
+    /// REV becomes NAME's recorded cut, and no commit is made. NAME must sort
+    /// after every other release of the series, so record the older name
+    /// first. REV must have no conflict and be no workspace's working copy,
+    /// every ref of NAME here or on the publish remote must name it, and a
+    /// published NAME must be one the publish remote holds: the refusal
+    /// gives the push that records it. A NAME no ref names gets a local
+    /// bookmark at REV. The commit is audited as a cut is, and it must carry
+    /// each member of the previous cut and of the newest write of the newest
+    /// release the ledger records in the series, and each fix by hand an
+    /// `adopt` of any release of the series recorded, file by file: at each
+    /// file where the file's reference, the newest recorded write that holds
+    /// it with no conflict, still holds the adopt's content, REV's own tree
+    /// must carry the adopt's change there, by a replay where this
+    /// repository can measure the adopt, else by holding what the reference
+    /// holds there, nothing included. A write that leaves the file
+    /// conflicted is no reference and does not end the hold. A deletion is
+    /// content: a REV that holds a file the fix deleted lacks the fix. For an
+    /// adopt this repository cannot measure, as where it does not hold the
+    /// adopt, each named file is held to what its reference holds, and a
+    /// reference that holds nothing there holds the fix as an absence. An
+    /// adopt event that an older knives wrote names its files in its text
+    /// alone; each path that its text may name is held where this
+    /// repository cannot measure the adopt, and where it can, each such path
+    /// that the adopt's own tree holds. Where this repository cannot measure
+    /// the adopt and that text does not read whole (a list of more than 16
+    /// pieces, or a list of files resolved by hand that another part
+    /// follows, which may end there or name a path that holds that part),
+    /// REV is refused, naming the adopt, and the fetch of its commit where
+    /// this repository does not hold it and origin or the publish remote has
+    /// a branch or tag at it, else `--allow-drop` alone. `--allow-drop` is
+    /// the last resort there: it also waives the checks of each recorded
+    /// member, of the newest recorded write and of each other fix by hand. A
+    /// repository that does not hold the newest write is refused and told to
+    /// fetch it.
+    /// In a stacked series that write, a successor of it or a copy with its
+    /// tree must be on its first-parent line. The ledger event records its
+    /// members: in a stacked series the side parents on its first-parent
+    /// line, with its previous release labelled as no member. No reap runs,
+    /// and the release is not signed or pushed; its ledger event is pushed
+    /// as a cut's is.
     Cut {
-        /// The dated release name. Omit it for a configured fixed release branch.
+        /// The dated release name, `release/[<series>/]YYYY-MM-DD[.N|-<label>]`.
+        /// It must sort after the newest release of the series. Omit it for a
+        /// configured fixed release branch.
         name: Option<String>,
         /// Proceed even when the cut would drop something: commits reachable
-        /// only from the previous release lineage, or members the previous
-        /// cut's ledger event recorded. The refusal lists exactly what.
+        /// only from the previous release lineage, members that the
+        /// previous cut's ledger event or the newest recorded write of the
+        /// newest release the ledger records in the series holds, a file of
+        /// a fix by hand that an `adopt` of any release of the series
+        /// recorded and the file's reference still holds, a fix by hand
+        /// whose files this repository cannot read whole, the newest write
+        /// itself where this repository does not hold it, or in a stacked
+        /// series that write, off the line the cut starts on. The refusal
+        /// lists exactly what, each file of a fix by name.
         #[arg(long)]
         allow_drop: bool,
+        /// Record a release cut outside knives: the commit becomes NAME's
+        /// recorded cut; no commit is made. A dated or series NAME only: a
+        /// fixed release branch records its published composition with a
+        /// plain `cut`.
+        #[arg(long, value_name = "REV")]
+        at: Option<String>,
     },
     /// Rebase the composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
     ///
@@ -634,7 +696,9 @@ pub enum ReleaseAction {
     /// each member added that it no longer holds, and a file changed outside
     /// the conflicts needs `--why`. Writes no commit and moves no bookmark:
     /// the record is a ledger event, and earlier writes of the name that
-    /// nothing rests on are abandoned.
+    /// nothing rests on are abandoned. A name the ledger records no cut of,
+    /// a release cut outside knives, is recorded first with `knives release
+    /// cut NAME --at <commit>`.
     Adopt {
         /// The release name. Defaults to the release in hand.
         reference: Option<String>,
@@ -677,8 +741,8 @@ pub enum ReleaseAction {
         #[arg(long, requires = "census", conflicts_with_all = ["reference", "verify", "carries"])]
         no_github: bool,
     },
-    /// Reap superseded dated cuts: forget their bookmarks everywhere, abandon their commits.
-    /// The remote is never touched.
+    /// Reap superseded dated cuts: forget their bookmarks everywhere, abandon their commits
+    /// unless a rule below keeps them. The remote is never touched.
     ///
     /// Runs automatically after every cut; exists standalone for pre-knives repos carrying
     /// years of historical refs. A later fetch re-materializes forgotten refs as untracked;
@@ -686,8 +750,11 @@ pub enum ReleaseAction {
     /// knives remote, and upstream's tags, which `knives start` writes) those refs pin nothing
     /// for `jj rebase`, so reaping is tidiness, never an unlock.
     ///
-    /// Keeps every superseded cut while the live one still carries conflicts: the previous
-    /// cut is the only record of how they were last resolved.
+    /// In a stacked series, a superseded name the live release descends from loses only its
+    /// refs, even while the live cut still carries conflicts: its commit stays, exit 0.
+    ///
+    /// Otherwise, keeps every superseded cut while the live one still carries conflicts: the
+    /// previous cut is the only record of how they were last resolved.
     ///
     /// Keeps a superseded cut, refs and all, while something rests on it: a workspace's
     /// working copy on it or above it, empty or not, or any other descendant, on the cut, on

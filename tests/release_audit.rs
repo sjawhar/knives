@@ -63,6 +63,8 @@ fn the_audit_catches_a_cut_missing_a_members_content() {
         knives::commands::release::AuditContext {
             previous: None,
             trunk: &trunk,
+            stacked_on: None,
+            drift_from: None,
         },
     )
     .expect("audit cut");
@@ -104,6 +106,8 @@ fn the_audit_passes_a_faithful_cut() {
         knives::commands::release::AuditContext {
             previous: None,
             trunk: &trunk,
+            stacked_on: None,
+            drift_from: None,
         },
     )
     .expect("audit cut");
@@ -164,6 +168,11 @@ fn divergence_the_previous_release_already_carried_is_not_a_loss() {
         knives::commands::release::AuditContext {
             previous: Some(&previous),
             trunk: &trunk,
+            stacked_on: None,
+            drift_from: Some((
+                &previous,
+                knives::commands::release::DriftBase::PreviousRelease,
+            )),
         },
     )
     .expect("audit cut");
@@ -220,6 +229,11 @@ fn a_loss_the_previous_release_did_not_have_still_fails_the_audit() {
         knives::commands::release::AuditContext {
             previous: Some(&previous),
             trunk: &trunk,
+            stacked_on: None,
+            drift_from: Some((
+                &previous,
+                knives::commands::release::DriftBase::PreviousRelease,
+            )),
         },
     )
     .expect("audit cut");
@@ -266,6 +280,8 @@ fn the_audit_passes_a_faithful_multi_commit_member_without_inconclusive() {
         knives::commands::release::AuditContext {
             previous: None,
             trunk: &trunk,
+            stacked_on: None,
+            drift_from: None,
         },
     )
     .expect("audit cut");
@@ -329,6 +345,8 @@ fn the_audit_passes_when_a_member_adds_then_deletes_a_file() {
         knives::commands::release::AuditContext {
             previous: None,
             trunk: &trunk,
+            stacked_on: None,
+            drift_from: None,
         },
     )
     .expect("audit cut");
@@ -381,6 +399,8 @@ fn the_audit_catches_a_member_whose_early_range_content_is_missing() {
         knives::commands::release::AuditContext {
             previous: None,
             trunk: &trunk,
+            stacked_on: None,
+            drift_from: None,
         },
     )
     .expect("audit cut");
@@ -426,6 +446,8 @@ fn the_audit_passes_when_a_member_renames_a_file() {
         knives::commands::release::AuditContext {
             previous: None,
             trunk: &trunk,
+            stacked_on: None,
+            drift_from: None,
         },
     )
     .expect("audit cut");
@@ -475,6 +497,8 @@ fn the_audit_fails_when_a_regenerated_lockfile_loses_member_content() {
         knives::commands::release::AuditContext {
             previous: None,
             trunk: &trunk,
+            stacked_on: None,
+            drift_from: None,
         },
     )
     .expect("audit cut");
@@ -519,6 +543,8 @@ fn the_audit_judges_the_captured_tip_not_the_moved_bookmark() {
         knives::commands::release::AuditContext {
             previous: None,
             trunk: &trunk,
+            stacked_on: None,
+            drift_from: None,
         },
     )
     .expect("audit cut");
@@ -571,7 +597,7 @@ fn committed_cut_fixture(
         &knives::jj::ReleaseWrite {
             source: previous,
             parents: &request.parents,
-            carriers: &[],
+            measured: knives::jj::Measured::WithoutCarriers(&[]),
             message: Some(&request.message()),
             bookmark: None,
             publish_remote: None,

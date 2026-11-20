@@ -104,29 +104,16 @@ fn stalled_remote() -> String {
 fn append(root: &Path, fork: &str, count: usize) {
     let ledger = Ledger::at(root.join(fork));
     for index in 0..count {
-        ledger
-            .append(&Entry {
-                ts: format!("2026-10-09T12:00:00.{index:09}Z"),
-                owner: "ses_sweep".to_owned(),
-                email: None,
-                subject: None,
-                kind: Kind::Note,
-                disposition: None,
-                statement: None,
-                text: format!("entry {index}"),
-                evidence: Vec::new(),
-                anchor: None,
-                pr: None,
-                parents: Vec::new(),
-                claim_change: None,
-                claim_change_why: None,
-                previous_owner: None,
-                previous_kind: None,
-                previous_started: None,
-                previous_last_seen: None,
-                previous_why: None,
-            })
-            .expect("append an entry");
+        // Built from its serialized form, so it names no field a later
+        // knives adds.
+        let entry: Entry = serde_json::from_value(serde_json::json!({
+            "ts": format!("2026-10-09T12:00:00.{index:09}Z"),
+            "owner": "ses_sweep",
+            "kind": Kind::Note,
+            "text": format!("entry {index}"),
+        }))
+        .expect("build an entry");
+        ledger.append(&entry).expect("append an entry");
     }
 }
 
@@ -717,6 +704,164 @@ fn a_fork_whose_ledger_no_git_directory_reaches_is_joined_and_its_sweep_names_th
     assert_eq!(entries_on(&remote, "alpha"), 0);
     let log = std::fs::read_to_string(home.path().join("ledger-sweep.log")).expect("a log");
     assert!(log.contains(&through), "{log}");
+}
+
+/// What [`sweep_raced_by_a_join`] left.
+struct Raced {
+    swept: Output,
+    /// `acme--zzz.git` in the config home's `ledger-repositories`: the git
+    /// directory joining `acme/zzz`, which the other command put there.
+    git_dir: PathBuf,
+    /// The config home, the remotes and the other command's directory.
+    _kept: Vec<tempfile::TempDir>,
+}
+
+/// A sweep that another command races to join `acme/zzz`.
+///
+/// The config home's registry shares `a-repo`'s ledger with `acme/aaa` and
+/// `z-repo`'s with `acme/zzz`. A git directory joins `acme/aaa` already; no
+/// git directory reaches `acme/zzz`. A `git` on the sweep's `PATH` renames a
+/// whole git directory, whose origin is `staged_origin` and whose machine is
+/// `m-staged`, into place as `acme--zzz.git` the first time the sweep runs
+/// git on `acme--aaa.git`. That is after the sweep lists the git directories
+/// and before it joins `acme/zzz`.
+fn sweep_raced_by_a_join(staged_origin: &str) -> Raced {
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        "[repos.a-repo]\nupstream = \"https://forge.invalid/acme/a-repo\"\n\
+         origin = \"https://forge.invalid/ours/a-repo\"\nledger = \"acme/aaa\"\n\n\
+         [repos.z-repo]\nupstream = \"https://forge.invalid/acme/z-repo\"\n\
+         origin = \"https://forge.invalid/ours/z-repo\"\nledger = \"acme/zzz\"\n",
+    )
+    .expect("write the registry");
+    let root = home.path().join("ledger");
+    let repositories = home.path().join("ledger-repositories");
+    let (aaa_dir, aaa) = lab::bare_remote();
+    lab::join_ledger(
+        &repositories.join("acme--aaa.git"),
+        &root,
+        "https://forge.invalid/acme/aaa",
+        &aaa,
+        "m-aaa",
+    );
+    let (staged_dir, staged_remote) = lab::bare_remote();
+    let racer = tempfile::tempdir().expect("the other command's directory");
+    let staged = racer.path().join("acme--zzz.git");
+    lab::join_ledger(&staged, &root, staged_origin, &staged_remote, "m-staged");
+    let git_dir = repositories.join("acme--zzz.git");
+    let path = std::env::var_os("PATH").expect("PATH");
+    let real = std::env::split_paths(&path)
+        .map(|directory| directory.join("git"))
+        .find(|candidate| candidate.is_file())
+        .expect("git on PATH");
+    let bin = racer.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("the racing git's directory");
+    let script = bin.join("git");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             case \" $* \" in\n\
+             *acme--aaa.git*)\n\
+             \x20 if [ -d '{staged}' ] && [ ! -e '{git_dir}' ]; then mv '{staged}' '{git_dir}'; fi;;\n\
+             esac\n\
+             exec '{real}' \"$@\"\n",
+            staged = staged.display(),
+            git_dir = git_dir.display(),
+            real = real.display()
+        ),
+    )
+    .expect("write the racing git");
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("make the racing git executable");
+    let swept = lab::knives_command(
+        home.path(),
+        home.path(),
+        home.path(),
+        &["--json", "ledger", "sweep"],
+    )
+    .env(
+        "PATH",
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path)))
+            .expect("join PATH"),
+    )
+    .output()
+    .expect("run knives ledger sweep");
+    assert!(
+        !staged.exists(),
+        "the racing git renamed nothing: {swept:?}"
+    );
+    Raced {
+        swept,
+        git_dir,
+        _kept: vec![home, aaa_dir, staged_dir, racer],
+    }
+}
+
+#[test]
+fn a_ledger_another_command_joins_between_the_listing_and_the_join_carries_its_fork() {
+    // Given: a config home whose `acme/zzz` ledger no git directory reaches,
+    // and another command that puts a git directory whose origin is
+    // `acme/zzz` in place after the sweep lists the git directories and
+    // before it joins that ledger.
+    // When: a sweep runs.
+    let raced = sweep_raced_by_a_join("https://forge.invalid/acme/zzz");
+
+    // Then: it succeeds, and says of no git directory that it is there
+    // already.
+    let stdout = String::from_utf8_lossy(&raced.swept.stdout);
+    let stderr = String::from_utf8_lossy(&raced.swept.stderr);
+    assert_eq!(raced.swept.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(
+        !stdout.contains("is there already") && !stderr.contains("is there already"),
+        "{stdout}\n{stderr}"
+    );
+    // And: it carries `z-repo` through the git directory the other command
+    // made, which still names that command's machine.
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("JSON");
+    assert!(
+        report["destinations"]
+            .as_array()
+            .expect("destinations")
+            .iter()
+            .any(
+                |destination| destination["git_dir"] == raced.git_dir.display().to_string()
+                    && destination["forks"] == serde_json::json!(["acme/z-repo"])
+            ),
+        "{report}"
+    );
+    assert_eq!(
+        git_in(&raced.git_dir, &["config", "--get", "knives.machine"]).as_deref(),
+        Some("m-staged")
+    );
+}
+
+#[test]
+fn a_git_directory_another_command_puts_in_place_with_another_origin_is_there_already() {
+    // Given: a config home whose `acme/zzz` ledger no git directory reaches,
+    // and another command that puts a git directory whose origin is
+    // `acme/other` where joining `acme/zzz` makes one, after the sweep lists
+    // the git directories and before it joins that ledger.
+    // When: a sweep runs.
+    let raced = sweep_raced_by_a_join("https://forge.invalid/acme/other");
+
+    // Then: it fails, saying that git directory is there already and its
+    // origin is not `acme/zzz`, and leaves that git directory as it was.
+    let stdout = String::from_utf8_lossy(&raced.swept.stdout);
+    let stderr = String::from_utf8_lossy(&raced.swept.stderr);
+    assert_eq!(raced.swept.status.code(), Some(3), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "{} is there already, and its origin is not acme/zzz",
+            raced.git_dir.display()
+        )),
+        "{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        git_in(&raced.git_dir, &["config", "--get", "remote.origin.url"]).as_deref(),
+        Some("https://forge.invalid/acme/other")
+    );
 }
 
 #[test]
@@ -1315,31 +1460,24 @@ fn a_track_from_a_machine_whose_clock_runs_behind_wins_over_the_statement_it_rep
     let alpha_root = share(alpha.path(), "alpha", &remote);
     share(beta.path(), "beta", &remote);
     let ahead = jiff::Timestamp::now() + jiff::SignedDuration::from_mins(5);
+    // Built from its serialized form, so it names no field a later knives
+    // adds.
+    let statement = knives::statement::Statement {
+        kind: knives::statement::StatementKind::Pull,
+        value: Some("12".to_owned()),
+    };
+    let stated: Entry = serde_json::from_value(serde_json::json!({
+        "ts": ahead.to_string(),
+        "owner": "ses_alpha",
+        "subject": "feat/alpha",
+        "kind": Kind::Event,
+        "statement": statement,
+        "text": "stated as #12",
+        "pr": 12,
+    }))
+    .expect("build alpha's statement");
     Ledger::at(alpha_root.join(FORK))
-        .append(&Entry {
-            ts: ahead.to_string(),
-            owner: "ses_alpha".to_owned(),
-            email: None,
-            subject: Some("feat/alpha".to_owned()),
-            kind: Kind::Event,
-            disposition: None,
-            statement: Some(knives::statement::Statement {
-                kind: knives::statement::StatementKind::Pull,
-                value: Some("12".to_owned()),
-            }),
-            text: "stated as #12".to_owned(),
-            evidence: Vec::new(),
-            anchor: None,
-            pr: Some(12),
-            parents: Vec::new(),
-            claim_change: None,
-            claim_change_why: None,
-            previous_owner: None,
-            previous_kind: None,
-            previous_started: None,
-            previous_last_seen: None,
-            previous_why: None,
-        })
+        .append(&stated)
         .expect("append alpha's statement");
     assert!(sweep(alpha.path()).status.success());
     let pr_on = |home: &Path| {
