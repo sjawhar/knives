@@ -281,72 +281,88 @@ pub(crate) fn run_rebase(
             inline_human_text(name)
         );
     }
-    let rebased_write = report_rebased_release(
-        fork,
-        RebasedRelease {
-            name: &release_name,
-            reference: &reference,
-            onto: &onto,
-            shed,
-            before: &before_rebase,
-            shed_unions,
-            unchecked: &unchecked,
-        },
-        bound,
-    )?;
-    // After the provenance is recorded, so a failed cleanup cannot leave the
-    // rebased release described with its pre-rebase parents.
-    let mut originals = tagged;
-    for commit in restored
-        .iter()
-        .map(|(_, commit)| commit)
-        .chain(&earlier_originals)
-    {
-        if !originals.contains(commit) {
-            originals.push(commit.clone());
-        }
-    }
-    let rebased = knives::jj::Repo::open(path)?;
-    let rebased_commit = rebased.resolve_commit(&release_name)?;
-    let cleaned = knives::jj::abandon_tagged_copies(
-        path,
-        &originals,
-        (
-            &onto,
-            knives::jj::RebasedName {
+    // The command's last write, once it made one: the rebase's, then the
+    // drop's once that write is done. Each step after a write can fail, and
+    // the command prints the repeated headings of its last write once,
+    // whether its steps end or fail.
+    let mut last = None;
+    let finished: anyhow::Result<Exit> = (|| {
+        let rebased = report_rebased_release(
+            fork,
+            RebasedRelease {
                 name: &release_name,
-                publish_remote: entry.publish_remote(),
-                commit: &rebased_commit,
-                earlier: EarlierWrites::read(
-                    &rebased,
-                    &release_name,
-                    &ledger,
-                    plan.published.as_ref(),
-                )?
-                .commits(),
+                reference: &reference,
+                onto: &onto,
+                shed,
+                before: &before_rebase,
+                shed_unions,
+                unchecked: &unchecked,
             },
-        ),
-        &format!("knives: {release_name}: abandon rebased copies of earlier releases"),
-    )?;
-    report_tagged_copies(
-        repo,
-        &cleaned.copies,
-        (&restored, &earlier_originals),
-        &release_name,
-    );
-    report_hidden(repo, &release_name, &cleaned.hidden);
-    let (exit, last) = if no_drop {
-        (Exit::Ok, rebased_write)
-    } else {
+            bound,
+            &mut last,
+        )?;
+        // After the provenance is recorded, so a failed cleanup cannot leave
+        // the rebased release described with its pre-rebase parents.
+        let mut originals = tagged;
+        for commit in restored
+            .iter()
+            .map(|(_, commit)| commit)
+            .chain(&earlier_originals)
+        {
+            if !originals.contains(commit) {
+                originals.push(commit.clone());
+            }
+        }
+        // The release and its earlier writes as the rebase's write left
+        // them, read through the opening its conflict report read: nothing
+        // wrote to the repository since.
+        let rebased_repo = rebased
+            .opened()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let cleaned = knives::jj::abandon_tagged_copies(
+            path,
+            &originals,
+            (
+                &onto,
+                knives::jj::RebasedName {
+                    name: &release_name,
+                    publish_remote: entry.publish_remote(),
+                    commit: rebased.commit(),
+                    earlier: EarlierWrites::read(
+                        rebased_repo,
+                        &release_name,
+                        &ledger,
+                        plan.published.as_ref(),
+                    )?
+                    .commits(),
+                },
+            ),
+            &format!("knives: {release_name}: abandon rebased copies of earlier releases"),
+        )?;
+        report_tagged_copies(
+            repo,
+            &cleaned.copies,
+            (&restored, &earlier_originals),
+            &release_name,
+        );
+        report_hidden(repo, &release_name, &cleaned.hidden);
+        if no_drop {
+            return Ok(Exit::Ok);
+        }
         // What it drops next is dropped from the rebase's own write, so its
         // event carries the same mark as the rebase's.
-        drop_landed_members(fork, (&release_name, &destination), (bound, &unchecked))?
-            .map_or_else(|exit| (exit, rebased_write), |dropped| (Exit::Ok, dropped))
-    };
+        drop_landed_members(
+            fork,
+            (&release_name, &destination),
+            (bound, &unchecked, &mut last),
+        )
+    })();
     // Once for the command, for the release its last write left, through
     // the opening that write's conflict report read.
-    last.report_headings();
-    Ok(exit)
+    if let Some(last) = &last {
+        last.report_headings();
+    }
+    finished
 }
 
 fn frozen_rebase_exit(
@@ -586,18 +602,20 @@ fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option
     if no_drop {
         return Ok(Some(Exit::Ok));
     }
-    let dropped = match drop_landed_members_in(
+    // The drop is the command's one write: a step after it can fail, and the
+    // command prints its repeated headings once, whether its steps end or
+    // fail.
+    let mut dropped = None;
+    let finished = drop_landed_members_in(
         fork,
         (opened, writes),
         (release_name, destination),
-        (bound, unchecked),
-    )? {
-        Ok(dropped) => dropped,
-        Err(exit) => return Ok(Some(exit)),
-    };
-    // The drop is the command's one write.
-    dropped.report_headings();
-    Ok(Some(Exit::Ok))
+        (bound, unchecked, &mut dropped),
+    );
+    if let Some(dropped) = &dropped {
+        dropped.report_headings();
+    }
+    finished.map(Some)
 }
 
 /// The commit a rebase moves onto, with the label the report and provenance use.
@@ -830,10 +848,10 @@ fn all_landed(
 fn drop_landed_members(
     fork: &Fork<'_>,
     (release_name, destination): (&str, &RebaseDestination),
-    (bound, unchecked): (Bound<'_>, &str),
-) -> anyhow::Result<Result<ReportedWrite, Exit>> {
+    (bound, unchecked, last): (Bound<'_>, &str, &mut Option<release::ReportedWrite>),
+) -> anyhow::Result<Exit> {
     if destination.landed.is_empty() {
-        return Ok(Err(Exit::Ok));
+        return Ok(Exit::Ok);
     }
     let opened = knives::jj::Repo::open(&fork.checkout.path)?;
     let release_parents = opened.parent_commits(release_name)?;
@@ -842,14 +860,14 @@ fn drop_landed_members(
             .local_bookmark_tip(&pull.head_ref_name)
             .is_some_and(|tip| release_parents.contains(&tip))
     }) {
-        return Ok(Err(Exit::Ok));
+        return Ok(Exit::Ok);
     }
     let writes = release_writes(fork, &opened, release_name)?;
     drop_landed_members_in(
         fork,
         (&opened, &writes),
         (release_name, destination),
-        (bound, unchecked),
+        (bound, unchecked, last),
     )
 }
 
@@ -862,15 +880,17 @@ fn drop_landed_members(
 /// leaves out the release's carriers, as every write composing from its
 /// parents does. `opened` is the repository as it is now, and `writes` the
 /// release's earlier writes read from it. `unchecked` is the mark its event
-/// ends with ([`release::unchecked_suffix`]). It gives the release it wrote,
-/// with the one opening after the write that its conflict report read
-/// ([`ReportedWrite`]), or the exit where it wrote nothing.
+/// ends with ([`release::unchecked_suffix`]). The release it writes is read
+/// through one opening as soon as the write is done
+/// ([`release::ReportedWrite`]) and left in `last`, the command's last
+/// write, so a step after the write that fails still leaves it there. It
+/// gives the exit: [`Exit::Ok`] where it wrote.
 fn drop_landed_members_in(
     fork: &Fork<'_>,
     (opened, writes): (&knives::jj::Repo, &EarlierWrites),
     (release_name, destination): (&str, &RebaseDestination),
-    (bound, unchecked): (Bound<'_>, &str),
-) -> anyhow::Result<Result<ReportedWrite, Exit>> {
+    (bound, unchecked, last): (Bound<'_>, &str, &mut Option<release::ReportedWrite>),
+) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
     let path = &fork.checkout.path;
@@ -900,7 +920,7 @@ fn drop_landed_members_in(
         ));
     }
     if deltas.is_empty() {
-        return Ok(Err(Exit::Ok));
+        return Ok(Exit::Ok);
     }
     let shown_release = inline_human_text(release_name);
     if kept.is_empty() {
@@ -908,7 +928,7 @@ fn drop_landed_members_in(
             "{repo}: every member of {shown_release} landed; dropping them all would leave it \
              without a parent, so nothing was dropped"
         );
-        return Ok(Err(Exit::Incomplete));
+        return Ok(Exit::Incomplete);
     }
     let release = opened.resolve_commit(release_name)?;
     let provenance = release::parent_sources(opened, entry, &entry.release_scheme(), &kept)?;
@@ -927,14 +947,14 @@ fn drop_landed_members_in(
             operation: &format!("knives: {release_name}: {delta}"),
         },
     )?;
-    let created = written.commit.clone();
+    let dropped = &*last.insert(release::ReportedWrite::read(path, written.commit.clone()));
     record_edit_event(
         fork,
         opened,
         &EditRecord {
             release: release_name,
             delta: &delta,
-            created: &created,
+            created: dropped.commit(),
             change: &written.change,
             provenance: &provenance,
             unions: &written.unions,
@@ -949,58 +969,11 @@ fn drop_landed_members_in(
         inline_human_text(&delta)
     );
     report_replaced(repo, release_name, &written);
-    let dropped = ReportedWrite::read(path, created);
     println!(
         "{}",
         release::conflict_report(release_name, dropped.conflicts(), &written.unions)
     );
-    Ok(Ok(dropped))
-}
-
-/// A release a rebase wrote, read through one opening of the repository
-/// after the write, as [`release::written_report`] reads the write of a cut
-/// or an edit: the files its tree leaves conflicted, which the write's own
-/// report prints, and its repeated `### ` headings, which the command prints
-/// once, after its last write.
-struct ReportedWrite {
-    commit: knives::ids::CommitId,
-    /// The opening with the conflicted files read through it, or the error
-    /// the opening gave.
-    read: Result<(knives::jj::Repo, Result<Vec<String>, knives::jj::JjError>), knives::jj::JjError>,
-}
-
-impl ReportedWrite {
-    /// Open the repository at `path` once, after the write of `commit`, and
-    /// list the files its tree leaves conflicted.
-    fn read(path: &std::path::Path, commit: knives::ids::CommitId) -> Self {
-        let read = knives::jj::Repo::open(path).map(|opened| {
-            let conflicts = opened.conflicted_files(commit.as_str());
-            (opened, conflicts)
-        });
-        Self { commit, read }
-    }
-
-    /// The files the tree leaves conflicted, or the error jj gave.
-    fn conflicts(&self) -> Result<&[String], &knives::jj::JjError> {
-        self.read
-            .as_ref()
-            .and_then(|(_, conflicts)| conflicts.as_deref())
-    }
-
-    /// Print a line for each `### ` heading that a release log of the tree
-    /// holds more than once in its one `[Unreleased]` section
-    /// ([`release::heading_report`]), read through the same opening.
-    fn report_headings(&self) {
-        let lines = match &self.read {
-            Ok((opened, _)) => {
-                release::heading_report(opened.repeated_headings(self.commit.as_str()).as_deref())
-            }
-            Err(error) => release::heading_report(Err(error)),
-        };
-        for line in lines {
-            println!("{line}");
-        }
-    }
+    Ok(Exit::Ok)
 }
 
 /// A composition rebase that just happened: what moved, and onto what.
@@ -1019,14 +992,17 @@ struct RebasedRelease<'a> {
 
 /// Re-describe the rebased release so the recorded provenance names the
 /// rewritten parents, writing in the same operation the union of each release
-/// log the rebase left conflicted, and report what moved. It gives the
-/// release it wrote, with the one opening after the write that its conflict
-/// report read ([`ReportedWrite`]).
-fn report_rebased_release(
+/// log the rebase left conflicted, and report what moved. The release it
+/// writes is read through one opening as soon as the write is done
+/// ([`release::ReportedWrite`]) and left in `last`, the command's last
+/// write, so a step after the write that fails still leaves it there; it
+/// gives that write.
+fn report_rebased_release<'w>(
     fork: &Fork<'_>,
     rebased: RebasedRelease<'_>,
     bound: Bound<'_>,
-) -> anyhow::Result<ReportedWrite> {
+    last: &'w mut Option<release::ReportedWrite>,
+) -> anyhow::Result<&'w release::ReportedWrite> {
     let repo = &fork.name;
     let entry = fork.entry;
     let path = &fork.checkout.path;
@@ -1043,7 +1019,7 @@ fn report_rebased_release(
         &message,
         &format!("knives: {}: record rebased provenance", rebased.name),
     )?;
-    let written = ReportedWrite::read(path, described);
+    let written = &*last.insert(release::ReportedWrite::read(path, described));
     let unions = rebase_unions(
         rebased.shed_unions,
         described_unions,
@@ -1061,7 +1037,7 @@ fn report_rebased_release(
         &EditRecord {
             release: rebased.name,
             delta: &delta,
-            created: &written.commit,
+            created: written.commit(),
             change: &change,
             provenance: &provenance,
             unions: &unions,

@@ -9,7 +9,7 @@
 //! as their union, and refuses while the release in hand carries a change
 //! knives did not write or adopt, printing the steps that record it. Every one
 //! of them writes the release locally only, and none of them pushes it.
-// allow: SIZE_OK: 5575 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
+// allow: SIZE_OK: 5634 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -1077,7 +1077,13 @@ pub enum InHandWrite {
     /// `write`, the matched write ([`matched_write`]), rebased onto its
     /// previous release, where it has one, and its members. Every write
     /// refuses it until `adopt` records it.
-    Unrecorded { write: RecordedWrite },
+    Unrecorded {
+        write: RecordedWrite,
+        /// Whether the release has a previous release it was measured
+        /// with: a stacked release that has one, read once with its members
+        /// ([`release_reading`]).
+        onto_previous: bool,
+    },
     /// Nothing here can measure the release against the writes the ledger
     /// records of its name ([`Unchecked`]). A write over it proceeds and says
     /// so, except over a release whose every parent is an earlier write
@@ -1253,6 +1259,7 @@ pub fn in_hand_write(
         } else {
             InHandWrite::Unrecorded {
                 write: matched.write,
+                onto_previous: reading.previous.is_some(),
             }
         },
     )
@@ -1670,12 +1677,14 @@ pub fn in_hand_refusal(
         ledger,
         name,
         commit,
-        writes,
         published,
-        tips,
+        ..
     } = *release;
-    let write = match standing {
-        InHandWrite::Unrecorded { write } => write,
+    let (write, onto_previous) = match standing {
+        InHandWrite::Unrecorded {
+            write,
+            onto_previous,
+        } => (write, *onto_previous),
         InHandWrite::Unchecked(Unchecked::NoMatch(no_match @ NoMatch::AllCarriers { .. })) => {
             return Ok(Some(no_match_refusal(release, no_match, entry)?));
         }
@@ -1693,10 +1702,7 @@ pub fn in_hand_refusal(
     let shown = crate::ledger::inline_human_text(name);
     // A stacked release that has a previous release is measured with it
     // ([`in_hand_write`]).
-    let onto = if entry.stacked()
-        && release_reading(repo, entry, (ledger, tips), (writes, commit))?
-            .is_ok_and(|reading| reading.previous.is_some())
-    {
+    let onto = if onto_previous {
         "its previous release and its members"
     } else {
         "its members"
@@ -4947,39 +4953,91 @@ pub fn conflict_guidance(release: &str, files: &[String], unions: &[jj::UnionedF
 
 /// What a release write prints about the tree it wrote.
 ///
-/// That tree is `commit`, written under `release` with `unions`, read from
-/// one opening of the repository at `path`: the conflict report
-/// ([`conflict_report`]), then a line for each `### ` heading that a
-/// release log of the tree holds more than once in its one `[Unreleased]`
-/// section ([`report_repeated_headings`]). A command that writes the
-/// release more than once prints the conflict report of each write, and
-/// those headings once, after its last write.
+/// That tree is `commit`, written under `release` with `unions`, read
+/// through one opening of the repository at `path` ([`ReportedWrite`]): the
+/// conflict report ([`conflict_report`]), then a line for each `### `
+/// heading that a release log of the tree holds more than once in its one
+/// `[Unreleased]` section ([`report_repeated_headings`]). A command that
+/// writes the release more than once prints the conflict report of each
+/// write, and those headings once, after its last write.
 pub fn written_report(
     path: &Path,
     release: &str,
     commit: &CommitId,
     unions: &[jj::UnionedFile],
 ) -> String {
-    let revision = commit.as_str();
-    let (mut report, headings) = match Repo::open(path) {
-        Ok(opened) => (
-            conflict_report(
-                release,
-                opened.conflicted_files(revision).as_deref(),
-                unions,
-            ),
-            heading_report(opened.repeated_headings(revision).as_deref()),
-        ),
-        Err(error) => (
-            conflict_report(release, Err(&error), unions),
-            heading_report(Err(&error)),
-        ),
-    };
-    for line in headings {
+    let written = ReportedWrite::read(path, commit.clone());
+    let mut report = conflict_report(release, written.conflicts(), unions);
+    for line in written.heading_lines() {
         report.push('\n');
         report.push_str(&line);
     }
     report
+}
+
+/// A release a command wrote, read through one opening of the repository
+/// after the write.
+///
+/// The opening lists the files its tree leaves conflicted, which the
+/// write's own report prints ([`conflict_report`]), and reads its repeated
+/// `### ` headings when they are asked for, which a command prints once,
+/// after its last write ([`report_repeated_headings`]). [`written_report`]
+/// reads the write of a cut or an edit through it, and a rebase each of its
+/// writes.
+#[derive(Debug)]
+pub struct ReportedWrite {
+    commit: CommitId,
+    /// The opening with the conflicted files read through it, or the error
+    /// the opening gave.
+    read: Result<(Repo, Result<Vec<String>, jj::JjError>), jj::JjError>,
+}
+
+impl ReportedWrite {
+    /// Open the repository at `path` once, after the write of `commit`, and
+    /// list the files its tree leaves conflicted.
+    pub fn read(path: &Path, commit: CommitId) -> Self {
+        let read = Repo::open(path).map(|opened| {
+            let conflicts = opened.conflicted_files(commit.as_str());
+            (opened, conflicts)
+        });
+        Self { commit, read }
+    }
+
+    /// The commit the write made.
+    pub const fn commit(&self) -> &CommitId {
+        &self.commit
+    }
+
+    /// The repository as the write left it, or the error its opening gave.
+    pub fn opened(&self) -> Result<&Repo, &jj::JjError> {
+        self.read.as_ref().map(|(opened, _)| opened)
+    }
+
+    /// The files the tree leaves conflicted, or the error jj gave.
+    pub fn conflicts(&self) -> Result<&[String], &jj::JjError> {
+        self.read
+            .as_ref()
+            .and_then(|(_, conflicts)| conflicts.as_deref())
+    }
+
+    /// Print a line for each `### ` heading that a release log of the tree
+    /// holds more than once in its one `[Unreleased]` section, read through
+    /// the same opening.
+    pub fn report_headings(&self) {
+        for line in self.heading_lines() {
+            println!("{line}");
+        }
+    }
+
+    /// The lines [`Self::report_headings`] prints ([`heading_report`]).
+    fn heading_lines(&self) -> Vec<String> {
+        match &self.read {
+            Ok((opened, _)) => {
+                heading_report(opened.repeated_headings(self.commit.as_str()).as_deref())
+            }
+            Err(error) => heading_report(Err(error)),
+        }
+    }
 }
 
 /// The lines a release write prints about the files its tree leaves
@@ -5018,13 +5076,10 @@ pub fn report_repeated_headings(path: &Path, commit: &CommitId) {
     }
 }
 
-/// The lines [`report_repeated_headings`] prints.
-///
-/// They are those of `repeated` as jj read them ([`repeated_heading_lines`]),
-/// or the error jj gave, escaped as [`conflict_report`] escapes it. A command
-/// that read its write's conflicts through one opening of the repository
-/// reads `repeated` through that opening too, as [`written_report`] does.
-pub fn heading_report(repeated: Result<&[jj::RepeatedHeadings], &jj::JjError>) -> Vec<String> {
+/// The lines [`report_repeated_headings`] prints: those of `repeated` as jj
+/// read them ([`repeated_heading_lines`]), or the error jj gave, escaped as
+/// [`conflict_report`] escapes it.
+fn heading_report(repeated: Result<&[jj::RepeatedHeadings], &jj::JjError>) -> Vec<String> {
     match repeated {
         Ok(repeated) => repeated_heading_lines(repeated),
         Err(error) => vec![format!(
@@ -5554,7 +5609,8 @@ mod members_tests {
         assert_eq!(
             standing(&ledger, &edited),
             InHandWrite::Unrecorded {
-                write: recorded_cut(&written)
+                write: recorded_cut(&written),
+                onto_previous: false,
             }
         );
         // And: a matched write this repository does not hold leaves the edit

@@ -24,11 +24,11 @@ mod lab;
 #[path = "common/release_forge.rs"]
 mod release_forge;
 
-use forge_shim::pull_record;
+use forge_shim::{install_snapshot_gh, path_with_gh_shim, pull_record};
 use knives::jj::Repo;
 use lab::{
     Lab, ReleaseOutput, commit_at, extend_branch, file_at_revision, knives_release, knives_start,
-    release_parents, release_test_home, release_test_home_pinned,
+    release_command, release_parents, release_test_home, release_test_home_pinned,
 };
 use release_forge::{
     ReleaseWithSnapshotForgeInput, knives_release_with_forge, release_with_snapshot_forge,
@@ -705,6 +705,105 @@ fn a_bare_rebase_that_drops_a_landed_member_names_a_heading_held_twice_once() {
         "{stdout}"
     );
     assert_eq!(stdout.matches("[Unreleased] holds").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains(
+            "  CHANGELOG.md: [Unreleased] holds `### Added` twice; knives changed no line for \
+             it; join them by hand before you push\n"
+        ),
+        "{stdout}"
+    );
+}
+
+/// Put a `jj` in `shim`, ahead of the real one on `PATH`, that refuses the
+/// read by which the drop of a landed member asks whether it carries work
+/// past the target: `jj log` with the template that asks whether each
+/// commit of a range is empty. That read comes after the rebase's write and
+/// before the drop's. Every other call reaches the real `jj`.
+fn install_jj_refusing_the_landed_read(shim: &std::path::Path) {
+    let real = std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+        .map(|directory| directory.join("jj"))
+        .find(|candidate| candidate.is_file())
+        .expect("find jj on PATH");
+    let jj = shim.join("jj");
+    std::fs::write(
+        &jj,
+        format!(
+            "#!/bin/sh\nfor argument in \"$@\"; do\n  case \"$argument\" in\n    'empty ++ '*) \
+             echo 'planted: the landed read is refused' >&2; exit 1 ;;\n  esac\ndone\nexec '{}' \
+             \"$@\"\n",
+            real.display()
+        ),
+    )
+    .expect("write the jj shim");
+    let mut permissions = std::fs::metadata(&jj)
+        .expect("read the jj shim's permissions")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&jj, permissions).expect("make the jj shim executable");
+}
+
+#[test]
+fn a_bare_rebase_whose_drop_fails_names_a_heading_held_twice_once_for_the_release_it_wrote() {
+    // Given: alpha merged upstream by a merge commit, and beta still open,
+    // whose changelog's one `[Unreleased]` section holds `### Added` twice;
+    // and a `jj` that refuses the read of whether alpha carries work past
+    // the target, which comes after the rebase's write.
+    let lab = Lab::new();
+    let release = "release/2026-08-04";
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch(
+        "feat/beta",
+        "CHANGELOG.md",
+        "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Beta's addition.\n\n### Added\n\n\
+         - An earlier addition.\n",
+    );
+    lab.octopus(release, "feat/alpha", "feat/beta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.publish_pull("feat/alpha", 7);
+    lab.merge_pull_with_merge_commit(7);
+    let merged_at = commit_at(&lab, "main@upstream");
+    let pulls = format!(
+        "[{},{}]",
+        pull_record(7, "MERGED", "feat/alpha", Some(merged_at.as_str())),
+        pull_record(8, "OPEN", "feat/beta", None)
+    );
+    let before = commit_at(&lab, release);
+    let shim = tempfile::tempdir().expect("create the shim directory");
+    install_snapshot_gh(shim.path(), &pulls, &[]);
+    install_jj_refusing_the_landed_read(shim.path());
+
+    // When: the bare rebase moves the release onto the merge commit, writes
+    // and records it, and the drop of alpha fails before it writes.
+    let output = release_command(&lab, &home, ReleaseOutput::Text, &["rebase"])
+        .env("XDG_CACHE_HOME", shim.path().join("cache"))
+        .env("PATH", path_with_gh_shim(shim.path()))
+        .output()
+        .expect("run knives release rebase");
+
+    // Then: the command exits with the failure, and one line names the file
+    // and the heading, for the release the rebase wrote.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("planted: the landed read is refused"),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("demo: {release} rebased onto ")),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("dropped feat/alpha"), "{stdout}");
+    assert_ne!(commit_at(&lab, release), before, "{stdout}");
+    assert_eq!(
+        stdout.matches("[Unreleased] holds").count(),
+        1,
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
     assert!(
         stdout.contains(
             "  CHANGELOG.md: [Unreleased] holds `### Added` twice; knives changed no line for \
