@@ -7,8 +7,8 @@ use std::path::Path;
 use super::{Destination, SweepError, Tally, remove_if_present, sweep_record};
 use crate::ids::UpstreamName;
 
-/// What sweeps did to this machine's ledger that `status` reports, since a
-/// sweep a write hands off has nowhere to say it ([`Pulled::backlog`]).
+/// What sweeps and sends did to this machine's ledger that `status` reports,
+/// since a write's send ([`super::send_now`]) says none of it.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Kept {
@@ -110,6 +110,19 @@ impl Kept {
         }
         self.skipped.retain(|_, by| !by.is_empty());
     }
+
+    /// Add `unkept`, repeated transitions discarded by fork, to those kept,
+    /// the newest of each fork's now.
+    fn discarded_now(&mut self, unkept: &BTreeMap<String, usize>, now: &str) {
+        for (fork, &count) in unkept {
+            let discards = self.discarded.entry(fork.clone()).or_insert(Discards {
+                count: 0,
+                last: String::new(),
+            });
+            discards.count += count;
+            now.clone_into(&mut discards.last);
+        }
+    }
 }
 
 /// Fold what the passes since the last call did into the [`sweep_record`]
@@ -128,14 +141,7 @@ pub(super) fn keep(
     let mut present = BTreeSet::new();
     for (destination, tally) in destinations.iter().zip(tallies.iter()) {
         let through = destination.describe();
-        for (fork, &count) in &tally.unkept {
-            let discards = kept.discarded.entry(fork.clone()).or_insert(Discards {
-                count: 0,
-                last: String::new(),
-            });
-            discards.count += count;
-            discards.last.clone_from(&now);
-        }
+        kept.discarded_now(&tally.unkept, &now);
         if let Some(skipped) = &tally.skipped {
             kept.pulled_through(&through, skipped);
         }
@@ -149,5 +155,21 @@ pub(super) fn keep(
     for tally in tallies {
         tally.unkept.clear();
     }
+    Ok(())
+}
+
+/// Fold `tally`'s discards into the [`sweep_record`] beside `root`, as
+/// [`keep`] does, and leave the rest of the record as it is: for a pass
+/// through one destination that pulled nothing, a claim's change, which
+/// knows nothing of what any other destination skips. Called with the lock
+/// held, as [`keep`] is; a record with nothing to add is not touched.
+pub(super) fn keep_discards(root: &Path, tally: &mut Tally) -> Result<(), SweepError> {
+    if tally.unkept.is_empty() {
+        return Ok(());
+    }
+    let mut kept = Kept::read(root)?;
+    kept.discarded_now(&tally.unkept, &jiff::Timestamp::now().to_string());
+    kept.write(root)?;
+    tally.unkept.clear();
     Ok(())
 }

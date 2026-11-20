@@ -287,6 +287,12 @@ pub enum Command {
     /// place it was taken, and a `start` with no `--why` keeps the reason it
     /// already carries.
     ///
+    /// On a fork whose `repos.toml` entry names a `ledger`, the claim is a ref on
+    /// that ledger's remote, so it holds on every machine that shares the ledger.
+    /// `start` reads it before it decides, and pushes the claim before it opens the
+    /// workspace. When it cannot read the claim or push it, it records no claim,
+    /// opens no workspace and exits 3.
+    ///
     /// Also states the fork's `immutable_heads()` — jj's trunk, the trunk by name
     /// on every knives remote, and every tag fetched from upstream — in the
     /// repository's jj config when that config states none, and says so on
@@ -329,6 +335,11 @@ pub enum Command {
     /// released is told who did it and sent to `start`, never to `finish --force`,
     /// which would release the live claim of whoever holds the branch now. A forced
     /// release over another owner's claim leaves that workspace as it is.
+    ///
+    /// On a fork whose `repos.toml` entry names a `ledger`, the claim `finish` hands
+    /// back is the one on that ledger's remote, read before `finish` decides. When
+    /// it cannot read that claim or push its release, it leaves the state file and
+    /// the workspace as they were, and exits 3.
     Finish {
         branch: String,
         /// Registry name. Defaults to the repo you are standing in.
@@ -342,7 +353,9 @@ pub enum Command {
         /// box. Requires a durable reason.
         #[arg(long, requires = "why")]
         force: bool,
-        /// Why this forced finish is safe.
+        /// Why you are finishing. The ledger records it every time: as the
+        /// released claim's reason, or, where no claim was held, in the text
+        /// of the entry this finish writes. `--force` requires it.
         #[arg(long)]
         why: Option<String>,
         /// Record that this branch was superseded by another.
@@ -480,15 +493,18 @@ pub enum HookHarness {
 pub enum LedgerAction {
     /// Commit new entries, pull every peer's, and push this machine's.
     ///
-    /// Every command that writes an entry starts one in the background as it
-    /// exits, so this rarely needs typing. One sweep runs at a time: run by
-    /// hand, a sweep that finds another running waits for it, up to a minute,
-    /// then runs its own pass and reports that, with the sweep it waited for.
+    /// Every command that writes an entry sends it before it exits, and exits
+    /// 3 naming the ledger when it could not, so this is typed to send what a
+    /// write could not, or to pull. One sweep or send runs at a time: a sweep
+    /// that finds another running waits for it, up to a minute, then runs its
+    /// own pass and reports that, with the command it waited for.
     /// A fork's ledger travels when its `repos.toml` entry names, as
-    /// `ledger`, the repository its ledger belongs to, and the ledger root is
-    /// a git repository with that repository as `origin` and this machine's
-    /// name as `knives.machine`. With no fork's `ledger` set, the ledger is
-    /// not shared and this does nothing.
+    /// `ledger`, the repository its ledger belongs to. It goes through a git
+    /// directory over the ledger root whose `origin` is that repository and
+    /// whose `knives.machine` is this machine's name: the root's own `.git`,
+    /// or one in `ledger-repositories` beside it. Where no git directory has
+    /// that `origin`, knives makes one there and says so on stderr. With no
+    /// fork's `ledger` set, the ledger is not shared and this does nothing.
     Sweep,
     /// Move what an older knives left onto what this one reads: each fork
     /// kept under its registry key moves to its upstream's lowercase

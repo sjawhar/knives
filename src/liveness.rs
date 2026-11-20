@@ -136,14 +136,19 @@ fn comm_of(pid: u32) -> String {
         .unwrap_or_default()
 }
 
+/// This machine's host name, as the kernel gives it.
+pub(crate) fn host_name() -> String {
+    rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// This process's place: the host name and the PID namespace it runs in. Two
 /// processes in one place can see each other in `/proc`; an agent box is a
 /// place of its own.
 pub fn this_place() -> String {
-    let host = rustix::system::uname()
-        .nodename()
-        .to_string_lossy()
-        .into_owned();
+    let host = host_name();
     let namespace = std::fs::read_link("/proc/self/ns/pid").map_or_else(
         |_| "pid:[unknown]".to_owned(),
         |link| link.display().to_string(),
@@ -243,6 +248,7 @@ mod tests {
 
     #[test]
     fn a_child_inside_the_directory_is_a_live_user() {
+        let _lock = crate::config::test_support::environment_lock();
         let directory = tempfile::tempdir().expect("tempdir");
         let mut child = std::process::Command::new("sleep")
             .arg("30")
@@ -257,6 +263,10 @@ mod tests {
 
     #[test]
     fn this_process_inside_the_directory_is_not() {
+        // A child another test is starting holds a copy of every file this
+        // process has open, the held one too, until it execs: the lock keeps
+        // every test that starts one out until this one is done.
+        let _lock = crate::config::test_support::environment_lock();
         let directory = tempfile::tempdir().expect("tempdir");
         let file = std::fs::File::create(directory.path().join("held")).expect("create");
         let users = live_users(directory.path(), None);

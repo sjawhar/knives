@@ -20,6 +20,8 @@ pub(crate) mod test_support {
     use std::ffi::OsString;
     use std::sync::{Mutex, MutexGuard};
 
+    use crate::commands::claim::HARNESS_SESSION_VARIABLES;
+
     static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
     /// Serializes every test that touches the process environment — in either
@@ -29,7 +31,9 @@ pub(crate) mod test_support {
     /// through `PATH` and inherits the environment at that instant, so an
     /// unlocked spawn racing a mutator fails in ways that look like the
     /// production code flaking (measured: `git`/`jj` fixtures in the hook and
-    /// sync tests, 3 failures in 50 parallel suite runs).
+    /// sync tests, 3 failures in 50 parallel suite runs). A test whose result
+    /// needs no child to be starting meanwhile holds it too: from its fork to
+    /// its exec a child holds a copy of every file this process has open.
     pub(crate) fn environment_lock() -> MutexGuard<'static, ()> {
         ENVIRONMENT_LOCK
             .lock()
@@ -100,6 +104,24 @@ pub(crate) mod test_support {
                 }
             }
         }
+    }
+
+    /// The environment of a shell no harness names a session in: each of
+    /// `HARNESS_SESSION_VARIABLES` captured and removed, and each of `others`
+    /// captured, all restored when the guard drops. A test of one harness
+    /// variable names it in `others` too, so that, were the list to lose it,
+    /// the test fails on the identity it resolves rather than on the guard.
+    pub(crate) fn no_harness_session(others: &[&'static str]) -> EnvironmentGuard {
+        let names: Vec<&'static str> = HARNESS_SESSION_VARIABLES
+            .iter()
+            .chain(others)
+            .copied()
+            .collect();
+        let environment = EnvironmentGuard::capture(&names);
+        for name in HARNESS_SESSION_VARIABLES {
+            environment.remove(name);
+        }
+        environment
     }
 }
 

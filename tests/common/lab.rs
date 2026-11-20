@@ -862,6 +862,39 @@ pub fn bare_remote() -> (TempDir, PathBuf) {
     (root, remote)
 }
 
+/// Push to `remote`, as `machine`'s ref, one commit carrying `contents` at
+/// `path` under the ledger root: what a machine running another knives, or
+/// a broken one, could send.
+pub fn push_as_peer(remote: &Path, machine: &str, path: &str, contents: &str) {
+    let scratch = tempfile::tempdir().expect("peer checkout");
+    let root = scratch.path().join("peer");
+    git_repository(&root, &[]);
+    let file = root.join(path);
+    std::fs::create_dir_all(file.parent().expect("an entry's directory")).expect("mkdir");
+    std::fs::write(&file, contents).expect("write the peer's entry");
+    git_output(&root, ["add", "--all"]);
+    git_output(
+        &root,
+        [
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "peer",
+        ],
+    );
+    git_output(
+        &root,
+        [
+            "push",
+            "--quiet",
+            remote.to_str().expect("utf-8"),
+            &format!("HEAD:refs/knives/{machine}"),
+        ],
+    );
+}
+
 /// Make a git directory at `git_dir` that joins the ledger as the dotfiles
 /// installer does on a machine: a non-bare repository whose work tree is the
 /// ledger root `work_tree`, whose `origin` is `url`, reached at `reached`,
@@ -967,13 +1000,30 @@ pub fn jj_workspace_add(checkout: &Path, name: &str, path: &Path) {
     );
 }
 
+/// `command` with every variable a harness names its session by removed
+/// (`HARNESS_SESSION_VARIABLES`). The harness running the suite names its
+/// own session in the environment; without this, a test's identity would be
+/// that session rather than the one the test states.
+pub fn without_harness_session(command: &mut Command) -> &mut Command {
+    for name in knives::commands::claim::HARNESS_SESSION_VARIABLES {
+        command.env_remove(name);
+    }
+    command
+}
+
+/// `command` with one rule handed to git as `GIT_CONFIG_COUNT` and its
+/// numbered pair, as a session hands git configuration of its own.
+pub fn with_git_rule<'c>(command: &'c mut Command, key: &str, value: &str) -> &'c mut Command {
+    command
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", key)
+        .env("GIT_CONFIG_VALUE_0", value)
+}
+
 /// The knives binary, run from `cwd` against the registry in `config_home` and
-/// scanning `scan_home` for checkouts. Returned unrun so a caller can add an
-/// environment variable (`KNIVES_OWNER`, say) before `.output()`.
-///
-/// The harness running the suite names its own session in the environment
-/// (`OMP_SESSION_ID`, `CLAUDE_CODE_SESSION_ID`, `KNIVES_OWNER`); those are
-/// removed so a test's identity is the one it states, whoever runs it.
+/// scanning `scan_home` for checkouts, with no harness session in its
+/// environment ([`without_harness_session`]). Returned unrun so a caller can
+/// add an environment variable (`KNIVES_OWNER`, say) before `.output()`.
 pub fn knives_command(cwd: &Path, config_home: &Path, scan_home: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
     command
@@ -981,9 +1031,7 @@ pub fn knives_command(cwd: &Path, config_home: &Path, scan_home: &Path, args: &[
         .current_dir(cwd)
         .env("KNIVES_CONFIG_HOME", config_home)
         .env("HOME", scan_home);
-    for name in knives::commands::claim::HARNESS_SESSION_VARIABLES {
-        command.env_remove(name);
-    }
+    without_harness_session(&mut command);
     command
 }
 

@@ -4,7 +4,7 @@
 
 use std::ffi::OsStr;
 use std::io::Write as _;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::Duration;
 
 use super::GitError;
@@ -24,7 +24,11 @@ const LOW_SPEED_BYTES: &str = "1000";
 const LOW_SPEED_SECONDS: &str = "15";
 
 /// Run `command` to completion, returning its stdout when it exits zero.
-pub(super) fn run(command: &mut Command) -> Result<Vec<u8>, GitError> {
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "re-exported through `ledger_git` for git commands run elsewhere in the crate"
+)]
+pub(crate) fn run(command: &mut Command) -> Result<Vec<u8>, GitError> {
     let output = command
         .stdin(Stdio::null())
         .output()
@@ -38,14 +42,86 @@ pub(super) fn run(command: &mut Command) -> Result<Vec<u8>, GitError> {
 /// [`run`] for a command that talks to a remote: one whose HTTP transfer
 /// stalls fails, and one still running at [`TRANSPORT_DEADLINE`] is ended.
 pub(super) fn transport(command: &mut Command) -> Result<Vec<u8>, GitError> {
-    command
-        .env("GIT_HTTP_LOW_SPEED_LIMIT", LOW_SPEED_BYTES)
-        .env("GIT_HTTP_LOW_SPEED_TIME", LOW_SPEED_SECONDS);
+    limit_speed(command);
+    run_until(command, TRANSPORT_DEADLINE)?.answer(command)
+}
+
+/// [`transport`], keeping everything git said however it ended: its exit
+/// status, its stdout and its stderr.
+///
+/// For a command whose failure must be read, not only reported: a push
+/// whose porcelain lines name each ref's fate even when git exits non-zero.
+/// git runs with `LC_ALL=C`, so the messages that reading looks for are
+/// git's own English ones whatever language the session speaks.
+pub(super) fn transport_transcript(command: &mut Command) -> Result<Transcript, GitError> {
+    limit_speed(command);
+    command.env("LC_ALL", "C");
     run_until(command, TRANSPORT_DEADLINE)
 }
 
-/// [`run`], ending the command and every process it started once it has run
-/// for `deadline`.
+fn limit_speed(command: &mut Command) {
+    command
+        .env("GIT_HTTP_LOW_SPEED_LIMIT", LOW_SPEED_BYTES)
+        .env("GIT_HTTP_LOW_SPEED_TIME", LOW_SPEED_SECONDS);
+}
+
+/// Everything a bounded command said, and how it ended.
+#[derive(Debug)]
+pub(super) struct Transcript {
+    /// How it exited; `None` when its deadline ended it first.
+    pub(super) status: Option<ExitStatus>,
+    pub(super) stdout: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
+    deadline: Duration,
+}
+
+impl Transcript {
+    /// Its stdout when it exited zero; otherwise the error [`transport`]
+    /// gives for the same run.
+    pub(super) fn answer(self, command: &Command) -> Result<Vec<u8>, GitError> {
+        match self.status {
+            None => Err(self.ended(command)),
+            Some(status) => succeeded(
+                command,
+                Output {
+                    status,
+                    stdout: self.stdout,
+                    stderr: self.stderr,
+                },
+            ),
+        }
+    }
+
+    /// What went wrong, as one message: how the command ended, then its
+    /// stdout and its stderr, each trimmed.
+    pub(super) fn account(&self, command: &Command) -> String {
+        let said = [&self.stdout, &self.stderr]
+            .into_iter()
+            .map(|bytes| String::from_utf8_lossy(bytes).trim().to_owned())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        match self.status {
+            None if said.is_empty() => self.ended(command).to_string(),
+            None => format!("{}; it had printed: {said}", self.ended(command)),
+            Some(_) => GitError::Failed {
+                invocation: invocation(command),
+                stderr: said,
+            }
+            .to_string(),
+        }
+    }
+
+    fn ended(&self, command: &Command) -> GitError {
+        GitError::Deadline {
+            invocation: invocation(command),
+            deadline: self.deadline,
+        }
+    }
+}
+
+/// Run `command` until it exits or has run for `deadline`, ending it and
+/// every process it started at the deadline; what it said either way.
 ///
 /// The command runs in a process group of its own, so ending it reaches the
 /// helpers git starts for a transport (`git-remote-https`, `ssh`): they hold
@@ -53,7 +129,7 @@ pub(super) fn transport(command: &mut Command) -> Result<Vec<u8>, GitError> {
 /// waiting on them. The same group keeps a Ctrl-C meant for knives from
 /// reaching git; a fetch or push left running that way still ends at its own
 /// low-speed limit or writes only the remote's copy of a ref.
-fn run_until(command: &mut Command, deadline: Duration) -> Result<Vec<u8>, GitError> {
+fn run_until(command: &mut Command, deadline: Duration) -> Result<Transcript, GitError> {
     use std::os::unix::process::CommandExt as _;
     let child = command
         .stdin(Stdio::null())
@@ -86,17 +162,22 @@ fn run_until(command: &mut Command, deadline: Duration) -> Result<Vec<u8>, GitEr
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         (output, ended)
     });
-    if ended {
-        return Err(GitError::Deadline {
+    match output {
+        Ok(output) => Ok(Transcript {
+            status: (!ended).then_some(output.status),
+            stdout: output.stdout,
+            stderr: output.stderr,
+            deadline,
+        }),
+        Err(_) if ended => Err(GitError::Deadline {
             invocation: invocation(command),
             deadline,
-        });
+        }),
+        Err(source) => Err(GitError::Run {
+            invocation: invocation(command),
+            source,
+        }),
     }
-    let output = output.map_err(|source| GitError::Run {
-        invocation: invocation(command),
-        source,
-    })?;
-    succeeded(command, output)
 }
 
 /// [`run`], with `input` written to the command's stdin.

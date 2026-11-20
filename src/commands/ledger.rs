@@ -5,10 +5,10 @@
 //! fork from the registry key an older knives named it by to its upstream
 //! repository's name.
 //!
-//! Every command that appends an entry starts one sweep detached as it exits
-//! ([`crate::ledger_sweep::hand_off`]), so it is rarely typed; run by hand it
-//! waits for any sweep already running, then reports what its own pass
-//! carried.
+//! Every command that appends an entry sends it before it exits
+//! ([`crate::ledger_sweep::send_now`]), so a sweep is typed to send what a
+//! write could not, or to pull; it waits for any sweep or send already
+//! running, then reports what its own pass carried.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -20,7 +20,7 @@ use crate::ids::{Requirement, UpstreamName};
 use crate::ledger::{
     Draft, Ledger, Scribe, Stated, inline_human_text, problem_human_text, unmigrated,
 };
-use crate::ledger_sweep::{self, Contended, Swept, Tally, Waited};
+use crate::ledger_sweep::{self, Swept, Tally, Waited};
 use crate::lock::FileLock;
 use crate::statement::{Statement, StatementKind, Statements};
 use crate::store::migration::{LegacyStatement, Renamed, renamed};
@@ -32,14 +32,11 @@ use crate::store::{Store, lock_forks};
 pub enum Outcome {
     /// This sweep held the lock and passed over every destination.
     Swept,
-    /// Another sweep holds the lock and carries this one's work: only the
-    /// sweep a write hands off answers this.
-    Busy,
     /// This machine's ledger has no repository to travel through.
     NotShared,
     /// The sweep could not start: where the ledger travels could not be
-    /// read, or another sweep held the lock past the wait, and its problems
-    /// say why.
+    /// read, or another sweep or send held the lock past the wait, and its
+    /// problems say why.
     Failed,
 }
 
@@ -47,8 +44,8 @@ pub enum Outcome {
 #[derive(Debug, serde::Serialize)]
 pub struct Report {
     pub outcome: Outcome,
-    /// The sweep this one waited for before its own pass: whom the lock
-    /// named, and for how long.
+    /// The sweep or send this one waited for before its own pass: whom the
+    /// lock named, and for how long.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waited: Option<Waited>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -65,19 +62,12 @@ pub struct Report {
 /// registry dispatch read (`loaded`): one that could not be read is a sweep
 /// that could not start.
 ///
-/// The sweep a write hands off ([`ledger_sweep::HANDED_OFF`]) leaves at once
-/// when another sweep holds the lock; any other waits for it, so that what
-/// it reports, and its exit code, is its own pass.
+/// A sweep or send already holding the ledger's lock is waited for, so that
+/// what this reports, and its exit code, is its own pass.
 pub fn run_sweep(output: Output, loaded: Result<Registry, ConfigError>) -> anyhow::Result<Exit> {
     let root = crate::ledger::default_ledger_root();
-    let contended = if std::env::var_os(ledger_sweep::HANDED_OFF).is_some() {
-        Contended::Leave
-    } else {
-        Contended::Wait
-    };
-    let report = match ledger_sweep::run(&root, loaded, contended) {
+    let report = match ledger_sweep::run(&root, loaded) {
         Ok(Swept::NotShared) => Report::of(Outcome::NotShared),
-        Ok(Swept::Busy) => Report::of(Outcome::Busy),
         Ok(Swept::Ran {
             tallies,
             problems,
@@ -125,9 +115,6 @@ pub fn render(report: &Report) -> String {
             "ledger: not shared; this machine's ledger has no repository to travel through"
                 .to_owned(),
         ],
-        Outcome::Busy => {
-            vec!["ledger: another sweep is running and carries this one's entries".to_owned()]
-        }
         Outcome::Failed => vec!["ledger: the sweep could not start".to_owned()],
         Outcome::Swept => report
             .destinations
@@ -177,12 +164,16 @@ pub fn render(report: &Report) -> String {
             .collect(),
     };
     if let Some(waited) = &report.waited {
-        let who = waited
-            .pid
-            .map_or_else(|| "another sweep".to_owned(), |pid| format!("sweep {pid}"));
+        let who = waited.pid.map_or_else(
+            || "another knives command".to_owned(),
+            |pid| format!("knives process {pid}"),
+        );
         lines.insert(
             0,
-            format!("ledger: waited {}s for {who} to finish", waited.seconds),
+            format!(
+                "ledger: waited {}s for {who} to let the ledger go",
+                waited.seconds
+            ),
         );
     }
     // Problems and notes name paths from disk and from other machines' refs.

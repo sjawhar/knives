@@ -164,6 +164,8 @@ fn claim_lines_filter_the_repo_and_render_claim_provenance() {
         started: "2026-08-02T00:00:00Z".to_owned(),
         files: vec![],
         place: None,
+        machine: None,
+        ledger_commit: None,
     };
     let claims = [
         claim("repo", "feature/no-reason", "alex", ""),

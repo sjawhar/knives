@@ -62,7 +62,7 @@ pub enum JjError {
     WorkspaceNameMismatch {
         workspace: PathBuf,
         expected: WorkspaceName,
-        actual: String,
+        actual: WorkspaceName,
     },
 
     #[error("could not resolve revision `{revision}`: {detail}")]
@@ -277,7 +277,7 @@ impl Repo {
                             detail: error.to_string(),
                         })?;
                 Ok((
-                    WorkspaceName::new(name.as_symbol().to_string()),
+                    WorkspaceName::new(name.as_str()),
                     ChangeId::new(commit.change_id().to_string()),
                 ))
             })
@@ -339,7 +339,7 @@ impl Repo {
             return Err(JjError::WorkspaceNameMismatch {
                 workspace: destination.to_owned(),
                 expected: expected_name.clone(),
-                actual: name.as_symbol().to_string(),
+                actual: WorkspaceName::new(name.as_str()),
             });
         }
         let recorded = workspace.working_copy().operation_id().clone();
@@ -489,7 +489,7 @@ impl Repo {
                         detail: error.to_string(),
                     })?;
                     for (name, commit) in view.wc_commit_ids() {
-                        let workspace = WorkspaceName::new(name.as_symbol().to_string());
+                        let workspace = WorkspaceName::new(name.as_str());
                         if wanted.contains(&workspace)
                             && !activity.moves.contains_key(&workspace)
                             && parent_view.wc_commit_ids().get(name) != Some(commit)
