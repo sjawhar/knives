@@ -1294,14 +1294,15 @@ fn unmeasured_why(why: release::Unmeasured, commit: &CommitId) -> String {
 /// whose files nothing here reads whole, where one of `remotes` has a
 /// branch or tag at it ([`unread_fetch`]). A cut gets back a member of the
 /// previous cut with `include`, after the move to the newest write where
-/// the refusal names one. A member only the newest write holds, a write off
-/// the cut's line or not held here, and a fix that the newest write carries
-/// and the cut lacks mean the release here is older than that write, as on
-/// a machine that has not fetched it: so the cut is made again once that
-/// write's release is moved to it, after the fetch of each write that
-/// [`unread_fetch`] names, and an `include` on the older commit would write
-/// a second, divergent write. A write not held here may be one no fetch
-/// brings, so both refusals then name `adopt` too ([`adopt_remedy`]).
+/// the refusal names one, and after the `adopt` that takes the move's place
+/// where the refusal names that too. A member only the newest write holds,
+/// a write off the cut's line or not held here, and a fix that the newest
+/// write carries and the cut lacks mean the release here is older than that
+/// write, as on a machine that has not fetched it: so the cut is made again
+/// once that write's release is moved to it, after the fetch of each write
+/// that [`unread_fetch`] names, and an `include` on the older commit would
+/// write a second, divergent write. A write not held here may be one no
+/// fetch brings, so both refusals then name `adopt` too ([`adopt_remedy`]).
 /// A fix that the subject changes on purpose is kept by an `adopt` of the
 /// new content ([`fix_adopt_remedy`]); a fix whose files nothing here reads
 /// whole has no files to keep, so it alone asks for no such adopt. A fix
@@ -1351,9 +1352,10 @@ fn refusal_remedy(
             "nothing was recorded"
         }
     };
-    // `include` follows the move to the newest write: the release here is
-    // older than that write, and an `include` on it would write a second,
-    // divergent write.
+    // `include` follows the move to the newest write, and the `adopt` that
+    // takes the move's place where the fetch does not bring that write: the
+    // release here is older than that write, and an `include` on it would
+    // write a second, divergent write.
     let restore = sources
         .iter()
         .any(|source| matches!(source, HeldRecord::PreviousCut(_)))
@@ -1390,10 +1392,10 @@ fn refusal_remedy(
             shell_word(commit)
         ));
     }
-    remedies.extend(restore);
     if let Some(write) = found.absent {
         remedies.push(adopt_remedy(write));
     }
+    remedies.extend(restore);
     remedies.extend(adopt_fixes);
     closing_line(outcome, &remedies, (&unheld, remotes.unread(), last))
 }
@@ -4313,6 +4315,68 @@ mod tests {
                  newest recorded write: `jj bookmark set release/2026-08-04 -r eeee \
                  --allow-backwards`; `knives release include <branch>` restores a member the \
                  previous cut recorded, or re-run with --allow-drop to state the drop is intended"
+            )
+        );
+    }
+
+    #[test]
+    fn a_refused_cut_names_the_adopt_that_takes_the_moves_place_before_it_includes_a_member() {
+        // Given: the previous cut of `release/2026-08-04`, `dddd`, which
+        // records `feat/gamma`; that release's newest recorded write, the
+        // edit `eeee`, which this repository does not hold; and a cut that
+        // lacks `feat/gamma`.
+        let gamma = CommitId::new("cccc");
+        let cut = RecordedCut {
+            kind: RecordedWriteKind::Cut,
+            name: "release/2026-08-04".to_owned(),
+            commit: CommitId::new("dddd"),
+            members: vec![gamma.clone()],
+        };
+        let write = RecordedCut {
+            kind: RecordedWriteKind::Edit,
+            name: "release/2026-08-04".to_owned(),
+            commit: CommitId::new("eeee"),
+            members: vec![gamma.clone()],
+        };
+        let check = CompositionCheck {
+            dropped: vec![RecordedMember {
+                commit: gamma,
+                name: "feat/gamma@cccc".to_owned(),
+            }],
+            absent_write: true,
+            ..CompositionCheck::default()
+        };
+        let held = HeldRecords {
+            first: HeldRecord::PreviousCut(&cut),
+            other: Some(HeldRecord::NewestWrite(&write)),
+            record: None,
+            stacked: false,
+        };
+
+        // When: the gate refuses the cut.
+        let lines = uncarried_cut_lines(
+            &RepoName::new("demo"),
+            held,
+            &check,
+            (DropDisposition::RefuseDiscardingCandidate, &no_remote()),
+        );
+
+        // Then: its remedy moves the release to the newest write after a
+        // fetch, names the `adopt` that takes the move's place where the
+        // fetch does not bring that write, and only then the `include` that
+        // restores the previous cut's member. Where the move fails, an
+        // `include` on the older release here would write a second write,
+        // divergent from the one this repository does not hold.
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(
+                "  the candidate was discarded; fetch, then move release/2026-08-04 to eeee, its \
+                 newest recorded write: `jj bookmark set release/2026-08-04 -r eeee \
+                 --allow-backwards`; if the fetch does not bring eeee, `knives release adopt \
+                 release/2026-08-04` records the commit this repository holds as \
+                 release/2026-08-04's newest write; `knives release include <branch>` restores a \
+                 member the previous cut recorded, or re-run with --allow-drop to state the drop \
+                 is intended"
             )
         );
     }
