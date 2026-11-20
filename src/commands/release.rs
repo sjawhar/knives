@@ -9,7 +9,7 @@
 //! as their union, and refuses while the release in hand carries a change
 //! knives did not write or adopt, printing the steps that record it. Every one
 //! of them writes the release locally only, and none of them pushes it.
-// allow: SIZE_OK: 5634 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
+// allow: SIZE_OK: 5636 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -4958,8 +4958,10 @@ pub fn conflict_guidance(release: &str, files: &[String], unions: &[jj::UnionedF
 /// conflict report ([`conflict_report`]), then a line for each `### `
 /// heading that a release log of the tree holds more than once in its one
 /// `[Unreleased]` section ([`report_repeated_headings`]). A command that
-/// writes the release more than once prints the conflict report of each
-/// write, and those headings once, after its last write.
+/// writes the release more than once prints those headings once, after its
+/// last write, and the conflict report of each write it reads through
+/// [`ReportedWrite`]; a rebase reports the unions of its first write, the
+/// shed of stale bases, in the report of the release it re-describes.
 pub fn written_report(
     path: &Path,
     release: &str,
@@ -4982,8 +4984,8 @@ pub fn written_report(
 /// write's own report prints ([`conflict_report`]), and reads its repeated
 /// `### ` headings when they are asked for, which a command prints once,
 /// after its last write ([`report_repeated_headings`]). [`written_report`]
-/// reads the write of a cut or an edit through it, and a rebase each of its
-/// writes.
+/// reads the write of a cut or an edit through it, and a rebase the release
+/// it re-describes after the move and the release its drop writes.
 #[derive(Debug)]
 pub struct ReportedWrite {
     commit: CommitId,

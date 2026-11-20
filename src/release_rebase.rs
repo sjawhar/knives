@@ -281,10 +281,12 @@ pub(crate) fn run_rebase(
             inline_human_text(name)
         );
     }
-    // The command's last write, once it made one: the rebase's, then the
-    // drop's once that write is done. Each step after a write can fail, and
-    // the command prints the repeated headings of its last write once,
-    // whether its steps end or fail.
+    // The last write the command reports, once it made one: the release it
+    // re-describes after the move, then the drop's once that write is done.
+    // The shed of stale bases before the move is not read here: the
+    // re-describe reports its unions. Each step after one of those writes can
+    // fail, and the command prints the repeated headings of the last of them
+    // once, whether its steps end or fail.
     let mut last = None;
     let finished: anyhow::Result<Exit> = (|| {
         let rebased = report_rebased_release(
