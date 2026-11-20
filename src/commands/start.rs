@@ -1164,8 +1164,9 @@ fn unread(branch: &BranchName, shared: &SharedFork, failure: &LedgerFailure) -> 
 fn released_meanwhile(branch: &BranchName, on: &OnLedger<'_>) -> String {
     format!(
         "nothing was claimed: the ledger {} holds no claim of {branch} now; it was released \
-         while this start ran, and `knives start {branch}` takes it",
-        on.shared.ledger
+         while this start ran, and `knives start {}` takes it",
+        on.shared.ledger,
+        crate::ledger::shell_word(branch.as_str())
     )
 }
 
@@ -1352,7 +1353,7 @@ fn shared_refusal(refused: Refused<'_>, now: jiff::Timestamp) -> String {
         "{}{}\n{evidence}\nuse `knives start {} --force --why \"…\"` to seize the claim",
         anonymous_note(refused.anonymous),
         render_claim_context(refused.claim, Some(refused.machine), last_seen, now),
-        refused.claim.branch,
+        crate::ledger::shell_word(&refused.claim.branch),
     )
 }
 
@@ -1368,7 +1369,7 @@ fn unreadable_record_refusal(
     format!(
         "{}\nuse `knives start {} --force --why \"…\"` to replace the claim",
         unreadable_holder(target, claim, commit, cause),
-        target.branch,
+        crate::ledger::shell_word(target.branch.as_str()),
     )
 }
 
@@ -1715,10 +1716,11 @@ fn land(
             eprintln!(
                 "the claim of {branch} was pushed to the ledger {} ({}), and whether it landed \
                  is unknown: {}; nothing is recorded on this machine, and `knives start \
-                 {branch}` reads the claim again",
+                 {}` reads the claim again",
                 on.shared.ledger,
                 git_dir_of(on.shared),
-                problem_human_text(&failure.cause)
+                problem_human_text(&failure.cause),
+                crate::ledger::shell_word(branch.as_str())
             );
             Err(Exit::Incomplete)
         }
@@ -1835,7 +1837,7 @@ fn own_claim_meanwhile(claim: &Claim, machine: &str, now: jiff::Timestamp) -> St
         inline_human_text(&claim.owner),
         claim.branch,
         inline_human_text(machine),
-        claim.branch,
+        crate::ledger::shell_word(&claim.branch),
         render_claim_context(claim, Some(machine), None, now)
     )
 }
@@ -1884,10 +1886,11 @@ fn release_unopened(
         ClaimOutcome::NotApplied { failure, .. } | ClaimOutcome::Unknown { failure } => {
             eprintln!(
                 "the claim of {branch} is held on the ledger {} with no workspace, since its \
-                 release could not be sent ({}): {}; `knives finish {branch}` releases it",
+                 release could not be sent ({}): {}; `knives finish {}` releases it",
                 on.shared.ledger,
                 git_dir_of(on.shared),
-                problem_human_text(&failure.cause)
+                problem_human_text(&failure.cause),
+                crate::ledger::shell_word(branch.as_str())
             );
         }
     }
@@ -2216,6 +2219,31 @@ mod tests {
              0123456789abcdef0123456789abcdef01234567, but the holder cannot be read: its \
              claim.toml does not read as a claim: \u{fffd}[2J\n\
              use `knives start feat/alpha --force --why \"…\"` to replace the claim"
+        );
+    }
+
+    #[test]
+    fn a_branch_the_shell_reads_apart_is_one_quoted_word_in_the_start_that_resumes_a_claim() {
+        // Given: the caller's own claim of a branch whose name holds a `$`,
+        // which a shell expands, taken on machine one in another config home
+        let claim = Claim {
+            branch: "feat/a$b".into(),
+            ..ledger_claim()
+        };
+
+        // When: a start that lost its race to that claim says so
+        let said = own_claim_meanwhile(&claim, "machine-one", at_eleven());
+
+        // Then: the `start` it offers names the branch as one quoted word,
+        // and the prose names it as it is
+        let (first, _) = said
+            .split_once('\n')
+            .expect("a line before the claim's context");
+        assert_eq!(
+            first,
+            "nothing was claimed: owner-one, the owner of this start, took feat/a$b in another \
+             config home, on machine machine-one, while this start ran; \
+             `knives start 'feat/a$b'` resumes that claim"
         );
     }
 }
