@@ -527,6 +527,19 @@ impl Repo {
             .map(commit_id)
     }
 
+    /// Whether `name` is a bookmark here, local or on the remote `remote`,
+    /// whatever it points at: a divergent bookmark is still one.
+    pub fn has_bookmark(&self, name: &str, remote: &str) -> bool {
+        self.repo.view().bookmarks().any(|(branch, targets)| {
+            branch.as_str() == name
+                && (targets.local_target.is_present()
+                    || targets
+                        .remote_refs
+                        .iter()
+                        .any(|(on, target)| on.as_str() == remote && target.target.is_present()))
+        })
+    }
+
     pub fn bookmark_tips(&self) -> Result<BookmarkTips, JjError> {
         let mut tips = BTreeMap::new();
         for (branch, targets) in self.repo.view().bookmarks() {

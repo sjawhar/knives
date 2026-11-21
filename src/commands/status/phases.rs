@@ -219,9 +219,13 @@ pub(super) fn conflicted_bookmark_findings(repo: &Repo) -> anyhow::Result<Vec<Fi
     }
     Ok(findings)
 }
-/// Every number declared before discovery: stated pull requests and same-repository
-/// dependencies for both maintained and divergent branches. A requirement is
-/// this fork's when it names `repo`, the name the fork is kept under.
+/// Every number declared before discovery: the pull request each of
+/// `branches` is stated to become, and every pull request on `repo`, the
+/// name the fork is kept under, that any branch requires. A dependent with no
+/// row (held only on origin, or deleted) counts too, since the report checks
+/// its requirements ([`super::dependencies`]); a number left out here is one
+/// the forge is never asked about. A requirement on the fork's own
+/// repository is asked of that repository.
 pub(super) fn declared_numbers(
     repo: &UpstreamName,
     branches: &[BranchName],
@@ -233,12 +237,20 @@ pub(super) fn declared_numbers(
         if let Some(number) = store.tracked_pull(&target) {
             let _ = numbers.insert(number);
         }
+    }
+    for (dependent, _) in store.dependents(repo) {
+        let target = BranchTarget::new(repo.clone(), dependent);
         numbers.extend(
             store
                 .dependencies(&target)
                 .into_iter()
-                .filter(|requirement| requirement.repo == *repo)
-                .map(|requirement| requirement.number),
+                .filter_map(|requirement| match requirement {
+                    crate::ids::Requirement::Upstream {
+                        repo: required,
+                        number,
+                    } if required == *repo => Some(number),
+                    _ => None,
+                }),
         );
     }
     numbers.into_iter().collect()

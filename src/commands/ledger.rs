@@ -508,8 +508,8 @@ fn by_fork(
     by_repo
 }
 
-/// `legacy` with the repository of each requirement it states renamed from
-/// a former name to the one its fork is kept under now.
+/// `legacy` with the repository of each upstream requirement it states
+/// renamed from a former name to the one its fork is kept under now.
 fn with_current_names(legacy: LegacyStatement, former: &FormerNames) -> LegacyStatement {
     if legacy.statement.kind != StatementKind::Depends {
         return legacy;
@@ -519,7 +519,10 @@ fn with_current_names(legacy: LegacyStatement, former: &FormerNames) -> LegacySt
             .split(',')
             .map(|written| {
                 Requirement::parse(written)
-                    .filter(|requirement| former.contains_key(requirement.repo.as_str()))
+                    .filter(|requirement| {
+                        matches!(requirement, Requirement::Upstream { repo, .. }
+                            if former.contains_key(repo.as_str()))
+                    })
                     .and_then(|_| renamed(former, written, '#'))
                     .unwrap_or_else(|| written.to_owned())
             })

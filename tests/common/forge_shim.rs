@@ -10,6 +10,7 @@
     reason = "a test fixture included by path; not every test target uses every helper"
 )]
 
+use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -287,6 +288,191 @@ pub fn path_with_gh_shim(shim: &Path) -> std::ffi::OsString {
         )),
     )
     .expect("construct shim PATH")
+}
+
+/// One forge repository a [`install_repository_gh`] shim answers for: the
+/// `<owner>/<name>` a call names it by, the `nameWithOwner` the forge gives
+/// it, and its pull requests ([`pull_record`] rows, as a JSON array).
+pub struct Repository<'a> {
+    pub named: &'a str,
+    pub canonical: &'a str,
+    pub pulls: &'a str,
+}
+
+/// Install a fake `gh` that answers each of `repositories` apart, as a forge
+/// does: `repo view <owner>/<name>` gives that repository's identity, `pr
+/// list -R <owner>/<name>` its pull requests, and a by-number facts query
+/// (`api graphql -f owner=… -f name=…`) the pull requests it asks about of
+/// the repository its `owner` and `name` fields name, a number that
+/// repository does not have, or the query does not ask about, being absent
+/// from the reply. A status snapshot's warm sweep finds nothing. A call
+/// naming any other repository fails as gh does for one that does not
+/// exist, or that the token cannot see, but a list of one is empty. A pull
+/// request row may repeat a field to replace [`pull_record_with_fields`]'s
+/// default: the last one is kept. Each call's arguments are appended to
+/// `log`.
+pub fn install_repository_gh(shim: &Path, repositories: &[Repository<'_>], log: &Path) {
+    install_repository_gh_failing(shim, repositories, &[], log);
+}
+
+/// [`install_repository_gh`], but every call naming one of `failing` (an
+/// `<owner>/<name>`) fails as an outage does, `HTTP 502`, not as a name the
+/// forge cannot resolve.
+pub fn install_repository_gh_failing(
+    shim: &Path,
+    repositories: &[Repository<'_>],
+    failing: &[&str],
+    log: &Path,
+) {
+    let sweep = json_file(
+        shim,
+        "sweep.json",
+        &serde_json::json!({
+            "data": {
+                "repository": {
+                    "pullRequests": {
+                        "pageInfo": {"hasNextPage": false},
+                        "nodes": [],
+                    }
+                }
+            }
+        }),
+    );
+    let mut views = String::new();
+    let mut lists = String::new();
+    let mut facts = String::new();
+    let outage = "echo \"HTTP 502: Bad Gateway (https://api.github.com/graphql)\" >&2; exit 1 ;;";
+    for repository in failing {
+        let (owner, name) = repository
+            .split_once('/')
+            .expect("a repository is named <owner>/<name>");
+        writeln!(views, "  {repository}) {outage}").expect("write to a string");
+        writeln!(lists, "  {repository}) {outage}").expect("write to a string");
+        writeln!(facts, "  \"{owner} {name}\") {outage}").expect("write to a string");
+    }
+    for (index, repository) in repositories.iter().enumerate() {
+        let (owner, name) = repository
+            .named
+            .split_once('/')
+            .expect("a repository is named <owner>/<name>");
+        let identity = json_file(
+            shim,
+            &format!("identity-{index}.json"),
+            &serde_json::json!({
+                "nameWithOwner": repository.canonical,
+                "id": format!("ID{index}"),
+            }),
+        );
+        let pulls: Vec<serde_json::Value> =
+            serde_json::from_str(repository.pulls).expect("parse fake pull request payload");
+        let list = json_file(shim, &format!("list-{index}.json"), &pulls);
+        cat_arm(&mut lists, repository.named, &list);
+        cat_arm(&mut views, repository.named, &identity);
+        facts.push_str(&facts_arm(shim, (owner, name), &pulls, &sweep));
+    }
+    install_executable(
+        &shim.join("gh"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             owner=\n\
+             name=\n\
+             previous=\n\
+             for argument in \"$@\"; do\n\
+               case \"$previous $argument\" in\n\
+               \"-f owner=\"*) owner=${{argument#owner=}} ;;\n\
+               \"-f name=\"*) name=${{argument#name=}} ;;\n\
+               esac\n\
+               previous=$argument\n\
+             done\n\
+             case \"$1 $2\" in\n\
+             \"repo view\")\n\
+               case \"$3\" in\n\
+             {views}\
+               esac\n\
+               echo \"GraphQL: Could not resolve to a Repository with the name '$3'.\" >&2\n\
+               exit 1 ;;\n\
+             \"pr list\")\n\
+               case \"$4\" in\n\
+             {lists}\
+               esac\n\
+               echo '[]'; exit 0 ;;\n\
+             \"api graphql\")\n\
+               case \"$owner $name\" in\n\
+             {facts}\
+               esac\n\
+               echo \"GraphQL: Could not resolve to a Repository with the name '$owner/$name'.\" >&2\n\
+               exit 1 ;;\n\
+             esac\n\
+             echo \"unexpected gh invocation: $*\" >&2\n\
+             exit 1\n",
+            log = log.display(),
+        ),
+    );
+}
+
+/// The `case` arm that answers a by-number facts query on `owner`/`name`,
+/// whose pull requests are `pulls`, for the numbers the query asks about,
+/// as GitHub answers it: one fragment per pull request, put together for
+/// the `pullRequest(number: N)` fields the query holds. A reinstall can hide
+/// a repository, so the fragments are kept by the repository's name, and
+/// cleared first.
+fn facts_arm(
+    shim: &Path,
+    (owner, name): (&str, &str),
+    pulls: &[serde_json::Value],
+    sweep: &Path,
+) -> String {
+    let dir = shim.join(format!("facts-{owner}-{name}"));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("clear the facts directory");
+    }
+    std::fs::create_dir_all(&dir).expect("create the facts directory");
+    for pull in pulls {
+        let number = pull["number"].as_u64().expect("pull request number");
+        std::fs::write(
+            dir.join(format!("{number}.json")),
+            format!(
+                "\"p{number}\":{}",
+                serde_json::to_string(pull).expect("serialize a fake pull request")
+            ),
+        )
+        .expect("write a fake pull request's facts");
+    }
+    format!(
+        "  \"{owner} {name}\")\n\
+         \x20   case \"$*\" in\n\
+         \x20   *\"pullRequest(number:\"*)\n\
+         \x20     printf '{{\"data\":{{\"repository\":{{'\n\
+         \x20     separator=\n\
+         \x20     for number in $(printf '%s\\n' \"$*\" | grep -o 'pullRequest(number: [0-9]*' | grep -o '[0-9]*$'); do\n\
+         \x20       if [ -f \"{dir}/$number.json\" ]; then\n\
+         \x20         printf '%s' \"$separator\"; cat \"{dir}/$number.json\"; separator=,\n\
+         \x20       fi\n\
+         \x20     done\n\
+         \x20     printf '}}}}}}\\n'; exit 0 ;;\n\
+         \x20   *\"orderBy: {{field: UPDATED_AT\"*) cat \"{sweep}\"; exit 0 ;;\n\
+         \x20   esac ;;\n",
+        dir = dir.display(),
+        sweep = sweep.display(),
+    )
+}
+
+/// Write `value` as JSON to `name` in `shim`; its path.
+fn json_file(shim: &Path, name: &str, value: &impl serde::Serialize) -> std::path::PathBuf {
+    let path = shim.join(name);
+    std::fs::write(
+        &path,
+        serde_json::to_vec(value).expect("serialize a fake forge payload"),
+    )
+    .expect("write a fake forge payload");
+    path
+}
+
+/// Append to `arms` a shell `case` arm that prints `path` for `pattern`.
+fn cat_arm(arms: &mut String, pattern: &str, path: &Path) {
+    writeln!(arms, "  {pattern}) cat \"{}\"; exit 0 ;;", path.display())
+        .expect("write to a string");
 }
 
 /// One forge pull request record with the fields the binary requires.
