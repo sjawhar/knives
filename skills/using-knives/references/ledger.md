@@ -35,7 +35,8 @@ knives notch --verify '#4545'
 | `claim_change` | `claimed`, `taken`, `released` or `resumed`, with `claim_change_why` and, when it displaced an owner, `previous_owner`, `previous_kind`, `previous_started`, `previous_last_seen`, `previous_why`. |
 
 - Per branch and statement kind, the entry with the greatest `ts` is live. A statement with no value is a forget.
-- A `depends` list is every requirement stated since the newest `depends` forget, so two machines that each add one keep both.
+- A `depends` list is every requirement stated since the newest `depends` forget, so two machines that each add one keep both. `depends --forget` writes a forget and then the list it leaves, so every knives, an older one too, reads the same list.
+- A knives from before fork requirements reads an `origin:<owner>/<name>:<branch>` requirement as a statement it cannot read (exit `3`), and an `origin:<owner>/<name>#<n>` one as a requirement on a fork its registry does not have (a `status` problem). Upgrade every machine that shares the ledger.
 - Only the `statement` field states anything; prose does not. A statement this knives cannot fully read states nothing and is a problem (exit `3`), and release writes refuse.
 - Commands record what they see: claims (`start`, `finish`), statements (`track`, `depends`), PR transitions (`sync`), and every release write. A release write records each parent's full commit and all its bookmarks, and the commit and change id it wrote. Find a lost member from that record, not from current bookmark names.
 

@@ -57,11 +57,18 @@ Reports upstream contribution facts: convention files and their changes since la
 Inference matches branches to PR heads from our copies and reads a `pr-<n>` bookmark as that PR's head. It can miss older or closed PRs and a superseding PR by someone else. State them:
 
 ```text
-knives track <branch> --pr 4545     # any number, state or author
-knives track <branch> --forget      # back to inference
-knives depends <branch> --on <repo>#<number>
+knives track <branch> --pr 4545                # any number, state or author
+knives track <branch> --forget                 # back to inference
+knives depends <branch> --on <repo>#<number>   # <repo>: the registry name; the forge says whose
+knives depends <branch> --on <owner>/<name>#<number>
+knives depends <branch> --on <member-branch>
+knives depends <branch> --forget <requirement> [--on <requirement>]
 ```
 
-- `depends` is never inferred and can cross forks. `status` reports requirements that have not merged.
+- `depends` is never inferred and can cross forks. Its record names each requirement as one of: `<upstream>#<n>`, a pull request on the fork's upstream; `origin:<owner>/<name>#<n>`, a review pull request on the fork's own repository; `origin:<owner>/<name>:<branch>`, a member branch of this fork.
+- `--on <repo>#<n>` with the registry name asks the forge which repository has #n. Both the upstream and the fork's own repository have it: refused (exit `2`), naming both; name the one you mean by its `<owner>/<name>`. Neither has it: refused (exit `2`). The forge cannot answer: exit `3`, nothing recorded.
+- `--on <owner>/<name>#<n>` names the upstream's pull request, or the fork's when `<owner>/<name>` is its own repository. A bare branch name must be a bookmark here or on origin.
+- `--forget` takes a requirement back, spelled as the record or as `--on` spells it; with `--on`, it corrects one. The removal is a ledger entry: every machine that shares the ledger reads the same list.
+- `status` reports a pull request that has not merged, with the head branch of a review pull request, and a member branch that has not landed.
 - `depends` and `track --forget` pull the shared ledger first and refuse (exit `3`) when the pull fails.
 - `track --fork-only` is a legacy statement; placement never records fork-only (fork-work §3).
