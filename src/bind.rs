@@ -46,6 +46,19 @@ impl Fork<'_> {
             .unwrap_or_else(|| self.checkout.path.parent().unwrap_or(&self.checkout.path))
     }
 
+    /// The URL of the fork's own repository: the checkout's `origin` remote
+    /// when it names a forge repository, else the registry's `origin`. A
+    /// checkout whose `origin` is a local path names no forge repository, so
+    /// the registry's is what the forge can be asked about.
+    pub fn own_origin(&self) -> &str {
+        self.checkout
+            .remotes
+            .get("origin")
+            .map(String::as_str)
+            .filter(|url| crate::remote_url::remote_slug(url).is_some())
+            .unwrap_or(self.entry.origin.as_str())
+    }
+
     /// How the checkout's `origin` and `release` differ from the registry's, in
     /// that order; empty when both match. `release` is compared only when the
     /// entry has one.

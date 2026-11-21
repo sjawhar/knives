@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use forge_shim::{
-    Repository, install_repository_gh, path_with_gh_shim, pull_record, pull_record_with_fields,
+    Repository, install_failing_gh, install_repository_gh, path_with_gh_shim, pull_record,
+    pull_record_with_fields,
 };
 use knives::ledger::{Entry, Ledger};
 use knives::statement::{Statement, StatementKind, Statements};
@@ -95,7 +96,11 @@ fn fixture_on(upstream: &str, origin: &str, registered: &str) -> Fixture {
     lab.branch("feat/landed", "landed.txt", "landed\n");
     lab.upstream_trunk_file("landed.txt", "landed\n");
     lab.upstream_at_forge_url(upstream);
-    lab.origin_at_forge_url(origin);
+    // An empty `origin` leaves the checkout's `origin` remote a local path,
+    // which names no forge repository.
+    if !origin.is_empty() {
+        lab.origin_at_forge_url(origin);
+    }
     let home = tempfile::tempdir().expect("config home");
     std::fs::write(
         home.path().join("repos.toml"),
@@ -1477,6 +1482,7 @@ fn a_merged_review_pull_request_whose_head_is_gone_names_its_base() {
         })
         .unwrap_or_else(|| panic!("{problems:?}\n{report}"));
     assert!(problem.contains("review/base"), "{problem}");
+    assert!(problem.contains("refs/pull/22/head"), "{problem}");
     assert!(!problem.contains("forget the requirement"), "{problem}");
     assert_eq!(code, Some(3), "{report}");
 }
@@ -1633,7 +1639,7 @@ fn a_member_whose_origin_holds_work_its_local_tip_lacks_stays_unmet() {
 }
 
 #[test]
-fn a_deleted_dependent_is_checked_by_its_recorded_head_until_its_work_lands() {
+fn a_deleted_dependent_is_checked_by_its_recorded_head_or_reported_unknown() {
     // Given: feat/dep and feat/done each require feat/base, which has not
     // landed; the trunk has feat/done's work and not feat/dep's. Both are
     // then deleted here, never pushed, as after merging into a review base.
@@ -1644,13 +1650,16 @@ fn a_deleted_dependent_is_checked_by_its_recorded_head_until_its_work_lands() {
     lab.upstream_trunk_file("done.txt", "done\n");
     fixture.depends_of("feat/dep", &["--on", "feat/base"]);
     fixture.depends_of("feat/done", &["--on", "feat/base"]);
+    let done = lab::commit_at(lab, "feat/done");
     lab.jj_work(["bookmark", "delete", "feat/dep", "feat/done"]);
 
     // When: status reports the fork.
     let (code, report) = status(&fixture);
 
-    // Then: feat/dep's work, not landed, still needs feat/base; feat/done's
-    // work landed, so its requirements no longer matter.
+    // Then: feat/dep's recorded commit has not landed, so its requirement is
+    // checked, and unmet. feat/done's recorded commit landed, which does not
+    // show that later work it carried did: not silent, a problem naming what
+    // could not be read.
     let unmet = details(&report, "unmet-dependency");
     assert!(
         unmet.contains(
@@ -1665,7 +1674,18 @@ fn a_deleted_dependent_is_checked_by_its_recorded_head_until_its_work_lands() {
             .any(|detail| detail.starts_with("feat/done requires")),
         "{unmet:?}\n{report}"
     );
-    assert_eq!(code, Some(1), "{report}");
+    assert!(
+        problems(&report).contains(&format!(
+            "cannot check whether feat/done still needs origin:acme/demo:feat/base: its branch \
+             is gone here and on origin, and the newest commit the ledger records for it, {}, \
+             has landed, which does not show that work it carried later did. Fetch a ref that \
+             holds its work, or forget its requirements (`knives depends feat/done --forget …`) \
+             once that work has landed or been dropped",
+            done.short()
+        )),
+        "{report}"
+    );
+    assert_eq!(code, Some(3), "{report}");
 }
 
 #[test]
@@ -1715,4 +1735,370 @@ fn status_on_github_remotes_keeps_another_owners_pull_request_off_a_member() {
         );
         assert_eq!(code, Some(1), "{upstream}: {report}");
     }
+}
+
+/// The two configs a renamed fork's repository can be in: its checkout and
+/// registry on the old name, `acme-old/demo`, or both on the new one.
+const RENAMED_CONFIGS: [(&str, &str); 2] = [(REGISTRY_ORIGIN, REGISTRY_ORIGIN), (ORIGIN, ORIGIN)];
+
+#[test]
+fn a_review_pull_request_held_under_both_names_is_forgotten_by_any_spelling() {
+    for (origin, registered) in RENAMED_CONFIGS {
+        let fixture = fixture_with(origin, registered);
+        for forget in [
+            "origin:acme/demo#13",
+            "origin:acme-old/demo#13",
+            "acme/demo#13",
+            "acme-old/demo#13",
+            "demo#13",
+        ] {
+            // Given: feat/alpha requires the fork's #13 under both the old
+            // name and the new, as when a record from before the rename was
+            // written again after it.
+            fixture.depends(&["--on", "acme/demo#13"]);
+            fixture.rewrite_requirements(
+                "origin:acme/demo#13",
+                "origin:acme-old/demo#13,origin:acme/demo#13",
+            );
+            assert_eq!(
+                fixture.required("feat/alpha"),
+                ["origin:acme-old/demo#13", "origin:acme/demo#13"],
+                "{origin}: {forget}"
+            );
+
+            // When / Then: any spelling takes both back: one requirement.
+            fixture.depends(&["--forget", forget]);
+            assert_eq!(
+                fixture.required("feat/alpha"),
+                Vec::<String>::new(),
+                "{origin}: {forget}"
+            );
+        }
+    }
+}
+
+#[test]
+fn naming_a_review_pull_request_again_keeps_the_spelling_held() {
+    for (origin, registered) in RENAMED_CONFIGS {
+        // Given: feat/alpha requires the fork's #13 under its old name only.
+        let fixture = fixture_with(origin, registered);
+        fixture.depends(&["--on", "acme/demo#13"]);
+        fixture.rewrite_requirements("origin:acme/demo#13", "origin:acme-old/demo#13");
+
+        // When: it is named again by the new name.
+        let named = fixture.depends(&["--on", "acme/demo#13"]);
+
+        // Then: the record held is named, and no second spelling is written.
+        assert_eq!(
+            named.trim_end(),
+            "demo/feat/alpha now requires origin:acme-old/demo#13",
+            "{origin}"
+        );
+        assert_eq!(
+            fixture.required("feat/alpha"),
+            ["origin:acme-old/demo#13"],
+            "{origin}"
+        );
+    }
+}
+
+#[test]
+fn an_exact_upstream_forget_needs_no_forge_answer() {
+    // Given: feat/base requires the upstream's #12 and the fork's #12; then
+    // the forge stops answering.
+    let fixture = fixture();
+    fixture.depends_of(
+        "feat/base",
+        &["--on", "maintainer/demo#12", "--on", "acme/demo#12"],
+    );
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+
+    // When / Then: the upstream's, named as its record spells it, is taken
+    // back without the forge.
+    fixture.depends_of("feat/base", &["--forget", "maintainer/demo#12"]);
+    assert_eq!(fixture.required("feat/base"), ["origin:acme/demo#12"]);
+}
+
+#[test]
+fn a_record_the_forge_cannot_name_does_not_stop_another_forget() {
+    // Given: feat/alpha requires the fork's #13 and #13 on a repository the
+    // forge does not know.
+    let fixture = fixture();
+    fixture.depends(&["--on", "acme/demo#13"]);
+    fixture.rewrite_requirements(
+        "origin:acme/demo#13",
+        "origin:acme/demo#13,origin:gone/demo#13",
+    );
+
+    // When / Then: the fork's #13 is taken back; the other stays.
+    fixture.depends(&["--forget", "origin:acme/demo#13"]);
+    assert_eq!(fixture.required("feat/alpha"), ["origin:gone/demo#13"]);
+}
+
+#[test]
+fn an_exact_sibling_member_token_takes_back_that_record_alone() {
+    // Given: feat/alpha requires this fork's feat/base, and holds a record
+    // naming the sibling's feat/base, as a hand edit could leave.
+    let fixture = fixture();
+    fixture.depends(&["--on", "feat/base"]);
+    fixture.rewrite_requirements(
+        "origin:acme/demo:feat/base",
+        "origin:acme/demo:feat/base,origin:acme/sibling:feat/base",
+    );
+
+    // When / Then: the sibling's token takes back that record alone.
+    fixture.depends(&["--forget", "origin:acme/sibling:feat/base"]);
+    assert_eq!(
+        fixture.required("feat/alpha"),
+        ["origin:acme/demo:feat/base"]
+    );
+}
+
+#[test]
+fn depends_reads_the_checkouts_origin_as_status_and_track_do() {
+    // Given: the checkout's `origin` names the fork's own repository,
+    // acme/demo, and the registry names another live one, acme/other. The
+    // fork's #12 and the upstream's #12 both exist.
+    let fixture = fixture_with(ORIGIN, "https://forge.invalid/acme/other");
+
+    // When / Then: `--on demo#12` asks the repository the checkout names, so
+    // the number is ambiguous, and refused naming both.
+    fixture.refused(
+        "feat/alpha",
+        &["--on", "demo#12"],
+        &[
+            "names two pull requests",
+            "maintainer/demo#12",
+            "acme/demo#12",
+        ],
+    );
+}
+
+/// Advance `branch` here with a commit adding `file`, and leave `@` empty on
+/// top of it.
+fn advance(lab: &Lab, branch: &str, file: &str, message: &str) {
+    lab.jj_work(["new", "-r", branch, "-m", message]);
+    std::fs::write(lab.work.join(file), format!("{message}\n")).expect("write the new work");
+    lab.jj_work(["bookmark", "set", branch, "-r", "@"]);
+    lab.jj_work(["new"]);
+}
+
+#[test]
+fn an_old_recorded_dependent_commit_does_not_show_its_later_work_landed() {
+    // Given: feat/dep requires feat/base, recorded at C; C's work lands
+    // upstream; feat/dep then advances to D with more work, held also by
+    // review/base. Its requirement is unmet while feat/dep is here.
+    let fixture = fixture();
+    let lab = &fixture.lab;
+    lab.branch("feat/dep", "dep.txt", "dep\n");
+    fixture.depends_of("feat/dep", &["--on", "feat/base"]);
+    let recorded = lab::commit_at(lab, "feat/dep");
+    lab.upstream_trunk_file("dep.txt", "dep\n");
+    advance(
+        lab,
+        "feat/dep",
+        "later-dep.txt",
+        "later work that still requires base",
+    );
+    lab.jj_work(["bookmark", "create", "review/base", "-r", "feat/dep"]);
+    let (_, control) = status(&fixture);
+    assert!(
+        details(&control, "unmet-dependency")
+            .iter()
+            .any(|detail| detail.starts_with("feat/dep requires ")),
+        "{control}"
+    );
+
+    // When: feat/dep alone is deleted; D stays in review/base.
+    lab.jj_work(["bookmark", "delete", "feat/dep"]);
+    let (code, report) = status(&fixture);
+
+    // Then: C's landing is not taken as feat/dep's: not silent, a problem
+    // naming what could not be read.
+    let problems = problems(&report);
+    assert!(
+        problems.iter().any(|problem| problem.starts_with(&format!(
+            "cannot check whether feat/dep still needs origin:acme/demo:feat/base: its branch \
+             is gone here and on origin, and the newest commit the ledger records for it, {}, \
+             has landed",
+            recorded.short()
+        ))),
+        "{problems:?}\n{report}"
+    );
+    assert_eq!(code, Some(3), "{report}");
+}
+
+#[test]
+fn a_deleted_dependent_is_judged_by_the_newest_commit_any_entry_records() {
+    // Given: feat/dep requires feat/base, recorded at C, whose work lands;
+    // feat/dep advances to D, and a note about it is written there; then
+    // feat/dep is deleted.
+    let fixture = fixture();
+    let lab = &fixture.lab;
+    lab.branch("feat/dep", "dep.txt", "dep\n");
+    fixture.depends_of("feat/dep", &["--on", "feat/base"]);
+    lab.upstream_trunk_file("dep.txt", "dep\n");
+    advance(lab, "feat/dep", "later-dep.txt", "later work");
+    let later = lab::commit_at(lab, "feat/dep");
+    let note = fixture.knives(&["--text", "notch", "feat/dep", "-m", "advanced"]);
+    assert!(note.status.success(), "{}", said(&note));
+    lab.jj_work(["bookmark", "delete", "feat/dep"]);
+
+    // When: status reports the fork.
+    let (code, report) = status(&fixture);
+
+    // Then: the note's commit, D, is the newest recorded, has not landed,
+    // and so the requirement is checked, and unmet; a note says why.
+    assert!(
+        details(&report, "unmet-dependency").contains(
+            &"feat/dep requires origin:acme/demo:feat/base, which has not landed (no-pr)"
+                .to_owned()
+        ),
+        "{report}"
+    );
+    let notes: Vec<&str> = report["notes"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        notes.contains(
+            &format!(
+                "feat/dep is gone here and on origin; its requirements are checked because the \
+             newest commit the ledger records for it, {}, has not landed",
+                later.short()
+            )
+            .as_str()
+        ),
+        "{notes:?}"
+    );
+    assert_eq!(code, Some(1), "{report}");
+}
+
+#[test]
+fn a_deleted_dependents_recorded_commit_outlives_a_later_forget() {
+    // Given: feat/dep requires feat/base, recorded at C, not landed; feat/dep
+    // is deleted, and then its list is corrected, which records no commit.
+    let fixture = fixture();
+    let lab = &fixture.lab;
+    lab.branch("feat/dep", "dep.txt", "dep\n");
+    fixture.depends_of("feat/dep", &["--on", "feat/base"]);
+    lab.jj_work(["bookmark", "delete", "feat/dep"]);
+    fixture.depends_of(
+        "feat/dep",
+        &["--forget", "feat/base", "--on", "acme/demo#13"],
+    );
+
+    // When: status reports the fork.
+    let (code, report) = status(&fixture);
+
+    // Then: C is still its recorded commit, so the corrected list is checked.
+    assert!(
+        details(&report, "unmet-dependency")
+            .iter()
+            .any(|detail| detail.starts_with(
+                "feat/dep requires origin:acme/demo#13 (head feat/base, open), which has not landed"
+            )),
+        "{report}"
+    );
+    assert_eq!(code, Some(1), "{report}");
+}
+
+#[test]
+fn a_dependent_the_ledger_records_no_commit_for_is_reported_unknown() {
+    // Given: feat/ghost, never a branch here, requires feat/base.
+    let fixture = fixture();
+    fixture.depends_of("feat/ghost", &["--on", "feat/base"]);
+
+    // When: status reports the fork.
+    let (code, report) = status(&fixture);
+
+    // Then: not silent: a problem saying the ledger records no commit for it.
+    assert!(
+        problems(&report).iter().any(|problem| problem.starts_with(
+            "cannot check whether feat/ghost still needs origin:acme/demo:feat/base: its branch \
+             is gone here and on origin, and the ledger records no commit for it."
+        )),
+        "{report}"
+    );
+    assert_eq!(code, Some(3), "{report}");
+}
+
+#[test]
+fn a_member_with_a_conflicted_local_bookmark_is_judged_on_origin_too() {
+    // Given: feat/base, two commits, pushed and squash-merged upstream as
+    // #40; feat/alpha requires it: met.
+    let fixture = fixture_with(ORIGIN, ORIGIN);
+    let lab = &fixture.lab;
+    advance(lab, "feat/base", "base2.txt", "second base commit");
+    lab.push_branch("feat/base");
+    lab.publish_pull("feat/base", 40);
+    let merged = lab::commit_at(lab, "feat/base");
+    lab.squash_merge_pull(40, None);
+    let landing = lab::commit_at(lab, "main@upstream");
+    fixture.forge(&[merged_upstream(
+        40,
+        "feat/base",
+        merged.as_str(),
+        landing.as_str(),
+    )]);
+    fixture.depends(&["--on", "feat/base"]);
+    let (_, control) = status(&fixture);
+    assert_eq!(
+        details(&control, "unmet-dependency"),
+        Vec::<String>::new(),
+        "{control}"
+    );
+
+    // When: this checkout stops tracking feat/base, two concurrent
+    // operations move it to two of its merged commits (a conflicted local
+    // bookmark, both sides within what merged), and another clone advances
+    // it on origin with new work, which the fetch brings in.
+    lab.jj_work(["bookmark", "untrack", "feat/base", "--remote", "origin"]);
+    let operation = lab.jj_work_output(["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "feat/base",
+        "-r",
+        "feat/base-",
+        "--allow-backwards",
+        "--ignore-working-copy",
+    ]);
+    lab.jj_work([
+        "--at-op",
+        operation.as_str(),
+        "bookmark",
+        "set",
+        "feat/base",
+        "-r",
+        "feat/base--",
+        "--allow-backwards",
+        "--ignore-working-copy",
+    ]);
+    lab.advance_origin_branch("feat/base", "new work on origin\n");
+    lab.jj_work(["git", "fetch", "--remote", "origin"]);
+    let conflicted = lab.jj_work_output([
+        "bookmark",
+        "list",
+        "feat/base",
+        "-T",
+        "if(conflict, \"conflicted\", \"single\") ++ \"\\n\"",
+    ]);
+    assert!(conflicted.contains("conflicted"), "{conflicted}");
+    let (code, report) = status(&fixture);
+
+    // Then: with no single local tip, origin's copy is judged too, and its
+    // new work has not landed.
+    assert!(
+        details(&report, "unmet-dependency")
+            .iter()
+            .any(|detail| detail.starts_with(
+                "feat/alpha requires origin:acme/demo:feat/base, which has not landed \
+             (feat/base@origin "
+            )),
+        "{report}"
+    );
+    assert_ne!(code, Some(0), "{report}");
 }

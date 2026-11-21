@@ -116,9 +116,9 @@ pub struct Statements {
     /// The live statement per subject and kind; a `None` value is a live
     /// forget.
     live: BTreeMap<String, BTreeMap<StatementKind, Live>>,
-    /// Per subject with a live `depends` list, the subject's tip when the
-    /// newest entry of that list that recorded one was written.
-    depends_heads: BTreeMap<String, String>,
+    /// Per branch, the newest commit any entry records for it
+    /// ([`Self::recorded_head`]).
+    recorded_heads: BTreeMap<String, String>,
 }
 
 /// One live statement: its value, and the stamp a statement replacing it is
@@ -136,9 +136,23 @@ struct Live {
 /// newer.
 type Place = (Option<jiff::Timestamp>, usize);
 
-/// One `depends` list as an entry states it: where the entry falls, the
-/// list, and the subject's tip when the entry was written, if recorded.
-type Listed<'e> = (Place, &'e str, Option<&'e str>);
+/// The newest commit any entry records for one branch, by where that entry
+/// falls.
+type Recorded<'e> = (Place, &'e str);
+
+/// Keep `commit` as `branch`'s recorded head when it is recorded at or after
+/// the one held.
+fn record_head<'e>(
+    recorded: &mut BTreeMap<&'e str, Recorded<'e>>,
+    branch: &'e str,
+    commit: &'e str,
+    place: Place,
+) {
+    let held = recorded.entry(branch).or_insert((place, commit));
+    if place >= held.0 {
+        *held = (place, commit);
+    }
+}
 
 impl Statements {
     /// Fold `entries` into the statements live now.
@@ -157,7 +171,19 @@ impl Statements {
         let mut newest: BTreeMap<&str, BTreeMap<StatementKind, (Place, Option<&str>)>> =
             BTreeMap::new();
         let mut forgotten: BTreeMap<&str, Place> = BTreeMap::new();
-        let mut required: BTreeMap<&str, Vec<Listed<'_>>> = BTreeMap::new();
+        let mut required: BTreeMap<&str, Vec<(Place, &str)>> = BTreeMap::new();
+        let mut recorded: BTreeMap<&str, Recorded<'_>> = BTreeMap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            let place = (entry.ts.parse::<jiff::Timestamp>().ok(), index);
+            if let (Some(subject), Some(anchor)) = (entry.subject.as_deref(), &entry.anchor) {
+                record_head(&mut recorded, subject, anchor, place);
+            }
+            for parent in &entry.parents {
+                for branch in &parent.branches {
+                    record_head(&mut recorded, branch, &parent.commit, place);
+                }
+            }
+        }
         for (index, entry) in entries.iter().enumerate() {
             let (Some(subject), Some(statement)) = (entry.subject.as_deref(), &entry.statement)
             else {
@@ -167,11 +193,7 @@ impl Statements {
             match (statement.kind, statement.value.as_deref()) {
                 (StatementKind::Unknown, _) => {}
                 (StatementKind::Depends, Some(list)) => {
-                    required.entry(subject).or_default().push((
-                        place,
-                        list,
-                        entry.anchor.as_deref(),
-                    ));
+                    required.entry(subject).or_default().push((place, list));
                 }
                 (StatementKind::Depends, None) => {
                     let held = forgotten.entry(subject).or_insert(place);
@@ -202,31 +224,21 @@ impl Statements {
                 (subject.to_owned(), kinds)
             })
             .collect();
-        let mut depends_heads = BTreeMap::new();
         let subjects: BTreeSet<&str> = forgotten.keys().chain(required.keys()).copied().collect();
         for subject in subjects {
             let forget = forgotten.get(subject).copied();
-            let since: Vec<Listed<'_>> = required
+            let since: Vec<(Place, &str)> = required
                 .get(subject)
                 .into_iter()
                 .flatten()
                 .copied()
-                .filter(|(place, _, _)| forget.is_none_or(|forget| *place > forget))
+                .filter(|(place, _)| forget.is_none_or(|forget| *place > forget))
                 .collect();
-            let stated = match (since.iter().map(|(place, _, _)| *place).max(), forget) {
+            let stated = match (since.iter().map(|(place, _)| *place).max(), forget) {
                 (Some((ts, _)), _) => {
-                    let union: BTreeSet<&str> = since
-                        .iter()
-                        .flat_map(|(_, list, _)| list.split(','))
-                        .collect();
+                    let union: BTreeSet<&str> =
+                        since.iter().flat_map(|(_, list)| list.split(',')).collect();
                     let value = Some(union.into_iter().collect::<Vec<_>>().join(","));
-                    if let Some((_, _, Some(head))) = since
-                        .iter()
-                        .filter(|(_, _, head)| head.is_some())
-                        .max_by_key(|(place, _, _)| *place)
-                    {
-                        let _ = depends_heads.insert(subject.to_owned(), (*head).to_owned());
-                    }
                     Live { ts, value }
                 }
                 (None, Some((ts, _))) => Live { ts, value: None },
@@ -238,7 +250,10 @@ impl Statements {
         }
         Self {
             live,
-            depends_heads,
+            recorded_heads: recorded
+                .into_iter()
+                .map(|(branch, (_, commit))| (branch.to_owned(), commit.to_owned()))
+                .collect(),
         }
     }
 
@@ -280,11 +295,14 @@ impl Statements {
             .map(|(branch, _)| branch.as_str())
     }
 
-    /// The commit `branch` was at when the newest entry of its live
-    /// `depends` list that recorded one was written: its head while it
-    /// required them, kept after the branch itself is deleted.
-    pub fn depends_head(&self, branch: &str) -> Option<&str> {
-        self.depends_heads.get(branch).map(String::as_str)
+    /// The newest commit any entry records for `branch`: an entry about it
+    /// records its tip when written ([`Entry::anchor`]), a release write
+    /// each parent's commit and the bookmarks there ([`Entry::parents`]).
+    /// Kept across forgets and after the branch is deleted. A lower bound on
+    /// the branch's work, not its final head: the branch can have moved
+    /// since, with nothing written.
+    pub fn recorded_head(&self, branch: &str) -> Option<&str> {
+        self.recorded_heads.get(branch).map(String::as_str)
     }
 
     /// The live statement of `kind` about `branch`: `Some(None)` for a live
@@ -620,6 +638,64 @@ mod tests {
         assert_eq!(
             Statements::from_entries(&[unparseable]).pull("feat/alpha"),
             Some(9)
+        );
+    }
+
+    #[test]
+    fn a_branchs_recorded_head_is_the_newest_commit_any_entry_records() {
+        // Given: a depends list anchored at c1; a note about the branch at c2;
+        // a forget written after the branch was gone, with no anchor; and a
+        // release write naming the branch on a parent at c3.
+        let listed = Entry {
+            anchor: Some("c1".to_owned()),
+            ..stated(
+                "2026-08-15T22:00:00Z",
+                "feat/alpha",
+                StatementKind::Depends,
+                Some("acme/demo#1"),
+            )
+        };
+        let noted = Entry {
+            anchor: Some("c2".to_owned()),
+            ..prose("2026-08-15T22:01:00Z", "feat/alpha", "noted")
+        };
+        let forgot = stated(
+            "2026-08-15T22:02:00Z",
+            "feat/alpha",
+            StatementKind::Depends,
+            None,
+        );
+        let released = Entry {
+            parents: vec![crate::ledger::RecordedParent {
+                commit: "c3".to_owned(),
+                branches: vec!["feat/beta".to_owned(), "feat/alpha".to_owned()],
+            }],
+            ..prose("2026-08-15T22:03:00Z", "release/x", "cut")
+        };
+
+        // When / Then: each newer entry moves the recorded head, a forget with
+        // no anchor keeps it, and a branch no entry names has none.
+        let heads = |entries: &[Entry]| {
+            Statements::from_entries(entries)
+                .recorded_head("feat/alpha")
+                .map(str::to_owned)
+        };
+        assert_eq!(heads(std::slice::from_ref(&listed)), Some("c1".to_owned()));
+        assert_eq!(
+            heads(&[listed.clone(), noted.clone()]),
+            Some("c2".to_owned())
+        );
+        assert_eq!(
+            heads(&[listed.clone(), noted.clone(), forgot.clone()]),
+            Some("c2".to_owned())
+        );
+        assert_eq!(
+            heads(&[released.clone(), forgot, noted, listed]),
+            Some("c3".to_owned())
+        );
+        assert_eq!(
+            Statements::from_entries(&[released]).recorded_head("feat/gamma"),
+            None
         );
     }
 }
