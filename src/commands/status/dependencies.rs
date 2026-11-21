@@ -202,7 +202,9 @@ impl Members<'_> {
     /// member known only on origin. The row judges the local tip only, so
     /// when origin holds work the local tip lacks (a local bookmark that did
     /// not follow a fetch), that origin tip is judged too, as a machine
-    /// holding only the origin copy judges it: both must have landed.
+    /// holding only the origin copy judges it: both must have landed. A row
+    /// with no single local tip (a conflicted bookmark) cannot say whether
+    /// origin's copy is behind it, so origin's copy is judged too.
     fn judged_now(&self, member: &BranchName) -> MemberState {
         let Some(row) = self.rows.iter().find(|row| row.name == *member) else {
             return self.judge_on_origin(member);
@@ -211,21 +213,21 @@ impl Members<'_> {
         if local != MemberState::Landed {
             return local;
         }
-        let (Some(tip), Some(on_origin)) = (
-            self.tips.get(&BookmarkRef::Local(member.clone())),
-            self.tips.get(&remote(member)),
-        ) else {
+        let Some(on_origin) = self.tips.get(&remote(member)) else {
             return local;
+        };
+        let shown = remote(member).to_string();
+        let Some(tip) = self.tips.get(&BookmarkRef::Local(member.clone())) else {
+            return self.judge_commit(member, on_origin, &shown);
         };
         if tip == on_origin {
             return local;
         }
         match self.repo.is_ancestor(on_origin, tip) {
             Ok(true) => local,
-            Ok(false) => self.judge_commit(member, on_origin, &remote(member).to_string()),
+            Ok(false) => self.judge_commit(member, on_origin, &shown),
             Err(error) => MemberState::Unknown(format!(
-                "whether {} holds work {member} lacks could not be read: {error}",
-                remote(member)
+                "whether {shown} holds work {member} lacks could not be read: {error}"
             )),
         }
     }
@@ -365,11 +367,13 @@ struct Sorted<'a> {
 fn unmet_dependencies(
     members: &Members<'_>,
     context: &DependencyContext<'_, '_>,
+    notes: &mut Vec<String>,
 ) -> (Vec<Finding>, Vec<String>) {
     let mut findings = Vec::new();
     let mut problems = Vec::new();
     let repo = &context.fork.upstream;
-    let sorted = sort_requirements(repo, members, context, &mut problems);
+    let checked = dependents(members, context, notes, &mut problems);
+    let sorted = sort_requirements(repo, &checked, context, &mut problems);
     let mut outcomes = DependencyResults {
         findings: &mut findings,
         problems: &mut problems,
@@ -385,13 +389,23 @@ fn unmet_dependencies(
 /// Every branch whose requirements a report checks: each row; each branch
 /// with a stated requirement that this checkout holds only as
 /// `<branch>@origin`, another machine's branch that nobody here claims; and
-/// each one held nowhere, deleted, whose recorded head (the commit it was at
-/// when its list was last recorded) is here and has not landed upstream: a
-/// branch merged into a review base before it was deleted still carries its
-/// work there, and still needs what it required. A dependent held nowhere
-/// whose recorded head landed is done; one whose recorded head is not here
-/// leaves no copy that says where its work is, and is not checked.
-fn dependents(repo: &UpstreamName, members: &Members<'_>, store: &Store) -> Vec<BranchName> {
+/// each one held nowhere, deleted, whose newest recorded commit
+/// ([`crate::statement::Statements::recorded_head`]) is here and has not
+/// landed upstream: a branch merged into a review base before it was
+/// deleted still carries its work there, and still needs what it required.
+///
+/// The recorded commit is a lower bound on a deleted dependent's work, not
+/// its final head: the branch can have moved on with nothing written. So a
+/// deleted dependent whose recorded commit landed, is not here, or was never
+/// recorded is not taken as done: it is a problem that names what could not
+/// be read, until its requirements are forgotten.
+fn dependents(
+    members: &Members<'_>,
+    context: &DependencyContext<'_, '_>,
+    notes: &mut Vec<String>,
+    problems: &mut Vec<String>,
+) -> Vec<BranchName> {
+    let (repo, store) = (&context.fork.upstream, context.store);
     let mut dependents: Vec<BranchName> = members.rows.iter().map(|row| row.name.clone()).collect();
     for (branch, head) in store.dependents(repo) {
         if dependents.contains(&branch) {
@@ -407,27 +421,58 @@ fn dependents(repo: &UpstreamName, members: &Members<'_>, store: &Store) -> Vec<
         {
             continue;
         }
-        let Some(commit) = head.and_then(|head| members.repo.resolve_commit(head.as_str()).ok())
-        else {
-            continue;
+        let unread = match head {
+            None => "the ledger records no commit for it".to_owned(),
+            Some(head) => match members.repo.resolve_commit(head.as_str()) {
+                Err(_) => format!(
+                    "the newest commit the ledger records for it, {}, is not in this checkout",
+                    head.short()
+                ),
+                Ok(commit) => {
+                    let shown = format!("{branch} at {}", commit.short());
+                    if members.judge_commit(&branch, &commit, &shown) != MemberState::Landed {
+                        notes.push(format!(
+                            "{branch} is gone here and on origin; its requirements are checked \
+                             because the newest commit the ledger records for it, {}, has not \
+                             landed",
+                            commit.short()
+                        ));
+                        dependents.push(branch);
+                        continue;
+                    }
+                    format!(
+                        "the newest commit the ledger records for it, {}, has landed, which does \
+                         not show that work it carried later did",
+                        commit.short()
+                    )
+                }
+            },
         };
-        let shown = format!("{branch} at {}", commit.short());
-        if members.judge_commit(&branch, &commit, &shown) != MemberState::Landed {
-            dependents.push(branch);
-        }
+        let target = BranchTarget::new(repo.clone(), branch.clone());
+        let required: Vec<String> = store
+            .dependencies(&target)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        problems.push(format!(
+            "cannot check whether {branch} still needs {}: its branch is gone here and on \
+             origin, and {unread}. Fetch a ref that holds its work, or forget its requirements \
+             (`knives depends {branch} --forget …`) once that work has landed or been dropped",
+            required.join(", ")
+        ));
     }
     dependents
 }
 
 fn sort_requirements<'a>(
     repo: &UpstreamName,
-    members: &Members<'_>,
+    checked: &[BranchName],
     context: &DependencyContext<'a, '_>,
     problems: &mut Vec<String>,
 ) -> Sorted<'a> {
     let mut sorted = Sorted::default();
     let mut member_pairs = BTreeSet::new();
-    for name in dependents(repo, members, context.store) {
+    for name in checked {
         let target = BranchTarget::new(repo.clone(), name.clone());
         for requirement in context.store.dependencies(&target) {
             let dependent = name.clone();
@@ -524,15 +569,6 @@ fn upstream_outcomes(
     }
 }
 
-/// This fork's `origin` URL: its checkout's `origin` remote, else the
-/// registry's.
-fn own_origin<'a>(fork: &'a Fork<'a>) -> &'a str {
-    fork.checkout
-        .remotes
-        .get(ORIGIN)
-        .map_or(fork.entry.origin.as_str(), String::as_str)
-}
-
 /// Review pull requests on a fork's own repository, one batch, each judged
 /// by its head. The own repository is the one the forge names for this
 /// fork's `origin` URL, asked once per report. A record names it when it
@@ -556,7 +592,7 @@ fn fork_pull_outcomes(
         return;
     };
     let fork = &context.fork.name;
-    let origin = own_origin(context.fork);
+    let origin = context.fork.own_origin();
     let named = |url: &str| {
         forge
             .repo_identity(context.path(), url, url)
@@ -665,8 +701,10 @@ impl Heads<'_, '_> {
             Err(missing) => {
                 let fetch = format!(
                     "its head commit {} is not in this checkout: fetch origin to judge it. If its \
-                     branch was deleted, no fetch brings the commit back",
-                    missing.short()
+                     branch was deleted, fetch a ref that still holds the commit: the base it \
+                     merged into, or the pull request's own `refs/pull/{}/head`",
+                    missing.short(),
+                    fact.pull.number
                 );
                 match fact.pull.base_ref_name.as_deref() {
                     Some(base) if fact.pull.is_merged() => MemberState::Unknown(format!(
@@ -778,6 +816,7 @@ pub(super) fn add_dependency_findings(input: DependencyInput<'_, '_, '_>) {
         judged: RefCell::new(BTreeMap::new()),
         judged_commits: RefCell::new(BTreeMap::new()),
     };
+    let mut notes = Vec::new();
     let (found, unanswered) = unmet_dependencies(
         &members,
         &DependencyContext {
@@ -787,8 +826,10 @@ pub(super) fn add_dependency_findings(input: DependencyInput<'_, '_, '_>) {
             forge: post.options.forge,
             snapshot,
         },
+        &mut notes,
     );
     timings.forge += started.elapsed();
     findings.extend(found);
     report.problems.extend(unanswered);
+    report.notes.extend(notes);
 }
