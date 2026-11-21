@@ -1640,23 +1640,19 @@ impl Repo {
         Ok((!reasons.is_empty()).then(|| reasons.join("; ")))
     }
 
-    /// Why the earlier write `commit` of release `name` must stay, or `None`
-    /// when nothing keeps it: [`what_keeps`] in this repository's own view,
-    /// by the rules a write applies to a stray earlier write. So a ref of
-    /// `name` on its publish remote keeps it too: the next push replaces that
+    /// Why the earlier release write `commit` must stay, or `None` when
+    /// nothing keeps it: [`what_keeps`] in this repository's own view, by the
+    /// rules a write applies to a stray earlier write. So a ref of the release
+    /// name on its publish remote keeps it too: the next push replaces that
     /// ref, and until then it names the write.
-    pub fn what_keeps_earlier_write(
-        &self,
-        commit: &CommitId,
-        name: &str,
-    ) -> Result<Option<String>, JjError> {
+    pub fn what_keeps_earlier_write(&self, commit: &CommitId) -> Result<Option<String>, JjError> {
         let commit = self.commit(commit.as_str())?;
         what_keeps(
             self,
             self.repo.as_ref(),
             &commit,
             &MovedName {
-                name,
+                name: "",
                 publish_remote: None,
             },
         )

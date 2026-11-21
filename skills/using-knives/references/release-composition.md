@@ -35,7 +35,7 @@ The release model, the verbs and the release-log conflict union: README.md, "Rel
 - the release in hand is unrecorded: adopt it ([releases.md](releases.md)).
 - the write would lose lines of a remaining member (`include`, `drop` and `advance` only). The edit names each path, member and line, and writes nothing. A line at a conflict that the write leaves is not counted. Read the named lines first. Then run the edit again with `--allow-loss '<reason>'`, put the lines back by hand, and record that with `knives release adopt <name> --why '<reason>'` ([releases.md](releases.md)).
 
-`--allow-loss` and the cut's `--allow-drop` differ. `--allow-drop` lets a cut leave out members or commits. `--allow-loss` lets an edit write a file that loses a remaining member's lines. Each needs a stated intent; neither is a way past a refusal you have not read.
+`--allow-loss` and the cut's `--allow-drop` differ. `--allow-drop` lets a cut leave out members, commits, a fix by hand, or a newest write that this repository does not hold. `--allow-loss` lets an edit write a file that loses a remaining member's lines. Each needs a stated intent; neither is a way past a refusal you have not read.
 
 An unreadable consumer, or a shared ledger that did not pull, blocks every plan, cut and edit. With no consumer registered or passed, the plan treats the release as unpinned.
 
@@ -44,7 +44,7 @@ An unreadable consumer, or a shared ledger that did not pull, blocks every plan,
 - It audits first: the cut tree must hold each member's own lines, the change from that member's own fork point with upstream trunk to its tip. The audit names each line the tree lacks, with its path. A line that the previous release also lacks is carried forward, not a loss. A failed audit writes nothing.
 - Refused, exit `3`: a dated name that does not sort after the newest; the same tree and parents as the previous published cut (use `include`, `advance` or `rebase`); an unrecorded release in hand.
 - When every pin of the previous dated release is frozen, or it is published, a new later name may start identical (exit `0`). Edit it before you push.
-- The orphan gate and the member gate refuse to strand commits that only the previous lineage reaches, or to lose a member the previous cut recorded, and list them. A bookmark that is not a release name keeps a commit when it is local, or on `origin` or the publish remote, tracked or not. A bookmark of `upstream` or of any other remote keeps nothing. `--allow-drop` states an intended drop; it is not a remedy for a refusal. Keep the reason and its dependency effects.
+- The orphan gate and the member gate refuse to strand commits that only the previous lineage reaches, or to lose a member the previous cut recorded, and list them. A bookmark that is not a release name keeps a commit when it is local, or on `origin` or the publish remote, tracked or not. The upstream trunk keeps a commit too. Any other bookmark of `upstream`, or of any other remote, keeps nothing. `--allow-drop` states an intended drop; it is not a remedy for a refusal. Keep the reason and its dependency effects.
 - Under the fixed scheme, when the last cut event is missing or names another commit than the published branch, `cut` records the published commit instead of making one.
 
 ## `knives release rebase [REF]`

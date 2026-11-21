@@ -1288,13 +1288,76 @@ pub fn release_ok(lab: &Lab, home: &TempDir, args: &[&str]) -> String {
 /// A release verb run in the work checkout that must go through, though the
 /// plan around it may exit with findings of its own; its stdout.
 pub fn release_ran(lab: &Lab, home: &TempDir, args: &[&str]) -> String {
-    let output = knives_release(lab, home, args);
+    release_ran_in(lab, home, &lab.work, args)
+}
+
+/// [`release_ran`] from `cwd`, a workspace of the work checkout, say.
+pub fn release_ran_in(lab: &Lab, home: &TempDir, cwd: &Path, args: &[&str]) -> String {
+    let output = release_command(lab, home, ReleaseOutput::Text, args)
+        .current_dir(cwd)
+        .output()
+        .expect("run knives release");
     assert!(
         matches!(output.status.code(), Some(0 | 1)),
         "{args:?}: {}",
         text(&output)
     );
     stdout(&output)
+}
+
+/// Whether `commit` is still a visible commit of the work checkout.
+pub fn is_visible(lab: &Lab, commit: &knives::ids::CommitId) -> bool {
+    knives::jj::commits_matching(&lab.work, "all()")
+        .expect("list visible commits")
+        .contains(commit)
+}
+
+/// The forge repository the lab fork's upstream is reached by where two
+/// machines share a ledger, so the ledger keeps the fork under its
+/// `<owner>/<name>`: a filesystem upstream names no repository that another
+/// machine could share a ledger for.
+pub const UPSTREAM: &str = "https://forge.invalid/acme/demo";
+/// The repository each machine's registry entry says its ledger belongs to.
+pub const LEDGER: &str = "acme/ledger";
+/// [`LEDGER`] as each ledger root's `origin` spells it; git reaches it at a
+/// bare remote through `insteadOf`.
+pub const LEDGER_URL: &str = "https://forge.invalid/acme/ledger";
+
+/// A config home whose registry calls the lab fork `demo`, with [`UPSTREAM`]
+/// as its upstream and its ledger shared with [`LEDGER`], and the lab's work
+/// checkout pointing there too.
+pub fn shared_home(lab: &Lab) -> TempDir {
+    let (home, _consumer) = release_test_home(lab);
+    lab.upstream_at_forge_url(UPSTREAM);
+    let registry = home.path().join("repos.toml");
+    let registered = std::fs::read_to_string(&registry).expect("read the registry");
+    std::fs::write(
+        &registry,
+        format!(
+            "{}ledger = \"{LEDGER}\"\n",
+            registered.replace(&lab.upstream.display().to_string(), UPSTREAM)
+        ),
+    )
+    .expect("write the registry");
+    home
+}
+
+/// Make `home`'s ledger root a repository whose `origin` is [`LEDGER_URL`],
+/// reached at `remote`, committing as `machine`.
+pub fn share(home: &Path, machine: &str, remote: &Path) {
+    let root = home.join("ledger");
+    git_repository(&root, &[("origin", LEDGER_URL)]);
+    let reached = format!("url.{}.insteadOf", remote.display());
+    git_output(&root, ["config", reached.as_str(), LEDGER_URL]);
+    git_output(&root, ["config", "knives.machine", machine]);
+}
+
+/// A second machine's config home: the same registry, nothing else yet.
+pub fn second_machine(first: &Path) -> TempDir {
+    let home = tempfile::tempdir().expect("second config home");
+    std::fs::copy(first.join("repos.toml"), home.path().join("repos.toml"))
+        .expect("copy the registry");
+    home
 }
 
 /// A config home whose registry releases the lab fork `demo` on the fixed

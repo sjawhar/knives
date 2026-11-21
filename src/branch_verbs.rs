@@ -283,7 +283,7 @@ pub(crate) fn run_finish(
         );
         return Ok(Exit::Incomplete);
     }
-    let (disposal, forgotten) = if let Some(displaced) = released.displaced.as_ref() {
+    let (disposal, unregistered) = if let Some(displaced) = released.displaced.as_ref() {
         (left_to_its_owner(&place, &displaced.owner), false)
     } else {
         ordinary_disposal(
@@ -294,17 +294,17 @@ pub(crate) fn run_finish(
         )?
     };
     println!("{}/{branch}: claim {claim}; {disposal}", fork.name);
-    // With a release claim's workspace forgotten, nothing of it holds a
+    // With no workspace of a release claim left in jj, nothing of it holds a
     // release commit any more: sweep as the next release write would.
-    if forgotten && is_release_name(branch, &fork.entry.release_scheme()) {
+    if unregistered && is_release_name(branch, &fork.entry.release_scheme()) {
         sweep_earlier_writes(fork, branch.as_str());
     }
     Ok(if lost { Exit::Findings } else { Exit::Ok })
 }
 
-/// Sweep the earlier writes of release `name` after `finish` forgot the
-/// release claim's workspace, as `knives release adopt` sweeps them after
-/// it records a write. A sweep that fails says so, and changes no exit.
+/// Sweep the earlier writes of release `name` once `finish` has left jj no
+/// workspace of the release claim, as `knives release adopt` sweeps them
+/// after it records a write. A sweep that fails says so, and changes no exit.
 ///
 /// jj abandons a forgotten workspace's working copy where it is empty and
 /// undescribed, so a release commit a write replaced and kept for that
@@ -315,7 +315,7 @@ pub(crate) fn run_finish(
 /// holds conflicts, its earlier writes are the record of their last
 /// resolution, so nothing is swept, as a write sweeps nothing then.
 ///
-/// The release name is read from the repository and the reasons name
+/// The release name is the caller's argument and the reasons name
 /// bookmarks, tags and jj workspaces, so each line goes out escaped
 /// ([`inline_human_text`]).
 fn sweep_earlier_writes(fork: &Fork<'_>, name: &str) {
@@ -354,16 +354,22 @@ fn sweep(fork: &Fork<'_>, name: &str) -> anyhow::Result<()> {
     )?;
     report_abandoned_earlier(repo, name, &swept.abandoned);
     report_hidden(repo, name, &swept.hidden);
-    let reopened = Repo::open(checkout)?;
+    // An abandon that abandoned nothing committed no operation, so the
+    // repository is still as `opened` read it.
+    let reopened = if swept.abandoned.is_empty() {
+        opened
+    } else {
+        Repo::open(checkout)?
+    };
     let mut left = Vec::new();
     for write in writes.commits() {
-        if reopened.is_visible(write)? {
-            let in_release = *write == release || reopened.is_ancestor(write, &release)?;
+        let in_release = *write == release || reopened.is_ancestor(write, &release)?;
+        if in_release || reopened.is_visible(write)? {
             left.push((write.clone(), in_release));
         }
     }
     let kept = kept_lines(repo, name, &left, |write| {
-        reopened.what_keeps_earlier_write(write, name)
+        reopened.what_keeps_earlier_write(write)
     })?;
     for line in kept {
         println!("{line}");
@@ -660,13 +666,13 @@ fn ordinary_disposal(
     let registration =
         release_registration(place.checkout, place.workspace, place.directory, present);
     let removal = removal_note(place, identity, &registration, cleanup)?;
-    let forgotten = matches!(
+    let unregistered = matches!(
         registration,
         Registration::Forgotten | Registration::NotRegistered
     );
     Ok((
         format!("workspace {} {registration}; {removal}", place.workspace),
-        forgotten,
+        unregistered,
     ))
 }
 

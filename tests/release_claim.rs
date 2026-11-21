@@ -5,11 +5,12 @@
 //! its working copy keeps no release commit that a release write replaces.
 //! `finish` forgets that workspace and then abandons each earlier write of the
 //! release that nothing holds, as `knives release adopt` does after its write,
-//! and names each one something else holds. A newer cut, and `knives release
-//! reap`, keep a release that a live claim holds. Each case runs in a local
-//! repository in the shape of run A of INFRA-4355's probe, with the main
-//! checkout's working copy off every commit of the release unless the case
-//! says so. These tests drive only the knives binary.
+//! and names each one that something other than the release holds, with what
+//! holds it. A newer cut, and `knives release reap`, keep a release that a
+//! live claim holds. Each case runs in a local repository in the shape of run
+//! A of INFRA-4355's probe, with the main checkout's working copy off every
+//! commit of the release unless the case says so. These tests drive only the
+//! knives binary.
 
 #![allow(
     clippy::expect_used,
@@ -26,8 +27,8 @@ use std::process::Output;
 
 use knives::ids::CommitId;
 use lab::{
-    Lab, ReleaseOutput, commit_at, conflicts_of, fixed_home, knives_release, release_command,
-    release_ok, release_ran, release_test_home, stdout, text,
+    Lab, commit_at, conflicts_of, fixed_home, home_after_first_cut, is_visible, knives_release,
+    release_ok, release_ran, release_ran_in, second_machine, share, shared_home, stdout, text,
 };
 use tempfile::TempDir;
 
@@ -56,8 +57,7 @@ fn cut_release() -> (Lab, TempDir) {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
-    let (home, _consumer) = release_test_home(&lab);
-    release_ok(&lab, &home, &["cut", RELEASE]);
+    let (home, _consumer) = home_after_first_cut(&lab);
     lab.jj_work(["new", "root()"]);
     (lab, home)
 }
@@ -108,21 +108,6 @@ fn workspace(lab: &Lab, name: &str) -> PathBuf {
         .join(name)
 }
 
-/// A release verb run from `cwd` that must go through, though it may exit
-/// with findings; its stdout.
-fn release_ran_in(lab: &Lab, home: &TempDir, cwd: &Path, args: &[&str]) -> String {
-    let output = release_command(lab, home, ReleaseOutput::Text, args)
-        .current_dir(cwd)
-        .output()
-        .expect("run knives release");
-    assert!(
-        matches!(output.status.code(), Some(0 | 1)),
-        "{args:?}: {}",
-        text(&output)
-    );
-    stdout(&output)
-}
-
 /// [`cut_release`], claimed, with a hand change made on [`RELEASE`] as step
 /// 2 of `release-wide-writes.md` says: in the claim's workspace `jj new
 /// <release>`, [`NOTE`] added, `jj squash`, and `knives release adopt` from
@@ -155,15 +140,8 @@ fn hand_resolved_release() -> (Lab, TempDir, PathBuf, CommitId) {
 /// Returns its path and that tip.
 fn workspace_on_the_release(lab: &Lab) -> (PathBuf, CommitId) {
     let claim = workspace(lab, CLAIM);
-    lab.jj_work([
-        "workspace",
-        "add",
-        "--name",
-        CLAIM,
-        "-r",
-        RELEASE,
-        claim.to_str().expect("utf-8 path"),
-    ]);
+    knives::jj::add_workspace(&lab.work, CLAIM, &claim, RELEASE)
+        .expect("add the claim's workspace as knives 5.1.0 did");
     let cut = commit_at(lab, RELEASE);
     assert_eq!(
         lab.revision(&claim, "parents(@)", "commit_id"),
@@ -209,13 +187,6 @@ fn held_line(name: &str, holder: &str) -> String {
     format!(
         "demo: kept {name}: held by the release claim of {holder}; `knives finish {name}` releases it"
     )
-}
-
-/// Whether `commit` is still a visible commit of the work checkout.
-fn is_visible(lab: &Lab, commit: &CommitId) -> bool {
-    knives::jj::commits_matching(&lab.work, "all()")
-        .expect("list visible commits")
-        .contains(commit)
 }
 
 /// The description of each operation in the shared operation log.
@@ -459,11 +430,11 @@ fn a_release_finish_whose_snapshot_jj_refuses_sweeps_nothing() {
     // When: the claim is finished.
     let finished = finish(&lab, &home);
 
-    // Then: it exits 3 as before, abandons nothing, and the adopted commit
-    // and the claim's workspace stay.
+    // Then: it exits 3 as before, sweeps nothing (no line names an earlier
+    // commit of R), and the adopted commit and the claim's workspace stay.
     let out = text(&finished);
     assert_eq!(finished.status.code(), Some(3), "{out}");
-    assert!(!out.contains("abandoned"), "{out}");
+    assert!(!out.contains(&format!("earlier {RELEASE} commit")), "{out}");
     assert!(is_visible(&lab, &adopted), "{out}");
     assert!(claim.join("big.bin").is_file(), "{out}");
     let names = lab.jj_work_output(["workspace", "list", "-T", "name ++ \"\\n\""]);
@@ -649,62 +620,6 @@ fn start_of_an_earlier_dated_cut_under_a_fixed_entry_rests_on_its_tip() {
         tip.as_str()
     );
     assert!(empty_working_copy(&lab, &claim), "{said}");
-}
-
-/// The forge repository the lab fork's upstream is reached by in the
-/// shared-ledger test, so the ledger keeps the fork under its
-/// `<owner>/<name>`.
-const UPSTREAM: &str = "https://forge.invalid/acme/demo";
-/// The repository each machine's registry entry says its ledger belongs to.
-const LEDGER: &str = "acme/ledger";
-/// [`LEDGER`] as each ledger root's `origin` spells it; git reaches it at a
-/// bare remote through `insteadOf`.
-const LEDGER_URL: &str = "https://forge.invalid/acme/ledger";
-
-// From here to `second_machine`, the helpers are tests/release_record.rs's,
-// copied: they are private to that file.
-
-/// A config home whose registry calls the lab fork `demo`, with [`UPSTREAM`]
-/// as its upstream and its ledger shared with [`LEDGER`], and the lab's work
-/// checkout pointing there too.
-fn shared_home(lab: &Lab) -> TempDir {
-    let (home, _consumer) = release_test_home(lab);
-    lab.upstream_at_forge_url(UPSTREAM);
-    let registry = home.path().join("repos.toml");
-    let registered = std::fs::read_to_string(&registry).expect("read the registry");
-    std::fs::write(
-        &registry,
-        format!(
-            "{}ledger = \"{LEDGER}\"\n",
-            registered.replace(&lab.upstream.display().to_string(), UPSTREAM)
-        ),
-    )
-    .expect("write the registry");
-    home
-}
-
-/// Make `home`'s ledger root a repository whose `origin` is [`LEDGER_URL`],
-/// reached at `remote`, committing as `machine`.
-fn share(home: &Path, machine: &str, remote: &Path) {
-    let root = home.join("ledger");
-    lab::git_repository(&root, &[("origin", LEDGER_URL)]);
-    lab::git_output(
-        &root,
-        [
-            "config",
-            &format!("url.{}.insteadOf", remote.display()),
-            LEDGER_URL,
-        ],
-    );
-    lab::git_output(&root, ["config", "knives.machine", machine]);
-}
-
-/// A second machine's config home: the same registry, nothing else yet.
-fn second_machine(first: &Path) -> TempDir {
-    let home = tempfile::tempdir().expect("second config home");
-    std::fs::copy(first.join("repos.toml"), home.path().join("repos.toml"))
-        .expect("copy the registry");
-    home
 }
 
 #[test]

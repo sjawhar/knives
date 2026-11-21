@@ -3187,13 +3187,14 @@ impl ReapPayload {
 }
 
 /// Return a finding when reaping leaves a cut behind because something rests
-/// on it — someone's stacked work, or a workspace's working copy — or could not
-/// finish. A commit kept because a tag or another bookmark still pins it is
-/// neither: every ref knives owns is gone and the commit stays on purpose, so
-/// there is nothing to act on, and a cut whose reap met one must not exit
-/// non-zero for as long as the pin exists. Neither is a cut kept only for
-/// what its own name published on it: consumers were given that, and
-/// the newer cut redoes it.
+/// on it — someone's stacked work, or a workspace's working copy — or a live
+/// release claim holds its name, or the claims could not be read, or the
+/// reap could not finish. A commit kept because a tag or another bookmark
+/// still pins it is none of these: every ref knives owns is gone and the
+/// commit stays on purpose, so there is nothing to act on, and a cut whose
+/// reap met one must not exit non-zero for as long as the pin exists.
+/// Neither is a cut kept only for what its own name published on it:
+/// consumers were given that, and the newer cut redoes it.
 fn reap_exit(report: &knives::commands::release::ReapReport) -> Exit {
     let acted_on = report
         .kept

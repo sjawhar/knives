@@ -931,14 +931,14 @@ fn add_on(context: &StartContext<'_>, revision: &str) -> anyhow::Result<String> 
 }
 
 /// Add a release claim's workspace at its path, its working copy a new
-/// empty commit whose parent is the root commit; the line that says so, its
-/// path escaped, as [`kept_line`]'s is.
+/// empty commit whose parent is the root commit; the line that says so
+/// ([`made_line`]).
 fn add_on_root(context: &StartContext<'_>) -> anyhow::Result<String> {
-    let change = add_on(context, "root()")?;
-    Ok(format!(
-        "workspace {} at {change} based on the root commit (a release claim's working copy \
-         rests on no release commit)",
-        inline_human_text(&context.destination.display().to_string())
+    Ok(made_line(
+        context,
+        &add_on(context, "root()")?,
+        "the root commit",
+        "a release claim's working copy rests on no release commit",
     ))
 }
 

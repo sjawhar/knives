@@ -32,8 +32,8 @@ use std::process::Output;
 use knives::ids::CommitId;
 use knives::ledger::{Entry, Kind, Ledger};
 use lab::{
-    Lab, commit_at, fixed_home, home_after_first_cut, knives_release, release_test_home, stdout,
-    text,
+    Lab, UPSTREAM, commit_at, fixed_home, home_after_first_cut, knives_release, release_test_home,
+    second_machine, share, shared_home, stdout, text,
 };
 
 /// The release every test here cuts and re-signs.
@@ -42,19 +42,10 @@ const RELEASE: &str = "release/2026-08-04";
 const NEXT: &str = "release/2026-08-05";
 /// The fixed release branch of a registry that names one.
 const FIXED: &str = "integration";
-/// The forge repository the lab fork's upstream is reached by where two
-/// machines share a ledger: a filesystem upstream names no repository that
-/// another machine could share a ledger for.
-const UPSTREAM: &str = "https://forge.invalid/acme/demo";
 /// [`UPSTREAM`]'s `<owner>/<name>`: what a shared ledger keeps the fork under.
 const SHARED_FORK: &str = "acme/demo";
 /// What a release home's ledger keeps the fork under: its registry key.
 const LOCAL_FORK: &str = "demo";
-/// The repository the shared ledger belongs to.
-const LEDGER: &str = "acme/ledger";
-/// [`LEDGER`] as each ledger root's `origin` spells it; git reaches it at a
-/// bare remote through `insteadOf`.
-const LEDGER_URL: &str = "https://forge.invalid/acme/ledger";
 
 /// Every entry of `home`'s ledger of `fork`, in the order it reads them.
 fn ledger_entries(home: &Path, fork: &str) -> Vec<Entry> {
@@ -206,43 +197,6 @@ fn a_marked_cut() -> (Lab, tempfile::TempDir, CommitId) {
     assert!(event.text.ends_with("; unchecked: no record"), "{event:?}");
     let written = commit_at(&lab, NEXT);
     (lab, home, written)
-}
-
-/// A config home whose registry calls the lab fork `demo`, with [`UPSTREAM`]
-/// as its upstream and its ledger shared with [`LEDGER`], and the lab's work
-/// checkout pointing there too.
-fn shared_home(lab: &Lab) -> tempfile::TempDir {
-    let (home, _consumer) = release_test_home(lab);
-    lab.upstream_at_forge_url(UPSTREAM);
-    let registry = home.path().join("repos.toml");
-    let text = std::fs::read_to_string(&registry).expect("read the registry");
-    std::fs::write(
-        &registry,
-        format!(
-            "{}ledger = \"{LEDGER}\"\n",
-            text.replace(&lab.upstream.display().to_string(), UPSTREAM)
-        ),
-    )
-    .expect("write the registry");
-    home
-}
-
-/// A second machine's config home: the same registry, nothing else yet.
-fn second_machine(first: &Path) -> tempfile::TempDir {
-    let home = tempfile::tempdir().expect("second config home");
-    std::fs::copy(first.join("repos.toml"), home.path().join("repos.toml"))
-        .expect("copy the registry");
-    home
-}
-
-/// Make `home`'s ledger root a repository whose `origin` is [`LEDGER_URL`],
-/// reached at `remote`, committing as `machine`.
-fn share(home: &Path, machine: &str, remote: &Path) {
-    let root = home.join("ledger");
-    lab::git_repository(&root, &[("origin", LEDGER_URL)]);
-    let reached = format!("url.{}.insteadOf", remote.display());
-    lab::git_output(&root, ["config", reached.as_str(), LEDGER_URL]);
-    lab::git_output(&root, ["config", "knives.machine", machine]);
 }
 
 /// Make the lab's second clone the fork's checkout on another machine: an

@@ -277,10 +277,14 @@ pub enum Command {
         #[arg(long)]
         timeline: bool,
     },
-    /// Take a branch and open a workspace on the fetched upstream trunk.
+    /// Take a branch and open your own workspace for it.
     ///
     /// Claiming a branch and opening a workspace for it were two commands for no
     /// reason: starting work on a branch is one act. `finish` is its inverse.
+    ///
+    /// The start of a release name takes the release claim, the write lease
+    /// for the release's refs. Its new workspace rests on a new empty commit
+    /// off the root commit, not on a release commit, and its line says so.
     ///
     /// A `--why` from the claim's own holder replaces the reason on the claim,
     /// from inside the workspace or outside it. The claim keeps the time and the
@@ -341,12 +345,13 @@ pub enum Command {
     /// it cannot read that claim or push its release, it leaves the state file and
     /// the workspace as they were, and exits 3.
     ///
-    /// The finish of a release name releases the release claim. Once it has
-    /// forgotten the claim's workspace, it abandons the earlier commits of the
-    /// release that nothing holds, in one jj operation, and names each earlier
-    /// commit that something else holds, with what holds it. While the release
-    /// holds conflicts, it abandons none and says so. The sweep does not change
-    /// the exit.
+    /// The finish of a release name releases the release claim. Once jj holds
+    /// no workspace of the claim (it forgot it, or there was none), `finish`
+    /// abandons the earlier commits of the release that nothing holds, in one
+    /// jj operation. It names each earlier commit that something other than
+    /// the release holds, with what holds it. While the release holds
+    /// conflicts, it abandons none and says so. The sweep does not change the
+    /// exit.
     Finish {
         branch: String,
         /// Registry name. Defaults to the repo you are standing in.
@@ -625,9 +630,9 @@ pub enum ReleaseAction {
     /// targets the first upstream trunk commit that contains every merged
     /// pull request, then drops the members whose landed branches carry
     /// nothing more. A flat release has no base parent, so the target
-    /// reaches it only through a member on the target. Where no other member
-    /// is on the target, the drop keeps the landed members that are, and
-    /// says why. Where none is, it drops nothing and exits 3. With nothing
+    /// reaches it only through a member on the target. Where no member that
+    /// stays is on the target, the drop keeps the landed members that are,
+    /// and says why. Where none is, it drops nothing and exits 3. With nothing
     /// merged there is no default, and which commit to move onto is a
     /// decision — a cut does not make it for you.
     ///
@@ -656,7 +661,8 @@ pub enum ReleaseAction {
     /// edit that would lose a line of a remaining member, away from any
     /// conflict that it leaves, writes nothing, names each such line with
     /// its path and member, and exits 3. A line at a conflict that the edit
-    /// leaves is reported with that conflict and is not counted.
+    /// leaves is not counted. The edit's conflict report names the file of
+    /// that conflict.
     Include {
         /// A branch name, or any revision when no bookmark fits.
         branch: String,
@@ -723,31 +729,32 @@ pub enum ReleaseAction {
     /// renumbered, a repair made on the release commit itself. Until it is
     /// recorded, audit reads that commit as drift from the write knives
     /// recorded, and `cut`, `include`, `drop`, `advance` and `rebase` refuse
-    /// to write over a hand change it carries. The commit must have no
-    /// conflicts, and the parents of the write it replaces, plus any earlier
-    /// write of the same name a fast-forward push added. It is measured
-    /// against that write rebuilt on the commit's member parents (the write
-    /// itself when the commit is an older recorded write), or, where this
-    /// repository lacks that write or the write's own record is marked
-    /// unchecked, against a fresh merge of its member parents with the
-    /// release-log union: the files it resolved are reported, with the lines
-    /// each member added that it no longer holds, and a file changed outside
-    /// the conflicts needs `--why`. Writes no commit and moves no bookmark:
-    /// the record is a ledger event, and earlier writes of the name that
-    /// nothing rests on are abandoned. A name the ledger records no cut of,
-    /// a release cut outside knives, is recorded first with `knives release
-    /// cut NAME --at <commit>`.
+    /// to write over a hand change it carries. The commit must have the
+    /// parents of the write it replaces, plus any earlier write of the same
+    /// name a fast-forward push added. A commit finished by hand must also
+    /// have no conflicts. It is measured against that write rebuilt on the
+    /// commit's member parents (the write itself when the commit is an older
+    /// recorded write), or, where this repository lacks that write or the
+    /// write's own record is marked unchecked, against a fresh merge of its
+    /// member parents with the release-log union: the files it resolved are
+    /// reported, with the lines each member added that it no longer holds,
+    /// and a file changed outside the conflicts needs `--why`. Writes no
+    /// commit and moves no bookmark: the record is a ledger event, and
+    /// earlier writes of the name that nothing rests on are abandoned. A name
+    /// the ledger records no cut of, a release cut outside knives, is
+    /// recorded first with `knives release cut NAME --at <commit>`.
     ///
     /// A knives write that `jj describe`, `jj sign`, `jj metaedit` or a push
     /// that signs rewrote has a new commit id, with the same change, parents
     /// and tree. Run `adopt` on the machine that rewrote it, while the write
     /// is unpublished, so that another machine can read the release. It
     /// records the new commit in one event that holds no fix by hand. A
-    /// conflict that the write left does not refuse it. A published write
-    /// (the publish remote holds it, a tag is on it, or a `record:
-    /// published` note names it) is nothing to adopt. Where the write's
-    /// record is marked unchecked, `adopt` measures the new commit as it
-    /// measures any release that knives could not check.
+    /// conflict that the write left does not refuse it. The write is
+    /// published when the publish remote holds its old commit, a tag is on
+    /// that commit, or a `record: published` note names that commit. A copy
+    /// of a published write is nothing to adopt. Where the write's record is
+    /// marked unchecked, `adopt` measures the new commit as it measures any
+    /// release that knives could not check.
     Adopt {
         /// The release name. Defaults to the release in hand.
         reference: Option<String>,
@@ -780,7 +787,7 @@ pub enum ReleaseAction {
         reference: Option<String>,
         /// Read each member's own lines in the release, from the member's fork
         /// point with the upstream trunk. Name each line the release lacks and
-        /// each line it holds only by its words. Report drop-guard anchors.
+        /// each line it holds only by its words.
         #[arg(long, conflicts_with = "carries")]
         verify: bool,
         /// A branch name, or any revision when no bookmark fits.

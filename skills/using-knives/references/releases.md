@@ -8,20 +8,20 @@ A **carrier** is a parent that is an earlier write of the same release name, as 
 
 Records the commit a release name holds now as its newest knives write. It makes no commit and moves no bookmark. Run it after any hand change on the release commit: a conflict resolved, a release log renumbered, a repair or restore, the fast-forward rebase before a push, or a new description or signature (below).
 
-1. Make sure the commit has no conflicts and is no workspace's working copy (run `jj new` there first).
+1. Make sure the commit has no conflicts, unless it is a knives write re-signed or metaedited (below), and is no workspace's working copy (run `jj new` there first).
 2. Run `knives release adopt <name>`. Add `--why '<reason>'` when the commit changes a file the baseline left without a conflict; without it, `adopt` refuses and names the files.
 3. Read the counts: per member and file, the member's added lines the commit no longer holds. A renumbered heading line is expected there.
 4. Exit `1`: measured against a recorded write, a member lost added lines from a file that was neither conflicted nor a release log, or lost all its blocks in a release log or a conflicted file. It has already recorded. Repair the release, then adopt again.
 
 - With no local bookmark, `adopt` fetches and reads `<name>@<publish-remote>`.
 - After a hand `jj restore --from <commit> --into <name> <path>...`, adopt with `--why`, then cut.
-- After an edit run with `--allow-loss '<reason>'` ([release-composition.md](release-composition.md)), its ledger event holds `; lost: <path> (<member>: <n> line(s))` and `; why lost: <reason>`. Put the named lines back by hand, then `knives release adopt <name> --why '<reason>'`: a line put back is a change beyond the write's conflicts. Read each named line first: where a conflicted release log holds `## [Unreleased]` more than once, a line the file still holds can be named. `--allow-loss` is not `--allow-drop`: the cut's `--allow-drop` leaves out members or commits, and an edit's `--allow-loss` writes a file that loses a remaining member's lines.
+- After an edit run with `--allow-loss '<reason>'` ([release-composition.md](release-composition.md)), its ledger event holds `; lost: <path> (<member>: <n> line(s))` and `; why lost: <reason>`. Put the named lines back by hand, then `knives release adopt <name> --why '<reason>'`: a line put back in a file that the write left without a conflict is a change beyond the write's conflicts. Read each named line first: where a conflicted release log holds `## [Unreleased]` more than once, a line the file still holds can be named.
 - `adopt` refuses a name the ledger records no write of; the next write over it records the name.
-- A release re-signed or metaedited after a knives write, by `jj describe`, `jj sign`, `jj metaedit` or a push that signs, has a new commit id with the same change, parents and tree. Adopt it on the machine that re-signed it, after the last rewrite, while that write is unpublished. `adopt` records the new commit, so another machine can read the release once it fetches it. A tag on that commit, a publish remote that does not hold it yet, or conflicts that the knives write left, do not refuse this adopt.
-- The write is published when the publish remote holds it, a tag is on it, or a `record: published` note names it, for a fixed release too. Then `adopt` prints `nothing to adopt`, exits `0` and records nothing. Recording the new commit would make every other machine wait for a push that moves a published name.
+- A release re-signed or metaedited after a knives write, by `jj describe`, `jj sign`, `jj metaedit` or a push that signs, has a new commit id with the same change, parents and tree. Adopt it on the machine that re-signed it, after the last rewrite, while that write is unpublished. `adopt` records the new commit, so another machine can read the release once it fetches it. A tag on the new commit, a publish remote that does not hold it yet, or conflicts that the knives write left, do not refuse this adopt.
+- The write is published when the publish remote holds the recorded write (its old commit id), a tag is on that commit, or a `record: published` note names that commit, for a fixed release too. Then `adopt` prints `nothing to adopt`, exits `0` and records nothing. Recording the new commit would make every other machine wait for a push that moves a published name.
 - Skip that adopt and the ledger names only the old commit, which no other machine holds: there `audit` reports `could not compare` and `release-drift`, and the next cut is refused.
-- Where the newest event of the name is marked `; unchecked:`, `adopt` reads the new commit as any release knives could not check ([below](#when-knives-cannot-check-the-release-in-hand)): it may refuse it as published, and otherwise it measures it and records it.
-- An adopt of the newest recorded write itself writes nothing and prints `nothing to adopt`, unless its event is marked `; unchecked:`. Then it records it, which ends the mark.
+- Where the newest event of the name is marked `; unchecked:`, `adopt` reads the new commit as any release knives could not check ([below](#when-knives-cannot-check-the-release-in-hand)): it checks it as any hand edit, so it may refuse it (as published, say), and otherwise it measures it and records it.
+- An adopt of the newest recorded write itself writes nothing and prints `nothing to adopt`, unless its event is marked `; unchecked:`. Then it checks it and records it as above, which ends the mark.
 
 ## Adopt a hand resolution before the next write
 
@@ -64,6 +64,7 @@ Runs after every dated cut, and alone. It forgets superseded dated refs locally 
 - A cut pinned by a tag, an untracked remote bookmark or a local bookmark of another name (`keep/…`) loses its refs and keeps its commit. Exit `0`.
 - A cut that something rests on stays with its refs; the reap names it and exits `1`. That is a workspace working copy on or above it, empty or not, or any descendant of the cut, of a commit an edit wrote under its name, or of a rewrite of either. Move your own empty working copy with `jj new <live cut>` and reap again. Another workspace's working copy is its owner's to move.
 - The quiet keep exits `0` with its `kept <name>` line: every descendant is reachable from the name's own ref on the publish remote or from a tag on those commits, and nothing else (no working copy, local bookmark or other ref) names one. The old name after the published remedy is kept this way.
+- A name that a release claim in this machine's state file holds stays with its refs. The reap names the holder and exits `1`. `knives finish <name>` releases the claim. When the reap cannot read the state file, every superseded name stays, and the reap says so and exits `1`.
 
 ## Publishing
 
