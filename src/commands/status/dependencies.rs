@@ -73,9 +73,9 @@ struct DependencyResults<'a> {
     /// judged is held here, for one problem per dependent; a met one says
     /// nothing.
     uncertain: &'a BTreeMap<BranchName, Unread>,
-    /// Per uncertain dependent, each such requirement's token and what was
-    /// seen of it.
-    deferred: BTreeMap<BranchName, Vec<(String, String)>>,
+    /// Per uncertain dependent, each such requirement and what was seen of
+    /// it.
+    deferred: BTreeMap<BranchName, Vec<(Requirement, String)>>,
 }
 
 /// What could not be read of a deleted dependent's work.
@@ -169,20 +169,26 @@ impl DependencyResults<'_> {
         self.deferred
             .entry(about.branch.clone())
             .or_default()
-            .push((about.requirement.to_string(), seen));
+            .push((about.requirement.clone(), seen));
     }
 
     /// One problem per uncertain dependent with a requirement that is unmet
     /// or cannot be judged: what could not be read, what was seen of each
-    /// such requirement, and the command that forgets them.
+    /// such requirement, and the command that forgets them, a member named
+    /// by its branch, which takes back every spelling of it.
     fn report_deferred(&mut self) {
         for (branch, open) in std::mem::take(&mut self.deferred) {
             let Some(unread) = self.uncertain.get(&branch) else {
                 continue;
             };
-            let mut tokens: Vec<&str> = Vec::new();
-            for (token, _) in &open {
-                if !tokens.contains(&token.as_str()) {
+            let mut needs: Vec<String> = Vec::new();
+            let mut tokens: Vec<String> = Vec::new();
+            for (requirement, _) in &open {
+                let (shown, token) = (requirement.to_string(), requirement.forget_token());
+                if !needs.contains(&shown) {
+                    needs.push(shown);
+                }
+                if !tokens.contains(&token) {
                     tokens.push(token);
                 }
             }
@@ -197,7 +203,7 @@ impl DependencyResults<'_> {
             self.problems.push(format!(
                 "cannot tell whether {branch} still needs {}: its branch is gone here and on \
                  origin, and {}; {}. {next}: `knives depends {branch} --forget {command}`",
-                tokens.join(", "),
+                needs.join(", "),
                 unread.why,
                 seen.join("; ")
             ));
@@ -609,7 +615,12 @@ fn upstream_outcomes(
     for (required_repo, (entry, requirements)) in grouped {
         if required_repo == *repo {
             let Some(snapshot) = context.snapshot else {
-                outcomes.unchecked_each(requirements, "no forge consulted");
+                let why = if context.forge.is_some() {
+                    "the forge did not answer for this fork's upstream pull requests"
+                } else {
+                    "no forge consulted"
+                };
+                outcomes.unchecked_each(requirements, why);
                 continue;
             };
             for (branch, requirement, number) in requirements {

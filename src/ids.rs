@@ -572,6 +572,17 @@ impl Requirement {
             number: number.parse().ok()?,
         })
     }
+
+    /// The `knives depends --forget` text that takes this requirement back
+    /// whatever repository spelling its records carry: a member's branch
+    /// name, which every record of the member answers to; else the token as
+    /// it is written.
+    pub fn forget_token(&self) -> String {
+        match self {
+            Self::ForkBranch { branch, .. } => branch.to_string(),
+            _ => self.to_string(),
+        }
+    }
 }
 
 /// Whether `text` is a forge repository's `<owner>/<name>`, holding none of
