@@ -9,7 +9,7 @@
 //! as their union, and refuses while the release in hand carries a change
 //! knives did not write or adopt, printing the steps that record it. Every one
 //! of them writes the release locally only, and none of them pushes it.
-// allow: SIZE_OK: 5673 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
+// allow: SIZE_OK: 5746 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -803,18 +803,75 @@ pub struct ReapReport {
     pub hidden: Vec<crate::jj::HiddenHead>,
 }
 
+/// A claim of a release name in this machine's state file: the release
+/// claim, which `knives start <name>` takes and `knives finish <name>`
+/// releases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldRelease {
+    pub name: String,
+    /// The claim's owner.
+    pub holder: String,
+}
+
+/// The live release claims of a fork, as the reap reads them from the state
+/// file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseClaims {
+    /// The claims of the fork's release names.
+    Read(Vec<HeldRelease>),
+    /// The state file could not be read, and why.
+    Unreadable(String),
+}
+
+impl ReleaseClaims {
+    /// Why the reap keeps the superseded `name` for a release claim, or
+    /// `None` when no claim holds it. Every name is kept while the claims
+    /// cannot be read.
+    fn keep(&self, name: &str) -> Option<String> {
+        match self {
+            Self::Unreadable(error) => Some(format!(
+                "the claims could not be read, so a release claim may hold it: {error}"
+            )),
+            Self::Read(held) => held.iter().find(|claim| claim.name == name).map(|claim| {
+                format!(
+                    "held by the release claim of {}; `knives finish {}` releases it",
+                    claim.holder,
+                    crate::ledger::shell_word(name)
+                )
+            }),
+        }
+    }
+}
+
+/// [`reap_superseded_held`] where no release claim holds a name.
+pub fn reap_superseded(
+    repo: &Repo,
+    scheme: &ReleaseScheme,
+    publish_remote: &str,
+    ledger: &[Entry],
+) -> anyhow::Result<ReapReport> {
+    reap_superseded_held(
+        repo,
+        scheme,
+        publish_remote,
+        ledger,
+        &ReleaseClaims::Read(Vec::new()),
+    )
+}
+
 /// Reap every superseded dated cut: forget its refs everywhere, abandon its commits.
 ///
 /// The newest dated name never appears in the enumeration, and the
 /// `previous_position` seam is `Fixed`-scheme-only while dated names are the
-/// only thing enumerated, so neither needs a runtime gate here. Two things do:
-/// a cut that anything rests on is kept with what rests on it named, by the
-/// rule a release edit keeps the commit it replaced by
-/// ([`Repo::what_rests_on`]); and while the live cut still carries conflicts,
-/// every superseded cut is kept, because the previous cut is the only record of
-/// how those conflicts were last resolved — reaping it while the successor is
-/// unsettled destroys the record exactly when an abandon-and-recut would need
-/// it.
+/// only thing enumerated, so neither needs a runtime gate here. Three things
+/// do: a cut that anything rests on is kept with what rests on it named, by
+/// the rule a release edit keeps the commit it replaced by
+/// ([`Repo::what_rests_on`]); a name a live release claim holds is kept with
+/// its holder named (`claims`); and while the live cut still carries
+/// conflicts, every superseded cut is kept, because the previous cut is the
+/// only record of how those conflicts were last resolved — reaping it while
+/// the successor is unsettled destroys the record exactly when an
+/// abandon-and-recut would need it.
 ///
 /// What rests on a cut is stacked work (#4's third loss mode), or a workspace's
 /// working copy on it or above it, empty or not. Abandoning the cut would
@@ -829,15 +886,28 @@ pub struct ReapReport {
 /// what rests on it, and once no ref names that commit, its name is the only
 /// thing that retires it.
 ///
+/// A release claim is the write lease of a release's refs, and its
+/// workspace rests on the root commit, so nothing else keeps a claimed name.
+/// Its keep names `knives finish <name>` and never `--force`: the holder the
+/// state file names can be this machine's copy of a ledger claim the ledger
+/// no longer holds, and a forced finish would then release the live
+/// holder's claim. Where the claims could not be read, every superseded name
+/// is kept, because a name reaped then may be one a claim holds.
+///
 /// Never touches a remote. A later fetch re-materializes forgotten refs as
 /// untracked (jj keeps no memory of forgetting); that is expected, harmless to
 /// the default log, and cleared by the next reap. Correctness never depends on
 /// reaping having run: the divergence detector ignores these refs regardless.
-pub fn reap_superseded(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the repository, the series, the publish remote, the ledger and the claims are independent inputs"
+)]
+pub fn reap_superseded_held(
     repo: &Repo,
     scheme: &ReleaseScheme,
     publish_remote: &str,
     ledger: &[Entry],
+    claims: &ReleaseClaims,
 ) -> anyhow::Result<ReapReport> {
     let repo_path = repo.path();
     let tips = repo.bookmark_tips()?;
@@ -878,6 +948,10 @@ pub fn reap_superseded(
     let mut entries: Vec<(String, Vec<CommitId>)> = Vec::new();
     let mut reaped_writes: Vec<CommitId> = Vec::new();
     for (name, targets) in by_name {
+        if let Some(reason) = claims.keep(&name) {
+            report.kept.push((name, reason));
+            continue;
+        }
         // An edit that replaced a commit of this name kept it for what rests
         // on it; once no ref names it, this name is all that will retire it.
         let earlier = earlier_writes(repo, ledger, &name)?;

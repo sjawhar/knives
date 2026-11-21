@@ -2733,13 +2733,10 @@ fn report_completed_cut(
             .map(|(reference, _)| reference.branch().to_string()),
     );
     // The cut is already published and recorded: a state file that cannot be
-    // read names no workspace rather than stopping the reap.
-    let claims = knives::store::Store::open(
-        knives::store::default_state_path(),
-        &bound.registry.former_names(),
-        &[],
-    );
-    match claims {
+    // read names no workspace rather than stopping the reap, and the reap
+    // keeps every superseded name then.
+    let claims = read_claims(bound);
+    match &claims {
         Err(error) => {
             // A `StoreError` printed here, not through main's `error_line`:
             // it quotes the state file's path and serde's reading of it.
@@ -2761,7 +2758,7 @@ fn report_completed_cut(
             }
         }
     }
-    let exit = post_cut_exit.worst(reap_after_cut(fork)?);
+    let exit = post_cut_exit.worst(reap_after_cut(fork, &release_claims(fork, &claims))?);
     if let Some(orphaned) = cut.stated_drop {
         report_stated_drop(fork, orphaned)?;
     }
@@ -2927,16 +2924,54 @@ fn stacked_branches(
     Ok(stacked)
 }
 
-/// Reap superseded dated cuts now that a newer one exists.
+/// Reap superseded dated cuts now that a newer one exists, keeping each name
+/// a release claim of `claims` holds.
 ///
 /// Under `Fixed` the enumeration is empty by construction (no dated names), so
 /// this is a no-op there. Opens the repository again deliberately: the caller's
 /// handle predates the cut and reads stale tips, under which the superseded cut
 /// is still the newest dated name and nothing is reaped at all.
-fn reap_after_cut(fork: &Fork<'_>) -> anyhow::Result<Exit> {
-    let reaped = reap(fork)?;
+fn reap_after_cut(fork: &Fork<'_>, claims: &release::ReleaseClaims) -> anyhow::Result<Exit> {
+    let reaped = reap(fork, claims)?;
     print_reap(&fork.name, &reaped);
     Ok(reap_exit(&reaped.report))
+}
+
+/// This machine's state file, read for its claims as the cut and the reap
+/// read it: with the registry's former names, and no fork's ledger.
+fn read_claims(bound: Bound<'_>) -> Result<knives::store::Store, knives::store::StoreError> {
+    knives::store::Store::open(
+        knives::store::default_state_path(),
+        &bound.registry.former_names(),
+        &[],
+    )
+}
+
+/// The release claims of `fork` in the state file `read` holds: each claim
+/// of a name that is a release under the fork's scheme, with its owner, or
+/// why the file could not be read ([`release::reap_superseded_held`]).
+fn release_claims(
+    fork: &Fork<'_>,
+    read: &Result<knives::store::Store, knives::store::StoreError>,
+) -> release::ReleaseClaims {
+    let store = match read {
+        Ok(store) => store,
+        Err(error) => return release::ReleaseClaims::Unreadable(error.to_string()),
+    };
+    let scheme = fork.entry.release_scheme();
+    release::ReleaseClaims::Read(
+        store
+            .claims(Some(&fork.upstream))
+            .into_iter()
+            .filter(|claim| {
+                knives::ids::is_release_name(&BranchName::new(claim.branch.as_str()), &scheme)
+            })
+            .map(|claim| release::HeldRelease {
+                name: claim.branch.clone(),
+                holder: claim.owner.clone(),
+            })
+            .collect(),
+    )
 }
 
 /// Abandon the earlier writes of each name the reap just forgot — commits the
@@ -3020,9 +3055,14 @@ struct ReapedWrites {
     notes: Vec<String>,
 }
 
-/// Reap superseded dated cuts on demand, in the chosen output.
-pub(crate) fn run_reap(fork: &Fork<'_>, output: knives::cli::Output) -> anyhow::Result<Exit> {
-    let reaped = reap(fork)?;
+/// Reap superseded dated cuts on demand, in the chosen output, keeping each
+/// name a release claim in this machine's state file holds.
+pub(crate) fn run_reap(
+    fork: &Fork<'_>,
+    output: knives::cli::Output,
+    bound: Bound<'_>,
+) -> anyhow::Result<Exit> {
+    let reaped = reap(fork, &release_claims(fork, &read_claims(bound)))?;
     if let Some(payload) = knives::cli::machine_payload(output, &ReapPayload::of(fork, &reaped))? {
         println!("{payload}");
     } else {
@@ -3041,13 +3081,14 @@ struct Reaped {
 
 /// The reap both callers run, on the repository as it is now. The ledger's
 /// earlier writes of each name count for the keep rule and are cleaned up
-/// after it.
-fn reap(fork: &Fork<'_>) -> anyhow::Result<Reaped> {
+/// after it, and a name a release claim of `claims` holds is kept.
+fn reap(fork: &Fork<'_>, claims: &release::ReleaseClaims) -> anyhow::Result<Reaped> {
     let path = &fork.checkout.path;
     let (scheme, publish_remote) = (fork.entry.dated_scheme(), fork.entry.publish_remote());
     let opened = knives::jj::Repo::open(path)?;
     let ledger = Ledger::for_fork(fork).read()?.entries;
-    let mut report = release::reap_superseded(&opened, &scheme, publish_remote, &ledger)?;
+    let mut report =
+        release::reap_superseded_held(&opened, &scheme, publish_remote, &ledger, claims)?;
     let cleaned = abandon_reaped_writes(fork, &report, &ledger);
     report.notes.extend(cleaned.notes);
     // The reap's own abandons hid what they exposed in one operation over

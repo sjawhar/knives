@@ -340,6 +340,13 @@ pub enum Command {
     /// back is the one on that ledger's remote, read before `finish` decides. When
     /// it cannot read that claim or push its release, it leaves the state file and
     /// the workspace as they were, and exits 3.
+    ///
+    /// The finish of a release name releases the release claim. Once it has
+    /// forgotten the claim's workspace, it abandons the earlier commits of the
+    /// release that nothing holds, in one jj operation, and names each earlier
+    /// commit that something else holds, with what holds it. While the release
+    /// holds conflicts, it abandons none and says so. The sweep does not change
+    /// the exit.
     Finish {
         branch: String,
         /// Registry name. Defaults to the repo you are standing in.
@@ -810,6 +817,10 @@ pub enum ReleaseAction {
     /// what rests on it; the next reap after that moves on retires it. A cut a tag, an
     /// untracked remote bookmark or a local bookmark of another name (`keep/…`) still names
     /// has its refs forgotten and its commit kept, exit 0. `--json` prints one document.
+    ///
+    /// Keeps a superseded name that a live release claim holds (`knives start <name>`),
+    /// exit 1. Its line names the holder and `knives finish <name>`, which releases the
+    /// claim. When it cannot read the claims, it keeps every superseded name and says so.
     Reap,
 }
 

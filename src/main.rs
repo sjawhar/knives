@@ -597,7 +597,7 @@ fn dispatch_release(
                 }
             }
         }
-        Some(ReleaseAction::Reap) => run_reap(fork, output),
+        Some(ReleaseAction::Reap) => run_reap(fork, output, bound),
         Some(ReleaseAction::Include {
             branch,
             why,

@@ -26,9 +26,11 @@ use knives::commands::claim::{
 };
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
 use knives::config::Registry;
-use knives::ids::{BranchName, BranchTarget, CommitId, Requirement, UpstreamName};
+use knives::ids::{
+    BranchName, BranchTarget, CommitId, RepoName, Requirement, UpstreamName, is_release_name,
+};
 use knives::jj::{
-    Repo, StaleRegistration, WorkspaceIdentity, path_occupant, remove_finished_worktree,
+    JjError, Repo, StaleRegistration, WorkspaceIdentity, path_occupant, remove_finished_worktree,
 };
 use knives::ledger::{
     ClaimChange, Displaced, Draft, Entry, LedgerError, Scribe, Stated, default_ledger_root,
@@ -40,6 +42,7 @@ use knives::seen::LastSeen;
 use knives::statement::{Statement, StatementKind};
 use knives::store::{Claim, Store, default_state_path};
 
+use super::release_edit::{release_writes, report_abandoned_earlier, report_hidden};
 use super::scribe_for;
 
 /// What a `finish` did, or nothing when it did nothing.
@@ -280,8 +283,8 @@ pub(crate) fn run_finish(
         );
         return Ok(Exit::Incomplete);
     }
-    let disposal = if let Some(displaced) = released.displaced.as_ref() {
-        left_to_its_owner(&place, &displaced.owner)
+    let (disposal, forgotten) = if let Some(displaced) = released.displaced.as_ref() {
+        (left_to_its_owner(&place, &displaced.owner), false)
     } else {
         ordinary_disposal(
             &place,
@@ -291,7 +294,110 @@ pub(crate) fn run_finish(
         )?
     };
     println!("{}/{branch}: claim {claim}; {disposal}", fork.name);
+    // With a release claim's workspace forgotten, nothing of it holds a
+    // release commit any more: sweep as the next release write would.
+    if forgotten && is_release_name(branch, &fork.entry.release_scheme()) {
+        sweep_earlier_writes(fork, branch.as_str());
+    }
     Ok(if lost { Exit::Findings } else { Exit::Ok })
+}
+
+/// Sweep the earlier writes of release `name` after `finish` forgot the
+/// release claim's workspace, as `knives release adopt` sweeps them after
+/// it records a write. A sweep that fails says so, and changes no exit.
+///
+/// jj abandons a forgotten workspace's working copy where it is empty and
+/// undescribed, so a release commit a write replaced and kept for that
+/// working copy is now a head nothing rests on, which `audit` reports as an
+/// orphan commit. A working copy with changes stays and holds what it rests
+/// on, as every other workspace's does; each earlier write something keeps
+/// is named with what keeps it ([`kept_lines`]). While the release in hand
+/// holds conflicts, its earlier writes are the record of their last
+/// resolution, so nothing is swept, as a write sweeps nothing then.
+///
+/// The release name is read from the repository and the reasons name
+/// bookmarks, tags and jj workspaces, so each line goes out escaped
+/// ([`inline_human_text`]).
+fn sweep_earlier_writes(fork: &Fork<'_>, name: &str) {
+    if let Err(error) = sweep(fork, name) {
+        eprintln!(
+            "{}: could not sweep the earlier {} commits: {}",
+            fork.name,
+            inline_human_text(name),
+            problem_human_text(&format!("{error:#}"))
+        );
+    }
+}
+
+/// What [`sweep_earlier_writes`] reads, abandons in one jj operation, and
+/// says.
+fn sweep(fork: &Fork<'_>, name: &str) -> anyhow::Result<()> {
+    let (repo, checkout) = (&fork.name, &fork.checkout.path);
+    let opened = Repo::open(checkout)?;
+    let writes = release_writes(fork, &opened, name)?;
+    let release = opened
+        .local_bookmark_tip(name)
+        .ok_or_else(|| anyhow::anyhow!("{name} has no local bookmark"))?;
+    if !opened.conflicted_files(release.as_str())?.is_empty() {
+        println!(
+            "{repo}: swept no earlier {} commit: the release holds conflicts, and its earlier \
+             writes are the record of their last resolution",
+            inline_human_text(name)
+        );
+        return Ok(());
+    }
+    let swept = knives::jj::abandon_unheld_writes(
+        checkout,
+        writes.commits(),
+        Some(&release),
+        &format!("knives: {name}: finish abandons earlier writes nothing rests on"),
+    )?;
+    report_abandoned_earlier(repo, name, &swept.abandoned);
+    report_hidden(repo, name, &swept.hidden);
+    let reopened = Repo::open(checkout)?;
+    let mut left = Vec::new();
+    for write in writes.commits() {
+        if reopened.is_visible(write)? {
+            let in_release = *write == release || reopened.is_ancestor(write, &release)?;
+            left.push((write.clone(), in_release));
+        }
+    }
+    let kept = kept_lines(repo, name, &left, |write| {
+        reopened.what_keeps_earlier_write(write, name)
+    })?;
+    for line in kept {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The `note: kept` line of each earlier write of `release` in `writes`
+/// that something keeps, with what keeps it (`keeps`,
+/// [`Repo::what_keeps_earlier_write`]). `writes` pairs each visible earlier
+/// write with whether the release descends from it: the release's own
+/// commit, a carrier, or a commit behind one. The release holds each of
+/// those itself, so none is named, and `keeps` is never asked about one.
+fn kept_lines(
+    repo: &RepoName,
+    release: &str,
+    writes: &[(CommitId, bool)],
+    mut keeps: impl FnMut(&CommitId) -> Result<Option<String>, JjError>,
+) -> Result<Vec<String>, JjError> {
+    let shown = inline_human_text(release);
+    let mut lines = Vec::new();
+    for (write, in_release) in writes {
+        if *in_release {
+            continue;
+        }
+        if let Some(reason) = keeps(write)? {
+            lines.push(format!(
+                "{repo}: note: kept {}, an earlier {shown} commit: {}",
+                write.short(),
+                inline_human_text(&reason)
+            ));
+        }
+    }
+    Ok(lines)
 }
 
 /// Where a `finish` of `target` releases its claim on the ledger, when its
@@ -543,19 +649,24 @@ fn copy_superseded(branch: &BranchName, holder: &str) -> String {
 }
 
 /// Forgets this branch's workspace and removes its directory, and says what
-/// became of each.
+/// became of each; and whether jj now holds no workspace of the name: it
+/// forgot it, or never had it.
 fn ordinary_disposal(
     place: &Place<'_>,
     identity: Option<&WorkspaceIdentity>,
     present: bool,
     cleanup: bool,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, bool)> {
     let registration =
         release_registration(place.checkout, place.workspace, place.directory, present);
     let removal = removal_note(place, identity, &registration, cleanup)?;
-    Ok(format!(
-        "workspace {} {registration}; {removal}",
-        place.workspace
+    let forgotten = matches!(
+        registration,
+        Registration::Forgotten | Registration::NotRegistered
+    );
+    Ok((
+        format!("workspace {} {registration}; {removal}", place.workspace),
+        forgotten,
     ))
 }
 
@@ -1687,8 +1798,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        Place, Registration, copy_superseded, finish_provenance, left_to_its_owner, no_claim_now,
-        removal_note, shared_holder, spoken, with_requirements,
+        Place, Registration, copy_superseded, finish_provenance, kept_lines, left_to_its_owner,
+        no_claim_now, removal_note, shared_holder, spoken, with_requirements,
     };
     use knives::ids::{BranchName, Requirement};
     use knives::jj::WorkspaceIdentity;
@@ -1945,5 +2056,54 @@ mod tests {
              workspace and its registration stay as they are\n\
              use `knives start 'feat/a$b' --force --why \"…\"` to take the branch back"
         );
+    }
+
+    mod release_claim_finish {
+        use knives::ids::{CommitId, RepoName};
+
+        use super::kept_lines;
+
+        #[test]
+        fn kept_lines_never_name_a_write_the_release_descends_from() {
+            // Given: four visible earlier writes of a release, each of which
+            // something keeps: the release's own commit, a carrier, an older
+            // carrier behind it, and a replaced commit that a working copy
+            // rests on
+            let commit = |digit: &str| CommitId::new(digit.repeat(40));
+            let (own, carrier, older) = (commit("a"), commit("b"), commit("c"));
+            let replaced = commit("d");
+            let writes = [
+                (own, true),
+                (carrier, true),
+                (older, true),
+                (replaced.clone(), false),
+            ];
+            let reason = "it has descendants, whose heads are eeeeeeeeeeee, the working copy of \
+                          default";
+            let mut asked = Vec::new();
+
+            // When: finish names the earlier writes something keeps
+            let lines = kept_lines(
+                &RepoName::new("demo"),
+                "release/2026-08-04",
+                &writes,
+                |write| {
+                    asked.push(write.clone());
+                    Ok(Some(reason.to_owned()))
+                },
+            )
+            .expect("name the kept writes");
+
+            // Then: only the replaced commit is named, with what keeps it,
+            // and what keeps the others is never read
+            assert_eq!(
+                lines,
+                [format!(
+                    "demo: note: kept {}, an earlier release/2026-08-04 commit: {reason}",
+                    replaced.short()
+                )]
+            );
+            assert_eq!(asked, [replaced]);
+        }
     }
 }

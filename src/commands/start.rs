@@ -1,6 +1,9 @@
 //! `knives start`: claim a branch and open a workspace on its tip, or on the
 //! release's shared base for a new one.
 //!
+//! The workspace of a release name, the release claim's, rests on a new
+//! empty commit off the root commit ([`workspace_base`]).
+//!
 //! On a fork that shares its ledger, the ledger's claim ref decides who
 //! holds the branch, on every machine that shares the ledger, and the claim
 //! is on the ledger before the workspace is touched ([`shared_start`]). On
@@ -22,7 +25,9 @@ use crate::commands::release::shared_base;
 use crate::commands::wip::workspace_for;
 use crate::config::Role;
 use crate::detect::BookmarkTips;
-use crate::ids::{BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, WorkspaceName};
+use crate::ids::{
+    BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, WorkspaceName, is_release_name,
+};
 use crate::jj::{
     MAX_ACTIVITY_OPS, Repo, StaleRegistration, WorkspaceIdentity, add_workspace, fetch_all,
     forget_workspace, is_workspace_named, path_occupant, registered_workspace_path,
@@ -865,6 +870,9 @@ enum WorkspaceBase {
         revision: String,
         label: String,
     },
+    /// A new empty commit whose parent is the root commit: a release claim's
+    /// ([`add_on_root`]).
+    Root,
     /// The branch's local bookmark names several commits, so there is no one tip
     /// to continue from.
     Divergent(Vec<CommitId>),
@@ -887,8 +895,8 @@ fn divergent_refusal_line(branch: &BranchName, tips: &[CommitId]) -> String {
 /// Create the branch's workspace with its working copy on the right commit
 /// ([`workspace_base`]), clearing first what a vanished one left at its
 /// name and path as `leftovers` says; the line that says so
-/// ([`made_line`]), or, for a divergent branch, the refusal, with nothing
-/// made ([`divergent_refusal_line`]).
+/// ([`made_line`], [`add_on_root`]), or, for a divergent branch, the
+/// refusal, with nothing made ([`divergent_refusal_line`]).
 fn create_workspace(
     context: &StartContext<'_>,
     leftovers: Leftovers,
@@ -898,6 +906,10 @@ fn create_workspace(
             clear_leftovers(context, leftovers)?;
             let change = add_on(context, &revision)?;
             Ok(made_line(context, &change, &revision, &label))
+        }
+        WorkspaceBase::Root => {
+            clear_leftovers(context, leftovers)?;
+            Ok(add_on_root(context)?)
         }
         WorkspaceBase::Divergent(tips) => Err(divergent_refusal_line(context.branch, &tips)),
     })
@@ -916,6 +928,18 @@ fn add_on(context: &StartContext<'_>, revision: &str) -> anyhow::Result<String> 
         &Repo::open(&context.fork.checkout.path)?,
         &context.workspace,
     )
+}
+
+/// Add a release claim's workspace at its path, its working copy a new
+/// empty commit whose parent is the root commit; the line that says so, its
+/// path escaped, as [`kept_line`]'s is.
+fn add_on_root(context: &StartContext<'_>) -> anyhow::Result<String> {
+    let change = add_on(context, "root()")?;
+    Ok(format!(
+        "workspace {} at {change} based on the root commit (a release claim's working copy \
+         rests on no release commit)",
+        inline_human_text(&context.destination.display().to_string())
+    ))
 }
 
 /// The line for the directory at the branch's workspace path, its working
@@ -951,10 +975,22 @@ fn made_line(context: &StartContext<'_>, change: &str, revision: &str, label: &s
 /// forks from; without a release, the fetched upstream trunk. Never the current
 /// `@`: an agent in a release workspace could otherwise run `jj new` and
 /// silently inherit the release merge as a parent.
+///
+/// A release name of the fork ([`is_release_name`]) is no branch an agent
+/// commits to: knives writes each release commit, and a hand change is
+/// squashed into one. Its workspace, the release claim's, rests on a new
+/// empty commit whose parent is the root commit ([`WorkspaceBase::Root`]). A
+/// release write keeps each release commit it replaces while a working copy
+/// rests on it or above it, so a claim's working copy on the release's tip
+/// would keep the commit each of the claim's writes replaces. A person puts
+/// it on the release commit (`jj new <release>`) for a hand resolution.
 fn workspace_base(context: &StartContext<'_>) -> anyhow::Result<WorkspaceBase> {
     let entry = context.fork.entry;
     let checkout = &context.fork.checkout.path;
     fetch_all(checkout)?;
+    if is_release_name(context.branch, &entry.release_scheme()) {
+        return Ok(WorkspaceBase::Root);
+    }
     let opened = Repo::open(checkout)?;
     let tips = opened.bookmark_tips()?;
     let ours = [
@@ -1380,6 +1416,9 @@ enum Prepared {
     Adopt,
     /// Create the workspace on `revision`, which `label` names.
     Create { revision: String, label: String },
+    /// Create a release claim's workspace on a new empty commit off the root
+    /// commit ([`WorkspaceBase::Root`]).
+    CreateOnRoot,
 }
 
 /// Every refusal of the workspace that changes nothing, made before the
@@ -1408,8 +1447,9 @@ fn prepare_workspace(
         )
         .map_or(Ok(Prepared::Adopt), Err));
     }
-    let (revision, label) = match workspace_base(context)? {
-        WorkspaceBase::At { revision, label } => (revision, label),
+    let prepared = match workspace_base(context)? {
+        WorkspaceBase::At { revision, label } => Prepared::Create { revision, label },
+        WorkspaceBase::Root => Prepared::CreateOnRoot,
         WorkspaceBase::Divergent(tips) => {
             return Ok(Err(divergent_refusal_line(context.branch, &tips)));
         }
@@ -1425,7 +1465,7 @@ fn prepare_workspace(
             check_vanished_workspace(context)?;
         }
     }
-    Ok(Ok(Prepared::Create { revision, label }))
+    Ok(Ok(prepared))
 }
 
 /// The adopted directory, or the new workspace, of a take whose claim the
@@ -1439,6 +1479,7 @@ fn take_workspace(context: &StartContext<'_>, prepared: &Prepared) -> anyhow::Re
         Prepared::Create { revision, label } => {
             made_line(context, &add_on(context, revision)?, revision, label)
         }
+        Prepared::CreateOnRoot => add_on_root(context)?,
     })
 }
 
@@ -1458,6 +1499,10 @@ fn seize_workspace(context: &StartContext<'_>, prepared: &Prepared) -> anyhow::R
                 "created missing {}",
                 made_line(context, &change, revision, label)
             )
+        }
+        Prepared::CreateOnRoot => {
+            clear_vanished_workspace(context)?;
+            format!("created missing {}", add_on_root(context)?)
         }
     })
 }
@@ -1497,7 +1542,7 @@ fn take_shared(context: &mut StartContext<'_>, on: &OnLedger<'_>) -> anyhow::Res
     };
     let event = match prepared {
         Prepared::Adopt => format!("claimed: {reason} (adopted existing workspace)"),
-        Prepared::Create { .. } => format!("claimed: {reason}"),
+        Prepared::Create { .. } | Prepared::CreateOnRoot => format!("claimed: {reason}"),
     };
     let draft =
         event_draft(context, event).about_claim(Some(ClaimChange::Claimed), Some(reason), None);
