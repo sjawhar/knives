@@ -480,12 +480,16 @@ that repository's owner and a member branch; any other is a problem that says wh
 met. A member no copy here holds cannot be judged, and is a problem until it is fetched;
 the problem says its work may still be in a review base it merged into before it was
 deleted. Without the landed probe (`status --no-landed`), a member not shown landed stays
-an unmet finding: what is not shown to have landed is still needed. When the forge was asked
-and did not answer, a member not shown landed cannot be judged, since a squash merge
-upstream leaves nothing a replay sees: a problem, not an unmet finding. A member recorded
-under two spellings of the fork's own repository, by machines whose `origin` remotes
-differ, is one requirement. A branch of another fork's own repository is no member of this
-one, whatever a branch of its name here says: a problem.
+an unmet finding: what is not shown to have landed is still needed. So does one under
+`--no-github`, or on a fork whose upstream is no forge repository: only the forge shows a
+squash merge, and it was not asked, so the finding says the member is not known to have
+landed. When the forge was asked and did not answer, a member not shown landed cannot be
+judged: a problem, not an unmet finding. A member recorded under two spellings of the
+fork's own repository, by machines whose `origin` remotes differ, is one requirement. A
+member record on a repository no spelling here gives is judged as a member only when the
+forge names that repository as the fork's own (a former name); a branch of another fork's
+own repository, or of one the forge names otherwise, is no member of this one, whatever a
+branch of its name here says: a problem.
 
 A report checks the requirements of every row; of a dependent this checkout holds only as
 `<branch>@origin`, another machine's branch nobody here claims; and of a dependent held
@@ -529,10 +533,14 @@ token cannot see decides what a forget takes. Each such refusal prints a command
 every record of that pull request number or member, each as it is spelled (a member by its
 branch name, unless that holds a `#`): every candidate is then named directly, so no forge
 answer changes what it takes. It can take a record the forge showed is another
-repository's; to keep one, run the forget again when the forge answers. A member token on
-another fork's repository is refused unless a record is spelled exactly so; then that
-record alone is taken back. Every machine running
-this knives folds the two into the same list. A knives from before fork requirements
+repository's; to keep one, run the forget again when the forge answers. When the text may
+name two requirements, the refusal prints one such command for each, never one that takes
+both. A text spelled exactly as a held upstream record names that record alone, and a
+`<repo>#<n>` text the registry reads as a pull request names that pull request, as `--on`
+reads it, even when a member branch is named so. A bare branch name names this fork's
+member, never another fork's branch. A member token on another fork's repository is refused
+unless a record is spelled exactly so; then that record alone is taken back. Every machine
+running this knives folds the two into the same list. A knives from before fork requirements
 reads the same list only while it holds no member branch: it cannot read a list that
 holds one, so the forget is the newest statement it reads there, and the branch requires
 nothing. The forget restates the list the writing machine holds after its pull, and the

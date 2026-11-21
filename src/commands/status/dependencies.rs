@@ -76,6 +76,14 @@ struct DependencyResults<'a> {
     /// Per uncertain dependent, each such requirement and what was seen of
     /// it.
     deferred: BTreeMap<BranchName, Vec<(Requirement, String)>>,
+    /// Per uncertain dependent, every requirement it holds: its command
+    /// names every record of a number or member it gives, as `depends`'s own
+    /// recovery does, so it never needs a second step.
+    held: BTreeMap<BranchName, Vec<Requirement>>,
+    /// The spellings of this fork's own repository here, lowercase: a member
+    /// record on any other repository is named by its own token, never by a
+    /// branch name that also names this fork's member.
+    own: Vec<String>,
 }
 
 /// What could not be read of a deleted dependent's work.
@@ -114,10 +122,9 @@ impl DependencyResults<'_> {
         match state {
             MemberState::Landed => {}
             MemberState::Open(seen) => self.unmet(about, &format!("which has not landed ({seen})")),
-            MemberState::Unprobed => self.unmet(
-                about,
-                "which is not known to have landed: the landed probe did not run",
-            ),
+            MemberState::Unprobed(why) => {
+                self.unmet(about, &format!("which is not known to have landed: {why}"));
+            }
             MemberState::Unknown(why) => self.unchecked(about, why),
         }
     }
@@ -184,24 +191,21 @@ impl DependencyResults<'_> {
 
     /// One problem per uncertain dependent with a requirement that is unmet
     /// or cannot be judged: what could not be read, what was seen of each
-    /// such requirement, and the command that forgets them, a member named
-    /// by its branch, which takes back every spelling of it.
+    /// such requirement, and the command that forgets them
+    /// ([`Self::tokens`]).
     fn report_deferred(&mut self) {
         for (branch, open) in std::mem::take(&mut self.deferred) {
             let Some(unread) = self.uncertain.get(&branch) else {
                 continue;
             };
             let mut needs: Vec<String> = Vec::new();
-            let mut tokens: Vec<String> = Vec::new();
             for (requirement, _) in &open {
-                let (shown, token) = (requirement.to_string(), requirement.forget_token());
+                let shown = requirement.to_string();
                 if !needs.contains(&shown) {
                     needs.push(shown);
                 }
-                if !tokens.contains(&token) {
-                    tokens.push(token);
-                }
             }
+            let tokens = self.tokens(&branch, open.iter().map(|(requirement, _)| requirement));
             let seen: Vec<&str> = open.iter().map(|(_, seen)| seen.as_str()).collect();
             let command = tokens.join(" --forget ");
             let next = if unread.fetchable {
@@ -219,6 +223,54 @@ impl DependencyResults<'_> {
             ));
         }
     }
+
+    /// The `--forget` texts that take back `open`, requirements of
+    /// `dependent`, in one run whatever the forge answers: every record it
+    /// holds of a review pull request number among them, each as spelled; a
+    /// member of this fork by its branch name (its records' tokens when the
+    /// name holds a `#`); a member record on any other repository, and an
+    /// upstream pull request, by its own token.
+    fn tokens<'r>(
+        &self,
+        dependent: &BranchName,
+        open: impl IntoIterator<Item = &'r Requirement>,
+    ) -> Vec<String> {
+        let held = self.held.get(dependent).map_or(&[][..], Vec::as_slice);
+        let ours = |repository: &str| self.own.contains(&repository.to_ascii_lowercase());
+        let mut tokens: Vec<String> = Vec::new();
+        let mut push = |token: String| {
+            if !tokens.contains(&token) {
+                tokens.push(token);
+            }
+        };
+        for requirement in open {
+            match requirement {
+                Requirement::ForkPull { number, .. } => {
+                    for record in held {
+                        if matches!(record, Requirement::ForkPull { number: other, .. } if other == number)
+                        {
+                            push(record.to_string());
+                        }
+                    }
+                    push(requirement.to_string());
+                }
+                Requirement::ForkBranch { repository, branch } if ours(repository) => {
+                    if branch.as_str().contains('#') {
+                        for record in held {
+                            if matches!(record, Requirement::ForkBranch { repository: other, branch: name }
+                                if name == branch && ours(other))
+                            {
+                                push(record.to_string());
+                            }
+                        }
+                    }
+                    push(requirement.forget_token());
+                }
+                _ => push(requirement.to_string()),
+            }
+        }
+        tokens
+    }
 }
 
 /// What this checkout says of a member branch of the fork.
@@ -228,11 +280,12 @@ enum MemberState {
     Landed,
     /// It has not, with what was seen: its row's state, or the probe's verdict.
     Open(String),
-    /// It has no landed row, and the landed probe, which alone can say it
-    /// landed, did not run (`status --no-landed`, or no upstream trunk). Kept
-    /// as unmet, as the drop guard needs: a member not shown to have landed
-    /// is still needed.
-    Unprobed,
+    /// It has no landed row, and what alone can say it landed was not read:
+    /// the landed probe did not run (`status --no-landed`, or no upstream
+    /// trunk), or the forge, the only witness of a squash merge, was not
+    /// asked. Kept as unmet, as the drop guard needs: a member not shown to
+    /// have landed is still needed.
+    Unprobed(String),
     /// It cannot be judged, and why.
     Unknown(String),
 }
@@ -256,10 +309,9 @@ struct Members<'a> {
     /// What the landed probe replays onto, the upstream trunk; `None` when
     /// the probe did not run.
     probed_onto: Option<&'a str>,
-    /// Whether the forge answered for this fork's upstream pull requests: when
-    /// it was asked and did not, a squash merge upstream cannot be seen, so a
-    /// member not shown landed cannot be judged.
-    forge_answered: bool,
+    /// What the forge said of this fork's upstream pull requests, the only
+    /// witness of a squash merge upstream ([`Evidence`]).
+    evidence: Evidence,
     judged: RefCell<BTreeMap<BranchName, MemberState>>,
     /// Head commits judged by [`Self::judge_commit`], by the branch name the
     /// review pull request gives them as well as the commit: the merge
@@ -328,11 +380,21 @@ impl Members<'_> {
         if row.state == BranchState::Landed || row.landed == Some(LandedVerdict::InTrunk) {
             MemberState::Landed
         } else if self.probed_onto.is_none() {
-            MemberState::Unprobed
-        } else if !self.forge_answered {
-            MemberState::Unknown(unseen_squash(&row.name.to_string()))
+            MemberState::Unprobed(NO_PROBE.to_owned())
         } else {
-            MemberState::Open(row.state.to_string())
+            self.not_landed(&row.name.to_string(), || row.state.to_string())
+        }
+    }
+
+    /// A member `shown` that a replay did not show landed: open, as `seen`
+    /// says, when the forge answered; when it was asked and did not, it
+    /// cannot be judged, since a squash merge upstream leaves nothing a
+    /// replay sees; when it was not asked, not known to have landed.
+    fn not_landed(&self, shown: &str, seen: impl FnOnce() -> String) -> MemberState {
+        match &self.evidence {
+            Evidence::Read => MemberState::Open(seen()),
+            Evidence::Unanswered => MemberState::Unknown(unseen_squash(shown)),
+            Evidence::NotAsked(why) => MemberState::Unprobed((*why).to_owned()),
         }
     }
 
@@ -390,13 +452,12 @@ impl Members<'_> {
             }
         }
         let Some(trunk) = self.probed_onto else {
-            return MemberState::Unprobed;
+            return MemberState::Unprobed(NO_PROBE.to_owned());
         };
         match crate::jj::probe_landed(self.path, &BranchName::new(tip.as_str()), trunk) {
             Ok(outcome) => match classify_landed(outcome) {
                 LandedVerdict::InTrunk => MemberState::Landed,
-                _ if !self.forge_answered => MemberState::Unknown(unseen_squash(shown)),
-                verdict => MemberState::Open(format!("{shown} {verdict}")),
+                verdict => self.not_landed(shown, || format!("{shown} {verdict}")),
             },
             Err(error) => {
                 MemberState::Unknown(format!("the landed probe of {shown} failed: {error}"))
@@ -455,6 +516,9 @@ struct Sorted<'a> {
     /// names; one per dependent and branch, whatever repository spelling
     /// each record carries.
     members: Vec<(BranchName, Requirement, BranchName)>,
+    /// Member records on a repository no spelling here gives, which the
+    /// forge is asked to place ([`placed_members`]).
+    elsewhere: Vec<(BranchName, Requirement, BranchName)>,
 }
 
 fn unmet_dependencies(
@@ -466,16 +530,35 @@ fn unmet_dependencies(
     let mut problems = Vec::new();
     let repo = &context.fork.upstream;
     let (checked, uncertain) = dependents(members, context, notes);
+    let held = uncertain
+        .keys()
+        .map(|branch| {
+            let target = BranchTarget::new(repo.clone(), branch.clone());
+            (branch.clone(), context.store.dependencies(&target))
+        })
+        .collect();
     let mut outcomes = DependencyResults {
         findings: &mut findings,
         problems: &mut problems,
         uncertain: &uncertain,
         deferred: BTreeMap::new(),
+        held,
+        own: own_spellings(context),
     };
     let sorted = sort_requirements(repo, &checked, context, &mut outcomes);
     upstream_outcomes(repo, sorted.upstream, context, &mut outcomes);
     fork_pull_outcomes(sorted.on_fork, members, context, &mut outcomes);
-    for (dependent, requirement, member) in sorted.members {
+    let mut judged = sorted.members;
+    for placed in placed_members(sorted.elsewhere, context, &mut outcomes) {
+        // One member under two spellings is one requirement.
+        if !judged
+            .iter()
+            .any(|(dependent, _, member)| *dependent == placed.0 && *member == placed.2)
+        {
+            judged.push(placed);
+        }
+    }
+    for (dependent, requirement, member) in judged {
         let shown = requirement.to_string();
         let about = About {
             branch: &dependent,
@@ -546,10 +629,7 @@ fn dependents(
                     if state != MemberState::Landed {
                         let seen = match state {
                             MemberState::Open(_) => "has not landed".to_owned(),
-                            MemberState::Unprobed => {
-                                "could not be shown landed: the landed probe did not run".to_owned()
-                            }
-                            MemberState::Unknown(why) => {
+                            MemberState::Unprobed(why) | MemberState::Unknown(why) => {
                                 format!("could not be shown landed: {why}")
                             }
                             MemberState::Landed => String::new(),
@@ -650,6 +730,10 @@ fn sort_requirements<'a>(
                         continue;
                     }
                     let branch = branch.clone();
+                    if !outcomes.own.contains(&repository.to_ascii_lowercase()) {
+                        sorted.elsewhere.push((dependent, requirement, branch));
+                        continue;
+                    }
                     if member_pairs.insert((dependent.clone(), branch.clone())) {
                         sorted.members.push((dependent, requirement, branch));
                     }
@@ -667,6 +751,106 @@ fn unseen_squash(shown: &str) -> String {
         "{shown} is not shown landed, and the forge did not answer for this fork's upstream pull \
          requests, so whether it landed by a squash merge cannot be read"
     )
+}
+
+/// Why a member not shown landed is not known to have landed when the
+/// landed probe did not run.
+const NO_PROBE: &str = "the landed probe did not run";
+
+/// What the forge said of this fork's upstream pull requests, the only
+/// witness of a squash merge upstream.
+enum Evidence {
+    /// It answered: a member not shown landed is open.
+    Read,
+    /// It was asked and did not answer: one not shown landed cannot be
+    /// judged.
+    Unanswered,
+    /// It was not asked, and why: one not shown landed is not known to have
+    /// landed, an unmet finding as without the landed probe.
+    NotAsked(&'static str),
+}
+
+/// The spellings of this fork's own repository here, lowercase: what its
+/// checkout's `origin` (or registry `origin`) names, and its registry
+/// `origin`.
+fn own_spellings(context: &DependencyContext<'_, '_>) -> Vec<String> {
+    let mut own: Vec<String> = Vec::new();
+    for url in [
+        context.fork.own_origin(),
+        context.fork.entry.origin.as_str(),
+    ] {
+        if let Some(slug) = remote_slug(url).map(str::to_ascii_lowercase)
+            && !own.contains(&slug)
+        {
+            own.push(slug);
+        }
+    }
+    own
+}
+
+/// The member records on a repository no spelling here gives, by the
+/// dependent and the branch, that the forge names as this fork's own
+/// repository (a former name nothing here spells): those are judged as
+/// members. One the forge names as another repository, or no forge
+/// consulted or able to answer, is a requirement nothing here can judge.
+fn placed_members(
+    elsewhere: Vec<(BranchName, Requirement, BranchName)>,
+    context: &DependencyContext<'_, '_>,
+    outcomes: &mut DependencyResults<'_>,
+) -> Vec<(BranchName, Requirement, BranchName)> {
+    let mut placed = Vec::new();
+    if elsewhere.is_empty() {
+        return placed;
+    }
+    let fork = &context.fork.name;
+    let origin = context.fork.own_origin();
+    let named = |url: &str| -> Result<String, String> {
+        let Some(forge) = context.forge else {
+            return Err("no forge consulted".to_owned());
+        };
+        forge
+            .repo_identity(context.path(), url, url)
+            .map(|identity| identity.name_with_owner.to_ascii_lowercase())
+            .map_err(|error| error.to_string())
+    };
+    let own = named(origin);
+    for (dependent, requirement, branch) in elsewhere {
+        let Requirement::ForkBranch { repository, .. } = &requirement else {
+            continue;
+        };
+        let resolved = own.clone().and_then(|own| {
+            let url = remote_slug(origin)
+                .map(|slug| origin.replacen(slug, repository, 1))
+                .ok_or_else(|| format!("{fork}'s {ORIGIN} names no forge repository"))?;
+            named(&url).map(|name| name == own)
+        });
+        let shown = requirement.to_string();
+        let about = About {
+            branch: &dependent,
+            requirement: &requirement,
+            shown: &shown,
+        };
+        match resolved {
+            Ok(true) => {
+                placed.push((dependent.clone(), requirement.clone(), branch));
+            }
+            Ok(false) => outcomes.not_judged(
+                about,
+                format!(
+                    "{dependent} requires {requirement}, a branch of {repository}, which is not \
+                     {fork}'s own repository: no member of {fork}, so nothing here can judge it"
+                ),
+                &format!("a branch of {repository}, which is not {fork}'s own repository"),
+            ),
+            Err(error) => outcomes.unchecked(
+                about,
+                format_args!(
+                    "whether {repository} is {fork}'s own repository could not be asked: {error}"
+                ),
+            ),
+        }
+    }
+    placed
 }
 
 /// The registry name of a fork other than this one whose own repository the
@@ -722,11 +906,25 @@ fn upstream_outcomes(
             continue;
         };
         let Some(identity) = upstream_identity(entry) else {
-            outcomes.problems.push(format!(
-                "{required_repo}: upstream {} is not a forge repository; cannot check \
-                 dependencies against it",
-                entry.upstream
-            ));
+            for (branch, requirement, _) in requirements {
+                let shown = requirement.to_string();
+                outcomes.not_judged(
+                    About {
+                        branch: &branch,
+                        requirement: &requirement,
+                        shown: &shown,
+                    },
+                    format!(
+                        "{branch} requires {requirement}, but {required_repo}'s upstream {} is \
+                         not a forge repository: cannot check dependencies against it",
+                        entry.upstream
+                    ),
+                    &format!(
+                        "on {required_repo}'s upstream {}, which is not a forge repository",
+                        entry.upstream
+                    ),
+                );
+            }
             continue;
         };
         asked(
@@ -987,7 +1185,19 @@ pub(super) fn add_dependency_findings(input: DependencyInput<'_, '_, '_>) {
         index,
         trunk_commit: post.trunk_commit,
         probed_onto: post.probe_ran.then_some(trunk_ref.as_str()),
-        forge_answered: snapshot.is_some() || post.options.forge.is_none(),
+        evidence: if post.options.forge.is_none() {
+            Evidence::NotAsked(
+                "the forge was not asked (--no-github), so a squash merge cannot be seen",
+            )
+        } else if remote_slug(&post.fork.entry.upstream).is_none() {
+            Evidence::NotAsked(
+                "the fork's upstream is not a forge repository, so a squash merge cannot be seen",
+            )
+        } else if snapshot.is_some() {
+            Evidence::Read
+        } else {
+            Evidence::Unanswered
+        },
         judged: RefCell::new(BTreeMap::new()),
         judged_commits: RefCell::new(BTreeMap::new()),
     };
