@@ -122,6 +122,17 @@ impl DependencyResults<'_> {
             "cannot check whether {branch} still needs {requirement}: {why}"
         ));
     }
+
+    /// [`Self::unchecked`] for each of `requirements`, for one reason.
+    fn unchecked_each(
+        &mut self,
+        requirements: impl IntoIterator<Item = Wanted>,
+        why: impl Display,
+    ) {
+        for (branch, requirement, _) in requirements {
+            self.unchecked(&branch, &requirement, &why);
+        }
+    }
 }
 
 /// What this checkout says of a member branch of the fork.
@@ -143,7 +154,9 @@ enum MemberState {
 /// The member branches of a fork as this checkout sees them: the rows the
 /// report already judged, then the origin's copy of a member this checkout
 /// has no bookmark of, as a machine that only fetched another machine's
-/// member has. Each member is judged once per report.
+/// member has. A review pull request's head is judged by the commit the
+/// forge reports for it, whatever a branch of that name points at here.
+/// Each member and each head commit is judged once per report.
 struct Members<'a> {
     rows: &'a [BranchRow],
     repo: &'a Repo,
@@ -157,10 +170,12 @@ struct Members<'a> {
     /// the probe did not run.
     probed_onto: Option<&'a str>,
     judged: RefCell<BTreeMap<BranchName, MemberState>>,
+    judged_commits: RefCell<BTreeMap<CommitId, MemberState>>,
 }
 
 impl Members<'_> {
-    /// Landed when its row is landed or merged, or its origin tip is in the
+    /// Landed when its row is landed (by the probe, or by its merged upstream
+    /// pull request's landing in the trunk), or its origin tip is in the
     /// upstream trunk: by a merged upstream pull request whose landing the
     /// trunk holds, or by an empty replay.
     fn judge(&self, member: &BranchName) -> MemberState {
@@ -175,10 +190,15 @@ impl Members<'_> {
         state
     }
 
+    /// A merged row is not met by its merge alone: a pull request merged
+    /// into anything but the upstream trunk leaves the work outside it.
+    /// [`super::merged`] sets the row's landed verdict when the trunk holds
+    /// the merge, the same evidence [`Self::merged_upstream`] asks of a
+    /// member known only on origin.
     fn judged_now(&self, member: &BranchName) -> MemberState {
         match self.rows.iter().find(|row| row.name == *member) {
             Some(row)
-                if matches!(row.state, BranchState::Landed | BranchState::Merged)
+                if row.state == BranchState::Landed
                     || row.landed == Some(LandedVerdict::InTrunk) =>
             {
                 MemberState::Landed
@@ -190,22 +210,55 @@ impl Members<'_> {
     }
 
     fn judge_on_origin(&self, member: &BranchName) -> MemberState {
-        let on_origin = BookmarkRef::Remote {
-            branch: member.clone(),
-            remote: RemoteName::new(ORIGIN),
-        };
+        let on_origin = remote(member);
         let Some(tip) = self.tips.get(&on_origin) else {
             return MemberState::Unknown(format!(
                 "this checkout has no branch {member}, here or on origin; fetch it, or forget \
                  the requirement if the branch landed or was dropped"
             ));
         };
+        self.judge_commit(member, tip, &on_origin.to_string())
+    }
+
+    /// The member a review pull request carries, judged by `head`, the
+    /// commit the forge reports as its head, named `name`: by its row or
+    /// origin copy when either is at that commit, else by the commit itself.
+    /// A commit this checkout lacks cannot be judged: the branch moved
+    /// since this checkout last fetched.
+    fn judge_head(&self, name: &BranchName, head: &str) -> Result<MemberState, CommitId> {
+        let Ok(commit) = self.repo.resolve_commit(head) else {
+            return Err(CommitId::new(head));
+        };
+        let row = self.rows.iter().any(|row| row.name == *name);
+        let local = self.tips.get(&BookmarkRef::Local(name.clone()));
+        let on_origin = self.tips.get(&remote(name));
+        if (row && local == Some(&commit))
+            || (!row && local.is_none() && on_origin == Some(&commit))
+        {
+            return Ok(self.judge(name));
+        }
+        if let Some(state) = self.judged_commits.borrow().get(&commit) {
+            return Ok(state.clone());
+        }
+        let state = self.judge_commit(name, &commit, &format!("{name} at {}", commit.short()));
+        let _ = self
+            .judged_commits
+            .borrow_mut()
+            .insert(commit, state.clone());
+        Ok(state)
+    }
+
+    /// `member`'s commit `tip`, `shown` as the report names it: landed when
+    /// its merged upstream pull request's landing is in the trunk and `tip`
+    /// holds nothing past what it merged, or when it replays empty onto the
+    /// trunk.
+    fn judge_commit(&self, member: &BranchName, tip: &CommitId, shown: &str) -> MemberState {
         match self.merged_upstream(member, tip) {
             Ok(true) => return MemberState::Landed,
             Ok(false) => {}
             Err(error) => {
                 return MemberState::Unknown(format!(
-                    "whether {on_origin}'s merged pull request landed could not be read: {error}"
+                    "whether {shown}'s merged pull request landed could not be read: {error}"
                 ));
             }
         }
@@ -215,18 +268,17 @@ impl Members<'_> {
         match crate::jj::probe_landed(self.path, &BranchName::new(tip.as_str()), trunk) {
             Ok(outcome) => match classify_landed(outcome) {
                 LandedVerdict::InTrunk => MemberState::Landed,
-                verdict => MemberState::Open(format!("{on_origin} {verdict}")),
+                verdict => MemberState::Open(format!("{shown} {verdict}")),
             },
             Err(error) => {
-                MemberState::Unknown(format!("the landed probe of {on_origin} failed: {error}"))
+                MemberState::Unknown(format!("the landed probe of {shown} failed: {error}"))
             }
         }
     }
 
     /// Whether `member`'s upstream pull request merged, the trunk holds its
-    /// landing, and the origin tip holds nothing past what it merged: the
-    /// evidence a squash merge leaves, which a replay cannot see
-    /// ([`super::merged`]).
+    /// landing, and `tip` holds nothing past what it merged: the evidence a
+    /// squash merge leaves, which a replay cannot see ([`super::merged`]).
     fn merged_upstream(&self, member: &BranchName, tip: &CommitId) -> Result<bool, JjError> {
         let Some(trunk) = self.trunk_commit else {
             return Ok(false);
@@ -245,6 +297,14 @@ impl Members<'_> {
         };
         Ok(self.repo.is_ancestor(&landing, trunk)?
             && (*tip == merged_head || self.repo.is_ancestor(tip, &merged_head)?))
+    }
+}
+
+/// `name` on the remote that holds the fork's own repository.
+fn remote(name: &BranchName) -> BookmarkRef {
+    BookmarkRef::Remote {
+        branch: name.clone(),
+        remote: RemoteName::new(ORIGIN),
     }
 }
 
@@ -276,7 +336,7 @@ fn unmet_dependencies(
     let mut findings = Vec::new();
     let mut problems = Vec::new();
     let repo = &context.fork.upstream;
-    let sorted = sort_requirements(repo, members.rows, context, &mut problems);
+    let sorted = sort_requirements(repo, members, context, &mut problems);
     let mut outcomes = DependencyResults {
         findings: &mut findings,
         problems: &mut problems,
@@ -289,18 +349,31 @@ fn unmet_dependencies(
     (findings, problems)
 }
 
+/// Every branch whose requirements a report checks: each row, and each
+/// branch with a stated requirement that this checkout holds only as
+/// `<branch>@origin`, another machine's branch that nobody here claims.
+fn dependents(repo: &UpstreamName, members: &Members<'_>, store: &Store) -> Vec<BranchName> {
+    let mut dependents: Vec<BranchName> = members.rows.iter().map(|row| row.name.clone()).collect();
+    for branch in store.dependents(repo) {
+        if !dependents.contains(&branch) && members.tips.contains_key(&remote(&branch)) {
+            dependents.push(branch);
+        }
+    }
+    dependents
+}
+
 fn sort_requirements<'a>(
     repo: &UpstreamName,
-    branches: &[BranchRow],
+    members: &Members<'_>,
     context: &DependencyContext<'a, '_>,
     problems: &mut Vec<String>,
 ) -> Sorted<'a> {
     let mut sorted = Sorted::default();
     let mut member_pairs = BTreeSet::new();
-    for row in branches {
-        let target = BranchTarget::new(repo.clone(), row.name.clone());
+    for name in dependents(repo, members, context.store) {
+        let target = BranchTarget::new(repo.clone(), name.clone());
         for requirement in context.store.dependencies(&target) {
-            let dependent = row.name.clone();
+            let dependent = name.clone();
             match &requirement {
                 Requirement::Upstream {
                     repo: required,
@@ -408,9 +481,22 @@ fn own_spellings(fork: &Fork<'_>) -> Vec<String> {
         .collect()
 }
 
-/// Review pull requests on a fork's own repository, one batch per
-/// repository, each judged by its head. A batch on any other repository is
-/// a problem per requirement: its heads are no members of this fork.
+/// This fork's `origin` URL: its checkout's `origin` remote, else the
+/// registry's.
+fn own_origin<'a>(fork: &'a Fork<'a>) -> &'a str {
+    fork.checkout
+        .remotes
+        .get(ORIGIN)
+        .map_or(fork.entry.origin.as_str(), String::as_str)
+}
+
+/// Review pull requests on a fork's own repository, one batch, each judged
+/// by its head. The own repository is asked of the forge by name once per
+/// report, and a record names it when it spells it as a remote here does,
+/// as the forge names it now, or by a name the forge resolves to that one:
+/// a record written before the repository was renamed still names it. Any
+/// other repository is a problem per requirement: its heads are no members
+/// of this fork.
 fn fork_pull_outcomes(
     on_fork: BTreeMap<String, Vec<Wanted>>,
     members: &Members<'_>,
@@ -421,99 +507,102 @@ fn fork_pull_outcomes(
         return;
     }
     let Some(forge) = context.forge else {
-        for (branch, requirement, _) in on_fork.into_values().flatten() {
-            outcomes.unchecked(&branch, &requirement, "no forge consulted");
-        }
+        outcomes.unchecked_each(on_fork.into_values().flatten(), "no forge consulted");
         return;
     };
-    let spellings = own_spellings(context.fork);
-    // The name the forge gives this fork's own repository, asked once and
-    // only when a record names a repository no spelling here gives: the
-    // repository was renamed, or the record is another fork's.
-    let mut renamed: Option<Result<String, String>> = None;
-    for (repository, requirements) in on_fork {
-        let own = spellings
-            .iter()
-            .any(|spelled| spelled.eq_ignore_ascii_case(&repository))
-            || match renamed.get_or_insert_with(|| {
-                let origin = context
-                    .fork
-                    .checkout
-                    .remotes
-                    .get(ORIGIN)
-                    .map_or(context.fork.entry.origin.as_str(), String::as_str);
-                forge
-                    .repo_identity(context.path(), origin, origin)
-                    .map(|identity| identity.name_with_owner.to_ascii_lowercase())
-                    .map_err(|error| error.to_string())
-            }) {
-                Ok(name) => name.eq_ignore_ascii_case(&repository),
-                Err(error) => {
-                    for (branch, requirement, _) in requirements {
-                        outcomes.unchecked(
-                            &branch,
-                            &requirement,
-                            format_args!(
-                                "whether {repository} is {}'s own repository could not be asked: \
-                                 {error}",
-                                context.fork.name
-                            ),
-                        );
-                    }
-                    continue;
-                }
-            };
-        if !own {
-            for (branch, requirement, _) in requirements {
-                outcomes.unchecked(
-                    &branch,
-                    &requirement,
-                    format_args!(
-                        "{repository} is not {}'s own repository, and a review pull request on \
-                         another fork's repository cannot be judged here; forget it and name the \
-                         upstream pull request its member becomes",
-                        context.fork.name
-                    ),
-                );
-            }
-            continue;
+    let fork = &context.fork.name;
+    let origin = own_origin(context.fork);
+    let named = |url: &str| {
+        forge
+            .repo_identity(context.path(), url, url)
+            .map(|identity| identity.name_with_owner.to_ascii_lowercase())
+    };
+    let own = match named(origin) {
+        Ok(own) => own,
+        Err(error) => {
+            outcomes.unchecked_each(
+                on_fork.into_values().flatten(),
+                format_args!(
+                    "the forge's name of {fork}'s own repository could not be asked: {error}"
+                ),
+            );
+            return;
         }
-        let owner = repository
-            .split_once('/')
-            .map_or(repository.as_str(), |(owner, _)| owner)
-            .to_owned();
-        let identity = RepoIdentity {
-            name_with_owner: repository,
-            id: String::new(),
+    };
+    let spellings = own_spellings(context.fork);
+    let mut ours = Vec::new();
+    for (repository, requirements) in on_fork {
+        let spelled = repository.eq_ignore_ascii_case(&own)
+            || spellings
+                .iter()
+                .any(|spelling| spelling.eq_ignore_ascii_case(&repository));
+        // A name no remote here gives: the forge says which repository it is.
+        let resolved = if spelled {
+            Ok(true)
+        } else {
+            remote_slug(origin)
+                .map(|slug| origin.replacen(slug, &repository, 1))
+                .map_or(Ok(false), |url: String| {
+                    named(url.as_str()).map(|name| name == own)
+                })
         };
-        asked(
-            forge,
-            context.path(),
-            Batch {
-                identity,
+        match resolved {
+            Ok(true) => ours.extend(requirements),
+            Ok(false) => outcomes.unchecked_each(
                 requirements,
-                heads: Some(Heads {
-                    members,
-                    owner,
-                    entry: context.fork.entry,
-                }),
-            },
-            outcomes,
-        );
+                format_args!(
+                    "{repository} is not {fork}'s own repository, and a review pull request on \
+                     another fork's repository cannot be judged here; forget it and name the \
+                     upstream pull request its member becomes"
+                ),
+            ),
+            Err(error) => outcomes.unchecked_each(
+                requirements,
+                format_args!(
+                    "whether {repository} is {fork}'s own repository could not be asked: {error}"
+                ),
+            ),
+        }
     }
+    if ours.is_empty() {
+        return;
+    }
+    let owner = own
+        .split_once('/')
+        .map_or(own.as_str(), |(owner, _)| owner)
+        .to_owned();
+    asked(
+        forge,
+        context.path(),
+        Batch {
+            identity: RepoIdentity {
+                name_with_owner: own,
+                id: String::new(),
+            },
+            requirements: ours,
+            heads: Some(Heads {
+                members,
+                owner,
+                entry: context.fork.entry,
+            }),
+        },
+        outcomes,
+    );
 }
 
 /// What a review pull request on the fork's own repository is judged by: its
 /// head, when that head is a member branch of the fork.
 struct Heads<'m, 'r> {
     members: &'m Members<'r>,
-    /// The own repository's owner: a head of any other owner is another
-    /// fork's branch, whatever its name.
+    /// The own repository's owner, as the forge names it now: a head of any
+    /// other owner is another fork's branch, whatever its name.
     owner: String,
     entry: &'m RepoEntry,
 }
 
 impl Heads<'_, '_> {
+    /// The member the pull request carries, judged at the head commit the
+    /// forge reports, not at whatever a branch of its name points at here.
     fn judge(&self, fact: &PullFacts) -> MemberState {
         let head = BranchName::new(fact.pull.head_ref_name.as_str());
         if !fact.pull.is_from(&self.owner) {
@@ -531,7 +620,22 @@ impl Heads<'_, '_> {
                 "its head {head} is {kind} of this fork, not a member branch"
             ));
         }
-        self.members.judge(&head)
+        match self.members.judge_head(&head, &fact.pull.head_ref_oid) {
+            Ok(state) => state,
+            Err(missing) => {
+                let fetch = format!(
+                    "its head commit {} is not in this checkout: fetch origin to judge it",
+                    missing.short()
+                );
+                match fact.pull.base_ref_name.as_deref() {
+                    Some(base) if fact.pull.is_merged() => MemberState::Unknown(format!(
+                        "{fetch}. It merged into {base}, which holds the member's work until \
+                         that lands upstream: keep this requirement until then"
+                    )),
+                    _ => MemberState::Unknown(fetch),
+                }
+            }
+        }
     }
 }
 
@@ -631,6 +735,7 @@ pub(super) fn add_dependency_findings(input: DependencyInput<'_, '_, '_>) {
         trunk_commit: post.trunk_commit,
         probed_onto: post.probe_ran.then_some(trunk_ref.as_str()),
         judged: RefCell::new(BTreeMap::new()),
+        judged_commits: RefCell::new(BTreeMap::new()),
     };
     let (found, unanswered) = unmet_dependencies(
         &members,

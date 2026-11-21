@@ -446,22 +446,33 @@ or a fetched `pr-<n>` head. A review pull request on another fork's repository i
 its head is that fork's branch, which nothing here can judge, so the dependent names the
 upstream pull request it becomes. The same branches are refused as member branches.
 
-A member branch is satisfied once it has landed upstream: its row is landed or merged (or
-its landed verdict is in the trunk, whatever else the row says), or, for a member this
-checkout knows only as `<branch>@origin` (another machine's, fetched), its upstream pull
-request merged with a landing the trunk holds and nothing past what it merged, or that
-copy replays empty onto the upstream trunk. A review pull request is satisfied once its
-head, the member it carries, has landed upstream, judged the same way; the report names
-the head. Its own state is not the rule: a review pull request merges into a review base
-or into another member, which says nothing about the upstream, and while the member is in
-the fork's release only, dropping it from the release breaks the dependent. A review pull
-request is judged by its head only on the fork's own repository and when its head is a
-branch of that repository's owner and a member branch; any other is a problem that says
-why, never met. A member no copy here holds cannot be judged, and is a problem until it is
-fetched or the requirement is forgotten. Without the landed probe (`status --no-landed`),
-a member not shown landed or merged stays an unmet finding: what is not shown to have
-landed is still needed. A member recorded under two spellings of the fork's own
-repository, by machines whose `origin` remotes differ, is one requirement.
+A member branch is satisfied once its current tip's work is in the upstream trunk: its row
+is landed, or its landed verdict is in the trunk (set by the probe, or by its merged
+upstream pull request when the trunk holds that merge and the tip holds nothing past what
+it merged); or, for a member this checkout knows only as `<branch>@origin` (another
+machine's, fetched), the same two tests on that copy: its merged upstream pull request
+with a landing the trunk holds and nothing past what it merged, or an empty replay onto
+the upstream trunk. A merge alone is not enough: a pull request merged into anything but
+the trunk, or a branch advanced past what merged, leaves work the upstream lacks. A
+review pull request is satisfied once its head, the member it carries, has landed
+upstream, judged at the head commit the forge reports for it, not at whatever a branch of
+that name points at here; a head commit this checkout lacks (the branch moved since the
+last fetch) is a problem until it is fetched, and for a merged review pull request the
+problem names the base that holds the member's work. The report names the head. Its own
+state is not the rule: a review pull request merges into a review base or into another
+member, which says nothing about the upstream, and while the member is in the fork's
+release only, dropping it from the release breaks the dependent. A review pull request is
+judged by its head only on the fork's own repository (as a remote here spells it, as the
+forge names it now, or by an older name the forge resolves to it, so a record from before
+a rename still counts) and when its head is a branch of that repository's owner and a
+member branch; any other is a problem that says why, never met. A member no copy here
+holds cannot be judged, and is a problem until it is fetched or the requirement is
+forgotten. Without the landed probe (`status --no-landed`), a member not shown landed
+stays an unmet finding: what is not shown to have landed is still needed. A member
+recorded under two spellings of the fork's own repository, by machines whose `origin`
+remotes differ, is one requirement. A dependent this checkout holds only as
+`<branch>@origin`, another machine's branch nobody here claims, has its requirements
+checked as one with a row.
 
 A requirement is taken back by a `depends` forget followed by the list without it, two
 entries stamped in that order and written newest first: a run cut short between them

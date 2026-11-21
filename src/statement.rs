@@ -244,6 +244,18 @@ impl Statements {
             })
     }
 
+    /// Every branch that requires something now.
+    pub fn dependents(&self) -> impl Iterator<Item = &str> {
+        self.live
+            .iter()
+            .filter(|(_, kinds)| {
+                kinds
+                    .get(&StatementKind::Depends)
+                    .is_some_and(|live| live.value.is_some())
+            })
+            .map(|(branch, _)| branch.as_str())
+    }
+
     /// The live statement of `kind` about `branch`: `Some(None)` for a live
     /// forget, `None` when none of that kind was ever made.
     pub fn stated(&self, branch: &str, kind: StatementKind) -> Option<Option<&str>> {
