@@ -713,7 +713,8 @@ fn a_hand_merge_on_the_previous_release_is_refused_outside_a_stacked_series() {
     let recorded = record(&lab, &home, "release/2026-08-05", &commit);
 
     // Then: it is refused, naming the previous release as never a member
-    // and the setting that reads a release made on it, and nothing is
+    // and saying that a release must be a flat octopus merge of the trunk
+    // and its member branches, with no setting named, and nothing is
     // written.
     let out = text(&recorded);
     assert_eq!(recorded.status.code(), Some(3), "{out}");
@@ -724,7 +725,15 @@ fn a_hand_merge_on_the_previous_release_is_refused_outside_a_stacked_series() {
         )),
         "{out}"
     );
-    assert!(out.contains("the default series has no table"), "{out}");
+    assert!(
+        out.contains(
+            "the series' previous release, which is never a member; a release must be a flat \
+             octopus merge of the trunk and its member branches: merge the members, not the \
+             previous release"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("stacked"), "{out}");
     assert_eq!(ledger_entries(&home), entries, "{out}");
     assert_eq!(bookmarks(&lab), refs, "{out}");
 }
@@ -1185,7 +1194,7 @@ fn a_chain_shaped_release_is_recorded_in_a_stacked_series() {
 }
 
 #[test]
-fn a_chain_shaped_release_outside_a_stacked_series_is_refused_naming_the_setting() {
+fn a_chain_shaped_release_is_refused_as_not_a_flat_octopus_merge() {
     // Given: the same chain in a series without the stacked key.
     let (lab, home) = previous_release_lab(false);
     members_on_previous(&lab);
@@ -1195,15 +1204,19 @@ fn a_chain_shaped_release_outside_a_stacked_series_is_refused_naming_the_setting
     // When: the chain is recorded.
     let recorded = record_in_series(&lab, &home, NEXT, NEXT);
 
-    // Then: it is refused, the series table and its setting named, and
+    // Then: it is refused, saying that a release must be a flat octopus
+    // merge of the trunk and its member branches, with no setting named, and
     // nothing is written.
     let out = text(&recorded);
     assert_eq!(recorded.status.code(), Some(3), "{out}");
-    assert!(out.contains("stacks on an earlier merge"), "{out}");
     assert!(
-        out.contains("set `stacked = true` on [repos.demo.series.\"old\"]"),
+        out.contains(
+            "a member above stacks on an earlier merge; a release must be a flat octopus merge \
+             of the trunk and its member branches: rebase each member above off the trunk"
+        ),
         "{out}"
     );
+    assert!(!out.contains("stacked = true"), "{out}");
     assert_eq!(ledger_entries(&home), entries, "{out}");
     assert_eq!(bookmarks(&lab), refs, "{out}");
 }

@@ -316,9 +316,6 @@ fn assert_refused_naming_adopt(output: &std::process::Output, name: &str) {
 enum Why {
     WriteAbsent,
     NoMatch,
-    /// Unchecked since a marked write the release in hand is, or stands on,
-    /// first marked because its matched write was absent.
-    SinceWriteAbsent,
     /// The ledger records no write of the name.
     NoRecord,
     /// Unchecked since a marked write the release in hand is, or stands on,
@@ -334,7 +331,6 @@ impl Why {
                 "its members match no recorded write, so they changed outside knives; knives did \
                  not fetch"
             }
-            Self::SinceWriteAbsent => "the release in hand is unchecked since the recorded edit",
             Self::NoRecord => {
                 "against its recorded writes: the ledger records no write of the name; knives \
                  did not fetch; a write over it is marked unchecked until `knives release \
@@ -346,7 +342,7 @@ impl Why {
 
     const fn mark(self) -> &'static str {
         match self {
-            Self::WriteAbsent | Self::SinceWriteAbsent => "W absent",
+            Self::WriteAbsent => "W absent",
             Self::NoMatch => "no match",
             Self::NoRecord | Self::SinceNoRecord => "no record",
         }
@@ -707,6 +703,138 @@ fn a_cut_over_a_name_with_no_recorded_write_is_marked_until_adopted() {
         NEXT,
         ["release/2026-08-06", "release/2026-08-07"],
     );
+}
+
+/// [`a_release_with_no_recorded_write`], then [`NEXT`] cut over it, which
+/// knives could not check, and `feat/delta`, which writes `shared.txt` too,
+/// included into that cut with `shared.txt` left conflicted: `NEXT`'s
+/// newest write is unchecked (`no record`), with no hand change on it, as
+/// F8 of the flat probe made its state. Returns the lab and its home.
+fn an_unchecked_write_left_conflicted() -> (Lab, tempfile::TempDir) {
+    let (lab, home) = a_release_with_no_recorded_write();
+    let out = release_ran(&lab, &home, &["cut", NEXT]);
+    assert_unchecked(&out, (DATED, NEXT), &home, Why::NoRecord);
+    lab.branch("feat/delta", "shared.txt", "delta\n");
+    step_off_onto_trunk(&lab);
+    let out = release_ran(&lab, &home, &["include", "feat/delta"]);
+    assert!(
+        out.contains("  1 conflicted file(s) left for a person:\n    shared.txt\n"),
+        "{out}"
+    );
+    assert_unchecked(&out, (NEXT, NEXT), &home, Why::SinceNoRecord);
+    (lab, home)
+}
+
+#[test]
+fn an_include_over_a_hand_resolution_of_an_unchecked_write_is_refused_until_adopted() {
+    // Given: an unchecked write left conflicted, its conflict then resolved
+    // by hand, and a branch to include.
+    let (lab, home) = an_unchecked_write_left_conflicted();
+    edit_by_hand(&lab, NEXT, &[("shared.txt", "merged\ndelta\n")]);
+    lab.branch("feat/epsilon", "epsilon.txt", "epsilon\n");
+    step_off_onto_trunk(&lab);
+    let resolved = commit_at(&lab, NEXT);
+    let (ledger, operations) = (ledger_entries(&home), operation_ids(&lab.work));
+
+    // When: the branch is included.
+    let output = release_in(&lab, &home, &lab.work, &["include", "feat/epsilon"]);
+
+    // Then: the resolution is a change no knives write or adopt recorded,
+    // though the write under it is unchecked: refused, naming adopt, and
+    // nothing is written.
+    assert_refused_naming_adopt(&output, NEXT);
+    assert_eq!(commit_at(&lab, NEXT), resolved);
+    assert_eq!(ledger_entries(&home), ledger);
+    assert_eq!(operation_ids(&lab.work), operations);
+
+    // When: the resolution is adopted, and the branch included again.
+    release_ran(
+        &lab,
+        &home,
+        &["adopt", NEXT, "--why", "hand resolution of shared.txt"],
+    );
+    let included = release_in(&lab, &home, &lab.work, &["include", "feat/epsilon"]);
+
+    // Then: it goes through, and the release keeps the resolution.
+    assert_eq!(included.status.code(), Some(0), "{}", text(&included));
+    assert_eq!(
+        file_at_revision(&lab, NEXT, "shared.txt"),
+        "merged\ndelta\n"
+    );
+}
+
+#[test]
+fn every_write_over_a_hand_resolution_of_an_unchecked_write_refuses() {
+    // Given: an unchecked write left conflicted, its conflict then resolved
+    // by hand, and work for each verb to do: a member to include, one to
+    // drop, one advanced, and an upstream that moved.
+    let (lab, home) = an_unchecked_write_left_conflicted();
+    edit_by_hand(&lab, NEXT, &[("shared.txt", "merged\ndelta\n")]);
+    let resolved = commit_at(&lab, NEXT);
+    lab.branch("feat/epsilon", "epsilon.txt", "epsilon\n");
+    extend_branch(&lab, "feat/alpha", "alpha.txt", "alpha, grown\n");
+    step_off_onto_trunk(&lab);
+    lab.advance_upstream("advance\n");
+    let (ledger, operations) = (ledger_entries(&home), operation_ids(&lab.work));
+
+    // When/Then: the cut and each edit verb refuse, naming adopt, and write
+    // nothing.
+    for args in [
+        vec!["cut", "release/2026-08-06"],
+        vec!["include", "feat/epsilon"],
+        vec!["drop", "feat/gamma", "--why", "a test"],
+        vec!["advance", "feat/alpha"],
+        vec!["rebase", "main@upstream"],
+    ] {
+        let output = knives_release(&lab, &home, &args);
+        assert_refused_naming_adopt(&output, NEXT);
+        assert_eq!(
+            commit_at(&lab, NEXT),
+            resolved,
+            "{args:?} moved the release"
+        );
+    }
+    assert_eq!(ledger_entries(&home), ledger);
+    assert_eq!(operation_ids(&lab.work), operations);
+}
+
+#[test]
+fn a_write_over_an_unresolved_conflict_of_an_unchecked_write_goes_ahead() {
+    // Given: an unchecked write left conflicted, with no hand change, and a
+    // branch to include.
+    let (lab, home) = an_unchecked_write_left_conflicted();
+    lab.branch("feat/epsilon", "epsilon.txt", "epsilon\n");
+    step_off_onto_trunk(&lab);
+
+    // When: the branch is included.
+    let out = release_ran(&lab, &home, &["include", "feat/epsilon"]);
+
+    // Then: it goes through, says the release in hand is unchecked since the
+    // recorded edit, and its event keeps that edit's mark.
+    assert!(
+        out.contains("the release in hand is unchecked since the recorded edit"),
+        "{out}"
+    );
+    assert_unchecked(&out, (NEXT, NEXT), &home, Why::SinceNoRecord);
+}
+
+#[test]
+fn a_marked_write_jj_rebased_over_a_member_reworded_in_place_is_not_refused() {
+    // Given: an unchecked write left conflicted, with no hand change; then
+    // gamma reworded in place, which makes jj rebase the release over it;
+    // and a branch to include.
+    let (lab, home) = an_unchecked_write_left_conflicted();
+    let written = commit_at(&lab, NEXT);
+    lab.jj_work(["describe", "-r", "feat/gamma", "-m", "gamma, reworded"]);
+    assert_ne!(commit_at(&lab, NEXT), written, "jj rebased the release");
+    lab.branch("feat/epsilon", "epsilon.txt", "epsilon\n");
+    step_off_onto_trunk(&lab);
+
+    // When: the branch is included.
+    let out = release_ran(&lab, &home, &["include", "feat/epsilon"]);
+
+    // Then: it goes through, unchecked with the write's mark, not refused.
+    assert_unchecked(&out, (NEXT, NEXT), &home, Why::SinceNoRecord);
 }
 
 #[test]
@@ -1818,23 +1946,37 @@ fn a_write_over_an_unchecked_write_stays_unchecked_until_adopt() {
 }
 
 #[test]
-fn a_hand_edit_over_an_unchecked_write_this_clone_holds_is_unchecked_not_refused() {
+fn a_hand_edit_over_an_unchecked_write_this_clone_holds_is_refused_until_adopted() {
     // Given: an unchecked write E in the second clone, then E edited by hand.
     let (lab, home, second) = an_unchecked_write_in_the_second_clone();
     edit_in(&lab, &second, DATED, &[("notes.txt", "by hand\n")]);
     branch_in(&lab, &second, "feat/delta");
+    let edited = commit_in(&second, DATED);
+    let (ledger, operations) = (ledger_entries(&home), operation_ids(&second));
 
     // When: an include runs over it.
+    let output = release_in(&lab, &home, &second, &["include", "feat/delta"]);
+
+    // Then: the edit on E is a change no knives write or adopt recorded,
+    // though E itself is unchecked: refused, naming adopt, and nothing is
+    // written.
+    assert_refused_naming_adopt(&output, DATED);
+    assert_eq!(commit_in(&second, DATED), edited);
+    assert_eq!(ledger_entries(&home), ledger);
+    assert_eq!(operation_ids(&second), operations);
+
+    // When: the edit, outside any conflict, is adopted with its reason, and
+    // the include runs again.
+    ok_in(
+        &lab,
+        &home,
+        &second,
+        &["adopt", DATED, "--why", "a note added by hand"],
+    );
     let out = ok_in(&lab, &home, &second, &["include", "feat/delta"]);
 
-    // Then: nothing measured E, so the edit on it is unchecked too, with E's
-    // mark, not refused.
-    assert_unchecked(&out, (DATED, DATED), &home, Why::SinceWriteAbsent);
-    assert!(
-        out.contains("the release in hand is unchecked since the recorded edit")
-            && out.contains("(W absent); knives did not fetch; `knives release adopt"),
-        "{out}"
-    );
+    // Then: it goes through, unchecked no more.
+    assert!(!out.contains("could not check"), "{out}");
 }
 
 /// The git repository behind jj checkout `dir`: its own `.git` when it is

@@ -2091,6 +2091,41 @@ fn preflight_names_an_unstacked_series_release_and_keeps_the_default_release_lin
 }
 
 #[test]
+fn status_names_an_unstacked_series_release_a_member_with_an_open_pull_request_is_built_on() {
+    // Given: a series `old` without `stacked`, whose first cut, pushed to
+    // origin, has `m5` built on it, and an open pull request from `m5`.
+    let (lab, home) = previous_release_lab(false);
+    let previous = commit_at(&lab, PREVIOUS);
+    let shim = tempfile::tempdir().expect("create forge shim directory");
+    let pulls = format!("[{}]", forge_shim::pull_record(7, "OPEN", "m5", None));
+    forge_shim::install_snapshot_gh(shim.path(), &pulls, &[]);
+
+    // When: status reads that fork, one line per finding.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "status", "demo", "--no-landed", "--verbose"])
+        .current_dir(lab.work_path())
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .env("XDG_CACHE_HOME", shim.path().join("cache"))
+        .env("PATH", forge_shim::path_with_gh_shim(shim.path()))
+        .output()
+        .expect("run status with a forge shim");
+
+    // Then: its stacked-history line for `m5` names that cut, local and on
+    // origin, and its commit, as preflight does, and does not send m5 to
+    // `knives sync`.
+    let out = text(&output);
+    let line = history_line(&out, "m5");
+    assert!(
+        line.ends_with(&format!(
+            "; releases in that history: {PREVIOUS}, {PREVIOUS}@origin ({})",
+            previous.short()
+        )),
+        "{out}"
+    );
+}
+
+#[test]
 fn status_names_the_stacked_release_a_member_with_an_open_pull_request_is_built_on() {
     // Given: a stacked series whose published first cut is the previous
     // release, with `m5` built on it, the next cut, which includes `m5`, and

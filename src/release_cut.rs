@@ -4184,6 +4184,53 @@ mod tests {
     }
 
     #[test]
+    fn a_fix_no_remote_holds_and_another_lacked_fix_name_the_other_remedies_before_allow_drop() {
+        // Given: the fix by hand of an adopt that this repository does not
+        // hold, whose files nothing here reads whole, where origin has no
+        // branch or tag at the adopt; and the fix by hand of another adopt at
+        // a file whose reference is the newest write.
+        let both = || vec![beyond_bound(release::Unmeasured::Absent), held_fix()];
+
+        // When: the gate refuses a record and a cut that lack both.
+        let none = no_remote();
+        let (record, cut) = (
+            fix_refusal(true, both(), &none),
+            fix_refusal(false, both(), &none),
+        );
+
+        // Then: the other fix keeps its remedies, the commit or the move and
+        // the adopt of the new content; `--allow-drop` follows them for the
+        // fix that no remote holds, and says why, naming origin; the line
+        // ends saying that `--allow-drop` is the last resort and what else
+        // it waives, the other fix among them.
+        let short = ids_prefix(ESCAPED);
+        let (ending, keep) = (
+            format!(
+                "re-run with --allow-drop to state the drop is intended: nothing in this \
+                 repository can hold a release against the fix by hand of release/{ESCAPED}'s \
+                 adopt {short}, as origin has no branch or tag at {short}"
+            ),
+            "to keep the new content of those files, edit release/2026-11-13 by hand to hold it \
+             and run `knives release adopt release/2026-11-13`",
+        );
+        assert_eq!(
+            record.last(),
+            Some(&format!(
+                "  nothing was recorded; record a commit that carries that fix; {keep}; then \
+                 {ending}{RECORD_LAST_RESORT}"
+            ))
+        );
+        assert_eq!(
+            cut.last(),
+            Some(&format!(
+                "  the candidate was discarded; fetch, then move release/2026-11-13 to bbbb, its \
+                 newest recorded write: `jj bookmark set release/2026-11-13 -r bbbb \
+                 --allow-backwards`; {keep}; then {ending}{CUT_LAST_RESORT}"
+            ))
+        );
+    }
+
+    #[test]
     fn a_refusal_over_a_fix_nothing_here_reads_whole_ends_with_allow_drop_as_the_last_resort() {
         // Given: the newest write, `release/2026-11-13`'s cut `bbbb`, which
         // records the member `feat/alpha@abab`; the previous cut,
