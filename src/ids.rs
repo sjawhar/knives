@@ -573,15 +573,25 @@ impl Requirement {
         })
     }
 
-    /// The `knives depends --forget` text that takes this requirement back
-    /// whatever repository spelling its records carry: a member's branch
-    /// name, which every record of the member answers to, unless it holds a
-    /// `#` and so also reads as a pull request (`maintainer/demo#7` is a
-    /// legal branch name); else the token as it is written.
-    pub fn forget_token(&self) -> String {
+    /// The repository a review pull request or member record spells.
+    pub fn repository(&self) -> Option<&str> {
         match self {
-            Self::ForkBranch { branch, .. } if !branch.as_str().contains('#') => branch.to_string(),
-            _ => self.to_string(),
+            Self::ForkPull { repository, .. } | Self::ForkBranch { repository, .. } => {
+                Some(repository)
+            }
+            Self::Upstream { .. } => None,
+        }
+    }
+
+    /// Whether this and `other` are records of one review pull request
+    /// number, or of one member branch, whatever repository each spells.
+    pub fn same_number_or_member(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::ForkPull { number: one, .. }, Self::ForkPull { number: two, .. }) => one == two,
+            (Self::ForkBranch { branch: one, .. }, Self::ForkBranch { branch: two, .. }) => {
+                one == two
+            }
+            _ => false,
         }
     }
 }

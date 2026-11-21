@@ -2438,6 +2438,8 @@ const SIBLING_M: &str = "origin:acme/sibling:feat/base";
 const GONE13: &str = "origin:gone/demo#13";
 const OTHER13: &str = "origin:acme/other#13";
 const U7: &str = "maintainer/demo#7";
+const SIB12: &str = "origin:acme/sibling#12";
+const OTHER_M: &str = "origin:acme/other:feat/base";
 
 /// One row of the `--forget` table: feat/alpha holds `held` in `config`,
 /// and `depends feat/alpha --forget <text>…` runs with the forge `now`.
@@ -2457,7 +2459,7 @@ struct ForgetRow {
 fn refusal_says(row: &str) -> &'static str {
     match row {
         "F4" | "F7" => "demo#12 answers to maintainer/demo#12, origin:acme/demo#12; name the one",
-        "F5" | "F6" => "If it does, it names two requirements.",
+        "F5" | "F6" | "F47" => "If it does, it names two requirements.",
         "F29" => "which is sibling's own repository, not demo's",
         "F34" => "does not require origin:acme/demo#99",
         "F43" => "does not require feat/base",
@@ -2473,6 +2475,9 @@ fn recovered(row: &str) -> Vec<Vec<&'static str>> {
     match row {
         "F5" | "F6" => vec![vec![F12], vec![U12]],
         "F41" => vec![vec![U7]],
+        "F45" => vec![vec!["origin:acme/demo#14"]],
+        "F46" => vec![vec![SIBLING_M]],
+        "F47" => vec![vec![F12, SIB12], vec![U12, SIB12]],
         _ => vec![Vec::new()],
     }
 }
@@ -2829,14 +2834,17 @@ fn forgetting_a_review_pull_request_under_two_names_follows_the_table() {
 fn forgetting_a_member_branch_follows_the_table() {
     let both: &[&str] = &[M_OLD, M];
     let failed = forget_rows(&[
+        // With the forge down, nothing tells whether the former name's
+        // record is this fork's member: a bare name or the own token takes
+        // nothing, and prints both records' tokens (N71).
         ForgetRow {
             row: "F21",
             config: CONFIG_B,
             held: both,
             now: ForgeNow::Down,
             texts: &["feat/base"],
-            exit: 0,
-            left: &[],
+            exit: 3,
+            left: both,
         },
         ForgetRow {
             row: "F22",
@@ -2844,8 +2852,8 @@ fn forgetting_a_member_branch_follows_the_table() {
             held: both,
             now: ForgeNow::Down,
             texts: &[M],
-            exit: 0,
-            left: &[],
+            exit: 3,
+            left: both,
         },
         ForgetRow {
             row: "F23",
@@ -3080,8 +3088,270 @@ fn forgetting_beside_other_requirements_follows_the_table() {
             exit: 0,
             left: &["origin:acme/demo:maintainer/demo#12"],
         },
+        // N75: a review pull request of another number stays, whatever the
+        // printed command takes.
+        ForgetRow {
+            row: "F45",
+            config: CONFIG_B,
+            held: &[F13_OLD, F13, "origin:acme/demo#14"],
+            now: ForgeNow::Down,
+            texts: &[F13],
+            exit: 3,
+            left: &[F13_OLD, F13, "origin:acme/demo#14"],
+        },
+        // N69: another fork's branch of the member's name is no record of
+        // it: the printed command leaves it.
+        ForgetRow {
+            row: "F46",
+            config: CONFIG_X,
+            held: &[M, SIBLING_M],
+            now: ForgeNow::Up,
+            texts: &["origin:gone/demo:feat/base"],
+            exit: 3,
+            left: &[M, SIBLING_M],
+        },
+        // N70: each choice takes one requirement, every record of it; a
+        // review pull request on another fork's repository is neither.
+        ForgetRow {
+            row: "F47",
+            config: CONFIG_A,
+            held: &[U12, F12, SIB12],
+            now: ForgeNow::Down,
+            texts: &["demo#12"],
+            exit: 3,
+            left: &[U12, F12, SIB12],
+        },
+        // N71: a member record on a live repository that is neither a
+        // spelling here nor a registry fork's is no record of this fork's
+        // member when the forge names it apart, and may be one when it
+        // cannot be asked.
+        ForgetRow {
+            row: "F48",
+            config: CONFIG_X,
+            held: &[OTHER_M, M],
+            now: ForgeNow::Up,
+            texts: &["feat/base"],
+            exit: 0,
+            left: &[OTHER_M],
+        },
+        ForgetRow {
+            row: "F49",
+            config: CONFIG_X,
+            held: &[OTHER_M, M],
+            now: ForgeNow::Down,
+            texts: &["feat/base"],
+            exit: 3,
+            left: &[OTHER_M, M],
+        },
+        // Sol's R10-N1 and N73: a text spelled exactly as a held upstream
+        // record names it alone, beside a member branch named so, whether or
+        // not the registry knows its repository.
+        ForgetRow {
+            row: "F50",
+            config: CONFIG_X,
+            held: &["nobody/else#13", "origin:acme/demo:nobody/else#13"],
+            now: ForgeNow::Down,
+            texts: &["nobody/else#13"],
+            exit: 0,
+            left: &["origin:acme/demo:nobody/else#13"],
+        },
     ]);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+fn naming_a_member_beside_a_record_on_another_repository_records_this_forks_member() {
+    // Given: feat/alpha holds a member record on acme/other, a live
+    // repository that is not this fork's and no registry fork's.
+    let fixture = fixture();
+    fixture.hold("feat/alpha", &["origin:acme/other:feat/landed"]);
+
+    // When: this fork's feat/landed is named.
+    let output = fixture.depends(&["--on", "feat/landed"]);
+
+    // Then: it is recorded beside the other record (Sol's R10-N2).
+    let mut held = fixture.required("feat/alpha");
+    held.sort();
+    assert_eq!(
+        held,
+        [
+            "origin:acme/demo:feat/landed",
+            "origin:acme/other:feat/landed"
+        ],
+        "{output}"
+    );
+}
+
+#[test]
+fn a_review_pull_request_of_a_fork_of_this_fork_is_this_forks_review_pull_request() {
+    // Given: the registry holds a fork of this fork, whose upstream is this
+    // fork's own repository.
+    let fixture = fixture();
+    let registry = fixture.home.path().join("repos.toml");
+    let text = std::fs::read_to_string(&registry).expect("read the registry");
+    std::fs::write(
+        &registry,
+        format!(
+            "{text}[repos.child]\nupstream = \"{ORIGIN}\"\n\
+             origin = \"https://forge.invalid/acme/child\"\n"
+        ),
+    )
+    .expect("rewrite the registry");
+
+    // When: #13 is named by this fork's own repository.
+    let output = fixture.depends(&["--on", "acme/demo#13"]);
+
+    // Then: it is this fork's review pull request #13 (N74).
+    assert_eq!(
+        fixture.required("feat/alpha"),
+        ["origin:acme/demo#13"],
+        "{output}"
+    );
+}
+
+#[test]
+fn a_deleted_dependents_command_takes_no_review_pull_request_of_another_number() {
+    // Given: feat/ghost, never a branch here, requires the fork's #14, whose
+    // head landed, and #13 under the former name, which the forge cannot
+    // look up.
+    let fixture = fixture();
+    fixture.hold(
+        "feat/ghost",
+        &["origin:acme/demo#14", "origin:acme-old/demo#13"],
+    );
+    fixture.forge_now(ForgeNow::FormerNameFails);
+
+    // When: status reports the fork.
+    let (_, report) = status(&fixture);
+
+    // Then: the command names #13 alone (N75), and takes it back.
+    let problem = problems(&report)
+        .into_iter()
+        .find(|problem| problem.starts_with("cannot tell whether feat/ghost still needs "))
+        .unwrap_or_else(|| panic!("no problem of feat/ghost: {report}"));
+    assert!(
+        problem.ends_with("`knives depends feat/ghost --forget origin:acme-old/demo#13`"),
+        "{problem}"
+    );
+    assert!(!problem.contains("too,"), "{problem}");
+    let _ = fixture.depends_of("feat/ghost", &["--forget", "origin:acme-old/demo#13"]);
+    assert_eq!(fixture.required("feat/ghost"), ["origin:acme/demo#14"]);
+}
+
+#[test]
+fn a_deleted_dependents_command_leaves_a_met_review_pull_request_of_its_number() {
+    // Given: feat/ghost, never a branch here, requires the fork's #14, whose
+    // head landed, and #14 on another fork's repository and on a live
+    // repository that is no fork's.
+    let fixture = fixture();
+    fixture.hold(
+        "feat/ghost",
+        &[
+            "origin:acme/demo#14",
+            "origin:acme/other#14",
+            "origin:acme/sibling#14",
+        ],
+    );
+
+    // When: status reports the fork.
+    let (_, report) = status(&fixture);
+
+    // Then: the command names the two records on other repositories alone
+    // (N68), and takes back those two.
+    let problem = problems(&report)
+        .into_iter()
+        .find(|problem| problem.starts_with("cannot tell whether feat/ghost still needs "))
+        .unwrap_or_else(|| panic!("no problem of feat/ghost: {report}"));
+    assert!(
+        problem.ends_with(
+            "`knives depends feat/ghost --forget origin:acme/other#14 --forget \
+             origin:acme/sibling#14`"
+        ),
+        "{problem}"
+    );
+    let _ = fixture.depends_of(
+        "feat/ghost",
+        &[
+            "--forget",
+            "origin:acme/other#14",
+            "--forget",
+            "origin:acme/sibling#14",
+        ],
+    );
+    assert_eq!(fixture.required("feat/ghost"), ["origin:acme/demo#14"]);
+}
+
+#[test]
+fn a_deleted_dependents_command_for_an_unplaced_member_runs_in_one_step() {
+    // Given: feat/ghost, never a branch here, requires this fork's
+    // feat/landed, which has landed, and feat/landed on a repository the
+    // forge cannot be asked about; the forge is down.
+    let fixture = fixture();
+    let unplaced = "origin:gone/demo:feat/landed";
+    fixture.hold("feat/ghost", &["origin:acme/demo:feat/landed", unplaced]);
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+
+    // When: status reports the fork.
+    let (_, report) = status(&fixture);
+
+    // Then: the problem names the unplaced record; its command names both
+    // records, says it takes the landed one too, and takes both back with
+    // the forge still down (Sol's R10-N3, N72).
+    let problem = problems(&report)
+        .into_iter()
+        .find(|problem| problem.starts_with("cannot tell whether feat/ghost still needs "))
+        .unwrap_or_else(|| panic!("no problem of feat/ghost: {report}"));
+    assert!(
+        problem.starts_with(&format!(
+            "cannot tell whether feat/ghost still needs {unplaced}: "
+        )),
+        "{problem}"
+    );
+    assert!(
+        problem.contains(
+            "the command takes back origin:acme/demo:feat/landed too, which may be the same \
+             requirement under another name of its repository"
+        ),
+        "{problem}"
+    );
+    let command = format!(
+        "`knives depends feat/ghost --forget origin:acme/demo:feat/landed --forget {unplaced}`"
+    );
+    assert!(problem.ends_with(&command), "{problem}");
+    let output = fixture.knives(&[
+        "--text",
+        "depends",
+        "feat/ghost",
+        "--forget",
+        "origin:acme/demo:feat/landed",
+        "--forget",
+        unplaced,
+    ]);
+    assert!(output.status.success(), "{}", said(&output));
+    assert_eq!(fixture.required("feat/ghost"), Vec::<String>::new());
+}
+
+#[test]
+fn without_the_forge_a_member_record_on_another_repository_cannot_be_judged() {
+    // Given: feat/alpha requires feat/landed recorded under a repository no
+    // spelling here gives.
+    let fixture = fixture();
+    fixture.hold("feat/alpha", &["origin:gone/demo:feat/landed"]);
+
+    // When: status runs without the forge.
+    let output = fixture.knives(&["--json", "status", "demo", "--no-github"]);
+    let report: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("status JSON ({error}): {}", said(&output)));
+
+    // Then: it is not read as this fork's landed member (N75).
+    assert!(
+        problems(&report).contains(
+            &"cannot check whether feat/alpha still needs origin:gone/demo:feat/landed: whether \
+              gone/demo is demo's own repository could not be asked: no forge consulted"
+                .to_owned()
+        ),
+        "{report}"
+    );
 }
 
 #[test]
@@ -3345,22 +3615,29 @@ fn a_deleted_dependents_command_takes_back_its_open_member_by_any_name() {
     // When: status reports the fork.
     let (code, report) = status(&fixture);
 
-    // Then: one problem, of the open member alone, whose command names it
-    // by its branch, which takes back every spelling.
+    // Then: one problem, of the open member alone, whose command names each
+    // record of it as spelled: the former name's record, which the forge
+    // placed, too, and the problem says so.
     let problem = problems(&report)
         .into_iter()
         .find(|problem| problem.starts_with("cannot tell whether feat/done still needs "))
         .unwrap_or_else(|| panic!("no problem of feat/done: {report}"));
     assert!(!problem.contains("feat/landed"), "{problem}");
     assert!(
-        problem.ends_with("`knives depends feat/done --forget feat/base`"),
+        problem.contains(&format!("the command takes back {M_OLD} too")),
+        "{problem}"
+    );
+    assert!(
+        problem.ends_with(&format!(
+            "`knives depends feat/done --forget {M_OLD} --forget {M}`"
+        )),
         "{problem}"
     );
     assert_eq!(code, Some(3), "{report}");
 
     // And: that command, run while the forge is down, clears the problem.
     install_failing_gh(fixture.shim.path(), &fixture.log);
-    let _ = fixture.depends_of("feat/done", &["--forget", "feat/base"]);
+    let _ = fixture.depends_of("feat/done", &["--forget", M_OLD, "--forget", M]);
     fixture.forge_now(ForgeNow::Up);
     let (code, report) = status(&fixture);
     assert!(
@@ -3420,9 +3697,10 @@ impl Holder {
 /// repository that is not this fork's own; a branch of another fork's own
 /// repository named as a landed member of this one; an upstream pull
 /// request of a fork the registry does not keep; a landed member's name on
-/// a repository the forge does not resolve; and on a former name nothing
-/// here spells, which the forge resolves to the fork's own repository.
-const KINDS: [(&str, &str); 15] = [
+/// a repository the forge does not resolve, on a live repository that is
+/// not this fork's and no registry fork's, and on a former name nothing here
+/// spells, which the forge resolves to the fork's own repository.
+const KINDS: [(&str, &str); 16] = [
     ("um", "maintainer/demo#<merged>"),
     ("uo", "maintainer/demo#<open>"),
     ("fl", "origin:acme/demo#14"),
@@ -3438,6 +3716,7 @@ const KINDS: [(&str, &str); 15] = [
     ("nr", "nobody/else#3"),
     ("ym", "origin:gone/demo:feat/landed"),
     ("zm", "origin:acme-older/demo:feat/landed"),
+    ("om", "origin:acme/other:feat/landed"),
 ];
 
 /// `requirement`, a [`KINDS`] entry, with a holder's own `numbers`.
