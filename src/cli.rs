@@ -400,8 +400,10 @@ pub enum Command {
     /// repository, `origin:<owner>/<name>:<branch>` a member branch of this fork.
     ///
     /// `--forget` takes a requirement back; with `--on` it corrects one. The
-    /// removal is a ledger entry, so every machine that shares the ledger
-    /// reads the same list.
+    /// removal is a ledger entry, so every machine running this knives that
+    /// shares the ledger reads the same list. A knives from before fork
+    /// requirements cannot read a list holding a member branch, and reads a
+    /// forget whose list holds one as requiring nothing.
     Depends {
         branch: String,
         /// What it needs, repeatable. `<repo>#<number>`, `<repo>` the registry

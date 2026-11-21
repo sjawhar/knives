@@ -38,9 +38,11 @@ const ORIGIN: &str = "https://forge.invalid/acme/demo";
 /// name, as GitHub does for a transferred repository.
 const REGISTRY_ORIGIN: &str = "https://forge.invalid/acme-old/demo";
 
-/// A fork with a dependent branch, `feat/alpha`, and a member branch,
-/// `feat/base`; its config home; and a forge on which the upstream has pull
-/// requests #7 and #12 and the fork's own repository has #12 and #13.
+/// A fork with a dependent branch, `feat/alpha`, and member branches
+/// `feat/base` and `feat/landed` (whose content upstream's trunk has); its
+/// config home; and a forge on which the upstream has pull requests #7 and
+/// #12 and the fork's own repository has #12 (head `feat/alpha`), #13 (head
+/// `feat/base`) and #14 (head `feat/landed`).
 struct Fixture {
     lab: Lab,
     home: tempfile::TempDir,
@@ -49,13 +51,18 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_with_origin(ORIGIN)
+}
+
+/// [`fixture`] with the checkout's `origin` remote spelled `origin`.
+fn fixture_with_origin(origin: &str) -> Fixture {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/base", "base.txt", "base\n");
     lab.branch("feat/landed", "landed.txt", "landed\n");
     lab.upstream_trunk_file("landed.txt", "landed\n");
     lab.upstream_at_forge_url(UPSTREAM);
-    lab.origin_at_forge_url(ORIGIN);
+    lab.origin_at_forge_url(origin);
     let home = tempfile::tempdir().expect("config home");
     std::fs::write(
         home.path().join("repos.toml"),
@@ -70,9 +77,10 @@ fn fixture() -> Fixture {
         pull_record(12, "OPEN", "upstream-twelve", None)
     );
     let fork_pulls = format!(
-        "[{},{}]",
+        "[{},{},{}]",
         pull_record(12, "OPEN", "feat/alpha", None),
-        pull_record(13, "OPEN", "feat/base", None)
+        pull_record(13, "OPEN", "feat/base", None),
+        pull_record(14, "OPEN", "feat/landed", None)
     );
     install_repository_gh(
         shim.path(),
@@ -117,9 +125,28 @@ impl Fixture {
     /// `knives --text depends feat/alpha <args>`, which must succeed; its
     /// stdout.
     fn depends(&self, args: &[&str]) -> String {
-        let output = self.knives(&[&["--text", "depends", "feat/alpha"], args].concat());
+        self.depends_of("feat/alpha", args)
+    }
+
+    /// `knives --text depends <branch> <args>`, which must succeed; its
+    /// stdout.
+    fn depends_of(&self, branch: &str, args: &[&str]) -> String {
+        let output = self.knives(&[&["--text", "depends", branch], args].concat());
         assert!(output.status.success(), "{}", said(&output));
         String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// `knives --text depends <branch> <args>`, which must be refused (exit
+    /// 2) with a message holding each of `reasons`; nothing is written.
+    fn refused(&self, branch: &str, args: &[&str], reasons: &[&str]) {
+        let before = self.entries().len();
+        let output = self.knives(&[&["--text", "depends", branch], args].concat());
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {}", said(&output));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for reason in reasons {
+            assert!(stderr.contains(reason), "{args:?}: {stderr}");
+        }
+        assert_eq!(self.entries().len(), before, "{args:?} wrote an entry");
     }
 
     fn entries(&self) -> Vec<Entry> {
@@ -269,6 +296,84 @@ fn a_branch_the_fork_does_not_have_or_the_dependent_itself_is_refused() {
 }
 
 #[test]
+fn a_base_a_release_or_a_fetched_pull_head_is_no_member_branch() {
+    // Given: the trunk, a dated release and a fetched pull request head, each
+    // a bookmark here, none a branch `status` gives a row.
+    let fixture = fixture();
+    for name in ["release/2026-11-01", "pr-7"] {
+        fixture
+            .lab
+            .jj_work(["bookmark", "create", name, "-r", "main@origin"]);
+    }
+
+    // When / Then: each is refused as a member branch, saying what it is.
+    fixture.refused("feat/alpha", &["--on", "main"], &["main is a base"]);
+    fixture.refused(
+        "feat/alpha",
+        &["--on", "release/2026-11-01"],
+        &["release/2026-11-01 is a release of demo"],
+    );
+    fixture.refused(
+        "feat/alpha",
+        &["--on", "pr-7"],
+        &["pr-7 is a fetched pull request head"],
+    );
+}
+
+#[test]
+fn a_branchs_own_review_pull_request_is_refused() {
+    // Given: the fork's #12, whose head is feat/alpha.
+    let fixture = fixture();
+
+    // When / Then: feat/alpha cannot require its own review pull request,
+    // however it is named; another branch can.
+    for on in ["acme/demo#12", "origin:acme/demo#12"] {
+        fixture.refused(
+            "feat/alpha",
+            &["--on", on],
+            &["acme/demo#12 is feat/alpha's own review pull request"],
+        );
+    }
+    let stdout = fixture.depends_of("feat/base", &["--on", "acme/demo#12"]);
+    assert_eq!(
+        stdout.trim_end(),
+        "demo/feat/base now requires origin:acme/demo#12"
+    );
+}
+
+#[test]
+fn a_renamed_fork_repository_is_named_by_any_spelling_and_forgotten_by_any() {
+    // Given: a fork whose checkout and registry both still spell its own
+    // repository `acme-old/demo`, which the forge calls `acme/demo` now.
+    let fixture = fixture_with_origin(REGISTRY_ORIGIN);
+
+    // When / Then: an ambiguous number suggests the spelling `--on` takes,
+    // and that spelling and the record's own each record the fork's pull
+    // request under the forge's name.
+    fixture.refused(
+        "feat/alpha",
+        &["--on", "demo#12"],
+        &["`--on maintainer/demo#12`", "`--on acme-old/demo#12`"],
+    );
+    let named = fixture.depends_of("feat/base", &["--on", "acme-old/demo#12"]);
+    assert_eq!(
+        named.trim_end(),
+        "demo/feat/base now requires origin:acme/demo#12"
+    );
+    let recorded = fixture.depends(&["--on", "origin:acme/demo#13"]);
+    assert_eq!(
+        recorded.trim_end(),
+        "demo/feat/alpha now requires origin:acme/demo#13"
+    );
+
+    // And: each is forgotten by the registry name or the old spelling.
+    fixture.depends_of("feat/base", &["--forget", "demo#12"]);
+    fixture.depends(&["--forget", "acme-old/demo#13"]);
+    assert_eq!(fixture.required("feat/base"), Vec::<String>::new());
+    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
+}
+
+#[test]
 fn a_wrong_requirement_is_taken_back_by_an_entry_of_its_own() {
     // Given: a branch recorded as needing the upstream's #12 (the record the
     // defect wrote) and the member branch feat/base.
@@ -281,8 +386,10 @@ fn a_wrong_requirement_is_taken_back_by_an_entry_of_its_own() {
     let stdout = fixture.depends(&["--forget", "demo#12"]);
 
     // Then: only the right one is left, and the removal is in the ledger as
-    // a forget of the list and the list restated without it: what every
-    // machine's knives, this one's and an older one's alike, folds the same.
+    // a forget of the list and the list restated without it, which every
+    // machine running this knives folds the same. (A knives from before fork
+    // requirements cannot read a list that holds a member branch, and reads
+    // this one as requiring nothing.)
     assert_eq!(
         stdout.trim_end(),
         "demo/feat/alpha no longer requires maintainer/demo#12; it requires \
@@ -316,17 +423,20 @@ fn a_wrong_requirement_is_corrected_in_one_command() {
     // Given: a branch recorded as needing the upstream's #12, where the fork's
     // review pull request #12 was meant.
     let fixture = fixture();
-    fixture.depends(&["--on", "maintainer/demo#12"]);
+    fixture.depends_of("feat/base", &["--on", "maintainer/demo#12"]);
 
     // When: the record is corrected.
-    let stdout = fixture.depends(&["--forget", "maintainer/demo#12", "--on", "acme/demo#12"]);
+    let stdout = fixture.depends_of(
+        "feat/base",
+        &["--forget", "maintainer/demo#12", "--on", "acme/demo#12"],
+    );
 
     // Then: the branch requires the fork's #12 alone.
     assert_eq!(
         stdout.trim_end(),
-        "demo/feat/alpha no longer requires maintainer/demo#12; it requires origin:acme/demo#12"
+        "demo/feat/base no longer requires maintainer/demo#12; it requires origin:acme/demo#12"
     );
-    assert_eq!(fixture.required("feat/alpha"), ["origin:acme/demo#12"]);
+    assert_eq!(fixture.required("feat/base"), ["origin:acme/demo#12"]);
 }
 
 #[test]
@@ -370,18 +480,18 @@ fn forgetting_what_the_branch_does_not_require_is_refused() {
 fn forgetting_a_number_two_requirements_answer_to_is_refused_naming_both() {
     // Given: a branch that requires both the upstream's #12 and the fork's.
     let fixture = fixture();
-    fixture.depends(&["--on", "maintainer/demo#12", "--on", "acme/demo#12"]);
-    let before = fixture.entries().len();
+    fixture.depends_of(
+        "feat/base",
+        &["--on", "maintainer/demo#12", "--on", "acme/demo#12"],
+    );
 
-    // When: demo#12 is forgotten.
-    let output = fixture.knives(&["--text", "depends", "feat/alpha", "--forget", "demo#12"]);
-
-    // Then: refused, naming both; nothing is written.
-    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("maintainer/demo#12"), "{stderr}");
-    assert!(stderr.contains("origin:acme/demo#12"), "{stderr}");
-    assert_eq!(fixture.entries().len(), before);
+    // When / Then: forgetting demo#12 is refused, naming both; nothing is
+    // written.
+    fixture.refused(
+        "feat/base",
+        &["--forget", "demo#12"],
+        &["maintainer/demo#12", "origin:acme/demo#12"],
+    );
 }
 
 #[test]
@@ -441,11 +551,12 @@ fn track_states_a_number_the_upstream_has() {
     );
 }
 
-/// The details of a status report's findings of `kind`.
+/// The details of a status report's findings of `kind`; a report with no
+/// findings leaves the field out.
 fn details(report: &Value, kind: &str) -> Vec<String> {
     report["findings"]
         .as_array()
-        .expect("findings")
+        .map_or(&[][..], Vec::as_slice)
         .iter()
         .filter(|group| group["kind"] == kind)
         .flat_map(|group| group["items"].as_array().expect("items").iter())
@@ -453,31 +564,52 @@ fn details(report: &Value, kind: &str) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn status_checks_a_fork_requirement_on_the_fork_and_names_the_branch_it_waits_for() {
-    // Given: feat/alpha requires the fork's review pull request #13, whose
-    // head is feat/base; feat/base requires the member branch feat/landed,
-    // whose content upstream's trunk already has; and feat/landed requires
-    // the member branch feat/base, which has not landed.
-    let fixture = fixture();
-    fixture.depends(&["--on", "acme/demo#13"]);
-    for (branch, on) in [("feat/base", "feat/landed"), ("feat/landed", "feat/base")] {
-        let output = fixture.knives(&["--text", "depends", branch, "--on", on]);
-        assert!(output.status.success(), "{}", said(&output));
-    }
-
-    // When: status reports the fork.
+/// `knives --json status demo`: its exit code and report.
+fn status(fixture: &Fixture) -> (Option<i32>, Value) {
     let output = fixture.knives(&["--json", "status", "demo"]);
     let report: Value = serde_json::from_slice(&output.stdout)
         .unwrap_or_else(|error| panic!("status JSON ({error}): {}", said(&output)));
+    (output.status.code(), report)
+}
 
-    // Then: the review pull request was asked of the fork's repository and
-    // is open, the head it waits for named; the landed branch is met; the
-    // branch that has not landed is not.
+/// The problems of a status report; a report with none leaves the field out.
+fn problems(report: &Value) -> Vec<String> {
+    report["problems"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .map(|problem| problem.as_str().expect("problem text").to_owned())
+        .collect()
+}
+
+#[test]
+fn status_judges_a_fork_requirement_by_the_member_it_waits_for() {
+    // Given: feat/alpha requires the fork's review pull request #13, whose
+    // head feat/base has not landed; feat/base requires the member branch
+    // feat/landed, whose content upstream's trunk already has, and the
+    // fork's #14, whose head is feat/landed; and feat/landed requires the
+    // member branch feat/base.
+    let fixture = fixture();
+    fixture.depends(&["--on", "acme/demo#13"]);
+    fixture.depends_of(
+        "feat/base",
+        &["--on", "feat/landed", "--on", "acme/demo#14"],
+    );
+    fixture.depends_of("feat/landed", &["--on", "feat/base"]);
+
+    // When: status reports the fork.
+    let (code, report) = status(&fixture);
+
+    // Then: each review pull request was asked of the fork's repository and
+    // is judged by its head: #13's has not landed, #14's has. The landed
+    // member is met; the one that has not landed is not. Nothing is left
+    // unanswered, so the report exits 1 for its findings.
     let unmet = details(&report, "unmet-dependency");
     assert!(
         unmet.contains(
-            &"feat/alpha requires origin:acme/demo#13 (head feat/base), which is open".to_owned()
+            &"feat/alpha requires origin:acme/demo#13 (head feat/base, open), which has not \
+              landed (no-pr)"
+                .to_owned()
         ),
         "{unmet:?}\n{report}"
     );
@@ -493,17 +625,54 @@ fn status_checks_a_fork_requirement_on_the_fork_and_names_the_branch_it_waits_fo
         )),
         "{unmet:?}"
     );
-    // A report with no problems leaves the field out.
-    let problems = report["problems"].as_array().map_or(&[][..], Vec::as_slice);
+    let problems = problems(&report);
     assert!(
-        !problems.iter().any(|problem| problem
-            .as_str()
-            .is_some_and(|text| text.contains("requires"))),
+        !problems
+            .iter()
+            .any(|problem| problem.contains("needs") || problem.contains("requires")),
         "{problems:?}\n{report}"
     );
+    assert_eq!(code, Some(1), "{report}");
     assert!(
         fixture.forge_calls().contains("owner=acme"),
         "{}",
         fixture.forge_calls()
     );
+}
+
+#[test]
+fn status_judges_a_member_this_checkout_knows_only_on_origin() {
+    // Given: two members another clone pushed to origin, which this checkout
+    // has fetched and holds no bookmark of: remote-landed, whose content
+    // upstream's trunk has, and remote-open, whose content it has not; and
+    // feat/alpha requires both.
+    let fixture = fixture();
+    fixture
+        .lab
+        .foreign_origin_branch("main@origin", "remote-open", "open\n");
+    fixture
+        .lab
+        .foreign_origin_branch("main@origin", "remote-landed", "landed\n");
+    fixture
+        .lab
+        .upstream_trunk_file("remote-landed.txt", "landed\n");
+    fixture.lab.jj_work(["git", "fetch", "--remote", "origin"]);
+    fixture.depends(&["--on", "remote-open", "--on", "remote-landed"]);
+
+    // When: status reports the fork.
+    let (code, report) = status(&fixture);
+
+    // Then: each is judged from its origin copy: the landed one is met, the
+    // other is unmet; nothing is left unanswered.
+    let unmet = details(&report, "unmet-dependency");
+    assert_eq!(
+        unmet,
+        [
+            "feat/alpha requires origin:acme/demo:remote-open, which has not landed \
+          (remote-open@origin not-in-trunk)"
+        ],
+        "{report}"
+    );
+    assert_eq!(problems(&report), Vec::<String>::new(), "{report}");
+    assert_eq!(code, Some(1), "{report}");
 }

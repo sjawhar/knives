@@ -427,7 +427,8 @@ so a number only the fork's repository has is refused, naming that review PR.
 A branch can require a pull request in another managed repo. Dropping the required one
 from a release without dropping the branch that needs it ships a release that cannot
 work, which is exactly what happened when one repo's #4545 was dropped while a sibling's
-#49 still needed it. Satisfied means merged; an open PR may still change or be rejected.
+#49 still needed it. An upstream pull request is satisfied when it has merged; an open PR
+may still change or be rejected.
 
 A requirement says what it names, because a fork and its upstream number their pull
 requests apart: `<upstream>#<n>` is a pull request on the fork's upstream,
@@ -435,13 +436,30 @@ requests apart: `<upstream>#<n>` is a pull request on the fork's upstream,
 `origin:<owner>/<name>:<branch>` a member branch of the fork. `knives depends --on
 <repo>#<n>`, the registry name, used to mean the upstream's pull request, and recorded an
 unrelated one where the fork's review pull request was meant; it now asks the forge which
-repository has #n, and refuses when both do, naming both. A review pull request is checked
-on the fork's repository, and the report names its head, the member the dependent waits
-for. A member branch is satisfied once it has landed upstream.
+repository has #n, and refuses when both do, naming both. A branch's own review pull
+request, a base, a release and a fetched `pr-<n>` head are refused: none is a member
+another branch can wait for.
+
+A member branch is satisfied once it has landed upstream: its row is landed or merged, or,
+for a member this checkout knows only as `<branch>@origin` (another machine's, fetched),
+that copy replays empty onto the upstream trunk. A review pull request is satisfied once
+its head, the member it carries, has landed upstream, judged the same way; the report
+names the head. Its own state is not the rule: a review pull request merges into a review
+base or into another member, which says nothing about the upstream, and while the member
+is in the fork's release only, dropping it from the release breaks the dependent. A
+member no copy here holds cannot be judged, and is a problem until it is fetched or the
+requirement is forgotten.
 
 A requirement is taken back by a `depends` forget followed by the list without it, two
 entries stamped in that order and written newest first: a run cut short between them
-leaves the list as it was, never empty. Every machine folds the two into the same list.
+leaves the list as it was, never empty. Every machine running this knives folds the two
+into the same list. A knives from before fork requirements reads the same list only while
+it holds no member branch: it cannot read a list that holds one, so the forget is the
+newest statement it reads there, and the branch requires nothing. The forget restates the
+list the writing machine holds after its pull: a requirement another machine stated that
+had not reached it (unsent, or sent after the pull) is not in that list, and is lost on
+every machine; the machines still agree on one list. A fold that kept it would read the
+forget differently from the knives before it.
 
 ### `knives preflight`
 

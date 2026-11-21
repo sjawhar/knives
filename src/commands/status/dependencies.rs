@@ -1,12 +1,14 @@
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::path::Path;
 
 use crate::commands::status::{BranchRow, BranchState, Options, Report, Timings};
 use crate::config::{Registry, RepoEntry};
-use crate::detect::{Finding, FindingKind, Subject};
+use crate::detect::{Finding, FindingKind, LandedVerdict, Subject, classify_landed};
 use crate::forge::{Forge, RepoIdentity};
 use crate::ids::{BranchName, BranchTarget, Requirement, UpstreamName};
+use crate::jj::Repo;
 use crate::store::Store;
 
 /// The forge repository a sibling entry's pull requests live in, from its
@@ -26,11 +28,14 @@ fn upstream_identity(entry: &RepoEntry) -> Option<RepoIdentity> {
 /// A branch can require a pull request in a sibling fork. Dropping the required one
 /// from a release without dropping the branch that needs it ships a release that
 /// cannot work, which is exactly what happened when one repo's #4545 was dropped
-/// while a sibling's #49 still needed it. Satisfied means merged: an open pull
-/// request may still change or be rejected. A review pull request on a fork's
-/// own repository is asked of that repository, and the report names its head:
-/// the member branch the dependent waits for. A member branch is satisfied once
-/// it has landed upstream, as the landed probe or its merged pull request says.
+/// while a sibling's #49 still needed it. An upstream pull request is satisfied
+/// when it has merged: an open one may still change or be rejected. A member
+/// branch of the fork is satisfied once it has landed upstream ([`Members`]).
+/// A review pull request on the fork's own repository is satisfied once its
+/// head, the member it carries, has landed upstream: a review pull request
+/// merges into a review base or another member, so its own state says nothing
+/// about the member reaching the upstream, and while the member is only in
+/// the fork's release, dropping it from the release would break the dependent.
 struct DependencyContext<'a, 'snapshot> {
     store: &'a Store,
     registry: &'a Registry,
@@ -38,8 +43,6 @@ struct DependencyContext<'a, 'snapshot> {
     path: &'a Path,
     forge: Option<&'a dyn Forge>,
     snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
-    /// Whether the landed probe judged this fork's branches.
-    probe_ran: bool,
 }
 
 struct DependencyResults<'a> {
@@ -66,6 +69,19 @@ impl DependencyResults<'_> {
         }
     }
 
+    /// A member `branch` requires, `shown` as the report names it, by what
+    /// this checkout says of the member.
+    fn member(&mut self, branch: &BranchName, shown: &str, state: MemberState) {
+        match state {
+            MemberState::Landed => {}
+            MemberState::Open(seen) => self.unmet(
+                branch,
+                format!("{branch} requires {shown}, which has not landed ({seen})"),
+            ),
+            MemberState::Unknown(why) => self.unchecked(branch, shown, why),
+        }
+    }
+
     fn unmet(&mut self, branch: &BranchName, detail: String) {
         self.findings.push(Finding::new(
             FindingKind::UnmetDependency,
@@ -74,10 +90,78 @@ impl DependencyResults<'_> {
         ));
     }
 
-    fn unchecked(&mut self, branch: &BranchName, requirement: &Requirement, why: impl Display) {
+    fn unchecked(&mut self, branch: &BranchName, requirement: impl Display, why: impl Display) {
         self.problems.push(format!(
             "cannot check whether {branch} still needs {requirement}: {why}"
         ));
+    }
+}
+
+/// What this checkout says of a member branch of the fork.
+#[derive(Debug, PartialEq, Eq)]
+enum MemberState {
+    /// It has landed upstream.
+    Landed,
+    /// It has not, with what was seen: its row's state, or the probe's verdict.
+    Open(String),
+    /// It cannot be judged, and why.
+    Unknown(String),
+}
+
+/// The member branches of a fork as this checkout sees them: the rows the
+/// report already judged, then the origin's copy of a member this checkout
+/// has no bookmark of, as a machine that only fetched another machine's
+/// member has.
+struct Members<'a> {
+    rows: &'a [BranchRow],
+    path: &'a Path,
+    /// What the landed probe replays onto, the upstream trunk; `None` when
+    /// the probe did not run.
+    probed_onto: Option<&'a str>,
+    repo: OnceCell<Option<Repo>>,
+}
+
+impl Members<'_> {
+    /// Landed when its row is landed or merged, or its origin tip replays
+    /// empty onto the upstream trunk.
+    fn judge(&self, member: &BranchName) -> MemberState {
+        match self.rows.iter().find(|row| row.name == *member) {
+            Some(row) if matches!(row.state, BranchState::Landed | BranchState::Merged) => {
+                MemberState::Landed
+            }
+            Some(_) if self.probed_onto.is_none() => {
+                MemberState::Unknown("the landed probe did not run".to_owned())
+            }
+            Some(row) => MemberState::Open(row.state.to_string()),
+            None => self.judge_on_origin(member),
+        }
+    }
+
+    fn judge_on_origin(&self, member: &BranchName) -> MemberState {
+        let on_origin = BranchName::new(format!("{member}@origin"));
+        let known = self
+            .repo
+            .get_or_init(|| Repo::open(self.path).ok())
+            .as_ref()
+            .is_some_and(|repo| repo.resolve_commit(on_origin.as_str()).is_ok());
+        if !known {
+            return MemberState::Unknown(format!(
+                "this checkout has no branch {member}, here or on origin; fetch it, or forget \
+                 the requirement if the branch landed or was dropped"
+            ));
+        }
+        let Some(trunk) = self.probed_onto else {
+            return MemberState::Unknown("the landed probe did not run".to_owned());
+        };
+        match crate::jj::probe_landed(self.path, &on_origin, trunk) {
+            Ok(outcome) => match classify_landed(outcome) {
+                LandedVerdict::InTrunk => MemberState::Landed,
+                verdict => MemberState::Open(format!("{on_origin} {verdict}")),
+            },
+            Err(error) => {
+                MemberState::Unknown(format!("the landed probe of {on_origin} failed: {error}"))
+            }
+        }
     }
 }
 
@@ -102,19 +186,21 @@ struct Sorted<'a> {
 
 fn unmet_dependencies(
     repo: &UpstreamName,
-    branches: &[BranchRow],
+    members: &Members<'_>,
     context: &DependencyContext<'_, '_>,
 ) -> (Vec<Finding>, Vec<String>) {
     let mut findings = Vec::new();
     let mut problems = Vec::new();
-    let sorted = sort_requirements(repo, branches, context, &mut problems);
+    let sorted = sort_requirements(repo, members.rows, context, &mut problems);
     let mut outcomes = DependencyResults {
         findings: &mut findings,
         problems: &mut problems,
     };
     upstream_outcomes(repo, sorted.upstream, context, &mut outcomes);
-    fork_pull_outcomes(sorted.on_fork, context, &mut outcomes);
-    member_outcomes(sorted.members, branches, context.probe_ran, &mut outcomes);
+    fork_pull_outcomes(sorted.on_fork, members, context, &mut outcomes);
+    for (dependent, requirement, member) in sorted.members {
+        outcomes.member(&dependent, &requirement.to_string(), members.judge(&member));
+    }
     (findings, problems)
 }
 
@@ -213,16 +299,18 @@ fn upstream_outcomes(
             Batch {
                 identity,
                 requirements,
-                with_head: false,
+                heads: None,
             },
             outcomes,
         );
     }
 }
 
-/// Review pull requests on a fork's own repository, one batch per repository.
+/// Review pull requests on a fork's own repository, one batch per
+/// repository, each judged by its head.
 fn fork_pull_outcomes(
     on_fork: BTreeMap<String, Vec<Wanted>>,
+    members: &Members<'_>,
     context: &DependencyContext<'_, '_>,
     outcomes: &mut DependencyResults<'_>,
 ) {
@@ -243,7 +331,7 @@ fn fork_pull_outcomes(
             Batch {
                 identity,
                 requirements,
-                with_head: true,
+                heads: Some(members),
             },
             outcomes,
         );
@@ -251,21 +339,27 @@ fn fork_pull_outcomes(
 }
 
 /// Pull requests to ask one repository about in one batch.
-struct Batch {
+struct Batch<'m, 'r> {
     identity: RepoIdentity,
     requirements: Vec<Wanted>,
-    /// Whether the report names each pull request's head branch: the member
-    /// a review pull request on the fork carries.
-    with_head: bool,
+    /// For review pull requests on the fork: the members their heads are
+    /// judged among. `None` for pull requests on an upstream, judged by
+    /// their own state.
+    heads: Option<&'m Members<'r>>,
 }
 
 /// Ask the forge about every number `batch` holds, in one call, and record
 /// each requirement.
-fn asked(forge: &dyn Forge, path: &Path, batch: Batch, outcomes: &mut DependencyResults<'_>) {
+fn asked(
+    forge: &dyn Forge,
+    path: &Path,
+    batch: Batch<'_, '_>,
+    outcomes: &mut DependencyResults<'_>,
+) {
     let Batch {
         identity,
         requirements,
-        with_head,
+        heads,
     } = batch;
     let numbers: Vec<u64> = requirements
         .iter()
@@ -276,49 +370,27 @@ fn asked(forge: &dyn Forge, path: &Path, batch: Batch, outcomes: &mut Dependency
     match forge.pull_facts(path, &identity, &numbers) {
         Ok(facts) => {
             for (branch, requirement, number) in requirements {
-                let fact = facts.get(&number);
-                let shown = match fact {
-                    Some(fact) if with_head => {
-                        format!("{requirement} (head {})", fact.pull.head_ref_name)
+                match (facts.get(&number), heads) {
+                    (Some(fact), Some(members)) => {
+                        let head = BranchName::new(fact.pull.head_ref_name.as_str());
+                        let shown = format!(
+                            "{requirement} (head {head}, {})",
+                            fact.pull.state.to_lowercase()
+                        );
+                        outcomes.member(&branch, &shown, members.judge(&head));
                     }
-                    _ => requirement.to_string(),
-                };
-                outcomes.record(&branch, &shown, fact.map(|fact| fact.pull.state.as_str()));
+                    (fact, _) => outcomes.record(
+                        &branch,
+                        &requirement.to_string(),
+                        fact.map(|fact| fact.pull.state.as_str()),
+                    ),
+                }
             }
         }
         Err(error) => {
             for (branch, requirement, _) in requirements {
                 outcomes.unchecked(&branch, &requirement, &error);
             }
-        }
-    }
-}
-
-/// Member branches of this fork, from the rows the report already judged.
-fn member_outcomes(
-    members: Vec<(BranchName, Requirement, BranchName)>,
-    branches: &[BranchRow],
-    probe_ran: bool,
-    outcomes: &mut DependencyResults<'_>,
-) {
-    for (dependent, requirement, member) in members {
-        match branches.iter().find(|row| row.name == member) {
-            Some(row) if matches!(row.state, BranchState::Landed | BranchState::Merged) => {}
-            Some(_) if !probe_ran => {
-                outcomes.unchecked(&dependent, &requirement, "the landed probe did not run");
-            }
-            Some(row) => outcomes.unmet(
-                &dependent,
-                format!(
-                    "{dependent} requires {requirement}, which has not landed ({})",
-                    row.state
-                ),
-            ),
-            None => outcomes.unchecked(
-                &dependent,
-                &requirement,
-                format_args!("this checkout has no branch {member}"),
-            ),
         }
     }
 }
@@ -334,7 +406,9 @@ pub(super) struct DependencyInput<'a, 'forge, 'snapshot> {
     pub(super) store: &'a Store,
     pub(super) options: &'a Options<'forge>,
     pub(super) snapshot: Option<&'a crate::snapshot::CompletedSnapshot<'snapshot>>,
-    pub(super) probe_ran: bool,
+    /// The upstream trunk the landed probe replayed onto, `None` when it did
+    /// not run: a member with no row is probed onto it too.
+    pub(super) probed_onto: Option<&'a str>,
     pub(super) timings: &'a mut Timings,
 }
 
@@ -347,23 +421,28 @@ pub(super) fn add_dependency_findings(input: DependencyInput<'_, '_, '_>) {
         store,
         options,
         snapshot,
-        probe_ran,
+        probed_onto,
         timings,
     } = input;
     let Some(registry) = options.registry else {
         return;
     };
     let started = std::time::Instant::now();
+    let members = Members {
+        rows: &report.branches,
+        path,
+        probed_onto,
+        repo: OnceCell::new(),
+    };
     let (found, unanswered) = unmet_dependencies(
         name,
-        &report.branches,
+        &members,
         &DependencyContext {
             store,
             registry,
             path,
             forge: options.forge,
             snapshot,
-            probe_ran,
         },
     );
     timings.forge += started.elapsed();
