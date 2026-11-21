@@ -618,9 +618,13 @@ pub enum ReleaseAction {
     /// this is how the members
     /// change theirs. Bare, it targets the first upstream trunk commit that
     /// contains every merged pull request, then drops the members whose landed
-    /// branches carry nothing more; with nothing merged there is no default,
-    /// and which commit to move onto is a decision — a cut does not make it
-    /// for you. When the move leaves the rebased tip of a member conflicted,
+    /// branches carry nothing more. A flat release has no base parent, so the
+    /// target reaches it only through a member on the target. Where no other
+    /// member is on the target, the drop keeps the landed members that are,
+    /// and says why; where none is, it drops nothing and exits 3. With
+    /// nothing merged there is no default, and which commit to move onto is
+    /// a decision — a cut does not make it for you. When the move leaves the
+    /// rebased tip of a member conflicted,
     /// the report names that member, by its branch or by its short commit id,
     /// with its conflicted files, and the command exits 1. The member stays
     /// in the release: resolve it on its branch. The report says "no

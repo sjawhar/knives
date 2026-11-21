@@ -37,9 +37,12 @@ use super::release_edit::{
 /// follows its rewrite; tags stay where they were, and the copies the rebase
 /// makes of pushed, published or tagged releases are abandoned unless something
 /// rests on
-/// them. After a bare rebase, members whose pull requests landed and carry
-/// nothing more are dropped — the work reaches the release through its new
-/// base — unless `--no-drop` keeps them.
+/// them. After a bare rebase, the members whose pull requests landed and
+/// that carry nothing more are dropped, unless `--no-drop` keeps them. A
+/// flat release has no base parent, so the target reaches it only through a
+/// member on it. Where no other member is on it, the drop keeps the landed
+/// members that are; where none is, it refuses and writes nothing
+/// ([`drop_landed_members_in`]).
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -903,13 +906,18 @@ fn drop_landed_members(
 ///
 /// Only a member carrying nothing past the target is dropped: a branch with
 /// commits beyond its merged pull request still holds undelivered work, and
-/// that is said instead. The drop duplicates the release onto the kept parents,
-/// exactly as `drop` does, so recorded conflict resolutions carry forward, and
-/// leaves out the release's carriers, as every write composing from its
-/// parents does. `opened` is the repository as it is now, and `writes` the
-/// release's earlier writes read from it. `unchecked` is the mark its event
-/// ends with ([`release::unchecked_suffix`]). The release it writes is read
-/// through one opening as soon as the write is done
+/// that is said instead. A flat release has no base parent, so the target
+/// reaches it only through a member that descends from it. Where no other
+/// kept parent descends from the target, the drop keeps each landed member
+/// that does, and says why; where no landed member does either, it refuses
+/// and drops nothing ([`keep_the_target`]). Where no parent would remain, it
+/// refuses too. The drop writes the release as a duplicate onto the kept
+/// parents, as `drop` does, and leaves out the release's carriers, as every
+/// write composing from its parents does: a carrier never counts as a
+/// parent that remains. `opened` is the repository as it is now, and
+/// `writes` the release's earlier writes read from it. `unchecked` is the
+/// mark its event ends with ([`release::unchecked_suffix`]). The release it
+/// writes is read through one opening as soon as the write is done
 /// ([`release::ReportedWrite`]) and left in `last`, the command's last
 /// write, so a step after the write that fails still leaves it there.
 /// `conflicted` are the members the rebase before it moved and left
@@ -930,8 +938,9 @@ fn drop_landed_members_in(
     let entry = fork.entry;
     let path = &fork.checkout.path;
     let (carriers, parents) = writes.partition(&opened.parent_commits(release_name)?);
-    let mut kept = parents.clone();
-    let mut deltas: Vec<String> = Vec::new();
+    // Each landed member the drop would take out, with its pull request, in
+    // the forge's order.
+    let mut dropped: Vec<(knives::ids::CommitId, &PullRequest)> = Vec::new();
     for pull in &destination.landed {
         let Some(tip) = opened.local_bookmark_tip(&pull.head_ref_name) else {
             continue;
@@ -948,26 +957,26 @@ fn drop_landed_members_in(
             );
             continue;
         }
-        kept.retain(|parent| parent != &tip);
-        deltas.push(format!(
-            "dropped {}: landed upstream as #{}",
-            pull.head_ref_name, pull.number
-        ));
+        dropped.push((tip, pull));
     }
-    if deltas.is_empty() {
+    if dropped.is_empty() {
         return Ok(members_exit(conflicted));
     }
     let shown_release = inline_human_text(release_name);
-    if kept.is_empty() {
-        println!(
-            "{repo}: every member of {shown_release} landed; dropping them all would leave it \
-             without a parent, so nothing was dropped"
-        );
+    let Some((kept, delta)) = keep_the_target(
+        (repo, &shown_release, destination),
+        opened,
+        &parents,
+        dropped,
+    )?
+    else {
         return Ok(Exit::Incomplete);
+    };
+    if delta.is_empty() {
+        return Ok(members_exit(conflicted));
     }
     let release = opened.resolve_commit(release_name)?;
     let provenance = release::parent_sources(opened, entry, &entry.release_scheme(), &kept)?;
-    let delta = deltas.join("; ");
     let message = release::composition_message(release_name, &provenance, &delta);
     let written = knives::jj::write_release(
         path,
@@ -1014,6 +1023,104 @@ fn drop_landed_members_in(
         )
     );
     Ok(members_exit(conflicted))
+}
+
+/// The parents the landed drop keeps and the delta its write records, or
+/// `None` after a refusal, which writes nothing.
+///
+/// `parents` are the release's members, its carriers left out: a carrier
+/// never counts as a parent that remains. `dropped` are the landed members
+/// the drop would take out, each with its pull request, in the forge's
+/// order. Where no parent would remain, the drop refuses. A flat release
+/// has no base parent, so the target reaches it only through a member that
+/// descends from it, or is it. Where a kept member does, every landed member
+/// goes. Where none does, the landed members that descend from the target
+/// stay, named in one line, and the others go; with none left to go, the
+/// delta is empty and nothing is written. Where no landed member descends
+/// from it either, as where only a carrier is on the target, the drop
+/// refuses.
+fn keep_the_target(
+    (repo, shown_release, destination): (&RepoName, &str, &RebaseDestination),
+    opened: &knives::jj::Repo,
+    parents: &[knives::ids::CommitId],
+    dropped: Vec<(knives::ids::CommitId, &PullRequest)>,
+) -> anyhow::Result<Option<(Vec<knives::ids::CommitId>, String)>> {
+    let kept = parents_left(parents, &dropped);
+    if kept.is_empty() {
+        println!(
+            "{repo}: every member of {shown_release} landed; dropping them all would leave it \
+             without a parent, so nothing was dropped"
+        );
+        return Ok(None);
+    }
+    let onto = &destination.onto;
+    let carried = kept.iter().try_fold(false, |found, parent| {
+        Ok::<bool, knives::jj::JjError>(found || opened.is_ancestor(onto, parent)?)
+    })?;
+    if carried {
+        return Ok(Some((kept, dropped_delta(&dropped))));
+    }
+    let (mut on_target, mut rest) = (Vec::new(), Vec::new());
+    for landed in dropped {
+        if opened.is_ancestor(onto, &landed.0)? {
+            on_target.push(landed);
+        } else {
+            rest.push(landed);
+        }
+    }
+    // The target is the caller's argument or a commit id this run resolved.
+    let target = &destination.reference;
+    if on_target.is_empty() {
+        println!(
+            "{repo}: no member of {shown_release} would carry {target}: dropping {} would take \
+             {target}'s changes out of it, so nothing was dropped",
+            shown_branches(&rest)
+        );
+        return Ok(None);
+    }
+    println!(
+        "{repo}: kept {}: no member but the landed ones is on {target}; dropping them would \
+         take {target}'s changes out of {shown_release}",
+        shown_branches(&on_target)
+    );
+    Ok(Some((parents_left(parents, &rest), dropped_delta(&rest))))
+}
+
+/// `parents` less each landed member in `dropped`, in parent order.
+fn parents_left(
+    parents: &[knives::ids::CommitId],
+    dropped: &[(knives::ids::CommitId, &PullRequest)],
+) -> Vec<knives::ids::CommitId> {
+    parents
+        .iter()
+        .filter(|parent| !dropped.iter().any(|(tip, _)| tip == *parent))
+        .cloned()
+        .collect()
+}
+
+/// The delta the release records for the landed members it drops, empty
+/// for none.
+fn dropped_delta(dropped: &[(knives::ids::CommitId, &PullRequest)]) -> String {
+    dropped
+        .iter()
+        .map(|(_, pull)| {
+            format!(
+                "dropped {}: landed upstream as #{}",
+                pull.head_ref_name, pull.number
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The head branches of `landed`, as a line shows them. Each is the forge's
+/// name for it, a ref a remote gave.
+fn shown_branches(landed: &[(knives::ids::CommitId, &PullRequest)]) -> String {
+    landed
+        .iter()
+        .map(|(_, pull)| inline_human_text(&pull.head_ref_name))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A composition rebase that just happened: what moved, and onto what.
