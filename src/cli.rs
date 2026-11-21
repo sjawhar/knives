@@ -255,8 +255,8 @@ pub enum Command {
         #[arg(long)]
         verbose: bool,
         /// Skip the landed probe, which replays every branch onto the trunk. A
-        /// required member branch not shown landed or merged then stays an unmet
-        /// dependency.
+        /// required member branch not shown to have landed then stays an unmet
+        /// dependency: a merge alone does not show it.
         #[arg(long)]
         no_landed: bool,
         /// Skip pull request lookups. Branch pull request state reads as unknown.

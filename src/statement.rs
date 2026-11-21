@@ -116,6 +116,9 @@ pub struct Statements {
     /// The live statement per subject and kind; a `None` value is a live
     /// forget.
     live: BTreeMap<String, BTreeMap<StatementKind, Live>>,
+    /// Per subject with a live `depends` list, the subject's tip when the
+    /// newest entry of that list that recorded one was written.
+    depends_heads: BTreeMap<String, String>,
 }
 
 /// One live statement: its value, and the stamp a statement replacing it is
@@ -132,6 +135,10 @@ struct Live {
 /// then its place in the slice, so between equal stamps the later one is
 /// newer.
 type Place = (Option<jiff::Timestamp>, usize);
+
+/// One `depends` list as an entry states it: where the entry falls, the
+/// list, and the subject's tip when the entry was written, if recorded.
+type Listed<'e> = (Place, &'e str, Option<&'e str>);
 
 impl Statements {
     /// Fold `entries` into the statements live now.
@@ -150,7 +157,7 @@ impl Statements {
         let mut newest: BTreeMap<&str, BTreeMap<StatementKind, (Place, Option<&str>)>> =
             BTreeMap::new();
         let mut forgotten: BTreeMap<&str, Place> = BTreeMap::new();
-        let mut required: BTreeMap<&str, Vec<(Place, &str)>> = BTreeMap::new();
+        let mut required: BTreeMap<&str, Vec<Listed<'_>>> = BTreeMap::new();
         for (index, entry) in entries.iter().enumerate() {
             let (Some(subject), Some(statement)) = (entry.subject.as_deref(), &entry.statement)
             else {
@@ -160,7 +167,11 @@ impl Statements {
             match (statement.kind, statement.value.as_deref()) {
                 (StatementKind::Unknown, _) => {}
                 (StatementKind::Depends, Some(list)) => {
-                    required.entry(subject).or_default().push((place, list));
+                    required.entry(subject).or_default().push((
+                        place,
+                        list,
+                        entry.anchor.as_deref(),
+                    ));
                 }
                 (StatementKind::Depends, None) => {
                     let held = forgotten.entry(subject).or_insert(place);
@@ -191,21 +202,31 @@ impl Statements {
                 (subject.to_owned(), kinds)
             })
             .collect();
+        let mut depends_heads = BTreeMap::new();
         let subjects: BTreeSet<&str> = forgotten.keys().chain(required.keys()).copied().collect();
         for subject in subjects {
             let forget = forgotten.get(subject).copied();
-            let since: Vec<(Place, &str)> = required
+            let since: Vec<Listed<'_>> = required
                 .get(subject)
                 .into_iter()
                 .flatten()
                 .copied()
-                .filter(|(place, _)| forget.is_none_or(|forget| *place > forget))
+                .filter(|(place, _, _)| forget.is_none_or(|forget| *place > forget))
                 .collect();
-            let stated = match (since.iter().map(|(place, _)| *place).max(), forget) {
+            let stated = match (since.iter().map(|(place, _, _)| *place).max(), forget) {
                 (Some((ts, _)), _) => {
-                    let union: BTreeSet<&str> =
-                        since.iter().flat_map(|(_, list)| list.split(',')).collect();
+                    let union: BTreeSet<&str> = since
+                        .iter()
+                        .flat_map(|(_, list, _)| list.split(','))
+                        .collect();
                     let value = Some(union.into_iter().collect::<Vec<_>>().join(","));
+                    if let Some((_, _, Some(head))) = since
+                        .iter()
+                        .filter(|(_, _, head)| head.is_some())
+                        .max_by_key(|(place, _, _)| *place)
+                    {
+                        let _ = depends_heads.insert(subject.to_owned(), (*head).to_owned());
+                    }
                     Live { ts, value }
                 }
                 (None, Some((ts, _))) => Live { ts, value: None },
@@ -215,7 +236,10 @@ impl Statements {
                 .or_default()
                 .insert(StatementKind::Depends, stated);
         }
-        Self { live }
+        Self {
+            live,
+            depends_heads,
+        }
     }
 
     /// The pull request stated for `branch`. Every value read from an entry
@@ -254,6 +278,13 @@ impl Statements {
                     .is_some_and(|live| live.value.is_some())
             })
             .map(|(branch, _)| branch.as_str())
+    }
+
+    /// The commit `branch` was at when the newest entry of its live
+    /// `depends` list that recorded one was written: its head while it
+    /// required them, kept after the branch itself is deleted.
+    pub fn depends_head(&self, branch: &str) -> Option<&str> {
+        self.depends_heads.get(branch).map(String::as_str)
     }
 
     /// The live statement of `kind` about `branch`: `Some(None)` for a live
