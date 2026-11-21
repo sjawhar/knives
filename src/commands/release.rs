@@ -21,8 +21,7 @@ use crate::consumer_pins::{
     ConsumerHeadMemo, ConsumerPinSource, scan_consumer_for, scan_consumer_slug_with_heads,
 };
 use crate::detect::{
-    BookmarkTips, Finding, FindingKind, RebaseOutcome, ReleaseParent, Subject, release_parents,
-    stale_parents,
+    BookmarkTips, Finding, FindingKind, ReleaseParent, Subject, release_parents, stale_parents,
 };
 use crate::ids::{
     BookmarkRef, BranchName, ChangeId, CommitId, ReleaseScheme, RemoteName, RepoName,
@@ -30,6 +29,7 @@ use crate::ids::{
 };
 use crate::jj::{self, Repo};
 use crate::ledger::{Entry, Kind, Ledger, RecordedParent};
+use crate::own_lines::{LostKind, MemberLines, Reading};
 use crate::pins::{Pin, PinKind};
 use crate::release_model::{
     BranchSuccessions, CompositionBaseline, EarlierWrites, MemberEvidence, MemberHistory,
@@ -2142,7 +2142,8 @@ pub struct MembersReport {
     /// `^parent` lines in commit-message prose).
     pub parent_count: usize,
     pub members: Vec<MemberRow>,
-    /// `--verify` only: `audit_cut`'s four buckets, reusing the cut path's phrasing.
+    /// `--verify` only: `audit_cut`'s four buckets, reusing the cut path's
+    /// phrasing, and each member's lines ([`CutAudit::members`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit: Option<CutAudit>,
     pub notes: Vec<String>,
@@ -2224,9 +2225,10 @@ fn member_label(member: &MemberRow) -> String {
 ///
 /// `ledger` is the fork's ledger: the writes it records under the name, with
 /// the publish remote's commit of it, are the carriers a row labels
-/// ([`EarlierWrites`]). `verify` replays the content (`--verify`) against no
-/// previous release: a member whose change the tree does not hold reads as
-/// missing, however the release came to drop it.
+/// ([`EarlierWrites`]). `verify` reads each member's own lines (`--verify`),
+/// each from the member's own fork point with the upstream trunk, against no
+/// previous release: a member whose lines the tree does not hold reads as
+/// missing, however the release came to drop them.
 pub fn gather_members(
     opened: &Repo,
     fork: &Fork<'_>,
@@ -2279,7 +2281,10 @@ pub fn gather_members(
                     CutSubject::Committed(&commit),
                     AuditContext {
                         previous: None,
-                        trunk,
+                        upstream_trunk: trunk,
+                        trunk_parents: &[],
+                        trunk_parent_base: None,
+                        drift_trunk: trunk,
                         drift_from: None,
                     },
                 )
@@ -2347,6 +2352,7 @@ pub fn render_members(report: &MembersReport) -> String {
                  re-check after resolving the cut's conflicts)",
                 inline_human_text(name)
             ));
+            lines.extend(audit.lost_lines_of(name));
         }
         for member in report.members.iter().filter(|member| is_member(member)) {
             let name = member_label(member);
@@ -2365,6 +2371,7 @@ pub fn render_members(report: &MembersReport) -> String {
                 "  !! {}: the cut tree is missing or diverges from the member's content",
                 inline_human_text(name)
             ));
+            lines.extend(audit.lost_lines_of(name));
         }
         // A file that changed since the release the audit measured from, with
         // no member or trunk explaining it.
@@ -2374,6 +2381,7 @@ pub fn render_members(report: &MembersReport) -> String {
                 .iter()
                 .map(|file| unexplained_row(file, DriftBase::PreviousRelease)),
         );
+        lines.extend(audit.words_lines());
     }
     // A note quotes jj, the forge or a consumer's pin files; the report keeps
     // the raw text for `--json`, and this line is the one a terminal reads.
@@ -3090,17 +3098,38 @@ pub struct CutAudit {
     pub missing: Vec<String>,
     pub unexplained: Vec<String>,
     pub inconclusive: Vec<String>,
-    /// Members the cut diverges from exactly as the previous release already
-    /// did. Reported, never refused — the audit charges a cut only with
-    /// divergence it introduces. Whether that divergence is a recorded
-    /// resolution is the caller's question: each row says how the previous
-    /// release stands to its recorded writes ([`carried_row`]).
+    /// Members the cut lacks only lines of that the previous release already
+    /// lacked ([`MemberLines::carry_forward`]). Reported, never refused —
+    /// the audit charges a cut only with divergence it introduces. Whether
+    /// that divergence is a recorded resolution is the caller's question:
+    /// each row says how the previous release stands to its recorded writes
+    /// ([`carried_row`]).
     pub carried: Vec<String>,
+    /// Each member's own lines against the cut, carried or not, each from its
+    /// fork point with the upstream trunk ([`audit_cut`]): what the cut
+    /// lacks of them, and the lines it holds only by their words.
+    pub members: Vec<MemberLines>,
 }
 
 impl CutAudit {
     pub const fn passed(&self) -> bool {
         self.missing.is_empty() && self.unexplained.is_empty()
+    }
+
+    /// The lines that name what the member labelled `name` lacks, to print
+    /// under its row ([`lost_lines`]); none for a member the audit did not
+    /// read.
+    pub fn lost_lines_of(&self, name: &str) -> Vec<String> {
+        self.members
+            .iter()
+            .find(|lines| lines.label == name)
+            .map_or_else(Vec::new, |lines| lost_lines(lines, LOST_LINE_INDENT))
+    }
+
+    /// Each line of every member that the cut holds only by its words, to
+    /// print after the rows ([`labelled_words_lines`]).
+    pub fn words_lines(&self) -> Vec<String> {
+        self.members.iter().flat_map(labelled_words_lines).collect()
     }
 
     /// Leave out of the drift each file that the composition gate after the
@@ -3126,13 +3155,31 @@ impl CutAudit {
 /// What a cut audit measures its members and its drift from ([`audit_cut`]).
 #[derive(Debug, Clone, Copy)]
 pub struct AuditContext<'a> {
-    /// The release a member's divergence may be carried from: a cut's
-    /// previous release. `None` carries nothing forward, so a member the
-    /// subject lacks is missing, however the subject came to drop it.
+    /// The release a member's lost lines may be carried forward from: a
+    /// cut's previous release. `None` carries nothing forward, so a member
+    /// the subject lacks a line of is missing, however the subject came to
+    /// drop it.
     pub previous: Option<&'a CommitId>,
-    /// What each member replays from: the members' fork point with the
-    /// trunk.
-    pub trunk: &'a CommitId,
+    /// The upstream trunk's tip. Each member's own change is the diff from
+    /// its fork point with it ([`Repo::fork_point`]) to its tip (spec R6), so
+    /// the trunk's commits after that fork point are never charged to the
+    /// member.
+    pub upstream_trunk: &'a CommitId,
+    /// The parents of the subject that the trunk holds, each with where it
+    /// came from: no member, but content the subject holds all the same.
+    /// Only `release cut NAME --at` audits them, beside its members.
+    pub trunk_parents: &'a [(String, CommitId)],
+    /// What each of `trunk_parents` is measured from: the fork point of all
+    /// the members and the trunk. A trunk parent's own fork point with the
+    /// trunk is itself, so its own change would read carried whatever the
+    /// subject holds. `None`, where there is no trunk parent, measures each
+    /// from its own fork point, as a member.
+    pub trunk_parent_base: Option<&'a CommitId>,
+    /// The trunk commit whose files explain the drift beside each member's:
+    /// a cut's audit base, the commit that the previous release and the
+    /// trunk share ([`shared_base`]) or the members' fork point with the
+    /// trunk. Only the drift check reads it.
+    pub drift_trunk: &'a CommitId,
     /// What the drift is measured from, and what that commit is, which the
     /// row of a file no member explains names ([`unexplained_row`]). `None`
     /// runs no drift check, as for a first cut.
@@ -3253,20 +3300,18 @@ impl CutSubject<'_> {
         }
     }
 
-    fn replay_outcome(
-        &mut self,
-        repo: &Path,
-        base: &str,
-        revision: &str,
-    ) -> anyhow::Result<RebaseOutcome> {
+    /// What the subject holds of a member's own lines: the change from
+    /// `fork_point` to `tip`, read path by path
+    /// ([`jj::Repo::member_lines`]). `label` names the member in the reading.
+    fn member_lines(
+        &self,
+        repo: &Repo,
+        label: &str,
+        (fork_point, tip): (&CommitId, &CommitId),
+    ) -> anyhow::Result<MemberLines> {
         match self {
-            Self::Candidate(candidate) => Ok(candidate.replay_outcome(base, revision)?),
-            Self::Committed(cut) => Ok(crate::jj::probe_net_diff(
-                repo,
-                base,
-                revision,
-                cut.as_str(),
-            )?),
+            Self::Candidate(candidate) => Ok(candidate.member_lines(label, (fork_point, tip))?),
+            Self::Committed(cut) => Ok(repo.member_lines(label, (fork_point, tip), cut)?),
         }
     }
 
@@ -3315,23 +3360,27 @@ impl CutSubject<'_> {
 
 /// Verify the cut actually contains what it merged (spec 1.3).
 ///
-/// For each member, a scratch child of `context.trunk` carrying the member
-/// tip's tree — a synthetic commit whose diff is `trunk..member_tip` — is
-/// replayed onto the cut.
-/// An empty replay means its hunks are present; a clean, non-empty replay means
-/// the cut silently lacks them. A conflicted replay is inconclusive only when
-/// the cut itself has unresolved conflicts; otherwise its tree diverges from the
-/// member and fails the audit, unless `context.previous` diverged from the
-/// member exactly so: that is carried forward.
+/// Each member is read by its own lines (spec R9): its own change is the
+/// diff from its fork point with `context.upstream_trunk` to its tip (spec
+/// R6), and the cut carries it where it holds each line that the change
+/// adds and does not hold again what it removes ([`jj::Repo::member_lines`]).
+/// A member whose own path holds an unresolved conflict, in the cut or at
+/// the member's tip, cannot be read there: it is inconclusive where it
+/// lacks nothing else. A member that lacks a line fails the audit, unless
+/// `context.previous` lacks that line too, read from the same fork point:
+/// a member whose every lost line the previous release lacked is carried
+/// forward ([`MemberLines::carry_forward`]). Each parent that the trunk
+/// holds (`context.trunk_parents`) is read beside the members, from
+/// `context.trunk_parent_base`.
 ///
 /// The drift is what changed since `context.drift_from`, the release the
-/// audited one follows, that no member or trunk explains: merge-invented
-/// drift. That release is a cut's `context.previous`. It is apart from
-/// `context.previous`, what a member's divergence may be carried from,
-/// because a release cut outside knives has a release it follows but
+/// audited one follows, that no member, trunk parent or trunk explains:
+/// merge-invented drift. That release is a cut's `context.previous`. It is
+/// apart from `context.previous`, what a member's lost lines may be carried
+/// from, because a release cut outside knives has a release it follows but
 /// carries nothing forward: a member it lacks is missing. The series' first
 /// record outside knives follows no release, and its drift is measured from
-/// `context.trunk`, its members' fork point with the trunk. With no
+/// `context.drift_trunk`, its members' fork point with the trunk. With no
 /// `drift_from` there is no drift check, as for a first cut. A caller that
 /// holds fixes by hand after the audit leaves their files out of the drift
 /// ([`CutAudit::leave_fixes_to_gate`]).
@@ -3345,44 +3394,44 @@ pub fn audit_cut(
     mut subject: CutSubject<'_>,
     context: AuditContext<'_>,
 ) -> anyhow::Result<CutAudit> {
+    let opened = Repo::open(repo)?;
     let mut audit = CutAudit::default();
-    let cut_is_conflicted = !subject.conflicted_files(repo)?.is_empty();
-    for (name, tip) in members {
-        match subject.replay_outcome(repo, context.trunk.as_str(), tip.as_str())? {
-            RebaseOutcome::Empty => {}
-            RebaseOutcome::Conflicted if cut_is_conflicted => audit.inconclusive.push(name.clone()),
-            RebaseOutcome::CleanNonEmpty | RebaseOutcome::Conflicted => {
-                // Divergence the release held against already carried is that
-                // release's resolution, carried forward, not a loss: refusing
-                // it would make every release with a hand-resolved conflict
-                // fail its own re-cut forever. Whether that resolution is
-                // recorded is the caller's question, not this audit's: a hand
-                // edit nothing recorded may have dropped a member's change, so
-                // it is `knives release adopt` that measures it before a cut.
-                let carried_before = match context.previous {
-                    Some(previous) => !matches!(
-                        crate::jj::probe_net_diff(
-                            repo,
-                            context.trunk.as_str(),
-                            tip.as_str(),
-                            previous.as_str(),
-                        )?,
-                        RebaseOutcome::Empty
-                    ),
-                    None => false,
-                };
-                if carried_before {
-                    audit.carried.push(name.clone());
-                } else {
-                    audit.missing.push(name.clone());
-                }
-            }
+    let read = members.iter().map(|member| (member, None)).chain(
+        context
+            .trunk_parents
+            .iter()
+            .map(|parent| (parent, context.trunk_parent_base)),
+    );
+    for ((name, tip), base) in read {
+        let fork_point = match base {
+            Some(base) => base.clone(),
+            None => opened.fork_point(tip, context.upstream_trunk)?,
+        };
+        let mut lines = subject.member_lines(&opened, name, (&fork_point, tip))?;
+        // A line the release held against already lacked is that release's
+        // resolution, carried forward, not a loss: refusing it would make
+        // every release with a hand-resolved conflict fail its own re-cut
+        // forever. Whether that resolution is recorded is the caller's
+        // question, not this audit's: a hand edit nothing recorded may have
+        // dropped a member's line, so it is `knives release adopt` that
+        // measures it before a cut.
+        if lines.reading == Reading::Missing
+            && let Some(previous) = context.previous
+        {
+            lines.carry_forward(&opened.member_lines(name, (&fork_point, tip), previous)?);
         }
+        match lines.reading {
+            Reading::Carried => {}
+            Reading::Inconclusive => audit.inconclusive.push(name.clone()),
+            Reading::CarriedForward => audit.carried.push(name.clone()),
+            Reading::Missing => audit.missing.push(name.clone()),
+        }
+        audit.members.push(lines);
     }
     if let Some((previous, _)) = context.drift_from {
         let drifted = subject.changed_files_since(repo, previous)?;
         let mut explained = BTreeSet::new();
-        for (_, tip) in members {
+        for (_, tip) in members.iter().chain(context.trunk_parents) {
             explained.extend(crate::jj::changed_files_between(
                 repo,
                 previous.as_str(),
@@ -3391,11 +3440,11 @@ pub fn audit_cut(
         }
         // The series' first record measures its drift from its trunk itself,
         // and a commit changes no file against itself.
-        if context.trunk != previous {
+        if context.drift_trunk != previous {
             explained.extend(crate::jj::changed_files_between(
                 repo,
                 previous.as_str(),
-                context.trunk.as_str(),
+                context.drift_trunk.as_str(),
             )?);
         }
         audit.unexplained = drifted
@@ -3404,6 +3453,114 @@ pub fn audit_cut(
             .collect();
     }
     Ok(audit)
+}
+
+/// How far each line that names what a member lacks is indented under the
+/// member's row ([`lost_lines`]).
+pub const LOST_LINE_INDENT: &str = "      ";
+
+/// The lines that name what `lines`, one member's reading against a release,
+/// lacks, each after `indent`.
+///
+/// There is one line for each lost entry that the release before did not
+/// lack too, in the reading's order. A line that the member added and the
+/// release does not hold, a hunk the member removed that the release holds
+/// again, a path read whole, an executable bit and a path the reading cannot
+/// read for its unresolved conflict are each named with their path; the
+/// lines of a range that the word step did not follow are named once, by
+/// the range.
+///
+/// This is the one renderer of a member's lacking lines, which `members
+/// --verify`, the audit of a cut, the composition gate and `--carries` print
+/// under the row that names the member; [`held_by_words_lines`] names the
+/// lines it holds only by their words. Each text is read from the
+/// repository, so it is escaped.
+pub fn lost_lines(lines: &MemberLines, indent: &str) -> Vec<String> {
+    use crate::ledger::inline_human_text;
+    let mut named_ranges = Vec::new();
+    let mut out = Vec::new();
+    for lost in lines.lost.iter().filter(|lost| !lost.carried_forward) {
+        let path = inline_human_text(&lost.path);
+        let text = lost
+            .text
+            .as_deref()
+            .map_or_else(String::new, inline_human_text);
+        let at = lost
+            .line
+            .map_or_else(String::new, |line| format!(":{line}"));
+        let named = match lost.kind {
+            LostKind::Added => format!("{path}{at}: added line lost ‹{text}›"),
+            LostKind::Removed => format!("{path}{at}: removed lines put back ‹{text}›"),
+            LostKind::File => format!("{path}: file differs from the member's ({text})"),
+            LostKind::Mode => format!("{path}: mode differs from the member's ({text})"),
+            LostKind::Conflict => format!("{path}: unresolved conflict {text}"),
+            LostKind::WordLimit => {
+                let range = lines.word_step_skipped.iter().position(|range| {
+                    range.path == lost.path
+                        && lost.line.is_some_and(|line| {
+                            (range.first_line..=range.last_line).contains(&line)
+                        })
+                });
+                if range.is_some_and(|range| named_ranges.contains(&range)) {
+                    continue;
+                }
+                named_ranges.extend(range);
+                let span = range
+                    .and_then(|range| lines.word_step_skipped.get(range))
+                    .map_or(at, |range| {
+                        format!(":{}-{}", range.first_line, range.last_line)
+                    });
+                format!(
+                    "{path}{span}: the word step did not run (more than {} words); its lines \
+                     count as lost",
+                    crate::own_lines::WORD_LIMIT
+                )
+            }
+        };
+        out.push(format!("{indent}{named}"));
+    }
+    out
+}
+
+/// The lines that name each line of `lines`, one member's reading against a
+/// release, that the release holds only by its words, each after `lead`.
+///
+/// Each names the member's line, and each line of the release's replaced
+/// range that holds its words, so that a person sees the words another
+/// change put around the member's own. Such a line does not make the member
+/// read missing ([`lost_lines`]). Each text is read from the repository, so
+/// it is escaped.
+pub fn held_by_words_lines(lines: &MemberLines, lead: &str) -> Vec<String> {
+    use crate::ledger::inline_human_text;
+    use std::fmt::Write as _;
+    lines
+        .held_by_words
+        .iter()
+        .map(|held| {
+            let mut named = format!(
+                "{lead}{}:{} held only by its words ‹{}›",
+                inline_human_text(&held.path),
+                held.line,
+                inline_human_text(&held.text)
+            );
+            for line in &held.release_lines {
+                let _ = write!(
+                    named,
+                    "; release line {} ‹{}›",
+                    line.line,
+                    inline_human_text(&line.text)
+                );
+            }
+            named
+        })
+        .collect()
+}
+
+/// [`held_by_words_lines`] after the member's label, as a report that names
+/// several members prints them, after its rows.
+pub fn labelled_words_lines(lines: &MemberLines) -> Vec<String> {
+    let lead = format!("  {}: ", crate::ledger::inline_human_text(&lines.label));
+    held_by_words_lines(lines, &lead)
 }
 
 /// Create and name a fresh cut for direct callers that do not need an audit.
@@ -3427,10 +3584,11 @@ pub struct RecordedMember {
 /// against.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CompositionCheck {
-    /// Recorded members whose content the candidate does not carry.
+    /// Recorded members whose own lines the candidate does not carry.
     pub dropped: Vec<RecordedMember>,
-    /// Members whose replay conflicted while the candidate itself is
-    /// conflicted: unanswerable either way, exactly as the audit reports it.
+    /// Recorded members whose own path holds an unresolved conflict, in the
+    /// candidate or at the member's tip, and which lack nothing else:
+    /// unanswerable either way, exactly as the audit reports it.
     pub inconclusive: Vec<RecordedMember>,
     /// Recorded members carried by another commit with exactly their tree,
     /// reachable from a parent: the member rendered for a human, and the twin.
@@ -3450,11 +3608,16 @@ pub struct CompositionCheck {
     pub dropped_fixes: Vec<LackedFix>,
     /// The fixes by hand that the series holds at a file that the subject
     /// and the newest recorded write both leave conflicted, each with those files: unanswerable until the
-    /// conflict is resolved, as for a member whose replay conflicted
+    /// conflict is resolved, as for a member whose path is conflicted
     /// ([`Self::inconclusive`]). A knives cut then goes ahead with the
     /// conflict for the person to resolve in place and `adopt`; the write
     /// it makes is no reference of those files, so the fix stays held.
     pub inconclusive_fixes: Vec<LackedFix>,
+    /// The lines of each recorded member that the check read against the
+    /// subject, carried or not ([`jj::Repo::member_lines`]): what a refusal
+    /// names under each member the subject lacks, and the lines it holds
+    /// only by their words.
+    pub members: Vec<MemberLines>,
 }
 
 impl CompositionCheck {
@@ -3470,6 +3633,12 @@ impl CompositionCheck {
     /// as the subject leaves a conflict: no refusal, but no clean result.
     pub const fn is_inconclusive(&self) -> bool {
         !self.inconclusive.is_empty() || !self.inconclusive_fixes.is_empty()
+    }
+
+    /// The lines the check read of the recorded member at `commit`, where
+    /// it read them.
+    pub fn lines_of(&self, commit: &CommitId) -> Option<&MemberLines> {
+        self.members.iter().find(|lines| lines.commit == *commit)
     }
 }
 
@@ -4035,13 +4204,17 @@ pub struct CompositionDelta<'a> {
 /// recreated outside jj with exactly its tree is carried when that twin is
 /// reachable
 /// from a parent past the base ([`Repo::same_tree_between`]), and the twin
-/// is named. The content replay
-/// accounts for one that landed upstream as a squash — the same measure
-/// [`audit_cut`] applies to current members, taken from the member's own fork
-/// point so a moved base is never charged to the member. A member the trunk
-/// reaches but the cut subject does not is dropped without a replay: its fork
-/// point degenerates to the member itself, and that replay would read empty
-/// without consulting the cut subject at all. A recorded commit this
+/// is named. A member that none of these account for is read by its own
+/// lines against the subject ([`jj::Repo::member_lines`]), the same measure
+/// [`audit_cut`] applies to current members, taken from the member's own
+/// fork point so a moved base is never charged to the member: that accounts
+/// for one that landed upstream as a squash, or one rewritten in another
+/// clone. A member whose own path the subject leaves conflicted, or that is
+/// conflicted at the member's tip, and that lacks nothing else, is
+/// inconclusive. A member the trunk reaches but the cut subject does not is
+/// dropped without a reading: its fork point degenerates to the member
+/// itself, so its own change would be empty and read carried whatever the
+/// cut subject holds. A recorded commit this
 /// repository cannot resolve counts as dropped: unverifiable must not read as
 /// carried. So does the newest write itself: a subject held against a write
 /// this repository does not hold is refused ([`CompositionCheck::absent_write`]),
@@ -4094,7 +4267,6 @@ pub fn uncarried_recorded_members(
             successors.push(repo.change_id_of(member.as_str())?);
         }
     }
-    let cut_is_conflicted = !conflicted.is_empty();
     for member in delta.baseline.members() {
         if delta.parents.contains(member) {
             continue;
@@ -4134,15 +4306,14 @@ pub fn uncarried_recorded_members(
             continue;
         }
         let base = repo.fork_point(member, delta.trunk)?;
-        match subject.replay_outcome(path, base.as_str(), member.as_str())? {
-            RebaseOutcome::Empty => {}
-            RebaseOutcome::Conflicted if cut_is_conflicted => {
-                check.inconclusive.push(recorded_member(member, delta.tips));
-            }
-            RebaseOutcome::CleanNonEmpty | RebaseOutcome::Conflicted => {
-                check.dropped.push(recorded_member(member, delta.tips));
-            }
+        let recorded = recorded_member(member, delta.tips);
+        let lines = subject.member_lines(repo, &recorded.name, (&base, member))?;
+        match lines.reading {
+            Reading::Carried | Reading::CarriedForward => {}
+            Reading::Inconclusive => check.inconclusive.push(recorded),
+            Reading::Missing => check.dropped.push(recorded),
         }
+        check.members.push(lines);
     }
     Ok(check)
 }
@@ -5194,6 +5365,7 @@ mod members_tests {
             missing: vec!["dddddddddddd".to_owned()],
             unexplained: vec!["Cargo.lock".to_owned()],
             inconclusive: Vec::new(),
+            members: Vec::new(),
         };
 
         let rendered = render_members(&report(Some(audit)));
@@ -5286,6 +5458,7 @@ mod members_tests {
                 unexplained: Vec::new(),
                 inconclusive: Vec::new(),
                 carried: Vec::new(),
+                members: Vec::new(),
             }),
             notes: Vec::new(),
             problems: Vec::new(),

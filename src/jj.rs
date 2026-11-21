@@ -50,6 +50,7 @@ use crate::ids::{
     BookmarkRef, BranchName, ChangeId, CommitId, ReleaseScheme, RemoteName, WorkspaceName,
     is_our_release, pull_number_from_bookmark, short_id,
 };
+use crate::own_lines::{self, MemberLines, PathValues};
 
 #[derive(Debug, Error)]
 pub enum JjError {
@@ -790,6 +791,57 @@ impl Repo {
         Ok(self
             .common_ancestor(commits, trunk)?
             .unwrap_or_else(|| trunk.clone()))
+    }
+
+    /// What `release` holds of a member's own lines (spec R6, R9): the
+    /// change `tip` makes from `fork_point`, its fork point with the upstream
+    /// trunk ([`Self::fork_point`]), read path by path by [`own_lines`].
+    /// `label` names the member in the reading. Nothing is written: no
+    /// transaction is started.
+    pub fn member_lines(
+        &self,
+        label: &str,
+        (fork_point, tip): (&CommitId, &CommitId),
+        release: &CommitId,
+    ) -> Result<MemberLines, JjError> {
+        let release = self.commit(release.as_str())?.tree();
+        self.member_lines_in(label, (fork_point, tip), &release)
+    }
+
+    /// [`Self::member_lines`] against `release`, a tree that no published
+    /// commit need hold: a candidate's ([`Candidate::member_lines`]).
+    ///
+    /// The member's paths are those where the trees of `fork_point` and
+    /// `tip` differ, read with no copy records, so a rename is the deletion
+    /// of one path and the addition of another. Each path is read with the
+    /// three values there ([`own_value`]); a path where the release holds
+    /// the tip's own resolved value loses nothing, and its contents are not
+    /// read.
+    fn member_lines_in(
+        &self,
+        label: &str,
+        (fork_point, tip): (&CommitId, &CommitId),
+        release: &MergedTree,
+    ) -> Result<MemberLines, JjError> {
+        let fork_tree = self.commit(fork_point.as_str())?.tree();
+        let tip_tree = self.commit(tip.as_str())?.tree();
+        let store = self.repo.store();
+        let mut lines = MemberLines::new(label.to_owned(), tip.clone(), fork_point.clone());
+        for entry in collect_stream(fork_tree.diff_stream(&tip_tree, &EverythingMatcher)) {
+            let values = entry.values.map_err(|error| store_error(&error))?;
+            let held =
+                block_on(release.path_value(&entry.path)).map_err(|error| store_error(&error))?;
+            if values.after.is_resolved() && held == values.after {
+                continue;
+            }
+            lines.read_path(&PathValues {
+                path: entry.path.as_internal_file_string().to_owned(),
+                fork: own_value(store, &entry.path, &values.before)?,
+                tip: own_value(store, &entry.path, &values.after)?,
+                release: own_value(store, &entry.path, &held)?,
+            });
+        }
+        Ok(lines)
     }
 
     /// Replays the net tree effect of `base..revision` onto a target.
@@ -1953,16 +2005,6 @@ pub fn carries_work_past(repo: &Path, base: &CommitId, tip: &CommitId) -> Result
     Ok(states.lines().any(|line| line.trim() == "false"))
 }
 
-/// [`Repo::net_diff_outcome`] in a repository opened for the one probe.
-pub fn probe_net_diff(
-    repo: &Path,
-    base: &str,
-    revision: &str,
-    onto: &str,
-) -> Result<RebaseOutcome, JjError> {
-    Repo::open(repo)?.net_diff_outcome(base, revision, onto)
-}
-
 /// `revision`'s tree, as the synthetic commit of a replay of `base..revision`
 /// onto `target` carries it: every release log whose block `target` already
 /// holds keeps `base`'s content instead.
@@ -2138,6 +2180,33 @@ fn file_content(
     Ok(content.into_resolved().ok().map(Vec::from))
 }
 
+/// What `value`, one tree's value at `path`, holds as [`own_lines`] reads
+/// it: a conflict, a regular file with its executable bit and content, a
+/// symlink by its target, a submodule by its commit, or no file at all, for
+/// nothing there or a directory.
+fn own_value(
+    store: &jj_lib::store::Store,
+    path: &RepoPath,
+    value: &MergedTreeValue,
+) -> Result<own_lines::Value, JjError> {
+    Ok(match value.as_resolved() {
+        None => own_lines::Value::Conflict,
+        Some(Some(TreeValue::File { id, executable, .. })) => file_content(store, path, id)?
+            .map_or(own_lines::Value::Conflict, |content| {
+                own_lines::Value::File {
+                    executable: *executable,
+                    content,
+                }
+            }),
+        Some(Some(TreeValue::Symlink(id))) => own_lines::Value::Symlink {
+            target: block_on(store.read_symlink(path, id)).map_err(|error| store_error(&error))?,
+        },
+        Some(Some(TreeValue::GitSubmodule(id))) => own_lines::Value::Submodule { commit: id.hex() },
+        // Nothing at the path, or a directory: no file.
+        Some(_) => own_lines::Value::Absent,
+    })
+}
+
 /// `path` as a repository-internal path, `/`-separated.
 fn internal_path(path: &str) -> Result<&RepoPath, JjError> {
     RepoPath::from_internal_string(path).map_err(|error| JjError::Revision {
@@ -2173,8 +2242,9 @@ fn tree_holds(tree: &MergedTree, path: &str) -> Result<bool, JjError> {
 /// Replays `base..revision` onto a target and classifies the resulting content.
 ///
 /// A read, not a mutation, in the same dropped-transaction style as
-/// [`probe_net_diff`]. Each commit is placed where `jj duplicate -r <range> -d
-/// <onto>` puts it, by the rewrite that command runs (see [`replay_range`]).
+/// [`Repo::uncarried_resolution_paths`]. Each commit is placed where `jj
+/// duplicate -r <range> -d <onto>` puts it, by the rewrite that command runs
+/// (see [`replay_range`]).
 pub fn probe_revision(
     repo: &Path,
     base: &str,
@@ -4274,7 +4344,7 @@ pub struct CutSpec {
 /// The cut audit needs to READ the merge it is judging. Committing the merge
 /// first meant a failed audit had to compensate with an abandon, and a crash
 /// between the two operations stranded an anonymous merge. A candidate gives
-/// the audit a real commit to read — conflicts, member replays, tree drift —
+/// the audit a real commit to read — conflicts, member lines, tree drift —
 /// inside a transaction that simply evaporates afterwards: a failed audit
 /// writes nothing at all. [`Candidate::publish`] rebuilds the spec in a fresh
 /// transaction and refuses if the rebuilt tree differs from the audited one,
@@ -4367,19 +4437,15 @@ impl Candidate {
         conflicted_paths(&self.commit.tree())
     }
 
-    /// [`probe_net_diff`] with the candidate as the target: the net effect of
-    /// `base..revision`, replayed onto the candidate in its own scratch
-    /// transaction, with a release log the candidate's union already holds
-    /// left out ([`replayed_tree`]).
-    pub fn replay_outcome(&mut self, base: &str, revision: &str) -> Result<RebaseOutcome, JjError> {
-        let base = self.repo.commit(base)?;
-        let revision = self.repo.commit(revision)?;
-        // `base..revision` is empty exactly when the base already reaches the tip.
-        if self.repo.backend_is_ancestor(revision.id(), base.id())? {
-            return Ok(RebaseOutcome::Empty);
-        }
-        let tree = replayed_tree(&base.tree(), revision.tree(), &self.commit.tree())?;
-        replayed_outcome(&mut self.tx, (base.id(), tree), self.commit.id())
+    /// [`Repo::member_lines`] with the candidate as the release, read from
+    /// its tree in its scratch transaction.
+    pub fn member_lines(
+        &self,
+        label: &str,
+        (fork_point, tip): (&CommitId, &CommitId),
+    ) -> Result<MemberLines, JjError> {
+        self.repo
+            .member_lines_in(label, (fork_point, tip), &self.commit.tree())
     }
 
     /// The paths of the change `resolution` holds against `baseline`, the

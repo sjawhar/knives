@@ -20,7 +20,6 @@
 mod lab;
 
 use knives::config::RepoEntry;
-use knives::detect::landed::RebaseOutcome;
 use knives::ids::ReleaseScheme;
 use knives::jj::Repo;
 use lab::{
@@ -1710,7 +1709,7 @@ fn a_discarded_candidate_leaves_no_trace() {
 
     // When: the candidate is built, audit-shaped reads run against it, and it
     // is dropped without publishing.
-    let mut candidate = knives::jj::candidate_release(
+    let candidate = knives::jj::candidate_release(
         &lab.work,
         knives::jj::CutSpec {
             source: None,
@@ -1722,10 +1721,14 @@ fn a_discarded_candidate_leaves_no_trace() {
     .expect("build candidate");
     let conflicted = candidate.conflicted_files().expect("list conflicts");
     assert!(conflicted.is_empty(), "{conflicted:?}");
-    let replay = candidate
-        .replay_outcome(trunk.as_str(), alpha.as_str())
-        .expect("replay alpha onto the candidate");
-    assert_eq!(replay, RebaseOutcome::Empty, "alpha must be carried");
+    let read = candidate
+        .member_lines("feat/alpha", (&trunk, &alpha))
+        .expect("read alpha's lines in the candidate");
+    assert_eq!(
+        read.reading,
+        knives::own_lines::Reading::Carried,
+        "alpha must be carried: {read:?}"
+    );
     drop(candidate);
 
     // Then: no operation was written and no commit became visible.

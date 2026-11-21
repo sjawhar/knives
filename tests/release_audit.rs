@@ -1,12 +1,13 @@
 //! The content audit: does the cut carry what its members carry?
 //!
-//! Each member replays against the release from the captured tip, not the moved
-//! bookmark: an empty replay is content present, a non-empty one is content
-//! missing, and a conflict is inconclusive only when the cut itself is
-//! conflicted. Multi-commit members, adds-then-deletes, renames, regenerated
-//! lockfiles and a loss the previous release did not have are each judged; the
-//! previous release's recorded conflict resolutions survive a recut, a rebase
-//! and a drop.
+//! Each member is read against the release by its own lines, from its fork
+//! point with the upstream trunk to the captured tip, not the moved bookmark:
+//! a line the release does not hold is content missing, and a path the
+//! release leaves conflicted is inconclusive. Multi-commit members,
+//! adds-then-deletes, renames, regenerated lockfiles and a loss the previous
+//! release did not have, line by line, are each judged; the previous
+//! release's recorded conflict resolutions survive a recut, a rebase and a
+//! drop.
 
 #![allow(
     clippy::expect_used,
@@ -62,7 +63,10 @@ fn the_audit_catches_a_cut_missing_a_members_content() {
         knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: None,
-            trunk: &trunk,
+            upstream_trunk: &trunk,
+            trunk_parents: &[],
+            trunk_parent_base: None,
+            drift_trunk: &trunk,
             drift_from: None,
         },
     )
@@ -104,7 +108,10 @@ fn the_audit_passes_a_faithful_cut() {
         knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: None,
-            trunk: &trunk,
+            upstream_trunk: &trunk,
+            trunk_parents: &[],
+            trunk_parent_base: None,
+            drift_trunk: &trunk,
             drift_from: None,
         },
     )
@@ -165,7 +172,10 @@ fn divergence_the_previous_release_already_carried_is_not_a_loss() {
         knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: Some(&previous),
-            trunk: &trunk,
+            upstream_trunk: &trunk,
+            trunk_parents: &[],
+            trunk_parent_base: None,
+            drift_trunk: &trunk,
             drift_from: Some((
                 &previous,
                 knives::commands::release::DriftBase::PreviousRelease,
@@ -225,7 +235,10 @@ fn a_loss_the_previous_release_did_not_have_still_fails_the_audit() {
         knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: Some(&previous),
-            trunk: &trunk,
+            upstream_trunk: &trunk,
+            trunk_parents: &[],
+            trunk_parent_base: None,
+            drift_trunk: &trunk,
             drift_from: Some((
                 &previous,
                 knives::commands::release::DriftBase::PreviousRelease,
@@ -238,6 +251,100 @@ fn a_loss_the_previous_release_did_not_have_still_fails_the_audit() {
     assert_eq!(audit.missing, vec!["feat/beta".to_owned()], "{audit:?}");
     assert!(audit.carried.is_empty(), "{audit:?}");
     assert!(!audit.passed(), "{audit:?}");
+}
+
+#[test]
+fn a_previous_release_that_lacked_one_line_carries_forward_only_that_line() {
+    // Given: beta adds two lines; a previous release that lacks beta's first
+    // line, and a recut that lacks both.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta one\nbeta two\n");
+    let repo = Repo::open(&lab.work).expect("open");
+    let alpha = repo.resolve_commit("feat/alpha").expect("resolve alpha");
+    let beta = repo.resolve_commit("feat/beta").expect("resolve beta");
+    let trunk = repo.resolve_commit("main@origin").expect("resolve trunk");
+    let request = knives::commands::release::Cut {
+        name: "release/2026-08-04".to_owned(),
+        parents: vec![alpha.clone(), beta.clone()],
+        provenance: vec![
+            (alpha.clone(), "feat/alpha".to_owned()),
+            (beta.clone(), "feat/beta".to_owned()),
+        ],
+    };
+    let previous = committed_cut_fixture(&lab, &request, None).expect("build previous");
+    lab.jj_work([
+        "bookmark",
+        "create",
+        "lacking-previous",
+        "-r",
+        previous.as_str(),
+    ]);
+    lab.jj_work(["edit", "lacking-previous"]);
+    std::fs::write(lab.work.join("beta.txt"), "beta two\n").expect("drop beta's first line");
+    lab.jj_work(["bookmark", "set", "lacking-previous", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let previous = Repo::open(&lab.work)
+        .expect("reopen")
+        .resolve_commit("lacking-previous")
+        .expect("resolve the previous release");
+    let recut = knives::commands::release::Cut {
+        name: "release/2026-08-05".to_owned(),
+        ..request
+    };
+    let cut = committed_cut_fixture(&lab, &recut, Some(&previous)).expect("build recut");
+    lab.jj_work(["bookmark", "create", "lossier-recut", "-r", cut.as_str()]);
+    lab.jj_work(["edit", "lossier-recut"]);
+    std::fs::write(lab.work.join("beta.txt"), "").expect("drop beta's second line too");
+    lab.jj_work(["bookmark", "set", "lossier-recut", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let cut = Repo::open(&lab.work)
+        .expect("reopen")
+        .resolve_commit("lossier-recut")
+        .expect("resolve the recut");
+
+    // When: the recut is audited with the previous release in view.
+    let audit = knives::commands::release::audit_cut(
+        &lab.work,
+        &[
+            ("feat/alpha".to_owned(), alpha),
+            ("feat/beta".to_owned(), beta),
+        ],
+        knives::commands::release::CutSubject::Committed(&cut),
+        knives::commands::release::AuditContext {
+            previous: Some(&previous),
+            upstream_trunk: &trunk,
+            trunk_parents: &[],
+            trunk_parent_base: None,
+            drift_trunk: &trunk,
+            drift_from: Some((
+                &previous,
+                knives::commands::release::DriftBase::PreviousRelease,
+            )),
+        },
+    )
+    .expect("audit cut");
+
+    // Then: beta reads missing, not carried forward: of its two lost lines,
+    // only the first is carried forward, and only the second is named.
+    assert_eq!(audit.missing, vec!["feat/beta".to_owned()], "{audit:?}");
+    assert!(audit.carried.is_empty(), "{audit:?}");
+    let read = audit
+        .members
+        .iter()
+        .find(|lines| lines.label == "feat/beta")
+        .unwrap_or_else(|| panic!("beta was not read: {audit:?}"));
+    let lost: Vec<(Option<u32>, bool)> = read
+        .lost
+        .iter()
+        .map(|lost| (lost.line, lost.carried_forward))
+        .collect();
+    assert_eq!(lost, vec![(Some(1), true), (Some(2), false)], "{audit:?}");
+    assert_eq!(
+        audit.lost_lines_of("feat/beta"),
+        vec!["      beta.txt:2: added line lost ‹beta two›".to_owned()],
+        "{audit:?}"
+    );
 }
 
 #[test]
@@ -275,7 +382,10 @@ fn the_audit_passes_a_faithful_multi_commit_member_without_inconclusive() {
         knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: None,
-            trunk: &trunk,
+            upstream_trunk: &trunk,
+            trunk_parents: &[],
+            trunk_parent_base: None,
+            drift_trunk: &trunk,
             drift_from: None,
         },
     )
@@ -339,7 +449,10 @@ fn the_audit_passes_when_a_member_adds_then_deletes_a_file() {
         knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: None,
-            trunk: &trunk,
+            upstream_trunk: &trunk,
+            trunk_parents: &[],
+            trunk_parent_base: None,
+            drift_trunk: &trunk,
             drift_from: None,
         },
     )
@@ -392,7 +505,10 @@ fn the_audit_catches_a_member_whose_early_range_content_is_missing() {
         knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: None,
-            trunk: &trunk,
+            upstream_trunk: &trunk,
+            trunk_parents: &[],
+            trunk_parent_base: None,
+            drift_trunk: &trunk,
             drift_from: None,
         },
     )
@@ -438,7 +554,10 @@ fn the_audit_passes_when_a_member_renames_a_file() {
         knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: None,
-            trunk: &trunk,
+            upstream_trunk: &trunk,
+            trunk_parents: &[],
+            trunk_parent_base: None,
+            drift_trunk: &trunk,
             drift_from: None,
         },
     )
@@ -488,7 +607,10 @@ fn the_audit_fails_when_a_regenerated_lockfile_loses_member_content() {
         knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: None,
-            trunk: &trunk,
+            upstream_trunk: &trunk,
+            trunk_parents: &[],
+            trunk_parent_base: None,
+            drift_trunk: &trunk,
             drift_from: None,
         },
     )
@@ -533,7 +655,10 @@ fn the_audit_judges_the_captured_tip_not_the_moved_bookmark() {
         knives::commands::release::CutSubject::Committed(&cut),
         knives::commands::release::AuditContext {
             previous: None,
-            trunk: &trunk,
+            upstream_trunk: &trunk,
+            trunk_parents: &[],
+            trunk_parent_base: None,
+            drift_trunk: &trunk,
             drift_from: None,
         },
     )
