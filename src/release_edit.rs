@@ -47,19 +47,29 @@ impl ReleaseEdit {
     }
 }
 
-/// What an edit decided: a new parent set to write with the delta that describes
-/// it, or an already-reported end.
+/// What an edit decided: a new parent set to write, or an already-reported
+/// end.
 enum EditOutcome {
-    Done {
-        parents: Vec<knives::ids::CommitId>,
-        delta: String,
-        /// The target of a drop whose parent no remaining member's history
-        /// carries: whether the release loses its content is read from the
-        /// written tree ([`apply_edit`]).
-        uncarried: Option<String>,
-    },
+    Done(EditDone),
     Settled(Exit),
 }
+
+/// A new parent set to write, with the delta that describes it
+/// ([`apply_edit`]).
+struct EditDone {
+    parents: Vec<knives::ids::CommitId>,
+    delta: String,
+    /// The target of a drop whose parent no remaining member's history
+    /// carries: whether the release loses its content is read from the
+    /// written tree ([`apply_edit`]).
+    uncarried: Option<String>,
+    /// Each parent the edit brings in ([`BroughtParent`]).
+    brought: Vec<BroughtParent>,
+}
+
+/// A parent an edit brings in, with the parent it replaces for an advance:
+/// what spec R11's check reads as brought in ([`knives::jj::Brought`]).
+type BroughtParent = (CommitId, Option<CommitId>);
 
 /// The release in hand: a flat merge of feature and fix branches.
 ///
@@ -134,6 +144,9 @@ struct EditContext<'a> {
     /// the release in hand against its recorded writes
     /// ([`release::unchecked_suffix`]); empty otherwise.
     unchecked: &'a str,
+    /// The reason `--allow-loss` gave: with it, an edit that spec R11's
+    /// check refuses is written, and its loss recorded ([`apply_edit`]).
+    allow_loss: Option<&'a str>,
     /// The release's last recorded parent set, from this repository's ledger.
     ///
     /// Ancestry and change ids cover a branch that grew or was rebased by jj. A
@@ -426,11 +439,12 @@ impl EditContext<'_> {
     }
 }
 
-/// Apply one stated change to the fork's release in hand.
+/// Apply one stated change to the fork's release in hand, with the reason
+/// `--allow-loss` gave, where it gave one ([`apply_edit`]).
 pub(crate) fn run_release_edit(
     fork: &Fork<'_>,
     extra_consumers: &[&std::path::Path],
-    change: &ReleaseEdit,
+    change: (&ReleaseEdit, Option<&str>),
     bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let mut locals = extra_consumers
@@ -632,9 +646,11 @@ fn refuse_if_frozen(
 /// gate a rebase has. A file whose conflict the release resolved keeps that
 /// resolution only where the plain merge of the new parents leaves the same
 /// conflict there. Elsewhere the write puts that plain merge in the file and
-/// names the file ([`knives::jj::write_edited_release`]), whether or not an
-/// adopt recorded the resolution. Every conflict the write leaves is
-/// reported.
+/// names the file ([`knives::jj::edit_candidate`]), whether or not an adopt
+/// recorded the resolution. Every conflict the write leaves is reported. The
+/// write is checked before it is made, and an edit that would lose a
+/// remaining member's lines writes nothing, unless `--allow-loss` gave a
+/// reason ([`apply_edit`]).
 #[allow(
     clippy::too_many_arguments,
     reason = "release-edit state and the shared consumer-scan collaborators are independently owned command inputs"
@@ -642,7 +658,7 @@ fn refuse_if_frozen(
 fn edit_release(
     fork: &Fork<'_>,
     locals: &[std::path::PathBuf],
-    change: &ReleaseEdit,
+    (change, allow_loss): (&ReleaseEdit, Option<&str>),
     forge: &dyn knives::consumer_pins::ConsumerPinSource,
     cache_root: Option<&std::path::Path>,
     heads: &knives::consumer_pins::ConsumerHeadMemo,
@@ -714,6 +730,7 @@ fn edit_release(
         recorded: last_recorded_parents(&ledger, &release.name),
         bound,
         unchecked: &unchecked,
+        allow_loss,
         stacked: StackedHistoryContext {
             repo: &opened,
             trunks: &release.trunk_tips,
@@ -730,30 +747,27 @@ fn edit_release(
             advance_edit(&context, entry, branches, from.as_deref())?
         }
     };
-    let (parents, delta, uncarried) = match outcome {
+    let done = match outcome {
         EditOutcome::Settled(exit) => return Ok(exit),
-        EditOutcome::Done {
-            parents,
-            delta,
-            uncarried,
-        } => (parents, delta, uncarried),
+        EditOutcome::Done(done) => done,
     };
-    release::with_last_write_headings(|last| {
-        apply_edit(
-            &context,
-            fork,
-            (&parents, &delta, uncarried.as_deref()),
-            last,
-        )
-    })
+    release::with_last_write_headings(|last| apply_edit(&context, fork, &done, last))
 }
 
 /// Write the edited release — duplicated onto its new parent set by spec
-/// R11's rule ([`knives::jj::write_edited_release`]), described, its name
-/// moved — record the parent set in the ledger, and report. Each file the
-/// rule wrote as the plain merge of the new parents is named after the
-/// lines on the replaced commit ([`plain_merged_lines`]), before the
-/// conflict report.
+/// R11's rule ([`knives::jj::edit_candidate`]), described, its name moved —
+/// record the parent set in the ledger, and report. Each file the rule
+/// wrote as the plain merge of the new parents is named after the lines on
+/// the replaced commit ([`plain_merged_lines`]), before the conflict report.
+///
+/// The write is built first as a scratch candidate and checked
+/// ([`edit_losses`]). Where the check counts a line of a remaining member
+/// that the write would lose, the edit names each path, member and line and
+/// the remedy, writes nothing, and exits 3 ([`refusal_lines`]). With
+/// `--allow-loss` it writes the candidate, names the same lines as lost
+/// ([`allowed_loss_lines`]), and records the loss in its ledger event
+/// ([`loss_event_text`]). Where the check counts nothing, the flag changes
+/// nothing.
 ///
 /// `uncarried` is the target of a drop whose parent no remaining member's
 /// history carries. Whether the release lost that content is read from the
@@ -768,47 +782,54 @@ fn edit_release(
 fn apply_edit(
     context: &EditContext<'_>,
     fork: &Fork<'_>,
-    (new_parents, delta, uncarried): (&[knives::ids::CommitId], &str, Option<&str>),
+    done: &EditDone,
     last: &mut Option<release::ReportedWrite>,
 ) -> anyhow::Result<Exit> {
     let (repo, opened, release) = (context.repo, context.opened, context.release);
-    let entry = fork.entry;
+    let (entry, new_parents, delta) = (fork.entry, done.parents.as_slice(), done.delta.as_str());
     let provenance = release::parent_sources(opened, entry, &entry.release_scheme(), new_parents)?;
     let message = release::composition_message(&release.name, &provenance, delta);
-    let (written, plain_merged) = knives::jj::write_edited_release(
-        &fork.checkout.path,
-        &knives::jj::ReleaseWrite {
-            source: Some(&release.commit),
-            parents: new_parents,
-            // What the release composes leaves its carriers out.
-            measured: knives::jj::Measured::WithoutCarriers(&release.carriers),
-            message: Some(&message),
-            bookmark: Some(&release.name),
-            publish_remote: Some(entry.publish_remote()),
-            earlier: release.writes.commits(),
-            operation: &format!("knives: {}: {delta}", release.name),
-        },
-    )?;
+    let operation = format!("knives: {}: {delta}", release.name);
+    let write = knives::jj::ReleaseWrite {
+        source: Some(&release.commit),
+        parents: new_parents,
+        // What the release composes leaves its carriers out.
+        measured: knives::jj::Measured::WithoutCarriers(&release.carriers),
+        message: Some(&message),
+        bookmark: Some(&release.name),
+        publish_remote: Some(entry.publish_remote()),
+        earlier: release.writes.commits(),
+        operation: &operation,
+    };
+    let candidate = knives::jj::edit_candidate(&fork.checkout.path, &write)?;
+    let losses = edit_losses(context, &candidate, (&provenance, &done.brought))?;
+    if !losses.is_empty() && context.allow_loss.is_none() {
+        for line in refusal_lines(repo, &release.name, &losses) {
+            println!("{line}");
+        }
+        return Ok(Exit::Incomplete);
+    }
+    let (written, plain_merged) = candidate.publish()?;
     let reported = &*last.insert(release::ReportedWrite::read(
         &fork.checkout.path,
         written.commit.clone(),
     ));
-    let created = &written.commit;
     record_edit_event(
         fork,
         opened,
         &EditRecord {
             release: &release.name,
             delta,
-            created,
+            created: &written.commit,
             change: &written.change,
             provenance: &provenance,
             unions: &written.unions,
+            loss: &loss_event_text(&losses, context.allow_loss),
             unchecked: context.unchecked,
         },
         context.bound,
     )?;
-    if let Some(target) = uncarried {
+    if let Some(target) = &done.uncarried {
         let shown_target = inline_human_text(target);
         if written.same_tree_as_source {
             println!(
@@ -832,7 +853,10 @@ fn apply_edit(
         inline_human_text(delta)
     );
     report_replaced(repo, &release.name, &written);
-    for line in plain_merged_lines(repo, &plain_merged) {
+    for line in plain_merged_lines(repo, &plain_merged)
+        .into_iter()
+        .chain(allowed_loss_lines(repo, &release.name, &losses))
+    {
         println!("{line}");
     }
     println!(
@@ -840,6 +864,138 @@ fn apply_edit(
         release::conflict_report(&release.name, reported.conflicts(), &written.unions)
     );
     Ok(Exit::Ok)
+}
+
+/// What a remaining member is to spec R11's check, its fork points read
+/// ([`edit_losses`], [`knives::jj::Brought`]).
+enum BroughtFrom {
+    Nothing,
+    Whole,
+    /// An advanced member: the fork point of its old tip, and that tip.
+    Since(CommitId, CommitId),
+}
+
+/// Spec R11's check of `candidate`
+/// ([`knives::jj::EditCandidate::lost_lines`]). Each remaining member is a
+/// parent of `provenance`, named as the release's description names it,
+/// and read from its fork point with the upstream trunk to its tip;
+/// `brought` gives each parent the edit brings in, with the one it replaces
+/// for an advance.
+fn edit_losses(
+    context: &EditContext<'_>,
+    candidate: &knives::jj::EditCandidate<'_>,
+    (provenance, brought): (&[(String, CommitId)], &[BroughtParent]),
+) -> anyhow::Result<Vec<knives::jj::EditLoss>> {
+    let opened = context.opened;
+    let trunk = opened.resolve_commit(&context.entry.trunk_ref())?;
+    let mut read = Vec::with_capacity(provenance.len());
+    for (_, tip) in provenance {
+        let from = match brought.iter().find(|(new, _)| new == tip) {
+            None => BroughtFrom::Nothing,
+            Some((_, None)) => BroughtFrom::Whole,
+            Some((_, Some(old))) => {
+                BroughtFrom::Since(opened.fork_point(old, &trunk)?, old.clone())
+            }
+        };
+        read.push((opened.fork_point(tip, &trunk)?, from));
+    }
+    let members: Vec<knives::jj::EditMember<'_>> = provenance
+        .iter()
+        .zip(&read)
+        .map(
+            |((label, tip), (fork_point, from))| knives::jj::EditMember {
+                label,
+                change: (fork_point, tip),
+                brought: match from {
+                    BroughtFrom::Nothing => knives::jj::Brought::Nothing,
+                    BroughtFrom::Whole => knives::jj::Brought::Whole,
+                    BroughtFrom::Since(old_fork_point, old) => {
+                        knives::jj::Brought::Since((old_fork_point, old))
+                    }
+                },
+            },
+        )
+        .collect();
+    Ok(candidate.lost_lines(&members)?)
+}
+
+/// The lines an edit prints when spec R11's check counts lines of a
+/// remaining member that its write would lose: for each path and member,
+/// that it refuses and writes nothing, then each counted line; then the
+/// remedy. The release, each path, member and line are read from the
+/// repository, so each is escaped.
+fn refusal_lines(repo: &RepoName, release: &str, losses: &[knives::jj::EditLoss]) -> Vec<String> {
+    let shown_release = inline_human_text(release);
+    let mut lines = Vec::new();
+    for loss in losses {
+        lines.push(format!(
+            "{repo}: refusing to write {shown_release}: {} would lose {}'s lines; nothing \
+             written",
+            inline_human_text(&loss.path),
+            inline_human_text(&loss.lines.label)
+        ));
+        lines.extend(release::lost_lines(&loss.lines, release::LOST_LINE_INDENT));
+    }
+    lines.push(format!(
+        "{repo}: run the edit again with `--allow-loss <reason>`, put the named lines back by \
+         hand, and record that with `knives release adopt {} --why <reason>`",
+        shell_word(release)
+    ));
+    lines
+}
+
+/// The lines an `--allow-loss` edit prints for the lines it wrote without:
+/// for each path and member, that they are lost by this write, then each
+/// line; then how to put them back. Nothing where it lost none. Each text
+/// is read from the repository, so it is escaped.
+fn allowed_loss_lines(
+    repo: &RepoName,
+    release: &str,
+    losses: &[knives::jj::EditLoss],
+) -> Vec<String> {
+    if losses.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    for loss in losses {
+        lines.push(format!(
+            "{repo}: {}: {}'s lines lost by this write (--allow-loss)",
+            inline_human_text(&loss.path),
+            inline_human_text(&loss.lines.label)
+        ));
+        lines.extend(release::lost_lines(&loss.lines, release::LOST_LINE_INDENT));
+    }
+    lines.push(format!(
+        "{repo}: put the named lines back by hand and record that with `knives release adopt {} \
+         --why <reason>`",
+        shell_word(release)
+    ));
+    lines
+}
+
+/// `; lost: <path> (<member>: <n> line(s))` for each path and member whose
+/// lines an `--allow-loss` write lost, then `; why lost: <reason>`; nothing
+/// where it lost none, or where no reason allowed a loss. An edit's event
+/// holds it after its delta and before its parents ([`record_edit_event`]).
+/// The ledger keeps each text raw.
+fn loss_event_text(losses: &[knives::jj::EditLoss], reason: Option<&str>) -> String {
+    use std::fmt::Write as _;
+    let Some(reason) = reason.filter(|_| !losses.is_empty()) else {
+        return String::new();
+    };
+    let mut text = String::new();
+    for loss in losses {
+        // Writing to a String does not fail.
+        let _ = write!(
+            text,
+            "; lost: {} ({}: {} line(s))",
+            loss.path,
+            loss.lines.label,
+            loss.lines.lost.len()
+        );
+    }
+    let _ = write!(text, "; why lost: {reason}");
+    text
 }
 
 /// The lines an edit prints for each file its write put as the plain merge
@@ -999,8 +1155,9 @@ pub(crate) fn release_writes(
 
 /// What one release edit wrote: the name, the delta, the new merge with its
 /// change id, its parent set with the branch each parent came from, the
-/// release logs it unioned, and the mark of a release in hand knives could
-/// not check ([`release::unchecked_suffix`]).
+/// release logs it unioned, the loss an `--allow-loss` write recorded
+/// ([`loss_event_text`]), and the mark of a release in hand knives could not
+/// check ([`release::unchecked_suffix`]).
 pub(crate) struct EditRecord<'a> {
     pub(crate) release: &'a str,
     pub(crate) delta: &'a str,
@@ -1008,6 +1165,8 @@ pub(crate) struct EditRecord<'a> {
     pub(crate) change: &'a knives::ids::ChangeId,
     pub(crate) provenance: &'a [(String, knives::ids::CommitId)],
     pub(crate) unions: &'a [knives::jj::UnionedFile],
+    /// `; lost: …` and `; why lost: …`, or empty.
+    pub(crate) loss: &'a str,
     pub(crate) unchecked: &'a str,
 }
 
@@ -1016,7 +1175,8 @@ pub(crate) struct EditRecord<'a> {
 /// rebase that left no ancestry or change id behind. Like a cut event, it names
 /// the written commit, its change id and its parents, and the commit leads the
 /// evidence: it is the position `audit` holds the release against. The release
-/// logs the edit unioned close the text ([`union_event_text`]).
+/// logs the edit unioned close the text ([`union_event_text`]). The loss an
+/// `--allow-loss` write recorded follows the delta, before the parents.
 pub(crate) fn record_edit_event(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
@@ -1041,7 +1201,7 @@ pub(crate) fn record_edit_event(
                     record.release,
                     (record.created, record.change),
                     record.provenance,
-                    record.delta
+                    &format!("{}{}", record.delta, record.loss)
                 ),
                 union_event_text(record.unions),
                 record.unchecked
@@ -1054,7 +1214,10 @@ pub(crate) fn record_edit_event(
 
 /// An edit event's text through its parents: `edited <release> as <commit>
 /// (change <id>) with <n> parent(s): <delta>; parents: <provenance>`. A
-/// write's unions and its unchecked mark close the text after it.
+/// write's unions and its unchecked mark close the text after it. The delta
+/// an edit's event holds ends with the loss an `--allow-loss` write
+/// recorded ([`record_edit_event`]), so a reason that holds `; unchecked: …`
+/// or `; parents: …` is never read as the event's mark or its parents.
 pub(crate) fn edit_event_text(
     release: &str,
     (created, change): (&knives::ids::CommitId, &knives::ids::ChangeId),
@@ -1263,14 +1426,14 @@ fn include_edit(
         return Ok(EditOutcome::Settled(Exit::Incomplete));
     }
     let mut parents = release.parents.clone();
-    parents.push(tip);
+    parents.push(tip.clone());
     let why = why.map_or_else(String::new, |why| format!(" ({why})"));
-    let delta = format!("included {target}{why}");
-    Ok(EditOutcome::Done {
+    Ok(EditOutcome::Done(EditDone {
         parents,
-        delta,
+        delta: format!("included {target}{why}"),
         uncarried: None,
-    })
+        brought: vec![(tip, None)],
+    }))
 }
 
 /// Remove one member parent. The branch and its bookmark are untouched.
@@ -1323,11 +1486,12 @@ fn drop_edit(context: &EditContext<'_>, target: &str, why: &str) -> anyhow::Resu
                 }
             }
             let delta = format!("dropped {target}: {why}");
-            Ok(EditOutcome::Done {
+            Ok(EditOutcome::Done(EditDone {
                 parents,
                 delta,
                 uncarried: (!carried_elsewhere).then(|| target.to_owned()),
-            })
+                brought: Vec::new(),
+            }))
         }
         many => {
             let listed: Vec<&str> = many.iter().map(CommitId::short).collect();
@@ -1399,6 +1563,16 @@ fn advance_edit(
         }
         return Ok(EditOutcome::Settled(Exit::Ok));
     }
+    // Each member moved, with the parent it replaces: each advance keeps the
+    // parents' places.
+    let brought = context
+        .release
+        .parents
+        .iter()
+        .zip(&parents)
+        .filter(|(old, new)| old != new)
+        .map(|(old, new)| (new.clone(), Some(old.clone())))
+        .collect();
     // Stacked members advanced to one tip collapse into a single parent.
     let mut deduped = Vec::new();
     for parent in parents {
@@ -1407,11 +1581,12 @@ fn advance_edit(
         }
     }
     let delta = format!("advanced {}", moved.join(", "));
-    Ok(EditOutcome::Done {
+    Ok(EditOutcome::Done(EditDone {
         parents: deduped,
         delta,
         uncarried: None,
-    })
+        brought,
+    }))
 }
 
 /// Advance every member whose branch has moved on. `None` is a refusal that
@@ -1725,6 +1900,126 @@ mod tests {
                  more",
             ]
         );
+    }
+
+    /// What an edit loses of `member` at `path`: one added line, at its
+    /// tip's line 2.
+    fn loss(path: &str, member: &str, text: &str) -> knives::jj::EditLoss {
+        let mut lines = knives::own_lines::MemberLines::new(
+            member.to_owned(),
+            CommitId::new("tip"),
+            CommitId::new("fork"),
+        );
+        lines.reading = knives::own_lines::Reading::Missing;
+        lines.lost = vec![knives::own_lines::Lost {
+            path: path.to_owned(),
+            kind: knives::own_lines::LostKind::Added,
+            line: Some(2),
+            text: Some(text.to_owned()),
+            carried_forward: false,
+        }];
+        knives::jj::EditLoss {
+            path: path.to_owned(),
+            lines,
+        }
+    }
+
+    #[test]
+    fn a_refusal_names_each_path_member_and_line_and_the_remedy_escaped() {
+        // Given: an edit that would lose a line of each of two members, one
+        // path holding a C1 character, as a path read from a tree can.
+        let losses = [
+            loss("CHANGELOG.md", "feat/a", "- a entry"),
+            loss("n\u{9b}2J.md", "feat/q", "- q entry"),
+        ];
+
+        // When: the refusal's lines are read.
+        let lines = refusal_lines(&RepoName::new("demo"), "release/2026-08-04", &losses);
+
+        // Then: each path and member, its line, then the remedy; no line holds
+        // a control character.
+        for line in &lines {
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+        }
+        assert_eq!(
+            lines,
+            [
+                "demo: refusing to write release/2026-08-04: CHANGELOG.md would lose feat/a's \
+                 lines; nothing written",
+                "      CHANGELOG.md:2: added line lost ‹- a entry›",
+                "demo: refusing to write release/2026-08-04: n\u{fffd}2J.md would lose feat/q's \
+                 lines; nothing written",
+                "      n\u{fffd}2J.md:2: added line lost ‹- q entry›",
+                "demo: run the edit again with `--allow-loss <reason>`, put the named lines back \
+                 by hand, and record that with `knives release adopt release/2026-08-04 --why \
+                 <reason>`",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_allowed_loss_names_its_lines_and_how_to_put_them_back() {
+        let losses = [loss("CHANGELOG.md", "feat/a", "- a entry")];
+        let repo = RepoName::new("demo");
+
+        // A write that lost lines names them, then the adopt that records
+        // them put back.
+        assert_eq!(
+            allowed_loss_lines(&repo, "release/2026-08-04", &losses),
+            [
+                "demo: CHANGELOG.md: feat/a's lines lost by this write (--allow-loss)",
+                "      CHANGELOG.md:2: added line lost ‹- a entry›",
+                "demo: put the named lines back by hand and record that with `knives release \
+                 adopt release/2026-08-04 --why <reason>`",
+            ]
+        );
+        // A write that lost none prints nothing.
+        assert_eq!(
+            allowed_loss_lines(&repo, "release/2026-08-04", &[]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn the_loss_follows_the_delta_before_the_parents_and_holds_no_mark() {
+        // Given: a drop that `--allow-loss` let lose a line of feat/a, with a
+        // reason that ends with an unchecked mark and holds `; parents: `.
+        let losses = [loss("CHANGELOG.md", "feat/a", "- a entry")];
+        let reason = "see; parents: x; unchecked: no record";
+        let lost = loss_event_text(&losses, Some(reason));
+
+        // When: the event's text is written, over a checked release.
+        let text = edit_event_text(
+            "release/2026-08-04",
+            (
+                &CommitId::new("a".repeat(40)),
+                &ChangeId::new("k".repeat(32)),
+            ),
+            &[("feat/m".to_owned(), CommitId::new("b".repeat(40)))],
+            &format!("dropped feat/d: x{lost}"),
+        );
+
+        // Then: the loss and its reason follow the delta and come before
+        // knives' own parents, which stay last.
+        assert_eq!(
+            lost,
+            "; lost: CHANGELOG.md (feat/a: 1 line(s)); why lost: see; parents: x; unchecked: no \
+             record"
+        );
+        assert!(
+            text.contains(&format!(
+                "parent(s): dropped feat/d: x{lost}; parents: feat/m@"
+            )),
+            "{text}"
+        );
+        assert_eq!(
+            text.rsplit_once("; parents: ").map(|(_, parents)| parents),
+            Some("feat/m@bbbbbbbbbbbb")
+        );
+        assert!(!text.ends_with(reason), "{text}");
+        // And: no loss, or no reason, writes nothing.
+        assert_eq!(loss_event_text(&[], Some(reason)), "");
+        assert_eq!(loss_event_text(&losses, None), "");
     }
 
     #[test]

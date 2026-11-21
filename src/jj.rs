@@ -13,7 +13,8 @@ use jj_lib::backend::{
 use jj_lib::config::{ConfigLayer, ConfigResolutionContext, ConfigSource, StackedConfig};
 use jj_lib::conflict_labels::ConflictLabels;
 use jj_lib::conflicts::{
-    ConflictMarkerStyle, ConflictMaterializeOptions, MaterializedTreeValue, extract_as_single_hunk,
+    ConflictMarkerStyle, ConflictMaterializeOptions, MaterializedTreeValue,
+    choose_materialized_conflict_marker_len, extract_as_single_hunk,
     materialize_merge_result_to_bytes, materialize_tree_value,
 };
 use jj_lib::default_backend_factories::{
@@ -97,6 +98,10 @@ pub enum JjError {
 
 /// Bound the passive operation walk so status stays proportional to current work.
 pub const MAX_ACTIVITY_OPS: usize = 200;
+
+/// A member's own change: each path where its fork point's tree and its
+/// tip's differ, with the two values there.
+type ChangeValues = BTreeMap<RepoPathBuf, (MergedTreeValue, MergedTreeValue)>;
 
 #[derive(Debug)]
 pub struct Repo {
@@ -826,6 +831,43 @@ impl Repo {
             });
         }
         Ok(lines)
+    }
+
+    /// Each path where the trees of `fork_point` and `tip` differ, read with
+    /// no copy records, with the values there: a member's own change, as
+    /// [`Self::member_lines`] reads it.
+    fn change_values(
+        &self,
+        (fork_point, tip): (&CommitId, &CommitId),
+    ) -> Result<ChangeValues, JjError> {
+        let fork_tree = self.commit(fork_point.as_str())?.tree();
+        let tip_tree = self.commit(tip.as_str())?.tree();
+        let mut change = BTreeMap::new();
+        for entry in collect_stream(fork_tree.diff_stream(&tip_tree, &EverythingMatcher)) {
+            let values = entry.values.map_err(|error| store_error(&error))?;
+            change.insert(entry.path, (values.before, values.after));
+        }
+        Ok(change)
+    }
+
+    /// Each line of the change `tip` makes from `fork_point` at `path`
+    /// ([`own_lines::change_lines`]).
+    fn change_lines_at(
+        &self,
+        path: &RepoPath,
+        (fork_point, tip): (&CommitId, &CommitId),
+    ) -> Result<Vec<own_lines::Lost>, JjError> {
+        let store = self.repo.store();
+        let value_at = |commit: &CommitId| -> Result<own_lines::Value, JjError> {
+            let tree = self.commit(commit.as_str())?.tree();
+            let value = block_on(tree.path_value(path)).map_err(|error| store_error(&error))?;
+            own_value(store, path, &value)
+        };
+        Ok(own_lines::change_lines(
+            path.as_internal_file_string(),
+            &value_at(fork_point)?,
+            &value_at(tip)?,
+        ))
     }
 
     /// The paths of the change `resolution` holds against `baseline` that
@@ -3007,8 +3049,8 @@ pub struct ReplacedRelease {
 }
 
 /// A file an edit wrote as the plain merge of its new parents
-/// ([`write_edited_release`]): the release's own change there answers a
-/// conflict that this merge does not leave (spec R11).
+/// ([`EditCandidate`]): the release's own change there answers a conflict
+/// that this merge does not leave (spec R11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlainMergedFile {
     /// The repository-internal path, `/`-separated.
@@ -3058,55 +3100,490 @@ pub struct PlainMergedFile {
 /// same operation hides each such head that is an earlier write of the name
 /// or superseded ([`hide_exposed`]).
 pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWritten, JjError> {
-    written_release(repo, write, false).map(|(written, _)| written)
-}
-
-/// [`write_release`] for an edit of a release: `include`, `drop` or `advance`.
-///
-/// The same one operation writes the duplicate by spec R11's rule
-/// ([`ruled_tree`]). A file whose conflict the release resolved keeps that
-/// resolution only where the plain merge of the new parents leaves the same
-/// conflict there. Elsewhere it is written as that plain merge, and comes
-/// back beside what [`write_release`] returns.
-pub fn write_edited_release(
-    repo: &Path,
-    write: &ReleaseWrite<'_>,
-) -> Result<(ReleaseWritten, Vec<PlainMergedFile>), JjError> {
-    written_release(repo, write, true)
-}
-
-/// The one body of [`write_release`] and, where `edit` holds,
-/// [`write_edited_release`].
-fn written_release(
-    repo: &Path,
-    write: &ReleaseWrite<'_>,
-    edit: bool,
-) -> Result<(ReleaseWritten, Vec<PlainMergedFile>), JjError> {
     validate_parents(write.source, write.parents)?;
     let repo = Repo::open_to_write(repo)?;
-    let (parent_commits, parent_ids) = resolved_parents(&repo, write.parents)?;
     let mut tx = repo.repo.start_transaction();
-    let (written, source, unions, plain_merged) = if let Some(source) = write.source {
-        let source = repo.commit(source.as_str())?;
-        let measured = match write.measured {
-            Measured::WithoutCarriers(carriers) => without_carriers(&source, carriers),
+    let built = built_release(&repo, &mut tx, write, false)?;
+    finished_release(&repo, tx, write, built).map(|(written, _)| written)
+}
+
+/// An edit of a release (`include`, `drop` or `advance`) built in a scratch
+/// transaction that is never committed, so that spec R11's check reads it
+/// before anything is written ([`EditCandidate::lost_lines`]).
+///
+/// The candidate is [`write_release`]'s commit written by spec R11's rule
+/// ([`ruled_tree`]): a file whose conflict the release resolved keeps that
+/// resolution only where the plain merge of the new parents leaves the same
+/// conflict there, and elsewhere it is written as that plain merge. Then
+/// the release-log union runs, as on every write. [`EditCandidate::publish`]
+/// rebuilds it in a fresh transaction, refuses if the rebuilt tree differs
+/// from the checked one, as [`Candidate::publish`] does, and then makes the
+/// write as [`write_release`] makes it, in one operation. A candidate that
+/// is dropped writes nothing: the operation log and every bookmark stay as
+/// they were.
+pub struct EditCandidate<'w> {
+    repo: Repo,
+    tx: Transaction,
+    write: &'w ReleaseWrite<'w>,
+    /// The release in hand: the write's source.
+    source: jj_lib::commit::Commit,
+    /// The written commit, in the scratch transaction.
+    commit: jj_lib::commit::Commit,
+    /// The plain merge of the new parents, with no release-log union.
+    plain: MergedTree,
+}
+
+impl std::fmt::Debug for EditCandidate<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EditCandidate")
+            .field("write", self.write)
+            .field("commit", self.commit.id())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Build an edit's `write` in a scratch transaction, for spec R11's check
+/// ([`EditCandidate`]). An edit duplicates the release in hand, so the
+/// write must name its source.
+pub fn edit_candidate<'w>(
+    repo: &Path,
+    write: &'w ReleaseWrite<'w>,
+) -> Result<EditCandidate<'w>, JjError> {
+    validate_parents(write.source, write.parents)?;
+    let repo = Repo::open(repo)?;
+    let mut tx = repo.repo.start_transaction();
+    let built = built_release(&repo, &mut tx, write, true)?;
+    let (Some(source), Some(plain)) = (built.source, built.plain) else {
+        return Err(JjError::Revision {
+            revision: commit_id(built.written.id()).as_str().to_owned(),
+            detail: "an edit duplicates the release in hand, and this write names none".to_owned(),
+        });
+    };
+    Ok(EditCandidate {
+        repo,
+        tx,
+        write,
+        source,
+        commit: built.written,
+        plain,
+    })
+}
+
+/// A remaining member of an edited release, as spec R11's check reads it
+/// ([`EditCandidate::lost_lines`]).
+#[derive(Debug, Clone, Copy)]
+pub struct EditMember<'a> {
+    /// How the report names the member.
+    pub label: &'a str,
+    /// Its own change: from its fork point with the upstream trunk to its
+    /// tip (spec R6).
+    pub change: (&'a CommitId, &'a CommitId),
+    /// What of that change this edit brings into the release.
+    pub brought: Brought<'a>,
+}
+
+/// What of a member's change an edit brings into the release (spec R11's
+/// second condition).
+#[derive(Debug, Clone, Copy)]
+pub enum Brought<'a> {
+    /// Nothing: the release in hand holds the member at this tip.
+    Nothing,
+    /// Every line: an included member.
+    Whole,
+    /// The lines that its change has more often than the change of its old
+    /// tip, from that tip's own fork point to it, compared by path, kind and
+    /// text: an advanced member.
+    Since((&'a CommitId, &'a CommitId)),
+}
+
+/// The lines of one member's change that an edit loses at one path, as
+/// spec R11's check counts them ([`EditCandidate::lost_lines`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditLoss {
+    /// The repository-internal path, `/`-separated.
+    pub path: String,
+    /// The member's reading there: its label, tip and fork point, each line
+    /// counted, and each range the word step did not follow.
+    pub lines: MemberLines,
+}
+
+impl EditCandidate<'_> {
+    /// Spec R11's check of the candidate: each line of a remaining member's
+    /// change that the edit loses, by path, then by member in `members`'
+    /// order.
+    ///
+    /// The paths read are each path where the candidate differs from the
+    /// release in hand, and each path that the change of an included or
+    /// advanced member touches. Each member whose own change touches such a
+    /// path is read there in three versions: the candidate, the release in
+    /// hand and the plain merge of the new parents, each with its conflicts
+    /// written out in jj's snapshot style ([`placing`],
+    /// [`own_lines::place`]). A line counts where all three conditions hold
+    /// ([`counted_lines`]).
+    pub fn lost_lines(&self, members: &[EditMember<'_>]) -> Result<Vec<EditLoss>, JjError> {
+        let (release, candidate) = (self.source.tree(), self.commit.tree());
+        let mut paths = BTreeSet::new();
+        for entry in collect_stream(release.diff_stream(&candidate, &EverythingMatcher)) {
+            entry.values.map_err(|error| store_error(&error))?;
+            paths.insert(entry.path);
+        }
+        let mut changes = Vec::with_capacity(members.len());
+        for member in members {
+            let change = self.repo.change_values(member.change)?;
+            if !matches!(member.brought, Brought::Nothing) {
+                paths.extend(change.keys().cloned());
+            }
+            changes.push(change);
+        }
+        let mut losses = Vec::new();
+        for path in &paths {
+            for (member, change) in members.iter().zip(&changes) {
+                let Some(values) = change.get(path) else {
+                    continue;
+                };
+                if let Some(lines) = self.lost_at((path, values), member)? {
+                    losses.push(EditLoss {
+                        path: path.as_internal_file_string().to_owned(),
+                        lines,
+                    });
+                }
+            }
+        }
+        Ok(losses)
+    }
+
+    /// The lines of `member`'s change at `path`, from its fork point's value
+    /// to its tip's, that the edit loses ([`Self::lost_lines`]); `None`
+    /// where it loses none.
+    fn lost_at(
+        &self,
+        (path, (before, after)): (&RepoPath, &(MergedTreeValue, MergedTreeValue)),
+        member: &EditMember<'_>,
+    ) -> Result<Option<MemberLines>, JjError> {
+        let store = self.repo.repo.store();
+        let value_at = |tree: &MergedTree| {
+            block_on(tree.path_value(path)).map_err(|error| store_error(&error))
         };
-        let ruled = edit.then_some(parent_commits.as_slice());
-        let (written, unions, plain_merged) = duplicated_from(
-            &mut tx,
-            (&source, write.message),
-            measured,
-            (&parent_ids, ruled),
-        )?;
-        (written, Some(source), unions, plain_merged)
-    } else {
+        let in_candidate = value_at(&self.commit.tree())?;
+        if after.is_resolved() && in_candidate == *after {
+            return Ok(None);
+        }
+        let name = path.as_internal_file_string();
+        let (fork, tip) = (
+            own_value(store, path, before)?,
+            own_value(store, path, after)?,
+        );
+        let read = |version: own_lines::Version| own_lines::place(name, (&fork, &tip), &version);
+        let own_lines::Placed::Lines {
+            lost,
+            word_step_skipped,
+        } = read(placing(store, path, in_candidate)?)
+        else {
+            return Ok(None);
+        };
+        if lost.iter().all(|line| line.at_conflict) {
+            return Ok(None);
+        }
+        let release = read(placing(store, path, value_at(&self.source.tree())?)?);
+        let plain = read(placing(store, path, value_at(&self.plain)?)?);
+        let brought = match member.brought {
+            Brought::Nothing => BroughtLines::Nothing,
+            Brought::Whole => BroughtLines::Whole,
+            Brought::Since(old) => BroughtLines::Since {
+                old: self.repo.change_lines_at(path, old)?,
+                new: own_lines::change_lines(name, &fork, &tip),
+            },
+        };
+        let counted = counted_lines(lost, (&release, &plain), &brought);
+        if counted.is_empty() {
+            return Ok(None);
+        }
+        let (fork_point, tip_commit) = member.change;
+        let mut lines = MemberLines::new(
+            member.label.to_owned(),
+            tip_commit.clone(),
+            fork_point.clone(),
+        );
+        lines.reading = own_lines::Reading::Missing;
+        lines.lost = counted;
+        lines.word_step_skipped = word_step_skipped;
+        Ok(Some(lines))
+    }
+
+    /// Rebuild the checked edit in a fresh transaction and write it as
+    /// [`write_release`] writes a release, as ONE operation, with the files
+    /// spec R11's rule wrote as the plain merge of the new parents. Refuses
+    /// where the rebuilt tree differs from the checked one, so the check
+    /// holds for what is written, as [`Candidate::publish`] refuses; a
+    /// rebuild of the same inputs never differs.
+    pub fn publish(self) -> Result<(ReleaseWritten, Vec<PlainMergedFile>), JjError> {
+        let Self {
+            repo,
+            tx,
+            write,
+            commit: checked,
+            ..
+        } = self;
+        // The checked scratch evaporates before anything real is written.
+        drop(tx);
+        let repo = repo.to_write()?;
+        let mut tx = repo.repo.start_transaction();
+        let built = built_release(&repo, &mut tx, write, true)?;
+        if built.written.tree_ids() != checked.tree_ids() {
+            return Err(JjError::Revision {
+                revision: commit_id(checked.id()).as_str().to_owned(),
+                detail: "the rebuilt edit's tree differs from the checked candidate".to_owned(),
+            });
+        }
+        finished_release(&repo, tx, write, built)
+    }
+}
+
+/// What `value`, one tree's value at `path`, holds as spec R11 places a
+/// member's lines in it ([`own_lines::place`]). A conflict between files is
+/// written out in jj's snapshot style ([`ConflictMarkerStyle::Snapshot`]),
+/// with its conflict regions; a file is its content; an absent path or a
+/// directory holds no file. A symlink, a submodule and any other conflict
+/// are what they are, which gives no place.
+fn placing(
+    store: &jj_lib::store::Store,
+    path: &RepoPath,
+    value: MergedTreeValue,
+) -> Result<own_lines::Version, JjError> {
+    let resolved = |value| own_lines::Version {
+        value,
+        regions: Vec::new(),
+        conflicted: false,
+    };
+    let materialized = block_on(materialize_tree_value(
+        store,
+        path,
+        value,
+        &ConflictLabels::unlabeled(),
+    ))
+    .map_err(|error| store_error(&error))?;
+    Ok(match materialized {
+        MaterializedTreeValue::Absent | MaterializedTreeValue::Tree(_) => {
+            resolved(own_lines::Value::Absent)
+        }
+        MaterializedTreeValue::File(mut file) => {
+            let content = block_on(file.read_all(path)).map_err(|error| store_error(&error))?;
+            resolved(own_lines::Value::File {
+                executable: file.executable,
+                content,
+            })
+        }
+        MaterializedTreeValue::FileConflict(file) => {
+            let marker_len = choose_materialized_conflict_marker_len(&file.contents);
+            let options = ConflictMaterializeOptions {
+                marker_style: ConflictMarkerStyle::Snapshot,
+                marker_len: Some(marker_len),
+                merge: store.merge_options().clone(),
+            };
+            let content = Vec::from(materialize_merge_result_to_bytes(
+                &file.contents,
+                &file.labels,
+                &options,
+            ));
+            own_lines::Version {
+                regions: own_lines::conflict_regions(&content, marker_len),
+                value: own_lines::Value::File {
+                    executable: file.executable.unwrap_or_default(),
+                    content,
+                },
+                conflicted: true,
+            }
+        }
+        MaterializedTreeValue::Symlink { target, .. } => {
+            resolved(own_lines::Value::Symlink { target })
+        }
+        MaterializedTreeValue::GitSubmodule(id) => {
+            resolved(own_lines::Value::Submodule { commit: id.hex() })
+        }
+        MaterializedTreeValue::OtherConflict { .. } | MaterializedTreeValue::AccessDenied(_) => {
+            own_lines::Version {
+                value: own_lines::Value::Conflict,
+                regions: Vec::new(),
+                conflicted: true,
+            }
+        }
+    })
+}
+
+/// What of a member's change an edit brings in, read at one path
+/// ([`Brought`]).
+enum BroughtLines {
+    Nothing,
+    Whole,
+    /// An advanced member's lines at the path, of its old tip's change and
+    /// of its new tip's ([`own_lines::change_lines`]).
+    Since {
+        old: Vec<own_lines::Lost>,
+        new: Vec<own_lines::Lost>,
+    },
+}
+
+impl BroughtLines {
+    /// Whether the edit brings `lost` in: every line of an included member,
+    /// and, of an advanced one, a line whose path, kind and text its new
+    /// change has more often than its old one.
+    fn brings(&self, lost: &own_lines::Lost) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::Whole => true,
+            Self::Since { old, new } => {
+                let count = |lines: &[own_lines::Lost]| {
+                    lines
+                        .iter()
+                        .filter(|line| {
+                            line.path == lost.path
+                                && line_kind(line.kind) == line_kind(lost.kind)
+                                && line.text == lost.text
+                        })
+                        .count()
+                };
+                count(new) > count(old)
+            }
+        }
+    }
+}
+
+/// A lost entry's kind as spec R11 tells lines apart: a line in a range
+/// that the word step did not follow is an added line.
+const fn line_kind(kind: own_lines::LostKind) -> own_lines::LostKind {
+    match kind {
+        own_lines::LostKind::WordLimit => own_lines::LostKind::Added,
+        other => other,
+    }
+}
+
+/// Whether `one` and `other` are one line of a member's change: the same
+/// path, kind ([`line_kind`]) and line. The readings are of one change at
+/// one tip, so two lines of the same text stay apart.
+fn same_line(one: &own_lines::Lost, other: &own_lines::Lost) -> bool {
+    one.path == other.path && line_kind(one.kind) == line_kind(other.kind) && one.line == other.line
+}
+
+/// Whether `placed`, a member's change read in one version, holds `lost`
+/// there or has it at a conflict.
+fn held_or_at_conflict(placed: &own_lines::Placed, lost: &own_lines::Lost) -> bool {
+    match placed {
+        own_lines::Placed::AtConflict => true,
+        own_lines::Placed::Lines { lost: lines, .. } => !lines
+            .iter()
+            .any(|line| !line.at_conflict && same_line(&line.lost, lost)),
+    }
+}
+
+/// Spec R11's count: each line of `candidate`, a member's change read in
+/// the candidate, that the edit loses. A line counts where all three hold:
+/// it is lost in the candidate at no conflict there; `release`, the release
+/// in hand, holds it or has it at a conflict, or the edit brings it in
+/// (`brought`); and `plain`, the plain merge of the new parents, holds it or
+/// has it at a conflict. A line the release in hand already lacked is not
+/// this edit's loss, and one the plain merge lacks with no conflict there
+/// is the members' own change.
+fn counted_lines(
+    candidate: Vec<own_lines::PlacedLost>,
+    (release, plain): (&own_lines::Placed, &own_lines::Placed),
+    brought: &BroughtLines,
+) -> Vec<own_lines::Lost> {
+    candidate
+        .into_iter()
+        .filter(|line| !line.at_conflict)
+        .map(|line| line.lost)
+        .filter(|lost| {
+            (held_or_at_conflict(release, lost) || brought.brings(lost))
+                && held_or_at_conflict(plain, lost)
+        })
+        .collect()
+}
+
+/// What [`built_release`] wrote in a transaction.
+struct BuiltRelease {
+    written: jj_lib::commit::Commit,
+    /// The write's source, when it duplicates one.
+    source: Option<jj_lib::commit::Commit>,
+    unions: Vec<UnionedFile>,
+    /// The files spec R11's rule wrote as the plain merge of the new
+    /// parents; none but for an edit.
+    plain_merged: Vec<PlainMergedFile>,
+    /// For an edit, the plain merge of the new parents, with no release-log
+    /// union.
+    plain: Option<MergedTree>,
+}
+
+/// The release commit `write` describes, written into `tx` and not yet
+/// named: a duplicate of its source onto its parents, or a fresh merge of
+/// them, with the release-log union. Where `edit` holds, the duplicate is
+/// written by spec R11's rule ([`ruled_tree`]).
+fn built_release(
+    repo: &Repo,
+    tx: &mut Transaction,
+    write: &ReleaseWrite<'_>,
+    edit: bool,
+) -> Result<BuiltRelease, JjError> {
+    let (parent_commits, parent_ids) = resolved_parents(repo, write.parents)?;
+    let Some(source) = write.source else {
         let (written, unions) = merged_release(
-            &mut tx,
+            tx,
             (&parent_commits, parent_ids),
             write.message.unwrap_or_default(),
         )?;
-        (written, None, unions, Vec::new())
+        return Ok(BuiltRelease {
+            written,
+            source: None,
+            unions,
+            plain_merged: Vec::new(),
+            plain: None,
+        });
     };
+    let source = repo.commit(source.as_str())?;
+    let measured = match write.measured {
+        Measured::WithoutCarriers(carriers) => without_carriers(&source, carriers),
+    };
+    let plain = if edit {
+        Some(
+            block_on(merge_commit_trees(tx.repo(), &parent_commits))
+                .map_err(|error| store_error(&error))?,
+        )
+    } else {
+        None
+    };
+    let (written, unions, plain_merged) = duplicated_from(
+        tx,
+        (&source, write.message),
+        measured,
+        (&parent_ids, plain.as_ref()),
+    )?;
+    Ok(BuiltRelease {
+        written,
+        source: Some(source),
+        unions,
+        plain_merged,
+        plain,
+    })
+}
+
+/// Name `built`, the commit [`built_release`] wrote into `tx`, as `write`
+/// says, and commit `tx` as one operation: the bookmark moved, a replaced
+/// source abandoned unless something rests on it, the earlier writes that
+/// nothing holds swept, and the heads this exposes hidden
+/// ([`hide_exposed`]).
+fn finished_release(
+    repo: &Repo,
+    mut tx: Transaction,
+    write: &ReleaseWrite<'_>,
+    built: BuiltRelease,
+) -> Result<(ReleaseWritten, Vec<PlainMergedFile>), JjError> {
+    let BuiltRelease {
+        written,
+        source,
+        unions,
+        plain_merged,
+        plain: _,
+    } = built;
     let same_tree_as_source = source
         .as_ref()
         .is_some_and(|source| source.tree_ids() == written.tree_ids());
@@ -3128,7 +3605,7 @@ fn written_release(
         tx.repo_mut()
             .set_local_bookmark_target(ref_name, RefTarget::normal(written.id().clone()));
         if let Some(source) = source {
-            let kept = what_keeps(&repo, tx.repo(), &source, &moved)?;
+            let kept = what_keeps(repo, tx.repo(), &source, &moved)?;
             if kept.is_none() {
                 tx.repo_mut().record_abandoned_commit(&source);
             }
@@ -3149,7 +3626,7 @@ fn written_release(
         let strays = if written.has_conflict() {
             Vec::new()
         } else {
-            unheld_heads(&repo, tx.repo(), write.earlier, &stray_rules)?
+            unheld_heads(repo, tx.repo(), write.earlier, &stray_rules)?
         };
         for stray in strays {
             let stray_id = commit_id(stray.id());
@@ -3170,7 +3647,7 @@ fn written_release(
             conflicted: written.has_conflict(),
         },
     )?;
-    commit_mutation(&repo, tx, write.operation)?;
+    commit_mutation(repo, tx, write.operation)?;
     Ok((
         ReleaseWritten {
             commit: commit_id(written.id()),
@@ -3611,7 +4088,7 @@ fn duplicated_from(
     tx: &mut Transaction,
     (source, message): (&jj_lib::commit::Commit, Option<&str>),
     measured: Vec<JjCommitId>,
-    parents: (&[JjCommitId], Option<&[jj_lib::commit::Commit]>),
+    parents: (&[JjCommitId], Option<&MergedTree>),
 ) -> Result<Duplicated, JjError> {
     if measured.as_slice() == source.parent_ids() {
         return duplicated_release(tx, (source, message), parents);
@@ -3641,17 +4118,18 @@ fn duplicated_from(
 /// with every release log whose conflict is a union written resolved, and
 /// those logs.
 ///
-/// Where `ruled` holds the new parents' commits (an edit), the duplicate is
-/// first written by spec R11's rule ([`ruled_tree`]), and the files it wrote
-/// as their plain merge are returned too; `None` (a cut, a rebase's write)
-/// keeps the duplicate as it is. The union goes into the duplicate by
-/// rewriting it in the same transaction, so the write leaves one visible
-/// commit with the duplicate's change id. `source` is the earlier release:
-/// its content of a log goes under the blocks the new parents bring in.
+/// Where `ruled` holds the plain merge of the new parents (an edit), the
+/// duplicate is first written by spec R11's rule ([`ruled_tree`]), and the
+/// files it wrote as that plain merge are returned too; `None` (a cut, a
+/// rebase's write) keeps the duplicate as it is. The union goes into the
+/// duplicate by rewriting it in the same transaction, so the write leaves
+/// one visible commit with the duplicate's change id. `source` is the
+/// earlier release: its content of a log goes under the blocks the new
+/// parents bring in.
 fn duplicated_release(
     tx: &mut Transaction,
     (source, message): (&jj_lib::commit::Commit, Option<&str>),
-    (parent_ids, ruled): (&[JjCommitId], Option<&[jj_lib::commit::Commit]>),
+    (parent_ids, ruled): (&[JjCommitId], Option<&MergedTree>),
 ) -> Result<Duplicated, JjError> {
     let mut descriptions = HashMap::new();
     if let Some(message) = message {
@@ -3674,7 +4152,7 @@ fn duplicated_release(
             detail: "the duplicate produced no commit".to_owned(),
         })?;
     let (tree, plain) = match ruled {
-        Some(parents) => ruled_tree(tx.repo(), (source, duplicate.tree()), parents)?,
+        Some(new) => ruled_tree(tx.repo(), (source, duplicate.tree()), new)?,
         None => (duplicate.tree(), Vec::new()),
     };
     let (tree, unions) = union_release_logs(tree, Some(&source.tree()))?;
@@ -3820,23 +4298,24 @@ fn regular_files(value: &MergedTreeValue) -> Option<RegularFiles> {
     })
 }
 
-/// `duplicate`, the duplicate of `source` onto `parents`, written by spec
-/// R11's rule for an edit, and each path the rule wrote as the plain merge of
-/// `parents`, with whether a hand change was left out there.
+/// `duplicate`, the duplicate of `source` onto the new parents, written by
+/// spec R11's rule for an edit, and each path the rule wrote as `new`, the
+/// plain merge of the new parents, with whether a hand change was left out
+/// there.
 ///
 /// The rule reads the plain merge of `source`'s own parents, the release in
 /// hand's members (its carriers left out, [`duplicated_from`]), and acts on
 /// each path where that merge leaves a conflict ([`RuleTrees::ruled`]): there
 /// the release's own change answers the conflict. It keeps that resolution
-/// only where the plain merge of `parents` leaves the same conflict, and
-/// otherwise sets that merge's value, conflicted, clean or absent. Every
-/// other path keeps the duplicate's value. Both merges are jj's own, as `jj
-/// new` makes them, with no release-log union: the union runs over the tree
-/// written here, as on every write ([`duplicated_release`]).
+/// only where `new` leaves the same conflict, and otherwise sets the value
+/// of `new` there, conflicted, clean or absent. Every other path keeps the
+/// duplicate's value. Both merges are jj's own, as `jj new` makes them,
+/// with no release-log union: the union runs over the tree written here, as
+/// on every write ([`duplicated_release`]).
 fn ruled_tree(
     repo: &dyn jj_lib::repo::Repo,
     (source, duplicate): (&jj_lib::commit::Commit, MergedTree),
-    parents: &[jj_lib::commit::Commit],
+    new: &MergedTree,
 ) -> Result<(MergedTree, Vec<(RepoPathBuf, bool)>), JjError> {
     let old_parents = block_on(source.parents()).map_err(|error| store_error(&error))?;
     let old =
@@ -3846,7 +4325,7 @@ fn ruled_tree(
     }
     let trees = RuleTrees {
         release: source.tree(),
-        new: block_on(merge_commit_trees(repo, parents)).map_err(|error| store_error(&error))?,
+        new: new.clone(),
         duplicate,
     };
     let sides = trees.duplicate.tree_ids().num_sides();
@@ -5882,10 +6361,12 @@ mod tests {
     use jj_lib::tree_merge::MergeOptions;
 
     use super::{
-        CommitId, ConflictHunks, JjError, changed_outside, fetch_all, fetch_pull_ref,
-        fetch_retry_pause, hunk_list, keeps_duplicate, left_to_union, ls_remote_args, padded,
+        BroughtLines, CommitId, ConflictHunks, JjError, changed_outside, counted_lines, fetch_all,
+        fetch_pull_ref, fetch_retry_pause, hunk_list, keeps_duplicate, left_to_union,
+        ls_remote_args, padded,
     };
     use crate::config::test_support::{EnvironmentGuard, environment_lock};
+    use crate::own_lines::{Lost, LostKind, Placed, PlacedLost};
 
     const FAKE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -6352,5 +6833,171 @@ esac
         let blocks = Merge::from_vec(vec!["x1\n", "", "y1"]);
         assert!(left_to_union(&blocks, None, &options));
         assert!(!left_to_union(&blocks, Some(b"x1\n".as_slice()), &options));
+    }
+
+    /// A line a member added to `f` at its tip's `line`, holding `text`.
+    fn line(line: u32, text: &str) -> Lost {
+        Lost {
+            path: "f".to_owned(),
+            kind: LostKind::Added,
+            line: Some(line),
+            text: Some(text.to_owned()),
+            carried_forward: false,
+        }
+    }
+
+    /// The member's lines that a version lacks, each with whether it is at
+    /// a conflict there.
+    fn lacks(lines: &[(&Lost, bool)]) -> Vec<PlacedLost> {
+        lines
+            .iter()
+            .map(|&(lost, at_conflict)| PlacedLost {
+                lost: lost.clone(),
+                at_conflict,
+            })
+            .collect()
+    }
+
+    /// A version that lacks `lines` ([`lacks`]).
+    fn version(lines: &[(&Lost, bool)]) -> Placed {
+        Placed::Lines {
+            lost: lacks(lines),
+            word_step_skipped: Vec::new(),
+        }
+    }
+
+    /// The tip lines of what the check counts.
+    fn counted(
+        candidate: &[(&Lost, bool)],
+        (release, plain): (&Placed, &Placed),
+        brought: &BroughtLines,
+    ) -> Vec<Option<u32>> {
+        counted_lines(lacks(candidate), (release, plain), brought)
+            .into_iter()
+            .map(|lost| lost.line)
+            .collect()
+    }
+
+    #[test]
+    fn a_line_lost_away_from_a_conflict_that_both_versions_hold_counts() {
+        let five = line(5, "five");
+        let holds = version(&[]);
+
+        // A line lost in the candidate at no conflict, held by the release in
+        // hand and by the plain merge, counts.
+        let lost = counted(&[(&five, false)], (&holds, &holds), &BroughtLines::Nothing);
+        assert_eq!(lost, [Some(5)]);
+        // So does one the plain merge has at a conflict.
+        let at_conflict = version(&[(&five, true)]);
+        let lost = counted(
+            &[(&five, false)],
+            (&holds, &at_conflict),
+            &BroughtLines::Nothing,
+        );
+        assert_eq!(lost, [Some(5)]);
+        // And one the release in hand has at a conflict.
+        let lost = counted(
+            &[(&five, false)],
+            (&at_conflict, &holds),
+            &BroughtLines::Nothing,
+        );
+        assert_eq!(lost, [Some(5)]);
+        // A version that gives no place has every line at a conflict.
+        let lost = counted(
+            &[(&five, false)],
+            (&Placed::AtConflict, &Placed::AtConflict),
+            &BroughtLines::Nothing,
+        );
+        assert_eq!(lost, [Some(5)]);
+    }
+
+    #[test]
+    fn a_line_the_plain_merge_lacks_with_no_conflict_does_not_count() {
+        let (five, nine) = (line(5, "five"), line(9, "nine"));
+        let holds = version(&[]);
+
+        // The plain merge lacks the line at no conflict there, though it has
+        // another line of the same file at a conflict: nothing counts.
+        let plain = version(&[(&five, false), (&nine, true)]);
+        let lost = counted(&[(&five, false)], (&holds, &plain), &BroughtLines::Whole);
+        assert_eq!(lost, Vec::<Option<u32>>::new());
+    }
+
+    #[test]
+    fn a_line_at_a_conflict_in_the_candidate_does_not_count_while_another_does() {
+        let (five, nine) = (line(5, "five"), line(9, "nine"));
+        let holds = version(&[]);
+
+        let lost = counted(
+            &[(&five, true), (&nine, false)],
+            (&holds, &holds),
+            &BroughtLines::Nothing,
+        );
+        assert_eq!(lost, [Some(9)]);
+    }
+
+    #[test]
+    fn a_line_the_release_in_hand_lacked_counts_only_where_the_edit_brings_it_in() {
+        let five = line(5, "five");
+        let (lacked, holds) = (version(&[(&five, false)]), version(&[]));
+        let lost = |brought| counted(&[(&five, false)], (&lacked, &holds), &brought);
+
+        // A line the release in hand already lacked at no conflict is not
+        // this edit's loss...
+        assert_eq!(lost(BroughtLines::Nothing), Vec::<Option<u32>>::new());
+        // ...unless the edit brings it in: every line of an included member,
+        assert_eq!(lost(BroughtLines::Whole), [Some(5)]);
+        // and a line that an advance added, compared with the old tip's
+        // change by path, kind and text, with counts.
+        let old_once = BroughtLines::Since {
+            old: vec![line(3, "five")],
+            new: vec![five.clone()],
+        };
+        assert_eq!(lost(old_once), Vec::<Option<u32>>::new());
+        let new_twice = BroughtLines::Since {
+            old: vec![line(3, "five")],
+            new: vec![line(2, "five"), five.clone()],
+        };
+        assert_eq!(lost(new_twice), [Some(5)]);
+    }
+
+    #[test]
+    fn of_two_equal_lines_the_one_the_release_in_hand_held_counts() {
+        // Given: a member whose change adds the same text at lines 5 and 7;
+        // the release in hand lacked line 5.
+        let (five, seven) = (line(5, "same"), line(7, "same"));
+        let (release, holds) = (version(&[(&five, false)]), version(&[]));
+
+        // Then: the candidate's loss of line 7 counts, and of line 5 does not.
+        let lost = counted(
+            &[(&seven, false)],
+            (&release, &holds),
+            &BroughtLines::Nothing,
+        );
+        assert_eq!(lost, [Some(7)]);
+        let lost = counted(
+            &[(&five, false)],
+            (&release, &holds),
+            &BroughtLines::Nothing,
+        );
+        assert_eq!(lost, Vec::<Option<u32>>::new());
+    }
+
+    #[test]
+    fn a_line_past_the_word_limit_is_the_same_line_as_an_added_one() {
+        // Given: the candidate loses line 5 in a range the word step did not
+        // follow, and the release in hand lacked it as an added line.
+        let mut word_limit = line(5, "five");
+        word_limit.kind = LostKind::WordLimit;
+        let five = line(5, "five");
+        let (release, holds) = (version(&[(&five, false)]), version(&[]));
+
+        // Then: it is the line the release in hand lacked, so nothing counts.
+        let lost = counted(
+            &[(&word_limit, false)],
+            (&release, &holds),
+            &BroughtLines::Nothing,
+        );
+        assert_eq!(lost, Vec::<Option<u32>>::new());
     }
 }

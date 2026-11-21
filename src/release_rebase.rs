@@ -913,7 +913,7 @@ fn drop_landed_members(
 /// and drops nothing ([`keep_the_target`]). Where no parent would remain, it
 /// refuses too. The drop writes the release as a duplicate onto the kept
 /// parents, which keeps every resolution the release holds. It does not
-/// follow `drop`'s rule (spec R11, `knives::jj::write_edited_release`): a
+/// follow `drop`'s rule (spec R11, `knives::jj::edit_candidate`): a
 /// member it drops carries nothing past the target, so its removal changes
 /// no merge of the kept parents. It leaves out the release's carriers, as every
 /// write composing from its parents does: a carrier never counts as a
@@ -1005,6 +1005,7 @@ fn drop_landed_members_in(
             change: &written.change,
             provenance: &provenance,
             unions: &written.unions,
+            loss: "",
             unchecked,
         },
         bound,
@@ -1204,6 +1205,7 @@ fn report_rebased_release<'w>(
             change: &change,
             provenance: &provenance,
             unions: &unions,
+            loss: "",
             unchecked: rebased.unchecked,
         },
         bound,

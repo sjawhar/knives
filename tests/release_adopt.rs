@@ -1065,11 +1065,20 @@ fn a_renumber_by_hand_is_adopted_only_with_a_why_and_keeps_the_recorded_parents(
     assert!(findings(&report, "orphan-commit").is_empty(), "{report}");
 }
 
+/// The block a ygo member's `notes` insert above the base's notes.
+fn notes_block(notes: &str) -> &str {
+    notes
+        .strip_suffix(BASE_NOTES)
+        .expect("a member's notes end with the base's")
+}
+
 #[test]
 fn the_ygo_rewritten_member_conflict_resolved_by_hand_is_adopted() {
     // Given: the ygo history's shape: the unioned cut, client-count included,
     // then split-from-store grown into split-one-path, which rewrote its
-    // block, and advanced: CHANGELOG.md is left conflicted for a person.
+    // block. Its advance would lose client-count's notes heading, so it is
+    // refused, and then run with `--allow-loss`: CHANGELOG.md is left
+    // conflicted for a person, and client-count's heading is named as lost.
     let (lab, home) = unioned_first_cut();
     ygo_member(&lab, CLIENT, (CLIENT_LOG, CLIENT_NOTES));
     release_ok(&lab, &home, &["include", CLIENT]);
@@ -1081,15 +1090,41 @@ fn the_ygo_rewritten_member_conflict_resolved_by_hand_is_adopted() {
             ("RELEASE_NOTES.md", SPLIT_ONE_PATH_NOTES),
         ],
     );
-    release_ok(&lab, &home, &["advance", SPLIT]);
+    let refused = knives_release(&lab, &home, &["advance", SPLIT]);
+    assert_eq!(refused.status.code(), Some(3), "{}", text(&refused));
+    assert!(
+        stdout(&refused).contains(&format!(
+            "refusing to write {RELEASE}: RELEASE_NOTES.md would lose {CLIENT}'s lines"
+        )),
+        "{}",
+        text(&refused)
+    );
+    let allowed = release_ok(
+        &lab,
+        &home,
+        &[
+            "advance",
+            SPLIT,
+            "--allow-loss",
+            "jj pairs the rewritten heading with client-count's",
+        ],
+    );
+    assert!(
+        allowed.contains(&format!(
+            "demo: RELEASE_NOTES.md: {CLIENT}'s lines lost by this write (--allow-loss)\n"
+        )),
+        "{allowed}"
+    );
     assert_eq!(
         knives::jj::conflicted_files(&lab.work, RELEASE).expect("list conflicts"),
         ["CHANGELOG.md"]
     );
     let advanced = commit_at(&lab, RELEASE);
 
-    // When: a person resolves it with every member's block, the rewritten
-    // one in place of the block it replaced, and the release is adopted.
+    // When: a person resolves CHANGELOG.md with every member's block, the
+    // rewritten one in place of the block it replaced, puts client-count's
+    // heading back in RELEASE_NOTES.md with every member's block, and adopts
+    // the release with `--why`.
     let (preamble, sections) = ygo_preamble_and_sections();
     let resolution = format!(
         "{preamble}{}{}{}{sections}",
@@ -1097,11 +1132,21 @@ fn the_ygo_rewritten_member_conflict_resolved_by_hand_is_adopted() {
         block(SPLIT_ONE_PATH_LOG),
         block(SAMI11_LOG)
     );
-    finish_in_place(&lab, &[("CHANGELOG.md", &resolution)]);
-    let output = adopt(&lab, &home, &[]);
+    let notes = format!(
+        "{}{}{}{BASE_NOTES}",
+        notes_block(CLIENT_NOTES),
+        notes_block(SPLIT_ONE_PATH_NOTES),
+        notes_block(SAMI11_NOTES)
+    );
+    finish_in_place(
+        &lab,
+        &[("CHANGELOG.md", &resolution), ("RELEASE_NOTES.md", &notes)],
+    );
+    let output = adopt(&lab, &home, &["--why", "put client-count's heading back"]);
 
     // Then: recorded against the advance, CHANGELOG.md resolved by hand,
-    // every member's added lines held.
+    // RELEASE_NOTES.md changed beyond the baseline's conflicts, and every
+    // member's added lines held.
     let out = stdout(&output);
     assert!(output.status.success(), "{}", text(&output));
     assert!(
@@ -1109,6 +1154,13 @@ fn the_ygo_rewritten_member_conflict_resolved_by_hand_is_adopted() {
             "  baseline: the recorded edit {}\n  1 file(s) resolved by hand:\n    CHANGELOG.md\n",
             advanced.short()
         )),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "  1 file(s) changed beyond the baseline's conflicts, because: put client-count's \
+             heading back\n    RELEASE_NOTES.md\n"
+        ),
         "{out}"
     );
     for member in [SPLIT, SAMI11, CLIENT] {

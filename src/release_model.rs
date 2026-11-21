@@ -2291,7 +2291,10 @@ mod carrier_tests {
 
 #[cfg(test)]
 mod unchecked_mark_tests {
-    use super::{CommitId, RecordedWrite, RecordedWriteKind, carrier_tests::event, unchecked_mark};
+    use super::{
+        CommitId, RecordedWrite, RecordedWriteKind, carrier_tests::event, recorded_write_events,
+        unchecked_mark,
+    };
     use crate::commands::release::{InHandWrite, NoMatch, Unchecked, unchecked_suffix};
 
     /// An edit event of `integration` whose text says `delta`, then its
@@ -2324,6 +2327,13 @@ mod unchecked_mark_tests {
                 "",
             ),
             edited("included feat/x", "; unchecked: y"),
+            // An `--allow-loss` reason sits after the delta, before the
+            // parents, so one that ends with a mark is no mark.
+            edited(
+                "dropped feat/d: x; lost: CHANGELOG.md (feat/a: 1 line(s)); why lost: r; \
+                 unchecked: no record",
+                "",
+            ),
         ];
 
         // Then: none reads as marked.
@@ -2374,6 +2384,31 @@ mod unchecked_mark_tests {
         // And: a write over a release knives checked carries no mark.
         let checked = edited("included feat/x", &unchecked_suffix(&InHandWrite::Recorded));
         assert_eq!(unchecked_mark(&checked), None, "{}", checked.text);
+
+        // And: an `--allow-loss` reason that holds `; parents: x` leaves
+        // knives' own parents the last `; parents: `, which every reader of
+        // the text takes; the event still reads as an edit of its commit.
+        let loss = edited(
+            "dropped feat/d: x; lost: CHANGELOG.md (feat/a: 1 line(s)); why lost: see; parents: x",
+            "",
+        );
+        assert_eq!(
+            loss.text
+                .rsplit_once("; parents: ")
+                .map(|(_, parents)| parents),
+            Some("feat/x@bbbbbbbbbbbb")
+        );
+        assert_eq!(unchecked_mark(&loss), None, "{}", loss.text);
+        let write = recorded_write_events(std::slice::from_ref(&loss), "integration")
+            .map(|(_, write)| write)
+            .next();
+        assert_eq!(
+            write,
+            Some(RecordedWrite {
+                kind: RecordedWriteKind::Edit,
+                commit: CommitId::new("a".repeat(40)),
+            })
+        );
     }
 }
 

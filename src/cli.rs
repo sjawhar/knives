@@ -644,18 +644,29 @@ pub enum ReleaseAction {
     /// Nothing else changes: every other parent stays at the commit the release
     /// already has. A member whose branch has advanced is not moved — that is a
     /// content change beyond including it, and `advance` is how it is asked for.
+    /// Like `drop` and `advance`, the write is checked before it is made: an
+    /// edit that would lose lines of a remaining member, away from any
+    /// conflict it leaves, writes nothing, names them, and exits 3.
     Include {
         /// A branch name, or any revision when no bookmark fits.
         branch: String,
         /// Why it belongs. Recorded on the release itself.
         #[arg(long)]
         why: Option<String>,
+        /// Write the edit even though it loses the named lines of a
+        /// remaining member, and record the loss with this reason. Put the
+        /// lines back by hand, then record that with `knives release adopt
+        /// <name> --why <reason>`. It must hold a reason: an empty or
+        /// whitespace-only value is refused.
+        #[arg(long, value_name = "REASON", value_parser = reason_text)]
+        allow_loss: Option<String>,
     },
     /// Remove a branch's parent from the release in hand.
     ///
     /// The branch and its bookmark are untouched — only the release changes. When
     /// the branch has advanced past its released parent, ancestry finds the
-    /// parent; a commit id works when no bookmark does.
+    /// parent; a commit id works when no bookmark does. The write is checked
+    /// as `include`'s is.
     Drop {
         /// A branch name, or the parent's commit id when no bookmark fits.
         branch: String,
@@ -665,6 +676,10 @@ pub enum ReleaseAction {
         /// whitespace-only value is refused.
         #[arg(long, value_parser = reason_text)]
         why: String,
+        /// Write the drop even though it loses the named lines of a
+        /// remaining member, as `include --allow-loss` does.
+        #[arg(long, value_name = "REASON", value_parser = reason_text)]
+        allow_loss: Option<String>,
     },
     /// Advance member parents to their branches' current tips.
     ///
@@ -676,7 +691,8 @@ pub enum ReleaseAction {
     /// duplicate` rebuild breaks: the rebuilt tip shares no history with the
     /// commit it replaces. `--from` names that old commit directly, for exactly
     /// one branch, so the caller asserts the mapping instead of losing the
-    /// release's recorded conflict resolution to a `drop` + `include`.
+    /// release's recorded conflict resolution to a `drop` + `include`. The
+    /// write is checked as `include`'s is.
     Advance {
         /// Branches to advance. Empty means every member that has advanced.
         branches: Vec<String>,
@@ -684,6 +700,10 @@ pub enum ReleaseAction {
         /// Requires exactly one branch; bypasses the ancestry search.
         #[arg(long)]
         from: Option<String>,
+        /// Write the advance even though it loses the named lines of a
+        /// remaining member, as `include --allow-loss` does.
+        #[arg(long, value_name = "REASON", value_parser = reason_text)]
+        allow_loss: Option<String>,
     },
     /// Record the commit a release name holds now as its newest knives write.
     ///
