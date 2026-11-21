@@ -204,6 +204,13 @@ fn install_forge(shim: &Path, log: &Path, state: &ForgeState) {
             canonical: "acme/demo",
             pulls: &fork_pulls,
         },
+        // A former name nothing here spells, which the forge resolves to
+        // the fork's own repository.
+        Repository {
+            named: "acme-older/demo",
+            canonical: "acme/demo",
+            pulls: "[]",
+        },
         Repository {
             named: "acme/other",
             canonical: "acme/other",
@@ -2271,6 +2278,7 @@ const M_OLD: &str = "origin:acme-old/demo:feat/base";
 const SIBLING_M: &str = "origin:acme/sibling:feat/base";
 const GONE13: &str = "origin:gone/demo#13";
 const OTHER13: &str = "origin:acme/other#13";
+const U7: &str = "maintainer/demo#7";
 
 /// One row of the `--forget` table: feat/alpha holds `held` in `config`,
 /// and `depends feat/alpha --forget <text>…` runs with the forge `now`.
@@ -2286,35 +2294,77 @@ struct ForgetRow {
 }
 
 /// What a refusal's stderr must hold, by row: exit 2 says why; exit 3 says
-/// what could not be asked and prints a command ([`printed_command`]).
+/// what could not be asked and prints a command ([`printed_commands`]).
 fn refusal_says(row: &str) -> &'static str {
     match row {
         "F4" | "F7" => "demo#12 answers to maintainer/demo#12, origin:acme/demo#12; name the one",
+        "F5" | "F6" => "If it does, it names two requirements.",
         "F29" => "which is sibling's own repository, not demo's",
         "F34" => "does not require origin:acme/demo#99",
+        "F43" => "does not require feat/base",
         _ => "nothing recorded: ",
     }
 }
 
-/// The `knives depends feat/alpha …` command a refusal prints, as
+/// What the list holds after each command an exit-3 refusal prints, by
+/// row, in any order, one list per command: every candidate record of the
+/// text taken back, and nothing else; one requirement per command when the
+/// text may name two.
+fn recovered(row: &str) -> Vec<Vec<&'static str>> {
+    match row {
+        "F5" | "F6" => vec![vec![F12], vec![U12]],
+        "F41" => vec![vec![U7]],
+        _ => vec![Vec::new()],
+    }
+}
+
+/// Every `knives depends feat/alpha …` command a refusal prints, each as
 /// arguments after `knives`.
-fn printed_command(stderr: &str) -> Option<Vec<String>> {
-    let start = stderr.find("`knives depends feat/alpha ")?;
-    let rest = &stderr[start + 1..];
-    let command = &rest[..rest.find('`')?];
-    Some(
-        command
-            .split_whitespace()
-            .skip(1)
-            .map(str::to_owned)
-            .collect(),
-    )
+fn printed_commands(stderr: &str) -> Vec<Vec<String>> {
+    stderr
+        .split('`')
+        .filter(|part| part.starts_with("knives depends feat/alpha "))
+        .map(|command| {
+            command
+                .split_whitespace()
+                .skip(1)
+                .map(str::to_owned)
+                .collect()
+        })
+        .collect()
+}
+
+/// What `held` leaves once `command` (arguments after `knives`) takes back
+/// the records it names: each spelled as a record, or a member of this fork
+/// named by its branch.
+fn left_by(held: &[&str], command: &[String]) -> Vec<String> {
+    let named: Vec<&str> = command
+        .iter()
+        .map(String::as_str)
+        .filter(|word| *word != "--forget")
+        .collect();
+    let mut left: Vec<String> = held
+        .iter()
+        .filter(|record| {
+            !named.contains(record)
+                && !record.strip_prefix("origin:").is_some_and(|token| {
+                    !token.starts_with("acme/sibling:")
+                        && token
+                            .split_once(':')
+                            .is_some_and(|(_, branch)| named.contains(&branch))
+                })
+        })
+        .map(|record| (*record).to_owned())
+        .collect();
+    left.sort();
+    left
 }
 
 /// Run each of `rows`; every row whose exit, list or refusal differs, said.
-/// A refusal writes nothing and says why; an exit-3 refusal prints a
-/// command, which, run with the forge as it is, takes back every record it
-/// names.
+/// A refusal writes nothing and says why. An exit-3 refusal prints one
+/// command per list [`recovered`] gives; each, run on the list as it was,
+/// with the forge as it is, leaves the list less exactly what it names, and
+/// the lists the commands leave are the row's.
 fn forget_rows(rows: &[ForgetRow]) -> Vec<String> {
     let mut failed = Vec::new();
     for row in rows {
@@ -2358,33 +2408,56 @@ fn forget_rows(rows: &[ForgetRow]) -> Vec<String> {
         if row.exit != 3 {
             continue;
         }
-        let Some(command) = printed_command(&stderr) else {
+        let commands = printed_commands(&stderr);
+        if commands.len() != recovered(row.row).len() {
             failed.push(format!(
-                "{shown}: the exit-3 refusal prints no command: {stderr}"
+                "{shown}: the exit-3 refusal prints {} commands, not {}: {stderr}",
+                commands.len(),
+                recovered(row.row).len()
             ));
             continue;
-        };
-        let mut run = vec!["--text".to_owned()];
-        run.extend(command.iter().cloned());
-        let run: Vec<&str> = run.iter().map(String::as_str).collect();
-        let recovery = fixture.knives(&run);
-        let named: Vec<&str> = command
-            .iter()
-            .map(String::as_str)
-            .filter(|word| *word != "--forget")
+        }
+        let mut afters: Vec<Vec<String>> = Vec::new();
+        for (index, command) in commands.iter().enumerate() {
+            // Each command runs on the list as the refusal left it.
+            let fresh;
+            let on = if index == 0 {
+                &fixture
+            } else {
+                fresh = fixture_with(row.config.0, row.config.1);
+                fresh.hold("feat/alpha", row.held);
+                fresh.forge_now(row.now);
+                &fresh
+            };
+            let mut run = vec!["--text"];
+            run.extend(command.iter().map(String::as_str));
+            let recovery = on.knives(&run);
+            let mut still = on.required("feat/alpha");
+            still.sort();
+            let expected = left_by(row.held, command);
+            if !recovery.status.success() || still != expected {
+                failed.push(format!(
+                    "{shown}: the printed command {command:?} left {still:?}, not \
+                     {expected:?}\n  {}",
+                    said(&recovery).replace('\n', "\n  ")
+                ));
+            }
+            afters.push(still);
+        }
+        afters.sort();
+        let mut wanted_after: Vec<Vec<String>> = recovered(row.row)
+            .into_iter()
+            .map(|list| {
+                let mut list: Vec<String> = list.into_iter().map(str::to_owned).collect();
+                list.sort();
+                list
+            })
             .collect();
-        let still = fixture.required("feat/alpha");
-        let taken = |held: &String| {
-            named.contains(&held.as_str())
-                || held
-                    .rsplit_once(':')
-                    .is_some_and(|(_, branch)| named.contains(&branch))
-        };
-        if !recovery.status.success() || still.iter().any(taken) {
+        wanted_after.sort();
+        if afters != wanted_after {
             failed.push(format!(
-                "{shown}: the printed command {command:?} did not take back what it names: \
-                 left {still:?}\n  {}",
-                said(&recovery).replace('\n', "\n  ")
+                "{shown}: the printed commands {commands:?} left {afters:?}, not \
+                 {wanted_after:?}"
             ));
         }
     }
@@ -2802,6 +2875,205 @@ fn forgetting_where_only_the_forge_could_decide_follows_the_table() {
 }
 
 #[test]
+fn forgetting_beside_other_requirements_follows_the_table() {
+    let failed = forget_rows(&[
+        // N65: a requirement no text names stays, whatever the printed
+        // command takes.
+        ForgetRow {
+            row: "F41",
+            config: CONFIG_B,
+            held: &[F13_OLD, F13, U7],
+            now: ForgeNow::Down,
+            texts: &[F13],
+            exit: 3,
+            left: &[F13_OLD, F13, U7],
+        },
+        // N59: an upstream record of a fork the registry does not keep,
+        // spelled exactly, beside a review pull request of its number.
+        ForgetRow {
+            row: "F42",
+            config: CONFIG_B,
+            held: &["nobody/else#13", F13],
+            now: ForgeNow::Up,
+            texts: &["nobody/else#13"],
+            exit: 0,
+            left: &[F13],
+        },
+        // N61(a): a bare branch name is this fork's member, never another
+        // fork's branch.
+        ForgetRow {
+            row: "F43",
+            config: CONFIG_X,
+            held: &[SIBLING_M],
+            now: ForgeNow::Down,
+            texts: &["feat/base"],
+            exit: 2,
+            left: &[SIBLING_M],
+        },
+        // N60: the upstream's own spelling, beside a member branch named so,
+        // names the upstream pull request, as `--on` reads it.
+        ForgetRow {
+            row: "F44",
+            config: CONFIG_X,
+            held: &[U12, "origin:acme/demo:maintainer/demo#12"],
+            now: ForgeNow::Down,
+            texts: &[U12],
+            exit: 0,
+            left: &["origin:acme/demo:maintainer/demo#12"],
+        },
+    ]);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+fn naming_a_member_beside_another_forks_branch_of_its_name_records_this_forks_member() {
+    // Given: feat/alpha holds another fork's branch named feat/landed, as an
+    // older knives or a hand edit could leave.
+    let fixture = fixture();
+    fixture.hold("feat/alpha", &["origin:acme/sibling:feat/landed"]);
+
+    // When: this fork's feat/landed is named.
+    let _ = fixture.depends(&["--on", "feat/landed"]);
+
+    // Then: it is recorded as this fork's member, beside the other fork's
+    // branch (N61(b)).
+    let mut held = fixture.required("feat/alpha");
+    held.sort();
+    assert_eq!(
+        held,
+        [
+            "origin:acme/demo:feat/landed",
+            "origin:acme/sibling:feat/landed"
+        ]
+    );
+}
+
+#[test]
+fn without_the_forge_a_member_not_shown_landed_is_not_known_to_have_landed() {
+    // Given: feat/alpha requires feat/base, which has not landed.
+    let fixture = fixture();
+    fixture.depends(&["--on", "feat/base"]);
+
+    // When: status runs without the forge, with the landed probe.
+    let output = fixture.knives(&["--json", "status", "demo", "--no-github"]);
+    let report: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("status JSON ({error}): {}", said(&output)));
+
+    // Then: an unmet finding that does not say it has not landed: a squash
+    // merge, which only the forge shows, could have landed it (N63).
+    assert!(
+        details(&report, "unmet-dependency").contains(
+            &"feat/alpha requires origin:acme/demo:feat/base, which is not known to have \
+              landed: the forge was not asked (--no-github), so a squash merge cannot be seen"
+                .to_owned()
+        ),
+        "{report}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{report}");
+}
+
+#[test]
+fn a_deleted_dependents_command_takes_its_review_pull_request_back_in_one_step() {
+    // Given: feat/ghost, never a branch here, requires the fork's #14 under
+    // both names; the former name's lookup fails, so that record cannot be
+    // judged while the other is met.
+    let fixture = fixture();
+    fixture.hold(
+        "feat/ghost",
+        &["origin:acme/demo#14", "origin:acme-old/demo#14"],
+    );
+    fixture.forge_now(ForgeNow::FormerNameFails);
+
+    // When: status reports the fork.
+    let (_, report) = status(&fixture);
+
+    // Then: the command names every record of #14 (N67), and taking it back
+    // needs no second step, whatever the forge says.
+    let problem = problems(&report)
+        .into_iter()
+        .find(|problem| problem.starts_with("cannot tell whether feat/ghost still needs "))
+        .unwrap_or_else(|| panic!("no problem of feat/ghost: {report}"));
+    let command = "`knives depends feat/ghost --forget origin:acme-old/demo#14 --forget \
+                   origin:acme/demo#14`";
+    assert!(problem.ends_with(command), "{problem}");
+    let _ = fixture.depends_of(
+        "feat/ghost",
+        &[
+            "--forget",
+            "origin:acme-old/demo#14",
+            "--forget",
+            "origin:acme/demo#14",
+        ],
+    );
+    assert_eq!(fixture.required("feat/ghost"), Vec::<String>::new());
+}
+
+#[test]
+fn a_deleted_dependents_command_takes_another_forks_branch_alone() {
+    // Given: feat/ghost, never a branch here, requires this fork's
+    // feat/landed, which has landed, and another fork's branch of that name.
+    let fixture = fixture();
+    let sibling = "origin:acme/sibling:feat/landed";
+    fixture.hold("feat/ghost", &["origin:acme/demo:feat/landed", sibling]);
+
+    // When: status reports the fork.
+    let (_, report) = status(&fixture);
+
+    // Then: the problem names the other fork's branch alone, and its command
+    // spells that record, which leaves this fork's member (Sol's R9-N1).
+    let problem = problems(&report)
+        .into_iter()
+        .find(|problem| problem.starts_with("cannot tell whether feat/ghost still needs "))
+        .unwrap_or_else(|| panic!("no problem of feat/ghost: {report}"));
+    assert!(
+        problem.ends_with(&format!("`knives depends feat/ghost --forget {sibling}`")),
+        "{problem}"
+    );
+    let _ = fixture.depends_of("feat/ghost", &["--forget", sibling]);
+    assert_eq!(
+        fixture.required("feat/ghost"),
+        ["origin:acme/demo:feat/landed"]
+    );
+}
+
+#[test]
+fn a_deleted_dependents_requirement_on_a_fork_with_a_local_upstream_is_in_its_one_problem() {
+    // Given: a fork whose upstream is a filesystem path; feat/ghost, never a
+    // branch here, requires its #3.
+    let fixture = fixture();
+    let registry = fixture.home.path().join("repos.toml");
+    let text = std::fs::read_to_string(&registry).expect("read the registry");
+    std::fs::write(
+        &registry,
+        format!(
+            "{text}[repos.local]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/local\"\n",
+            fixture.home.path().display()
+        ),
+    )
+    .expect("rewrite the registry");
+    fixture.hold("feat/ghost", &["local#3"]);
+
+    // When: status reports the fork.
+    let (_, report) = status(&fixture);
+
+    // Then: the requirement is in feat/ghost's one problem, with its forget
+    // command, not a problem of its own (N64).
+    let problems = problems(&report);
+    assert!(
+        problems.iter().any(|problem| problem
+            .starts_with("cannot tell whether feat/ghost still needs local#3: ")
+            && problem.ends_with("`knives depends feat/ghost --forget local#3`")),
+        "{problems:?}"
+    );
+    assert!(
+        !problems
+            .iter()
+            .any(|problem| problem.starts_with("local: upstream ")),
+        "{problems:?}"
+    );
+}
+
+#[test]
 fn a_forget_the_forge_could_not_decide_names_only_what_it_might_also_take() {
     // Given: feat/alpha requires the fork's #13 under both of its names.
     let fixture = fixture_with(CONFIG_B.0, CONFIG_B.1);
@@ -2987,9 +3259,11 @@ impl Holder {
 /// branch that landed or did not; another fork's upstream pull request it
 /// does not have, has merged, or has open; a review pull request on a
 /// repository that is not this fork's own; a branch of another fork's own
-/// repository named as a landed member of this one; and an upstream pull
-/// request of a fork the registry does not keep.
-const KINDS: [(&str, &str); 13] = [
+/// repository named as a landed member of this one; an upstream pull
+/// request of a fork the registry does not keep; a landed member's name on
+/// a repository the forge does not resolve; and on a former name nothing
+/// here spells, which the forge resolves to the fork's own repository.
+const KINDS: [(&str, &str); 15] = [
     ("um", "maintainer/demo#<merged>"),
     ("uo", "maintainer/demo#<open>"),
     ("fl", "origin:acme/demo#14"),
@@ -3003,6 +3277,8 @@ const KINDS: [(&str, &str); 13] = [
     ("or", "origin:acme/other#12"),
     ("xm", "origin:acme/sibling:feat/landed"),
     ("nr", "nobody/else#3"),
+    ("ym", "origin:gone/demo:feat/landed"),
+    ("zm", "origin:acme-older/demo:feat/landed"),
 ];
 
 /// `requirement`, a [`KINDS`] entry, with a holder's own `numbers`.
@@ -3045,9 +3321,15 @@ fn status_table(now: ForgeNow, kind: &str) -> (Said, Said) {
         "fr" => !matches!(now, Down | OwnUnseen | FormerNameFails | FormerNameUnseen),
         "sm" | "sx" => !matches!(now, Down),
         "ml" => true,
+        // A member on a former name nothing here spells: the forge must name
+        // it as the fork's own repository.
+        "zm" => !matches!(now, Down | OwnUnseen),
         _ => false,
     };
-    match (answered, matches!(kind, "um" | "fl" | "fr" | "ml" | "sm")) {
+    match (
+        answered,
+        matches!(kind, "um" | "fl" | "fr" | "ml" | "sm" | "zm"),
+    ) {
         (false, _) => (Unknown, Deferred),
         (true, true) => (Met, Met),
         (true, false) => (Unmet, Deferred),

@@ -422,8 +422,9 @@ pub enum Command {
         /// together: when the forge cannot say whether a record is named (it
         /// is down, or cannot see a repository), and counting it would take
         /// back more, or tell two requirements from one, nothing is taken
-        /// back (exit 3), and the refusal prints a command that names every
-        /// record of that number or member, which no forge answer changes.
+        /// back (exit 3), and the refusal prints a command no forge answer
+        /// changes: one that names every record of that number or member, or,
+        /// when the text may name two requirements, one such command for each.
         #[arg(long)]
         forget: Vec<String>,
         /// Registry name. Defaults to the repo you are standing in.
