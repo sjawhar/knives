@@ -156,7 +156,8 @@ enum MemberState {
 /// has no bookmark of, as a machine that only fetched another machine's
 /// member has. A review pull request's head is judged by the commit the
 /// forge reports for it, whatever a branch of that name points at here.
-/// Each member and each head commit is judged once per report.
+/// Each member, and each head commit under each branch name, is judged once
+/// per report.
 struct Members<'a> {
     rows: &'a [BranchRow],
     repo: &'a Repo,
@@ -170,7 +171,11 @@ struct Members<'a> {
     /// the probe did not run.
     probed_onto: Option<&'a str>,
     judged: RefCell<BTreeMap<BranchName, MemberState>>,
-    judged_commits: RefCell<BTreeMap<CommitId, MemberState>>,
+    /// Head commits judged by [`Self::judge_commit`], by the branch name the
+    /// review pull request gives them as well as the commit: the merge
+    /// evidence it consults is the named branch's, so one commit can be
+    /// landed under one name and not under another.
+    judged_commits: RefCell<BTreeMap<(BranchName, CommitId), MemberState>>,
 }
 
 impl Members<'_> {
@@ -237,14 +242,12 @@ impl Members<'_> {
         {
             return Ok(self.judge(name));
         }
-        if let Some(state) = self.judged_commits.borrow().get(&commit) {
+        let key = (name.clone(), commit);
+        if let Some(state) = self.judged_commits.borrow().get(&key) {
             return Ok(state.clone());
         }
-        let state = self.judge_commit(name, &commit, &format!("{name} at {}", commit.short()));
-        let _ = self
-            .judged_commits
-            .borrow_mut()
-            .insert(commit, state.clone());
+        let state = self.judge_commit(name, &key.1, &format!("{name} at {}", key.1.short()));
+        let _ = self.judged_commits.borrow_mut().insert(key, state.clone());
         Ok(state)
     }
 
