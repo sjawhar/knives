@@ -179,7 +179,7 @@ fn fast_forward(lab: &Lab, name: &str) {
 }
 
 #[test]
-fn a_bare_rebase_keeps_a_landed_member_when_no_other_member_is_on_the_target() {
+fn a_bare_rebase_keeps_a_landed_member_that_alone_carries_the_target() {
     // Given (K16 1, the probe's case 2): X and A cut; upstream merges X's #1
     // by a merge commit, commits u.txt, and squash-merges A's #2, which
     // gives T. The forge reports only #2 merged; X's bookmark still holds
@@ -213,7 +213,7 @@ fn a_bare_rebase_keeps_a_landed_member_when_no_other_member_is_on_the_target() {
 }
 
 #[test]
-fn a_bare_rebase_whose_every_member_landed_drops_nothing_and_keeps_the_target() {
+fn every_member_landed_refuses_and_keeps_the_target() {
     // Given (K16 2): the same shape, with the forge reporting X's #1 merged
     // too.
     let (lab, home) = cut_release(&[X, A]);
@@ -247,7 +247,7 @@ fn a_bare_rebase_whose_every_member_landed_drops_nothing_and_keeps_the_target() 
 }
 
 #[test]
-fn a_bare_rebase_drops_a_landed_member_when_another_member_is_on_the_target() {
+fn a_drop_with_another_member_on_the_target_goes_ahead() {
     // Given (K16 3): X, A and C cut, where C's pull request #3 is open; X and
     // A land as in the other tests, and the forge reports #2 merged.
     let (lab, home) = cut_release(&[X, A, C]);
@@ -285,7 +285,7 @@ fn a_bare_rebase_drops_a_landed_member_when_another_member_is_on_the_target() {
 }
 
 #[test]
-fn a_rebase_already_at_the_target_keeps_a_landed_member_when_no_other_is_on_it() {
+fn a_drop_with_no_move_keeps_a_landed_member_that_alone_carries_the_target() {
     // Given (K16 4, the probe's version 4): the shape of the first test, and
     // a rebase onto T with --no-drop, which leaves A's empty chain on T as a
     // parent.
@@ -341,7 +341,7 @@ fn a_rebase_already_at_the_target_keeps_a_landed_member_when_no_other_is_on_it()
 }
 
 #[test]
-fn a_bare_rebase_keeps_every_landed_member_on_the_target_and_names_them_in_one_line() {
+fn two_landed_members_on_the_target_are_both_kept_and_named() {
     // Given (K16 5): X, A and B cut; X lands as in the other tests, then A's
     // #2 and B's #3 are squash-merged, and B's squash is T. The forge
     // reports #2 and #3 merged.
@@ -375,7 +375,7 @@ fn a_bare_rebase_keeps_every_landed_member_on_the_target_and_names_them_in_one_l
 }
 
 #[test]
-fn a_rebase_already_at_the_target_only_through_a_carrier_refuses_and_writes_nothing() {
+fn a_release_on_the_target_only_through_a_carrier_refuses_the_drop() {
     // Given (K16 7): X and A cut; upstream merges X's #1 by a merge commit,
     // commits u.txt, and merges A's #2 by a merge commit, which gives T, so
     // both members are in T's history. Then C, made on T, is included, the
@@ -423,7 +423,7 @@ fn a_rebase_already_at_the_target_only_through_a_carrier_refuses_and_writes_noth
 }
 
 #[test]
-fn a_rebase_already_at_the_target_keeps_a_landed_member_beside_one_the_trunk_held_before() {
+fn a_member_on_an_older_trunk_commit_does_not_carry_the_target() {
     // Given (K16 8): A cut alone, then Y included; upstream merges Y's #1 by
     // a merge commit, commits u.txt, and squash-merges A's #2, which gives
     // T, so the trunk holds Y's tip on a commit older than T. A rebase onto
