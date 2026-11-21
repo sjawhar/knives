@@ -16,9 +16,11 @@ Records the commit a release name holds now as its newest knives write. It makes
 - With no local bookmark, `adopt` fetches and reads `<name>@<publish-remote>`.
 - After a hand `jj restore --from <commit> --into <name> <path>...`, adopt with `--why`, then cut.
 - `adopt` refuses a name the ledger records no write of; the next write over it records the name.
-- A release re-signed or metaedited after a knives write, by `jj describe`, `jj sign`, `jj metaedit` or a push that signs, has a new commit id with the same change, parents and tree. Adopt it on the machine that re-signed it, after the last rewrite. `adopt` records the new commit, so another machine can read the release once it fetches it. A tag on that commit, a publish remote that does not hold it yet, or conflicts that the knives write left, do not refuse this adopt.
+- A release re-signed or metaedited after a knives write, by `jj describe`, `jj sign`, `jj metaedit` or a push that signs, has a new commit id with the same change, parents and tree. Adopt it on the machine that re-signed it, after the last rewrite, while that write is unpublished. `adopt` records the new commit, so another machine can read the release once it fetches it. A tag on that commit, a publish remote that does not hold it yet, or conflicts that the knives write left, do not refuse this adopt.
+- The write is published when the publish remote holds it, a tag is on it, or a `record: published` note names it, for a fixed release too. Then `adopt` prints `nothing to adopt`, exits `0` and records nothing. Recording the new commit would make every other machine wait for a push that moves a published name.
 - Skip that adopt and the ledger names only the old commit, which no other machine holds: there `audit` reports `could not compare` and `release-drift`, and the next cut is refused.
-- An adopt of the newest recorded write itself writes nothing and prints `nothing to adopt`.
+- Where the newest event of the name is marked `; unchecked:`, `adopt` reads the new commit as any release knives could not check ([below](#when-knives-cannot-check-the-release-in-hand)): it may refuse it as published, and otherwise it measures it and records it.
+- An adopt of the newest recorded write itself writes nothing and prints `nothing to adopt`, unless its event is marked `; unchecked:`. Then it records it, which ends the mark.
 
 ## Adopt a hand resolution before the next write
 

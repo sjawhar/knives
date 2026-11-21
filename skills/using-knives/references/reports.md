@@ -66,7 +66,7 @@ One `branches` row per local bookmark with one target that is not trunk or a rel
 ### Release drift
 
 - `release-drift` holds each local and published release name against the commits its cut and edit events record. A release at its newest recorded write is not drift. A copy with the same change id, parents and tree (signed or metaedited) is a note. The publish remote at an earlier recorded write is a note: a newer write is not pushed yet.
-- Adopt such a signed or metaedited copy on the machine that made it. Another machine does not hold the recorded commit, so until then its audit reports `could not compare` and `release-drift` for the release.
+- Adopt such a signed or metaedited copy on the machine that made it, while the recorded write is unpublished. Another machine does not hold the recorded commit, so until then its audit reports `could not compare` and `release-drift` for the release. A copy of a published write (the publish remote holds it, a tag is on it, or a `record: published` note names it) stays `nothing to adopt`.
 - A local name at an earlier recorded write is drift, also when another machine's newer write is not fetched here. Fetch; do not adopt for that, because `adopt` records the commit you hold as the newest write.
 - A hand-finished release, and the fast-forward rebase before a push, are drift until `knives release adopt <name>`.
 - After the published remedy, one `release-drift` line stays on the old published name when its published commit is itself an all-carrier hand edit: a resolution made on top of the release and pushed under its name. It is true and needs no action.

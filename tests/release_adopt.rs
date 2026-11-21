@@ -12,8 +12,8 @@
 //! working copy on the commit, a hand edit of a published release the publish
 //! remote does not hold, and a change beyond the conflicts with no reason. The
 //! newest write itself is nothing to adopt. That write re-signed or
-//! metaedited, or an older one, is recorded as the newest
-//! (`tests/release_resign.rs` has the rest of the re-signed case). The
+//! metaedited while it is unpublished, or an older one, is recorded as the
+//! newest (`tests/release_resign.rs` has the rest of the re-signed case). The
 //! resolution is measured against the replaced write rebuilt on its members
 //! (D7), so a member rewritten in place is no change beyond the conflicts. A
 //! member's lost lines are counted against the baseline (D8): exit 1 for any
@@ -329,8 +329,9 @@ fn adopting_the_recorded_write_itself_writes_nothing() {
     assert_ne!(rewritten, cut, "the metaedit made no new commit");
     let output = adopt(&lab, &home, &[]);
 
-    // Then: the re-signed commit is recorded as the newest write, in one
-    // event that names it and holds no file as a fix by hand.
+    // Then: the cut is unpublished, so the re-signed commit is recorded as
+    // the newest write, in one event that names it and holds no file as a
+    // fix by hand.
     let out = stdout(&output);
     assert!(output.status.success(), "{}", text(&output));
     assert!(
@@ -360,6 +361,10 @@ fn adopting_the_recorded_write_itself_writes_nothing() {
         "{event:?}"
     );
     assert!(event.fix_files.is_empty(), "{event:?}");
+    assert!(
+        !event.text.contains("resolved by hand:") && !event.text.contains("changed beyond"),
+        "{event:?}"
+    );
 }
 
 #[test]

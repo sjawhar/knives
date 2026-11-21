@@ -11,9 +11,12 @@
 //!
 //! A release re-signed or metaedited after a knives write (by `jj describe`,
 //! `jj sign`, `jj metaedit` or a push that signs) holds the write's change,
-//! parents and tree under a new commit id. Adopting it records that commit,
-//! the one that is pushed, so another machine on the ledger, which holds
-//! only what was pushed, can read the release.
+//! parents and tree under a new commit id. Where the write's event bears no
+//! `; unchecked:` mark and the write is unpublished, adopting that commit
+//! records it, the one that is pushed, so another machine on the ledger,
+//! which holds only what was pushed, can read the release. A copy of a
+//! published write is nothing to adopt. Where the event is marked, the copy
+//! is checked and measured as any release knives could not check.
 
 use std::collections::BTreeMap;
 
@@ -354,45 +357,69 @@ impl Replaced {
 /// How the commit to adopt stands to the newest recorded write of its name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Newest {
-    /// It is that write, and the write's event bears no `; unchecked:` mark:
-    /// there is nothing to adopt.
-    Itself,
-    /// It is that write re-signed or metaedited: the same change, parents and
-    /// tree under another commit id. Adopting it records the commit that is
-    /// pushed, which another machine can read, and changes no content.
+    /// The write's event bears no `; unchecked:` mark, and the commit is
+    /// that write itself, or that write re-signed or metaedited while the
+    /// write is published ([`is_published`]): there is nothing to adopt.
+    /// Recording a copy of a published write would make every other machine
+    /// wait for a push that moves a published name, which knives never does.
+    NothingToAdopt,
+    /// The write's event bears no `; unchecked:` mark, the write is
+    /// unpublished, and the commit is that write re-signed or metaedited:
+    /// the same change, parents and tree under another commit id. Adopting
+    /// it records the commit that is pushed, which another machine can read,
+    /// and changes no content.
     Rewritten,
-    /// Neither: an older recorded write, a hand edit, or that write itself
-    /// where its event is marked `; unchecked:`, which stays unchecked until
-    /// adopted.
+    /// Neither: an older recorded write or a hand edit; or any commit where
+    /// the write's event is marked `; unchecked:`, the write itself and a
+    /// copy of it included. Adopt then checks and measures the commit as any
+    /// release knives could not check, and its record ends the mark.
     Neither,
 }
 
 /// How `held` stands to the newest recorded write of its name, saying so
-/// where it is that write itself ([`Newest::Itself`]).
+/// where there is nothing to adopt ([`Newest::NothingToAdopt`]). A write
+/// whose event is marked `; unchecked:` answers [`Newest::Neither`] before
+/// the commit is read at all.
 fn is_newest(repo: &RepoName, held: &Held, ledger: &[Entry]) -> anyhow::Result<Newest> {
     let Some((event, newest)) = recorded_write_events(ledger, &held.name).next() else {
         return Ok(Newest::Neither);
     };
-    if held.commit == newest.commit {
-        if knives::release_model::unchecked_mark(event).is_some() {
-            return Ok(Newest::Neither);
-        }
-        println!(
-            "{repo}: {} is at {}, {}; nothing to adopt",
-            held.shown_name(),
-            held.commit.short(),
-            release::described_write(&newest)
-        );
-        return Ok(Newest::Itself);
+    if knives::release_model::unchecked_mark(event).is_some() {
+        return Ok(Newest::Neither);
     }
-    let rewritten = held
+    let (shown, at) = (held.shown_name(), held.commit.short());
+    let described = release::described_write(&newest);
+    if held.commit == newest.commit {
+        println!("{repo}: {shown} is at {at}, {described}; nothing to adopt");
+        return Ok(Newest::NothingToAdopt);
+    }
+    if !held
         .opened
-        .is_same_or_metadata_rewrite(&newest.commit, &held.commit)?;
-    Ok(if rewritten {
-        Newest::Rewritten
-    } else {
-        Newest::Neither
-    })
+        .is_same_or_metadata_rewrite(&newest.commit, &held.commit)?
+    {
+        return Ok(Newest::Neither);
+    }
+    if !is_published(held, ledger, &newest.commit)? {
+        return Ok(Newest::Rewritten);
+    }
+    println!(
+        "{repo}: {shown} is at {at}, {described} re-signed or metaedited (same change, parents \
+         and tree); nothing to adopt"
+    );
+    Ok(Newest::NothingToAdopt)
+}
+
+/// Whether the recorded write `write` of `held`'s name is published, read
+/// on that commit itself and under every release scheme, a fixed release
+/// included: the publish remote holds it ([`release::publish_remote_holds`]),
+/// a tag is on it, or a `record: published` note of the name names it
+/// ([`release::published_note_names`]).
+fn is_published(held: &Held, ledger: &[Entry], write: &CommitId) -> anyhow::Result<bool> {
+    Ok(
+        release::publish_remote_holds(&held.opened, write, held.published.as_ref())?
+            || !held.opened.tags_on(write)?.is_empty()
+            || release::published_note_names(ledger, &held.name, write),
+    )
 }
 
 /// What every check reads: whose release, the commit to adopt, the ledger and
@@ -403,7 +430,8 @@ struct Adopting<'a, 'f> {
     ledger: &'a [Entry],
     replaced: &'a Replaced,
     /// Whether the commit is the newest recorded write re-signed or
-    /// metaedited ([`Newest::Rewritten`]).
+    /// metaedited, its event unmarked and the write unpublished
+    /// ([`Newest::Rewritten`]).
     rewritten: bool,
 }
 
@@ -411,11 +439,11 @@ impl Adopting<'_, '_> {
     /// Refuse, saying why, a commit that is not finished
     /// ([`refuse_unfinished_commit`]), and a hand edit of a published release
     /// the publish remote does not hold. For the newest recorded write
-    /// re-signed or metaedited ([`Self::rewritten`]), only the refusal of a
-    /// commit a workspace has checked out runs: its tree is that write's own,
-    /// conflicts included, and it changes no content, so it is no hand edit,
-    /// whatever tag names it or whether the publish remote holds it yet.
-    /// `true` after refusing.
+    /// re-signed or metaedited, its event unmarked and the write unpublished
+    /// ([`Self::rewritten`]), only the refusal of a commit a workspace has
+    /// checked out runs: its tree is that write's own, conflicts included,
+    /// and it changes no content, so it is no hand edit, whatever tag names
+    /// it or whether the publish remote holds it yet. `true` after refusing.
     fn refuse_unfinished(&self) -> anyhow::Result<bool> {
         let held = self.held;
         let release = (held.name.as_str(), &held.commit);
@@ -876,7 +904,7 @@ fn adopt(
         ) => {}
     }
     let newest = is_newest(repo, held, &ledger)?;
-    if newest == Newest::Itself {
+    if newest == Newest::NothingToAdopt {
         return Ok(Exit::Ok);
     }
     let (carriers, members) = writes.partition(&held.parents);

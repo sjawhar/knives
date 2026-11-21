@@ -2,12 +2,19 @@
 //! write: the write's change, parents and tree under a new commit id, as
 //! `jj describe`, `jj sign`, `jj metaedit` or a push that signs leave it.
 //!
-//! The adopt records the new commit in one event that holds no fix by hand,
-//! and says which commit it recorded, so another machine on the same ledger
-//! reads the release as recorded once it has fetched it. It changes no
-//! content, so a tag on the new commit, while the publish remote does not
-//! hold it, refuses nothing, and a write that knives left conflicted is
-//! adopted with its conflicts. These tests drive only the knives binary.
+//! Where the write's event bears no `; unchecked:` mark and the write is
+//! unpublished, the adopt records the new commit in one event that holds no
+//! fix by hand, and says which commit it recorded, so another machine on the
+//! same ledger reads the release as recorded once it has fetched it. It
+//! changes no content, so a tag on the new commit, while the publish remote
+//! does not hold it, refuses nothing, and a write that knives left
+//! conflicted is adopted with its conflicts. A write is published where the
+//! publish remote holds it, a tag is on it or a `record: published` note
+//! names it, under every release scheme: a copy of it is nothing to adopt.
+//! Where the event is marked, the adopt reads the copy, or the write itself,
+//! as any release knives could not check: it may refuse it as published,
+//! and otherwise measures it and records it. These tests drive only the
+//! knives binary.
 
 #![allow(
     clippy::expect_used,
@@ -28,6 +35,10 @@ use lab::{Lab, commit_at, home_after_first_cut, knives_release, release_test_hom
 
 /// The release every test here cuts and re-signs.
 const RELEASE: &str = "release/2026-08-04";
+/// The release cut after [`RELEASE`].
+const NEXT: &str = "release/2026-08-05";
+/// The fixed release branch of a registry that names one.
+const FIXED: &str = "integration";
 /// The forge repository the lab fork's upstream is reached by where two
 /// machines share a ledger: a filesystem upstream names no repository that
 /// another machine could share a ledger for.
@@ -63,17 +74,43 @@ fn ledger_entries(home: &Path, fork: &str) -> Vec<Entry> {
         .entries
 }
 
-/// Re-describe the release in the work checkout with `jj describe`, keeping
-/// its message and adding a review line, as a person does before the push:
-/// a new commit with the same change, parents and tree. Returns it.
-fn re_describe(lab: &Lab) -> CommitId {
-    let written = commit_at(lab, RELEASE);
+/// The newest event `entries` hold about `name`.
+fn newest_event<'a>(entries: &'a [Entry], name: &str) -> &'a Entry {
+    entries
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == Kind::Event && entry.subject.as_deref() == Some(name))
+        .unwrap_or_else(|| panic!("no event about {name}: {entries:?}"))
+}
+
+/// A lab with alpha and beta, each on a file of its own.
+fn two_branches() -> Lab {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab
+}
+
+/// Re-describe the release `name` in the work checkout with `jj describe`,
+/// keeping its message and adding a review line, as a person does: a new
+/// commit with the same change, parents and tree. It passes
+/// `--ignore-immutable`, which a pushed or tagged release needs. Returns
+/// the new commit.
+fn re_describe(lab: &Lab, name: &str) -> CommitId {
+    let written = commit_at(lab, name);
     let message = format!(
         "{}\n\nReview: read by hand\n",
-        lab.revision(&lab.work, RELEASE, "description")
+        lab.revision(&lab.work, name, "description")
     );
-    lab.jj_work(["describe", "-r", RELEASE, "-m", message.as_str()]);
-    let described = commit_at(lab, RELEASE);
+    lab.jj_work([
+        "describe",
+        "--ignore-immutable",
+        "-r",
+        name,
+        "-m",
+        message.as_str(),
+    ]);
+    let described = commit_at(lab, name);
     assert_ne!(described, written, "the describe made no new commit");
     described
 }
@@ -102,11 +139,7 @@ fn assert_recorded(
         text(output)
     );
     assert_eq!(after.len(), before + 1, "{after:?}");
-    let event = after
-        .iter()
-        .rev()
-        .find(|entry| entry.kind == Kind::Event && entry.subject.as_deref() == Some(RELEASE))
-        .unwrap_or_else(|| panic!("no event about {RELEASE}: {after:?}"));
+    let event = newest_event(after, RELEASE);
     assert_eq!(
         event.evidence.first().map(String::as_str),
         Some(rewritten.as_str()),
@@ -121,6 +154,91 @@ fn assert_recorded(
         "{event:?}"
     );
     assert!(event.fix_files.is_empty(), "{event:?}");
+}
+
+/// Assert that `output`, an adopt of `described`, the cut `written` of
+/// `name` re-described while that cut is published, recorded nothing: it
+/// exits 0 and says the release is the cut re-signed or metaedited, with
+/// nothing to adopt, and the ledger `after` it is the one `before` it.
+fn assert_nothing_to_adopt(
+    output: &Output,
+    (name, written, described): (&str, &CommitId, &CommitId),
+    (before, after): (&[Entry], &[Entry]),
+) {
+    assert_eq!(output.status.code(), Some(0), "{}", text(output));
+    assert!(
+        stdout(output).contains(&format!(
+            "demo: {name} is at {}, the recorded cut {} re-signed or metaedited (same change, \
+             parents and tree); nothing to adopt\n",
+            described.short(),
+            written.short()
+        )),
+        "{}",
+        text(output)
+    );
+    assert_eq!(after, before);
+}
+
+/// Assert that `after`, the ledger after an adopt of `adopted` under
+/// [`NEXT`], holds one entry more than the `before` it held: an event whose
+/// evidence starts with `adopted` and which bears no `; unchecked:` mark,
+/// so the adopt ended the mark.
+fn assert_mark_ended(adopted: &CommitId, (before, after): (usize, &[Entry])) {
+    assert_eq!(after.len(), before + 1, "{after:?}");
+    let event = newest_event(after, NEXT);
+    assert_eq!(
+        event.evidence.first().map(String::as_str),
+        Some(adopted.as_str()),
+        "{event:?}"
+    );
+    assert!(!event.text.contains("; unchecked:"), "{event:?}");
+}
+
+/// A config home whose registry releases the lab fork `demo` on the fixed
+/// branch [`FIXED`], with an empty local consumer.
+fn fixed_home(lab: &Lab) -> tempfile::TempDir {
+    let home = tempfile::tempdir().expect("create config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n\
+             release_branch = \"{FIXED}\"\n",
+            lab.upstream.display(),
+        ),
+    )
+    .expect("write fixed-scheme registry");
+    let consumer = home.path().join("consumer");
+    std::fs::create_dir_all(&consumer).expect("create local consumer");
+    std::fs::write(
+        home.path().join("local-consumer"),
+        consumer.display().to_string(),
+    )
+    .expect("write local consumer fixture path");
+    home
+}
+
+/// [`two_branches`] cut as [`RELEASE`]; then the ledger removed, so that
+/// name has no recorded write; then [`NEXT`] cut over it, which knives
+/// could not check, so its event ends `; unchecked: no record`. That cut
+/// holds no hand change: its tree is the automerge of its members, the
+/// baseline an adopt measures it against. Returns the lab, its home and the
+/// cut.
+fn a_marked_cut() -> (Lab, tempfile::TempDir, CommitId) {
+    let lab = two_branches();
+    let (home, _consumer) = home_after_first_cut(&lab);
+    std::fs::remove_dir_all(home.path().join("ledger").join(LOCAL_FORK))
+        .expect("remove the ledger");
+    let cut = knives_release(&lab, &home, &["cut", NEXT]);
+    assert!(
+        stdout(&cut).contains(&format!("cut {NEXT} as")),
+        "{}",
+        text(&cut)
+    );
+    let entries = ledger_entries(home.path(), LOCAL_FORK);
+    let event = newest_event(&entries, NEXT);
+    assert!(event.text.ends_with("; unchecked: no record"), "{event:?}");
+    let written = commit_at(&lab, NEXT);
+    (lab, home, written)
 }
 
 /// A config home whose registry calls the lab fork `demo`, with [`UPSTREAM`]
@@ -222,13 +340,11 @@ fn sweep(home: &Path) -> Output {
 }
 
 #[test]
-fn a_release_re_described_and_adopted_on_one_machine_reads_as_recorded_on_another() {
+fn an_adopt_records_a_release_re_described_after_a_knives_write_and_another_machine_reads_it() {
     // Given: two machines sharing one ledger remote. Alpha, in the lab's work
     // checkout, cuts a release of two branches, then re-describes it with
     // `jj describe`, as a person adds a review line before the push.
-    let lab = Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let lab = two_branches();
     let alpha = shared_home(&lab);
     let beta = second_machine(alpha.path());
     let (_remote_dir, remote) = lab::bare_remote();
@@ -237,13 +353,14 @@ fn a_release_re_described_and_adopted_on_one_machine_reads_as_recorded_on_anothe
     let cut = knives_release(&lab, &alpha, &["cut", RELEASE]);
     assert!(cut.status.success(), "{}", text(&cut));
     let written = commit_at(&lab, RELEASE);
-    let described = re_describe(&lab);
+    let described = re_describe(&lab, RELEASE);
     let before = ledger_entries(alpha.path(), SHARED_FORK).len();
 
     // When: alpha adopts it.
     let adopted = knives_release(&lab, &alpha, &["adopt", RELEASE]);
 
-    // Then: one event records the described commit, with no fix by hand.
+    // Then: the cut is unpublished, so one event records the described
+    // commit, with no fix by hand.
     let after = ledger_entries(alpha.path(), SHARED_FORK);
     assert_recorded(&adopted, (&written, &described), (before, &after));
 
@@ -278,42 +395,34 @@ fn a_release_re_described_and_adopted_on_one_machine_reads_as_recorded_on_anothe
     let next = knives_in_second(
         &lab,
         beta.path(),
-        &[
-            "--text",
-            "release",
-            "--repo",
-            "demo",
-            "cut",
-            "release/2026-08-05",
-        ],
+        &["--text", "release", "--repo", "demo", "cut", NEXT],
     );
     assert_eq!(next.status.code(), Some(0), "{}", text(&next));
     assert!(
-        stdout(&next).contains("cut release/2026-08-05 as"),
+        stdout(&next).contains(&format!("cut {NEXT} as")),
         "{}",
         text(&next)
     );
 }
 
 #[test]
-fn a_re_described_release_tagged_before_its_push_is_adopted_not_refused_as_published() {
+fn an_adopt_records_a_re_described_release_tagged_before_its_push() {
     // Given: a cut re-described with `jj describe`, then tagged before its
-    // push: the tag marks the new commit published, and the publish remote
-    // does not hold it.
-    let lab = Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
-    lab.branch("feat/beta", "beta.txt", "beta\n");
+    // push: the tag is on the new commit, not on the cut, and the publish
+    // remote holds neither.
+    let lab = two_branches();
     let (home, _consumer) = home_after_first_cut(&lab);
     let cut = commit_at(&lab, RELEASE);
-    let described = re_describe(&lab);
+    let described = re_describe(&lab, RELEASE);
     lab.jj_work(["tag", "set", "v1.0.0", "-r", RELEASE]);
     let before = ledger_entries(home.path(), LOCAL_FORK).len();
 
     // When: it is adopted.
     let output = knives_release(&lab, &home, &["adopt", RELEASE]);
 
-    // Then: it changes no content, so it is no hand edit of a published
-    // release: it is recorded as the newest write, with no published remedy.
+    // Then: the cut is unpublished, and the new commit changes no content,
+    // so it is no hand edit of a published release: it is recorded as the
+    // newest write, with no published remedy.
     let after = ledger_entries(home.path(), LOCAL_FORK);
     assert_recorded(&output, (&cut, &described), (before, &after));
     assert!(
@@ -324,9 +433,10 @@ fn a_re_described_release_tagged_before_its_push_is_adopted_not_refused_as_publi
 }
 
 #[test]
-fn a_re_signed_write_that_knives_left_conflicted_is_adopted_with_its_conflicts() {
-    // Given: a cut that left shared.txt conflicted, then re-signed with
-    // `jj metaedit`: its tree, the conflict included, is the cut's own.
+fn an_adopt_records_a_re_signed_write_that_holds_a_conflict() {
+    // Given: a first cut, whose event bears no `; unchecked:` mark, that
+    // left shared.txt conflicted; then re-described with `jj describe`: its
+    // tree, the conflict included, is the cut's own.
     let lab = Lab::new();
     lab.branch("feat/alpha", "shared.txt", "alpha\n");
     lab.branch("feat/beta", "shared.txt", "beta\n");
@@ -337,18 +447,12 @@ fn a_re_signed_write_that_knives_left_conflicted_is_adopted_with_its_conflicts()
         "{}",
         text(&cut)
     );
+    let entries = ledger_entries(home.path(), LOCAL_FORK);
+    let event = newest_event(&entries, RELEASE);
+    assert!(!event.text.contains("; unchecked:"), "{event:?}");
     let written = commit_at(&lab, RELEASE);
-    lab.jj_work([
-        "metaedit",
-        "--force-rewrite",
-        "--ignore-immutable",
-        "-r",
-        RELEASE,
-    ]);
-    let rewritten = commit_at(&lab, RELEASE);
-    assert_ne!(rewritten, written, "the metaedit made no new commit");
+    let described = re_describe(&lab, RELEASE);
     assert_eq!(lab.revision(&lab.work, RELEASE, "conflict"), "true");
-    let before = ledger_entries(home.path(), LOCAL_FORK).len();
 
     // When: it is adopted.
     let output = knives_release(&lab, &home, &["adopt", RELEASE]);
@@ -356,6 +460,195 @@ fn a_re_signed_write_that_knives_left_conflicted_is_adopted_with_its_conflicts()
     // Then: its conflicts are the recorded write's own, so it is not refused
     // as unresolved: it is recorded as the newest write, and exits 0.
     let after = ledger_entries(home.path(), LOCAL_FORK);
-    assert_recorded(&output, (&written, &rewritten), (before, &after));
+    assert_recorded(&output, (&written, &described), (entries.len(), &after));
     assert!(!stdout(&output).contains("still has"), "{}", text(&output));
+}
+
+#[test]
+fn an_adopt_of_a_pushed_write_re_described_records_nothing() {
+    // Given: a cut pushed to the publish remote, then re-described.
+    let lab = two_branches();
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let written = commit_at(&lab, RELEASE);
+    lab.push_branch(RELEASE);
+    let described = re_describe(&lab, RELEASE);
+    let before = ledger_entries(home.path(), LOCAL_FORK);
+
+    // When: it is adopted.
+    let output = knives_release(&lab, &home, &["adopt", RELEASE]);
+
+    // Then: the publish remote holds the cut, so the cut is published, and
+    // the new commit is nothing to adopt.
+    let after = ledger_entries(home.path(), LOCAL_FORK);
+    assert_nothing_to_adopt(&output, (RELEASE, &written, &described), (&before, &after));
+}
+
+#[test]
+fn an_adopt_of_a_tagged_write_re_described_records_nothing() {
+    // Given: a cut tagged, then re-described past the immutability the tag
+    // gives it. The tag stays on the cut.
+    let lab = two_branches();
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let written = commit_at(&lab, RELEASE);
+    lab.jj_work(["tag", "set", "v1.0.0", "-r", RELEASE]);
+    let described = re_describe(&lab, RELEASE);
+    assert_eq!(commit_at(&lab, "v1.0.0"), written, "the tag left the cut");
+    let before = ledger_entries(home.path(), LOCAL_FORK);
+
+    // When: it is adopted.
+    let output = knives_release(&lab, &home, &["adopt", RELEASE]);
+
+    // Then: a tag is on the cut, so the cut is published, and the new
+    // commit is nothing to adopt.
+    let after = ledger_entries(home.path(), LOCAL_FORK);
+    assert_nothing_to_adopt(&output, (RELEASE, &written, &described), (&before, &after));
+}
+
+#[test]
+fn an_adopt_of_a_write_recorded_published_re_described_records_nothing() {
+    // Given: a cut that a `record: published` note names, then
+    // re-described.
+    let lab = two_branches();
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let written = commit_at(&lab, RELEASE);
+    let noted = lab::knives(
+        &lab,
+        &home,
+        &[
+            "notch",
+            RELEASE,
+            "-m",
+            "record: published as v1.0.0",
+            "--evidence",
+            written.as_str(),
+            "--repo",
+            "demo",
+        ],
+    );
+    assert!(noted.status.success(), "{}", text(&noted));
+    let described = re_describe(&lab, RELEASE);
+    let before = ledger_entries(home.path(), LOCAL_FORK);
+
+    // When: it is adopted.
+    let output = knives_release(&lab, &home, &["adopt", RELEASE]);
+
+    // Then: the note names the cut, so the cut is published, and the new
+    // commit is nothing to adopt.
+    let after = ledger_entries(home.path(), LOCAL_FORK);
+    assert_nothing_to_adopt(&output, (RELEASE, &written, &described), (&before, &after));
+}
+
+#[test]
+fn an_adopt_of_a_tagged_fixed_release_re_described_records_nothing() {
+    // Given: a fixed release cut and tagged, then re-described past the
+    // immutability the tag gives it. The tag stays on the cut.
+    let lab = two_branches();
+    lab.jj_work(["new", "main@origin"]);
+    let home = fixed_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut"]);
+    assert!(
+        stdout(&cut).contains(&format!("cut {FIXED} as")),
+        "{}",
+        text(&cut)
+    );
+    let written = commit_at(&lab, FIXED);
+    lab.jj_work(["tag", "set", "v1.0.0", "-r", FIXED]);
+    let described = re_describe(&lab, FIXED);
+    assert_eq!(commit_at(&lab, "v1.0.0"), written, "the tag left the cut");
+    let before = ledger_entries(home.path(), LOCAL_FORK);
+
+    // When: it is adopted.
+    let output = knives_release(&lab, &home, &["adopt", FIXED]);
+
+    // Then: a tag is on the cut, so the cut is published under a fixed
+    // scheme too, and the new commit is nothing to adopt.
+    let after = ledger_entries(home.path(), LOCAL_FORK);
+    assert_nothing_to_adopt(&output, (FIXED, &written, &described), (&before, &after));
+}
+
+#[test]
+fn a_marked_re_signed_write_only_the_publish_remote_holds_is_measured_and_recorded() {
+    // Given: a marked cut pushed to the publish remote, then re-described
+    // here, so only the publish remote holds the cut itself.
+    let (lab, home, written) = a_marked_cut();
+    lab.push_branch(NEXT);
+    let described = re_describe(&lab, NEXT);
+    let before = ledger_entries(home.path(), LOCAL_FORK).len();
+
+    // When: the new commit is adopted.
+    let output = knives_release(&lab, &home, &["adopt", NEXT]);
+
+    // Then: the mark sends the adopt the way of any release knives could
+    // not check. Nothing marks the release published, so the new commit is
+    // measured against an automerge of its members and recorded, which ends
+    // the mark. The adopt does not say that no content changed.
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        out.contains(&format!(
+            "demo: adopted {} as the newest write of {NEXT}, replacing the recorded cut {}\n  \
+             baseline: an automerge of its 2 member parent(s)",
+            described.short(),
+            written.short()
+        )),
+        "{}",
+        text(&output)
+    );
+    assert!(!out.contains("no content changed"), "{}", text(&output));
+    let after = ledger_entries(home.path(), LOCAL_FORK);
+    assert_mark_ended(&described, (before, &after));
+}
+
+#[test]
+fn a_marked_re_signed_write_with_a_tag_on_the_publish_remotes_commit_is_refused_as_published() {
+    // Given: a marked cut pushed to the publish remote, then re-described
+    // here, and a tag on the cut, the publish remote's commit.
+    let (lab, home, written) = a_marked_cut();
+    lab.push_branch(NEXT);
+    let described = re_describe(&lab, NEXT);
+    lab.jj_work(["tag", "set", "v1.0.0", "-r", written.as_str()]);
+    let before = ledger_entries(home.path(), LOCAL_FORK);
+
+    // When: the new commit is adopted.
+    let output = knives_release(&lab, &home, &["adopt", NEXT]);
+
+    // Then: the tag marks the release published, and the publish remote
+    // does not hold the new commit, so the adopt refuses it with the
+    // published remedy and records nothing.
+    assert_eq!(output.status.code(), Some(3), "{}", text(&output));
+    assert!(
+        stdout(&output).contains(&format!(
+            "demo: {NEXT} is published (tag v1.0.0 names {}), so a hand edit cannot be recorded \
+             under it: ",
+            written.short()
+        )),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(commit_at(&lab, NEXT), described);
+    assert_eq!(ledger_entries(home.path(), LOCAL_FORK), before);
+}
+
+#[test]
+fn an_adopt_of_a_marked_write_itself_records_it() {
+    // Given: a marked cut, as knives wrote it.
+    let (lab, home, written) = a_marked_cut();
+    let before = ledger_entries(home.path(), LOCAL_FORK).len();
+
+    // When: it is adopted.
+    let output = knives_release(&lab, &home, &["adopt", NEXT]);
+
+    // Then: it is measured and recorded as the newest write, which ends the
+    // mark.
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout(&output).contains(&format!(
+            "demo: adopted {0} as the newest write of {NEXT}, replacing the recorded cut {0}\n",
+            written.short()
+        )),
+        "{}",
+        text(&output)
+    );
+    let after = ledger_entries(home.path(), LOCAL_FORK);
+    assert_mark_ended(&written, (before, &after));
 }

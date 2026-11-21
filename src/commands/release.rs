@@ -251,6 +251,13 @@ fn published_note(ledger: &[Entry], release: &str, commits: &[&CommitId]) -> Opt
     recorded.map(|commit| format!("a record: published note names {}", commit.short()))
 }
 
+/// Whether a `record: published …` note on `release` names `commit`: the
+/// note half of [`published_release`], read on that one commit and under
+/// every release scheme.
+pub fn published_note_names(ledger: &[Entry], release: &str, commit: &CommitId) -> bool {
+    published_note(ledger, release, &[commit]).is_some()
+}
+
 /// Refuse `name` when it is a series' own prefix, such as `release/9.2` on an
 /// entry with series 9.2: git cannot hold that ref beside `release/9.2/<date>`.
 pub fn clear_of_series_prefixes(entry: &RepoEntry, name: &str) -> Result<(), String> {
