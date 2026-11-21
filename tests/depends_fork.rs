@@ -182,6 +182,7 @@ fn install_forge(shim: &Path, log: &Path, state: &ForgeState) {
         review(5, "OPEN", "sib/feature", "acme"),
         review(6, "OPEN", "feat/landed", "acme")
     );
+    let other_pulls = format!("[{}]", review(12, "OPEN", "feat/base", "acme"));
     install_repository_gh(
         shim,
         &[
@@ -203,7 +204,7 @@ fn install_forge(shim: &Path, log: &Path, state: &ForgeState) {
             Repository {
                 named: "acme/other",
                 canonical: "acme/other",
-                pulls: "[]",
+                pulls: &other_pulls,
             },
             Repository {
                 named: "maintainer/sibling",
@@ -320,8 +321,15 @@ impl Fixture {
     /// to state `to`: a record an older knives, or another machine, could
     /// have written, which this knives refuses to write.
     fn rewrite_requirements(&self, from: &str, to: &str) {
+        let rewritten =
+            self.rewrite_ledger(&format!("value = \"{from}\""), &format!("value = \"{to}\""));
+        assert_eq!(rewritten, 1, "no one entry states {from}");
+    }
+
+    /// Replace `from` with `to` in every ledger entry of the fork that holds
+    /// it, at least one; how many.
+    fn rewrite_ledger(&self, from: &str, to: &str) -> usize {
         let dir = self.home.path().join("ledger").join(KEPT_UNDER);
-        let (from, to) = (format!("value = \"{from}\""), format!("value = \"{to}\""));
         let mut rewritten = 0;
         for file in std::fs::read_dir(&dir).expect("read the ledger directory") {
             let path = file.expect("a ledger directory entry").path();
@@ -329,17 +337,13 @@ impl Fixture {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("read a ledger entry");
-            if text.contains(&from) {
-                std::fs::write(&path, text.replace(&from, &to)).expect("rewrite a ledger entry");
+            if text.contains(from) {
+                std::fs::write(&path, text.replace(from, to)).expect("rewrite a ledger entry");
                 rewritten += 1;
             }
         }
-        assert_eq!(
-            rewritten,
-            1,
-            "no one entry states {from} in {}",
-            dir.display()
-        );
+        assert!(rewritten > 0, "no entry holds {from} in {}", dir.display());
+        rewritten
     }
 }
 
@@ -1693,14 +1697,72 @@ fn a_deleted_dependent_is_checked_by_its_recorded_head_or_reported_unknown() {
     );
     assert!(
         problems(&report).contains(&format!(
-            "cannot check whether feat/done still needs origin:acme/demo:feat/base: its branch \
-             is gone here and on origin, and the newest commit the ledger records for it, {}, \
-             has landed, which does not show that work it carried later did. Fetch a ref that \
-             holds its work, or forget its requirements (`knives depends feat/done --forget …`) \
-             once that work has landed or been dropped",
+            "cannot tell whether feat/done still needs origin:acme/demo:feat/base: its branch is \
+             gone here and on origin, and the newest commit the ledger records for it, {}, has \
+             landed, which does not show that work it carried later did; \
+             origin:acme/demo:feat/base, which has not landed (no-pr). Forget these once its \
+             work has landed or been dropped: `knives depends feat/done --forget \
+             origin:acme/demo:feat/base`",
             done.short()
         )),
         "{report}"
+    );
+    assert_eq!(code, Some(3), "{report}");
+}
+
+#[test]
+fn a_deleted_dependent_whose_requirements_are_all_met_says_nothing() {
+    // Given: feat/done requires only feat/landed, which has landed; the
+    // trunk has feat/done's own work too; then feat/done is deleted.
+    let fixture = fixture();
+    let lab = &fixture.lab;
+    lab.branch("feat/done", "done.txt", "done\n");
+    lab.upstream_trunk_file("done.txt", "done\n");
+    fixture.depends_of("feat/done", &["--on", "feat/landed"]);
+    lab.jj_work(["bookmark", "delete", "feat/done"]);
+
+    // When: status reports the fork.
+    let (code, report) = status(&fixture);
+
+    // Then: what feat/done carried later cannot change a met requirement, so
+    // nothing is said of it.
+    assert!(
+        !problems(&report)
+            .iter()
+            .any(|problem| problem.contains("feat/done")),
+        "{report}"
+    );
+    assert_ne!(code, Some(3), "{report}");
+}
+
+#[test]
+fn a_deleted_dependents_absent_commit_is_fetched_to_judge_it() {
+    // Given: feat/gone requires feat/base, which has not landed; the ledger's
+    // record of feat/gone's commit names one this checkout does not hold.
+    let fixture = fixture();
+    let lab = &fixture.lab;
+    lab.branch("feat/gone", "gone.txt", "gone\n");
+    fixture.depends_of("feat/gone", &["--on", "feat/base"]);
+    let held = lab::commit_at(lab, "feat/gone");
+    fixture.rewrite_ledger(held.as_str(), &"d".repeat(40));
+    lab.jj_work(["bookmark", "delete", "feat/gone"]);
+
+    // When: status reports the fork.
+    let (code, report) = status(&fixture);
+
+    // Then: the problem says a fetch can judge it, and gives the command.
+    let problems = problems(&report);
+    assert!(
+        problems.iter().any(|problem| problem.starts_with(&format!(
+            "cannot tell whether feat/gone still needs origin:acme/demo:feat/base: its branch is \
+             gone here and on origin, and the newest commit the ledger records for it, {}, is \
+             not in this checkout; origin:acme/demo:feat/base, which has not landed (no-pr). \
+             Fetch a ref that holds its work to judge it, or forget these once its work has \
+             landed or been dropped: `knives depends feat/gone --forget \
+             origin:acme/demo:feat/base`",
+            "d".repeat(12)
+        ))),
+        "{problems:?}\n{report}"
     );
     assert_eq!(code, Some(3), "{report}");
 }
@@ -1754,9 +1816,14 @@ fn status_on_github_remotes_keeps_another_owners_pull_request_off_a_member() {
     }
 }
 
-/// The two configs a renamed fork's repository can be in: its checkout and
-/// registry on the old name, `acme-old/demo`, or both on the new one.
-const RENAMED_CONFIGS: [(&str, &str); 2] = [(REGISTRY_ORIGIN, REGISTRY_ORIGIN), (ORIGIN, ORIGIN)];
+/// The configs a renamed fork's repository can be in: its checkout and
+/// registry on the old name, `acme-old/demo`; both on the new one; or the
+/// checkout on the new name and the registry on the old.
+const RENAMED_CONFIGS: [(&str, &str); 3] = [
+    (REGISTRY_ORIGIN, REGISTRY_ORIGIN),
+    (ORIGIN, ORIGIN),
+    (ORIGIN, REGISTRY_ORIGIN),
+];
 
 #[test]
 fn a_review_pull_request_held_under_both_names_is_forgotten_by_any_spelling() {
@@ -1821,25 +1888,33 @@ fn naming_a_review_pull_request_again_keeps_the_spelling_held() {
 
 #[test]
 fn an_exact_upstream_forget_needs_no_forge_answer() {
-    // Given: feat/base requires the upstream's #12 and the fork's #12; then
-    // the forge stops answering.
+    // Given: feat/base requires the upstream's #12 and the fork's #12.
     let fixture = fixture();
     fixture.depends_of(
         "feat/base",
         &["--on", "maintainer/demo#12", "--on", "acme/demo#12"],
     );
-    install_failing_gh(fixture.shim.path(), &fixture.log);
 
-    // When / Then: the upstream's, named as its record spells it, is taken
-    // back without the forge.
+    // When: the upstream's is taken back, named as its record spells it,
+    // with a forge that answers.
+    std::fs::write(&fixture.log, "").expect("clear the forge call log");
+    fixture.depends_of("feat/base", &["--forget", "maintainer/demo#12"]);
+
+    // Then: the forge was not asked, and only the upstream's is gone.
+    assert_eq!(fixture.forge_calls(), "");
+    assert_eq!(fixture.required("feat/base"), ["origin:acme/demo#12"]);
+
+    // And: with the forge down, the same forget still works.
+    fixture.depends_of("feat/base", &["--on", "maintainer/demo#12"]);
+    install_failing_gh(fixture.shim.path(), &fixture.log);
     fixture.depends_of("feat/base", &["--forget", "maintainer/demo#12"]);
     assert_eq!(fixture.required("feat/base"), ["origin:acme/demo#12"]);
 }
 
 #[test]
-fn a_record_the_forge_cannot_name_does_not_stop_another_forget() {
+fn a_record_on_a_repository_the_forge_says_does_not_exist_is_another_requirement() {
     // Given: feat/alpha requires the fork's #13 and #13 on a repository the
-    // forge does not know.
+    // forge answers does not exist.
     let fixture = fixture();
     fixture.depends(&["--on", "acme/demo#13"]);
     fixture.rewrite_requirements(
@@ -1847,9 +1922,135 @@ fn a_record_the_forge_cannot_name_does_not_stop_another_forget() {
         "origin:acme/demo#13,origin:gone/demo#13",
     );
 
-    // When / Then: the fork's #13 is taken back; the other stays.
+    // When / Then: each is taken back alone, by its own spelling.
     fixture.depends(&["--forget", "origin:acme/demo#13"]);
     assert_eq!(fixture.required("feat/alpha"), ["origin:gone/demo#13"]);
+    fixture.depends(&["--forget", "origin:gone/demo#13"]);
+    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
+}
+
+#[test]
+fn an_ambiguous_forget_while_the_forge_is_down_takes_nothing_back() {
+    // Given: the checkout and registry on the old name; feat/base requires
+    // the upstream's #12 and the fork's #12, recorded under its new name.
+    let fixture = fixture_with(REGISTRY_ORIGIN, REGISTRY_ORIGIN);
+    fixture.depends_of(
+        "feat/base",
+        &["--on", "maintainer/demo#12", "--on", "acme/demo#12"],
+    );
+
+    // When / Then, with the forge up: `demo#12` names both, refused.
+    fixture.refused(
+        "feat/base",
+        &["--forget", "demo#12"],
+        &["demo#12 answers to maintainer/demo#12, origin:acme/demo#12"],
+    );
+
+    // When: the forge is down.
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+    let output = fixture.knives(&["--text", "depends", "feat/base", "--forget", "demo#12"]);
+
+    // Then: whether it names the fork's #12 too could not be asked, so
+    // nothing is taken back (exit 3), never the upstream's alone.
+    assert_eq!(output.status.code(), Some(3), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "nothing recorded: whether demo#12 also names origin:acme/demo#12 could not be asked \
+             of the forge"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(
+        fixture.required("feat/base"),
+        ["maintainer/demo#12", "origin:acme/demo#12"]
+    );
+}
+
+#[test]
+fn an_explicit_origin_alias_is_no_upstream_token() {
+    // Given: feat/alpha requires the fork's #13, and another fork's upstream
+    // is this fork's own repository under its old name, acme-old/demo.
+    let fixture = fixture();
+    fixture.depends(&["--on", "acme/demo#13"]);
+    let registry = fixture.home.path().join("repos.toml");
+    let text = std::fs::read_to_string(&registry).expect("read the registry");
+    std::fs::write(
+        &registry,
+        text.replace(
+            "https://forge.invalid/maintainer/sibling",
+            "https://forge.invalid/acme-old/demo",
+        ),
+    )
+    .expect("rewrite the registry");
+
+    // When / Then: `origin:` names this fork's own repository, so the old
+    // name takes the record back.
+    fixture.depends(&["--forget", "origin:acme-old/demo#13"]);
+    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
+}
+
+#[test]
+fn a_member_token_under_the_former_name_takes_back_every_spelling() {
+    for (origin, registered) in [(ORIGIN, ORIGIN), (ORIGIN, REGISTRY_ORIGIN)] {
+        // Given: feat/alpha requires feat/base under both names of the fork's
+        // repository.
+        let fixture = fixture_with(origin, registered);
+        fixture.depends(&["--on", "feat/base"]);
+        fixture.rewrite_requirements(
+            "origin:acme/demo:feat/base",
+            "origin:acme-old/demo:feat/base,origin:acme/demo:feat/base",
+        );
+
+        // When / Then: the former name's token takes back both.
+        fixture.depends(&["--forget", "origin:acme-old/demo:feat/base"]);
+        assert_eq!(
+            fixture.required("feat/alpha"),
+            Vec::<String>::new(),
+            "{registered}"
+        );
+    }
+}
+
+#[test]
+fn a_correction_to_the_new_name_writes_the_new_name() {
+    // Given: both on the new name; feat/alpha requires the fork's #13 under
+    // its old name.
+    let fixture = fixture_with(ORIGIN, ORIGIN);
+    fixture.depends(&["--on", "acme/demo#13"]);
+    fixture.rewrite_requirements("origin:acme/demo#13", "origin:acme-old/demo#13");
+
+    // When: the old spelling is forgotten and the new one named.
+    let stdout = fixture.depends(&[
+        "--forget",
+        "origin:acme-old/demo#13",
+        "--on",
+        "acme/demo#13",
+    ]);
+
+    // Then: the list holds the new spelling.
+    assert_eq!(
+        stdout.trim_end(),
+        "demo/feat/alpha no longer requires origin:acme-old/demo#13; it requires \
+         origin:acme/demo#13"
+    );
+    assert_eq!(fixture.required("feat/alpha"), ["origin:acme/demo#13"]);
+}
+
+#[test]
+fn a_registry_spelling_naming_another_live_repository_is_no_review_pull_request_here() {
+    // Given: the checkout's origin names acme/demo; the registry names
+    // another live repository, acme/other, which has #12 from acme's
+    // feat/base.
+    let fixture = fixture_with(ORIGIN, "https://forge.invalid/acme/other");
+
+    // When / Then: acme/other#12 is refused, as `status` would never judge
+    // it as this fork's.
+    fixture.refused(
+        "feat/alpha",
+        &["--on", "acme/other#12"],
+        &["acme/other is not demo's own repository: its checkout's origin names acme/demo"],
+    );
 }
 
 #[test]
@@ -1935,9 +2136,9 @@ fn an_old_recorded_dependent_commit_does_not_show_its_later_work_landed() {
     let problems = problems(&report);
     assert!(
         problems.iter().any(|problem| problem.starts_with(&format!(
-            "cannot check whether feat/dep still needs origin:acme/demo:feat/base: its branch \
-             is gone here and on origin, and the newest commit the ledger records for it, {}, \
-             has landed",
+            "cannot tell whether feat/dep still needs origin:acme/demo:feat/base: its branch is \
+             gone here and on origin, and the newest commit the ledger records for it, {}, has \
+             landed",
             recorded.short()
         ))),
         "{problems:?}\n{report}"
@@ -2034,8 +2235,11 @@ fn a_dependent_the_ledger_records_no_commit_for_is_reported_unknown() {
     // Then: not silent: a problem saying the ledger records no commit for it.
     assert!(
         problems(&report).iter().any(|problem| problem.starts_with(
-            "cannot check whether feat/ghost still needs origin:acme/demo:feat/base: its branch \
-             is gone here and on origin, and the ledger records no commit for it."
+            "cannot tell whether feat/ghost still needs origin:acme/demo:feat/base: its branch \
+             is gone here and on origin, and the ledger records no commit for it; \
+             origin:acme/demo:feat/base, which has not landed (no-pr). Forget these once its \
+             work has landed or been dropped: `knives depends feat/ghost --forget \
+             origin:acme/demo:feat/base`"
         )),
         "{report}"
     );
