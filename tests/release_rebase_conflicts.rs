@@ -25,10 +25,11 @@ mod lab;
 #[path = "common/release_forge.rs"]
 mod release_forge;
 
-use std::process::Output;
-
 use forge_shim::pull_record;
-use lab::{Lab, commit_at, file_at_revision, knives_release, release_parents, release_test_home};
+use lab::{
+    Lab, Resolution, a_f, adopted_release, commit_at, conflicts_of, d_f, f_with, file_at_revision,
+    knives_release, release_parents, release_test_home, squash_land, text,
+};
 use release_forge::knives_release_with_forge;
 
 /// The release every test here cuts and rebases.
@@ -40,103 +41,12 @@ const D: &str = "feat/d";
 /// A member, made after the cut, that sets line 5 of `f` as D does.
 const A: &str = "feat/a";
 
-/// Both streams, for an assertion's message.
-fn text(output: &Output) -> String {
+/// The line that names a member the rebase left conflicted in one file.
+fn member_line(name: &str, files: &str) -> String {
     format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        "demo: member {name} holds 1 conflicted file(s) after the rebase: {files}; resolve them \
+         on its branch"
     )
-}
-
-/// `f`: thirty lines `let lN = N`, with each line of `changed` set to its
-/// value.
-fn f_with(changed: &[(usize, &str)]) -> String {
-    use std::fmt::Write as _;
-    let mut f = String::new();
-    for line in 1..=30 {
-        match changed.iter().find(|(at, _)| *at == line) {
-            Some((_, value)) => writeln!(f, "let l{line} = {value}"),
-            None => writeln!(f, "let l{line} = {line}"),
-        }
-        .expect("write to a String");
-    }
-    f
-}
-
-/// D's `f`: A's change to line 5, and its own line 6 next to it.
-fn d_f() -> String {
-    f_with(&[(5, "compare_fix ()"), (6, "d809_only ()")])
-}
-
-/// A's `f`: line 5 only.
-fn a_f() -> String {
-    f_with(&[(5, "compare_fix ()")])
-}
-
-/// The files `revision` leaves conflicted.
-fn conflicts_of(lab: &Lab, revision: &str) -> Vec<String> {
-    knives::jj::conflicted_files(&lab.work, revision).expect("list the conflicted files")
-}
-
-/// The line that names a member the rebase left conflicted.
-fn member_line(name: &str, files: &str, count: usize) -> String {
-    format!(
-        "demo: member {name} holds {count} conflicted file(s) after the rebase: {files}; resolve \
-         them on its branch"
-    )
-}
-
-/// How the conflict of `include A` in `f` is resolved by hand before the
-/// adopt.
-#[derive(Clone, Copy)]
-enum Resolution {
-    /// `f` as D has it, which holds A's line too.
-    DVersion,
-    /// A text that keeps neither side.
-    Neither,
-}
-
-/// The shape of case 3b of INFRA-4895's drop-after-adopt probe (version 2):
-/// a trunk holding `f`; M adds `m.txt`; D sets lines 5 and 6 of `f`; a first
-/// cut of M and D; A, made after the cut, sets line 5 as D does; `include A`
-/// conflicts in `f`; `f` resolved by hand and adopted. Returns the lab and
-/// its home.
-fn adopted_release(resolution: Resolution) -> (Lab, tempfile::TempDir) {
-    let lab = Lab::new();
-    lab.upstream_trunk_file("f", &f_with(&[]));
-    lab.mirror_upstream_trunk_to_origin();
-    lab.branch(M, "m.txt", "m\n");
-    lab.branch(D, "f", &d_f());
-    let (home, _consumer) = release_test_home(&lab);
-    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
-    assert!(matches!(cut.status.code(), Some(0 | 1)), "{}", text(&cut));
-    assert_eq!(release_parents(&lab, RELEASE).len(), 2, "{}", text(&cut));
-    lab.branch(A, "f", &a_f());
-    let included = knives_release(&lab, &home, &["include", A]);
-    assert_eq!(included.status.code(), Some(0), "{}", text(&included));
-    assert_eq!(conflicts_of(&lab, RELEASE), ["f"], "{}", text(&included));
-    match resolution {
-        Resolution::DVersion => lab.jj_work(["restore", "--from", D, "--into", RELEASE, "f"]),
-        Resolution::Neither => {
-            // No message, so the squash keeps the release's own and opens
-            // no editor.
-            lab.jj_work(["new", RELEASE]);
-            std::fs::write(lab.work.join("f"), "merged\n").expect("resolve f");
-            lab.jj_work(["squash"]);
-            lab.jj_work(["new", "main@origin"]);
-        }
-    }
-    let adopted = knives_release(&lab, &home, &["adopt", RELEASE, "--why", "resolve f"]);
-    assert!(
-        matches!(adopted.status.code(), Some(0 | 1))
-            && String::from_utf8_lossy(&adopted.stdout)
-                .contains(&format!("as the newest write of {RELEASE}")),
-        "{}",
-        text(&adopted)
-    );
-    assert!(conflicts_of(&lab, RELEASE).is_empty(), "{}", text(&adopted));
-    (lab, home)
 }
 
 #[test]
@@ -160,11 +70,7 @@ fn a_rebase_that_leaves_a_member_conflicted_names_it_and_exits_1() {
     );
     // And: the report names D's branch with `f`, never says the release has
     // no conflicts, and the command exits 1.
-    assert!(
-        stdout.contains(&member_line(D, "f", 1)),
-        "{}",
-        text(&output)
-    );
+    assert!(stdout.contains(&member_line(D, "f")), "{}", text(&output));
     assert!(
         !stdout.contains("no conflicts in this release"),
         "{}",
@@ -185,11 +91,7 @@ fn a_no_drop_rebase_that_leaves_a_member_conflicted_exits_1() {
     // Then: the report names D's branch with `f`, and the command exits 1.
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(conflicts_of(&lab, D), ["f"], "{}", text(&output));
-    assert!(
-        stdout.contains(&member_line(D, "f", 1)),
-        "{}",
-        text(&output)
-    );
+    assert!(stdout.contains(&member_line(D, "f")), "{}", text(&output));
     assert_eq!(output.status.code(), Some(1), "{}", text(&output));
 }
 
@@ -252,16 +154,8 @@ fn a_conflicted_release_and_member_are_both_named() {
         "{}",
         text(&output)
     );
-    assert!(
-        stdout.contains(&member_line(D, "f", 1)),
-        "{}",
-        text(&output)
-    );
-    assert!(
-        stdout.contains(&member_line(A, "f", 1)),
-        "{}",
-        text(&output)
-    );
+    assert!(stdout.contains(&member_line(D, "f")), "{}", text(&output));
+    assert!(stdout.contains(&member_line(A, "f")), "{}", text(&output));
     assert_eq!(output.status.code(), Some(1), "{}", text(&output));
 }
 
@@ -300,9 +194,7 @@ fn a_bare_rebase_whose_landed_drop_leaves_a_member_conflicted_names_it_and_exits
     // request #7 squash-merged upstream, so that the trunk commit T holds
     // all of A's change and the forge reports #7 merged as T.
     let (lab, home) = adopted_release(Resolution::DVersion);
-    lab.publish_pull(A, 7);
-    lab.squash_merge_pull(7, None);
-    let merged_at = commit_at(&lab, "main@upstream");
+    let merged_at = squash_land(&lab, A, 7);
     let pulls = format!(
         "[{}]",
         pull_record(7, "MERGED", A, Some(merged_at.as_str()))
@@ -326,7 +218,7 @@ fn a_bare_rebase_whose_landed_drop_leaves_a_member_conflicted_names_it_and_exits
     // And: the drop's report, which ends the command, names D's branch with
     // `f`, and the command exits 1.
     assert!(
-        drop_report.contains(&member_line(D, "f", 1)),
+        drop_report.contains(&member_line(D, "f")),
         "{}",
         text(&output)
     );
@@ -369,7 +261,7 @@ fn a_conflicted_member_no_bookmark_holds_is_named_by_its_commit() {
         text(&output)
     );
     assert!(
-        stdout.contains(&member_line(rebased_d.short(), "f", 1)),
+        stdout.contains(&member_line(rebased_d.short(), "f")),
         "{}",
         text(&output)
     );
@@ -431,7 +323,7 @@ fn a_rebase_with_a_union_and_a_conflicted_member_does_not_say_no_other_conflicts
     assert!(
         stdout.contains(&format!(
             "demo: no conflicted file in the release commit\n{}",
-            member_line("feat/alpha", "CHANGELOG.md", 1)
+            member_line("feat/alpha", "CHANGELOG.md")
         )),
         "{}",
         text(&output)

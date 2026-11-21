@@ -31,7 +31,10 @@ use std::process::Output;
 
 use knives::ids::CommitId;
 use knives::ledger::{Entry, Kind, Ledger};
-use lab::{Lab, commit_at, home_after_first_cut, knives_release, release_test_home};
+use lab::{
+    Lab, commit_at, fixed_home, home_after_first_cut, knives_release, release_test_home, stdout,
+    text,
+};
 
 /// The release every test here cuts and re-signs.
 const RELEASE: &str = "release/2026-08-04";
@@ -52,19 +55,6 @@ const LEDGER: &str = "acme/ledger";
 /// [`LEDGER`] as each ledger root's `origin` spells it; git reaches it at a
 /// bare remote through `insteadOf`.
 const LEDGER_URL: &str = "https://forge.invalid/acme/ledger";
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-/// Both streams, for an assertion's message.
-fn text(output: &Output) -> String {
-    format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-}
 
 /// Every entry of `home`'s ledger of `fork`, in the order it reads them.
 fn ledger_entries(home: &Path, fork: &str) -> Vec<Entry> {
@@ -192,29 +182,6 @@ fn assert_mark_ended(adopted: &CommitId, (before, after): (usize, &[Entry])) {
         "{event:?}"
     );
     assert!(!event.text.contains("; unchecked:"), "{event:?}");
-}
-
-/// A config home whose registry releases the lab fork `demo` on the fixed
-/// branch [`FIXED`], with an empty local consumer.
-fn fixed_home(lab: &Lab) -> tempfile::TempDir {
-    let home = tempfile::tempdir().expect("create config home");
-    std::fs::write(
-        home.path().join("repos.toml"),
-        format!(
-            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n\
-             release_branch = \"{FIXED}\"\n",
-            lab.upstream.display(),
-        ),
-    )
-    .expect("write fixed-scheme registry");
-    let consumer = home.path().join("consumer");
-    std::fs::create_dir_all(&consumer).expect("create local consumer");
-    std::fs::write(
-        home.path().join("local-consumer"),
-        consumer.display().to_string(),
-    )
-    .expect("write local consumer fixture path");
-    home
 }
 
 /// [`two_branches`] cut as [`RELEASE`]; then the ledger removed, so that
@@ -544,7 +511,7 @@ fn an_adopt_of_a_tagged_fixed_release_re_described_records_nothing() {
     // immutability the tag gives it. The tag stays on the cut.
     let lab = two_branches();
     lab.jj_work(["new", "main@origin"]);
-    let home = fixed_home(&lab);
+    let home = fixed_home(&lab, FIXED);
     let cut = knives_release(&lab, &home, &["cut"]);
     assert!(
         stdout(&cut).contains(&format!("cut {FIXED} as")),

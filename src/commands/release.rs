@@ -617,6 +617,10 @@ pub fn cut_keepers(
     }
     keep.extend(repo.parent_commits(previous.as_str())?);
     keep.push(repo.resolve_commit(&entry.trunk_ref())?);
+    // A remote's tip is often the local bookmark's commit: the callers join
+    // the list into one revset, which needs each commit once.
+    keep.sort();
+    keep.dedup();
     Ok(keep)
 }
 
@@ -2348,8 +2352,8 @@ pub fn render_members(report: &MembersReport) -> String {
         }
         for name in &audit.inconclusive {
             lines.push(format!(
-                "  {}: content check inconclusive (replay conflicted; \
-                 re-check after resolving the cut's conflicts)",
+                "  {}: content check inconclusive (an unresolved conflict; re-check after \
+                 resolving it)",
                 inline_human_text(name)
             ));
             lines.extend(audit.lost_lines_of(name));
@@ -3495,21 +3499,23 @@ pub fn lost_lines(lines: &MemberLines, indent: &str) -> Vec<String> {
             LostKind::Mode => format!("{path}: mode differs from the member's ({text})"),
             LostKind::Conflict => format!("{path}: unresolved conflict {text}"),
             LostKind::WordLimit => {
-                let range = lines.word_step_skipped.iter().position(|range| {
-                    range.path == lost.path
-                        && lost.line.is_some_and(|line| {
-                            (range.first_line..=range.last_line).contains(&line)
-                        })
-                });
-                if range.is_some_and(|range| named_ranges.contains(&range)) {
+                let skipped = lines
+                    .word_step_skipped
+                    .iter()
+                    .enumerate()
+                    .find(|(_, range)| {
+                        range.path == lost.path
+                            && lost.line.is_some_and(|line| {
+                                (range.first_line..=range.last_line).contains(&line)
+                            })
+                    });
+                if skipped.is_some_and(|(index, _)| named_ranges.contains(&index)) {
                     continue;
                 }
-                named_ranges.extend(range);
-                let span = range
-                    .and_then(|range| lines.word_step_skipped.get(range))
-                    .map_or(at, |range| {
-                        format!(":{}-{}", range.first_line, range.last_line)
-                    });
+                named_ranges.extend(skipped.map(|(index, _)| index));
+                let span = skipped.map_or(at, |(_, range)| {
+                    format!(":{}-{}", range.first_line, range.last_line)
+                });
                 format!(
                     "{path}{span}: the word step did not run (more than {} words); its lines \
                      count as lost",
@@ -3635,10 +3641,20 @@ impl CompositionCheck {
         !self.inconclusive.is_empty() || !self.inconclusive_fixes.is_empty()
     }
 
-    /// The lines the check read of the recorded member at `commit`, where
-    /// it read them.
-    pub fn lines_of(&self, commit: &CommitId) -> Option<&MemberLines> {
-        self.members.iter().find(|lines| lines.commit == *commit)
+    /// The lines that name what the recorded member at `commit` lacks, to
+    /// print under its row ([`lost_lines`]); none for a member the check
+    /// did not read.
+    pub fn lost_lines_of(&self, commit: &CommitId) -> Vec<String> {
+        self.members
+            .iter()
+            .find(|lines| lines.commit == *commit)
+            .map_or_else(Vec::new, |lines| lost_lines(lines, LOST_LINE_INDENT))
+    }
+
+    /// Each line of every recorded member that the subject holds only by
+    /// its words, to print after the rows ([`labelled_words_lines`]).
+    pub fn words_lines(&self) -> Vec<String> {
+        self.members.iter().flat_map(labelled_words_lines).collect()
     }
 }
 

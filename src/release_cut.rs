@@ -372,9 +372,7 @@ pub(crate) fn run_release(
                     if let Some(orphaned) = &orphaned {
                         report_stated_drop(fork, orphaned)?;
                     }
-                    if !audit.inconclusive.is_empty() || check.is_inconclusive() {
-                        worst = worst.worst(Exit::Findings);
-                    }
+                    worst = worst.worst(completed.exit());
                     return Ok(worst);
                 } else {
                     println!(
@@ -598,8 +596,8 @@ fn report_cut_audit(
     // Each name is a member's bookmark, read from the repository.
     for name in &audit.inconclusive {
         println!(
-            "  {}: content check inconclusive (replay conflicted; \
-             re-check after resolving the cut's conflicts)",
+            "  {}: content check inconclusive (an unresolved conflict; re-check after resolving \
+             it)",
             inline_human_text(name)
         );
         for line in audit.lost_lines_of(name) {
@@ -977,14 +975,12 @@ fn uncarried_cut_lines(
     for member in &check.inconclusive {
         let holder = held.holder(&member.commit);
         lines.push(format!(
-            "  {}: recorded by the {}; carry check inconclusive (replay conflicted; re-check \
-             after resolving the cut's conflicts)",
+            "  {}: recorded by the {}; carry check inconclusive (an unresolved conflict; \
+             re-check after resolving it)",
             inline_human_text(&member.name),
             holder.title(&inline_human_text(&holder.recorded().name))
         ));
-        if let Some(read) = check.lines_of(&member.commit) {
-            lines.extend(release::lost_lines(read, release::LOST_LINE_INDENT));
-        }
+        lines.extend(check.lost_lines_of(&member.commit));
     }
     // A fix whose file the cut leaves conflicted is unanswerable until the
     // conflict is resolved: the person resolves it in place and adopts.
@@ -999,7 +995,7 @@ fn uncarried_cut_lines(
     if check.refuses() {
         lines.extend(refusal_lines(repo, held, check, (on_drop, remotes)));
     }
-    lines.extend(check.members.iter().flat_map(release::labelled_words_lines));
+    lines.extend(check.words_lines());
     lines
 }
 
@@ -1062,11 +1058,7 @@ fn refusal_lines(
 fn lacking_lines(check: &release::CompositionCheck) -> Vec<String> {
     let mut lines = Vec::new();
     for member in &check.dropped {
-        let lost = check
-            .lines_of(&member.commit)
-            .map_or_else(Vec::new, |read| {
-                release::lost_lines(read, release::LOST_LINE_INDENT)
-            });
+        let lost = check.lost_lines_of(&member.commit);
         if !lost.is_empty() {
             lines.push(format!("    {}:", inline_human_text(&member.name)));
             lines.extend(lost);
@@ -1888,6 +1880,19 @@ struct CompletedCut<'a> {
     composition: Option<&'a [(String, CommitId)]>,
 }
 
+impl CompletedCut<'_> {
+    /// The exit of the cut's checks: findings where the audit or the
+    /// composition gate could not read a member, or a fix by hand, for an
+    /// unresolved conflict; else 0.
+    const fn exit(&self) -> Exit {
+        if self.audit.inconclusive.is_empty() && !self.check.is_inconclusive() {
+            Exit::Ok
+        } else {
+            Exit::Findings
+        }
+    }
+}
+
 /// What the event of a cut composed outside knives says after it restates
 /// the records it was held against ([`restated_delta`]): `cut NAME --at`
 /// recorded it, knives wrote no commit.
@@ -2256,13 +2261,7 @@ fn write_hand_cut(
     );
     // The commit holds no conflict, but a member whose tip is conflicted in
     // one of its own paths cannot be read there, as for any cut.
-    Ok(
-        if cut.audit.inconclusive.is_empty() && !cut.check.is_inconclusive() {
-            Exit::Ok
-        } else {
-            Exit::Findings
-        },
-    )
+    Ok(cut.exit())
 }
 
 /// The commit a release cut outside knives is recorded at, as its gates
@@ -2688,11 +2687,7 @@ fn report_completed_cut(
     (bound, last): (Bound<'_>, &mut Option<release::ReportedWrite>),
 ) -> anyhow::Result<Exit> {
     let entry = fork.entry;
-    let mut post_cut_exit = if cut.audit.inconclusive.is_empty() && !cut.check.is_inconclusive() {
-        Exit::Ok
-    } else {
-        Exit::Findings
-    };
+    let mut post_cut_exit = cut.exit();
     print_previous_release_position(opened, entry);
     println!(
         "  cut {} as {} with {} parent(s), not pushed",

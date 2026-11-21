@@ -147,7 +147,7 @@ fn members_verify_reports_a_dropped_members_content() {
     std::fs::write(lab.work.join("shared.txt"), "merged\n").expect("resolve by hand");
     lab.jj_work(["new"]);
 
-    // When: each member's content is replayed against the resolved release.
+    // When: each member is read by its own lines against the resolved release.
     let output = knives_release(&lab, &home, &["members", "--verify"]);
 
     // Then: the lost member is a finding, rather than a successful inspection.

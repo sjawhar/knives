@@ -233,8 +233,8 @@ fn a_cut_is_signed_as_the_users_jj_would_sign_it() {
     assert!(output.status.success(), "{output:?}");
 
     // Then: exactly one commit was signed — the published cut. The audit's
-    // candidate and replays are scratch that is dropped, so the jj CLI would
-    // never sign them; signing each would run the key once per replayed commit.
+    // candidate is scratch that is dropped, so the jj CLI would never sign it,
+    // and the audit reads each member by its own lines, which writes no commit.
     assert_eq!(signing.signature_count(), 1, "{output:?}");
     // And: the cut's signature verifies against that key.
     assert_eq!(release_signature(&lab, &signing.config), "good");
@@ -1598,7 +1598,7 @@ fn a_fixed_scheme_cut_identical_to_its_published_position_is_refused_when_every_
 #[test]
 fn a_named_cut_with_an_inconclusive_content_audit_returns_findings() {
     // Given: two members entangled in one file, so the cut is conflicted from birth
-    // and every member's replay onto it answers nothing either way.
+    // and neither member, read by its own lines, can be read in that file.
     let lab = Lab::new();
     lab.branch("feat/alpha", "shared.txt", "alpha\n");
     lab.branch("feat/beta", "shared.txt", "beta\n");

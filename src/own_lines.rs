@@ -28,6 +28,7 @@
 mod difflib;
 mod words;
 
+use std::cell::OnceCell;
 use std::collections::{BTreeSet, HashSet};
 use std::ops::Range;
 
@@ -49,11 +50,18 @@ pub const WORD_LIMIT: usize = 30_000;
 
 /// The text of a [`LostKind::Conflict`] entry where the member's tip holds
 /// the unresolved conflict.
-pub const CONFLICT_AT_TIP: &str = "at the member's tip";
+const CONFLICT_AT_TIP: &str = "at the member's tip";
 
 /// The text of a [`LostKind::Conflict`] entry where the release holds the
 /// unresolved conflict.
-pub const CONFLICT_IN_RELEASE: &str = "in the release";
+const CONFLICT_IN_RELEASE: &str = "in the release";
+
+/// The text of a [`LostKind::File`] entry for a file that is not text.
+const BINARY_FILE: &str = "a binary file";
+
+/// The text of a [`LostKind::File`] entry for a file that the member added
+/// with no non-blank line.
+const EMPTY_FILE: &str = "an empty file";
 
 /// The most characters of a line that a reading names, as the prototype of
 /// the rule showed a line; a longer line is cut there, with `…` after it.
@@ -122,7 +130,8 @@ pub enum Reading {
     /// The release lacks a line, or a path, of the member's own change.
     Missing,
     /// A path of the member's change holds an unresolved conflict, in the
-    /// release or at the member's tip, and the release lacks nothing else.
+    /// release or at the member's tip, and the release lacks nothing else
+    /// that the release before it did not lack too.
     Inconclusive,
     /// The release lacks only what the release before it lacked too
     /// ([`MemberLines::carry_forward`]).
@@ -137,7 +146,7 @@ pub struct Lost {
     pub kind: LostKind,
     /// For an added line, its line number at the member's tip; for a hunk of
     /// removed lines, the fork point's line number of its first non-blank
-    /// line. `None` for a path read whole.
+    /// line. `None` for a path read whole, a mode and a conflict.
     pub line: Option<u32>,
     /// For a line, its text. For a path read whole, what the member made of
     /// it (`deleted`, `a binary file`, `an empty file`, `a symlink to …`,
@@ -257,11 +266,11 @@ impl MemberLines {
 
     /// Carries forward, line by line, what `previous`, the reading of the
     /// same member, from the same fork point and tip, against the release
-    /// before this one, lacks too: a lost entry is carried forward where
-    /// `previous` lost one of the same path, kind and line. A member whose
-    /// every lost line is carried forward reads carried forward, or
-    /// inconclusive where a path cannot be read; one with any other lost
-    /// line still reads missing.
+    /// before this one, lacks too: a lost entry other than a conflict is
+    /// carried forward where `previous` lost one of the same path, kind and
+    /// line. A member whose every lost line is carried forward reads carried
+    /// forward, or inconclusive where a path cannot be read; one with any
+    /// other lost line still reads missing.
     pub fn carry_forward(&mut self, previous: &Self) {
         for lost in &mut self.lost {
             lost.carried_forward = lost.kind != LostKind::Conflict
@@ -273,8 +282,9 @@ impl MemberLines {
     }
 
     /// Whether every path the member cannot be read at holds its unresolved
-    /// conflict at the member's tip, and none in the release. `false` where
-    /// no path holds a conflict.
+    /// conflict at the member's tip, whether or not the release holds one
+    /// there too: [`Self::read_path`] records a path conflicted at both as at
+    /// the tip. `false` where no path holds a conflict.
     #[must_use]
     pub fn conflicted_only_at_tip(&self) -> bool {
         let mut conflicts = self
@@ -288,27 +298,18 @@ impl MemberLines {
 
     /// The reading that the lost entries give.
     fn settled(&self) -> Reading {
-        let mut lines = self
+        if self
             .lost
             .iter()
-            .filter(|lost| lost.kind != LostKind::Conflict)
-            .peekable();
-        let unread = self.lost.iter().any(|lost| lost.kind == LostKind::Conflict);
-        if lines.peek().is_none() {
-            return if unread {
-                Reading::Inconclusive
-            } else {
-                Reading::Carried
-            };
-        }
-        if lines.all(|lost| lost.carried_forward) {
-            if unread {
-                Reading::Inconclusive
-            } else {
-                Reading::CarriedForward
-            }
-        } else {
+            .any(|lost| lost.kind != LostKind::Conflict && !lost.carried_forward)
+        {
             Reading::Missing
+        } else if self.lost.iter().any(|lost| lost.kind == LostKind::Conflict) {
+            Reading::Inconclusive
+        } else if self.lost.is_empty() {
+            Reading::Carried
+        } else {
+            Reading::CarriedForward
         }
     }
 }
@@ -367,7 +368,7 @@ impl Out<'_> {
         }
         if is_binary(content) {
             if release.is_none_or(|(_, held)| held != content) {
-                let made = "a binary file".to_owned();
+                let made = BINARY_FILE.to_owned();
                 self.lost(entry(path, LostKind::File, None, Some(made)), || {
                     Place::Path
                 });
@@ -376,7 +377,7 @@ impl Out<'_> {
         }
         if fork.is_none() && is_blank(content) {
             if release.is_none() {
-                let made = "an empty file".to_owned();
+                let made = EMPTY_FILE.to_owned();
                 self.lost(entry(path, LostKind::File, None, Some(made)), || {
                     Place::Path
                 });
@@ -513,18 +514,20 @@ pub fn place(path: &str, (fork, tip): (&Value, &Value), version: &Version) -> Pl
 pub fn conflict_regions(text: &[u8], marker_len: usize) -> Vec<Range<usize>> {
     let mut regions = Vec::new();
     let mut open = None;
+    let mut lines = 0;
     for (index, line) in text.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        lines = index + 1;
         match (open, marker(line, marker_len)) {
             (None, Some(b'<')) => open = Some(index),
             (Some(start), Some(b'>')) => {
-                regions.push(start..index + 1);
+                regions.push(start..lines);
                 open = None;
             }
             _ => {}
         }
     }
     if let Some(start) = open {
-        regions.push(start..text.split_inclusive(|byte| *byte == b'\n').count());
+        regions.push(start..lines);
     }
     regions
 }
@@ -571,9 +574,9 @@ pub fn change_lines(path: &str, fork: &Value, tip: &Value) -> Vec<Lost> {
         return lines;
     }
     let made = if is_binary(content) {
-        Some("a binary file")
+        Some(BINARY_FILE)
     } else if before.is_none() && is_blank(content) {
-        Some("an empty file")
+        Some(EMPTY_FILE)
     } else {
         None
     };
@@ -757,10 +760,13 @@ struct TextPath<'t> {
     /// For each line of the tip, the survival hunk that deletes or replaces
     /// it.
     gone: Vec<Option<usize>>,
+    /// The release's text, which R8 reads ([`Self::held_by_r8`]).
+    release_text: &'t [u8],
     /// R8: where the path is a release log and the release's file has one
     /// `[Unreleased]` section, that section's lines, trailing whitespace
-    /// cut ([`changelog_union::unreleased_lines`]).
-    unreleased: Option<HashSet<&'t [u8]>>,
+    /// cut ([`changelog_union::unreleased_lines`]). It is read the first
+    /// time a line needs it.
+    unreleased: OnceCell<Option<HashSet<&'t [u8]>>>,
 }
 
 /// What the rule reads of one line that the member added and the survival
@@ -779,7 +785,9 @@ struct Added<'t> {
     /// Its index at the tip.
     index: usize,
     text: &'t [u8],
-    /// The line that it replaced, where the pairing pairs it with one.
+    /// The line that it replaced, where the pairing pairs it with one. A
+    /// line that the survival diff deletes is not paired: it is lost
+    /// whatever it replaced.
     fork: Option<&'t [u8]>,
 }
 
@@ -803,9 +811,8 @@ impl<'t> TextPath<'t> {
             member: line_hunks(fork, tip),
             survival,
             gone,
-            unreleased: changelog_union::eligible(path)
-                .then(|| changelog_union::unreleased_lines(release))
-                .flatten(),
+            release_text: release,
+            unreleased: OnceCell::new(),
         }
     }
 
@@ -855,13 +862,24 @@ impl<'t> TextPath<'t> {
             if is_blank(text) || self.held_by_r8(text) {
                 continue;
             }
-            let pairs = pairs.get_or_insert_with(|| words::pair_hunk(removed, added));
-            let fork = pairs
-                .get(offset)
-                .copied()
-                .flatten()
-                .and_then(|at| removed.get(at))
-                .copied();
+            // A survival hunk that deletes the line loses it, whatever line
+            // it replaced ([`Self::judge`]), so only a replaced line is
+            // paired.
+            let replaces = self
+                .survival
+                .get(survival)
+                .is_some_and(|replacing| !replacing.new.is_empty());
+            let fork = if replaces {
+                pairs
+                    .get_or_insert_with(|| words::pair_hunk(removed, added))
+                    .get(offset)
+                    .copied()
+                    .flatten()
+                    .and_then(|at| removed.get(at))
+                    .copied()
+            } else {
+                None
+            };
             let line = Added { index, text, fork };
             match self.judge(line, survival, steps) {
                 Judged::Lost(kind) => out.lost(
@@ -897,6 +915,11 @@ impl<'t> TextPath<'t> {
     /// section, trailing whitespace aside, in a release log.
     fn held_by_r8(&self, line: &[u8]) -> bool {
         self.unreleased
+            .get_or_init(|| {
+                changelog_union::eligible(self.path)
+                    .then(|| changelog_union::unreleased_lines(self.release_text))
+                    .flatten()
+            })
             .as_ref()
             .is_some_and(|held| held.contains(line.trim_ascii_end()))
     }
@@ -1005,8 +1028,9 @@ enum WordStep<'t> {
 /// The word survival diff of one replaced range: the words of the tip's
 /// lines in the range against the words of the release's lines.
 struct WordDiff<'t> {
-    /// The words of each tip line of the range, as a range of the tip's
-    /// words.
+    /// The words of the tip's lines in the range.
+    tip_words: Vec<&'t [u8]>,
+    /// The words of each tip line of the range, as a range of `tip_words`.
     spans: Vec<Range<usize>>,
     /// Whether the diff deletes or replaces each of the tip's words.
     lost: Vec<bool>,
@@ -1066,6 +1090,7 @@ impl<'t> WordStep<'t> {
             }
         }
         Self::Followed(WordDiff {
+            tip_words,
             spans,
             lost,
             to_release,
@@ -1094,22 +1119,31 @@ impl<'t> WordDiff<'t> {
     /// it replaced and the new line inserts or replaces.
     fn loses(&self, offset: usize, line: Added<'t>) -> bool {
         let span = self.span(offset);
-        let line_words = words::tokens(line.text);
-        let (added, removed) = line.fork.map_or_else(
-            || ((0..line_words.len()).collect(), Vec::new()),
-            |fork| {
-                let own = words::line_word_diff(&words::tokens(fork), &line_words);
-                (own.added, own.removed)
+        // `line` is the tip line at `offset`, so its words are its span's.
+        let line_words = self.tip_words.get(span.clone()).unwrap_or_default();
+        let fork_words = line.fork.map(words::tokens);
+        let whitespace_only = line.fork.is_some_and(|fork| bare(fork) != bare(line.text))
+            && fork_words.as_deref() == Some(line_words);
+        if whitespace_only {
+            return true;
+        }
+        let (added_lost, removed) = fork_words.as_deref().map_or_else(
+            || {
+                let lost = self.lost.get(span.clone()).unwrap_or_default();
+                (lost.contains(&true), Vec::new())
+            },
+            |fork_words| {
+                let own = words::line_word_diff(fork_words, line_words);
+                let lost = own
+                    .added
+                    .iter()
+                    .any(|&at| self.lost.get(span.start + at) == Some(&true));
+                (lost, own.removed)
             },
         );
-        let whitespace_only = line
-            .fork
-            .is_some_and(|fork| bare(fork) != bare(line.text) && words::tokens(fork) == line_words);
-        let added_lost = added
-            .iter()
-            .any(|&at| self.lost.get(span.start + at) == Some(&true));
-        let put_back = !removed.is_empty() && is_subsequence(&removed, &self.inserted_at(&span));
-        added_lost || whitespace_only || put_back || self.kept(&span) == 0
+        added_lost
+            || (!removed.is_empty() && is_subsequence(&removed, &self.inserted_at(&span)))
+            || self.kept(&span) == 0
     }
 
     /// The release's words that the diff inserts at a tip line whose words
@@ -1719,7 +1753,7 @@ mod tests {
         // and the previous release lacks the first
         let (fork, tip) = (file("a\n"), file("a\nl1\nl2\n"));
         let candidate = read("f.txt", fork.clone(), tip.clone(), file("a\n"));
-        let previous = read("f.txt", fork.clone(), tip.clone(), file("a\nl2\n"));
+        let previous = read("f.txt", fork, tip, file("a\nl2\n"));
 
         // When: the candidate carries forward what the previous lacked
         let mut one_more = candidate.clone();
@@ -1734,7 +1768,7 @@ mod tests {
         assert_eq!(one_more.reading, Reading::Missing);
 
         // Given: a previous release that lacks both lines
-        let both = read("f.txt", fork, tip, file("a\n"));
+        let both = candidate.clone();
         // When/Then: the member reads carried forward
         let mut same = candidate;
         same.carry_forward(&both);
@@ -1747,8 +1781,8 @@ mod tests {
         // limit
         let over = format!("keep\nkey = 2{}\nend\n", " w".repeat(30_001));
         let (fork, tip) = (file("keep\nkey = 1\nend\n"), file("keep\nkey = 2\nend\n"));
-        let mut lines = read("big.txt", fork.clone(), tip.clone(), file(&over));
-        let previous = read("big.txt", fork, tip, file(&over));
+        let mut lines = read("big.txt", fork, tip, file(&over));
+        let previous = lines.clone();
         lines.carry_forward(&previous);
 
         // When: it is written as JSON
@@ -1967,15 +2001,15 @@ mod tests {
 
     #[test]
     fn conflict_regions_run_from_each_opening_marker_through_its_closing_one() {
-        // Given: a snapshot with two conflicts, the second left open, and two
-        // lines that only look like markers: one too short, one with no
-        // space after its run
-        let text = b"a\n<<<<<<< conflict 1 of 2\n<<<<<< short\n<<<<<<<b\n>>>>>>> conflict 1 of \
-                     2 ends\nc\n<<<<<<< conflict 2 of 2\nd\n";
+        // Given: a snapshot with two conflicts, the second left open, and,
+        // before the first, two lines that only look like markers: one too
+        // short, one with no space after its run
+        let text = b"a\n<<<<<< short\n<<<<<<<b\n<<<<<<< conflict 1 of 2\n>>>>>>> conflict 1 \
+                     of 2 ends\nc\n<<<<<<< conflict 2 of 2\nd\n";
 
-        // Then: each region runs through its closing marker, and the open one
-        // to the end of the text
-        assert_eq!(conflict_regions(text, 7), [1..5, 6..8]);
+        // Then: neither look-alike opens a region; each region runs through
+        // its closing marker, and the open one to the end of the text
+        assert_eq!(conflict_regions(text, 7), [3..5, 6..8]);
         // And: with longer markers, these lines are text
         assert_eq!(conflict_regions(text, 8), Vec::<Range<usize>>::new());
     }

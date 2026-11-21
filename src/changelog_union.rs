@@ -950,15 +950,34 @@ fn is_line_run(target: &[u8], text: &[u8]) -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "crate-visible test helpers are consumed from sibling test modules"
+)]
+pub(crate) mod test_support {
+    use jj_lib::files::FileMergeHunkLevel;
+    use jj_lib::merge::SameChange;
+    use jj_lib::tree_merge::MergeOptions;
+
+    /// jj's own defaults for `merge.hunk-level` and `merge.same-change`,
+    /// which is what a repository hands the caller unless it was configured
+    /// otherwise, and what `jj new` merges with.
+    pub(crate) fn merge_options() -> MergeOptions {
+        MergeOptions {
+            hunk_level: FileMergeHunkLevel::Line,
+            same_change: SameChange::Accept,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(
         clippy::expect_used,
         reason = "a union a test demands and does not get is the failure"
     )]
 
-    use jj_lib::files::FileMergeHunkLevel;
-    use jj_lib::merge::SameChange;
-
+    use super::test_support::merge_options;
     use super::*;
 
     const BASE_LOG: &[u8] =
@@ -997,16 +1016,6 @@ mod tests {
         include_bytes!("../tests/fixtures/changelog_union/oh-my-pi/member/CHANGELOG.md");
     const OMP_RELEASE: &[u8] =
         include_bytes!("../tests/fixtures/changelog_union/oh-my-pi/release/CHANGELOG.md");
-
-    /// jj's own defaults for `merge.hunk-level` and `merge.same-change`, which
-    /// is what a repository hands the caller unless it was configured
-    /// otherwise.
-    fn merge_options() -> MergeOptions {
-        MergeOptions {
-            hunk_level: FileMergeHunkLevel::Line,
-            same_change: SameChange::Accept,
-        }
-    }
 
     /// A merge of byte-string literals, so a test writes its terms as it
     /// reads them rather than casting each one.

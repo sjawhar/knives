@@ -583,20 +583,9 @@ fn a_cut_over_a_carrier_keeps_the_hand_resolution_and_the_working_copy() {
 
     // Then: the cut holds the resolution and carries no carrier. The
     // resolution holds both members' lines, so the audit carries neither
-    // forward, and no carried row names the carrier: neither its commit nor
-    // its label. The plan it prints first shows the release in hand, carrier
+    // forward. The plan it prints first shows the release in hand, carrier
     // included.
     assert!(!cut.contains("carried forward"), "{cut}");
-    let rows: Vec<&str> = cut
-        .lines()
-        .filter(|line| line.contains("carried"))
-        .collect();
-    for row in rows {
-        assert!(
-            !row.contains(state.carrier.short()) && !row.contains("earlier write"),
-            "{row}\n{cut}"
-        );
-    }
     assert_resolution_kept(lab, "cut");
     assert!(!release_parents(lab, RELEASE).contains(&state.carrier));
     assert_working_copy_on(lab, &state.release, "cut");

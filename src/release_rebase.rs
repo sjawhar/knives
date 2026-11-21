@@ -1058,9 +1058,13 @@ fn keep_the_target(
         return Ok(None);
     }
     let onto = &destination.onto;
-    let carried = kept.iter().try_fold(false, |found, parent| {
-        Ok::<bool, knives::jj::JjError>(found || opened.is_ancestor(onto, parent)?)
-    })?;
+    let mut carried = false;
+    for parent in &kept {
+        if opened.is_ancestor(onto, parent)? {
+            carried = true;
+            break;
+        }
+    }
     if carried {
         return Ok(Some((kept, dropped_delta(&dropped))));
     }

@@ -3238,11 +3238,12 @@ impl EditCandidate<'_> {
         }
         let mut losses = Vec::new();
         for path in &paths {
+            let mut versions = PathVersions::new(&release, &candidate);
             for (member, change) in members.iter().zip(&changes) {
                 let Some(values) = change.get(path) else {
                     continue;
                 };
-                if let Some(lines) = self.lost_at((path, values), member)? {
+                if let Some(lines) = self.lost_at((path, values), member, &mut versions)? {
                     losses.push(EditLoss {
                         path: path.as_internal_file_string().to_owned(),
                         lines,
@@ -3255,18 +3256,22 @@ impl EditCandidate<'_> {
 
     /// The lines of `member`'s change at `path`, from its fork point's value
     /// to its tip's, that the edit loses ([`Self::lost_lines`]); `None`
-    /// where it loses none.
+    /// where it loses none. `versions` keeps what this path holds in each
+    /// version once a member at the path read it.
     fn lost_at(
         &self,
         (path, (before, after)): (&RepoPath, &(MergedTreeValue, MergedTreeValue)),
         member: &EditMember<'_>,
+        versions: &mut PathVersions<'_>,
     ) -> Result<Option<MemberLines>, JjError> {
         let store = self.repo.repo.store();
         let value_at = |tree: &MergedTree| {
             block_on(tree.path_value(path)).map_err(|error| store_error(&error))
         };
-        let in_candidate = value_at(&self.commit.tree())?;
-        if after.is_resolved() && in_candidate == *after {
+        let in_candidate = read_once(&mut versions.in_candidate, || {
+            value_at(versions.candidate_tree)
+        })?;
+        if after.is_resolved() && in_candidate == after {
             return Ok(None);
         }
         let name = path.as_internal_file_string();
@@ -3274,19 +3279,26 @@ impl EditCandidate<'_> {
             own_value(store, path, before)?,
             own_value(store, path, after)?,
         );
-        let read = |version: own_lines::Version| own_lines::place(name, (&fork, &tip), &version);
+        let read = |version: &own_lines::Version| own_lines::place(name, (&fork, &tip), version);
+        let candidate = read_once(&mut versions.candidate, || {
+            placing(store, path, in_candidate.clone())
+        })?;
         let own_lines::Placed::Lines {
             lost,
             word_step_skipped,
-        } = read(placing(store, path, in_candidate)?)
+        } = read(candidate)
         else {
             return Ok(None);
         };
         if lost.iter().all(|line| line.at_conflict) {
             return Ok(None);
         }
-        let release = read(placing(store, path, value_at(&self.source.tree())?)?);
-        let plain = read(placing(store, path, value_at(&self.plain)?)?);
+        let release = read(read_once(&mut versions.release, || {
+            placing(store, path, value_at(versions.release_tree)?)
+        })?);
+        let plain = read(read_once(&mut versions.plain, || {
+            placing(store, path, value_at(&self.plain)?)
+        })?);
         let brought = match member.brought {
             Brought::Nothing => BroughtLines::Nothing,
             Brought::Whole => BroughtLines::Whole,
@@ -3338,6 +3350,45 @@ impl EditCandidate<'_> {
         }
         finished_release(&repo, tx, write, built)
     }
+}
+
+/// One path, as spec R11's check reads it in each version
+/// ([`EditCandidate::lost_at`]): each value is read the first time a member
+/// at the path needs it, and kept for the path's other members.
+struct PathVersions<'t> {
+    /// The trees of the release in hand and of the candidate.
+    release_tree: &'t MergedTree,
+    candidate_tree: &'t MergedTree,
+    /// The candidate's value at the path.
+    in_candidate: Option<MergedTreeValue>,
+    /// The candidate, the release in hand and the plain merge of the new
+    /// parents at the path, each as [`placing`] reads it.
+    candidate: Option<own_lines::Version>,
+    release: Option<own_lines::Version>,
+    plain: Option<own_lines::Version>,
+}
+
+impl<'t> PathVersions<'t> {
+    /// A path of which nothing is read yet.
+    const fn new(release_tree: &'t MergedTree, candidate_tree: &'t MergedTree) -> Self {
+        Self {
+            release_tree,
+            candidate_tree,
+            in_candidate: None,
+            candidate: None,
+            release: None,
+            plain: None,
+        }
+    }
+}
+
+/// What `slot` holds, read with `read` where it holds nothing yet.
+fn read_once<T>(
+    slot: &mut Option<T>,
+    read: impl FnOnce() -> Result<T, JjError>,
+) -> Result<&T, JjError> {
+    let value = slot.take().map_or_else(read, Ok)?;
+    Ok(slot.insert(value))
 }
 
 /// What `value`, one tree's value at `path`, holds as spec R11 places a
@@ -6356,15 +6407,15 @@ mod tests {
     use std::path::Path;
 
     use jj_lib::backend::{SymlinkId, TreeValue};
-    use jj_lib::files::{FileMergeHunkLevel, MergeResult, merge_hunks};
-    use jj_lib::merge::{Merge, SameChange};
-    use jj_lib::tree_merge::MergeOptions;
+    use jj_lib::files::{MergeResult, merge_hunks};
+    use jj_lib::merge::Merge;
 
     use super::{
         BroughtLines, CommitId, ConflictHunks, JjError, changed_outside, counted_lines, fetch_all,
         fetch_pull_ref, fetch_retry_pause, hunk_list, keeps_duplicate, left_to_union,
         ls_remote_args, padded,
     };
+    use crate::changelog_union::test_support::merge_options;
     use crate::config::test_support::{EnvironmentGuard, environment_lock};
     use crate::own_lines::{Lost, LostKind, Placed, PlacedLost};
 
@@ -6601,14 +6652,6 @@ esac
                 "refs/heads/release/*"
             ]
         );
-    }
-
-    /// The merge options a store holds by default, as `jj new` merges with.
-    fn merge_options() -> MergeOptions {
-        MergeOptions {
-            hunk_level: FileMergeHunkLevel::Line,
-            same_change: SameChange::Accept,
-        }
     }
 
     /// The probe's `f`: thirty lines `let lN = N`, with each line of

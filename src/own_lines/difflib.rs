@@ -149,10 +149,10 @@ impl<'s, T: Eq + Hash> SequenceMatcher<'s, T> {
         };
         for i in window_a {
             let at = self.a.get(i).and_then(|element| self.b2j.get(element));
-            for &j in at.map_or(&[][..], Vec::as_slice) {
-                if j < window_b.start {
-                    continue;
-                }
+            let list = at.map_or(&[][..], Vec::as_slice);
+            // `list` is ascending: skip the indices before the window.
+            let skip = list.partition_point(|&j| j < window_b.start);
+            for &j in list.get(skip..).unwrap_or_default() {
                 if j >= window_b.end {
                     break;
                 }
@@ -275,12 +275,13 @@ impl<'s, T: Eq + Hash> SequenceMatcher<'s, T> {
         }
         Ratio::new(matches, self.a.len() + self.b.len())
     }
+}
 
-    /// Python's `real_quick_ratio`: an upper bound on [`Self::quick_ratio`],
-    /// from the two lengths alone.
-    pub(super) fn real_quick_ratio(&self) -> Ratio {
-        Ratio::new(self.a.len().min(self.b.len()), self.a.len() + self.b.len())
-    }
+/// Python's `real_quick_ratio` of two sequences `a_len` and `b_len` long:
+/// an upper bound on [`SequenceMatcher::quick_ratio`], from the two lengths
+/// alone, so it needs no matcher.
+pub(super) fn real_quick_ratio(a_len: usize, b_len: usize) -> Ratio {
+    Ratio::new(a_len.min(b_len), a_len + b_len)
 }
 
 /// The run lengths of [`SequenceMatcher::find_longest_match`]'s dynamic

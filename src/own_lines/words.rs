@@ -18,7 +18,7 @@
 
 use std::cmp::Ordering;
 
-use super::difflib::{Ratio, SequenceMatcher, Tag};
+use super::difflib::{Ratio, SequenceMatcher, Tag, real_quick_ratio};
 
 /// The words of `line`, in order, each a slice of it.
 pub(super) fn tokens(line: &[u8]) -> Vec<&[u8]> {
@@ -85,8 +85,11 @@ pub(super) fn pair_hunk(removed: &[&[u8]], added: &[&[u8]]) -> Vec<Option<usize>
         let mut best: Option<usize> = None;
         let mut best_ratio = Ratio::HALF;
         for (candidate, candidate_words) in added_words.iter().enumerate().skip(next).take(window) {
+            if real_quick_ratio(words.len(), candidate_words.len()) < best_ratio {
+                continue;
+            }
             let matcher = SequenceMatcher::new(&words, candidate_words);
-            if matcher.real_quick_ratio() < best_ratio || matcher.quick_ratio() < best_ratio {
+            if matcher.quick_ratio() < best_ratio {
                 continue;
             }
             let ratio = matcher.ratio();
@@ -1083,7 +1086,7 @@ mod tests {
             // And: the quick ratios bound it from above, as Python's do
             assert!(matcher.quick_ratio() >= ratio, "{case}");
             assert!(
-                matcher.real_quick_ratio() >= matcher.quick_ratio(),
+                real_quick_ratio(a.len(), b.len()) >= matcher.quick_ratio(),
                 "{case}"
             );
         }

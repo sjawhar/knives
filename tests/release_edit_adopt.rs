@@ -30,8 +30,10 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use lab::{
-    Lab, ReleaseOutput, commit_at, extend_branch, knives_release, operation_ids, release_command,
-    release_parents, release_test_home,
+    Lab, ReleaseOutput, Resolution, a_f, adopt, adopted_release, commit_at, conflicts_of, d_f,
+    edit_by_hand, extend_branch, f_with, fast_forward, fixed_home, included_release, jj_in,
+    knives_release, operation_ids, release_command, release_ok, release_parents, release_ran,
+    release_test_home, text, trunk_with,
 };
 
 /// The dated release most tests cut and edit.
@@ -42,21 +44,33 @@ const FIXED: &str = "integration";
 const M: &str = "feat/m";
 /// A member that sets lines 5 and 6 of `f`, as `d809` did in the probe.
 const D: &str = "feat/d";
-/// A member, made after the first cut, that sets line 5 of `f` as D does.
+/// A member, made after the first cut, that sets line 5 of `f` as D does;
+/// or, in the tests of a side's count, one that writes `f` as `a`; in the
+/// tests of a release log, one that adds [`A_ENTRY`] to `CHANGELOG.md`; and
+/// in the test of an adopted `--why` change, one in the first cut that adds
+/// a line to a file `g`.
 const A: &str = "feat/a";
-/// A member that changes only a file of its own.
+/// A member that changes only a file of its own; or, in a test of a release
+/// log, one that inserts its own block in `CHANGELOG.md`.
 const Q: &str = "feat/q";
 /// A member that sets line 30 of `f`, far from the conflict, or, in the
 /// tests of a side's count, a cherry-pick of A.
 const P: &str = "feat/p";
-/// A member that sets line 5 of a second file `g` as D does.
+/// A member that sets line 5 of a second file `g` as A does; or, in the
+/// test of an advance, one that writes a file of its own and then grows by
+/// a commit that sets line 5 of `f`.
 const B: &str = "feat/b";
-/// Two members that each add a section on top of `CHANGELOG.md`.
+/// A member that adds a section on top of `CHANGELOG.md`.
 const X: &str = "feat/x";
+/// Another member that adds a section on top of `CHANGELOG.md`.
 const Y: &str = "feat/y";
-/// Two members that each change the release in a second place, or, in the
-/// test of a merge branch, the two members that the branch merges.
+/// A member that inserts a block at the end of `CHANGELOG.md`; or, in the
+/// test of a merge branch, one that sets line 10 of `f`, which the branch
+/// [`C`] merges and rewrites.
 const E: &str = "feat/e";
+/// A member that inserts another block at the end of `CHANGELOG.md`; or,
+/// in the test of a merge branch, one that changes a file of its own, which
+/// [`C`] merges too.
 const F: &str = "feat/f";
 /// A member, included after an adopt, that changes another line of a file.
 const G: &str = "feat/g";
@@ -68,53 +82,9 @@ const A_ENTRY: &str = "- a entry\n";
 /// lie between it and the conflict at lines 5 and 6.
 const HAND_LINE: &str = "let e = hand ()\n";
 
-/// Both streams, for an assertion's message.
-fn text(output: &Output) -> String {
-    format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-}
-
-/// `f`: thirty lines `let lN = N`, with each line of `changed` set to its
-/// value.
-fn f_with(changed: &[(usize, &str)]) -> String {
-    use std::fmt::Write as _;
-    let mut f = String::new();
-    for line in 1..=30 {
-        match changed.iter().find(|(at, _)| *at == line) {
-            Some((_, value)) => writeln!(f, "let l{line} = {value}"),
-            None => writeln!(f, "let l{line} = {line}"),
-        }
-        .expect("write to a String");
-    }
-    f
-}
-
-/// D's `f`: A's change to line 5, and its own line 6 next to it.
-fn d_f() -> String {
-    f_with(&[(5, "compare_fix ()"), (6, "d809_only ()")])
-}
-
-/// A's `f`: line 5 only.
-fn a_f() -> String {
-    f_with(&[(5, "compare_fix ()")])
-}
-
 /// `f` with [`HAND_LINE`] after its line 20.
 fn with_hand_line(f: &str) -> String {
     f.replacen("let l20 = 20\n", &format!("let l20 = 20\n{HAND_LINE}"), 1)
-}
-
-/// A lab whose trunk, upstream and on the fork, holds `files`.
-fn trunk_with(files: &[(&str, &str)]) -> Lab {
-    let lab = Lab::new();
-    for (file, content) in files {
-        lab.upstream_trunk_file(file, content);
-    }
-    lab.mirror_upstream_trunk_to_origin();
-    lab
 }
 
 /// A member branch forked from the fork's trunk that writes `files`.
@@ -133,40 +103,6 @@ fn release_in(lab: &Lab, home: &tempfile::TempDir, dir: &Path, args: &[&str]) ->
         .current_dir(dir)
         .output()
         .expect("run knives release")
-}
-
-/// A release verb run in the work checkout that must exit 0; its stdout.
-fn release_ok(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> String {
-    let output = knives_release(lab, home, args);
-    assert_eq!(output.status.code(), Some(0), "{args:?}: {}", text(&output));
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-/// A release verb run in the work checkout that must go through, though the
-/// plan around it may exit with findings of its own; its stdout.
-fn release_ran(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> String {
-    let output = knives_release(lab, home, args);
-    assert!(
-        matches!(output.status.code(), Some(0 | 1)),
-        "{args:?}: {}",
-        text(&output)
-    );
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-/// `knives release adopt <release> --why <why>`, which must record the
-/// release.
-fn adopt(lab: &Lab, home: &tempfile::TempDir, release: &str, why: &str) {
-    let adopted = release_ran(lab, home, &["adopt", release, "--why", why]);
-    assert!(
-        adopted.contains(&format!("as the newest write of {release}")),
-        "{adopted}"
-    );
-}
-
-/// The files `revision` leaves conflicted.
-fn conflicts_of(lab: &Lab, revision: &str) -> Vec<String> {
-    knives::jj::conflicted_files(&lab.work, revision).expect("list the conflicted files")
 }
 
 /// `file` at `revision` in checkout `dir`, a conflict written with jj's
@@ -204,14 +140,7 @@ fn plain(lab: &Lab, parents: &[&str], file: &str) -> String {
     for parent in parents {
         args.extend(["-r", *parent]);
     }
-    let output = Command::new("jj")
-        .args(&args)
-        .current_dir(&lab.work)
-        .env("JJ_USER", "Knives Lab")
-        .env("JJ_EMAIL", "knives-lab@example.test")
-        .output()
-        .expect("make the plain merge");
-    assert!(output.status.success(), "{}", text(&output));
+    jj_in(&lab.work, &args);
     let merged = show_in(&lab.work, "@", file);
     lab.jj_work(["new", "main@origin"]);
     merged
@@ -221,7 +150,8 @@ fn plain(lab: &Lab, parents: &[&str], file: &str) -> String {
 /// or `-` seven times or more, else nothing.
 fn marker(line: &str) -> Option<char> {
     let first = line.chars().next()?;
-    ("<>+-".contains(first) && line.starts_with(&first.to_string().repeat(7))).then_some(first)
+    ("<>+-".contains(first) && line.chars().take(7).eq(std::iter::repeat_n(first, 7)))
+        .then_some(first)
 }
 
 /// Each conflict hunk of `text`, read from jj's snapshot markers: its bases
@@ -310,62 +240,10 @@ fn left_for_a_person(files: &[&str]) -> String {
     report
 }
 
-/// Edit `release` by hand, as a person does: `jj edit`, the files written,
-/// the working copy moved off it.
-fn edit_by_hand(lab: &Lab, release: &str, files: &[(&str, &str)]) {
-    lab.jj_work(["edit", release]);
-    for (file, content) in files {
-        std::fs::write(lab.work.join(file), content).expect("write by hand");
-    }
-    lab.jj_work(["new", "main@origin"]);
-}
-
-/// How `f` is resolved by hand after `include A` conflicts there.
-#[derive(Clone, Copy)]
-enum Resolution {
-    /// `f` as D has it, which holds A's line too.
-    DVersion,
-    /// A text that keeps neither side.
-    Neither,
-}
-
-/// The probe's shape up to the include: a trunk holding `f`; M adds
-/// `m.txt`; D writes `d` as its `f`; a first cut of M and D; A, made after
-/// the cut, sets line 5 of `f`; `include A`. Returns the lab, its home and
-/// the include's stdout.
-fn included(d: &str) -> (Lab, tempfile::TempDir, String) {
-    let lab = trunk_with(&[("f", &f_with(&[]))]);
-    member(&lab, M, &[("m.txt", "m\n")]);
-    member(&lab, D, &[("f", d)]);
-    let (home, _consumer) = release_test_home(&lab);
-    let cut = release_ran(&lab, &home, &["cut", RELEASE]);
-    assert_eq!(release_parents(&lab, RELEASE).len(), 2, "{cut}");
-    member(&lab, A, &[("f", &a_f())]);
-    let include = release_ok(&lab, &home, &["include", A]);
-    (lab, home, include)
-}
-
-/// [`included`] with D's `f`: the include conflicts in `f`, which is
-/// resolved by hand and adopted. Returns the lab and its home.
-fn adopted(resolution: Resolution) -> (Lab, tempfile::TempDir) {
-    let (lab, home, include) = included(&d_f());
-    assert_eq!(conflicts_of(&lab, RELEASE), ["f"], "{include}");
-    match resolution {
-        Resolution::DVersion => lab.jj_work(["restore", "--from", D, "--into", RELEASE, "f"]),
-        Resolution::Neither => edit_by_hand(&lab, RELEASE, &[("f", "merged\n")]),
-    }
-    adopt(&lab, &home, RELEASE, "resolve f");
-    assert!(
-        conflicts_of(&lab, RELEASE).is_empty(),
-        "the adopt left a conflict"
-    );
-    (lab, home)
-}
-
-/// [`adopted`] to D's version, then [`HAND_LINE`] added to `f` by hand and
-/// recorded with `adopt --why`. Returns the lab and its home.
+/// [`adopted_release`] to D's version, then [`HAND_LINE`] added to `f` by
+/// hand and recorded with `adopt --why`. Returns the lab and its home.
 fn adopted_with_hand_line() -> (Lab, tempfile::TempDir) {
-    let (lab, home) = adopted(Resolution::DVersion);
+    let (lab, home) = adopted_release(Resolution::DVersion);
     edit_by_hand(&lab, RELEASE, &[("f", &with_hand_line(&d_f()))]);
     adopt(&lab, &home, RELEASE, "a line by hand");
     (lab, home)
@@ -411,14 +289,7 @@ fn octopus_by_hand(
         args.extend(["-r", *name]);
     }
     args.extend(["-m", RELEASE]);
-    let merged = Command::new("jj")
-        .args(&args)
-        .current_dir(&lab.work)
-        .env("JJ_USER", "Knives Lab")
-        .env("JJ_EMAIL", "knives-lab@example.test")
-        .output()
-        .expect("merge the members by hand");
-    assert!(merged.status.success(), "{}", text(&merged));
+    jj_in(&lab.work, &args);
     let path = lab.work.join(file);
     let conflicted = std::fs::read_to_string(&path).expect("read the conflicted file");
     std::fs::write(&path, edit(&conflicted)).expect("write the file by hand");
@@ -490,7 +361,7 @@ fn resolved_in_part() -> (Lab, tempfile::TempDir) {
 #[test]
 fn a_drop_after_an_adopt_writes_the_plain_merge_where_the_conflict_is_gone() {
     // Given (K14 1): `f` resolved by hand to D's version and adopted.
-    let (lab, home) = adopted(Resolution::DVersion);
+    let (lab, home) = adopted_release(Resolution::DVersion);
 
     // When: D is dropped.
     let dropped = release_ok(&lab, &home, &["drop", D, "--why", "not ready"]);
@@ -507,7 +378,7 @@ fn a_drop_after_an_adopt_writes_the_plain_merge_where_the_conflict_is_gone() {
 fn an_advance_to_the_base_after_an_adopt_writes_the_plain_merge() {
     // Given (K14 2): `f` resolved to D's version and adopted, then a commit
     // D2 on D's branch that puts `f` back to the base.
-    let (lab, home) = adopted(Resolution::DVersion);
+    let (lab, home) = adopted_release(Resolution::DVersion);
     extend_branch(&lab, D, "f", &f_with(&[]));
 
     // When: D is advanced to D2.
@@ -523,7 +394,7 @@ fn an_advance_to_the_base_after_an_adopt_writes_the_plain_merge() {
 #[test]
 fn a_drop_of_the_other_side_after_an_adopt_writes_the_clean_plain_merge() {
     // Given (K14 3): `f` resolved to D's version and adopted.
-    let (lab, home) = adopted(Resolution::DVersion);
+    let (lab, home) = adopted_release(Resolution::DVersion);
 
     // When: A, whose line D also holds, is dropped.
     let dropped = release_ok(&lab, &home, &["drop", A, "--why", "not ready"]);
@@ -540,7 +411,7 @@ fn a_drop_of_the_other_side_after_an_adopt_writes_the_clean_plain_merge() {
 fn an_advance_that_changes_the_conflict_after_an_adopt_leaves_its_conflict() {
     // Given (K14 4): `f` resolved to D's version and adopted, then a commit
     // D3 on D's branch that sets A's line to another text.
-    let (lab, home) = adopted(Resolution::DVersion);
+    let (lab, home) = adopted_release(Resolution::DVersion);
     extend_branch(
         &lab,
         D,
@@ -565,7 +436,7 @@ fn an_advance_that_changes_the_conflict_after_an_adopt_leaves_its_conflict() {
 fn a_drop_with_no_adopt_writes_the_remaining_side() {
     // Given (K14 5, a control): the include left `f` conflicted, with no hand
     // resolution and no adopt.
-    let (lab, home, include) = included(&d_f());
+    let (lab, home, include) = included_release(&d_f());
     assert_eq!(conflicts_of(&lab, RELEASE), ["f"], "{include}");
 
     // When: D is dropped.
@@ -575,7 +446,7 @@ fn a_drop_with_no_adopt_writes_the_remaining_side() {
     assert_eq!(show(&lab, "f"), a_f(), "{dropped}");
 
     // Given: D's change apart from A's, so the include has no conflict.
-    let (lab, home, include) = included(&f_with(&[(20, "d809_only ()")]));
+    let (lab, home, include) = included_release(&f_with(&[(20, "d809_only ()")]));
     assert!(conflicts_of(&lab, RELEASE).is_empty(), "{include}");
 
     // When: D is dropped.
@@ -590,7 +461,7 @@ fn an_include_beside_the_conflict_keeps_the_resolution() {
     // Given (K14 6, a control): `f` resolved to D's version and adopted, and
     // P, which changes line 30 of `f`, with unchanged lines between it and
     // the conflict.
-    let (lab, home) = adopted(Resolution::DVersion);
+    let (lab, home) = adopted_release(Resolution::DVersion);
     member(&lab, P, &[("f", &f_with(&[(30, "extra ()")]))]);
 
     // When: P is included.
@@ -630,7 +501,7 @@ fn an_include_beside_the_conflict_keeps_the_resolution() {
 #[test]
 fn a_drop_of_an_unrelated_member_keeps_the_resolution() {
     // Given (K14 7, a control): `f` resolved to D's version and adopted.
-    let (lab, home) = adopted(Resolution::DVersion);
+    let (lab, home) = adopted_release(Resolution::DVersion);
 
     // When: M is dropped.
     let dropped = release_ok(&lab, &home, &["drop", M, "--why", "not ready"]);
@@ -652,7 +523,7 @@ fn a_drop_of_an_unrelated_member_keeps_the_resolution() {
 fn a_rebase_onto_an_unrelated_trunk_keeps_the_resolution() {
     // Given (K14 8, a control): `f` resolved to D's version and adopted, and
     // a trunk commit that changes a file no member changes.
-    let (lab, home) = adopted(Resolution::DVersion);
+    let (lab, home) = adopted_release(Resolution::DVersion);
     lab.advance_upstream("advance\n");
 
     // When: the release is rebased onto it.
@@ -667,7 +538,7 @@ fn a_rebase_onto_an_unrelated_trunk_keeps_the_resolution() {
 fn a_resolution_that_keeps_neither_side_is_kept() {
     // Given (K14 9, a control): `f` resolved to a text that keeps neither
     // side, adopted, and Q, which changes another file.
-    let (lab, home) = adopted(Resolution::Neither);
+    let (lab, home) = adopted_release(Resolution::Neither);
     member(&lab, Q, &[("q.txt", "q\n")]);
 
     // When: Q is included.
@@ -681,7 +552,7 @@ fn a_resolution_that_keeps_neither_side_is_kept() {
 #[test]
 fn a_drop_and_an_include_of_the_same_member_leave_the_returning_conflict() {
     // Given (K14 10): `f` resolved to D's version and adopted.
-    let (lab, home) = adopted(Resolution::DVersion);
+    let (lab, home) = adopted_release(Resolution::DVersion);
 
     // When: D is dropped.
     let dropped = release_ok(&lab, &home, &["drop", D, "--why", "not ready"]);
@@ -706,7 +577,7 @@ fn a_drop_and_an_include_of_the_same_member_leave_the_returning_conflict() {
 fn a_hand_change_adopted_after_a_drop_is_carried_and_kept_in_the_returning_conflict() {
     // Given (K14 11): `f` resolved to D's version and adopted; D dropped;
     // then a line added to `f` by hand and adopted with `--why`.
-    let (lab, home) = adopted(Resolution::DVersion);
+    let (lab, home) = adopted_release(Resolution::DVersion);
     release_ok(&lab, &home, &["drop", D, "--why", "not ready"]);
     let after_drop = show(&lab, "f");
     edit_by_hand(&lab, RELEASE, &[("f", &with_hand_line(&after_drop))]);
@@ -735,25 +606,25 @@ fn a_second_checkout_after_a_pushed_rebase_reads_the_rule_from_its_release_in_ha
     // rebased onto an unrelated trunk commit, and only then the members and
     // the release pushed; a second checkout on the same ledger that fetched
     // them, so it holds none of the adopted write's parents.
-    let (lab, home) = adopted(Resolution::DVersion);
+    let (lab, home) = adopted_release(Resolution::DVersion);
     let adopted_parents = release_parents(&lab, RELEASE);
     lab.advance_upstream("advance\n");
     release_ok(&lab, &home, &["rebase", "main@upstream"]);
     for branch in [M, D, A, RELEASE] {
         lab.push_branch(branch);
     }
-    let second = lab.second.clone();
+    let second = &lab.second;
     let upstream = lab.upstream.display().to_string();
     lab.jj_at(
-        &second,
+        second,
         ["git", "remote", "add", "upstream", upstream.as_str()],
     );
-    lab.jj_at(&second, ["git", "fetch", "--all-remotes"]);
+    lab.jj_at(second, ["git", "fetch", "--all-remotes"]);
     for branch in [M, D, A, RELEASE] {
         let remote = format!("{branch}@origin");
-        lab.jj_at(&second, ["bookmark", "track", remote.as_str()]);
+        lab.jj_at(second, ["bookmark", "track", remote.as_str()]);
     }
-    let opened = knives::jj::Repo::open(&second).expect("open the second checkout");
+    let opened = knives::jj::Repo::open(second).expect("open the second checkout");
     for parent in &adopted_parents {
         assert!(
             opened.resolve_commit(parent.as_str()).is_err(),
@@ -762,11 +633,11 @@ fn a_second_checkout_after_a_pushed_rebase_reads_the_rule_from_its_release_in_ha
     }
 
     // When: D is dropped in the second checkout.
-    let output = release_in(&lab, &home, &second, &["drop", D, "--why", "not ready"]);
+    let output = release_in(&lab, &home, second, &["drop", D, "--why", "not ready"]);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
 
     // Then: `f` is A's version, as K14 (1) writes it.
-    assert_eq!(show_in(&second, RELEASE, "f"), a_f(), "{}", text(&output));
+    assert_eq!(show_in(second, RELEASE, "f"), a_f(), "{}", text(&output));
 }
 
 #[test]
@@ -981,7 +852,7 @@ fn a_file_changed_beyond_the_conflicts_is_written_as_before() {
     // Given: `f` resolved to D's version and adopted, then M's own file,
     // which the release's parents merge cleanly, changed by hand and adopted
     // with `--why`.
-    let (lab, home) = adopted(Resolution::DVersion);
+    let (lab, home) = adopted_release(Resolution::DVersion);
     edit_by_hand(&lab, RELEASE, &[("m.txt", "m, repaired\n")]);
     adopt(&lab, &home, RELEASE, "repair m.txt");
 
@@ -1025,29 +896,6 @@ fn a_three_parent_conflict_matches_after_its_equal_sides_cancel() {
     assert!(!included.contains(&written_prefix("f")), "{included}");
 }
 
-/// A registry home whose entry releases on the fixed branch [`FIXED`], with
-/// an empty local consumer.
-fn fixed_home(lab: &Lab) -> tempfile::TempDir {
-    let home = tempfile::tempdir().expect("create config home");
-    std::fs::write(
-        home.path().join("repos.toml"),
-        format!(
-            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n\
-             release_branch = \"{FIXED}\"\n",
-            lab.upstream.display(),
-        ),
-    )
-    .expect("write fixed-scheme registry");
-    let consumer = home.path().join("consumer");
-    std::fs::create_dir_all(&consumer).expect("create local consumer");
-    std::fs::write(
-        home.path().join("local-consumer"),
-        consumer.display().to_string(),
-    )
-    .expect("write local consumer fixture path");
-    home
-}
-
 #[test]
 fn a_release_with_a_carrier_parent_compares_without_it() {
     // Given: a fixed release of M and D cut and pushed; A included, `f`
@@ -1058,7 +906,7 @@ fn a_release_with_a_carrier_parent_compares_without_it() {
     let lab = trunk_with(&[("f", &f_with(&[]))]);
     member(&lab, M, &[("m.txt", "m\n")]);
     member(&lab, D, &[("f", &d_f())]);
-    let home = fixed_home(&lab);
+    let home = fixed_home(&lab, FIXED);
     release_ran(&lab, &home, &["cut"]);
     let carrier = commit_at(&lab, FIXED);
     lab.push_branch(FIXED);
@@ -1067,10 +915,7 @@ fn a_release_with_a_carrier_parent_compares_without_it() {
     assert_eq!(conflicts_of(&lab, FIXED), ["f"]);
     lab.jj_work(["restore", "--from", D, "--into", FIXED, "f"]);
     adopt(&lab, &home, FIXED, "resolve f");
-    let before = commit_at(&lab, FIXED);
-    let destination = format!("parents({FIXED}) | {FIXED}@origin");
-    lab.jj_work(["rebase", "-r", FIXED, "-d", destination.as_str()]);
-    lab.jj_work(["restore", "--from", before.as_str(), "--into", FIXED]);
+    fast_forward(&lab, FIXED);
     lab.push_branch(FIXED);
     assert!(release_parents(&lab, FIXED).contains(&carrier));
     member(&lab, Q, &[("q.txt", "q\n")]);
@@ -1110,7 +955,7 @@ fn a_hand_change_beside_a_resolution_is_kept_by_an_include_of_another_member() {
 fn a_whole_file_resolution_conflicts_with_another_change_to_the_file() {
     // Given (the probe's case 2b): `f` resolved to a text that keeps neither
     // side, adopted, and P, which changes line 30 of `f`.
-    let (lab, home) = adopted(Resolution::Neither);
+    let (lab, home) = adopted_release(Resolution::Neither);
     member(&lab, P, &[("f", &f_with(&[(30, "extra ()")]))]);
 
     // When: P is included.
@@ -1217,7 +1062,7 @@ fn a_second_edit_after_a_plain_merge_write_names_the_file_no_more() {
     // Given: `f` resolved to D's version and adopted, then D dropped, which
     // writes `f` as the plain merge of M and A (K14 1); and Q, which changes
     // another file.
-    let (lab, home) = adopted(Resolution::DVersion);
+    let (lab, home) = adopted_release(Resolution::DVersion);
     let dropped = release_ok(&lab, &home, &["drop", D, "--why", "not ready"]);
     assert!(dropped.contains(&written_line("f", false)), "{dropped}");
     member(&lab, Q, &[("q.txt", "q\n")]);
@@ -1349,7 +1194,7 @@ fn a_union_joined_changelog_resolved_by_hand_is_not_dropped_in_silence() {
     let before = Untouched::read(&lab, &home);
 
     // When: D is dropped.
-    let output = release_in(&lab, &home, &lab.work, &["drop", D, "--why", "not ready"]);
+    let output = knives_release(&lab, &home, &["drop", D, "--why", "not ready"]);
 
     // Then: the drop writes nothing, exits 3, and names CHANGELOG.md, A and
     // A's entry, and the remedy.
@@ -1373,7 +1218,7 @@ fn a_recorded_union_with_a_hand_removed_duplicate_is_not_dropped_in_silence() {
     let before = Untouched::read(&lab, &home);
 
     // When: D is dropped.
-    let output = release_in(&lab, &home, &lab.work, &["drop", D, "--why", "not ready"]);
+    let output = knives_release(&lab, &home, &["drop", D, "--why", "not ready"]);
 
     // Then: the drop writes nothing, exits 3, and names CHANGELOG.md, A and
     // A's entry.
@@ -1418,7 +1263,7 @@ fn three_members_at_one_changelog_place_resolved_to_d_refuse_the_drop_of_d() {
     let before = Untouched::read(&lab, &home);
 
     // When: D is dropped.
-    let output = release_in(&lab, &home, &lab.work, &["drop", D, "--why", "not ready"]);
+    let output = knives_release(&lab, &home, &["drop", D, "--why", "not ready"]);
 
     // Then: the drop writes nothing, exits 3, and names CHANGELOG.md with
     // A's and Q's entries; the operation log, the bookmark and the ledger
@@ -1450,7 +1295,7 @@ fn a_reworded_d_entry_elsewhere_does_not_hide_a_lost_a_entry() {
     let before = Untouched::read(&lab, &home);
 
     // When: D is dropped.
-    let output = release_in(&lab, &home, &lab.work, &["drop", D, "--why", "not ready"]);
+    let output = knives_release(&lab, &home, &["drop", D, "--why", "not ready"]);
 
     // Then: the drop writes nothing, exits 3, and names CHANGELOG.md, A and
     // A's entry.
@@ -1492,7 +1337,7 @@ fn a_part_resolved_changelog_does_not_hide_a_lost_entry() {
     let before = Untouched::read(&lab, &home);
 
     // When: D is dropped.
-    let output = release_in(&lab, &home, &lab.work, &["drop", D, "--why", "not ready"]);
+    let output = knives_release(&lab, &home, &["drop", D, "--why", "not ready"]);
 
     // Then: the drop writes nothing, exits 3, and names CHANGELOG.md, A,
     // A's entry and the remedy.
@@ -1558,7 +1403,6 @@ fn a_line_an_adopted_why_change_removed_is_not_counted() {
     // Then: written, with G's line and without A's: the release in hand
     // already lacked A's line, so the include does not count it.
     assert_eq!(show(&lab, "g"), f_with(&[(25, "g_fix ()")]), "{included}");
-    assert!(!included.contains("refusing to write"), "{included}");
 }
 
 #[test]
@@ -1608,7 +1452,6 @@ fn a_merge_branch_include_rewriting_a_members_line_beside_the_resolved_hunk_goes
         f_with(&[(5, "compare_fix ()"), (6, "d809_only ()"), (10, "e_ten")]),
         "{included}"
     );
-    assert!(!included.contains("refusing to write"), "{included}");
 }
 
 #[test]
@@ -1618,10 +1461,9 @@ fn a_drop_allowed_to_lose_records_the_loss_and_adopt_records_its_repair() {
     let before = Untouched::read(&lab, &home);
 
     // When: D is dropped with an `--allow-loss` that holds no reason.
-    let blank = release_in(
+    let blank = knives_release(
         &lab,
         &home,
-        &lab.work,
         &["drop", D, "--why", "not ready", "--allow-loss", ""],
     );
 

@@ -27,8 +27,8 @@ use std::process::{Command, Output};
 
 use knives::ids::CommitId;
 use lab::{
-    Lab, ReleaseOutput, commit_at, home_after_first_cut, knives_release, release_command,
-    release_test_home,
+    Lab, ReleaseOutput, commit_at, home_after_first_cut, jj_in, knives_release, release_command,
+    release_test_home, stdout, text, trunk_with,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -47,33 +47,6 @@ const O: &str = "feat/o";
 const FINDINGS: i32 = 1;
 /// The exit of a command that refuses and writes nothing.
 const REFUSED: i32 = 3;
-
-/// Both streams, for an assertion's message.
-fn text(output: &Output) -> String {
-    format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-}
-
-/// The standard output alone.
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-/// `jj` in `directory` with the lab's identity, for an argument list of any
-/// length. The command must succeed.
-fn jj_in(directory: &Path, args: &[&str]) {
-    let status = Command::new("jj")
-        .args(args)
-        .current_dir(directory)
-        .env("JJ_USER", "Knives Lab")
-        .env("JJ_EMAIL", "knives-lab@example.test")
-        .status()
-        .expect("run jj");
-    assert!(status.success(), "jj {args:?} failed");
-}
 
 /// Write `content` to `file` under `root`.
 fn write_file(root: &Path, file: &str, content: &str) {
@@ -99,17 +72,6 @@ fn lines(items: &[&str]) -> String {
         joined.push('\n');
     }
     joined
-}
-
-/// A lab whose trunk, upstream and on the fork, holds `files`: the base every
-/// member forks from.
-fn trunk_with(files: &[(&str, &str)]) -> Lab {
-    let lab = Lab::new();
-    for (file, content) in files {
-        lab.upstream_trunk_file(file, content);
-    }
-    lab.mirror_upstream_trunk_to_origin();
-    lab
 }
 
 /// A commit on `base`, a revset that names one commit, whose change `edit`
@@ -402,21 +364,14 @@ fn carries_reads_carried_rewritten_for_a_cherry_pick_on_an_older_trunk() {
     let out = stdout(&output);
     assert!(
         out.contains(&format!(
-            "carried-rewritten  {RELEASE} @ {}",
+            "carried-rewritten  {RELEASE} @ {}  (evidence {}: the release holds its own lines)",
+            release.short(),
             release.short()
         )),
         "{}",
         text(&output)
     );
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
-    assert!(
-        out.contains(&format!(
-            "carried-rewritten  {RELEASE} @ {}  (evidence {}: the release holds its own lines)",
-            release.short(),
-            release.short()
-        )),
-        "{out}"
-    );
 }
 
 #[test]
@@ -1691,8 +1646,8 @@ fn a_conflict_in_the_members_path_is_inconclusive_and_one_elsewhere_is_not() {
     let out = stdout(&output);
     assert!(
         out.contains(&format!(
-            "  {}: content check inconclusive (replay conflicted; re-check after resolving the \
-             cut's conflicts)\n      f.txt: unresolved conflict in the release",
+            "  {}: content check inconclusive (an unresolved conflict; re-check after resolving \
+             it)\n      f.txt: unresolved conflict in the release",
             label(&lab, M)
         )),
         "{out}"

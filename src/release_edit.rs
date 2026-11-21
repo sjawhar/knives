@@ -926,16 +926,12 @@ fn edit_losses(
 /// repository, so each is escaped.
 fn refusal_lines(repo: &RepoName, release: &str, losses: &[knives::jj::EditLoss]) -> Vec<String> {
     let shown_release = inline_human_text(release);
-    let mut lines = Vec::new();
-    for loss in losses {
-        lines.push(format!(
-            "{repo}: refusing to write {shown_release}: {} would lose {}'s lines; nothing \
-             written",
-            inline_human_text(&loss.path),
-            inline_human_text(&loss.lines.label)
-        ));
-        lines.extend(release::lost_lines(&loss.lines, release::LOST_LINE_INDENT));
-    }
+    let mut lines = loss_lines(losses, |path, member| {
+        format!(
+            "{repo}: refusing to write {shown_release}: {path} would lose {member}'s lines; \
+             nothing written"
+        )
+    });
     lines.push(format!(
         "{repo}: run the edit again with `--allow-loss <reason>`, put the named lines back by \
          hand, and record that with `knives release adopt {} --why <reason>`",
@@ -956,20 +952,32 @@ fn allowed_loss_lines(
     if losses.is_empty() {
         return Vec::new();
     }
-    let mut lines = Vec::new();
-    for loss in losses {
-        lines.push(format!(
-            "{repo}: {}: {}'s lines lost by this write (--allow-loss)",
-            inline_human_text(&loss.path),
-            inline_human_text(&loss.lines.label)
-        ));
-        lines.extend(release::lost_lines(&loss.lines, release::LOST_LINE_INDENT));
-    }
+    let mut lines = loss_lines(losses, |path, member| {
+        format!("{repo}: {path}: {member}'s lines lost by this write (--allow-loss)")
+    });
     lines.push(format!(
         "{repo}: put the named lines back by hand and record that with `knives release adopt {} \
          --why <reason>`",
         shell_word(release)
     ));
+    lines
+}
+
+/// For each path and member of `losses`, the line `header` makes of the
+/// path and the member's label, each escaped, then each of the member's
+/// lines lost there ([`release::lost_lines`]).
+fn loss_lines(
+    losses: &[knives::jj::EditLoss],
+    header: impl Fn(&str, &str) -> String,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for loss in losses {
+        lines.push(header(
+            &inline_human_text(&loss.path),
+            &inline_human_text(&loss.lines.label),
+        ));
+        lines.extend(release::lost_lines(&loss.lines, release::LOST_LINE_INDENT));
+    }
     lines
 }
 

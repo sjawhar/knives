@@ -19,10 +19,25 @@
 #[path = "common/lab.rs"]
 mod lab;
 
+use knives::commands::release::{AuditContext, DriftBase};
 use knives::ids::CommitId;
 use knives::jj::Repo;
 use lab::{Lab, file_at_revision, knives_release, release_test_home};
 use std::process::Command;
+
+/// What a test audits a cut against: each member from its fork point with
+/// `trunk`, carried forward from `previous` and its drift measured from it,
+/// where there is one.
+fn context<'a>(trunk: &'a CommitId, previous: Option<&'a CommitId>) -> AuditContext<'a> {
+    AuditContext {
+        previous,
+        upstream_trunk: trunk,
+        trunk_parents: &[],
+        trunk_parent_base: None,
+        drift_trunk: trunk,
+        drift_from: previous.map(|previous| (previous, DriftBase::PreviousRelease)),
+    }
+}
 
 #[test]
 fn the_audit_catches_a_cut_missing_a_members_content() {
@@ -61,14 +76,7 @@ fn the_audit_catches_a_cut_missing_a_members_content() {
             ("feat/beta".to_owned(), beta),
         ],
         knives::commands::release::CutSubject::Committed(&cut),
-        knives::commands::release::AuditContext {
-            previous: None,
-            upstream_trunk: &trunk,
-            trunk_parents: &[],
-            trunk_parent_base: None,
-            drift_trunk: &trunk,
-            drift_from: None,
-        },
+        context(&trunk, None),
     )
     .expect("audit cut");
 
@@ -106,14 +114,7 @@ fn the_audit_passes_a_faithful_cut() {
             ("feat/beta".to_owned(), beta),
         ],
         knives::commands::release::CutSubject::Committed(&cut),
-        knives::commands::release::AuditContext {
-            previous: None,
-            upstream_trunk: &trunk,
-            trunk_parents: &[],
-            trunk_parent_base: None,
-            drift_trunk: &trunk,
-            drift_from: None,
-        },
+        context(&trunk, None),
     )
     .expect("audit cut");
 
@@ -170,17 +171,7 @@ fn divergence_the_previous_release_already_carried_is_not_a_loss() {
             ("feat/beta".to_owned(), beta),
         ],
         knives::commands::release::CutSubject::Committed(&cut),
-        knives::commands::release::AuditContext {
-            previous: Some(&previous),
-            upstream_trunk: &trunk,
-            trunk_parents: &[],
-            trunk_parent_base: None,
-            drift_trunk: &trunk,
-            drift_from: Some((
-                &previous,
-                knives::commands::release::DriftBase::PreviousRelease,
-            )),
-        },
+        context(&trunk, Some(&previous)),
     )
     .expect("audit cut");
 
@@ -233,17 +224,7 @@ fn a_loss_the_previous_release_did_not_have_still_fails_the_audit() {
             ("feat/beta".to_owned(), beta),
         ],
         knives::commands::release::CutSubject::Committed(&cut),
-        knives::commands::release::AuditContext {
-            previous: Some(&previous),
-            upstream_trunk: &trunk,
-            trunk_parents: &[],
-            trunk_parent_base: None,
-            drift_trunk: &trunk,
-            drift_from: Some((
-                &previous,
-                knives::commands::release::DriftBase::PreviousRelease,
-            )),
-        },
+        context(&trunk, Some(&previous)),
     )
     .expect("audit cut");
 
@@ -311,17 +292,7 @@ fn a_previous_release_that_lacked_one_line_carries_forward_only_that_line() {
             ("feat/beta".to_owned(), beta),
         ],
         knives::commands::release::CutSubject::Committed(&cut),
-        knives::commands::release::AuditContext {
-            previous: Some(&previous),
-            upstream_trunk: &trunk,
-            trunk_parents: &[],
-            trunk_parent_base: None,
-            drift_trunk: &trunk,
-            drift_from: Some((
-                &previous,
-                knives::commands::release::DriftBase::PreviousRelease,
-            )),
-        },
+        context(&trunk, Some(&previous)),
     )
     .expect("audit cut");
 
@@ -380,18 +351,11 @@ fn the_audit_passes_a_faithful_multi_commit_member_without_inconclusive() {
             ("feat/beta".to_owned(), beta),
         ],
         knives::commands::release::CutSubject::Committed(&cut),
-        knives::commands::release::AuditContext {
-            previous: None,
-            upstream_trunk: &trunk,
-            trunk_parents: &[],
-            trunk_parent_base: None,
-            drift_trunk: &trunk,
-            drift_from: None,
-        },
+        context(&trunk, None),
     )
     .expect("audit cut");
 
-    // Then: replaying the net member effect sees it as present without a
+    // Then: reading the member by its own lines sees it as present without a
     // manufactured intermediate-commit conflict.
     assert!(audit.inconclusive.is_empty(), "{audit:?}");
     assert!(audit.passed(), "{audit:?}");
@@ -447,14 +411,7 @@ fn the_audit_passes_when_a_member_adds_then_deletes_a_file() {
             ("feat/beta".to_owned(), beta),
         ],
         knives::commands::release::CutSubject::Committed(&cut),
-        knives::commands::release::AuditContext {
-            previous: None,
-            upstream_trunk: &trunk,
-            trunk_parents: &[],
-            trunk_parent_base: None,
-            drift_trunk: &trunk,
-            drift_from: None,
-        },
+        context(&trunk, None),
     )
     .expect("audit cut");
 
@@ -503,14 +460,7 @@ fn the_audit_catches_a_member_whose_early_range_content_is_missing() {
             ("feat/beta".to_owned(), beta),
         ],
         knives::commands::release::CutSubject::Committed(&cut),
-        knives::commands::release::AuditContext {
-            previous: None,
-            upstream_trunk: &trunk,
-            trunk_parents: &[],
-            trunk_parent_base: None,
-            drift_trunk: &trunk,
-            drift_from: None,
-        },
+        context(&trunk, None),
     )
     .expect("audit cut");
 
@@ -552,14 +502,7 @@ fn the_audit_passes_when_a_member_renames_a_file() {
             ("feat/beta".to_owned(), beta),
         ],
         knives::commands::release::CutSubject::Committed(&cut),
-        knives::commands::release::AuditContext {
-            previous: None,
-            upstream_trunk: &trunk,
-            trunk_parents: &[],
-            trunk_parent_base: None,
-            drift_trunk: &trunk,
-            drift_from: None,
-        },
+        context(&trunk, None),
     )
     .expect("audit cut");
 
@@ -605,14 +548,7 @@ fn the_audit_fails_when_a_regenerated_lockfile_loses_member_content() {
             ("feat/beta".to_owned(), beta),
         ],
         knives::commands::release::CutSubject::Committed(&cut),
-        knives::commands::release::AuditContext {
-            previous: None,
-            upstream_trunk: &trunk,
-            trunk_parents: &[],
-            trunk_parent_base: None,
-            drift_trunk: &trunk,
-            drift_from: None,
-        },
+        context(&trunk, None),
     )
     .expect("audit cut");
 
@@ -653,14 +589,7 @@ fn the_audit_judges_the_captured_tip_not_the_moved_bookmark() {
             ("feat/beta".to_owned(), beta),
         ],
         knives::commands::release::CutSubject::Committed(&cut),
-        knives::commands::release::AuditContext {
-            previous: None,
-            upstream_trunk: &trunk,
-            trunk_parents: &[],
-            trunk_parent_base: None,
-            drift_trunk: &trunk,
-            drift_from: None,
-        },
+        context(&trunk, None),
     )
     .expect("audit cut");
 

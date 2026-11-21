@@ -10,9 +10,10 @@
 //! under one `### ` heading join that heading's one list, the heading written
 //! once — and the content checks read a member whose block the union holds
 //! as carried. A conflict that is not every side inserting its own block —
-//! a member that rewrote its block, sides on different bases, a code file, a
-//! drop that takes a block out — stays conflicted and is named as a
-//! person's.
+//! sides on different bases, a code file, a drop that takes a block out —
+//! stays conflicted and is named as a person's. An advance to a member that
+//! rewrote its block, where that would lose another member's lines, is
+//! refused with exit 3.
 //! The fixtures are the real ygo and oh-my-pi files, cut down; their README
 //! names each source.
 
@@ -22,7 +23,7 @@
     clippy::panic,
     reason = "a fixture or assertion that cannot proceed IS the test failure"
 )]
-// allow: SIZE_OK: 1144 lines - real-binary release-log union scenarios share one set of changelog fixtures and helpers.
+// allow: SIZE_OK: 1163 lines - real-binary release-log union scenarios share one set of changelog fixtures and helpers.
 
 #[path = "common/lab.rs"]
 mod lab;

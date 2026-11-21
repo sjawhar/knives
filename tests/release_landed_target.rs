@@ -9,8 +9,8 @@
 //! writes nothing. Where no member would stay, it refuses as before. The
 //! same holds whether the rebase moved the release or found that it already
 //! contains the target. The shapes are those of INFRA-4895's
-//! drop-after-adopt probe (version 3), with the forge faked by the snapshot
-//! shim. These tests drive only the knives binary.
+//! drop-after-adopt probe (versions 3 and 4), with the forge faked by the
+//! snapshot shim. These tests drive only the knives binary.
 
 #![allow(
     clippy::expect_used,
@@ -31,7 +31,10 @@ use std::process::Output;
 use forge_shim::pull_record;
 use knives::ids::CommitId;
 use knives::jj::Repo;
-use lab::{Lab, commit_at, home_after_first_cut, knives_release, release_parents};
+use lab::{
+    Lab, commit_at, fast_forward, home_after_first_cut, release_parents, release_ran, squash_land,
+    text,
+};
 use release_forge::knives_release_with_forge;
 
 /// The release every test here cuts and rebases.
@@ -47,26 +50,6 @@ const C: &str = "feat/c";
 /// A member that upstream merges before the target, included after the
 /// first cut.
 const Y: &str = "feat/y";
-
-/// Both streams, for an assertion's message.
-fn text(output: &Output) -> String {
-    format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-}
-
-/// A release verb that must go through: neither refused nor a usage error,
-/// though the plan around it may exit with findings of its own.
-fn release_ran(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) {
-    let output = knives_release(lab, home, args);
-    assert!(
-        matches!(output.status.code(), Some(0 | 1)),
-        "{args:?} did not go through: {}",
-        text(&output)
-    );
-}
 
 /// A lab with each of `members` a branch off the fork's trunk that writes
 /// its own file (`feat/x` writes `x.txt`), cut into the release.
@@ -85,14 +68,6 @@ fn cut_release(members: &[&str]) -> (Lab, tempfile::TempDir) {
 fn merge_land(lab: &Lab, branch: &str, number: u64) -> CommitId {
     lab.publish_pull(branch, number);
     lab.merge_pull_with_merge_commit(number);
-    commit_at(lab, "main@upstream")
-}
-
-/// Upstream squash-merges `branch`'s pull request `number`. Returns the
-/// squash commit.
-fn squash_land(lab: &Lab, branch: &str, number: u64) -> CommitId {
-    lab.publish_pull(branch, number);
-    lab.squash_merge_pull(number, None);
     commit_at(lab, "main@upstream")
 }
 
@@ -118,14 +93,6 @@ fn merged(pulls: &[(u64, &str, &CommitId)]) -> String {
 /// One file's text at `revision`, or `None` where it has no such file.
 fn file_in(lab: &Lab, revision: &str, file: &str) -> Option<String> {
     knives::jj::file_text(&lab.work, revision, file).expect("read a file")
-}
-
-/// The parents of `revision`.
-fn parents_of(lab: &Lab, revision: &str) -> Vec<CommitId> {
-    Repo::open(&lab.work)
-        .expect("open the work checkout")
-        .parent_commits(revision)
-        .expect("read the parents")
 }
 
 fn sorted(mut commits: Vec<CommitId>) -> Vec<CommitId> {
@@ -168,16 +135,6 @@ fn assert_holds_the_target(lab: &Lab, target: &CommitId, output: &Output) {
     );
 }
 
-/// The fork recipe's fast-forward, as `tests/release_unrecorded.rs` makes
-/// it: the release rebased onto its parents and the publish remote's commit
-/// of it, its tree put back.
-fn fast_forward(lab: &Lab, name: &str) {
-    let before = commit_at(lab, name);
-    let destination = format!("parents({name}) | {name}@origin");
-    lab.jj_work(["rebase", "-r", name, "-d", destination.as_str()]);
-    lab.jj_work(["restore", "--from", before.as_str(), "--into", name]);
-}
-
 #[test]
 fn a_bare_rebase_keeps_a_landed_member_that_alone_carries_the_target() {
     // Given (K16 1, the probe's case 2): X and A cut; upstream merges X's #1
@@ -208,7 +165,7 @@ fn a_bare_rebase_keeps_a_landed_member_that_alone_carries_the_target() {
         "{}",
         text(&output)
     );
-    assert_eq!(parents_of(&lab, A), std::slice::from_ref(&target));
+    assert_eq!(release_parents(&lab, A), std::slice::from_ref(&target));
     assert_holds_the_target(&lab, &target, &output);
 }
 
@@ -302,7 +259,7 @@ fn a_drop_with_no_move_keeps_a_landed_member_that_alone_carries_the_target() {
     );
     assert_eq!(moved.status.code(), Some(0), "{}", text(&moved));
     assert_eq!(
-        parents_of(&lab, A),
+        release_parents(&lab, A),
         std::slice::from_ref(&target),
         "{}",
         text(&moved)
@@ -428,9 +385,7 @@ fn a_member_on_an_older_trunk_commit_does_not_carry_the_target() {
     // a merge commit, commits u.txt, and squash-merges A's #2, which gives
     // T, so the trunk holds Y's tip on a commit older than T. A rebase onto
     // T with --no-drop leaves A's empty chain on T and Y where it was.
-    let lab = Lab::new();
-    lab.branch(A, "a.txt", "a\n");
-    let (home, _consumer) = home_after_first_cut(&lab);
+    let (lab, home) = cut_release(&[A]);
     lab.branch(Y, "y.txt", "y\n");
     release_ran(&lab, &home, &["include", Y]);
     merge_land(&lab, Y, 1);
@@ -447,7 +402,7 @@ fn a_member_on_an_older_trunk_commit_does_not_carry_the_target() {
     assert_eq!(moved.status.code(), Some(0), "{}", text(&moved));
     assert_eq!(commit_at(&lab, Y), y, "{}", text(&moved));
     assert_eq!(
-        parents_of(&lab, A),
+        release_parents(&lab, A),
         std::slice::from_ref(&target),
         "{}",
         text(&moved)
