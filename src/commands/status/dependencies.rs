@@ -135,6 +135,16 @@ impl DependencyResults<'_> {
         ));
     }
 
+    /// A requirement nothing here can judge: `problem` for a dependent
+    /// checked as a row's; for an uncertain one, `why` joins its one problem.
+    fn not_judged(&mut self, about: About<'_>, problem: String, why: &str) {
+        if self.uncertain.contains_key(about.branch) {
+            self.defer(about, format!("{}, {why}", about.shown));
+            return;
+        }
+        self.problems.push(problem);
+    }
+
     fn unchecked(&mut self, about: About<'_>, why: impl Display) {
         let About { branch, shown, .. } = about;
         if self.uncertain.contains_key(branch) {
@@ -246,6 +256,10 @@ struct Members<'a> {
     /// What the landed probe replays onto, the upstream trunk; `None` when
     /// the probe did not run.
     probed_onto: Option<&'a str>,
+    /// Whether the forge answered for this fork's upstream pull requests: when
+    /// it was asked and did not, a squash merge upstream cannot be seen, so a
+    /// member not shown landed cannot be judged.
+    forge_answered: bool,
     judged: RefCell<BTreeMap<BranchName, MemberState>>,
     /// Head commits judged by [`Self::judge_commit`], by the branch name the
     /// review pull request gives them as well as the commit: the merge
@@ -315,6 +329,8 @@ impl Members<'_> {
             MemberState::Landed
         } else if self.probed_onto.is_none() {
             MemberState::Unprobed
+        } else if !self.forge_answered {
+            MemberState::Unknown(unseen_squash(&row.name.to_string()))
         } else {
             MemberState::Open(row.state.to_string())
         }
@@ -379,6 +395,7 @@ impl Members<'_> {
         match crate::jj::probe_landed(self.path, &BranchName::new(tip.as_str()), trunk) {
             Ok(outcome) => match classify_landed(outcome) {
                 LandedVerdict::InTrunk => MemberState::Landed,
+                _ if !self.forge_answered => MemberState::Unknown(unseen_squash(shown)),
                 verdict => MemberState::Open(format!("{shown} {verdict}")),
             },
             Err(error) => {
@@ -449,13 +466,13 @@ fn unmet_dependencies(
     let mut problems = Vec::new();
     let repo = &context.fork.upstream;
     let (checked, uncertain) = dependents(members, context, notes);
-    let sorted = sort_requirements(repo, &checked, context, &mut problems);
     let mut outcomes = DependencyResults {
         findings: &mut findings,
         problems: &mut problems,
         uncertain: &uncertain,
         deferred: BTreeMap::new(),
     };
+    let sorted = sort_requirements(repo, &checked, context, &mut outcomes);
     upstream_outcomes(repo, sorted.upstream, context, &mut outcomes);
     fork_pull_outcomes(sorted.on_fork, members, context, &mut outcomes);
     for (dependent, requirement, member) in sorted.members {
@@ -525,11 +542,21 @@ fn dependents(
                 },
                 Ok(commit) => {
                     let shown = format!("{branch} at {}", commit.short());
-                    if members.judge_commit(&branch, &commit, &shown) != MemberState::Landed {
+                    let state = members.judge_commit(&branch, &commit, &shown);
+                    if state != MemberState::Landed {
+                        let seen = match state {
+                            MemberState::Open(_) => "has not landed".to_owned(),
+                            MemberState::Unprobed => {
+                                "could not be shown landed: the landed probe did not run".to_owned()
+                            }
+                            MemberState::Unknown(why) => {
+                                format!("could not be shown landed: {why}")
+                            }
+                            MemberState::Landed => String::new(),
+                        };
                         notes.push(format!(
                             "{branch} is gone here and on origin; its requirements are checked \
-                             because the newest commit the ledger records for it, {}, has not \
-                             landed",
+                             because the newest commit the ledger records for it, {}, {seen}",
                             commit.short()
                         ));
                         dependents.push(branch);
@@ -556,7 +583,7 @@ fn sort_requirements<'a>(
     repo: &UpstreamName,
     checked: &[BranchName],
     context: &DependencyContext<'a, '_>,
-    problems: &mut Vec<String>,
+    outcomes: &mut DependencyResults<'_>,
 ) -> Sorted<'a> {
     let mut sorted = Sorted::default();
     let mut member_pairs = BTreeSet::new();
@@ -564,25 +591,36 @@ fn sort_requirements<'a>(
         let target = BranchTarget::new(repo.clone(), name.clone());
         for requirement in context.store.dependencies(&target) {
             let dependent = name.clone();
+            let shown = requirement.to_string();
+            let about = About {
+                branch: &dependent,
+                requirement: &requirement,
+                shown: &shown,
+            };
             match &requirement {
                 Requirement::Upstream {
                     repo: required,
                     number,
                 } => {
                     let (required, number) = (required.clone(), *number);
-                    match context.registry.kept_under(&required) {
-                        Some(entry) => sorted
+                    if let Some(entry) = context.registry.kept_under(&required) {
+                        sorted
                             .upstream
                             .entry(required)
                             .or_insert_with(|| (entry, Vec::new()))
                             .1
-                            .push((dependent, requirement, number)),
-                        None => problems.push(format!(
+                            .push((dependent, requirement, number));
+                        continue;
+                    }
+                    outcomes.not_judged(
+                        about,
+                        format!(
                             "{dependent} requires {requirement}, but no fork in the registry is \
                              kept under {required}: a requirement names its fork by its \
                              upstream repository's <owner>/<name>"
-                        )),
-                    }
+                        ),
+                        &format!("which names no fork the registry keeps under {required}"),
+                    );
                 }
                 Requirement::ForkPull { repository, number } => {
                     let (repository, number) = (repository.clone(), *number);
@@ -592,7 +630,25 @@ fn sort_requirements<'a>(
                         number,
                     ));
                 }
-                Requirement::ForkBranch { branch, .. } => {
+                Requirement::ForkBranch { repository, branch } => {
+                    // A branch of another fork's own repository, which only a
+                    // knives before this one or a hand edit writes, is no member
+                    // of this fork, whatever a branch of its name here says.
+                    if let Some(key) = another_forks(context, repository) {
+                        outcomes.not_judged(
+                            about,
+                            format!(
+                                "{dependent} requires {requirement}, a branch of {key}'s own \
+                                 repository: no member of {}, so nothing here can judge it; \
+                                 forget it and name the upstream pull request that branch becomes",
+                                context.fork.name
+                            ),
+                            &format!(
+                                "a branch of {key}'s own repository, which nothing here can judge"
+                            ),
+                        );
+                        continue;
+                    }
                     let branch = branch.clone();
                     if member_pairs.insert((dependent.clone(), branch.clone())) {
                         sorted.members.push((dependent, requirement, branch));
@@ -602,6 +658,30 @@ fn sort_requirements<'a>(
         }
     }
     sorted
+}
+
+/// Why a member not shown landed cannot be judged when the forge did not
+/// answer: a squash merge upstream leaves no trace a replay can see.
+fn unseen_squash(shown: &str) -> String {
+    format!(
+        "{shown} is not shown landed, and the forge did not answer for this fork's upstream pull \
+         requests, so whether it landed by a squash merge cannot be read"
+    )
+}
+
+/// The registry name of a fork other than this one whose own repository the
+/// registry spells `repository`.
+fn another_forks<'r>(context: &DependencyContext<'r, '_>, repository: &str) -> Option<&'r str> {
+    context
+        .registry
+        .repos
+        .iter()
+        .find(|(key, entry)| {
+            entry.upstream_name(key) != context.fork.upstream
+                && remote_slug(&entry.origin)
+                    .is_some_and(|slug| slug.eq_ignore_ascii_case(repository))
+        })
+        .map(|(key, _)| key.as_str())
 }
 
 /// Pull requests on a fork's upstream: this fork's from the status snapshot,
@@ -907,6 +987,7 @@ pub(super) fn add_dependency_findings(input: DependencyInput<'_, '_, '_>) {
         index,
         trunk_commit: post.trunk_commit,
         probed_onto: post.probe_ran.then_some(trunk_ref.as_str()),
+        forge_answered: snapshot.is_some() || post.options.forge.is_none(),
         judged: RefCell::new(BTreeMap::new()),
         judged_commits: RefCell::new(BTreeMap::new()),
     };

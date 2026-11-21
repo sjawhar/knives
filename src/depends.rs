@@ -836,9 +836,8 @@ impl Context<'_, '_> {
     /// the forge could not be asked about a record, and counting it as named
     /// would take back more than the forge's answers take, nothing is taken
     /// back and the refusal says so (exit 3): neither an outage nor a
-    /// repository the token cannot see decides what a forget takes. Naming
-    /// every record of a requirement takes them all back whatever the forge
-    /// answers.
+    /// repository the token cannot see decides what a forget takes. Each such
+    /// refusal prints a command no forge answer changes ([`Self::recovery`]).
     fn forgotten(
         &self,
         required: &[Requirement],
@@ -861,21 +860,63 @@ impl Context<'_, '_> {
         if also.is_empty() {
             return Ok(known);
         }
-        let mut tokens: Vec<String> = Vec::new();
-        joined(&mut tokens, at_most.iter().map(Requirement::forget_token));
         refused(
             Exit::Incomplete,
             format_args!(
-                "nothing recorded: whether {} also {} {} could not be asked of the forge: {}. \
-                 Run it again when the forge answers, or name every record to take back: \
-                 `knives depends {} --forget {}`",
+                "nothing recorded: whether {} also {} {} could not be asked of the forge: {}. {}",
                 texts.join(" or "),
                 if texts.len() == 1 { "names" } else { "name" },
                 listed(also.iter().copied()),
                 reasons(&unasked, &also),
-                self.branch,
-                tokens.join(" --forget ")
+                self.recovery(required, &at_most)
             ),
+        )
+    }
+
+    /// What to do when the forge could not say what a forget takes: run it
+    /// again when it answers, or run the printed command. That command names
+    /// each of `records`, and every other record of a review pull request
+    /// number or member among them, each as it is spelled (a member by its
+    /// branch when that names nothing else): every candidate a text could
+    /// tie is then named directly, so no forge answer changes what it takes.
+    /// It can take a record the forge showed is another repository's; to keep
+    /// one, wait for the forge.
+    fn recovery(&self, required: &[Requirement], records: &[Requirement]) -> String {
+        let numbers: Vec<u64> = records
+            .iter()
+            .filter_map(|record| match record {
+                Requirement::ForkPull { number, .. } => Some(*number),
+                _ => None,
+            })
+            .collect();
+        let branches: Vec<&BranchName> = records
+            .iter()
+            .filter_map(|record| match record {
+                Requirement::ForkBranch { branch, .. } => Some(branch),
+                _ => None,
+            })
+            .collect();
+        let mut tokens: Vec<String> = Vec::new();
+        joined(
+            &mut tokens,
+            required
+                .iter()
+                .filter(|held| {
+                    records.contains(held)
+                        || match held {
+                            Requirement::ForkPull { number, .. } => numbers.contains(number),
+                            Requirement::ForkBranch { branch, .. } => branches.contains(&branch),
+                            Requirement::Upstream { .. } => false,
+                        }
+                })
+                .map(Requirement::forget_token),
+        );
+        format!(
+            "Run it again when the forge answers, or take back every record it might name and \
+             every other record of the same number or member, each as it is spelled, which no \
+             forge answer changes: `knives depends {} --forget {}`",
+            self.branch,
+            tokens.join(" --forget ")
         )
     }
 
@@ -905,6 +946,16 @@ impl Context<'_, '_> {
         let at_most = self.outcome(required, text, &tied);
         let two = matches!(at_most, Outcome::Ambiguous(_));
         match (self.outcome(required, text, &tie.same), at_most) {
+            (Outcome::Ambiguous(records), Outcome::One(_)) => refused(
+                Exit::Incomplete,
+                format_args!(
+                    "nothing recorded: {text} answers to {}, and whether they are one requirement \
+                     could not be asked of the forge: {}. {}",
+                    listed(&records),
+                    reasons(&tie.unasked, &records.iter().collect::<Vec<_>>()),
+                    self.recovery(required, &records)
+                ),
+            ),
             (Outcome::Ambiguous(records), _) => refused(
                 Exit::Usage,
                 format_args!(
@@ -944,7 +995,7 @@ impl Context<'_, '_> {
                     Exit::Incomplete,
                     format_args!(
                         "nothing recorded: whether {text} {} {} could not be asked of the \
-                         forge: {}{}",
+                         forge: {}. {}{}",
                         if known.is_empty() {
                             "names"
                         } else {
@@ -953,11 +1004,12 @@ impl Context<'_, '_> {
                         listed(also.iter().copied()),
                         reasons(&tie.unasked, &also),
                         if two {
-                            "; if it does, it names two requirements. Name the one to forget \
-                             as its record spells it"
+                            "If it does, it names two requirements: name the one to forget as \
+                             its record spells it. "
                         } else {
-                            ". Run it again when the forge answers"
-                        }
+                            ""
+                        },
+                        self.recovery(required, &at_most)
                     ),
                 )
             }
@@ -1022,11 +1074,9 @@ impl Context<'_, '_> {
                     Exit::Incomplete,
                     format_args!(
                         "nothing recorded: whether {repository} is {fork}'s own repository, so \
-                         that {text} names {}, could not be asked of the forge: {error}. Run it \
-                         again when the forge answers, or name the member by its branch: \
-                         `knives depends {} --forget {branch}`",
+                         that {text} names {}, could not be asked of the forge: {error}. {}",
                         listed(&also),
-                        self.branch
+                        self.recovery(required, &also)
                     ),
                 ));
             }
