@@ -142,10 +142,10 @@ enum MemberState {
     Landed,
     /// It has not, with what was seen: its row's state, or the probe's verdict.
     Open(String),
-    /// It has no landed or merged row, and the landed probe, which alone can
-    /// say it landed, did not run (`status --no-landed`, or no upstream
-    /// trunk). Kept as unmet, as the drop guard needs: a member not shown to
-    /// have landed is still needed.
+    /// It has no landed row, and the landed probe, which alone can say it
+    /// landed, did not run (`status --no-landed`, or no upstream trunk). Kept
+    /// as unmet, as the drop guard needs: a member not shown to have landed
+    /// is still needed.
     Unprobed,
     /// It cannot be judged, and why.
     Unknown(String),
@@ -156,7 +156,8 @@ enum MemberState {
 /// has no bookmark of, as a machine that only fetched another machine's
 /// member has. A review pull request's head is judged by the commit the
 /// forge reports for it, whatever a branch of that name points at here.
-/// Each member and each head commit is judged once per report.
+/// Each member, and each head commit under each branch name, is judged once
+/// per report.
 struct Members<'a> {
     rows: &'a [BranchRow],
     repo: &'a Repo,
@@ -170,7 +171,11 @@ struct Members<'a> {
     /// the probe did not run.
     probed_onto: Option<&'a str>,
     judged: RefCell<BTreeMap<BranchName, MemberState>>,
-    judged_commits: RefCell<BTreeMap<CommitId, MemberState>>,
+    /// Head commits judged by [`Self::judge_commit`], by the branch name the
+    /// review pull request gives them as well as the commit: the merge
+    /// evidence it consults is the named branch's, so one commit can be
+    /// landed under one name and not under another.
+    judged_commits: RefCell<BTreeMap<(BranchName, CommitId), MemberState>>,
 }
 
 impl Members<'_> {
@@ -194,18 +199,46 @@ impl Members<'_> {
     /// into anything but the upstream trunk leaves the work outside it.
     /// [`super::merged`] sets the row's landed verdict when the trunk holds
     /// the merge, the same evidence [`Self::merged_upstream`] asks of a
-    /// member known only on origin.
+    /// member known only on origin. The row judges the local tip only, so
+    /// when origin holds work the local tip lacks (a local bookmark that did
+    /// not follow a fetch), that origin tip is judged too, as a machine
+    /// holding only the origin copy judges it: both must have landed.
     fn judged_now(&self, member: &BranchName) -> MemberState {
-        match self.rows.iter().find(|row| row.name == *member) {
-            Some(row)
-                if row.state == BranchState::Landed
-                    || row.landed == Some(LandedVerdict::InTrunk) =>
-            {
-                MemberState::Landed
-            }
-            Some(_) if self.probed_onto.is_none() => MemberState::Unprobed,
-            Some(row) => MemberState::Open(row.state.to_string()),
-            None => self.judge_on_origin(member),
+        let Some(row) = self.rows.iter().find(|row| row.name == *member) else {
+            return self.judge_on_origin(member);
+        };
+        let local = self.row_state(row);
+        if local != MemberState::Landed {
+            return local;
+        }
+        let (Some(tip), Some(on_origin)) = (
+            self.tips.get(&BookmarkRef::Local(member.clone())),
+            self.tips.get(&remote(member)),
+        ) else {
+            return local;
+        };
+        if tip == on_origin {
+            return local;
+        }
+        match self.repo.is_ancestor(on_origin, tip) {
+            Ok(true) => local,
+            Ok(false) => self.judge_commit(member, on_origin, &remote(member).to_string()),
+            Err(error) => MemberState::Unknown(format!(
+                "whether {} holds work {member} lacks could not be read: {error}",
+                remote(member)
+            )),
+        }
+    }
+
+    /// What a row says of its local tip: landed when its state is landed or
+    /// its landed verdict is in the trunk.
+    fn row_state(&self, row: &BranchRow) -> MemberState {
+        if row.state == BranchState::Landed || row.landed == Some(LandedVerdict::InTrunk) {
+            MemberState::Landed
+        } else if self.probed_onto.is_none() {
+            MemberState::Unprobed
+        } else {
+            MemberState::Open(row.state.to_string())
         }
     }
 
@@ -213,8 +246,9 @@ impl Members<'_> {
         let on_origin = remote(member);
         let Some(tip) = self.tips.get(&on_origin) else {
             return MemberState::Unknown(format!(
-                "this checkout has no branch {member}, here or on origin; fetch it, or forget \
-                 the requirement if the branch landed or was dropped"
+                "this checkout has no branch {member}, here or on origin: fetch it. If it was \
+                 deleted, its work may still be in a review base it merged into: forget the \
+                 requirement only once that work has landed upstream"
             ));
         };
         self.judge_commit(member, tip, &on_origin.to_string())
@@ -229,22 +263,21 @@ impl Members<'_> {
         let Ok(commit) = self.repo.resolve_commit(head) else {
             return Err(CommitId::new(head));
         };
-        let row = self.rows.iter().any(|row| row.name == *name);
+        let row = self.rows.iter().find(|row| row.name == *name);
         let local = self.tips.get(&BookmarkRef::Local(name.clone()));
         let on_origin = self.tips.get(&remote(name));
-        if (row && local == Some(&commit))
-            || (!row && local.is_none() && on_origin == Some(&commit))
-        {
+        if let Some(row) = row.filter(|_| local == Some(&commit)) {
+            return Ok(self.row_state(row));
+        }
+        if row.is_none() && local.is_none() && on_origin == Some(&commit) {
             return Ok(self.judge(name));
         }
-        if let Some(state) = self.judged_commits.borrow().get(&commit) {
+        let key = (name.clone(), commit);
+        if let Some(state) = self.judged_commits.borrow().get(&key) {
             return Ok(state.clone());
         }
-        let state = self.judge_commit(name, &commit, &format!("{name} at {}", commit.short()));
-        let _ = self
-            .judged_commits
-            .borrow_mut()
-            .insert(commit, state.clone());
+        let state = self.judge_commit(name, &key.1, &format!("{name} at {}", key.1.short()));
+        let _ = self.judged_commits.borrow_mut().insert(key, state.clone());
         Ok(state)
     }
 
@@ -349,13 +382,37 @@ fn unmet_dependencies(
     (findings, problems)
 }
 
-/// Every branch whose requirements a report checks: each row, and each
-/// branch with a stated requirement that this checkout holds only as
-/// `<branch>@origin`, another machine's branch that nobody here claims.
+/// Every branch whose requirements a report checks: each row; each branch
+/// with a stated requirement that this checkout holds only as
+/// `<branch>@origin`, another machine's branch that nobody here claims; and
+/// each one held nowhere, deleted, whose recorded head (the commit it was at
+/// when its list was last recorded) is here and has not landed upstream: a
+/// branch merged into a review base before it was deleted still carries its
+/// work there, and still needs what it required. A dependent held nowhere
+/// whose recorded head landed is done; one whose recorded head is not here
+/// leaves no copy that says where its work is, and is not checked.
 fn dependents(repo: &UpstreamName, members: &Members<'_>, store: &Store) -> Vec<BranchName> {
     let mut dependents: Vec<BranchName> = members.rows.iter().map(|row| row.name.clone()).collect();
-    for branch in store.dependents(repo) {
-        if !dependents.contains(&branch) && members.tips.contains_key(&remote(&branch)) {
+    for (branch, head) in store.dependents(repo) {
+        if dependents.contains(&branch) {
+            continue;
+        }
+        if members.tips.contains_key(&remote(&branch)) {
+            dependents.push(branch);
+            continue;
+        }
+        if members
+            .tips
+            .contains_key(&BookmarkRef::Local(branch.clone()))
+        {
+            continue;
+        }
+        let Some(commit) = head.and_then(|head| members.repo.resolve_commit(head.as_str()).ok())
+        else {
+            continue;
+        };
+        let shown = format!("{branch} at {}", commit.short());
+        if members.judge_commit(&branch, &commit, &shown) != MemberState::Landed {
             dependents.push(branch);
         }
     }
@@ -467,20 +524,6 @@ fn upstream_outcomes(
     }
 }
 
-/// This fork's own repository as the remotes here spell it: the checkout's
-/// `origin` remote and the registry's `origin`, each as `<owner>/<name>`.
-fn own_spellings(fork: &Fork<'_>) -> Vec<String> {
-    fork.checkout
-        .remotes
-        .get(ORIGIN)
-        .map(String::as_str)
-        .into_iter()
-        .chain(std::iter::once(fork.entry.origin.as_str()))
-        .filter_map(remote_slug)
-        .map(str::to_ascii_lowercase)
-        .collect()
-}
-
 /// This fork's `origin` URL: its checkout's `origin` remote, else the
 /// registry's.
 fn own_origin<'a>(fork: &'a Fork<'a>) -> &'a str {
@@ -491,12 +534,14 @@ fn own_origin<'a>(fork: &'a Fork<'a>) -> &'a str {
 }
 
 /// Review pull requests on a fork's own repository, one batch, each judged
-/// by its head. The own repository is asked of the forge by name once per
-/// report, and a record names it when it spells it as a remote here does,
-/// as the forge names it now, or by a name the forge resolves to that one:
-/// a record written before the repository was renamed still names it. Any
-/// other repository is a problem per requirement: its heads are no members
-/// of this fork.
+/// by its head. The own repository is the one the forge names for this
+/// fork's `origin` URL, asked once per report. A record names it when it
+/// spells it as the forge names it now, or by a name the forge resolves to
+/// that one: a record written before the repository was renamed still
+/// names it. A spelling a remote here gives counts only so: a registry and
+/// a checkout that name two live repositories do not merge them. Any other
+/// repository is a problem per requirement: its heads are no members of
+/// this fork.
 fn fork_pull_outcomes(
     on_fork: BTreeMap<String, Vec<Wanted>>,
     members: &Members<'_>,
@@ -529,15 +574,10 @@ fn fork_pull_outcomes(
             return;
         }
     };
-    let spellings = own_spellings(context.fork);
     let mut ours = Vec::new();
     for (repository, requirements) in on_fork {
-        let spelled = repository.eq_ignore_ascii_case(&own)
-            || spellings
-                .iter()
-                .any(|spelling| spelling.eq_ignore_ascii_case(&repository));
-        // A name no remote here gives: the forge says which repository it is.
-        let resolved = if spelled {
+        // Any other name: the forge says which repository it is.
+        let resolved = if repository.eq_ignore_ascii_case(&own) {
             Ok(true)
         } else {
             remote_slug(origin)
@@ -624,7 +664,8 @@ impl Heads<'_, '_> {
             Ok(state) => state,
             Err(missing) => {
                 let fetch = format!(
-                    "its head commit {} is not in this checkout: fetch origin to judge it",
+                    "its head commit {} is not in this checkout: fetch origin to judge it. If its \
+                     branch was deleted, no fetch brings the commit back",
                     missing.short()
                 );
                 match fact.pull.base_ref_name.as_deref() {

@@ -84,8 +84,8 @@ pub(crate) fn run(
         return Ok(Exit::Incomplete);
     }
     let target = BranchTarget::new(fork.upstream.clone(), branch.clone());
-    let renamed = match renamed_spellings(&context, bound, &target, change.forget)? {
-        Ok(renamed) => renamed,
+    let tied = match tied_through_forge(&context, bound, &target, change.forget)? {
+        Ok(tied) => tied,
         Err(exit) => return Ok(exit),
     };
     // The fork's lock is held while the list is read and the next statement
@@ -100,8 +100,8 @@ pub(crate) fn run(
     let required = store.dependencies(&target);
     let added = as_held(added, &required);
     let mut forgotten: Vec<Requirement> = Vec::new();
-    for (text, renamed) in change.forget.iter().zip(&renamed) {
-        match context.forgotten(&required, text, renamed.as_deref()) {
+    for (text, tied) in change.forget.iter().zip(&tied) {
+        match context.forgotten(&required, text, tied) {
             Ok(answering) => {
                 for requirement in answering {
                     if !forgotten.contains(&requirement) {
@@ -176,6 +176,8 @@ pub(crate) fn run(
 /// is `branch`'s and the upstream's is not (naming both), when only the fork
 /// has #n, and when neither does. `Ok`, with no forge call, when the fork has
 /// one forge repository at most, whose numbers are the only ones there are.
+/// The fork's own repository is the one its checkout's `origin` remote
+/// names, else its registry `origin`, as `status` and `depends` read it.
 pub(crate) fn upstream_pull(
     fork: &Fork<'_>,
     registry: &Registry,
@@ -183,8 +185,12 @@ pub(crate) fn upstream_pull(
     number: u64,
 ) -> Result<(), Exit> {
     let entry = fork.entry;
-    let (Some(upstream), Some(spelled)) =
-        (remote_slug(&entry.upstream), remote_slug(&entry.origin))
+    let origin = fork
+        .checkout
+        .remotes
+        .get(ORIGIN)
+        .map_or(entry.origin.as_str(), String::as_str);
+    let (Some(upstream), Some(spelled)) = (remote_slug(&entry.upstream), remote_slug(origin))
     else {
         return Ok(());
     };
@@ -197,7 +203,7 @@ pub(crate) fn upstream_pull(
         branch,
         forge: &CliForge,
     };
-    let own = context.identity(&entry.origin)?;
+    let own = context.identity(origin)?;
     let own_name = own.name_with_owner.to_ascii_lowercase();
     let own_owner = own_name
         .split_once('/')
@@ -253,17 +259,17 @@ pub(crate) fn upstream_pull(
     }
 }
 
-/// The forge's name of the renamed own repository each `--forget` text
-/// names, where one does ([`Context::renamed_spelling`]): asked from the list
-/// the pulled ledger states, before the fork's lock, so no forge round trip
-/// holds the lock. A list another writer changes before the lock is taken
-/// can only make a forget refuse, never forget the wrong requirement.
-fn renamed_spellings(
+/// For each `--forget` text, the review pull requests it names only through
+/// the forge ([`Context::tied_by_forge`]): asked from the list the pulled
+/// ledger states, before the fork's lock, so no forge round trip holds the
+/// lock. A list another writer changes before the lock is taken can only
+/// make a forget refuse, never forget the wrong requirement.
+fn tied_through_forge(
     context: &Context<'_, '_>,
     bound: Bound<'_>,
     target: &BranchTarget,
     forget: &[String],
-) -> anyhow::Result<Result<Vec<Option<String>>, Exit>> {
+) -> anyhow::Result<Result<Vec<Vec<Requirement>>, Exit>> {
     if forget.is_empty() {
         return Ok(Ok(Vec::new()));
     }
@@ -276,7 +282,7 @@ fn renamed_spellings(
     drop(read);
     Ok(forget
         .iter()
-        .map(|text| context.renamed_spelling(&required, text))
+        .map(|text| context.tied_by_forge(&required, text))
         .collect())
 }
 
@@ -714,18 +720,44 @@ impl Context<'_, '_> {
 
     /// What `--forget <text>` takes back from `required`: the one requirement
     /// it names, or every record of the one member branch it names, whatever
-    /// repository spelling each carries ([`same`]). `renamed` is the forge's
-    /// name of the own repository `text` names, when that repository was
-    /// renamed ([`Self::renamed_spelling`], asked before the fork's lock).
+    /// repository spelling each carries ([`same`]). `tied` holds the records
+    /// `text` names only through the forge ([`Self::tied_by_forge`], asked
+    /// before the fork's lock). A member token on a repository that is not
+    /// this fork's own is refused, as `--on` refuses it, unless a record is
+    /// spelled exactly so.
     fn forgotten(
         &self,
         required: &[Requirement],
         text: &str,
-        renamed: Option<&str>,
+        tied: &[Requirement],
     ) -> Result<Vec<Requirement>, Exit> {
+        if let Some(Requirement::ForkBranch { repository, .. }) = Requirement::parse(text) {
+            let fork = &self.fork.name;
+            if let Some(key) = self.other_fork(&repository) {
+                return refused(
+                    Exit::Usage,
+                    format_args!(
+                        "{text} names a branch of {repository}, which is {key}'s own \
+                         repository, not {fork}'s: nothing {fork} requires is spelled so"
+                    ),
+                );
+            }
+            if !self.is_own_repository(&repository)
+                && !required.iter().any(|held| held.to_string() == text)
+            {
+                return refused(
+                    Exit::Usage,
+                    format_args!(
+                        "{text} names a branch of {repository}, which is not {fork}'s own \
+                         repository; name the requirement as its record spells it, or by its \
+                         branch name"
+                    ),
+                );
+            }
+        }
         let answering: Vec<&Requirement> = required
             .iter()
-            .filter(|requirement| self.answers_to(requirement, text, renamed))
+            .filter(|requirement| self.answers_to(requirement, text, tied))
             .collect();
         match answering.as_slice() {
             [] => refused(
@@ -755,12 +787,11 @@ impl Context<'_, '_> {
     }
 
     /// Whether `text` names `requirement`: spelled as its record spells it,
-    /// or as `--on` names it, without asking the forge. A registry name with a
-    /// number answers for that fork's upstream pull request and for its own
-    /// repository's; `renamed` is the forge's name of the own repository
-    /// `text` names, when that repository was renamed
-    /// ([`Self::renamed_spelling`]).
-    fn answers_to(&self, requirement: &Requirement, text: &str, renamed: Option<&str>) -> bool {
+    /// or as `--on` names it. A registry name with a number answers for that
+    /// fork's upstream pull request and for its own repository's; `tied`
+    /// holds the review pull requests `text` names only through the forge
+    /// ([`Self::tied_by_forge`]).
+    fn answers_to(&self, requirement: &Requirement, text: &str, tied: &[Requirement]) -> bool {
         if Requirement::parse(text).is_some_and(|named| same(&named, requirement)) {
             return true;
         }
@@ -771,53 +802,76 @@ impl Context<'_, '_> {
                         || self.registry.resolve(named.0).as_ref() == Some(repo))
             }),
             Requirement::ForkPull { repository, number } => {
-                numbered(text.strip_prefix("origin:").unwrap_or(text)).is_some_and(|named| {
-                    named.1 == *number
-                        && (named.0.eq_ignore_ascii_case(repository)
-                            || renamed.is_some_and(|own| own.eq_ignore_ascii_case(repository))
-                            || self.registry.repos.get_key_value(named.0).is_some_and(
-                                |(key, entry)| {
-                                    self.repositories_of(key, entry)
-                                        .iter()
-                                        .any(|own| own.eq_ignore_ascii_case(repository))
-                                },
-                            ))
-                })
+                tied.contains(requirement)
+                    || numbered(text.strip_prefix("origin:").unwrap_or(text)).is_some_and(|named| {
+                        named.1 == *number
+                            && (named.0.eq_ignore_ascii_case(repository)
+                                || self.registry.repos.get_key_value(named.0).is_some_and(
+                                    |(key, entry)| {
+                                        self.repositories_of(key, entry)
+                                            .iter()
+                                            .any(|own| own.eq_ignore_ascii_case(repository))
+                                    },
+                                ))
+                    })
             }
             Requirement::ForkBranch { branch, .. } => branch.as_str() == text,
         }
     }
 
-    /// The name the forge gives the own repository `text` names, by a
-    /// registry name or an `origin` spelling, when `required` holds a review
-    /// pull request of that number on a repository no spelling here names:
-    /// the repository was renamed, and only the forge ties the two names
-    /// together. `None`, with no forge call, otherwise.
-    fn renamed_spelling(
+    /// The review pull requests of `required` that `text` names only through
+    /// the forge: records of `text`'s number, on a repository no spelling in
+    /// `text` or here gives, that the forge names as the repository `text`
+    /// names. A repository renamed between the record and now, in either
+    /// direction, is tied so: the old record by the new spelling, the new
+    /// record by the old. The forge is asked only when such a record exists.
+    fn tied_by_forge(
         &self,
         required: &[Requirement],
         text: &str,
-    ) -> Result<Option<String>, Exit> {
+    ) -> Result<Vec<Requirement>, Exit> {
         let Some((repo, number)) = numbered(text.strip_prefix("origin:").unwrap_or(text)) else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
-        let (origin, known) = if let Some((key, entry)) = self.registry.repos.get_key_value(repo) {
-            (entry.origin.as_str(), self.repositories_of(key, entry))
-        } else if let Some(origin) = self.own_origin_named(repo) {
-            (origin, vec![repo.to_ascii_lowercase()])
-        } else {
-            return Ok(None);
-        };
-        let unnamed = required.iter().any(|requirement| {
-            matches!(requirement, Requirement::ForkPull { repository, number: wanted }
-                if *wanted == number
-                    && !known.iter().any(|name| name.eq_ignore_ascii_case(repository)))
-        });
-        if !unnamed {
-            return Ok(None);
+        let untied: Vec<&Requirement> = required
+            .iter()
+            .filter(|requirement| {
+                matches!(requirement, Requirement::ForkPull { number: wanted, .. }
+                    if *wanted == number)
+                    && !self.answers_to(requirement, text, &[])
+            })
+            .collect();
+        if untied.is_empty() {
+            return Ok(Vec::new());
         }
-        self.identity(origin)
-            .map(|own| Some(own.name_with_owner.to_ascii_lowercase()))
+        let origin = if let Some(entry) = self.registry.repos.get(repo) {
+            entry.origin.clone()
+        } else if let Some(origin) = self.own_origin_named(repo) {
+            origin.to_owned()
+        } else if let Some(origin) = self.renamed_origin(repo, text)? {
+            origin
+        } else {
+            return Ok(Vec::new());
+        };
+        let Some(slug) = remote_slug(&origin) else {
+            return Ok(Vec::new());
+        };
+        let named = self.identity(&origin)?.name_with_owner;
+        let mut tied = Vec::new();
+        for requirement in untied {
+            let Requirement::ForkPull { repository, .. } = requirement else {
+                continue;
+            };
+            let url = origin.replacen(slug, repository, 1);
+            if self
+                .identity(&url)?
+                .name_with_owner
+                .eq_ignore_ascii_case(&named)
+            {
+                tied.push(requirement.clone());
+            }
+        }
+        Ok(tied)
     }
 
     /// This fork's own `origin` URL when the forge names that repository
