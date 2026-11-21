@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{FormerNames, default_config_path};
-use crate::ids::{BranchName, BranchTarget, Requirement, UpstreamName};
+use crate::ids::{BranchName, BranchTarget, CommitId, Requirement, UpstreamName};
 use crate::ledger::{Entry, Ledger, LedgerError, inline_human_text, unmigrated};
 use crate::lock::{FileLock, LockError, LockWait};
 use crate::statement::{StatementKind, Statements};
@@ -597,11 +597,19 @@ impl Store {
             .collect()
     }
 
-    /// Every branch of `repo` that requires something now.
-    pub fn dependents(&self, repo: &UpstreamName) -> Vec<BranchName> {
-        self.stated_in(repo)
+    /// Every branch of `repo` that requires something now, with the commit
+    /// it was at when its list was last recorded, where that was recorded
+    /// ([`crate::statement::Statements::depends_head`]).
+    pub fn dependents(&self, repo: &UpstreamName) -> Vec<(BranchName, Option<CommitId>)> {
+        let stated = self.stated_in(repo);
+        stated
             .dependents()
-            .map(BranchName::new)
+            .map(|branch| {
+                (
+                    BranchName::new(branch),
+                    stated.depends_head(branch).map(CommitId::new),
+                )
+            })
             .collect()
     }
 

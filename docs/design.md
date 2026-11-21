@@ -447,37 +447,54 @@ upstream pull request when the trunk holds that merge and the tip holds nothing 
 it merged); or, for a member this checkout knows only as `<branch>@origin` (another
 machine's, fetched), the same two tests on that copy: its merged upstream pull request
 with a landing the trunk holds and nothing past what it merged, or an empty replay onto
-the upstream trunk. A merge alone is not enough: a pull request merged into anything but
-the trunk, or a branch advanced past what merged, leaves work the upstream lacks. A
-review pull request is satisfied once its head, the member it carries, has landed
-upstream, judged at the head commit the forge reports for it, not at whatever a branch of
-that name points at here; a head commit this checkout lacks (the branch moved since the
-last fetch) is a problem until it is fetched, and for a merged review pull request the
-problem names the base that holds the member's work. The report names the head. Its own
-state is not the rule: a review pull request merges into a review base or into another
-member, which says nothing about the upstream, and while the member is in the fork's
-release only, dropping it from the release breaks the dependent. A review pull request is
-judged by its head only on the fork's own repository (as a remote here spells it, as the
-forge names it now, or by an older name the forge resolves to it, so a record from before
-a rename still counts) and when its head is a branch of that repository's owner and a
-member branch; any other is a problem that says why, never met. A member no copy here
-holds cannot be judged, and is a problem until it is fetched or the requirement is
-forgotten. Without the landed probe (`status --no-landed`), a member not shown landed
-stays an unmet finding: what is not shown to have landed is still needed. A member
-recorded under two spellings of the fork's own repository, by machines whose `origin`
-remotes differ, is one requirement. A dependent this checkout holds only as
-`<branch>@origin`, another machine's branch nobody here claims, has its requirements
-checked as one with a row.
+the upstream trunk. A row judges the local tip only, so when `<branch>@origin` holds work
+the local tip lacks (a local bookmark that did not follow a fetch), that origin tip must
+pass too, as it would for a machine holding only it. A merge alone is not enough: a pull
+request merged into anything but the trunk, or a branch advanced past what merged, leaves
+work the upstream lacks. A review pull request is satisfied once its head, the member it
+carries, has landed upstream, judged at the head commit the forge reports for it, not at
+whatever a branch of that name points at here: by that branch's row only when the local
+tip is that commit, else by the commit itself. A head commit this checkout lacks (the
+branch moved since the last fetch) is a problem until it is fetched, and the problem says
+that a head branch deleted on the forge cannot be fetched; for a merged review pull
+request it names the base that holds the member's work. The report names the head. Its
+own state is not the rule: a review pull request merges into a review base or into
+another member, which says nothing about the upstream, and while the member is in the
+fork's release only, dropping it from the release breaks the dependent. A review pull
+request is judged by its head only on the fork's own repository, the one the forge names
+for this fork's `origin` (a record under any other name counts when the forge resolves
+that name to it, so a record from before a rename still counts, and a registry and a
+checkout naming two live repositories are not merged), and when its head is a branch of
+that repository's owner and a member branch; any other is a problem that says why, never
+met. A member no copy here holds cannot be judged, and is a problem until it is fetched;
+the problem says its work may still be in a review base it merged into before it was
+deleted. Without the landed probe (`status --no-landed`), a member not shown landed stays
+an unmet finding: what is not shown to have landed is still needed. A member recorded
+under two spellings of the fork's own repository, by machines whose `origin` remotes
+differ, is one requirement.
+
+A report checks the requirements of every row; of a dependent this checkout holds only as
+`<branch>@origin`, another machine's branch nobody here claims; and of a dependent held
+nowhere, deleted, whose recorded head is here and has not landed upstream. Each `depends`
+entry records the dependent's tip when it was written, and that head outlives the branch:
+a branch merged into a review base and then deleted carries its work there, and still
+needs what it required, until that work lands. A deleted dependent whose recorded head
+landed is done; one whose recorded head is not here leaves no copy that says where its
+work is, and is not checked.
 
 A requirement is taken back by a `depends` forget followed by the list without it, two
 entries stamped in that order and written newest first: a run cut short between them
-leaves the list as it was, never empty. Every machine running this knives folds the two
-into the same list. A knives from before fork requirements reads the same list only while
-it holds no member branch: it cannot read a list that holds one, so the forget is the
-newest statement it reads there, and the branch requires nothing. The forget restates the
-list the writing machine holds after its pull, and the machines still agree on one list,
-but it can differ from what was meant, both ways. A requirement another machine stated
-that had not reached the forgetting machine (unsent, or sent after its pull) is not in
+leaves the list as it was, never empty. `--forget` takes a requirement by any spelling
+`--on` takes or the record's own: a review pull request recorded under a repository's
+name from before a rename is taken back by the new spellings too, the forge tying the two
+names, and a member token on another fork's repository is refused. Every machine running
+this knives folds the two into the same list. A knives from before fork requirements
+reads the same list only while it holds no member branch: it cannot read a list that
+holds one, so the forget is the newest statement it reads there, and the branch requires
+nothing. The forget restates the list the writing machine holds after its pull, and the
+machines still agree on one list, but it can differ from what was meant, both ways. A
+requirement another machine stated that had not reached the forgetting machine (unsent, or
+sent after its pull) is not in
 that list, and is lost on every machine. A list another machine writes after the forget
 from a ledger that has not received it (the forget unsent, or sent after that machine's
 pull) still holds the forgotten requirement, and brings it back; two forgets made that
