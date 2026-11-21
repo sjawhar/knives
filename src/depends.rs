@@ -95,7 +95,6 @@ pub(crate) fn run(
         &[&fork.upstream],
     )?;
     let required = store.dependencies(&target);
-    let added = as_held(added, &required, &forged.aliases);
     let mut forgotten: Vec<Requirement> = Vec::new();
     for (text, tie) in change.forget.iter().zip(&forged.ties) {
         match context.forgotten(&required, text, tie) {
@@ -109,6 +108,14 @@ pub(crate) fn run(
             Err(exit) => return Ok(exit),
         }
     }
+    // A requirement to add is named as a record already held only when that
+    // record stays: one this command takes back is not held.
+    let staying: Vec<Requirement> = required
+        .iter()
+        .filter(|requirement| !forgotten.contains(requirement))
+        .cloned()
+        .collect();
+    let added = as_held(added, &staying, &forged.aliases);
     let pr = store.tracked_pull(&target);
     let replaces = store.statement_stamp(&target, StatementKind::Depends);
     let subject = Some(branch.as_str());
@@ -157,13 +164,25 @@ pub(crate) fn run(
     Ok(Exit::Ok)
 }
 
-/// What the forge says of a review pull request's repository spelling: for
-/// a `--forget` text, every record of its number the forge names as the
-/// repository it names, and those it could not be asked about.
+/// What the forge says of a `--forget` text's repository spelling: every
+/// review pull request of its number the forge names as the repository the
+/// text names, those it could not be asked about, and, for a member token
+/// on a repository no spelling here gives, whether the forge names that
+/// repository as this fork's own.
 #[derive(Debug, Default)]
 struct Tie {
     same: Vec<Requirement>,
     unasked: Vec<(Requirement, String)>,
+    member_own: Option<Result<bool, String>>,
+}
+
+/// Which records of a list a `--forget` text answers to, and whether they
+/// are one requirement.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    Nothing,
+    One(Vec<Requirement>),
+    Ambiguous(Vec<Requirement>),
 }
 
 /// What the forge says, before the fork's lock, about the list the pulled
@@ -539,6 +558,25 @@ impl Context<'_, '_> {
     /// the name the forge gives that repository now.
     fn fork_pull(&self, origin: &str, number: u64) -> Result<Requirement, Exit> {
         let own = self.identity(origin)?;
+        // A spelling that matched the registry's `origin` while the checkout's
+        // names another live repository is not this fork's own: `status`
+        // judges review pull requests on the checkout's.
+        let own_now = self.fork.own_origin();
+        if origin != own_now {
+            let current = self.identity(own_now)?;
+            if !current
+                .name_with_owner
+                .eq_ignore_ascii_case(&own.name_with_owner)
+            {
+                return refused(
+                    Exit::Usage,
+                    format_args!(
+                        "{} is not {}'s own repository: its checkout's {ORIGIN} names {}",
+                        own.name_with_owner, self.fork.name, current.name_with_owner
+                    ),
+                );
+            }
+        }
         let Some(ours) = self.pull(&own, number)? else {
             return refused(
                 Exit::Usage,
@@ -667,71 +705,50 @@ impl Context<'_, '_> {
     /// it names, or every record of it, whatever repository spelling each
     /// carries: a member's by its branch ([`same`]), a review pull request's
     /// by the forge naming each record's repository as the one `text` names
-    /// (`tie`, asked before the fork's lock: [`Self::tied_by_forge`]). A
-    /// member token on a repository that is not this fork's own is refused,
-    /// as `--on` refuses it, unless a record is spelled exactly so: then that
-    /// record alone is taken back.
+    /// (`tie`, asked before the fork's lock: [`Self::tied_by_forge`]). When
+    /// the forge could not be asked about a record, and counting that record
+    /// as tied would change what is taken back or make it ambiguous, nothing
+    /// is taken back and the refusal says so (exit 3): the answer never
+    /// depends on whether the forge was reachable. A member token on a
+    /// repository that is not this fork's own is refused, as `--on` refuses
+    /// it, unless a record is spelled exactly so (then that record alone);
+    /// one on a former name of this fork's repository, which the forge names
+    /// as its own, takes back every record of the member.
     fn forgotten(
         &self,
         required: &[Requirement],
         text: &str,
         tie: &Tie,
     ) -> Result<Vec<Requirement>, Exit> {
-        if let Some(Requirement::ForkBranch { repository, .. }) = Requirement::parse(text) {
-            let fork = &self.fork.name;
-            let exact: Vec<Requirement> = required
-                .iter()
-                .filter(|held| held.to_string() == text)
-                .cloned()
-                .collect();
-            if let Some(key) = self.other_fork(&repository) {
-                if !exact.is_empty() {
-                    return Ok(exact);
-                }
+        if let Some(decided) = self.member_token(required, text, tie) {
+            return decided;
+        }
+        let known = self.outcome(required, text, &tie.same);
+        if !tie.unasked.is_empty() {
+            let mut tied = tie.same.clone();
+            tied.extend(
+                tie.unasked
+                    .iter()
+                    .map(|(requirement, _)| requirement.clone()),
+            );
+            if self.outcome(required, text, &tied) != known {
                 return refused(
-                    Exit::Usage,
+                    Exit::Incomplete,
                     format_args!(
-                        "{text} names a branch of {repository}, which is {key}'s own \
-                         repository, not {fork}'s, and {fork}/{} requires nothing spelled so",
-                        self.branch
-                    ),
-                );
-            }
-            if !self.is_own_repository(&repository) {
-                if !exact.is_empty() {
-                    return Ok(exact);
-                }
-                return refused(
-                    Exit::Usage,
-                    format_args!(
-                        "{text} names a branch of {repository}, which is not {fork}'s own \
-                         repository; name the requirement as its record spells it, or by its \
-                         branch name"
+                        "nothing recorded: whether {text} also names {} could not be asked of \
+                         the forge: {}",
+                        listed(tie.unasked.iter().map(|(requirement, _)| requirement)),
+                        tie.unasked
+                            .iter()
+                            .map(|(_, error)| error.as_str())
+                            .collect::<Vec<_>>()
+                            .join("; ")
                     ),
                 );
             }
         }
-        let answering: Vec<&Requirement> = required
-            .iter()
-            .filter(|requirement| self.answers_to(requirement, text, &tie.same))
-            .collect();
-        let one_requirement = |first: &Requirement, other: &Requirement| {
-            same(first, other) || (tie.same.contains(first) && tie.same.contains(other))
-        };
-        match answering.as_slice() {
-            [] if !tie.unasked.is_empty() => refused(
-                Exit::Incomplete,
-                format_args!(
-                    "nothing recorded: whether {text} names {} could not be asked of the forge: {}",
-                    listed(tie.unasked.iter().map(|(requirement, _)| requirement)),
-                    tie.unasked
-                        .iter()
-                        .map(|(_, error)| error.as_str())
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                ),
-            ),
-            [] => refused(
+        match known {
+            Outcome::Nothing => refused(
                 Exit::Usage,
                 format_args!(
                     "{}/{} does not require {text}; it requires {}",
@@ -744,16 +761,105 @@ impl Context<'_, '_> {
                     }
                 ),
             ),
-            [first, rest @ ..] if rest.iter().all(|other| one_requirement(first, other)) => {
-                Ok(answering.into_iter().cloned().collect())
-            }
-            many => refused(
+            Outcome::One(records) => Ok(records),
+            Outcome::Ambiguous(records) => refused(
                 Exit::Usage,
                 format_args!(
                     "{text} answers to {}; name the one to forget as its record spells it",
-                    listed(many.iter().copied())
+                    listed(&records)
                 ),
             ),
+        }
+    }
+
+    /// What `--forget` of a member token on a repository that is not this
+    /// fork's own spelling takes back, or `None` when it is this fork's own
+    /// (a spelling here, or a former name the forge names as its own), for
+    /// the general match. Another fork's repository, or one the forge names
+    /// otherwise: the record spelled exactly so alone, or a refusal. One the
+    /// forge could not be asked about: exit 3 when counting it as this fork's
+    /// own would take back more.
+    fn member_token(
+        &self,
+        required: &[Requirement],
+        text: &str,
+        tie: &Tie,
+    ) -> Option<Result<Vec<Requirement>, Exit>> {
+        let Some(Requirement::ForkBranch { repository, branch }) = Requirement::parse(text) else {
+            return None;
+        };
+        let (repository, branch) = (repository.as_str(), &branch);
+        let fork = &self.fork.name;
+        let exact: Vec<Requirement> = required
+            .iter()
+            .filter(|held| held.to_string() == text)
+            .cloned()
+            .collect();
+        if let Some(key) = self.other_fork(repository) {
+            if !exact.is_empty() {
+                return Some(Ok(exact));
+            }
+            return Some(refused(
+                Exit::Usage,
+                format_args!(
+                    "{text} names a branch of {repository}, which is {key}'s own repository, \
+                     not {fork}'s, and {fork}/{} requires nothing spelled so",
+                    self.branch
+                ),
+            ));
+        }
+        if self.is_own_repository(repository) || tie.member_own == Some(Ok(true)) {
+            return None;
+        }
+        if let Some(Err(error)) = &tie.member_own {
+            let every: Vec<Requirement> = required
+                .iter()
+                .filter(|held| {
+                    matches!(held, Requirement::ForkBranch { branch: other, .. } if other == branch)
+                })
+                .cloned()
+                .collect();
+            if every != exact {
+                return Some(refused(
+                    Exit::Incomplete,
+                    format_args!(
+                        "nothing recorded: whether {repository} is {fork}'s own repository, so \
+                         that {text} also names {}, could not be asked of the forge: {error}",
+                        listed(every.iter().filter(|held| !exact.contains(held)))
+                    ),
+                ));
+            }
+        }
+        if !exact.is_empty() {
+            return Some(Ok(exact));
+        }
+        Some(refused(
+            Exit::Usage,
+            format_args!(
+                "{text} names a branch of {repository}, which is not {fork}'s own repository; \
+                 name the requirement as its record spells it, or by its branch name"
+            ),
+        ))
+    }
+
+    /// The records of `required` that `text` answers to, `tied` holding the
+    /// review pull requests the forge ties to it, and whether they are one
+    /// requirement.
+    fn outcome(&self, required: &[Requirement], text: &str, tied: &[Requirement]) -> Outcome {
+        let answering: Vec<Requirement> = required
+            .iter()
+            .filter(|requirement| self.answers_to(requirement, text, tied))
+            .cloned()
+            .collect();
+        let one_requirement = |first: &Requirement, other: &Requirement| {
+            same(first, other) || (tied.contains(first) && tied.contains(other))
+        };
+        match answering.as_slice() {
+            [] => Outcome::Nothing,
+            [first, rest @ ..] if rest.iter().all(|other| one_requirement(first, other)) => {
+                Outcome::One(answering)
+            }
+            _ => Outcome::Ambiguous(answering),
         }
     }
 
@@ -790,19 +896,30 @@ impl Context<'_, '_> {
         }
     }
 
-    /// What the forge ties `text` to among `required`: every review pull
-    /// request of `text`'s number whose repository the forge names as the
-    /// one `text` names, those `text` spells directly included, once any
-    /// such record is spelled otherwise; a repository renamed between two
-    /// records, in either direction, ties them. Nothing for a text that names
-    /// an upstream by its `<owner>/<name>`: no review pull request is on it,
-    /// so the forge is not asked. A record the forge cannot be asked about
-    /// is left untied and listed, never an error by itself.
+    /// What the forge ties `text` to among `required` ([`Tie`]). For a review
+    /// pull request: every record of `text`'s number whose repository the
+    /// forge names as the one `text` names, those `text` spells directly
+    /// included, when two records are spelled apart or any is spelled
+    /// otherwise; a repository renamed between two records, in either
+    /// direction, ties them. Nothing, with no forge call, for a text that
+    /// names an upstream by its `<owner>/<name>` without an `origin:`
+    /// prefix: no review pull request is on it. A repository the forge says
+    /// does not exist ties nothing; a record the forge cannot be asked about
+    /// is listed as unasked. For a member token on a repository no spelling
+    /// here gives: whether the forge names it as this fork's own, asked only
+    /// when the list holds the member under another spelling.
     fn tied_by_forge(&self, required: &[Requirement], text: &str) -> Tie {
+        if let Some(Requirement::ForkBranch { repository, branch }) = Requirement::parse(text) {
+            return self.member_tie(required, text, (&repository, &branch));
+        }
+        let explicit = text.starts_with("origin:");
         let Some((repo, number)) = numbered(text.strip_prefix("origin:").unwrap_or(text)) else {
             return Tie::default();
         };
-        if !self.registry.repos.contains_key(repo) && self.registry.resolve(repo).is_some() {
+        if !explicit
+            && !self.registry.repos.contains_key(repo)
+            && self.registry.resolve(repo).is_some()
+        {
             return Tie::default();
         }
         let candidates: Vec<&Requirement> = required
@@ -812,9 +929,17 @@ impl Context<'_, '_> {
                     if *wanted == number)
             })
             .collect();
-        if candidates
+        let spellings: std::collections::BTreeSet<String> = candidates
             .iter()
-            .all(|requirement| self.answers_to(requirement, text, &[]))
+            .filter_map(|requirement| match requirement {
+                Requirement::ForkPull { repository, .. } => Some(repository.to_ascii_lowercase()),
+                _ => None,
+            })
+            .collect();
+        if spellings.len() <= 1
+            && candidates
+                .iter()
+                .all(|requirement| self.answers_to(requirement, text, &[]))
         {
             return Tie::default();
         }
@@ -840,7 +965,8 @@ impl Context<'_, '_> {
         };
         let mut tie = Tie::default();
         let named = match self.named(&origin) {
-            Ok(named) => named,
+            Ok(Some(named)) => named,
+            Ok(None) => return tie,
             Err(error) => {
                 tie.unasked = candidates
                     .into_iter()
@@ -859,7 +985,7 @@ impl Context<'_, '_> {
                 Ok(true)
             } else {
                 self.named(&origin.replacen(slug, repository, 1))
-                    .map(|name| name.eq_ignore_ascii_case(&named))
+                    .map(|name| name.is_some_and(|name| name.eq_ignore_ascii_case(&named)))
             };
             match is_named {
                 Ok(true) => tie.same.push(requirement.clone()),
@@ -868,6 +994,43 @@ impl Context<'_, '_> {
             }
         }
         tie
+    }
+
+    /// Whether the forge names a member token's repository as this fork's
+    /// own ([`Tie::member_own`]), asked only when the repository is no
+    /// spelling here and the list holds the member under another spelling.
+    fn member_tie(
+        &self,
+        required: &[Requirement],
+        text: &str,
+        (repository, branch): (&str, &BranchName),
+    ) -> Tie {
+        let spelled_apart = required.iter().any(|held| {
+            matches!(held, Requirement::ForkBranch { branch: other, .. } if other == branch)
+                && held.to_string() != text
+        });
+        if !spelled_apart
+            || self.is_own_repository(repository)
+            || self.other_fork(repository).is_some()
+        {
+            return Tie::default();
+        }
+        let own = self.fork.own_origin();
+        let Some(slug) = remote_slug(own) else {
+            return Tie::default();
+        };
+        let member_own = match (
+            self.named(own),
+            self.named(&own.replacen(slug, repository, 1)),
+        ) {
+            (Ok(Some(own)), Ok(Some(named))) => Ok(own == named),
+            (Ok(_), Ok(_)) => Ok(false),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
+        Tie {
+            member_own: Some(member_own),
+            ..Tie::default()
+        }
     }
 
     /// The record of `required` the forge names as `wanted`, a review pull
@@ -888,20 +1051,21 @@ impl Context<'_, '_> {
                 matches!(held, Requirement::ForkPull { repository: other, number: held_number }
                     if held_number == number
                         && !other.eq_ignore_ascii_case(repository)
-                        && self
-                            .named(&origin.replacen(slug, other, 1))
-                            .is_ok_and(|name| name.eq_ignore_ascii_case(repository)))
+                        && matches!(self.named(&origin.replacen(slug, other, 1)),
+                            Ok(Some(name)) if name.eq_ignore_ascii_case(repository)))
             })
             .cloned()
     }
 
-    /// The name the forge gives the repository the remote `url` names, or
-    /// why it could not be asked.
-    fn named(&self, url: &str) -> Result<String, String> {
-        self.forge
-            .repo_identity(&self.fork.checkout.path, url, url)
-            .map(|identity| identity.name_with_owner.to_ascii_lowercase())
-            .map_err(|error| format!("{url}: {error}"))
+    /// The name the forge gives the repository the remote `url` names;
+    /// `None` when the forge answers that no repository has that name; or why
+    /// it could not be asked.
+    fn named(&self, url: &str) -> Result<Option<String>, String> {
+        match self.forge.repo_identity(&self.fork.checkout.path, url, url) {
+            Ok(identity) => Ok(Some(identity.name_with_owner.to_ascii_lowercase())),
+            Err(error) if error.is_missing_repository() => Ok(None),
+            Err(error) => Err(format!("{url}: {error}")),
+        }
     }
 
     /// This fork's own `origin` URL when the forge names that repository
