@@ -14,9 +14,9 @@
 //! for the session that joins it, or, in no harness session, with random
 //! digits, so two config homes here that join it are two machines.
 //!
-//! Every test here drives the `knives` binary, raw git and
-//! `tests/common/lab.rs` alone, so this file also runs, unchanged, against
-//! the release before claims were shared.
+//! Every test here drives the `knives` binary, raw git, `tests/common/lab.rs`
+//! and the fake gh of `tests/common/forge_shim.rs` alone, so this file also
+//! runs, unchanged, against the release before claims were shared.
 
 #![allow(
     clippy::expect_used,
@@ -25,6 +25,8 @@
     reason = "a fixture or assertion that cannot proceed IS the test failure"
 )]
 
+#[path = "common/forge_shim.rs"]
+mod forge_shim;
 #[path = "common/lab.rs"]
 mod lab;
 
@@ -1323,6 +1325,24 @@ fn every_write_on_a_shared_fork_is_on_the_ledger_when_it_exits() {
     // a write could not have landed by the time the write exits.
     let shared = Shared::new();
     let one = &shared.one;
+    // A forge whose upstream has #7, which `track --pr 7` asks it.
+    let forge = tempfile::tempdir().expect("gh shim directory");
+    forge_shim::install_repository_gh(
+        forge.path(),
+        &[
+            forge_shim::Repository {
+                named: FORK,
+                canonical: FORK,
+                pulls: &format!("[{}]", forge_shim::pull_record(7, "OPEN", BRANCH, None)),
+            },
+            forge_shim::Repository {
+                named: "acme/work",
+                canonical: "acme/work",
+                pulls: "[]",
+            },
+        ],
+        &forge.path().join("calls.log"),
+    );
     let writes: [&[&str]; 5] = [
         &[
             "--text", "start", BRANCH, "--repo", "demo", "--why", "port it",
@@ -1336,8 +1356,7 @@ fn every_write_on_a_shared_fork_is_on_the_ledger_when_it_exits() {
             "demo",
         ],
         &["--text", "track", BRANCH, "--pr", "7", "--repo", "demo"],
-        // The upstream's own `<owner>/<name>`: a registry name with a number
-        // asks the forge, which this test has none of.
+        // Named by the upstream's own `<owner>/<name>`, which asks no forge.
         &[
             "--text",
             "depends",
@@ -1354,7 +1373,17 @@ fn every_write_on_a_shared_fork_is_on_the_ledger_when_it_exits() {
         let before = one.entries();
 
         // When: the write runs.
-        let output = one.ran("owner-one", args);
+        let output = one
+            .command("owner-one", args)
+            .env("PATH", forge_shim::path_with_gh_shim(forge.path()))
+            .output()
+            .expect("run knives");
+        assert!(
+            output.status.success(),
+            "`knives {}`: {}",
+            args.join(" "),
+            stderr_of(&output)
+        );
 
         // Then: as it exits, machine one's ref on the remote holds the
         // entry it wrote, as it wrote it; and the write said nothing on

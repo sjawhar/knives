@@ -3,6 +3,8 @@
 //! member branch of the fork, and the record says which. A number both
 //! repositories have is refused, never guessed, and a requirement recorded
 //! wrongly can be taken back or corrected by an entry every machine reads.
+//! `knives track --pr` states an upstream pull request, and refuses the
+//! number of one only the fork has.
 
 #![allow(
     clippy::expect_used,
@@ -380,6 +382,63 @@ fn forgetting_a_number_two_requirements_answer_to_is_refused_naming_both() {
     assert!(stderr.contains("maintainer/demo#12"), "{stderr}");
     assert!(stderr.contains("origin:acme/demo#12"), "{stderr}");
     assert_eq!(fixture.entries().len(), before);
+}
+
+#[test]
+fn track_refuses_a_number_only_the_forks_own_repository_has() {
+    // Given: #13 is a review pull request on the fork only, #99 is on neither.
+    let fixture = fixture();
+
+    // When / Then: `track` states the upstream pull request a branch becomes,
+    // so each is refused, the first naming the fork's pull request it is,
+    // and nothing is written.
+    for (number, reason) in [
+        ("13", "acme/demo#13"),
+        (
+            "99",
+            "neither maintainer/demo nor acme/demo has a pull request #99",
+        ),
+    ] {
+        let output = fixture.knives(&["--text", "track", "feat/alpha", "--pr", number]);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "#{number}: {}",
+            said(&output)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(reason), "#{number}: {stderr}");
+    }
+    assert!(fixture.entries().is_empty(), "{:?}", fixture.entries());
+}
+
+#[test]
+fn track_states_a_number_the_upstream_has() {
+    // Given: #7 is on the upstream only; #12 is on both.
+    let fixture = fixture();
+
+    // When: each is stated as the branch's pull request.
+    let mut said_lines = Vec::new();
+    for number in ["7", "12"] {
+        let output = fixture.knives(&["--text", "track", "feat/alpha", "--pr", number]);
+        assert!(output.status.success(), "#{number}: {}", said(&output));
+        said_lines.push(
+            String::from_utf8_lossy(&output.stdout)
+                .trim_end()
+                .to_owned(),
+        );
+    }
+
+    // Then: both are recorded, as `track` always read a number: the
+    // upstream's.
+    assert_eq!(
+        said_lines,
+        ["demo/feat/alpha is #7", "demo/feat/alpha is #12"]
+    );
+    assert_eq!(
+        Statements::from_entries(&fixture.entries()).pull("feat/alpha"),
+        Some(12)
+    );
 }
 
 /// The details of a status report's findings of `kind`.
