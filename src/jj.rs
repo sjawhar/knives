@@ -11,10 +11,16 @@ use jj_lib::backend::{
     BackendError, CommitId as JjCommitId, CopyId, FileId, MergedTreeValue, TreeValue,
 };
 use jj_lib::config::{ConfigLayer, ConfigResolutionContext, ConfigSource, StackedConfig};
-use jj_lib::conflicts::extract_as_single_hunk;
+use jj_lib::conflict_labels::ConflictLabels;
+use jj_lib::conflicts::{
+    ConflictMarkerStyle, ConflictMaterializeOptions, MaterializedTreeValue, extract_as_single_hunk,
+    materialize_merge_result_to_bytes, materialize_tree_value,
+};
 use jj_lib::default_backend_factories::{
     default_backend_factories, default_working_copy_factories,
 };
+use jj_lib::diff::{ContentDiff, DiffHunkKind};
+use jj_lib::files::{MergeResult, merge_hunks};
 use jj_lib::local_working_copy::LocalWorkingCopy;
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::merge::Merge;
@@ -31,6 +37,7 @@ use jj_lib::revset::{ResolvedRevsetExpression, RevsetEvaluationError, SymbolReso
 use jj_lib::rewrite::{CommitRewriter, duplicate_commits, merge_commit_trees, rebase_commit};
 use jj_lib::settings::UserSettings;
 use jj_lib::transaction::Transaction;
+use jj_lib::tree_merge::MergeOptions;
 use jj_lib::working_copy::WorkingCopy as _;
 use jj_lib::workspace::Workspace;
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _, WorkspaceStoreError};
@@ -2999,6 +3006,20 @@ pub struct ReplacedRelease {
     pub kept: Option<String>,
 }
 
+/// A file an edit wrote as the plain merge of its new parents
+/// ([`write_edited_release`]): the release's own change there answers a
+/// conflict that this merge does not leave (spec R11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainMergedFile {
+    /// The repository-internal path, `/`-separated.
+    pub path: String,
+    /// Whether the written release leaves the file conflicted.
+    pub conflicted: bool,
+    /// Whether the release had also changed lines outside that conflict, a
+    /// hand change the plain merge does not carry ([`changed_outside`]).
+    pub hand_change_left_out: bool,
+}
+
 /// Write a release commit — and optionally its bookmark — as ONE operation.
 ///
 /// Explicit commit ids, never bookmark names: a name can move between the
@@ -3037,25 +3058,54 @@ pub struct ReplacedRelease {
 /// same operation hides each such head that is an earlier write of the name
 /// or superseded ([`hide_exposed`]).
 pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWritten, JjError> {
+    written_release(repo, write, false).map(|(written, _)| written)
+}
+
+/// [`write_release`] for an edit of a release: `include`, `drop` or `advance`.
+///
+/// The same one operation writes the duplicate by spec R11's rule
+/// ([`ruled_tree`]). A file whose conflict the release resolved keeps that
+/// resolution only where the plain merge of the new parents leaves the same
+/// conflict there. Elsewhere it is written as that plain merge, and comes
+/// back beside what [`write_release`] returns.
+pub fn write_edited_release(
+    repo: &Path,
+    write: &ReleaseWrite<'_>,
+) -> Result<(ReleaseWritten, Vec<PlainMergedFile>), JjError> {
+    written_release(repo, write, true)
+}
+
+/// The one body of [`write_release`] and, where `edit` holds,
+/// [`write_edited_release`].
+fn written_release(
+    repo: &Path,
+    write: &ReleaseWrite<'_>,
+    edit: bool,
+) -> Result<(ReleaseWritten, Vec<PlainMergedFile>), JjError> {
     validate_parents(write.source, write.parents)?;
     let repo = Repo::open_to_write(repo)?;
     let (parent_commits, parent_ids) = resolved_parents(&repo, write.parents)?;
     let mut tx = repo.repo.start_transaction();
-    let (written, source, unions) = if let Some(source) = write.source {
+    let (written, source, unions, plain_merged) = if let Some(source) = write.source {
         let source = repo.commit(source.as_str())?;
         let measured = match write.measured {
             Measured::WithoutCarriers(carriers) => without_carriers(&source, carriers),
         };
-        let (written, unions) =
-            duplicated_from(&mut tx, (&source, write.message), measured, &parent_ids)?;
-        (written, Some(source), unions)
+        let ruled = edit.then_some(parent_commits.as_slice());
+        let (written, unions, plain_merged) = duplicated_from(
+            &mut tx,
+            (&source, write.message),
+            measured,
+            (&parent_ids, ruled),
+        )?;
+        (written, Some(source), unions, plain_merged)
     } else {
         let (written, unions) = merged_release(
             &mut tx,
             (&parent_commits, parent_ids),
             write.message.unwrap_or_default(),
         )?;
-        (written, None, unions)
+        (written, None, unions, Vec::new())
     };
     let same_tree_as_source = source
         .as_ref()
@@ -3121,15 +3171,18 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
         },
     )?;
     commit_mutation(&repo, tx, write.operation)?;
-    Ok(ReleaseWritten {
-        commit: commit_id(written.id()),
-        change: ChangeId::new(written.change_id().to_string()),
-        replaced,
-        abandoned_earlier,
-        hidden,
-        unions,
-        same_tree_as_source,
-    })
+    Ok((
+        ReleaseWritten {
+            commit: commit_id(written.id()),
+            change: ChangeId::new(written.change_id().to_string()),
+            replaced,
+            abandoned_earlier,
+            hidden,
+            unions,
+            same_tree_as_source,
+        },
+        plain_merged,
+    ))
 }
 
 /// The bookmark a release write moved, and where it publishes.
@@ -3530,6 +3583,15 @@ fn without_carriers(source: &jj_lib::commit::Commit, carriers: &[CommitId]) -> V
         .collect()
 }
 
+/// What [`duplicated_release`] wrote: the duplicate, the release logs the
+/// union wrote in it, and the files spec R11's rule wrote as the plain merge
+/// of the new parents.
+type Duplicated = (
+    jj_lib::commit::Commit,
+    Vec<UnionedFile>,
+    Vec<PlainMergedFile>,
+);
+
 /// [`duplicated_release`] of `source`, its own change measured against the
 /// merge of `measured`: its parents less its carriers ([`without_carriers`]).
 ///
@@ -3543,15 +3605,16 @@ fn without_carriers(source: &jj_lib::commit::Commit, carriers: &[CommitId]) -> V
 /// duplicated; and it is recorded abandoned in the same transaction, so the
 /// write still leaves one new visible commit. A new commit, never a rewrite
 /// of the source: a rewrite would record the source rewritten and move
-/// everything resting on it, a working copy included.
+/// everything resting on it, a working copy included. `parents` are the
+/// new parents, as [`duplicated_release`] takes them.
 fn duplicated_from(
     tx: &mut Transaction,
     (source, message): (&jj_lib::commit::Commit, Option<&str>),
     measured: Vec<JjCommitId>,
-    parent_ids: &[JjCommitId],
-) -> Result<(jj_lib::commit::Commit, Vec<UnionedFile>), JjError> {
+    parents: (&[JjCommitId], Option<&[jj_lib::commit::Commit]>),
+) -> Result<Duplicated, JjError> {
     if measured.as_slice() == source.parent_ids() {
-        return duplicated_release(tx, (source, message), parent_ids);
+        return duplicated_release(tx, (source, message), parents);
     }
     if measured.is_empty() {
         return Err(JjError::Revision {
@@ -3569,7 +3632,7 @@ fn duplicated_from(
             .write(),
     )
     .map_err(|error| store_error(&error))?;
-    let written = duplicated_release(tx, (&in_between, message), parent_ids)?;
+    let written = duplicated_release(tx, (&in_between, message), parents)?;
     tx.repo_mut().record_abandoned_commit(&in_between);
     Ok(written)
 }
@@ -3578,15 +3641,18 @@ fn duplicated_from(
 /// with every release log whose conflict is a union written resolved, and
 /// those logs.
 ///
-/// The union goes into the duplicate by rewriting it in the same
-/// transaction, so the write leaves one visible commit with the duplicate's
-/// change id. `source` is the earlier release: its content of a log goes
-/// under the blocks the new parents bring in.
+/// Where `ruled` holds the new parents' commits (an edit), the duplicate is
+/// first written by spec R11's rule ([`ruled_tree`]), and the files it wrote
+/// as their plain merge are returned too; `None` (a cut, a rebase's write)
+/// keeps the duplicate as it is. The union goes into the duplicate by
+/// rewriting it in the same transaction, so the write leaves one visible
+/// commit with the duplicate's change id. `source` is the earlier release:
+/// its content of a log goes under the blocks the new parents bring in.
 fn duplicated_release(
     tx: &mut Transaction,
     (source, message): (&jj_lib::commit::Commit, Option<&str>),
-    parent_ids: &[JjCommitId],
-) -> Result<(jj_lib::commit::Commit, Vec<UnionedFile>), JjError> {
+    (parent_ids, ruled): (&[JjCommitId], Option<&[jj_lib::commit::Commit]>),
+) -> Result<Duplicated, JjError> {
     let mut descriptions = HashMap::new();
     if let Some(message) = message {
         descriptions.insert(source.id().clone(), message.to_owned());
@@ -3607,18 +3673,31 @@ fn duplicated_release(
             revision: source.id().to_string(),
             detail: "the duplicate produced no commit".to_owned(),
         })?;
-    let (tree, unions) = union_release_logs(duplicate.tree(), Some(&source.tree()))?;
-    if unions.is_empty() {
-        return Ok((duplicate, unions));
+    let (tree, plain) = match ruled {
+        Some(parents) => ruled_tree(tx.repo(), (source, duplicate.tree()), parents)?,
+        None => (duplicate.tree(), Vec::new()),
+    };
+    let (tree, unions) = union_release_logs(tree, Some(&source.tree()))?;
+    if plain.is_empty() && unions.is_empty() {
+        return Ok((duplicate, unions, Vec::new()));
     }
-    let unioned = block_on(
+    let mut plain_merged = Vec::with_capacity(plain.len());
+    for (path, hand_change_left_out) in plain {
+        let written = block_on(tree.path_value(&path)).map_err(|error| store_error(&error))?;
+        plain_merged.push(PlainMergedFile {
+            path: path.as_internal_file_string().to_owned(),
+            conflicted: !written.is_resolved(),
+            hand_change_left_out,
+        });
+    }
+    let rewritten = block_on(
         tx.repo_mut()
             .rewrite_commit(&duplicate)
             .set_tree(tree)
             .write(),
     )
     .map_err(|error| store_error(&error))?;
-    Ok((unioned, unions))
+    Ok((rewritten, unions, plain_merged))
 }
 
 /// `tree` with every release log whose conflict is a union
@@ -3739,6 +3818,335 @@ fn regular_files(value: &MergedTreeValue) -> Option<RegularFiles> {
         executable: *executable,
         copy_id: copy_id.clone(),
     })
+}
+
+/// `duplicate`, the duplicate of `source` onto `parents`, written by spec
+/// R11's rule for an edit, and each path the rule wrote as the plain merge of
+/// `parents`, with whether a hand change was left out there.
+///
+/// The rule reads the plain merge of `source`'s own parents, the release in
+/// hand's members (its carriers left out, [`duplicated_from`]), and acts on
+/// each path where that merge leaves a conflict ([`RuleTrees::ruled`]): there
+/// the release's own change answers the conflict. It keeps that resolution
+/// only where the plain merge of `parents` leaves the same conflict, and
+/// otherwise sets that merge's value, conflicted, clean or absent. Every
+/// other path keeps the duplicate's value. Both merges are jj's own, as `jj
+/// new` makes them, with no release-log union: the union runs over the tree
+/// written here, as on every write ([`duplicated_release`]).
+fn ruled_tree(
+    repo: &dyn jj_lib::repo::Repo,
+    (source, duplicate): (&jj_lib::commit::Commit, MergedTree),
+    parents: &[jj_lib::commit::Commit],
+) -> Result<(MergedTree, Vec<(RepoPathBuf, bool)>), JjError> {
+    let old_parents = block_on(source.parents()).map_err(|error| store_error(&error))?;
+    let old =
+        block_on(merge_commit_trees(repo, &old_parents)).map_err(|error| store_error(&error))?;
+    if !old.has_conflict() {
+        return Ok((duplicate, Vec::new()));
+    }
+    let trees = RuleTrees {
+        release: source.tree(),
+        new: block_on(merge_commit_trees(repo, parents)).map_err(|error| store_error(&error))?,
+        duplicate,
+    };
+    let sides = trees.duplicate.tree_ids().num_sides();
+    let mut builder = MergedTreeBuilder::new(trees.duplicate.clone());
+    let mut written = Vec::new();
+    for (path, value) in old.conflicts() {
+        let value = value.map_err(|error| store_error(&error))?.simplify();
+        if let Some((plain, hand_change_left_out)) = trees.ruled(&path, &value)? {
+            builder.set_or_remove(path.clone(), padded(plain, sides));
+            written.push((path, hand_change_left_out));
+        }
+    }
+    if written.is_empty() {
+        return Ok((trees.duplicate, written));
+    }
+    let tree = block_on(builder.write_tree()).map_err(|error| store_error(&error))?;
+    Ok((tree, written))
+}
+
+/// The trees spec R11's rule reads at a path ([`ruled_tree`]).
+struct RuleTrees {
+    /// The release in hand's own tree.
+    release: MergedTree,
+    /// The plain merge of the new parents.
+    new: MergedTree,
+    /// The duplicate of the release onto the new parents.
+    duplicate: MergedTree,
+}
+
+impl RuleTrees {
+    /// What the rule writes at `path`, where the plain merge of the release
+    /// in hand's own parents leaves the conflict `old` (simplified): `None`
+    /// keeps the duplicate's value; otherwise the new parents' plain merge
+    /// at the path, and whether the release had changed lines outside that
+    /// conflict ([`changed_outside`]).
+    ///
+    /// A release log ([`changelog_union::eligible`]) whose conflict the union
+    /// joins is left to the union ([`left_to_union`]). Every other path keeps
+    /// the duplicate's value where [`keeps_duplicate`] says so, or where the
+    /// new merge holds what the duplicate holds there: then nothing changes,
+    /// and nothing is named.
+    fn ruled(
+        &self,
+        path: &RepoPath,
+        old: &MergedTreeValue,
+    ) -> Result<Option<(MergedTreeValue, bool)>, JjError> {
+        let store = self.duplicate.store();
+        let options = store.merge_options();
+        let value_at = |tree: &MergedTree| {
+            block_on(tree.path_value(path)).map_err(|error| store_error(&error))
+        };
+        let release = value_at(&self.release)?;
+        let terms = regular_terms(store, path, old)?;
+        if changelog_union::eligible(path.as_internal_file_string()) {
+            let earlier = regular_file_content(store, path, &release)?;
+            if terms
+                .as_ref()
+                .is_some_and(|terms| left_to_union(terms, earlier.as_deref(), options))
+            {
+                return Ok(None);
+            }
+        }
+        let merged = terms.as_ref().map(|terms| merge_hunks(terms, options));
+        let answered = merged.as_ref().map_or_else(
+            || ConflictHunks::Whole(old.clone()),
+            |merged| ConflictHunks::Text(hunk_list(merged)),
+        );
+        let new = value_at(&self.new)?;
+        if keeps_duplicate(
+            &answered,
+            conflict_at(store, path, &release)?.as_ref(),
+            conflict_at(store, path, &new)?.as_ref(),
+        ) || new.simplify() == value_at(&self.duplicate)?.simplify()
+        {
+            return Ok(None);
+        }
+        let hand_change_left_out = match (merged, materialized_file(store, path, release)?) {
+            (Some(MergeResult::Conflict(hunks)), Some(file)) => changed_outside(&hunks, &file),
+            _ => false,
+        };
+        Ok(Some((new, hand_change_left_out)))
+    }
+}
+
+/// The terms of `value`, a conflict, as the contents of regular files, read
+/// as [`union_release_logs`] reads a conflict ([`regular_files`]); `None`
+/// where a term is not a regular file of the others' mode.
+fn regular_terms(
+    store: &jj_lib::store::Store,
+    path: &RepoPath,
+    value: &MergedTreeValue,
+) -> Result<Option<Merge<impl AsRef<[u8]> + Clone + PartialEq + use<>>>, JjError> {
+    let Some(files) = regular_files(value) else {
+        return Ok(None);
+    };
+    block_on(extract_as_single_hunk(&files.ids, store, path))
+        .map(Some)
+        .map_err(|error| store_error(&error))
+}
+
+/// One unresolved hunk of a conflict between regular files, as spec R11
+/// compares it: its bases and its sides, each sorted, so each reads as a
+/// multiset that counts how often each text occurs.
+#[derive(Debug, PartialEq, Eq)]
+struct ConflictHunk {
+    bases: Vec<Vec<u8>>,
+    sides: Vec<Vec<u8>>,
+}
+
+/// The conflict a value leaves at a path, as spec R11 compares it.
+#[derive(Debug)]
+enum ConflictHunks {
+    /// A conflict between regular files: its unresolved hunks in file order
+    /// ([`hunk_list`]).
+    Text(Vec<ConflictHunk>),
+    /// Any other conflict, compared whole: its simplified terms, its bases
+    /// and its sides each read as a multiset ([`same_terms`]).
+    Whole(MergedTreeValue),
+}
+
+impl PartialEq for ConflictHunks {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Text(ours), Self::Text(theirs)) => ours == theirs,
+            (Self::Whole(ours), Self::Whole(theirs)) => {
+                same_terms(ours.removes(), theirs.removes())
+                    && same_terms(ours.adds(), theirs.adds())
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Whether `ours` and `theirs` hold the same terms, each as many times, in
+/// any order.
+fn same_terms<'a, T: PartialEq + 'a>(
+    ours: impl Iterator<Item = &'a T>,
+    theirs: impl Iterator<Item = &'a T>,
+) -> bool {
+    let (ours, theirs): (Vec<&T>, Vec<&T>) = (ours.collect(), theirs.collect());
+    let count = |terms: &[&T], term: &T| terms.iter().filter(|other| **other == term).count();
+    ours.len() == theirs.len()
+        && ours
+            .iter()
+            .all(|&term| count(ours.as_slice(), term) == count(theirs.as_slice(), term))
+}
+
+/// The conflict `value` leaves at `path` as spec R11 compares it, or `None`
+/// where it is resolved.
+fn conflict_at(
+    store: &jj_lib::store::Store,
+    path: &RepoPath,
+    value: &MergedTreeValue,
+) -> Result<Option<ConflictHunks>, JjError> {
+    let value = value.simplify();
+    if value.is_resolved() {
+        return Ok(None);
+    }
+    let Some(terms) = regular_terms(store, path, &value)? else {
+        return Ok(Some(ConflictHunks::Whole(value)));
+    };
+    Ok(Some(ConflictHunks::Text(hunk_list(&merge_hunks(
+        &terms,
+        store.merge_options(),
+    )))))
+}
+
+/// The unresolved hunks of `merged`, the merge hunks of a conflict between
+/// regular files, in file order ([`ConflictHunk`]).
+///
+/// Each hunk is simplified on its own, so a side that equals a base cancels
+/// with it ([`Merge::simplify`]). A merge of more than two parents keeps such
+/// a side in a hunk where its parent changed only other lines of the file,
+/// and a simplify of the whole file leaves it there.
+fn hunk_list(merged: &MergeResult) -> Vec<ConflictHunk> {
+    let MergeResult::Conflict(hunks) = merged else {
+        return Vec::new();
+    };
+    hunks
+        .iter()
+        .map(Merge::simplify)
+        .filter(|hunk| !hunk.is_resolved())
+        .map(|hunk| {
+            let mut bases: Vec<Vec<u8>> = hunk.removes().map(|term| term.to_vec()).collect();
+            let mut sides: Vec<Vec<u8>> = hunk.adds().map(|term| term.to_vec()).collect();
+            bases.sort_unstable();
+            sides.sort_unstable();
+            ConflictHunk { bases, sides }
+        })
+        .collect()
+}
+
+/// Whether spec R11 keeps the duplicate's value at a path where the plain
+/// merge of the release in hand's own parents leaves `answered`.
+///
+/// It does where that conflict has no unresolved hunk; where `release`, the
+/// release's own value there when it is a conflict, leaves the same hunks,
+/// every one still open with the sides it had, so the release answers none
+/// of them; and where `new`, the new parents' plain merge there when it is a
+/// conflict, leaves the same hunks, so the same conflict comes back. A count
+/// of a side that changed makes the hunks differ.
+fn keeps_duplicate(
+    answered: &ConflictHunks,
+    release: Option<&ConflictHunks>,
+    new: Option<&ConflictHunks>,
+) -> bool {
+    matches!(answered, ConflictHunks::Text(hunks) if hunks.is_empty())
+        || release == Some(answered)
+        || new == Some(answered)
+}
+
+/// Whether spec R11 leaves a release log to the union: the union, applied
+/// as [`union_release_logs`] applies it, joins `terms`, the conflict of the
+/// plain merge of the release in hand's own parents, with `earlier`, the
+/// release in hand's own content of the log, as the earlier release.
+fn left_to_union<T: AsRef<[u8]>>(
+    terms: &Merge<T>,
+    earlier: Option<&[u8]>,
+    options: &MergeOptions,
+) -> bool {
+    changelog_union::union_of(terms, earlier, options).is_some()
+}
+
+/// Whether `release`, the release's file, changed lines outside the conflict
+/// hunks of `hunks`, the merge hunks of the plain merge of its own parents,
+/// in file order.
+///
+/// The lines of the resolved hunks, each conflict hunk a position between
+/// them, are line-diffed against the file ([`ContentDiff::by_line`]). A
+/// resolved line deleted or changed, or a line inserted at a position no
+/// conflict hunk holds, is such a change. A line inserted at a conflict
+/// hunk's position is part of its resolution, at either edge of its region
+/// too, and so is a conflict marker the file still holds there.
+fn changed_outside<T: AsRef<[u8]>>(hunks: &[Merge<T>], release: &[u8]) -> bool {
+    let mut resolved = Vec::new();
+    let mut positions = Vec::new();
+    for hunk in hunks {
+        if let Some(text) = hunk.as_resolved() {
+            resolved.extend_from_slice(text.as_ref());
+            continue;
+        }
+        positions.push(resolved.len());
+    }
+    ContentDiff::by_line([resolved.as_slice(), release])
+        .hunk_ranges()
+        .filter(|range| range.kind == DiffHunkKind::Different)
+        .any(|range| {
+            range
+                .ranges
+                .first()
+                .is_some_and(|ours| !ours.is_empty() || !positions.contains(&ours.start))
+        })
+}
+
+/// The file `value` holds at `path` as jj materializes it
+/// ([`materialize_tree_value`]): its text, with jj's conflict markers where
+/// it is still a conflict, or no text where it is absent; `None` for a value
+/// that is no file.
+fn materialized_file(
+    store: &jj_lib::store::Store,
+    path: &RepoPath,
+    value: MergedTreeValue,
+) -> Result<Option<Vec<u8>>, JjError> {
+    let materialized = block_on(materialize_tree_value(
+        store,
+        path,
+        value,
+        &ConflictLabels::unlabeled(),
+    ))
+    .map_err(|error| store_error(&error))?;
+    Ok(match materialized {
+        MaterializedTreeValue::Absent => Some(Vec::new()),
+        MaterializedTreeValue::File(mut file) => {
+            Some(block_on(file.read_all(path)).map_err(|error| store_error(&error))?)
+        }
+        MaterializedTreeValue::FileConflict(file) => {
+            let options = ConflictMaterializeOptions {
+                marker_style: ConflictMarkerStyle::Diff,
+                marker_len: None,
+                merge: store.merge_options().clone(),
+            };
+            Some(Vec::from(materialize_merge_result_to_bytes(
+                &file.contents,
+                &file.labels,
+                &options,
+            )))
+        }
+        _ => None,
+    })
+}
+
+/// `value` padded with absent terms to `sides`, the number of sides of the
+/// tree it is set in, where it is a conflict with fewer.
+/// [`MergedTreeBuilder`] sets each term of a conflict in its own tree, and
+/// a tree that gets no term of its own keeps its old value at the path.
+fn padded(mut value: MergedTreeValue, sides: usize) -> MergedTreeValue {
+    if !value.is_resolved() {
+        value.pad_to(sides, &None);
+    }
+    value
 }
 
 /// The release a hand resolution is measured against.
@@ -3907,7 +4315,8 @@ pub fn candidate_release(repo: &Path, spec: CutSpec) -> Result<Candidate, JjErro
 /// The release commit `spec` describes, written into `tx`, and the release
 /// logs it unioned. A source with carriers goes through the in-between commit
 /// a release write uses ([`duplicated_from`]), in the audited candidate and in
-/// the published rebuild alike, so both hold the same tree.
+/// the published rebuild alike, so both hold the same tree. A cut keeps the
+/// duplicate as it is: spec R11's rule is an edit's.
 fn spec_commit(
     repo: &Repo,
     tx: &mut Transaction,
@@ -3916,12 +4325,13 @@ fn spec_commit(
     let (parent_commits, parent_ids) = resolved_parents(repo, &spec.parents)?;
     if let Some(source) = &spec.source {
         let source = repo.commit(source.as_str())?;
-        duplicated_from(
+        let (commit, unions, _) = duplicated_from(
             tx,
             (&source, Some(&spec.message)),
             without_carriers(&source, &spec.carriers),
-            &parent_ids,
-        )
+            (&parent_ids, None),
+        )?;
+        Ok((commit, unions))
     } else {
         merged_release(tx, (&parent_commits, parent_ids), &spec.message)
     }
@@ -5470,7 +5880,15 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
 
-    use super::{CommitId, JjError, fetch_all, fetch_pull_ref, fetch_retry_pause, ls_remote_args};
+    use jj_lib::backend::{SymlinkId, TreeValue};
+    use jj_lib::files::{FileMergeHunkLevel, MergeResult, merge_hunks};
+    use jj_lib::merge::{Merge, SameChange};
+    use jj_lib::tree_merge::MergeOptions;
+
+    use super::{
+        CommitId, ConflictHunks, JjError, changed_outside, fetch_all, fetch_pull_ref,
+        fetch_retry_pause, hunk_list, keeps_duplicate, left_to_union, ls_remote_args, padded,
+    };
     use crate::config::test_support::{EnvironmentGuard, environment_lock};
 
     const FAKE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -5706,5 +6124,237 @@ esac
                 "refs/heads/release/*"
             ]
         );
+    }
+
+    /// The merge options a store holds by default, as `jj new` merges with.
+    fn merge_options() -> MergeOptions {
+        MergeOptions {
+            hunk_level: FileMergeHunkLevel::Line,
+            same_change: SameChange::Accept,
+        }
+    }
+
+    /// The probe's `f`: thirty lines `let lN = N`, with each line of
+    /// `changed` set to its value.
+    fn probe_file(changed: &[(usize, &str)]) -> String {
+        use std::fmt::Write as _;
+        let mut file = String::new();
+        for line in 1..=30 {
+            let value = changed
+                .iter()
+                .find(|(at, _)| *at == line)
+                .map_or_else(|| line.to_string(), |(_, value)| (*value).to_owned());
+            writeln!(file, "let l{line} = {value}").expect("write to a String");
+        }
+        file
+    }
+
+    /// The conflict a merge of `terms`, in jj's order of sides and bases,
+    /// leaves, as spec R11 compares it.
+    fn text_conflict(terms: &[&str]) -> ConflictHunks {
+        ConflictHunks::Text(hunk_list(&merge_hunks(
+            &Merge::from_vec(terms.to_vec()),
+            &merge_options(),
+        )))
+    }
+
+    /// The terms of a conflict of symlinks, one for each of `targets`, which
+    /// no regular-file reading takes.
+    fn symlinks(targets: &[u8]) -> Vec<Option<TreeValue>> {
+        targets
+            .iter()
+            .map(|target| Some(TreeValue::Symlink(SymlinkId::new(vec![*target]))))
+            .collect()
+    }
+
+    #[test]
+    fn a_side_equal_to_the_base_inside_a_hunk_cancels_so_a_three_parent_merge_matches() {
+        // Given (the probe's case 1d): D and A conflict at lines 5 and 6,
+        // and P changes only line 30, so its side equals the base inside
+        // that hunk.
+        let base = probe_file(&[]);
+        let d = probe_file(&[(5, "compare_fix ()"), (6, "d809_only ()")]);
+        let a = probe_file(&[(5, "compare_fix ()")]);
+        let p = probe_file(&[(30, "extra ()")]);
+
+        // When: the hunks of the merge of D and A, and of D, A and P, are
+        // read.
+        let answered = text_conflict(&[&d, &base, &a]);
+        let with_p = text_conflict(&[&d, &base, &a, &base, &p]);
+
+        // Then: they are the same one hunk.
+        assert!(matches!(&answered, ConflictHunks::Text(hunks) if hunks.len() == 1));
+        assert_eq!(with_p, answered);
+    }
+
+    #[test]
+    fn a_side_whose_count_changes_makes_the_hunks_differ_and_an_equal_repeat_does_not() {
+        // Given (K14 21): `f` is x on the base; A and P, a cherry-pick of A,
+        // write a; D writes d.
+        let with_pick = text_conflict(&["a\n", "x\n", "a\n", "x\n", "d\n"]);
+
+        // Then: without P, a's side counts once, so the hunks differ.
+        assert_ne!(text_conflict(&["a\n", "x\n", "d\n"]), with_pick);
+        // And: a member that leaves `f` at the base changes nothing.
+        assert_eq!(
+            text_conflict(&["a\n", "x\n", "a\n", "x\n", "d\n", "x\n", "x\n"]),
+            with_pick
+        );
+    }
+
+    #[test]
+    fn a_conflict_that_is_not_between_regular_files_is_compared_whole() {
+        // Given: a conflict of symlinks.
+        let whole = |targets: &[u8]| ConflictHunks::Whole(Merge::from_vec(symlinks(targets)));
+        let ours = whole(&[1, 0, 2]);
+
+        // Then: the same terms in another order are the same conflict; a
+        // side that repeats, or a text conflict, is another.
+        assert_eq!(whole(&[2, 0, 1]), ours);
+        assert_ne!(whole(&[1, 0, 1, 0, 2]), ours);
+        assert_ne!(text_conflict(&["a\n", "x\n", "d\n"]), ours);
+    }
+
+    #[test]
+    fn a_conflicted_value_is_padded_to_the_sides_of_the_tree_it_is_set_in() {
+        let conflict = Merge::from_vec(symlinks(&[1, 0, 2]));
+
+        // A conflict set over a tree with more sides gets an absent term for
+        // each side it lacks.
+        let mut terms = symlinks(&[1, 0, 2]);
+        terms.extend([None, None]);
+        assert_eq!(padded(conflict.clone(), 3), Merge::from_vec(terms));
+        // A conflict set over a resolved tree, which has fewer sides, stays
+        // as it is: the builder pads the tree.
+        assert_eq!(padded(conflict.clone(), 1), conflict);
+        // A resolved value is set in every tree as it is.
+        let resolved = Merge::normal(TreeValue::Symlink(SymlinkId::new(vec![3])));
+        assert_eq!(padded(resolved.clone(), 3), resolved);
+    }
+
+    #[test]
+    fn the_line_test_names_a_change_outside_the_conflict_and_not_its_resolution() {
+        // Given: the conflict of D and A at lines 5 and 6 of the probe's
+        // `f`.
+        let base = probe_file(&[]);
+        let d = probe_file(&[(5, "compare_fix ()"), (6, "d809_only ()")]);
+        let a = probe_file(&[(5, "compare_fix ()")]);
+        let MergeResult::Conflict(hunks) = merge_hunks(
+            &Merge::from_vec(vec![d.as_str(), base.as_str(), a.as_str()]),
+            &merge_options(),
+        ) else {
+            panic!("D and A do not conflict");
+        };
+        let changed = |file: &str| changed_outside(&hunks, file.as_bytes());
+
+        // Then: the resolution, a line inserted at the edge of its region,
+        // and conflict markers still at its place are not a change outside
+        // it.
+        assert!(!changed(&d));
+        assert!(!changed(&d.replace(
+            "let l6 = d809_only ()\n",
+            "let l6 = d809_only ()\nlet edge = 0\n"
+        )));
+        assert!(!changed(&base.replace(
+            "let l5 = 5\nlet l6 = 6\n",
+            "<<<<<<< conflict 1 of 1\n+++++++ side #1\nlet l5 = a ()\n------- base\nlet l5 = \
+             5\n+++++++ side #2\nlet l5 = b ()\n>>>>>>> conflict 1 of 1 ends\n"
+        )));
+        // And: a resolved line deleted, one changed, and a line inserted
+        // away from the conflict are.
+        assert!(changed(&d.replace("let l10 = 10\n", "")));
+        assert!(changed(&d.replace("let l10 = 10\n", "let l10 = ten\n")));
+        assert!(changed(
+            &d.replace("let l20 = 20\n", "let l20 = 20\nlet e = hand ()\n")
+        ));
+    }
+
+    #[test]
+    fn the_rule_keeps_the_duplicate_where_the_release_answers_nothing_or_the_conflict_returns() {
+        // Given: A and D conflict at lines 5 and 6 (h1) and at line 20 (h2).
+        let base = probe_file(&[]);
+        let a = probe_file(&[(5, "compare_fix ()"), (20, "a_twenty ()")]);
+        let d = probe_file(&[
+            (5, "compare_fix ()"),
+            (6, "d809_only ()"),
+            (20, "d_twenty ()"),
+        ]);
+        let answered = text_conflict(&[&a, &base, &d]);
+        let open = text_conflict(&[&a, &base, &d]);
+        // The release resolved h1 to D's text and left h2 open.
+        let in_part = text_conflict(&[
+            &probe_file(&[
+                (5, "compare_fix ()"),
+                (6, "d809_only ()"),
+                (20, "a_twenty ()"),
+            ]),
+            &probe_file(&[(5, "compare_fix ()"), (6, "d809_only ()")]),
+            &d,
+        ]);
+        // The release left both open but changed A's side in h1.
+        let side_changed = text_conflict(&[
+            &probe_file(&[(5, "compare_fix (2)"), (20, "a_twenty ()")]),
+            &base,
+            &d,
+        ]);
+
+        // Then: after an edit wrote the plain merge, the old merge leaves no
+        // hunk, so a returning conflict (`drop D`, then `include D`) is
+        // written as the duplicate writes it.
+        assert!(keeps_duplicate(
+            &ConflictHunks::Text(Vec::new()),
+            None,
+            Some(&answered)
+        ));
+        // And: a release that leaves every hunk open with its sides answers
+        // none of them.
+        assert!(keeps_duplicate(&answered, Some(&open), None));
+        // And: a release that resolved a part, or changed a side of a hunk it
+        // left open, follows the rule: the plain merge where the conflict
+        // is gone, the duplicate where the same hunks come back.
+        assert!(!keeps_duplicate(&answered, Some(&in_part), None));
+        assert!(keeps_duplicate(&answered, Some(&in_part), Some(&answered)));
+        assert!(!keeps_duplicate(&answered, Some(&side_changed), None));
+        // And: a resolution meets other hunks, or a side's count that
+        // changed, with the plain merge.
+        let other = text_conflict(&[&a, &base, &probe_file(&[(5, "other_fix ()")])]);
+        assert!(!keeps_duplicate(&answered, None, Some(&other)));
+        assert!(!keeps_duplicate(
+            &text_conflict(&["a\n", "x\n", "a\n", "x\n", "d\n"]),
+            None,
+            Some(&text_conflict(&["a\n", "x\n", "d\n"]))
+        ));
+    }
+
+    #[test]
+    fn a_release_log_is_left_to_the_union_only_where_the_union_joins_its_conflict() {
+        let options = merge_options();
+        let base = "# Changelog\n## [1.0.0]\n- old\n";
+
+        // Each side only inserts its own block: the union joins them.
+        let x = "# Changelog\n## [1.1.0-x]\n- x\n## [1.0.0]\n- old\n";
+        let y = "# Changelog\n## [1.1.0-y]\n- y\n## [1.0.0]\n- old\n";
+        assert!(left_to_union(
+            &Merge::from_vec(vec![x, base, y]),
+            None,
+            &options
+        ));
+
+        // D holds A's entry and also changes the heading below it: the union
+        // declines, so the rule reads the log.
+        let a = "# Changelog\n## [Unreleased]\n- a entry\n## [1.0.0]\n- old\n";
+        let d = "# Changelog\n## [Unreleased]\n- a entry\n- d entry\n## [1.0.0] - fork\n- old\n";
+        assert!(!left_to_union(
+            &Merge::from_vec(vec![d, base, a]),
+            Some(d.as_bytes()),
+            &options
+        ));
+
+        // A block with no final newline joins only where it ends the file,
+        // so the answer depends on the order the earlier release gives the
+        // sides: a log joined in one order can read as declined in another.
+        let blocks = Merge::from_vec(vec!["x1\n", "", "y1"]);
+        assert!(left_to_union(&blocks, None, &options));
+        assert!(!left_to_union(&blocks, Some(b"x1\n".as_slice()), &options));
     }
 }

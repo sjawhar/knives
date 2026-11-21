@@ -3174,13 +3174,15 @@ pub fn workspaces_to_clean(
 /// for.
 ///
 /// `Some((previous, carriers))` duplicates the previous release onto the new
-/// parent set, preserving its recorded conflict resolutions, with `carriers`,
+/// parent set, keeping its recorded conflict resolutions, with `carriers`,
 /// its parents that are earlier writes of its name, left out of what the
 /// duplicate measures it against ([`jj::CutSpec::carriers`]). Adding a branch
-/// or advancing the base therefore avoids replaying old conflicts; dropping
-/// an entangled branch surfaces a focused conflict rather than silently
-/// retaining its content. `None` builds a fresh flat merge. Both paths
-/// produce a flat octopus of exactly `request.parents`.
+/// or advancing the base therefore avoids replaying old conflicts. Dropping
+/// a branch whose version a resolution by hand took can instead write that
+/// file without another member's lines and with no conflict. The cut keeps
+/// the duplicate, and its composition gate's hold on each fix by hand
+/// ([`adopted_fixes`]) refuses such a candidate. `None` builds a fresh flat
+/// merge. Both paths produce a flat octopus of exactly `request.parents`.
 /// The parent-count guard catches a silent failure: a cut that dropped a parent
 /// looks exactly like one that did not, until work goes missing downstream.
 ///
@@ -4556,8 +4558,9 @@ pub fn check_test_count(fork: &Fork<'_>, cut: &CommitId, parent: &CommitId) -> T
 /// three-sided one in another. Resolving those correctly is a semantic
 /// judgement about the config, which a tool cannot make. Saying exactly where
 /// they are, and what shape the resolution takes, is the part a tool can do.
-/// An edit reports the same way: a duplicate carries the old resolutions
-/// forward, so what is left is the conflict the edit itself introduced. A
+/// An edit reports the same way. It keeps a resolution only where the same
+/// conflict comes back, so what is left is the conflict the edit itself
+/// brought in, or the plain merge's conflict where it wrote that merge. A
 /// resolution by hand is a change knives did not write, and every write over
 /// the release refuses until `knives release adopt <release>` records it, so
 /// the guidance names that step for `release`.

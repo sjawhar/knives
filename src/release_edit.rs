@@ -629,8 +629,12 @@ fn refuse_if_frozen(
 ///
 /// The whole command is the jj sequence agents fumble — duplicate the release
 /// onto the changed parent set, describe it, move its name — with the same pin
-/// gate a rebase has. The duplicate preserves recorded conflict resolutions;
-/// only the change itself can surface new conflicts, and they are reported.
+/// gate a rebase has. A file whose conflict the release resolved keeps that
+/// resolution only where the plain merge of the new parents leaves the same
+/// conflict there. Elsewhere the write puts that plain merge in the file and
+/// names the file ([`knives::jj::write_edited_release`]), whether or not an
+/// adopt recorded the resolution. Every conflict the write leaves is
+/// reported.
 #[allow(
     clippy::too_many_arguments,
     reason = "release-edit state and the shared consumer-scan collaborators are independently owned command inputs"
@@ -744,8 +748,12 @@ fn edit_release(
     })
 }
 
-/// Write the edited release — duplicated onto its new parent set, described,
-/// its name moved — record the parent set in the ledger, and report.
+/// Write the edited release — duplicated onto its new parent set by spec
+/// R11's rule ([`knives::jj::write_edited_release`]), described, its name
+/// moved — record the parent set in the ledger, and report. Each file the
+/// rule wrote as the plain merge of the new parents is named after the
+/// lines on the replaced commit ([`plain_merged_lines`]), before the
+/// conflict report.
 ///
 /// `uncarried` is the target of a drop whose parent no remaining member's
 /// history carries. Whether the release lost that content is read from the
@@ -767,7 +775,7 @@ fn apply_edit(
     let entry = fork.entry;
     let provenance = release::parent_sources(opened, entry, &entry.release_scheme(), new_parents)?;
     let message = release::composition_message(&release.name, &provenance, delta);
-    let written = knives::jj::write_release(
+    let (written, plain_merged) = knives::jj::write_edited_release(
         &fork.checkout.path,
         &knives::jj::ReleaseWrite {
             source: Some(&release.commit),
@@ -824,11 +832,41 @@ fn apply_edit(
         inline_human_text(delta)
     );
     report_replaced(repo, &release.name, &written);
+    for line in plain_merged_lines(repo, &plain_merged) {
+        println!("{line}");
+    }
     println!(
         "{}",
         release::conflict_report(&release.name, reported.conflicts(), &written.unions)
     );
     Ok(Exit::Ok)
+}
+
+/// The lines an edit prints for each file its write put as the plain merge
+/// of the new parents (spec R11): that it did, and whether the file holds a
+/// conflict; then, where the release had also changed lines outside the
+/// conflict there, that this hand change was not carried. A path is read
+/// from the tree, so it is escaped.
+fn plain_merged_lines(repo: &RepoName, files: &[knives::jj::PlainMergedFile]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for file in files {
+        let path = inline_human_text(&file.path);
+        let left = if file.conflicted {
+            "which leaves a conflict"
+        } else {
+            "with no conflict"
+        };
+        lines.push(format!(
+            "{repo}: {path}: written as the plain merge of the new parents (the resolution \
+             answers another conflict), {left}"
+        ));
+        if file.hand_change_left_out {
+            lines.push(format!(
+                "{repo}: {path}: the hand change outside the resolved conflict was not carried"
+            ));
+        }
+    }
+    lines
 }
 
 /// One line on the commit a release write replaced under `release`: abandoned,
@@ -1685,6 +1723,45 @@ mod tests {
                  working copy of workspace ws\u{fffd}x\u{fffd}y rests on it",
                 "demo: abandoned cccc, an earlier release/x\u{fffd}2J commit nothing rests on any \
                  more",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_written_as_the_plain_merge_is_named_escaped_with_its_left_out_hand_change() {
+        // Given: one file written with no conflict, whose release had a hand
+        // change outside the conflict, and one left conflicted, its path
+        // holding a C1 character, as a path read from a tree can.
+        let files = [
+            knives::jj::PlainMergedFile {
+                path: "src/f.ml".to_owned(),
+                conflicted: false,
+                hand_change_left_out: true,
+            },
+            knives::jj::PlainMergedFile {
+                path: "g\u{9b}2J".to_owned(),
+                conflicted: true,
+                hand_change_left_out: false,
+            },
+        ];
+
+        // When: the edit's lines for them are read.
+        let lines = plain_merged_lines(&RepoName::new("demo"), &files);
+
+        // Then: each file is named with whether it holds a conflict, the
+        // first with its hand change not carried, and no line holds a
+        // control character.
+        for line in &lines {
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+        }
+        assert_eq!(
+            lines,
+            [
+                "demo: src/f.ml: written as the plain merge of the new parents (the resolution \
+                 answers another conflict), with no conflict",
+                "demo: src/f.ml: the hand change outside the resolved conflict was not carried",
+                "demo: g\u{fffd}2J: written as the plain merge of the new parents (the \
+                 resolution answers another conflict), which leaves a conflict",
             ]
         );
     }

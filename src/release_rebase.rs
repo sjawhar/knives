@@ -912,7 +912,10 @@ fn drop_landed_members(
 /// that does, and says why; where no landed member does either, it refuses
 /// and drops nothing ([`keep_the_target`]). Where no parent would remain, it
 /// refuses too. The drop writes the release as a duplicate onto the kept
-/// parents, as `drop` does, and leaves out the release's carriers, as every
+/// parents, which keeps every resolution the release holds. It does not
+/// follow `drop`'s rule (spec R11, `knives::jj::write_edited_release`): a
+/// member it drops carries nothing past the target, so its removal changes
+/// no merge of the kept parents. It leaves out the release's carriers, as every
 /// write composing from its parents does: a carrier never counts as a
 /// parent that remains. `opened` is the repository as it is now, and
 /// `writes` the release's earlier writes read from it. `unchecked` is the
