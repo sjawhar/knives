@@ -19,7 +19,9 @@ mod lab;
 use std::path::PathBuf;
 use std::process::Output;
 
-use forge_shim::{Repository, install_repository_gh, path_with_gh_shim, pull_record};
+use forge_shim::{
+    Repository, install_repository_gh, path_with_gh_shim, pull_record, pull_record_with_fields,
+};
 use knives::ledger::{Entry, Ledger};
 use knives::statement::{Statement, StatementKind, Statements};
 use lab::Lab;
@@ -39,8 +41,11 @@ const REGISTRY_ORIGIN: &str = "https://forge.invalid/acme-old/demo";
 /// A fork with a dependent branch, `feat/alpha`, and member branches
 /// `feat/base` and `feat/landed` (whose content upstream's trunk has); its
 /// config home; and a forge on which the upstream has pull requests #7 and
-/// #12 and the fork's own repository has #12 (head `feat/alpha`), #13 (head
-/// `feat/base`) and #14 (head `feat/landed`).
+/// #12; the fork's own repository has, from `acme`'s branches, #12 (head
+/// `feat/alpha`), #13 (head `feat/base`), #14 (head `feat/landed`) and #15
+/// (merged, head `feat/base`), and #20 from `bob`'s `main`; and a sibling
+/// fork, whose own repository `acme/sibling` has #5 (head `sib/feature`)
+/// and #6 (head `feat/landed`, the sibling's own branch of that name).
 struct Fixture {
     lab: Lab,
     home: tempfile::TempDir,
@@ -64,7 +69,11 @@ fn fixture_with_origin(origin: &str) -> Fixture {
     let home = tempfile::tempdir().expect("config home");
     std::fs::write(
         home.path().join("repos.toml"),
-        format!("[repos.demo]\nupstream = \"{UPSTREAM}\"\norigin = \"{REGISTRY_ORIGIN}\"\n"),
+        format!(
+            "[repos.demo]\nupstream = \"{UPSTREAM}\"\norigin = \"{REGISTRY_ORIGIN}\"\n\
+             [repos.sibling]\nupstream = \"https://forge.invalid/maintainer/sibling\"\n\
+             origin = \"https://forge.invalid/acme/sibling\"\n"
+        ),
     )
     .expect("write the registry");
     let shim = tempfile::tempdir().expect("gh shim directory");
@@ -75,10 +84,17 @@ fn fixture_with_origin(origin: &str) -> Fixture {
         pull_record(12, "OPEN", "upstream-twelve", None)
     );
     let fork_pulls = format!(
-        "[{},{},{}]",
-        pull_record(12, "OPEN", "feat/alpha", None),
-        pull_record(13, "OPEN", "feat/base", None),
-        pull_record(14, "OPEN", "feat/landed", None)
+        "[{},{},{},{},{}]",
+        review(12, "OPEN", "feat/alpha", "acme"),
+        review(13, "OPEN", "feat/base", "acme"),
+        review(14, "OPEN", "feat/landed", "acme"),
+        review(15, "MERGED", "feat/base", "acme"),
+        review(20, "OPEN", "main", "bob")
+    );
+    let sibling_pulls = format!(
+        "[{},{}]",
+        review(5, "OPEN", "sib/feature", "acme"),
+        review(6, "OPEN", "feat/landed", "acme")
     );
     install_repository_gh(
         shim.path(),
@@ -98,6 +114,16 @@ fn fixture_with_origin(origin: &str) -> Fixture {
                 canonical: "acme/demo",
                 pulls: &fork_pulls,
             },
+            Repository {
+                named: "maintainer/sibling",
+                canonical: "maintainer/sibling",
+                pulls: "[]",
+            },
+            Repository {
+                named: "acme/sibling",
+                canonical: "acme/sibling",
+                pulls: &sibling_pulls,
+            },
         ],
         &log,
     );
@@ -107,6 +133,16 @@ fn fixture_with_origin(origin: &str) -> Fixture {
         shim,
         log,
     }
+}
+
+/// A pull request whose head is `owner`'s branch `head`.
+fn review(number: u64, state: &str, head: &str, owner: &str) -> String {
+    pull_record_with_fields(
+        number,
+        state,
+        head,
+        &format!(",\"headRepositoryOwner\":{{\"login\":\"{owner}\"}}"),
+    )
 }
 
 impl Fixture {
@@ -162,6 +198,32 @@ impl Fixture {
 
     fn forge_calls(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// Rewrite the one ledger entry of the fork that states the list `from`
+    /// to state `to`: a record an older knives, or another machine, could
+    /// have written, which this knives refuses to write.
+    fn rewrite_requirements(&self, from: &str, to: &str) {
+        let dir = self.home.path().join("ledger").join(KEPT_UNDER);
+        let (from, to) = (format!("value = \"{from}\""), format!("value = \"{to}\""));
+        let mut rewritten = 0;
+        for file in std::fs::read_dir(&dir).expect("read the ledger directory") {
+            let path = file.expect("a ledger directory entry").path();
+            if path.extension().is_none_or(|extension| extension != "md") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read a ledger entry");
+            if text.contains(&from) {
+                std::fs::write(&path, text.replace(&from, &to)).expect("rewrite a ledger entry");
+                rewritten += 1;
+            }
+        }
+        assert_eq!(
+            rewritten,
+            1,
+            "no one entry states {from} in {}",
+            dir.display()
+        );
     }
 }
 
@@ -336,6 +398,39 @@ fn a_branchs_own_review_pull_request_is_refused() {
     assert_eq!(
         stdout.trim_end(),
         "demo/feat/base now requires origin:acme/demo#12"
+    );
+}
+
+#[test]
+fn a_review_pull_request_whose_head_is_no_member_of_this_fork_is_refused() {
+    // Given: a sibling fork whose own repository has #5 (head sib/feature)
+    // and #6 (head feat/landed, the sibling's own branch of a name this fork
+    // also has); and this fork's #20, from bob's `main`.
+    let fixture = fixture();
+
+    // When / Then: each is refused, saying why, however it is named, and
+    // nothing is written: `status` here could judge none of their heads.
+    for on in ["sibling#5", "acme/sibling#6", "origin:acme/sibling#6"] {
+        fixture.refused(
+            "feat/alpha",
+            &["--on", on],
+            &[&format!(
+                "{on} is a review pull request on sibling's own repository"
+            )],
+        );
+    }
+    fixture.refused(
+        "feat/alpha",
+        &["--on", "acme/demo#20"],
+        &["acme/demo#20's head main is a branch of bob, not of acme"],
+    );
+
+    // And: the sibling's #6 is refused for feat/landed as another fork's,
+    // not as feat/landed's own review pull request.
+    fixture.refused(
+        "feat/landed",
+        &["--on", "acme/sibling#6"],
+        &["acme/sibling#6 is a review pull request on sibling's own repository"],
     );
 }
 
@@ -616,4 +711,139 @@ fn status_judges_a_member_this_checkout_knows_only_on_origin() {
     );
     assert_eq!(problems(&report), Vec::<String>::new(), "{report}");
     assert_eq!(code, Some(1), "{report}");
+}
+
+#[test]
+fn a_merged_review_pull_request_whose_head_has_not_landed_stays_unmet() {
+    // Given: feat/alpha requires the fork's #15, merged into a review base,
+    // whose head feat/base has not landed upstream.
+    let fixture = fixture();
+    fixture.depends(&["--on", "acme/demo#15"]);
+
+    // When: status reports the fork.
+    let (code, report) = status(&fixture);
+
+    // Then: the merge does not meet it: the member has not reached upstream.
+    assert_eq!(
+        details(&report, "unmet-dependency"),
+        [
+            "feat/alpha requires origin:acme/demo#15 (head feat/base, merged), which has not \
+          landed (no-pr)"
+        ],
+        "{report}"
+    );
+    assert_eq!(code, Some(1), "{report}");
+}
+
+#[test]
+fn status_judges_no_review_pull_request_whose_head_is_no_member_here() {
+    // Given: records an older knives could write: feat/alpha requires the
+    // sibling's #6, whose head shares its name with this fork's landed
+    // feat/landed, and this fork's #20, from bob's `main`, whose content
+    // the trunk has.
+    let fixture = fixture();
+    fixture.depends(&["--on", "acme/demo#13"]);
+    fixture.rewrite_requirements(
+        "origin:acme/demo#13",
+        "origin:acme/demo#20,origin:acme/sibling#6",
+    );
+
+    // When: status reports the fork.
+    let (code, report) = status(&fixture);
+
+    // Then: neither reads as met: each is a problem that says why, and the
+    // report exits 3.
+    let problems = problems(&report);
+    for (named, why) in [
+        (
+            "origin:acme/sibling#6:",
+            "acme/sibling is not demo's own repository",
+        ),
+        (
+            "origin:acme/demo#20 (head main, open):",
+            "its head main is a branch of bob, not of acme",
+        ),
+    ] {
+        assert!(
+            problems.iter().any(|problem| problem.starts_with(&format!(
+                "cannot check whether feat/alpha still needs {named}"
+            )) && problem.contains(why)),
+            "{named}: {problems:?}\n{report}"
+        );
+    }
+    assert_eq!(details(&report, "unmet-dependency"), Vec::<String>::new());
+    assert_eq!(code, Some(3), "{report}");
+}
+
+#[test]
+fn one_member_recorded_under_two_spellings_of_the_fork_is_one_requirement() {
+    // Given: feat/alpha requires feat/base under both spellings of the fork's
+    // own repository, as two machines whose `origin` remotes differ write it.
+    let fixture = fixture();
+    fixture.depends(&["--on", "feat/base"]);
+    fixture.rewrite_requirements(
+        "origin:acme/demo:feat/base",
+        "origin:acme-old/demo:feat/base,origin:acme/demo:feat/base",
+    );
+
+    // When: status reports the fork, and the branch is named again.
+    let (_, report) = status(&fixture);
+    fixture.depends(&["--on", "feat/base"]);
+
+    // Then: status reports it once, naming it again adds no third record,
+    // and forgetting it by name takes back both records.
+    let unmet = details(&report, "unmet-dependency");
+    assert_eq!(
+        unmet
+            .iter()
+            .filter(|detail| detail.starts_with("feat/alpha requires"))
+            .count(),
+        1,
+        "{unmet:?}"
+    );
+    assert_eq!(
+        fixture.required("feat/alpha"),
+        [
+            "origin:acme-old/demo:feat/base",
+            "origin:acme/demo:feat/base"
+        ]
+    );
+    fixture.depends(&["--forget", "feat/base"]);
+    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
+}
+
+#[test]
+fn status_without_the_landed_probe_keeps_a_member_requirement_unmet() {
+    // Given: feat/alpha requires the fork's #13, whose head is feat/base, and
+    // feat/base itself.
+    let fixture = fixture();
+    fixture.depends(&["--on", "acme/demo#13", "--on", "feat/base"]);
+
+    // When: status reports the fork without the landed probe.
+    let output = fixture.knives(&["--json", "status", "demo", "--no-landed"]);
+    let report: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("status JSON ({error}): {}", said(&output)));
+
+    // Then: each stays an unmet finding that says the probe did not run,
+    // not a problem: what is not shown to have landed is still needed.
+    let unmet = details(&report, "unmet-dependency");
+    for requirement in [
+        "origin:acme/demo#13 (head feat/base, open)",
+        "origin:acme/demo:feat/base",
+    ] {
+        assert!(
+            unmet.contains(&format!(
+                "feat/alpha requires {requirement}, which is not known to have landed: the \
+                 landed probe did not run"
+            )),
+            "{requirement}: {unmet:?}\n{report}"
+        );
+    }
+    assert!(
+        !problems(&report)
+            .iter()
+            .any(|problem| problem.contains("needs")),
+        "{report}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{report}");
 }
