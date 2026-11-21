@@ -9,9 +9,11 @@
 //! write is absent, no recorded write has the release's members, or the
 //! ledger records no write of the name, knives cannot check it: the write
 //! proceeds, says so, marks its ledger event `; unchecked: …`, and audit
-//! notes it; every later write over it is marked too until `adopt` records
-//! it. A member rewritten in place, a fast-forward carrier, a reset to an
-//! earlier recorded write and a name with no recorded write are not refused.
+//! notes it. A later write over the marked write, or over a jj rebase or
+//! metadata rewrite of it, is marked too until `adopt` records it, while a
+//! hand change on top of it is unrecorded and refused until `adopt`. A
+//! member rewritten in place, a fast-forward carrier, a reset to an earlier
+//! recorded write and a name with no recorded write are not refused.
 
 #![allow(
     clippy::expect_used,

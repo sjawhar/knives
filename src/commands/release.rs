@@ -989,24 +989,28 @@ pub enum InHandWrite {
     Recorded,
     /// It carries a change no knives write or adopt recorded: its tree is not
     /// `write`, the matched write ([`matched_write`]), rebased onto its
-    /// members. Every write refuses it until `adopt` records it.
+    /// members, whether or not `write`'s own event is marked unchecked. Every
+    /// write refuses it until `adopt` records it.
     Unrecorded { write: RecordedWrite },
     /// Nothing here can measure the release against the writes the ledger
-    /// records of its name ([`Unchecked`]). A write over it proceeds and says
-    /// so, except over a release whose every parent is an earlier write
+    /// records of its name, or it holds a recorded write that nothing
+    /// measured ([`Unchecked`]). A write over it proceeds and says so, except
+    /// over a release whose every parent is an earlier write
     /// ([`NoMatch::AllCarriers`], whether or not the ledger records a write of
     /// the name), which every write and `adopt` refuse.
     Unchecked(Unchecked),
     /// The ledger records no write of the name: a release older than the
     /// ledger, or one made with no knives at all. No write refuses it, and
     /// nothing measured it, so a write over it proceeds, says so, and marks
-    /// its event unchecked ([`crate::release_model::UNCHECKED_NO_RECORD`]),
-    /// which every later write over it inherits ([`Unchecked::Inherited`])
-    /// until `adopt` records it. `adopt` has no write of the release itself
-    /// to replace, so a cut's carried rows say the ledger records no write of
-    /// it and that a person must check each divergence by hand
-    /// ([`CarriedFrom::Unledgered`]). A release whose every parent is an
-    /// earlier write is [`Self::Unchecked`] instead.
+    /// its event unchecked ([`crate::release_model::UNCHECKED_NO_RECORD`]).
+    /// A later write over that marked write, or over a jj rebase or metadata
+    /// rewrite of it, inherits the mark ([`Unchecked::Inherited`]) until
+    /// `adopt` records it; a change by hand on top of it is
+    /// [`Self::Unrecorded`], which every write refuses until then. `adopt` has
+    /// no write of the release itself to replace, so a cut's carried rows say
+    /// the ledger records no write of it and that a person must check each
+    /// divergence by hand ([`CarriedFrom::Unledgered`]). A release whose every
+    /// parent is an earlier write is [`Self::Unchecked`] instead.
     NoRecord,
 }
 
@@ -1019,10 +1023,13 @@ pub enum Unchecked {
     WriteAbsent(RecordedWrite),
     /// Its members match no recorded write: they changed outside knives.
     NoMatch(NoMatch),
-    /// It is the recorded write it equals or matches, or holds that write's
-    /// tree, and that write's own event says knives could not check the
-    /// release it was written over (`reason`). Nothing measured that release
-    /// since, so it stays unchecked until `adopt` records it.
+    /// It is the recorded write it equals, or a metadata rewrite of it, or its
+    /// tree is that write rebased onto its members
+    /// ([`Repo::holds_rebased_write`]), and that write's own event says knives
+    /// could not check the release it was written over (`reason`). Nothing
+    /// measured that release since, so it stays unchecked until `adopt`
+    /// records it. A change by hand on top of that write is
+    /// [`InHandWrite::Unrecorded`] instead.
     Inherited {
         write: RecordedWrite,
         reason: String,
@@ -1086,6 +1093,14 @@ pub fn unchecked_suffix(standing: &InHandWrite) -> String {
 /// write is not here, or no recorded write has the release's members, there
 /// is nothing to build the tree from, so the release is unchecked and a write
 /// proceeds as it always has, saying so.
+///
+/// A matched write whose own event is marked unchecked is held to its tree
+/// the same way. A release that is that write, or a jj rebase or metadata
+/// rewrite of it, stays unchecked with the write's mark
+/// ([`Unchecked::Inherited`]), so a write over a conflict it left unresolved
+/// goes ahead. A release whose tree carries a change on top of it, such as
+/// that conflict resolved by hand, is unrecorded and every write refuses it
+/// until `adopt` records it.
 pub fn in_hand_write(release: &InHand<'_>) -> Result<InHandWrite, crate::jj::JjError> {
     let InHand {
         repo,
@@ -1130,24 +1145,22 @@ pub fn in_hand_write(release: &InHand<'_>) -> Result<InHandWrite, crate::jj::JjE
             matched.write,
         )));
     }
-    // A write marked unchecked leaves the release unchecked, whatever its
-    // tree holds ([`Unchecked::Inherited`]).
-    if let Some(reason) = crate::release_model::unchecked_mark(matched.event) {
-        return Ok(InHandWrite::Unchecked(Unchecked::Inherited {
-            write: matched.write,
-            reason: reason.to_owned(),
-        }));
-    }
+    // The tree decides before the mark: a change on top of the matched write
+    // is unrecorded even where the write's own event is marked unchecked, and
+    // every write refuses it until `adopt`. A release that holds a marked
+    // write, rebased onto its members, stays unchecked with that write's mark
+    // ([`Unchecked::Inherited`]).
     let composed = write_composition(repo, (writes, &matched.write.commit))?;
-    Ok(
-        if repo.holds_rebased_write((&matched.write.commit, &composed), &reading.members, commit)? {
-            InHandWrite::Recorded
-        } else {
-            InHandWrite::Unrecorded {
-                write: matched.write,
-            }
-        },
-    )
+    if !repo.holds_rebased_write((&matched.write.commit, &composed), &reading.members, commit)? {
+        return Ok(InHandWrite::Unrecorded {
+            write: matched.write,
+        });
+    }
+    Ok(unless_marked(
+        matched.event,
+        matched.write,
+        InHandWrite::Recorded,
+    ))
 }
 
 /// What `write`, a recorded write of a release whose earlier writes are
@@ -1168,10 +1181,12 @@ pub fn write_composition(
         .collect())
 }
 
-/// How a release in hand measured against `write` stands (`held`), unless
-/// `event`, the write's own, says knives could not check the release it was
-/// written over: then the release is unchecked too ([`Unchecked::Inherited`]),
-/// a hand edit on top included, since nothing measured what it stands on.
+/// How a release in hand that holds `write` stands (`held`), unless `event`,
+/// the write's own, says knives could not check the release it was written
+/// over: then the release is unchecked too ([`Unchecked::Inherited`]), since
+/// nothing measured what it stands on. Only a release that is `write`, or a
+/// jj rebase or metadata rewrite of it, gets here: one whose tree carries a
+/// change on top of `write` is [`InHandWrite::Unrecorded`], marked or not.
 fn unless_marked(event: &Entry, write: RecordedWrite, held: InHandWrite) -> InHandWrite {
     crate::release_model::unchecked_mark(event).map_or(held, |reason| {
         InHandWrite::Unchecked(Unchecked::Inherited {
