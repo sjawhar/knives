@@ -3,7 +3,7 @@
 Read this when you read `knives status [REPO|--all]` rows, states or columns. A state is the strongest observed condition, not advice. What each finding kind means: docs/design.md, "Detection rules".
 
 - One named repository gives an object; `--all` gives an array. A claim on a deleted branch still has a row.
-- `--no-landed` skips the trunk replay probe, the slow part. Under `--no-github`, an unknown PR state does not mean no PR.
+- `--no-landed` skips the trunk replay probe, the slow part; a required member branch not shown landed then stays an unmet dependency, or goes into a deleted dependent's one problem when that dependent's recorded commit landed, is absent or was never recorded. Under `--no-github`, an unknown PR state does not mean no PR.
 
 ## State precedence
 
