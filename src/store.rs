@@ -1148,11 +1148,11 @@ mod tests {
         assert_eq!(
             subject.dependencies(&target()),
             [
-                Requirement {
+                Requirement::Upstream {
                     repo: repo(),
                     number: 7
                 },
-                Requirement {
+                Requirement::Upstream {
                     repo: UpstreamName::new("sibling"),
                     number: 49
                 },

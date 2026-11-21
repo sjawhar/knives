@@ -385,16 +385,35 @@ pub enum Command {
         #[arg(long)]
         repo: Option<String>,
     },
-    /// Record that a branch cannot land before something else does.
+    /// Record that a branch cannot land before something else does, or take a
+    /// requirement back.
     ///
     /// Dependencies cross forks: a branch here can require a pull request in another
     /// managed repo. Dropping the thing it needs from a release, without dropping
     /// this too, ships something that cannot work.
+    ///
+    /// A requirement is a pull request or a member branch, and the record says
+    /// which: `<upstream>#<n>` is a pull request on the fork's upstream,
+    /// `origin:<owner>/<name>#<n>` a review pull request on the fork's own
+    /// repository, `origin:<owner>/<name>:<branch>` a member branch of this fork.
+    ///
+    /// `--forget` takes a requirement back; with `--on` it corrects one. The
+    /// removal is a ledger entry, so every machine that shares the ledger
+    /// reads the same list.
     Depends {
         branch: String,
-        /// What it needs, as `<repo>#<number>`, repeatable.
-        #[arg(long = "on", required = true)]
+        /// What it needs, repeatable. `<repo>#<number>`, `<repo>` the registry
+        /// name: knives asks the forge whether the upstream or the fork's own
+        /// repository has that pull request, and refuses when both or neither
+        /// do. `<owner>/<name>#<number>`: the upstream's pull request, or the
+        /// fork's when `<owner>/<name>` is its own repository. A branch name: a
+        /// member branch of this fork.
+        #[arg(long = "on", required_unless_present = "forget")]
         on: Vec<String>,
+        /// A requirement to take back, repeatable: as its record spells it, or
+        /// as `--on` would.
+        #[arg(long)]
+        forget: Vec<String>,
         /// Registry name. Defaults to the repo you are standing in.
         #[arg(long)]
         repo: Option<String>,
@@ -885,6 +904,10 @@ mod tests {
             vec!["knives", "release", "members", "r", "--carries", "x"],
             vec!["knives", "release", "members", "--census"],
             vec!["knives", "depends", "a-branch", "--on", "other#1"],
+            vec!["knives", "depends", "a-branch", "--forget", "other#1"],
+            vec![
+                "knives", "depends", "a-branch", "--forget", "other#1", "--on", "o/r#1",
+            ],
             vec!["knives", "track", "a-branch", "--pr", "7"],
             vec!["knives", "notch"],
             vec!["knives", "notch", "feat/alpha"],

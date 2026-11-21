@@ -10,6 +10,7 @@
     reason = "a test fixture included by path; not every test target uses every helper"
 )]
 
+use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -287,6 +288,121 @@ pub fn path_with_gh_shim(shim: &Path) -> std::ffi::OsString {
         )),
     )
     .expect("construct shim PATH")
+}
+
+/// One forge repository a [`install_repository_gh`] shim answers for: the
+/// `<owner>/<name>` a call names it by, the `nameWithOwner` the forge gives
+/// it, and its pull requests ([`pull_record`] rows, as a JSON array).
+pub struct Repository<'a> {
+    pub named: &'a str,
+    pub canonical: &'a str,
+    pub pulls: &'a str,
+}
+
+/// Install a fake `gh` that answers each of `repositories` apart, as a forge
+/// does: `repo view <owner>/<name>` gives that repository's identity, and a
+/// by-number facts query (`api graphql -f owner=… -f name=…`) gives the pull
+/// requests of the repository its `owner` and `name` fields name, a number it
+/// does not have being absent from the reply. A status snapshot's wide list
+/// and warm sweep find nothing, so every number a report shows comes from a
+/// facts query. A call naming any other repository fails as gh does for one
+/// that does not exist. Each call's arguments are appended to `log`.
+pub fn install_repository_gh(shim: &Path, repositories: &[Repository<'_>], log: &Path) {
+    let sweep = shim.join("sweep.json");
+    std::fs::write(
+        &sweep,
+        serde_json::to_vec(&serde_json::json!({
+            "data": {
+                "repository": {
+                    "pullRequests": {
+                        "pageInfo": {"hasNextPage": false},
+                        "nodes": [],
+                    }
+                }
+            }
+        }))
+        .expect("serialize sweep payload"),
+    )
+    .expect("write sweep payload");
+    let mut views = String::new();
+    let mut facts = String::new();
+    for (index, repository) in repositories.iter().enumerate() {
+        let (owner, name) = repository
+            .named
+            .split_once('/')
+            .expect("a repository is named <owner>/<name>");
+        let identity = shim.join(format!("identity-{index}.json"));
+        std::fs::write(
+            &identity,
+            serde_json::to_vec(&serde_json::json!({
+                "nameWithOwner": repository.canonical,
+                "id": format!("ID{index}"),
+            }))
+            .expect("serialize identity payload"),
+        )
+        .expect("write identity payload");
+        let pulls: Vec<serde_json::Value> =
+            serde_json::from_str(repository.pulls).expect("parse fake pull request payload");
+        let reply = shim.join(format!("facts-{index}.json"));
+        std::fs::write(
+            &reply,
+            serde_json::to_vec(&facts_reply(&pulls, &[], &[])).expect("serialize facts payload"),
+        )
+        .expect("write facts payload");
+        writeln!(
+            views,
+            "  {named}) cat \"{}\"; exit 0 ;;",
+            identity.display(),
+            named = repository.named,
+        )
+        .expect("write to a string");
+        writeln!(
+            facts,
+            "  \"{owner} {name}\")\n\
+             \x20   case \"$*\" in\n\
+             \x20   *\"pullRequest(number:\"*) cat \"{}\"; exit 0 ;;\n\
+             \x20   *\"orderBy: {{field: UPDATED_AT\"*) cat \"{}\"; exit 0 ;;\n\
+             \x20   esac ;;",
+            reply.display(),
+            sweep.display(),
+        )
+        .expect("write to a string");
+    }
+    install_executable(
+        &shim.join("gh"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             owner=\n\
+             name=\n\
+             previous=\n\
+             for argument in \"$@\"; do\n\
+               case \"$previous $argument\" in\n\
+               \"-f owner=\"*) owner=${{argument#owner=}} ;;\n\
+               \"-f name=\"*) name=${{argument#name=}} ;;\n\
+               esac\n\
+               previous=$argument\n\
+             done\n\
+             case \"$1 $2\" in\n\
+             \"repo view\")\n\
+               case \"$3\" in\n\
+             {views}\
+               esac\n\
+               echo \"GraphQL: Could not resolve to a Repository with the name '$3'.\" >&2\n\
+               exit 1 ;;\n\
+             \"pr list\") echo '[]'; exit 0 ;;\n\
+             \"api graphql\")\n\
+               case \"$owner $name\" in\n\
+             {facts}\
+               esac\n\
+               echo \"GraphQL: Could not resolve to a Repository with the name '$owner/$name'.\" >&2\n\
+               exit 1 ;;\n\
+             esac\n\
+             echo \"unexpected gh invocation: $*\" >&2\n\
+             exit 1\n",
+            log = log.display(),
+        ),
+    );
 }
 
 /// One forge pull request record with the fields the binary requires.

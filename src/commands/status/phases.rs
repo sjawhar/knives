@@ -221,7 +221,9 @@ pub(super) fn conflicted_bookmark_findings(repo: &Repo) -> anyhow::Result<Vec<Fi
 }
 /// Every number declared before discovery: stated pull requests and same-repository
 /// dependencies for both maintained and divergent branches. A requirement is
-/// this fork's when it names `repo`, the name the fork is kept under.
+/// this fork's when it names a pull request on `repo`, the name the fork is
+/// kept under; one on the fork's own repository is asked of that repository
+/// ([`super::dependencies`]).
 pub(super) fn declared_numbers(
     repo: &UpstreamName,
     branches: &[BranchName],
@@ -237,8 +239,13 @@ pub(super) fn declared_numbers(
             store
                 .dependencies(&target)
                 .into_iter()
-                .filter(|requirement| requirement.repo == *repo)
-                .map(|requirement| requirement.number),
+                .filter_map(|requirement| match requirement {
+                    crate::ids::Requirement::Upstream {
+                        repo: required,
+                        number,
+                    } if required == *repo => Some(number),
+                    _ => None,
+                }),
         );
     }
     numbers.into_iter().collect()

@@ -832,6 +832,7 @@ fn fold_phase_outcome(
         store: input.store,
         options: input.options,
         snapshot,
+        probe_ran: input.probe_ran,
         timings,
     });
     finalize_status(

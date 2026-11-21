@@ -334,7 +334,9 @@ knives finish BRANCH           hand back claim and remove workspace; the branch,
                                the workspace, and when it cannot, it leaves the state file and the
                                workspace as they were and exits 3
 knives track BRANCH --pr N     state which PR a branch belongs to, overriding inference
-knives depends BRANCH --on R#N  record that a branch cannot land before something else
+knives depends BRANCH --on R#N  record that a branch cannot land before a pull request (upstream's or
+                               the fork's own, the forge says which) or a member branch; --forget R
+                               takes one back, and with --on corrects it
 knives notch [SUBJECT]         read what happened here (bare: newest 20 human notes plus a
                                folded machine-event count; a subject: its whole chronology);
                                -m writes a note, --disposition requires --evidence
@@ -424,6 +426,20 @@ A branch can require a pull request in another managed repo. Dropping the requir
 from a release without dropping the branch that needs it ships a release that cannot
 work, which is exactly what happened when one repo's #4545 was dropped while a sibling's
 #49 still needed it. Satisfied means merged; an open PR may still change or be rejected.
+
+A requirement says what it names, because a fork and its upstream number their pull
+requests apart: `<upstream>#<n>` is a pull request on the fork's upstream,
+`origin:<owner>/<name>#<n>` a review pull request on the fork's own repository, and
+`origin:<owner>/<name>:<branch>` a member branch of the fork. `knives depends --on
+<repo>#<n>`, the registry name, used to mean the upstream's pull request, and recorded an
+unrelated one where the fork's review pull request was meant; it now asks the forge which
+repository has #n, and refuses when both do, naming both. A review pull request is checked
+on the fork's repository, and the report names its head, the member the dependent waits
+for. A member branch is satisfied once it has landed upstream.
+
+A requirement is taken back by a `depends` forget followed by the list without it, two
+entries stamped in that order and written newest first: a run cut short between them
+leaves the list as it was, never empty. Every machine folds the two into the same list.
 
 ### `knives preflight`
 

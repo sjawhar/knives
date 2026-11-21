@@ -497,38 +497,100 @@ pub fn pull_number_from_bookmark(name: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-/// Something a branch cannot land before: a pull request in some managed repo.
+/// Something a branch cannot land before, as one token of a `depends`
+/// statement.
 ///
-/// Written `<repo>#<number>`, where `<repo>` is the required fork's
-/// [`UpstreamName`]. The repo is named because dependencies cross forks,
-/// which is the case that motivated this: a change in one fork needing a pull request
-/// in a sibling, where dropping one from a release without the other ships a release
-/// that cannot work.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-pub struct Requirement {
-    pub repo: UpstreamName,
-    pub number: u64,
+/// Dependencies cross forks, which is the case that motivated them: a change
+/// in one fork needing a pull request in a sibling, where dropping one from a
+/// release without the other ships a release that cannot work. Within one
+/// fork, a member can need another member, or the review pull request on the
+/// fork's own repository that carries it. Each token says which it names:
+///
+/// - `<repo>#<number>`: pull request `<number>` on the upstream of the fork
+///   kept under `<repo>`, its [`UpstreamName`].
+/// - `origin:<owner>/<name>#<number>`: review pull request `<number>` on a
+///   fork's own repository, the one its `origin` remote names, as the forge
+///   names it.
+/// - `origin:<owner>/<name>:<branch>`: the member branch `<branch>` of the
+///   fork whose ledger states it, pushed to its own repository
+///   `<owner>/<name>`. A ref name holds no `:`, so the first one after the
+///   repository ends it. The repository says where the branch was when it
+///   was stated; the branch is looked up in that fork, whatever its
+///   repository is called since.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Requirement {
+    Upstream {
+        repo: UpstreamName,
+        number: u64,
+    },
+    ForkPull {
+        repository: String,
+        number: u64,
+    },
+    ForkBranch {
+        repository: String,
+        branch: BranchName,
+    },
 }
 
+/// How a requirement on a fork's own repository begins: the role of the
+/// remote that names that repository.
+const ON_ORIGIN: &str = "origin:";
+
 impl Requirement {
-    /// `<repo>#<number>` as written. The repo is split off at the last `#`,
-    /// and is whatever was written there; `knives depends` resolves a
-    /// registry key to the fork's upstream name before recording it.
+    /// One token as written ([`Requirement`] has the forms). A token without
+    /// the `origin:` prefix is split at its last `#`, and its repo is
+    /// whatever was written there; `knives depends` resolves a registry key
+    /// to the fork's upstream name before recording it. `None` for anything
+    /// else, a branch holding the `,` that joins tokens among it.
     pub fn parse(text: &str) -> Option<Self> {
-        let (repo, number) = text.rsplit_once('#')?;
-        if repo.is_empty() {
+        let Some(rest) = text.strip_prefix(ON_ORIGIN) else {
+            let (repo, number) = text.rsplit_once('#')?;
+            if repo.is_empty() {
+                return None;
+            }
+            return Some(Self::Upstream {
+                repo: UpstreamName::new(repo),
+                number: number.parse().ok()?,
+            });
+        };
+        if let Some((repository, branch)) = rest.split_once(':') {
+            let branch = BranchName::parse(branch)
+                .ok()
+                .filter(|branch| !branch.as_str().contains(','))?;
+            return is_repository(repository).then(|| Self::ForkBranch {
+                repository: repository.to_owned(),
+                branch,
+            });
+        }
+        let (repository, number) = rest.rsplit_once('#')?;
+        if !is_repository(repository) {
             return None;
         }
-        Some(Self {
-            repo: UpstreamName::new(repo),
+        Some(Self::ForkPull {
+            repository: repository.to_owned(),
             number: number.parse().ok()?,
         })
     }
 }
 
+/// Whether `text` is a forge repository's `<owner>/<name>`, holding none of
+/// the characters a token is split at.
+fn is_repository(text: &str) -> bool {
+    text.split_once('/')
+        .is_some_and(|(owner, name)| !owner.is_empty() && !name.is_empty() && !name.contains('/'))
+        && !text.contains([',', '#', ':'])
+}
+
 impl std::fmt::Display for Requirement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}#{}", self.repo, self.number)
+        match self {
+            Self::Upstream { repo, number } => write!(f, "{repo}#{number}"),
+            Self::ForkPull { repository, number } => write!(f, "{ON_ORIGIN}{repository}#{number}"),
+            Self::ForkBranch { repository, branch } => {
+                write!(f, "{ON_ORIGIN}{repository}:{branch}")
+            }
+        }
     }
 }
 
@@ -540,14 +602,48 @@ mod tests {
     )]
     #[test]
     fn a_requirement_round_trips_and_refuses_nonsense() {
-        use super::Requirement;
-        let parsed = Requirement::parse("swe#4545").unwrap();
-        assert_eq!(parsed.repo.as_str(), "swe");
-        assert_eq!(parsed.number, 4545);
-        assert_eq!(parsed.to_string(), "swe#4545");
-        assert!(Requirement::parse("swe").is_none());
-        assert!(Requirement::parse("#4545").is_none());
-        assert!(Requirement::parse("swe#abc").is_none());
+        use super::{BranchName, Requirement, UpstreamName};
+        for (text, parsed) in [
+            (
+                "swe#4545",
+                Requirement::Upstream {
+                    repo: UpstreamName::new("swe"),
+                    number: 4545,
+                },
+            ),
+            (
+                "origin:acme/swe#12",
+                Requirement::ForkPull {
+                    repository: "acme/swe".to_owned(),
+                    number: 12,
+                },
+            ),
+            (
+                "origin:acme/swe:fix/a#1",
+                Requirement::ForkBranch {
+                    repository: "acme/swe".to_owned(),
+                    branch: BranchName::new("fix/a#1"),
+                },
+            ),
+        ] {
+            assert_eq!(Requirement::parse(text), Some(parsed), "{text}");
+            assert_eq!(Requirement::parse(text).unwrap().to_string(), text);
+        }
+        for nonsense in [
+            "swe",
+            "#4545",
+            "swe#abc",
+            "origin:acme#12",
+            "origin:acme/swe",
+            "origin:acme/swe#x",
+            "origin:a/b/c#1",
+            "origin:acme/swe:",
+            "origin:acme/swe:../x",
+            "origin:acme/swe:a,b",
+            "origin:/swe:main",
+        ] {
+            assert_eq!(Requirement::parse(nonsense), None, "{nonsense}");
+        }
     }
 
     #[test]

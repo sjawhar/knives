@@ -32,10 +32,12 @@ pub enum StatementKind {
     ForkOnly,
     /// The branch was superseded: the branch that replaced it.
     Superseded,
-    /// What the branch cannot land before: every `<repo>#<number>` it needs,
-    /// comma-joined. The live list is every requirement each `depends`
-    /// statement since the newest `depends` forget names, so a statement adds
-    /// to it whatever order machines make them in.
+    /// What the branch cannot land before: every requirement it needs, each
+    /// as [`crate::ids::Requirement`] writes it, comma-joined. The live list
+    /// is every requirement each `depends` statement since the newest
+    /// `depends` forget names, so a statement adds to it whatever order
+    /// machines make them in; a requirement is taken back by a forget
+    /// followed by the list without it.
     Depends,
     /// A kind a newer knives writes and this one does not know. Ledgers are
     /// shared between machines that upgrade at different times, so an entry
@@ -99,6 +101,7 @@ impl Statement {
                 .any(|text| Requirement::parse(text).is_none())
                 .then_some(
                     "a `depends` statement holds every requirement as `<owner>/<name>#<number>`, \
+                     `origin:<owner>/<name>#<number>` or `origin:<owner>/<name>:<branch>`, \
                      comma-joined",
                 ),
             StatementKind::ForkOnly | StatementKind::Superseded | StatementKind::Unknown => None,
@@ -231,8 +234,9 @@ impl Statements {
         self.value(branch, StatementKind::Superseded)
     }
 
-    /// Everything `branch` is stated to need first, as `<repo>#<number>`.
-    /// Every part read from an entry file is one ([`Statement::check`]).
+    /// Everything `branch` is stated to need first, each as a
+    /// [`Requirement`] token. Every part read from an entry file is one
+    /// ([`Statement::check`]).
     pub fn depends(&self, branch: &str) -> Vec<String> {
         self.value(branch, StatementKind::Depends)
             .map_or_else(Vec::new, |list| {

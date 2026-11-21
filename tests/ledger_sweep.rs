@@ -1363,7 +1363,7 @@ fn a_dependency_stated_on_another_machine_survives_a_second_machines_depends() {
     let stated = knives_on(
         &lab,
         alpha.path(),
-        &["--text", "depends", "feat/alpha", "--on", "demo#1"],
+        &["--text", "depends", "feat/alpha", "--on", "acme/demo#1"],
     );
     assert!(
         stated.status.success(),
@@ -1376,7 +1376,7 @@ fn a_dependency_stated_on_another_machine_survives_a_second_machines_depends() {
     let stated = knives_on(
         &lab,
         beta.path(),
-        &["--text", "depends", "feat/alpha", "--on", "demo#2"],
+        &["--text", "depends", "feat/alpha", "--on", "acme/demo#2"],
     );
     assert!(
         stated.status.success(),
@@ -1409,7 +1409,7 @@ fn dependencies_two_machines_state_at_once_both_survive() {
     // When: each states a different dependency of the same branch, which
     // stays on its machine, then the remote takes pushes again, and each
     // sweeps until it has the other's.
-    for (home, on) in [(&alpha, "demo#1"), (&beta, "demo#2")] {
+    for (home, on) in [(&alpha, "acme/demo#1"), (&beta, "acme/demo#2")] {
         let stated = knives_on(
             &lab,
             home.path(),
@@ -1444,6 +1444,66 @@ fn dependencies_two_machines_state_at_once_both_survive() {
             ["acme/demo#1", "acme/demo#2"],
             "{entries:?}"
         );
+    }
+}
+
+#[test]
+fn a_dependency_one_machine_forgets_is_gone_on_every_machine() {
+    // Given: two machines sharing one ledger remote, and a branch both know
+    // requires acme/demo#1 and acme/demo#2.
+    let lab = lab::Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let alpha = shared_home(&lab);
+    let beta = second_machine(alpha.path());
+    let (_remote_dir, remote) = lab::bare_remote();
+    share(alpha.path(), "alpha", &remote);
+    share(beta.path(), "beta", &remote);
+    let stated = knives_on(
+        &lab,
+        alpha.path(),
+        &[
+            "--text",
+            "depends",
+            "feat/alpha",
+            "--on",
+            "acme/demo#1",
+            "--on",
+            "acme/demo#2",
+        ],
+    );
+    assert!(
+        stated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stated.stderr)
+    );
+
+    // When: beta forgets acme/demo#1, and alpha pulls.
+    let forgot = knives_on(
+        &lab,
+        beta.path(),
+        &["--text", "depends", "feat/alpha", "--forget", "acme/demo#1"],
+    );
+    assert!(
+        forgot.status.success(),
+        "{}",
+        String::from_utf8_lossy(&forgot.stderr)
+    );
+    let swept = sweep(alpha.path());
+    assert!(
+        swept.status.success(),
+        "{}",
+        String::from_utf8_lossy(&swept.stdout)
+    );
+
+    // Then: both machines fold the same list from what they hold, with
+    // acme/demo#1 gone from it.
+    for home in [&alpha, &beta] {
+        let entries = Ledger::at(home.path().join("ledger").join(FORK))
+            .read()
+            .expect("read the ledger")
+            .entries;
+        let live = knives::statement::Statements::from_entries(&entries);
+        assert_eq!(live.depends("feat/alpha"), ["acme/demo#2"], "{entries:?}");
     }
 }
 
@@ -1586,7 +1646,8 @@ fn a_depends_or_a_forget_is_refused_when_the_ledger_cannot_be_pulled() {
     // When / Then: each write that replaces what it read is refused, says
     // why, and writes nothing.
     for args in [
-        &["--text", "depends", "feat/alpha", "--on", "demo#1"][..],
+        &["--text", "depends", "feat/alpha", "--on", "acme/demo#1"][..],
+        &["--text", "depends", "feat/alpha", "--forget", "acme/demo#1"][..],
         &["--text", "track", "feat/alpha", "--forget"][..],
     ] {
         let refused = knives_on(&lab, home.path(), args);
