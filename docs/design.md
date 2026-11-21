@@ -470,9 +470,12 @@ that repository's owner and a member branch; any other is a problem that says wh
 met. A member no copy here holds cannot be judged, and is a problem until it is fetched;
 the problem says its work may still be in a review base it merged into before it was
 deleted. Without the landed probe (`status --no-landed`), a member not shown landed stays
-an unmet finding: what is not shown to have landed is still needed. A member recorded
+an unmet finding: what is not shown to have landed is still needed. When the forge was asked
+and did not answer, a member not shown landed cannot be judged, since a squash merge
+upstream leaves nothing a replay sees: a problem, not an unmet finding. A member recorded
 under two spellings of the fork's own repository, by machines whose `origin` remotes
-differ, is one requirement.
+differ, is one requirement. A branch of another fork's own repository is no member of this
+one, whatever a branch of its name here says: a problem.
 
 A report checks the requirements of every row; of a dependent this checkout holds only as
 `<branch>@origin`, another machine's branch nobody here claims; and of a dependent held
@@ -490,10 +493,11 @@ carried later can change it; each one that is unmet or cannot be judged is a pro
 names the dependent, what could not be read, what was seen of the requirement, and the
 `knives depends <dependent> --forget …` command that takes those back, with a fetch
 suggested only when the recorded commit is not here; a member is named by its branch name
-there, which takes back every spelling of it. Under `--no-landed` a recorded commit can still
-be shown landed by its merged pull request's landing, not by a replay: one shown landed is
-judged as above, like a missing or unrecorded one, and one not shown landed has its
-requirements checked as a row's.
+there, which takes back every spelling of it, unless that name holds a `#`. Under
+`--no-landed` a recorded commit can still be shown landed by its merged pull request's
+landing, not by a replay: one shown landed is judged as above, like a missing or
+unrecorded one, and one not shown landed has its requirements checked as a row's, with a
+note that says it could not be shown landed.
 
 A requirement is taken back by a `depends` forget followed by the list without it, two
 entries stamped in that order and written newest first: a run cut short between them
@@ -509,11 +513,15 @@ same way for a repository that is gone, for one the token cannot see, and in som
 outages. So a record whose repository the forge does not name, by that answer or by a
 failure, is one the forge could not be asked about. The texts of one command are weighed
 together: when counting each such record as named would take back more than the forge's
-answers take, or make a text ambiguous, nothing is taken back (exit 3), so neither an
-outage nor a repository the token cannot see decides what a forget takes. Naming every
-record of a requirement, each as its record spells it, takes them all back whatever the
-forge answers. A member token on another fork's repository is refused unless a record is
-spelled exactly so; then that record alone is taken back. Every machine running
+answers take, make a text ambiguous, or join two records a text names into one
+requirement, nothing is taken back (exit 3), so neither an outage nor a repository the
+token cannot see decides what a forget takes. Each such refusal prints a command that names
+every record of that pull request number or member, each as it is spelled (a member by its
+branch name, unless that holds a `#`): every candidate is then named directly, so no forge
+answer changes what it takes. It can take a record the forge showed is another
+repository's; to keep one, run the forget again when the forge answers. A member token on
+another fork's repository is refused unless a record is spelled exactly so; then that
+record alone is taken back. Every machine running
 this knives folds the two into the same list. A knives from before fork requirements
 reads the same list only while it holds no member branch: it cannot read a list that
 holds one, so the forget is the newest statement it reads there, and the branch requires
