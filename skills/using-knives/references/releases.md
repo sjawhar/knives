@@ -25,8 +25,9 @@ A release in hand is **unrecorded** when its tree differs from its matched recor
 
 Three cases: this repository lacks the matched write (made on another machine, not fetched here), no recorded write matches the release's parents (the members changed outside knives), or the ledger records no write of the name. The write goes ahead, prints `knives could not check <name> at <commit> against its recorded writes: …` with the remedy, and its ledger event ends `; unchecked: W absent`, `no match` or `no record`.
 
-- The mark is sticky: every later write over that release repeats it, and `audit` shows a note while the newest write of the name carries it.
-- `knives release adopt <name>` ends it. For `no match`, first make the change with `knives release include`, `drop` or `advance` (a member added by hand: drop it, then include it), then adopt.
+- A release that is such a marked write, or a jj rebase or metadata rewrite of it, stays unchecked: every later write over it repeats the mark, and `audit` shows a note while the newest write of the name carries it.
+- A release that carries a hand change on top of a marked write that this repository holds, such as a conflict resolved by hand, is unrecorded (above): every write refuses it until `knives release adopt <name>` records it.
+- `knives release adopt <name>` ends the mark. For `no match`, first make the change with `knives release include`, `drop` or `advance` (a member added by hand: drop it, then include it), then adopt.
 - A release whose every parent is a carrier (a resolution committed on top of the release) has no member. Every write and `adopt` refuse it and print a squash remedy, or, for a published dated or series release, the published remedy.
 
 ## The published remedy
