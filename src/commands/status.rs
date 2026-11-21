@@ -824,6 +824,7 @@ fn fold_phase_outcome(
     let landed = input
         .probe_ran
         .then(|| std::mem::take(&mut phases.probe.landed));
+    let trunk_ref = entry.trunk_ref();
     add_dependency_findings(DependencyInput {
         report,
         findings,
@@ -832,7 +833,7 @@ fn fold_phase_outcome(
         store: input.store,
         options: input.options,
         snapshot,
-        probe_ran: input.probe_ran,
+        probed_onto: input.probe_ran.then_some(trunk_ref.as_str()),
         timings,
     });
     finalize_status(
