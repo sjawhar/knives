@@ -439,19 +439,29 @@ requests apart: `<upstream>#<n>` is a pull request on the fork's upstream,
 `origin:<owner>/<name>:<branch>` a member branch of the fork. `knives depends --on
 <repo>#<n>`, the registry name, used to mean the upstream's pull request, and recorded an
 unrelated one where the fork's review pull request was meant; it now asks the forge which
-repository has #n, and refuses when both do, naming both. A branch's own review pull
-request, a base, a release and a fetched `pr-<n>` head are refused: none is a member
-another branch can wait for.
+repository has #n, and refuses when both do, naming both. A review pull request is
+recorded only on the fork's own repository, and only when its head is a member branch of
+the fork: a branch of the fork's owner that is not the dependent itself, a base, a release
+or a fetched `pr-<n>` head. A review pull request on another fork's repository is refused:
+its head is that fork's branch, which nothing here can judge, so the dependent names the
+upstream pull request it becomes. The same branches are refused as member branches.
 
-A member branch is satisfied once it has landed upstream: its row is landed or merged, or,
-for a member this checkout knows only as `<branch>@origin` (another machine's, fetched),
-that copy replays empty onto the upstream trunk. A review pull request is satisfied once
-its head, the member it carries, has landed upstream, judged the same way; the report
-names the head. Its own state is not the rule: a review pull request merges into a review
-base or into another member, which says nothing about the upstream, and while the member
-is in the fork's release only, dropping it from the release breaks the dependent. A
-member no copy here holds cannot be judged, and is a problem until it is fetched or the
-requirement is forgotten.
+A member branch is satisfied once it has landed upstream: its row is landed or merged (or
+its landed verdict is in the trunk, whatever else the row says), or, for a member this
+checkout knows only as `<branch>@origin` (another machine's, fetched), its upstream pull
+request merged with a landing the trunk holds and nothing past what it merged, or that
+copy replays empty onto the upstream trunk. A review pull request is satisfied once its
+head, the member it carries, has landed upstream, judged the same way; the report names
+the head. Its own state is not the rule: a review pull request merges into a review base
+or into another member, which says nothing about the upstream, and while the member is in
+the fork's release only, dropping it from the release breaks the dependent. A review pull
+request is judged by its head only on the fork's own repository and when its head is a
+branch of that repository's owner and a member branch; any other is a problem that says
+why, never met. A member no copy here holds cannot be judged, and is a problem until it is
+fetched or the requirement is forgotten. Without the landed probe (`status --no-landed`),
+a member not shown landed or merged stays an unmet finding: what is not shown to have
+landed is still needed. A member recorded under two spellings of the fork's own
+repository, by machines whose `origin` remotes differ, is one requirement.
 
 A requirement is taken back by a `depends` forget followed by the list without it, two
 entries stamped in that order and written newest first: a run cut short between them
@@ -459,10 +469,14 @@ leaves the list as it was, never empty. Every machine running this knives folds 
 into the same list. A knives from before fork requirements reads the same list only while
 it holds no member branch: it cannot read a list that holds one, so the forget is the
 newest statement it reads there, and the branch requires nothing. The forget restates the
-list the writing machine holds after its pull: a requirement another machine stated that
-had not reached it (unsent, or sent after the pull) is not in that list, and is lost on
-every machine; the machines still agree on one list. A fold that kept it would read the
-forget differently from the knives before it.
+list the writing machine holds after its pull, and the machines still agree on one list,
+but it can differ from what was meant, both ways. A requirement another machine stated
+that had not reached the forgetting machine (unsent, or sent after its pull) is not in
+that list, and is lost on every machine. A list another machine writes after the forget
+from a ledger that has not received it (the forget unsent, or sent after that machine's
+pull) still holds the forgotten requirement, and brings it back; two forgets made that
+way can undo each other. A fold that guarded against either would read the forget
+differently from the knives before it.
 
 ### `knives preflight`
 
