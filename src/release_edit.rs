@@ -5,8 +5,6 @@
 //! parent set; a branch joins or moves only through a verb here, and every
 //! write records the parent set it left behind.
 
-use std::borrow::Cow;
-
 use knives::bind::Fork;
 use knives::cli::Exit;
 use knives::commands::claim::Bound;
@@ -15,10 +13,10 @@ use knives::forge::github::CliForge;
 use knives::ids::{BranchName, CommitId, ReleaseScheme, RepoName};
 use knives::ledger::{Draft, Ledger, inline_human_text, shell_word};
 use knives::release_model::{
-    EarlierWrites, MemberEvidence, MemberHistory, MemberLookup, MemberSuccession, PreviousRelease,
-    SeriesFit, StackedHistoryContext, carried_from_tips, carries_member_line, composition,
-    is_previous_release_label, last_recorded_parents, member_history, member_parents,
-    members_event_text, series_fit, trunk_positions_in, with_commit,
+    EarlierWrites, MemberEvidence, MemberHistory, MemberLookup, MemberSuccession, SeriesFit,
+    StackedHistoryContext, carried_from_tips, carries_member_line, last_recorded_parents,
+    member_history, member_parents, members_event_text, read_release, series_fit,
+    trunk_positions_in,
 };
 
 use super::scribe_for;
@@ -69,22 +67,15 @@ enum EditOutcome {
 /// fast-forward push gave it, a carrier, which no new composition keeps. The
 /// upstream base is never a direct parent — it is reachable through every
 /// member, because members fork from it — so there is no role to classify
-/// and nothing for a landed member to be mistaken for. A release of a stacked
-/// series reads as its previous release and its members
-/// ([`release::release_reading`]): the previous release is kept apart, never
-/// a member, and every write puts it first again.
+/// and nothing for a landed member to be mistaken for.
 struct ReleaseInHand {
     name: String,
     commit: knives::ids::CommitId,
-    /// The members: the release's parents, its carriers left out, or for a
-    /// stacked release the side parents on its first-parent line.
+    /// The members: the release's parents, its carriers left out.
     parents: Vec<knives::ids::CommitId>,
     /// The parents that are earlier writes of the release
     /// ([`knives::release_model::EarlierWrites::carriers`]).
     carriers: Vec<knives::ids::CommitId>,
-    /// The previous release a release of a stacked series is built on: its
-    /// first parent, which no verb drops or moves.
-    previous: Option<PreviousRelease>,
     /// Every earlier write of the name, which the write hides once it leaves
     /// one a head nothing holds.
     writes: EarlierWrites,
@@ -94,10 +85,10 @@ struct ReleaseInHand {
 }
 
 impl ReleaseInHand {
-    /// Read the release's members and carriers, and in a stacked series its
-    /// previous release, from `tips`, every bookmark the caller read; the
-    /// carriers from the ledger's writes of the name and `published`, the
-    /// publish remote's commit of it in jj's view.
+    /// Read the release's members and carriers, the carriers from the
+    /// ledger's writes of the name and `published`, the publish remote's
+    /// commit of it in jj's view; and its trunk positions from `tips`, every
+    /// bookmark the caller read.
     fn read(
         opened: &knives::jj::Repo,
         entry: &knives::config::RepoEntry,
@@ -110,45 +101,15 @@ impl ReleaseInHand {
     ) -> anyhow::Result<Self> {
         let commit = opened.resolve_commit(&name)?;
         let writes = EarlierWrites::read(opened, &name, ledger, published)?;
-        // The plan reads the release this way too, and every edit refuses a
-        // plan whose reading refused the release before it gets here.
-        let reading =
-            match release::release_reading(opened, entry, (ledger, tips), (&writes, &commit))? {
-                Ok(reading) => reading,
-                Err(unexplained) => anyhow::bail!("{name}: {unexplained}"),
-            };
+        let reading = read_release(opened, (&writes, &commit))?;
         Ok(Self {
             name,
             commit,
             parents: reading.members,
             carriers: reading.carriers,
-            previous: reading.previous,
             writes,
             trunk_tips: trunk_positions_in(tips, entry),
         })
-    }
-
-    /// What a branch's history is measured past, and what the release
-    /// already carries ([`StackedHistoryContext`]): the trunk positions and
-    /// the members. A stacked release adds its previous release to both: it
-    /// carries that release whole, and a member may stack on it. Succession
-    /// and the trunk's own refusals still read [`Self::trunk_tips`] alone.
-    fn measured(&self) -> (Cow<'_, [CommitId]>, Cow<'_, [CommitId]>) {
-        let previous = self.previous.as_ref().map(|previous| &previous.commit);
-        (
-            with_commit(&self.trunk_tips, previous),
-            with_commit(&self.parents, previous),
-        )
-    }
-
-    /// What the release composes ([`composition`]): its previous release
-    /// when it has one, then its members, its carriers left out. Its own
-    /// change is its tree against their merge
-    /// ([`knives::jj::Measured::Composed`]): a release made as a chain of
-    /// merges, one member each, holds what each inner merge resolved, and
-    /// only that merge holds all of it.
-    fn composition(&self) -> Cow<'_, [CommitId]> {
-        composition(self.previous.as_ref(), &self.parents)
     }
 
     /// The release's name for a terminal line: a name read from the
@@ -553,7 +514,7 @@ fn refuse_unrecorded(
     entry: &knives::config::RepoEntry,
     release: &release::InHand<'_>,
 ) -> anyhow::Result<Result<release::InHandWrite, Exit>> {
-    let standing = release::in_hand_write(release, entry)?;
+    let standing = release::in_hand_write(release)?;
     let Some(refusal) = release::in_hand_refusal(release, &standing, entry)? else {
         return Ok(Ok(standing));
     };
@@ -668,8 +629,12 @@ fn refuse_if_frozen(
 ///
 /// The whole command is the jj sequence agents fumble — duplicate the release
 /// onto the changed parent set, describe it, move its name — with the same pin
-/// gate a rebase has. The duplicate preserves recorded conflict resolutions;
-/// only the change itself can surface new conflicts, and they are reported.
+/// gate a rebase has. A file whose conflict the release resolved keeps that
+/// resolution only where the plain merge of the new parents leaves the same
+/// conflict there. Elsewhere the write puts that plain merge in the file and
+/// names the file ([`knives::jj::write_edited_release`]), whether or not an
+/// adopt recorded the resolution. Every conflict the write leaves is
+/// reported.
 #[allow(
     clippy::too_many_arguments,
     reason = "release-edit state and the shared consumer-scan collaborators are independently owned command inputs"
@@ -728,7 +693,6 @@ fn edit_release(
         commit: &release.commit,
         writes: &release.writes,
         published: plan.published.as_ref(),
-        tips: &tips,
     };
     let unchecked =
         match refuse_edit_in_hand((repo, change.verb()), entry, &in_hand, ("editing", "edit"))? {
@@ -742,7 +706,6 @@ fn edit_release(
     );
     let written =
         knives::release_model::recorded_release_changes(&opened, &ledger, &entry.release_scheme());
-    let (measured, carried) = release.measured();
     let context = EditContext {
         repo,
         opened: &opened,
@@ -753,9 +716,9 @@ fn edit_release(
         unchecked: &unchecked,
         stacked: StackedHistoryContext {
             repo: &opened,
-            trunks: &measured,
+            trunks: &release.trunk_tips,
             releases: &releases,
-            carried: &carried,
+            carried: &release.parents,
             written: &written,
             replaced: None,
         },
@@ -785,14 +748,13 @@ fn edit_release(
     })
 }
 
-/// Write the edited release — duplicated onto its new parent set, described,
-/// its name moved — record the parent set in the ledger, and report.
+/// Write the edited release — duplicated onto its new parent set by spec
+/// R11's rule ([`knives::jj::write_edited_release`]), described, its name
+/// moved — record the parent set in the ledger, and report. Each file the
+/// rule wrote as the plain merge of the new parents is named after the
+/// lines on the replaced commit ([`plain_merged_lines`]), before the
+/// conflict report.
 ///
-/// `new_parents` are the members; a stacked release's previous release is
-/// put first again here, the one place every verb's parent set passes. The
-/// release's own change is measured against what it composes
-/// ([`ReleaseInHand::composition`]), never its own parents, so an edit of a
-/// release made as a chain of merges keeps what each inner merge resolved.
 /// `uncarried` is the target of a drop whose parent no remaining member's
 /// history carries. Whether the release lost that content is read from the
 /// written tree: jj merges the remaining parents over their real merge base,
@@ -811,16 +773,15 @@ fn apply_edit(
 ) -> anyhow::Result<Exit> {
     let (repo, opened, release) = (context.repo, context.opened, context.release);
     let entry = fork.entry;
-    let parents = composition(release.previous.as_ref(), new_parents);
-    let provenance = composition_sources(opened, entry, (release.previous.as_ref(), new_parents))?;
+    let provenance = release::parent_sources(opened, entry, &entry.release_scheme(), new_parents)?;
     let message = release::composition_message(&release.name, &provenance, delta);
-    let written = knives::jj::write_release(
+    let (written, plain_merged) = knives::jj::write_edited_release(
         &fork.checkout.path,
         &knives::jj::ReleaseWrite {
             source: Some(&release.commit),
-            parents: &parents,
+            parents: new_parents,
             // What the release composes leaves its carriers out.
-            measured: knives::jj::Measured::Composed(&release.composition()),
+            measured: knives::jj::Measured::WithoutCarriers(&release.carriers),
             message: Some(&message),
             bookmark: Some(&release.name),
             publish_remote: Some(entry.publish_remote()),
@@ -867,15 +828,45 @@ fn apply_edit(
     println!(
         "{repo}: {} now has {} parent(s): {}",
         release.shown_name(),
-        parents.len(),
+        new_parents.len(),
         inline_human_text(delta)
     );
     report_replaced(repo, &release.name, &written);
+    for line in plain_merged_lines(repo, &plain_merged) {
+        println!("{line}");
+    }
     println!(
         "{}",
         release::conflict_report(&release.name, reported.conflicts(), &written.unions)
     );
     Ok(Exit::Ok)
+}
+
+/// The lines an edit prints for each file its write put as the plain merge
+/// of the new parents (spec R11): that it did, and whether the file holds a
+/// conflict; then, where the release had also changed lines outside the
+/// conflict there, that this hand change was not carried. A path is read
+/// from the tree, so it is escaped.
+fn plain_merged_lines(repo: &RepoName, files: &[knives::jj::PlainMergedFile]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for file in files {
+        let path = inline_human_text(&file.path);
+        let left = if file.conflicted {
+            "which leaves a conflict"
+        } else {
+            "with no conflict"
+        };
+        lines.push(format!(
+            "{repo}: {path}: written as the plain merge of the new parents (the resolution \
+             answers another conflict), {left}"
+        ));
+        if file.hand_change_left_out {
+            lines.push(format!(
+                "{repo}: {path}: the hand change outside the resolved conflict was not carried"
+            ));
+        }
+    }
+    lines
 }
 
 /// One line on the commit a release write replaced under `release`: abandoned,
@@ -1025,9 +1016,7 @@ pub(crate) struct EditRecord<'a> {
 /// rebase that left no ancestry or change id behind. Like a cut event, it names
 /// the written commit, its change id and its parents, and the commit leads the
 /// evidence: it is the position `audit` holds the release against. The release
-/// logs the edit unioned close the text ([`union_event_text`]). A stacked
-/// release's previous release is recorded under its label
-/// ([`provenance_parents`]).
+/// logs the edit unioned close the text ([`union_event_text`]).
 pub(crate) fn record_edit_event(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
@@ -1107,11 +1096,7 @@ pub(crate) fn recorded_parents(
     ))
 }
 
-/// [`recorded_parents`] of a write's `provenance`, in its order. A parent
-/// whose provenance is the label of a stacked release's previous release
-/// ([`composition_sources`]) is recorded under that label alone, as a
-/// carrier is under its own: every reader of the record then skips it as no
-/// member ([`knives::release_model::recorded_members`]).
+/// [`recorded_parents`] of a write's `provenance`, in its order.
 pub(crate) fn provenance_parents(
     opened: &knives::jj::Repo,
     entry: &knives::config::RepoEntry,
@@ -1121,35 +1106,7 @@ pub(crate) fn provenance_parents(
         .iter()
         .map(|(_, commit)| commit.clone())
         .collect();
-    let mut parents = recorded_parents(opened, entry, &commits)?;
-    for (parent, (source, _)) in parents.iter_mut().zip(provenance) {
-        if is_previous_release_label(source) {
-            parent.branches = vec![source.clone()];
-        }
-    }
-    Ok(parents)
-}
-
-/// A release's parents, each with where it came from: a stacked release's
-/// `previous` release first, under its label ([`PreviousRelease::labelled`]),
-/// then each of `members` as [`release::parent_sources`] names it. What a
-/// cut's or an edit's message and ledger event list.
-pub(crate) fn composition_sources(
-    opened: &knives::jj::Repo,
-    entry: &knives::config::RepoEntry,
-    (previous, members): (Option<&PreviousRelease>, &[knives::ids::CommitId]),
-) -> anyhow::Result<Vec<(String, knives::ids::CommitId)>> {
-    let mut sources: Vec<(String, knives::ids::CommitId)> = previous
-        .map(PreviousRelease::labelled)
-        .into_iter()
-        .collect();
-    sources.extend(release::parent_sources(
-        opened,
-        entry,
-        &entry.release_scheme(),
-        members,
-    )?);
-    Ok(sources)
+    recorded_parents(opened, entry, &commits)
 }
 
 /// Whether the release name has one local position to move, saying why not when
@@ -1316,27 +1273,10 @@ fn include_edit(
     })
 }
 
-/// Remove one member parent. The branch and its bookmark are untouched. The
-/// previous release of a stacked release is no member, and it is refused.
+/// Remove one member parent. The branch and its bookmark are untouched.
 fn drop_edit(context: &EditContext<'_>, target: &str, why: &str) -> anyhow::Result<EditOutcome> {
     let (repo, opened, release) = (context.repo, context.opened, context.release);
     let (shown_target, shown_release) = (inline_human_text(target), release.shown_name());
-    if let Some(previous) = &release.previous
-        && opened
-            .local_bookmark_tip(target)
-            .or_else(|| opened.resolve_commit(target).ok())
-            .is_some_and(|commit| commit == previous.commit)
-    {
-        // The previous release is a name the ledger or a release ref gave.
-        println!(
-            "{repo}: refusing to drop {shown_target}: it is {} ({}), the previous release \
-             {shown_release} is built on; it is the first parent of every write of \
-             {shown_release} and never a member, so it cannot be dropped",
-            inline_human_text(&previous.name),
-            previous.commit.short()
-        );
-        return Ok(EditOutcome::Settled(Exit::Incomplete));
-    }
     let mut candidates = Vec::new();
     if let Some(tip) = opened.local_bookmark_tip(target) {
         if release.parents.contains(&tip) {
@@ -1376,10 +1316,7 @@ fn drop_edit(context: &EditContext<'_>, target: &str, why: &str) -> anyhow::Resu
             // members' bases do not reach yet), so the fact is stated rather
             // than judged, once the written tree says which it is.
             let mut carried_elsewhere = false;
-            for kept in parents
-                .iter()
-                .chain(release.previous.iter().map(|previous| &previous.commit))
-            {
+            for kept in &parents {
                 if opened.is_ancestor(parent, kept)? {
                     carried_elsewhere = true;
                     break;
@@ -1693,20 +1630,6 @@ fn advance_named_member_from(
 ) -> anyhow::Result<Option<(Vec<knives::ids::CommitId>, Vec<String>)>> {
     let (repo, opened, release) = (context.repo, context.opened, context.release);
     let (shown_branch, shown_release) = (inline_human_text(branch.as_str()), release.shown_name());
-    if let Some(previous) = release
-        .previous
-        .as_ref()
-        .filter(|previous| previous.commit == *old)
-    {
-        // The previous release is a name the ledger or a release ref gave.
-        println!(
-            "{repo}: {} is {}, the previous release {shown_release} is built on, never a \
-             member: no advance moves it",
-            old.short(),
-            inline_human_text(&previous.name)
-        );
-        return Ok(None);
-    }
     let Some(tip) = carried
         .iter()
         .find(|(carried, _)| carried == branch.as_str())
@@ -1800,6 +1723,45 @@ mod tests {
                  working copy of workspace ws\u{fffd}x\u{fffd}y rests on it",
                 "demo: abandoned cccc, an earlier release/x\u{fffd}2J commit nothing rests on any \
                  more",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_written_as_the_plain_merge_is_named_escaped_with_its_left_out_hand_change() {
+        // Given: one file written with no conflict, whose release had a hand
+        // change outside the conflict, and one left conflicted, its path
+        // holding a C1 character, as a path read from a tree can.
+        let files = [
+            knives::jj::PlainMergedFile {
+                path: "src/f.ml".to_owned(),
+                conflicted: false,
+                hand_change_left_out: true,
+            },
+            knives::jj::PlainMergedFile {
+                path: "g\u{9b}2J".to_owned(),
+                conflicted: true,
+                hand_change_left_out: false,
+            },
+        ];
+
+        // When: the edit's lines for them are read.
+        let lines = plain_merged_lines(&RepoName::new("demo"), &files);
+
+        // Then: each file is named with whether it holds a conflict, the
+        // first with its hand change not carried, and no line holds a
+        // control character.
+        for line in &lines {
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+        }
+        assert_eq!(
+            lines,
+            [
+                "demo: src/f.ml: written as the plain merge of the new parents (the resolution \
+                 answers another conflict), with no conflict",
+                "demo: src/f.ml: the hand change outside the resolved conflict was not carried",
+                "demo: g\u{fffd}2J: written as the plain merge of the new parents (the \
+                 resolution answers another conflict), which leaves a conflict",
             ]
         );
     }

@@ -11,13 +11,14 @@
 //! match no recorded write (a child of the release included), conflicts, a
 //! working copy on the commit, a hand edit of a published release the publish
 //! remote does not hold, and a change beyond the conflicts with no reason. The
-//! newest write itself, or a re-signed copy, is nothing to adopt; an older one
-//! is recorded as the newest. The resolution is measured against the replaced
-//! write rebuilt on its members (D7), so a member rewritten in place is no
-//! change beyond the conflicts. A member's lost lines are counted against the
-//! baseline (D8): exit 1 for any line lost from a plain file the baseline left
-//! without a conflict, or every line lost from a conflicted file or a release
-//! log.
+//! newest write itself is nothing to adopt. That write re-signed or
+//! metaedited while it is unpublished, or an older one, is recorded as the
+//! newest (`tests/release_resign.rs` has the rest of the re-signed case). The
+//! resolution is measured against the replaced write rebuilt on its members
+//! (D7), so a member rewritten in place is no change beyond the conflicts. A
+//! member's lost lines are counted against the baseline (D8): exit 1 for any
+//! line lost from a plain file the baseline left without a conflict, or
+//! every line lost from a conflicted file or a release log.
 
 #![allow(
     clippy::expect_used,
@@ -328,19 +329,42 @@ fn adopting_the_recorded_write_itself_writes_nothing() {
     assert_ne!(rewritten, cut, "the metaedit made no new commit");
     let output = adopt(&lab, &home, &[]);
 
-    // Then: that is the same write, and nothing is recorded either.
+    // Then: the cut is unpublished, so the re-signed commit is recorded as
+    // the newest write, in one event that names it and holds no file as a
+    // fix by hand.
+    let out = stdout(&output);
     assert!(output.status.success(), "{}", text(&output));
     assert!(
-        stdout(&output).contains(&format!(
-            "demo: {RELEASE} is at {}, the recorded cut {} re-signed or metaedited (same \
-             change, parents and tree); nothing to adopt",
+        out.contains(&format!(
+            "demo: adopted {0} as the newest write of {RELEASE}, replacing the recorded cut {1}\n  \
+             {0} is {1} re-signed or metaedited (same change, parents and tree): no content \
+             changed\n  baseline: the recorded cut {1}\n  no file resolved by hand\n",
             rewritten.short(),
             cut.short()
         )),
-        "{}",
-        text(&output)
+        "{out}"
     );
-    assert_eq!(ledger_entries(&home), before);
+    let after = ledger_entries(&home);
+    assert_eq!(after.len(), before.len() + 1, "{after:?}");
+    let event = newest_event(&home, RELEASE);
+    assert_eq!(
+        event.evidence.first().map(String::as_str),
+        Some(rewritten.as_str()),
+        "{event:?}"
+    );
+    assert!(
+        event.text.contains(&format!(
+            " parent(s): adopted: replaces the recorded cut {0}; measured against the recorded \
+             cut {0}; parents: ",
+            cut.short()
+        )),
+        "{event:?}"
+    );
+    assert!(event.fix_files.is_empty(), "{event:?}");
+    assert!(
+        !event.text.contains("resolved by hand:") && !event.text.contains("changed beyond"),
+        "{event:?}"
+    );
 }
 
 #[test]

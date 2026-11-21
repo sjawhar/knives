@@ -442,6 +442,8 @@ pub enum Command {
     },
     /// Plan, curate and cut releases.
     ///
+    /// A release is a flat octopus merge of member branches.
+    ///
     /// With no subcommand, plans: what a cut would contain, whether every parent is
     /// still its branch tip, and who pins the current release.
     Release {
@@ -574,13 +576,8 @@ pub enum ReleaseAction {
     /// the last resort there: it also waives the checks of each recorded
     /// member, of the newest recorded write and of each other fix by hand. A
     /// repository that does not hold the newest write is refused and told to
-    /// fetch it.
-    /// In a stacked series that write, a successor of it or a copy with its
-    /// tree must be on its first-parent line. The ledger event records its
-    /// members: in a stacked series the side parents on its first-parent
-    /// line, with its previous release labelled as no member. No reap runs,
-    /// and the release is not signed or pushed; its ledger event is pushed
-    /// as a cut's is.
+    /// fetch it. No reap runs, and the release is not signed or pushed; its
+    /// ledger event is pushed as a cut's is.
     Cut {
         /// The dated release name, `release/[<series>/]YYYY-MM-DD[.N|-<label>]`.
         /// It must sort after the newest release of the series. Omit it for a
@@ -592,10 +589,9 @@ pub enum ReleaseAction {
         /// newest release the ledger records in the series holds, a file of
         /// a fix by hand that an `adopt` of any release of the series
         /// recorded and the file's reference still holds, a fix by hand
-        /// whose files this repository cannot read whole, the newest write
-        /// itself where this repository does not hold it, or in a stacked
-        /// series that write, off the line the cut starts on. The refusal
-        /// lists exactly what, each file of a fix by name.
+        /// whose files this repository cannot read whole, or the newest write
+        /// itself where this repository does not hold it. The refusal lists
+        /// exactly what, each file of a fix by name.
         #[arg(long)]
         allow_drop: bool,
         /// Record a release cut outside knives: the commit becomes NAME's
@@ -622,9 +618,19 @@ pub enum ReleaseAction {
     /// this is how the members
     /// change theirs. Bare, it targets the first upstream trunk commit that
     /// contains every merged pull request, then drops the members whose landed
-    /// branches carry nothing more; with nothing merged there is no default,
-    /// and which commit to move onto is a decision — a cut does not make it
-    /// for you.
+    /// branches carry nothing more. A flat release has no base parent, so the
+    /// target reaches it only through a member on the target. Where no other
+    /// member is on the target, the drop keeps the landed members that are,
+    /// and says why; where none is, it drops nothing and exits 3. With
+    /// nothing merged there is no default, and which commit to move onto is
+    /// a decision — a cut does not make it for you. When the move leaves the
+    /// rebased tip of a member conflicted,
+    /// the report names that member, by its branch or by its short commit id,
+    /// with its conflicted files, and the command exits 1. The member stays
+    /// in the release: resolve it on its branch. The report says "no
+    /// conflicts in this release" only when neither the release nor a moved
+    /// member holds a conflict. A conflicted release with no conflicted
+    /// member still exits 0.
     Rebase {
         /// The rebase target. Bare, the first upstream trunk commit containing
         /// every merged pull request; required when nothing has merged.
@@ -750,11 +756,8 @@ pub enum ReleaseAction {
     /// knives remote, and upstream's tags, which `knives start` writes) those refs pin nothing
     /// for `jj rebase`, so reaping is tidiness, never an unlock.
     ///
-    /// In a stacked series, a superseded name the live release descends from loses only its
-    /// refs, even while the live cut still carries conflicts: its commit stays, exit 0.
-    ///
-    /// Otherwise, keeps every superseded cut while the live one still carries conflicts: the
-    /// previous cut is the only record of how they were last resolved.
+    /// Keeps every superseded cut while the live one still carries conflicts: the previous
+    /// cut is the only record of how they were last resolved.
     ///
     /// Keeps a superseded cut, refs and all, while something rests on it: a workspace's
     /// working copy on it or above it, empty or not, or any other descendant, on the cut, on
