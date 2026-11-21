@@ -300,18 +300,20 @@ pub struct Repository<'a> {
 }
 
 /// Install a fake `gh` that answers each of `repositories` apart, as a forge
-/// does: `repo view <owner>/<name>` gives that repository's identity, and a
-/// by-number facts query (`api graphql -f owner=… -f name=…`) gives the pull
-/// requests of the repository its `owner` and `name` fields name, a number it
-/// does not have being absent from the reply. A status snapshot's wide list
-/// and warm sweep find nothing, so every number a report shows comes from a
-/// facts query. A call naming any other repository fails as gh does for one
-/// that does not exist. Each call's arguments are appended to `log`.
+/// does: `repo view <owner>/<name>` gives that repository's identity, `pr
+/// list -R <owner>/<name>` its pull requests, and a by-number facts query
+/// (`api graphql -f owner=… -f name=…`) the pull requests of the repository
+/// its `owner` and `name` fields name, a number it does not have being
+/// absent from the reply. A status snapshot's warm sweep finds nothing. A
+/// call naming any other repository fails as gh does for one that does not
+/// exist, but a list of one is empty. A pull request row may repeat a field
+/// to replace [`pull_record_with_fields`]'s default: the last one is kept.
+/// Each call's arguments are appended to `log`.
 pub fn install_repository_gh(shim: &Path, repositories: &[Repository<'_>], log: &Path) {
-    let sweep = shim.join("sweep.json");
-    std::fs::write(
-        &sweep,
-        serde_json::to_vec(&serde_json::json!({
+    let sweep = json_file(
+        shim,
+        "sweep.json",
+        &serde_json::json!({
             "data": {
                 "repository": {
                     "pullRequests": {
@@ -320,42 +322,34 @@ pub fn install_repository_gh(shim: &Path, repositories: &[Repository<'_>], log: 
                     }
                 }
             }
-        }))
-        .expect("serialize sweep payload"),
-    )
-    .expect("write sweep payload");
+        }),
+    );
     let mut views = String::new();
+    let mut lists = String::new();
     let mut facts = String::new();
     for (index, repository) in repositories.iter().enumerate() {
         let (owner, name) = repository
             .named
             .split_once('/')
             .expect("a repository is named <owner>/<name>");
-        let identity = shim.join(format!("identity-{index}.json"));
-        std::fs::write(
-            &identity,
-            serde_json::to_vec(&serde_json::json!({
+        let identity = json_file(
+            shim,
+            &format!("identity-{index}.json"),
+            &serde_json::json!({
                 "nameWithOwner": repository.canonical,
                 "id": format!("ID{index}"),
-            }))
-            .expect("serialize identity payload"),
-        )
-        .expect("write identity payload");
+            }),
+        );
         let pulls: Vec<serde_json::Value> =
             serde_json::from_str(repository.pulls).expect("parse fake pull request payload");
-        let reply = shim.join(format!("facts-{index}.json"));
-        std::fs::write(
-            &reply,
-            serde_json::to_vec(&facts_reply(&pulls, &[], &[])).expect("serialize facts payload"),
-        )
-        .expect("write facts payload");
-        writeln!(
-            views,
-            "  {named}) cat \"{}\"; exit 0 ;;",
-            identity.display(),
-            named = repository.named,
-        )
-        .expect("write to a string");
+        let list = json_file(shim, &format!("list-{index}.json"), &pulls);
+        let reply = json_file(
+            shim,
+            &format!("facts-{index}.json"),
+            &facts_reply(&pulls, &[], &[]),
+        );
+        cat_arm(&mut lists, repository.named, &list);
+        cat_arm(&mut views, repository.named, &identity);
         writeln!(
             facts,
             "  \"{owner} {name}\")\n\
@@ -390,7 +384,11 @@ pub fn install_repository_gh(shim: &Path, repositories: &[Repository<'_>], log: 
                esac\n\
                echo \"GraphQL: Could not resolve to a Repository with the name '$3'.\" >&2\n\
                exit 1 ;;\n\
-             \"pr list\") echo '[]'; exit 0 ;;\n\
+             \"pr list\")\n\
+               case \"$4\" in\n\
+             {lists}\
+               esac\n\
+               echo '[]'; exit 0 ;;\n\
              \"api graphql\")\n\
                case \"$owner $name\" in\n\
              {facts}\
@@ -403,6 +401,23 @@ pub fn install_repository_gh(shim: &Path, repositories: &[Repository<'_>], log: 
             log = log.display(),
         ),
     );
+}
+
+/// Write `value` as JSON to `name` in `shim`; its path.
+fn json_file(shim: &Path, name: &str, value: &impl serde::Serialize) -> std::path::PathBuf {
+    let path = shim.join(name);
+    std::fs::write(
+        &path,
+        serde_json::to_vec(value).expect("serialize a fake forge payload"),
+    )
+    .expect("write a fake forge payload");
+    path
+}
+
+/// Append to `arms` a shell `case` arm that prints `path` for `pattern`.
+fn cat_arm(arms: &mut String, pattern: &str, path: &Path) {
+    writeln!(arms, "  {pattern}) cat \"{}\"; exit 0 ;;", path.display())
+        .expect("write to a string");
 }
 
 /// One forge pull request record with the fields the binary requires.

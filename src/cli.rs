@@ -410,7 +410,9 @@ pub enum Command {
         /// name: knives asks the forge whether the upstream or the fork's own
         /// repository has that pull request, and refuses when both or neither
         /// do. `<owner>/<name>#<number>`: the upstream's pull request, or the
-        /// fork's when `<owner>/<name>` is its own repository. A branch name: a
+        /// fork's when `<owner>/<name>` is its own repository. A review pull
+        /// request on another fork's repository is refused, and so is one whose
+        /// head is not a member branch of the fork's owner. A branch name: a
         /// member branch of this fork.
         #[arg(long = "on", required_unless_present = "forget")]
         on: Vec<String>,

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{FormerNames, default_config_path};
-use crate::ids::{BranchTarget, Requirement, UpstreamName};
+use crate::ids::{BranchName, BranchTarget, Requirement, UpstreamName};
 use crate::ledger::{Entry, Ledger, LedgerError, inline_human_text, unmigrated};
 use crate::lock::{FileLock, LockError, LockWait};
 use crate::statement::{StatementKind, Statements};
@@ -594,6 +594,14 @@ impl Store {
             .depends(target.branch.as_str())
             .iter()
             .filter_map(|text| Requirement::parse(text))
+            .collect()
+    }
+
+    /// Every branch of `repo` that requires something now.
+    pub fn dependents(&self, repo: &UpstreamName) -> Vec<BranchName> {
+        self.stated_in(repo)
+            .dependents()
+            .map(BranchName::new)
             .collect()
     }
 
