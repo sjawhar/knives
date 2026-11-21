@@ -18,14 +18,14 @@ use knives::forge::github::CliForge;
 use knives::ids::{BookmarkRef, BranchName, CommitId, ReleaseScheme, RemoteName, RepoName};
 use knives::ledger::{Draft, Ledger, inline_human_text, problem_human_text, shell_word};
 use knives::release_model::{
-    CompositionBaseline, EarlierWrites, PreviousRelease, RecordedCut, RecordedWriteKind,
-    StackedHistoryContext, UnreadFixText, carried_branches, members_event_text,
-    previous_release_for_cut, previous_release_for_record, previous_release_label, series_members,
-    trunk_positions, trunk_positions_in, trunk_reaches,
+    CompositionBaseline, EarlierWrites, RecordedCut, RecordedWriteKind, StackedHistoryContext,
+    UnreadFixText, carried_branches, members_event_text, previous_release_for_cut,
+    previous_release_for_record, read_release, series_members, trunk_positions, trunk_positions_in,
+    trunk_reaches,
 };
 
 use super::release_edit::{
-    announce_unchecked, composition_sources, provenance_parents, report_hidden, union_event_text,
+    announce_unchecked, provenance_parents, report_hidden, union_event_text,
 };
 use super::scribe_for;
 
@@ -164,9 +164,8 @@ pub(crate) fn run_release(
                     commit,
                     writes: &previous_writes,
                     published: previous_published,
-                    tips: &tips,
                 };
-                let standing = release::in_hand_write(&in_hand, entry)?;
+                let standing = release::in_hand_write(&in_hand)?;
                 if let Some(refusal) = release::in_hand_refusal(&in_hand, &standing, entry)? {
                     println!("{repo}: refusing to cut {name}: {refusal}");
                     println!("{repo}: cut discarded; nothing was written at all.");
@@ -187,37 +186,12 @@ pub(crate) fn run_release(
             }
             None => (release::CarriedFrom::Unledgered, String::new()),
         };
-        // A stacked cut starts as one commit on the previous release, with
-        // its tree: identical to it, so it is allowed only where a verbatim
-        // new name is (below), and that is decided before anything is built.
-        if entry.stacked()
-            && let Some((previous_ref, previous_tip)) = &previous
-            && let Some(exit) = stacked_start_gate(
-                &opened,
-                (repo, &name, &pins),
-                (&scheme, &ledger),
-                (previous_ref, previous_tip, previous_published),
-            )?
-        {
-            return Ok(exit);
-        }
-        let (carried, members, audit_base) = if let Some((previous_ref, previous)) = &previous {
-            if entry.stacked() {
-                // The previous release is the stacked cut's one parent and
-                // never a member: nothing is replayed, and every member
-                // `include` adds later is measured from it.
-                let labelled = (
-                    previous_release_label(previous_ref.branch().as_str()),
-                    previous.clone(),
-                );
-                (vec![labelled], Vec::new(), previous.clone())
-            } else {
-                let carried = release::parent_sources(&opened, entry, &scheme, &previous_members)?;
-                let members = carried.clone();
-                let base = release::shared_base(&opened, previous, &trunk)?
-                    .unwrap_or_else(|| trunk.clone());
-                (carried, members, base)
-            }
+        let (carried, members, audit_base) = if let Some((_, previous)) = &previous {
+            let carried = release::parent_sources(&opened, entry, &scheme, &previous_members)?;
+            let members = carried.clone();
+            let base =
+                release::shared_base(&opened, previous, &trunk)?.unwrap_or_else(|| trunk.clone());
+            (carried, members, base)
         } else {
             // The first cut of a series composes only that series' branches:
             // a branch on another series' base would carry that base in.
@@ -263,14 +237,11 @@ pub(crate) fn run_release(
             (carried, members, base)
         };
         let request = release::Cut::from_carried(name.clone(), &carried);
-        // A stacked cut is a fresh merge of its one parent, the previous
-        // release; any other duplicates the previous release onto its parents.
         let mut candidate = release::candidate_cut(
             path,
             &request,
             previous_commit
                 .as_ref()
-                .filter(|_| !entry.stacked())
                 .map(|previous| (previous, previous_carriers.as_slice())),
         )?;
         // The orphan gate protects unreachable commits; this protects the
@@ -278,12 +249,11 @@ pub(crate) fn run_release(
         // parent set that survives the bookmark moving, so every subject is
         // held against the previous cut's event and the newest recorded write
         // of the newest release the ledger records before anything is
-        // recorded or published. In a stacked series that write must also be
-        // on the line of the commit the cut starts on, its first parent. Each
-        // fix by hand that the series holds, an `adopt` of any of its
-        // releases, is held file by file, each file against its reference,
-        // the newest recorded write that holds it with no conflict, where
-        // that reference still holds the fix, by the candidate's own tree.
+        // recorded or published. Each fix by hand that the series holds, an
+        // `adopt` of any of its releases, is held file by file, each file
+        // against its reference, the newest recorded write that holds it with
+        // no conflict, where that reference still holds the fix, by the
+        // candidate's own tree.
         // What this repository cannot read is never held to less: a newest
         // write it lacks refuses the cut, and a fix it cannot measure is
         // held, at each file that its adopt event can name, to what that
@@ -300,16 +270,14 @@ pub(crate) fn run_release(
             base: &audit_base,
             trunk: &trunk,
             tips: &tips,
-            start: request.parents.first().filter(|_| entry.stacked()),
             fixes,
         };
         // A cut is audited against the release it duplicates: a member's
         // divergence that release already had is carried, and the drift is
-        // measured from it. A stacked cut starts with no member.
+        // measured from it.
         let context = release::AuditContext {
             previous: previous_commit.as_ref(),
             trunk: &audit_base,
-            stacked_on: None,
             drift_from: previous_commit
                 .as_ref()
                 .map(|previous| (previous, release::DriftBase::PreviousRelease)),
@@ -562,52 +530,11 @@ fn release_plan_exit(
     Ok((exit, plan.pins))
 }
 
-/// The gate of a cut in a stacked series that has a previous release, before
-/// anything is built: `Some` after refusing, `None` after saying why the cut
-/// may go ahead.
-///
-/// Such a cut starts as one commit on the previous release, with its tree,
-/// and becomes the next release as members are included into it. So it
-/// always starts identical to the previous release, and the identical gate
-/// (`Candidate::matches`) cannot see it: that gate compares parents too, and
-/// the start's one parent is the previous release itself. The start is
-/// allowed where a verbatim cut under a new dated name is
-/// ([`verbatim_cut_reason`]). Otherwise there is nothing to cut, and the
-/// previous release is the composition to edit.
-fn stacked_start_gate(
-    opened: &knives::jj::Repo,
-    (repo, name, pins): (&RepoName, &str, &[knives::pins::Pin]),
-    (scheme, ledger): (&ReleaseScheme, &[knives::ledger::Entry]),
-    (previous, tip, published): (&BookmarkRef, &CommitId, Option<&CommitId>),
-) -> anyhow::Result<Option<Exit>> {
-    // The previous release is a name read from the repository.
-    let shown = inline_human_text(previous.branch().as_str());
-    let Some(why) =
-        verbatim_cut_reason(opened, (pins, scheme, ledger), (previous, tip, published))?
-    else {
-        println!(
-            "{repo}: refusing to cut {name}: it would start identical to {shown} ({}), as one \
-             commit on it; nothing to cut: {shown} is neither published (no tag or `record: \
-             published` note names it) nor frozen by every pin, so `knives release include \
-             <branch>` edits {shown} itself",
-            tip.short()
-        );
-        return Ok(Some(Exit::Incomplete));
-    };
-    println!(
-        "{repo}: {name} starts identical to {shown} ({}), as one commit on it; {why}, so this \
-         new name is the composition to edit — `include`, `advance` or `drop` it before pushing",
-        tip.short()
-    );
-    Ok(None)
-}
-
 /// Why a cut under a new dated name may start identical to `previous`, at
 /// `tip` here and `published` on the publish remote, or `None`: every pin of
 /// a dated or series release is frozen, or it is published (a tag or a
 /// `record: published` note names its commit), so it cannot be edited in
-/// place. The identical gate and [`stacked_start_gate`] each say so in their
-/// own words. Both facts are read whichever one holds.
+/// place.
 fn verbatim_cut_reason(
     opened: &knives::jj::Repo,
     (pins, scheme, ledger): (
@@ -705,11 +632,6 @@ struct CompositionGate<'a> {
     base: &'a knives::ids::CommitId,
     trunk: &'a knives::ids::CommitId,
     tips: &'a knives::detect::BookmarkTips,
-    /// In a stacked series, the commit the subject starts on, whose
-    /// first-parent line must hold the newest recorded write
-    /// ([`release::CompositionDelta::start`]): the commit a record names, or
-    /// the previous release a cut starts on. `None` in any other series.
-    start: Option<&'a CommitId>,
     /// The fixes by hand that the series holds: each `adopt` of any of its
     /// releases, at each file where its hold has not ended, each held
     /// against its reference ([`release::adopted_fixes`]).
@@ -762,7 +684,6 @@ impl CompositionGate<'_> {
             first,
             other: records.next(),
             record: self.record,
-            stacked: self.start.is_some(),
         })
     }
 }
@@ -843,9 +764,6 @@ struct HeldRecords<'a> {
     /// The release cut outside knives that the gate holds
     /// ([`CompositionGate::record`]): `None` for a cut.
     record: Option<(&'a str, &'a CommitId)>,
-    /// Whether the series is stacked ([`CompositionGate::start`]): a
-    /// subject there is built on the newest write.
-    stacked: bool,
 }
 
 impl<'a> HeldRecords<'a> {
@@ -929,9 +847,7 @@ impl<'a> HeldRecords<'a> {
 }
 
 /// Hold the cut subject against the gate's [`CompositionBaseline`]: each
-/// member the previous cut's event or the newest write records, and in a
-/// stacked series the newest write itself, on the line of the commit the
-/// subject starts on ([`CompositionGate::start`]).
+/// member the previous cut's event or the newest write records.
 ///
 /// `Err` is the refusal, already reported. `Ok` carries what the check
 /// found, for the cut event to restate.
@@ -954,7 +870,6 @@ fn recorded_composition_check(
             base: gate.base,
             trunk: gate.trunk,
             tips: gate.tips,
-            start: gate.start,
             fixes: &gate.fixes,
         },
     )?;
@@ -984,10 +899,10 @@ enum DropDisposition {
 }
 
 /// Say what the recorded-composition check found; refuse when members are
-/// gone, when a stacked subject is not built on the newest write, when this
-/// repository does not hold that write, or when the subject lacks a fix by
-/// hand that the series holds, an `adopt` of any of its releases, at a file
-/// where its hold has not ended ([`release::CompositionCheck::refuses`]).
+/// gone, when this repository does not hold the newest write, or when the
+/// subject lacks a fix by hand that the series holds, an `adopt` of any of
+/// its releases, at a file where its hold has not ended
+/// ([`release::CompositionCheck::refuses`]).
 ///
 /// Inconclusive members are reported without refusing, for the same reason the
 /// audit's are: a conflicted replay onto a conflicted cut subject answers
@@ -1010,12 +925,11 @@ fn report_uncarried_cut(
 }
 
 /// The lines [`report_uncarried_cut`] prints, which name each member with
-/// the record that names it ([`HeldRecords::holder`]), the newest write a
-/// stacked subject is not built on or that this repository does not hold,
-/// and each adopt whose fix the subject lacks, with the files where it
-/// lacks it ([`fix_lines`]). A refusal's remedy names the fetch of a commit
-/// that this repository does not hold only where one of `remotes` has a
-/// branch or tag at it ([`fix_remedy`]).
+/// the record that names it ([`HeldRecords::holder`]), the newest write
+/// that this repository does not hold, and each adopt whose fix the subject
+/// lacks, with the files where it lacks it ([`fix_lines`]). A refusal's
+/// remedy names the fetch of a commit that this repository does not hold
+/// only where one of `remotes` has a branch or tag at it ([`fix_remedy`]).
 ///
 /// The recorded release's name and its members are a ledger entry's subject
 /// and evidence, which a peer's pulled ledger can carry any text in; a member
@@ -1054,7 +968,6 @@ fn uncarried_cut_lines(
             fix_files(fix.files(), inline_human_text)
         ));
     }
-    let off_line = held.newest_write().filter(|_| check.off_line);
     let absent = held.newest_write().filter(|_| check.absent_write);
     if !check.refuses() {
         return lines;
@@ -1067,21 +980,6 @@ fn uncarried_cut_lines(
             lines.extend(dropped_lines(repo, (held, source), &dropped, allowed));
             sources.push(source);
         }
-    }
-    if let Some(write) = off_line {
-        let named = write.with_commit(inline_human_text);
-        lines.push(if allowed {
-            format!(
-                "{repo}: --allow-drop: {} without {named} on its first-parent line",
-                held.doing()
-            )
-        } else {
-            format!(
-                "{} does not have {named} on its first-parent line, so it does not carry {}",
-                held.refusing(repo),
-                inline_human_text(&write.recorded().name)
-            )
-        });
     }
     if let Some(write) = absent {
         let named = write.with_commit(inline_human_text);
@@ -1101,7 +999,7 @@ fn uncarried_cut_lines(
     }
     lines.extend(fix_lines(repo, held, &check.dropped_fixes, allowed));
     if !allowed {
-        let write = WriteFindings { off_line, absent };
+        let write = WriteFindings { absent };
         lines.push(refusal_remedy(
             held,
             (&sources, write, &check.dropped_fixes),
@@ -1115,8 +1013,6 @@ fn uncarried_cut_lines(
 /// it.
 #[derive(Clone, Copy)]
 struct WriteFindings<'a> {
-    /// The newest write, where a stacked subject is not built on it.
-    off_line: Option<HeldRecord<'a>>,
     /// The newest write, where this repository does not hold it.
     absent: Option<HeldRecord<'a>>,
 }
@@ -1234,9 +1130,9 @@ fn fix_files(files: &[release::HeldFile], render: fn(&str) -> String) -> String 
 
 /// What a message says after [`fix_files`] of a fix by hand that nothing
 /// here can measure, `why`, the fix of the adopt `commit`: that this
-/// repository does not hold the adopt, or that its series cannot read it,
-/// and that the fix is held by its content, what the reference of each of
-/// `files` holds there ([`release::HeldFile::reference`]). Where `newest`,
+/// repository does not hold the adopt, and that the fix is held by its
+/// content, what the reference of each of `files` holds there
+/// ([`release::HeldFile::reference`]). Where `newest`,
 /// the newest write, is the reference of every file, the message names that
 /// write once. Otherwise it names the reference of each file: an older
 /// write where the newest leaves the file conflicted, or `none here` where
@@ -1281,35 +1177,30 @@ fn unmeasured_fix(
 }
 
 /// Why nothing here can measure the fix by hand of the adopt `commit`,
-/// `why`: `this repository does not hold COMMIT`, or `this repository
-/// cannot read COMMIT as a release of the series`. The commit is a ledger
+/// `why`: `this repository does not hold COMMIT`. The commit is a ledger
 /// entry's evidence, so escaped.
 fn unmeasured_why(why: release::Unmeasured, commit: &CommitId) -> String {
     let adopt = inline_human_text(commit.short());
     match why {
         release::Unmeasured::Absent => format!("this repository does not hold {adopt}"),
-        release::Unmeasured::Unread => {
-            format!("this repository cannot read {adopt} as a release of the series")
-        }
     }
 }
 
 /// The line that closes a refusal of [`uncarried_cut_lines`]: what each
 /// refused finding asks for, or `--allow-drop`. `sources` are the records
-/// whose members the subject lacks, `found` the newest write where a
-/// stacked subject is not built on it or this repository does not hold it,
-/// and `fixes` the fixes by hand that the series holds the subject lacks.
+/// whose members the subject lacks, `found` the newest write where this
+/// repository does not hold it, and `fixes` the fixes by hand that the
+/// series holds the subject lacks.
 ///
-/// A record is built again: on that write when it is off the line, which
-/// carries its fixes too, and after a fetch when this repository does not
-/// hold it, or a write that a lacked file's reference needs or an adopt
-/// whose files nothing here reads whole, where one of `remotes` has a
+/// A record is built again after a fetch when this repository does not
+/// hold that write, or a write that a lacked file's reference needs or an
+/// adopt whose files nothing here reads whole, where one of `remotes` has a
 /// branch or tag at it ([`unread_fetch`]). A cut gets back a member of the
 /// previous cut with `include`, after the move to the newest write where
 /// the refusal names one, and after the `adopt` that takes the move's place
 /// where the refusal names that too. A member only the newest write holds,
-/// a write off the cut's line or not held here, and a fix that the newest
-/// write carries and the cut lacks mean the release here is older than that
+/// a write not held here, and a fix that the newest write carries and the
+/// cut lacks mean the release here is older than that
 /// write, as on a machine that has not fetched it: so the cut is made again
 /// once that write's release is moved to it, after the fetch of each write
 /// that [`unread_fetch`] names, and an `include` on the older commit would
@@ -1348,7 +1239,7 @@ fn refusal_remedy(
         })
         .map(fix_adopt_remedy);
     if held.record.is_some() {
-        let remedies: Vec<String> = record_remedy(held, (sources, found, &asks))
+        let remedies: Vec<String> = record_remedy((sources, found, &asks))
             .into_iter()
             .chain(adopt_fixes)
             .collect();
@@ -1380,7 +1271,6 @@ fn refusal_remedy(
         .iter()
         .copied()
         .find(|source| matches!(source, HeldRecord::NewestWrite(_)))
-        .or(found.off_line)
         .or(found.absent)
         .or_else(|| {
             held.newest_write()
@@ -1433,10 +1323,6 @@ enum FixRemedy<'r> {
     /// ([`Remotes::answered`]), so no fetch brings what reads its files, and
     /// only `--allow-drop` goes past it ([`closing_line`]).
     NoRemote,
-    /// No step: this repository holds the adopt but cannot read it as a
-    /// release of the series, so no fetch brings what reads it, and only
-    /// `--allow-drop` goes past it ([`closing_line`]).
-    Unholdable,
 }
 
 impl<'r> FixRemedy<'r> {
@@ -1449,7 +1335,7 @@ impl<'r> FixRemedy<'r> {
     /// Whether any step meets the fix: a fetch, a commit or an adopt, as
     /// against `--allow-drop` alone.
     const fn has_step(&self) -> bool {
-        !matches!(self, Self::NoRemote | Self::Unholdable)
+        !matches!(self, Self::NoRemote)
     }
 
     /// The fetches that it asks for ([`unread_fetch`]).
@@ -1457,7 +1343,7 @@ impl<'r> FixRemedy<'r> {
         match self {
             Self::Files { fetches, .. } => fetches,
             Self::FetchAdopt(fetch) => std::slice::from_ref(fetch),
-            Self::NoRemote | Self::Unholdable => &[],
+            Self::NoRemote => &[],
         }
     }
 }
@@ -1482,10 +1368,8 @@ struct Fetch<'r> {
 /// remedy names that fetch only where one of `remotes` has a branch or tag
 /// at the adopt now, and otherwise no step meets the fix here, as an edit
 /// abandons the commit it replaced and a later write of the name moves the
-/// ref that held it. Where it holds the adopt but cannot read it as a
-/// release of the series ([`release::Unmeasured::Unread`]), no fetch brings
-/// what reads it, and no commit carries it here. A fix lacked at its files
-/// keeps the adopt of the subject's new content there. A commit carries it
+/// ref that held it. A fix lacked at its files keeps the adopt of the
+/// subject's new content there. A commit carries it
 /// at a file of the adopt's change ([`release::HeldFile::replayed`]), which
 /// a commit that the change replays empty onto carries, or at a file with a
 /// reference ([`release::FixReference::Write`]). A file whose reference
@@ -1508,10 +1392,6 @@ fn fix_remedy<'r>(fix: &'r release::LackedFix, remotes: &'r Remotes<'_>) -> FixR
             unmeasured: release::Unmeasured::Absent,
             ..
         } => fetch(&fix.commit).map_or(FixRemedy::NoRemote, FixRemedy::FetchAdopt),
-        release::FixLack::Unread {
-            unmeasured: release::Unmeasured::Unread,
-            ..
-        } => FixRemedy::Unholdable,
         release::FixLack::Files { files, .. } => {
             let (mut commit, mut fetches) = (files.is_empty(), Vec::new());
             for file in files {
@@ -1549,7 +1429,6 @@ fn unheld_fix(
 ) -> Option<String> {
     let title = fix_title((&fix.name, &fix.commit), inline_human_text);
     match ask {
-        FixRemedy::Unholdable => Some(title),
         FixRemedy::NoRemote => {
             let at = inline_human_text(fix.commit.short());
             let none = match remotes.answered() {
@@ -1618,9 +1497,9 @@ fn closing_line(
 /// ([`closing_line`]). `--allow-drop` goes past that fix only by going past
 /// every finding of the gate ([`release::CompositionCheck::refuses`]) too:
 /// each recorded member that the subject lacks, the newest recorded write
-/// off its line or not held here, and each other fix by hand; and for a
-/// knives cut outside a stacked series, `held` with no record, the commits
-/// reachable only from the previous release as well
+/// not held here, and each other fix by hand; and for a knives cut, `held`
+/// with no record, the commits reachable only from the previous release as
+/// well
 /// ([`report_orphaned_cut`]). So it is the last resort, and the line says
 /// what else it waives. Empty where the refusal holds no such fix, whose
 /// line stays as it was.
@@ -1636,8 +1515,8 @@ fn last_resort(held: HeldRecords<'_>, fixes: &[release::LackedFix]) -> &'static 
         .any(|fix| matches!(fix.lacks, release::FixLack::Unread { .. }));
     match (unread, held.record.is_some()) {
         (false, _) => "",
-        (true, false) if !held.stacked => CUT,
-        (true, _) => RECORD,
+        (true, false) => CUT,
+        (true, true) => RECORD,
     }
 }
 
@@ -1649,38 +1528,22 @@ fn last_resort(held: HeldRecords<'_>, fixes: &[release::LackedFix]) -> &'static 
 /// so `None` where nothing else is lacked: the adopt of the new content, or
 /// `--allow-drop`, is then the way on.
 fn record_remedy(
-    held: HeldRecords<'_>,
     (sources, found, asks): (&[HeldRecord<'_>], WriteFindings<'_>, &[FixRemedy<'_>]),
 ) -> Option<String> {
     let holdable = asks.iter().filter(|ask| ask.commit_carries()).count();
-    let remedy = match (found.absent, found.off_line) {
-        (Some(write), _) if held.stacked => format!(
-            "fetch, then build the commit on {} and record that one; {}",
-            inline_human_text(write.recorded().commit.short()),
-            adopt_remedy(write)
-        ),
-        (Some(write), _) => format!(
+    let remedy = match found.absent {
+        Some(write) => format!(
             "fetch, then record a commit that carries what {} carries; {}",
             inline_human_text(write.recorded().commit.short()),
             adopt_remedy(write)
         ),
-        (None, Some(write)) if sources.is_empty() => format!(
-            "build the commit on {} and record that one",
-            inline_human_text(write.recorded().commit.short())
-        ),
-        (None, Some(write)) => format!(
-            "record a commit built on {} that carries each of them",
-            inline_human_text(write.recorded().commit.short())
-        ),
-        (None, None) if sources.is_empty() && holdable == 0 => return None,
-        (None, None) if sources.is_empty() && holdable == 1 => {
+        None if sources.is_empty() && holdable == 0 => return None,
+        None if sources.is_empty() && holdable == 1 => {
             "record a commit that carries that fix".to_owned()
         }
-        (None, None) if sources.is_empty() => "record a commit that carries those fixes".to_owned(),
-        (None, None) if holdable > 0 => {
-            "record a commit that carries each of them and each fix".to_owned()
-        }
-        (None, None) => "record a commit that carries each of them".to_owned(),
+        None if sources.is_empty() => "record a commit that carries those fixes".to_owned(),
+        None if holdable > 0 => "record a commit that carries each of them and each fix".to_owned(),
+        None => "record a commit that carries each of them".to_owned(),
     };
     Some(format!("{}{remedy}", unread_fetch(asks)))
 }
@@ -1954,8 +1817,7 @@ struct CompletedCut<'a> {
     /// the cut duplicates ([`release::unchecked_suffix`]); empty otherwise.
     unchecked: &'a str,
     /// The composition of a release composed outside knives that `cut NAME
-    /// --at` records: its previous release first, under its label, when it
-    /// has one, then its members, every parent the trunk holds left out
+    /// --at` records: its members, every parent the trunk holds left out
     /// ([`record_hand_cut`]). The event records it, and says the release was
     /// composed outside knives ([`RECORDED_OUTSIDE`]). `None` for a cut
     /// knives wrote or recorded as published, whose event reads its
@@ -1990,12 +1852,7 @@ fn record_cut_event(
     let change = opened.change_id_of(cut.created.as_str())?;
     let members: std::borrow::Cow<'_, [(String, CommitId)]> = match cut.composition {
         Some(composition) => std::borrow::Cow::Borrowed(composition),
-        None => std::borrow::Cow::Owned(cut_composition(
-            fork,
-            &opened,
-            (cut.name, cut.created),
-            cut.scheme,
-        )?),
+        None => std::borrow::Cow::Owned(cut_composition(fork, &opened, cut.created, cut.scheme)?),
     };
     let members_text = members_event_text(&members);
     let mut evidence = vec![cut.created.as_str().to_owned()];
@@ -2043,10 +1900,9 @@ fn record_cut_event(
 /// NAME recorded N member(s)` or `; NAME's newest recorded write (an edit)
 /// holds N member(s)`, then `all carried` or the members the subject
 /// dropped, each member that only the other record holds named with that
-/// record, then `; not built on <the newest write> <commit>` for a stacked
-/// subject that `--allow-drop` let off that write's line, then `; not held
-/// against <the newest write> <commit>, which this repository does not
-/// hold` for a subject that `--allow-drop` let go ahead without that write,
+/// record, then `; not held against <the newest write> <commit>, which this
+/// repository does not hold` for a subject that `--allow-drop` let go ahead
+/// without that write,
 /// then `; without the fix by hand of <release>'s adopt <commit>, in <n>
 /// file(s): <files>` for each fix by hand that `--allow-drop` let the
 /// subject go ahead without, with the files where it lacks it
@@ -2078,12 +1934,6 @@ fn restated_delta(held: Option<HeldRecords<'_>>, check: &release::CompositionChe
     } else {
         dropped.join("; ")
     };
-    let off_line = held
-        .newest_write()
-        .filter(|_| check.off_line)
-        .map_or_else(String::new, |write| {
-            format!("; not built on {}", write.with_commit(str::to_owned))
-        });
     let absent = held
         .newest_write()
         .filter(|_| check.absent_write)
@@ -2127,7 +1977,7 @@ fn restated_delta(held: Option<HeldRecords<'_>>, check: &release::CompositionChe
         format!("; unverified: {}", unverified.join(", "))
     };
     format!(
-        "; {}; {carried}{off_line}{absent}{fixes}{unverified}",
+        "; {}; {carried}{absent}{fixes}{unverified}",
         held.first.restated()
     )
 }
@@ -2135,38 +1985,15 @@ fn restated_delta(held: Option<HeldRecords<'_>>, check: &release::CompositionChe
 /// What a cut event records of `created`, the commit cut as `name`: each
 /// parent with where it came from ([`release::parent_sources`]), in parent
 /// order.
-///
-/// A release of a stacked series records its reading instead
-/// ([`release::release_reading`]): its previous release first when it has
-/// one, under its label ([`PreviousRelease::labelled`]), then its members,
-/// the side parents on its first-parent line, never the commit's literal
-/// parents. A commit the reading refuses is no release to record.
 fn cut_composition(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
-    (name, created): (&str, &CommitId),
+    created: &CommitId,
     scheme: &ReleaseScheme,
 ) -> anyhow::Result<Vec<(String, CommitId)>> {
-    let entry = fork.entry;
-    if entry.stacked() {
-        let ledger = Ledger::for_fork(fork).read()?.entries;
-        let tips = opened.bookmark_tips()?;
-        let published = tips.get(&BookmarkRef::Remote {
-            branch: BranchName::new(name),
-            remote: RemoteName::new(entry.publish_remote()),
-        });
-        let writes = EarlierWrites::read(opened, name, &ledger, published)?;
-        return match release::release_reading(opened, entry, (&ledger, &tips), (&writes, created))?
-        {
-            Ok(reading) => {
-                composition_sources(opened, entry, (reading.previous.as_ref(), &reading.members))
-            }
-            Err(unexplained) => anyhow::bail!("{name}: {unexplained}"),
-        };
-    }
     release::parent_sources(
         opened,
-        entry,
+        fork.entry,
         scheme,
         &opened.parent_commits(created.as_str())?,
     )
@@ -2224,14 +2051,14 @@ fn checked_committed_cut(
 ///
 /// The name and the pulled plan are gated before this ([`requested_cut`],
 /// [`release_plan_exit`]), and the commit and its name here
-/// ([`hand_cut_gates`]). Its members are its series' reading of it
-/// ([`hand_cut_composition`]), audited as every cut is
-/// ([`checked_committed_cut`]). The audit replays each member and each
-/// parent the trunk holds, and measures the drift from the release the
-/// record follows: the previous release a stacked one stacks on, else
-/// `follows`, the newest other release of the series, as a cut's audit
-/// measures it ([`previous_release_for_record`]). A first record follows no
-/// release, and its drift is measured from its members' fork point with the
+/// ([`hand_cut_gates`]). Its members are its parents, its carriers and
+/// every parent the trunk holds left out ([`hand_cut_composition`]),
+/// audited as every cut is ([`checked_committed_cut`]). The audit replays
+/// each member and each parent the trunk holds, and measures the drift
+/// from the release the record follows: `follows`, the newest other release
+/// of the series, as a cut's audit measures it
+/// ([`previous_release_for_record`]). A first record follows no release,
+/// and its drift is measured from its members' fork point with the
 /// trunk: it is the release every later record's drift is measured from, so
 /// a change no member explains is refused in it too. Then the commit is held
 /// against the gate's baseline ([`CompositionBaseline`], NAME aside): the
@@ -2246,13 +2073,9 @@ fn checked_committed_cut(
 /// write that holds the file with no conflict. The drift check leaves
 /// those files to the gate. This repository must hold the newest write, or
 /// the record is refused and told to fetch it
-/// ([`release::CompositionCheck::absent_write`]).
-/// In a stacked series that write, a successor of it or a copy with its
-/// tree must be the commit or on its first-parent line
-/// ([`release::CompositionDelta::start`]), so a commit built on an older
-/// release than that one is refused, however many levels of the stack it
-/// leaves out. Each refusal writes nothing. Only then is the local
-/// bookmark made, where no ref of the name exists, and the event recorded,
+/// ([`release::CompositionCheck::absent_write`]). Each refusal writes
+/// nothing. Only then is the local bookmark made, where no ref of the name
+/// exists, and the event recorded,
 /// which the process sends to a shared ledger before it exits; the
 /// commit's repeated headings print once after them, even where the
 /// record fails after the bookmark was made ([`write_hand_cut`]).
@@ -2282,7 +2105,7 @@ fn record_hand_cut(
     let composed = match hand_cut_composition(
         (fork, opened),
         (name, commit),
-        (&ledger, &writes),
+        &writes,
         (&tips, &trunk, follows.as_ref()),
     )? {
         Ok(composed) => composed,
@@ -2302,7 +2125,6 @@ fn record_hand_cut(
         base: &composed.base,
         trunk: &trunk,
         tips: &tips,
-        start: entry.stacked().then_some(commit),
         fixes,
     };
     // A parent the trunk holds is no member, but the release holds its
@@ -2321,7 +2143,6 @@ fn record_hand_cut(
         context: release::AuditContext {
             previous: None,
             trunk: &composed.base,
-            stacked_on: composed.previous.as_ref().map(|previous| &previous.commit),
             drift_from: Some(composed.drift_from(follows.as_ref().map(|(_, previous)| previous))),
         },
         carried_from: release::CarriedFrom::Unledgered,
@@ -2330,15 +2151,7 @@ fn record_hand_cut(
         Ok(checked) => checked,
         Err(exit) => return Ok(exit),
     };
-    // The event records the reading made above: a stacked release's previous
-    // release first, under its label, then the members, never a parent the
-    // trunk holds.
-    let composition: Vec<(String, CommitId)> = composed
-        .previous
-        .iter()
-        .map(PreviousRelease::labelled)
-        .chain(composed.members.iter().cloned())
-        .collect();
+    // The event records the members, never a parent the trunk holds.
     let cut = CompletedCut {
         name,
         request: &release::Cut::from_carried(name.to_owned(), &composed.members),
@@ -2351,7 +2164,7 @@ fn record_hand_cut(
         // Recorded, not written: knives unioned nothing.
         unions: &[],
         unchecked: "",
-        composition: Some(&composition),
+        composition: Some(&composed.members),
     };
     let unpushed = held.published.is_none();
     release::with_last_write_headings(|last| {
@@ -2620,9 +2433,7 @@ fn refuse_recorded_name(
 /// ([`knives::release_model::recorded_release_names`]).
 ///
 /// A record takes a name that sorts after every other release of its series,
-/// as a cut does: the reap after the next cut keeps only the newest name, and
-/// the previous release of a stacked series is the nearest one recorded on
-/// its first-parent line.
+/// as a cut does: the reap after the next cut keeps only the newest name.
 fn newer_release(
     scheme: &ReleaseScheme,
     follows: Option<&(BookmarkRef, CommitId)>,
@@ -2680,10 +2491,8 @@ fn name_refs(
     Ok(refs)
 }
 
-/// What a release cut outside knives composes, as its series reads it.
+/// What a release cut outside knives composes.
 struct HandCut {
-    /// The previous release a release of a stacked series stacks on.
-    previous: Option<PreviousRelease>,
     /// Each member with where it came from ([`release::parent_sources`]).
     /// Never a parent the trunk holds.
     members: Vec<(String, CommitId)>,
@@ -2692,49 +2501,42 @@ struct HandCut {
     /// holds all the same.
     bases: Vec<(String, CommitId)>,
     /// What the audit replays each member from and the composition gate's
-    /// base: the previous release, or the trunk's fork point with the
-    /// members, as for a first cut. With no release to follow, the series'
-    /// first record measures its drift from it too ([`Self::drift_from`]).
+    /// base: the trunk's fork point with the members, as for a first cut.
+    /// With no release to follow, the series' first record measures its
+    /// drift from it too ([`Self::drift_from`]).
     base: CommitId,
 }
 
 impl HandCut {
-    /// What the record's drift is measured from: the previous release it
-    /// stacks on, else `follows`, the series' previous release. The series'
-    /// first record follows no release, so its drift is measured from
-    /// `base`, its members' fork point with the trunk, and a change no member
+    /// What the record's drift is measured from: `follows`, the series'
+    /// previous release. The series' first record follows no release, so its
+    /// drift is measured from `base`, its members' fork point with the
+    /// trunk, and a change no member
     /// explains is refused as in a later record.
     fn drift_from<'a>(
         &'a self,
         follows: Option<&'a CommitId>,
     ) -> (&'a CommitId, release::DriftBase) {
-        self.previous
-            .as_ref()
-            .map(|previous| &previous.commit)
-            .or(follows)
-            .map_or((&self.base, release::DriftBase::ForkPoint), |previous| {
-                (previous, release::DriftBase::PreviousRelease)
-            })
+        follows.map_or((&self.base, release::DriftBase::ForkPoint), |previous| {
+            (previous, release::DriftBase::PreviousRelease)
+        })
     }
 }
 
-/// The members of `commit`, a release cut outside knives, as its series
-/// reads it ([`release::release_reading`]), or the exit after refusing it.
+/// The members of `commit`, a release cut outside knives, or the exit after
+/// refusing it.
 ///
 /// A parent the trunk holds, which a trunk position reaches, is never a
-/// member: it is one of the reading's bases. A stacked series that has a
-/// previous release reads `commit` as that release and the side parents on
-/// its first-parent line, and refuses it when that line holds a one-parent
-/// commit; a start commit on that release is a release with no member.
-/// Otherwise its members are its parents, its carriers left out, and it is
-/// refused when it merges no member, when a member is `follows`, the
-/// series' previous release, which is never a member either, or when a
-/// member carries a merge past the trunk: only a stacked series reads a
-/// release made on its previous release ([`stacked_record_remedy`]).
+/// member: it is one of the bases. Its members are its parents, its
+/// carriers left out, and it is refused when it merges no member, when a
+/// member is `follows`, the series' previous release, which is never a
+/// member either ([`previous_parent_remedy`]), or when a member carries a
+/// merge past the trunk ([`chain_record_remedy`]): a release is one flat
+/// octopus merge ([`FLAT_RELEASE`]).
 fn hand_cut_composition(
     (fork, opened): (&Fork<'_>, &knives::jj::Repo),
     (name, commit): (&str, &CommitId),
-    (ledger, writes): (&[knives::ledger::Entry], &EarlierWrites),
+    writes: &EarlierWrites,
     (tips, trunk, follows): (
         &knives::detect::BookmarkTips,
         &CommitId,
@@ -2743,17 +2545,7 @@ fn hand_cut_composition(
 ) -> anyhow::Result<Result<HandCut, Exit>> {
     let (repo, entry) = (&fork.name, fork.entry);
     let (shown, at) = (inline_human_text(name), commit.short());
-    let reading = match release::release_reading(opened, entry, (ledger, tips), (writes, commit))? {
-        Ok(reading) => reading,
-        Err(unexplained) => {
-            // The previous release's name is a ledger subject or a ref.
-            println!(
-                "{repo}: refusing to record {shown} at {at}: {}",
-                inline_human_text(&unexplained.to_string())
-            );
-            return Ok(Err(Exit::Incomplete));
-        }
-    };
+    let reading = read_release(opened, (writes, commit))?;
     let trunks = trunk_positions_in(tips, entry);
     let (mut members, mut bases) = (Vec::new(), Vec::new());
     for sourced in
@@ -2764,14 +2556,6 @@ fn hand_cut_composition(
         } else {
             members.push(sourced);
         }
-    }
-    if let Some(previous) = reading.previous {
-        return Ok(Ok(HandCut {
-            base: previous.commit.clone(),
-            previous: Some(previous),
-            members,
-            bases,
-        }));
     }
     if members.is_empty() {
         println!(
@@ -2790,7 +2574,7 @@ fn hand_cut_composition(
              previous release, which is never a member; {}",
             previous_commit.short(),
             inline_human_text(previous.branch().as_str()),
-            previous_parent_remedy(fork)
+            previous_parent_remedy()
         );
         return Ok(Err(Exit::Incomplete));
     }
@@ -2801,66 +2585,37 @@ fn hand_cut_composition(
         }
         println!(
             "{repo}: refusing to record {shown} at {at}: {}",
-            stacked_record_remedy(fork)
+            chain_record_remedy()
         );
         return Ok(Err(Exit::Incomplete));
     }
     let member_tips: Vec<CommitId> = members.iter().map(|(_, tip)| tip.clone()).collect();
     let base = opened.fork_point_of(&member_tips, trunk)?;
     Ok(Ok(HandCut {
-        previous: None,
         members,
         bases,
         base,
     }))
 }
 
+/// What every release is: a record of a commit built on an earlier release
+/// is refused with it ([`previous_parent_remedy`], [`chain_record_remedy`]).
+const FLAT_RELEASE: &str =
+    "a release must be a flat octopus merge of the trunk and its member branches";
+
 /// Why a release cut outside knives whose member carries a merge past the
 /// trunk is refused, and what records it.
-fn stacked_record_remedy(fork: &Fork<'_>) -> String {
-    if fork.entry.stacked() {
-        return "no previous release of the series is on its first-parent line, so it reads as \
-                the series' first cut, which is flat; rebase each member above off the trunk"
-            .to_owned();
-    }
+fn chain_record_remedy() -> String {
     format!(
-        "a member above stacks on an earlier merge, as a release made as merges on its previous \
-         release does; {}, or rebase each member off the trunk",
-        stacked_setting(fork)
+        "a member above stacks on an earlier merge; {FLAT_RELEASE}: rebase each member above off \
+         the trunk"
     )
 }
 
 /// Why a release cut outside knives that merges its series' previous
 /// release as a member is refused, and what records it.
-fn previous_parent_remedy(fork: &Fork<'_>) -> String {
-    if fork.entry.stacked() {
-        return "a release of a stacked series has its previous release as its first parent, so \
-                make it the first one"
-            .to_owned();
-    }
-    format!(
-        "such a release is made on its previous release, and {}",
-        stacked_setting(fork)
-    )
-}
-
-/// Which series reads a release made as merges on its previous release,
-/// for a series without the `stacked = true` setting: the setting to make.
-fn stacked_setting(fork: &Fork<'_>) -> String {
-    fork.entry.selected_series.as_ref().map_or_else(
-        || {
-            "only a named series whose table sets `stacked = true` reads one, and the default \
-             series has no table; record it in such a series"
-                .to_owned()
-        },
-        |series| {
-            format!(
-                "only a series with `stacked = true` on its table reads one; set `stacked = true` \
-                 on [repos.{}.series.\"{series}\"] to record it",
-                fork.name
-            )
-        },
-    )
+fn previous_parent_remedy() -> String {
+    format!("{FLAT_RELEASE}: merge the members, not the previous release")
 }
 
 /// What a published and recorded cut prints, and the exit of its checks
@@ -3046,18 +2801,11 @@ fn report_orphaned_cut(
 
 /// The commits the cut would strand, reachable only from the previous
 /// release or its descendants, or `None`.
-///
-/// A stacked series strands none: its cut keeps the previous release as its
-/// first parent, and the reap after it abandons nothing the cut descends
-/// from, so that release and every descendant of it stay visible.
 fn check_orphan_commits_before_cut(
     opened: &knives::jj::Repo,
     fork: &Fork<'_>,
 ) -> anyhow::Result<Option<OrphanedLineage>> {
     let entry = fork.entry;
-    if entry.stacked() {
-        return Ok(None);
-    }
     let tips = opened.bookmark_tips()?;
     let Some(previous) = previous_release_for_cut(entry, &tips) else {
         return Ok(None);
@@ -3241,28 +2989,13 @@ struct Reaped {
 /// The reap both callers run, on the repository as it is now. The ledger's
 /// earlier writes of each name count for the keep rule and are cleaned up
 /// after it.
-///
-/// A stacked series first forgets each superseded name the live release
-/// descends from ([`release::forget_superseded_ancestors`]): it is reported
-/// with the names whose commit stays, and nothing of it is abandoned, its
-/// earlier writes included. Every other name keeps the rules below.
 fn reap(fork: &Fork<'_>) -> anyhow::Result<Reaped> {
     let path = &fork.checkout.path;
     let (scheme, publish_remote) = (fork.entry.dated_scheme(), fork.entry.publish_remote());
-    let descended = if fork.entry.stacked() {
-        release::forget_superseded_ancestors(
-            &knives::jj::Repo::open(path)?,
-            &scheme,
-            publish_remote,
-        )?
-    } else {
-        Vec::new()
-    };
     let opened = knives::jj::Repo::open(path)?;
     let ledger = Ledger::for_fork(fork).read()?.entries;
     let mut report = release::reap_superseded(&opened, &scheme, publish_remote, &ledger)?;
     let cleaned = abandon_reaped_writes(fork, &report, &ledger);
-    report.forgotten_only.extend(descended);
     report.notes.extend(cleaned.notes);
     // The reap's own abandons hid what they exposed in one operation over
     // every reaped name, so those heads are named with all of them.
@@ -3285,8 +3018,7 @@ struct ReapPayload {
     repo: String,
     /// Names whose refs were forgotten and commits abandoned.
     reaped: Vec<String>,
-    /// Names whose refs were forgotten while a pin kept the commit, or, in a
-    /// stacked series, while the live release descends from it.
+    /// Names whose refs were forgotten while a pin kept the commit.
     forgotten_only: Vec<NamedReason>,
     /// Names left untouched, with why.
     kept: Vec<NamedReason>,
@@ -3521,7 +3253,6 @@ mod tests {
                 name: format!("feat/{HOSTILE}@aaaa"),
             }],
             twins: vec![(format!("feat/{HOSTILE}@bbbb"), CommitId::new("cccc"))],
-            off_line: true,
             absent_write: true,
             inconclusive_fixes: Vec::new(),
             dropped_fixes: Vec::new(),
@@ -3540,13 +3271,11 @@ mod tests {
                 first: HeldRecord::PreviousCut(&cut),
                 other: Some(HeldRecord::NewestWrite(&write)),
                 record: None,
-                stacked: false,
             },
             HeldRecords {
                 first: HeldRecord::NewestWrite(&write),
                 other: Some(HeldRecord::PreviousCut(&cut)),
                 record: Some(("release/2026-11-14", &at)),
-                stacked: false,
             },
         ];
         let none = no_remote();
@@ -3577,10 +3306,6 @@ mod tests {
             format!("    feat/{ESCAPED}@abab"),
             format!("feat/{ESCAPED}@aaaa: recorded by the previous cut release/{ESCAPED}"),
             format!("feat/{ESCAPED}@bbbb is carried by cccc"),
-            format!(
-                "release/{ESCAPED}.2's newest recorded write (an edit) {short} on its \
-                 first-parent line"
-            ),
             format!(
                 "cannot be held against release/{ESCAPED}.2's newest recorded write (an edit) \
                  {short}: this repository does not hold that commit"
@@ -3624,7 +3349,6 @@ mod tests {
             first: HeldRecord::NewestWrite(&write),
             other: None,
             record: Some(("release/2026-11-14", &at)),
-            stacked: false,
         };
 
         // When: the gate says what it found, refused and allowed.
@@ -3698,7 +3422,6 @@ mod tests {
             first: HeldRecord::NewestWrite(&write),
             other: None,
             record: Some(("release/2026-11-14", &at)),
-            stacked: false,
         };
         let refuse = DropDisposition::RefuseRecordingNothing;
 
@@ -3774,7 +3497,6 @@ mod tests {
             first: HeldRecord::NewestWrite(&write),
             other: None,
             record: Some(("release/2026-11-14", &at)),
-            stacked: false,
         };
         let cut = HeldRecords {
             record: None,
@@ -4057,7 +3779,6 @@ mod tests {
             first: HeldRecord::NewestWrite(&write),
             other: None,
             record: record.then_some(("release/2026-11-14", &at)),
-            stacked: false,
         };
         let on_drop = if record {
             DropDisposition::RefuseRecordingNothing
@@ -4071,116 +3792,6 @@ mod tests {
         let lines = uncarried_cut_lines(&RepoName::new("demo"), held, &check, (on_drop, remotes));
         assert_escaped(&lines);
         lines
-    }
-
-    /// How a refusal ends for [`beyond_bound`]'s fix where this repository
-    /// holds its adopt but cannot read it as a release of the series.
-    fn unheld_ending() -> String {
-        format!(
-            "re-run with --allow-drop to state the drop is intended: nothing in this repository \
-             can hold a release against the fix by hand of release/{ESCAPED}'s adopt {}",
-            ids_prefix(ESCAPED)
-        )
-    }
-
-    #[test]
-    fn a_fix_that_nothing_here_can_hold_a_release_against_asks_only_for_allow_drop() {
-        // Given: the fix by hand of an adopt that this repository holds but
-        // cannot read as a release of the series, whose event names its files
-        // in a list that it cannot read whole; and the same fix where this
-        // repository does not hold the adopt.
-        let unread = release::Unmeasured::Unread;
-
-        // When: the gate refuses a record and a cut that lack the first, and
-        // a record that lacks the second, where origin has a branch at the
-        // adopt.
-        let none = no_remote();
-        let record = fix_refusal(true, vec![beyond_bound(unread)], &none);
-        let cut = fix_refusal(false, vec![beyond_bound(unread)], &none);
-        let origin = origin_has(&format!("refs/heads/release/{HOSTILE}"), HOSTILE);
-        let absent = fix_refusal(
-            true,
-            vec![beyond_bound(release::Unmeasured::Absent)],
-            &origin,
-        );
-
-        // Then: the refusal names the adopt and why the subject cannot be held
-        // against it; its remedy asks for no fetch and no commit, says that
-        // nothing here can hold a release against the fix, and gives
-        // `--allow-drop`; and the adopt this repository does not hold is
-        // still fetched from origin. Each line ends saying that
-        // `--allow-drop` is the last resort and what else it waives.
-        let (short, ending) = (ids_prefix(ESCAPED), unheld_ending());
-        assert_eq!(
-            record,
-            [
-                format!(
-                    "demo: refusing to record release/2026-11-14 at eeee: it cannot be held \
-                     against the fix by hand of release/{ESCAPED}'s adopt {short}: this \
-                     repository cannot read {short} as a release of the series, and the adopt's \
-                     event is an older one that names the files of the fix in its text alone, in \
-                     a list of more than 16 pieces, which may name a path of more pieces than \
-                     this repository reads"
-                ),
-                format!("  nothing was recorded; {ending}{RECORD_LAST_RESORT}"),
-            ]
-        );
-        assert_eq!(
-            cut.last(),
-            Some(&format!(
-                "  the candidate was discarded; {ending}{CUT_LAST_RESORT}"
-            ))
-        );
-        assert_eq!(
-            absent.last(),
-            Some(&format!(
-                "  nothing was recorded; fetch origin's refs/heads/release/{ESCAPED}, which holds \
-                 {short}, then record a commit that carries that fix, or re-run with --allow-drop \
-                 to state the drop is intended{RECORD_LAST_RESORT}"
-            ))
-        );
-    }
-
-    #[test]
-    fn a_fix_that_nothing_here_can_hold_a_release_against_leaves_the_other_remedies() {
-        // Given: the fix by hand of an adopt that this repository holds but
-        // cannot read as a release of the series, whose event names its files
-        // in a list that it cannot read whole, and the fix by hand of another
-        // adopt at a file whose reference is the newest write.
-        let both = || vec![beyond_bound(release::Unmeasured::Unread), held_fix()];
-
-        // When: the gate refuses a record and a cut that lack both.
-        let none = no_remote();
-        let (record, cut) = (
-            fix_refusal(true, both(), &none),
-            fix_refusal(false, both(), &none),
-        );
-
-        // Then: the other fix keeps its remedies, the commit or the move and
-        // the adopt of the new content, and `--allow-drop` follows them for
-        // the fix that nothing here can hold a release against; the line
-        // ends saying that `--allow-drop` is the last resort and what else
-        // it waives, the other fix among them.
-        let (ending, keep) = (
-            unheld_ending(),
-            "to keep the new content of those files, edit release/2026-11-13 by hand to hold it \
-             and run `knives release adopt release/2026-11-13`",
-        );
-        assert_eq!(
-            record.last(),
-            Some(&format!(
-                "  nothing was recorded; record a commit that carries that fix; {keep}; then \
-                 {ending}{RECORD_LAST_RESORT}"
-            ))
-        );
-        assert_eq!(
-            cut.last(),
-            Some(&format!(
-                "  the candidate was discarded; fetch, then move release/2026-11-13 to bbbb, its \
-                 newest recorded write: `jj bookmark set release/2026-11-13 -r bbbb \
-                 --allow-backwards`; {keep}; then {ending}{CUT_LAST_RESORT}"
-            ))
-        );
     }
 
     #[test]
@@ -4256,7 +3867,6 @@ mod tests {
             first: HeldRecord::NewestWrite(&write),
             other: None,
             record: Some(("release/2026-11-14", &at)),
-            stacked: false,
         };
         let cut = HeldRecords {
             record: None,
@@ -4381,7 +3991,6 @@ mod tests {
             first: HeldRecord::PreviousCut(&cut),
             other: Some(HeldRecord::NewestWrite(&write)),
             record: None,
-            stacked: false,
         };
 
         // When: the gate refuses the cut.
@@ -4439,7 +4048,6 @@ mod tests {
             first: HeldRecord::PreviousCut(&cut),
             other: Some(HeldRecord::NewestWrite(&write)),
             record: None,
-            stacked: false,
         };
 
         // When: the gate refuses the cut.
@@ -4468,40 +4076,6 @@ mod tests {
                  is intended"
             )
         );
-    }
-
-    #[test]
-    fn a_refused_stacked_cut_names_no_check_of_the_commits_only_the_previous_release_reaches() {
-        // Given: the newest write, `release/2026-11-13`'s cut `bbbb`, which
-        // records the member `feat/alpha@abab`; the fix by hand of an adopt
-        // whose files nothing here reads whole; and the records a cut holds
-        // in a stacked series and outside one.
-        let write = RecordedCut {
-            kind: RecordedWriteKind::Cut,
-            name: "release/2026-11-13".to_owned(),
-            commit: CommitId::new("bbbb"),
-            members: vec![CommitId::new("abab")],
-        };
-        let stacked = HeldRecords {
-            first: HeldRecord::NewestWrite(&write),
-            other: None,
-            record: None,
-            stacked: true,
-        };
-        let flat = HeldRecords {
-            stacked: false,
-            ..stacked
-        };
-        let fixes = [beyond_bound(release::Unmeasured::Absent)];
-
-        // When: each refusal's last words are read.
-        let (stacked_last, flat_last) = (last_resort(stacked, &fixes), last_resort(flat, &fixes));
-
-        // Then: the stacked cut, which runs no orphan check, ends as a
-        // record does; only the cut outside a stacked series names the
-        // commits reachable only from the previous release.
-        assert_eq!(stacked_last, RECORD_LAST_RESORT);
-        assert_eq!(flat_last, CUT_LAST_RESORT);
     }
 
     #[test]
@@ -4607,7 +4181,6 @@ mod tests {
             first: HeldRecord::PreviousCut(&cut),
             other: Some(HeldRecord::NewestWrite(&write)),
             record: None,
-            stacked: false,
         };
 
         // When: its event restates the records it was held against.
@@ -4651,7 +4224,6 @@ mod tests {
             first: HeldRecord::PreviousCut(&cut),
             other: None,
             record: None,
-            stacked: false,
         };
 
         // When: its event restates the records it was held against.
@@ -4705,8 +4277,8 @@ mod tests {
             )
         );
         // And: a fix that nothing here can measure names its adopt as a
-        // commit this repository does not hold, or as one its series cannot
-        // read, with the newest write whose content held it.
+        // commit this repository does not hold, with the newest write whose
+        // content held it.
         let write = RecordedCut {
             kind: RecordedWriteKind::Cut,
             name: format!("release/{HOSTILE}.2"),
@@ -4719,23 +4291,13 @@ mod tests {
         )];
         let newest = (Some(HeldRecord::NewestWrite(&write)), held.as_slice());
         let absent = unmeasured_fix((release::Unmeasured::Absent, &commit), newest);
-        let unread = unmeasured_fix((release::Unmeasured::Unread, &commit), newest);
-        assert_escaped(&[absent.clone(), unread.clone()]);
+        assert_escaped(std::slice::from_ref(&absent));
         assert_eq!(
             absent,
             format!(
                 " (this repository does not hold {short}, so the fix is held by its content: \
                  what release/{ESCAPED}.2's newest recorded write (a cut) {short} holds in those \
                  files)",
-                short = ids_prefix(ESCAPED)
-            )
-        );
-        assert_eq!(
-            unread,
-            format!(
-                " (this repository cannot read {short} as a release of the series, so the fix is \
-                 held by its content: what release/{ESCAPED}.2's newest recorded write (a cut) \
-                 {short} holds in those files)",
                 short = ids_prefix(ESCAPED)
             )
         );

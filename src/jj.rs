@@ -1234,8 +1234,7 @@ impl Repo {
     /// The visible rewrites of `commit` ([`Self::rewrites_of`]) that stand
     /// for it ([`Self::stands_for`]): its successors and its copies that keep
     /// its change id, never a commit it replaced. A copy with a new change id
-    /// is no rewrite; a caller that holds copies too compares trees
-    /// ([`crate::release_model::on_first_parent_line`]).
+    /// is no rewrite; a caller that holds copies too compares trees.
     pub fn standing_rewrites_of(&self, commit: &CommitId) -> Result<Vec<CommitId>, JjError> {
         let mut standing = Vec::new();
         for rewrite in self.rewrites_of(commit.as_str())? {
@@ -1314,11 +1313,7 @@ impl Repo {
     /// ([`duplicated_from`]), and `write`'s own tree, which a union puts
     /// under the blocks the members bring in.
     ///
-    /// `composed` is what `write` composes: its parents less its carriers,
-    /// or, for a release of a stacked series, its previous release and its
-    /// members. A release made as a chain of merges, one member each, holds
-    /// what each inner merge resolved, and that is its own change only
-    /// against the merge of all it composes, never against its own parents.
+    /// `composed` is what `write` composes: its parents less its carriers.
     ///
     /// Built in a transaction that is dropped, never committed, so it leaves
     /// nothing an operation names; the trees it wrote stay readable from the
@@ -2930,15 +2925,6 @@ pub enum Measured<'a> {
     /// so what the source resolved over a carrier becomes its own change and
     /// the duplicate keeps it.
     WithoutCarriers(&'a [CommitId]),
-    /// What it composes, never its own parents, its carriers left out. A
-    /// release of a stacked series composes its previous release and its
-    /// members. Made as a chain of merges, one member each, it holds what
-    /// each inner merge resolved, and none of that is its top commit's own
-    /// change. So the source is first written again on these with its own
-    /// tree, and that in-between commit is duplicated: the write keeps every
-    /// resolution the chain holds. A source whose own parents are these is
-    /// duplicated as it is.
-    Composed(&'a [CommitId]),
 }
 
 /// What a release write made, and what became of the commit it replaced.
@@ -3058,7 +3044,6 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
     let (written, source, unions) = if let Some(source) = write.source {
         let source = repo.commit(source.as_str())?;
         let measured = match write.measured {
-            Measured::Composed(composed) => resolved_parents(&repo, composed)?.1,
             Measured::WithoutCarriers(carriers) => without_carriers(&source, carriers),
         };
         let (written, unions) =
@@ -3546,15 +3531,13 @@ fn without_carriers(source: &jj_lib::commit::Commit, carriers: &[CommitId]) -> V
 }
 
 /// [`duplicated_release`] of `source`, its own change measured against the
-/// merge of `measured`: its parents less its carriers ([`without_carriers`]),
-/// or what it composes ([`Measured::Composed`]).
+/// merge of `measured`: its parents less its carriers ([`without_carriers`]).
 ///
 /// A duplicate replays the source's own change, its tree against the merge
 /// of its parents, onto the new parents. With a carrier among those parents
 /// the merge already holds every resolution the carrier holds, so the
 /// source's own change is empty there and a duplicate onto the members alone
-/// loses them; a chain of merges holds what each inner merge resolved, which
-/// is no change of its top commit's own. So a source whose parents are not
+/// loses them. So a source whose parents are not
 /// `measured` is first written again as an in-between commit on `measured`
 /// with its own tree, description and author, which makes those resolutions
 /// its own change; that commit is duplicated; and it is recorded abandoned in
@@ -3768,8 +3751,8 @@ pub enum ResolutionBaseline<'a> {
     /// A recorded write this repository holds, rebuilt on the resolution's
     /// `members` as a knives write onto them builds it: `write`'s own change,
     /// its tree against the merge of `composed`, what it composes (its
-    /// parents less its carriers, or a stacked write's previous release and
-    /// members), rebased onto them with the release-log union, the tree
+    /// parents less its carriers), rebased onto them with the release-log
+    /// union, the tree
     /// [`Repo::holds_rebased_write`] reads. A member rewritten in place,
     /// which makes jj rebase the release, is then no change of the
     /// resolution's.
@@ -4815,26 +4798,6 @@ pub fn forget_and_abandon(
     )?;
     commit_mutation(&repo, tx, operation)?;
     Ok(outcome)
-}
-
-/// Forget every ref of each of `names`, locally and on every remote, as ONE
-/// operation, and abandon nothing.
-///
-/// The reap of a stacked series retires a superseded name this way when the
-/// live release descends from its commit: the commit stays, reachable from
-/// the live release, and only the name goes. Nothing changes on any remote; a
-/// later fetch re-materializes whatever still exists there, as after
-/// [`forget_and_abandon`].
-pub fn forget_bookmarks(repo: &Path, names: &[String], operation: &str) -> Result<(), JjError> {
-    if names.is_empty() {
-        return Ok(());
-    }
-    let repo = Repo::open_to_write(repo)?;
-    let mut tx = repo.repo.start_transaction();
-    for name in names {
-        forget_refs(tx.repo_mut(), name);
-    }
-    commit_mutation(&repo, tx, operation)
 }
 
 /// Refuse to abandon a commit that a local bookmark still names, other than a

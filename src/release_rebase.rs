@@ -81,19 +81,6 @@ pub(crate) fn run_rebase(
         println!("{repo}: no release to move");
         return Ok(Exit::Ok);
     };
-    // Each release of a stacked series is one merge of the previous release
-    // and its members, built on that release: there is no base to move, and
-    // a rebase would move the previous release's own commits under it.
-    if entry.stacked() {
-        println!(
-            "{repo}: refusing to rebase {}: the {} is stacked, so each release is built on its \
-             previous release and there is no base to move; `include` or `advance` a member \
-             rebased by hand instead",
-            inline_human_text(&release_name),
-            entry.series_label()
-        );
-        return Ok(Exit::Incomplete);
-    }
     if !release_is_locally_movable(&opened, repo, &release_name) {
         return Ok(Exit::Incomplete);
     }
@@ -134,7 +121,6 @@ pub(crate) fn run_rebase(
     let writes = EarlierWrites::read(&opened, &release_name, &ledger, plan.published.as_ref())?;
     // A release that carries a change knives did not write or adopt would
     // carry it onto the new base unmeasured, as every write would.
-    let tips = opened.bookmark_tips()?;
     let in_hand = release::InHand {
         repo: &opened,
         ledger: &ledger,
@@ -142,7 +128,6 @@ pub(crate) fn run_rebase(
         commit: &release_commit,
         writes: &writes,
         published: plan.published.as_ref(),
-        tips: &tips,
     };
     let unchecked =
         match refuse_edit_in_hand((repo, "rebase"), entry, &in_hand, ("rebasing", "rebase"))? {
