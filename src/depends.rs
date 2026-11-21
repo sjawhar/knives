@@ -176,6 +176,8 @@ pub(crate) fn run(
 /// is `branch`'s and the upstream's is not (naming both), when only the fork
 /// has #n, and when neither does. `Ok`, with no forge call, when the fork has
 /// one forge repository at most, whose numbers are the only ones there are.
+/// The fork's own repository is the one its checkout's `origin` remote
+/// names, else its registry `origin`, as `status` and `depends` read it.
 pub(crate) fn upstream_pull(
     fork: &Fork<'_>,
     registry: &Registry,
@@ -183,8 +185,12 @@ pub(crate) fn upstream_pull(
     number: u64,
 ) -> Result<(), Exit> {
     let entry = fork.entry;
-    let (Some(upstream), Some(spelled)) =
-        (remote_slug(&entry.upstream), remote_slug(&entry.origin))
+    let origin = fork
+        .checkout
+        .remotes
+        .get(ORIGIN)
+        .map_or(entry.origin.as_str(), String::as_str);
+    let (Some(upstream), Some(spelled)) = (remote_slug(&entry.upstream), remote_slug(origin))
     else {
         return Ok(());
     };
@@ -197,7 +203,7 @@ pub(crate) fn upstream_pull(
         branch,
         forge: &CliForge,
     };
-    let own = context.identity(&entry.origin)?;
+    let own = context.identity(origin)?;
     let own_name = own.name_with_owner.to_ascii_lowercase();
     let own_owner = own_name
         .split_once('/')

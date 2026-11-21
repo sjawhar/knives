@@ -196,6 +196,11 @@ fn install_forge(shim: &Path, log: &Path, state: &ForgeState) {
                 pulls: &fork_pulls,
             },
             Repository {
+                named: "acme/other",
+                canonical: "acme/other",
+                pulls: "[]",
+            },
+            Repository {
                 named: "maintainer/sibling",
                 canonical: "maintainer/sibling",
                 pulls: "[]",
@@ -790,6 +795,25 @@ fn track_refuses_a_number_whose_fork_pull_request_is_the_branchs_own() {
     for named in ["maintainer/demo#12", "upstream-twelve", "acme/demo#12"] {
         assert!(stderr.contains(named), "{named}: {stderr}");
     }
+    assert!(fixture.entries().is_empty(), "{:?}", fixture.entries());
+}
+
+#[test]
+fn track_reads_the_checkouts_origin_as_status_and_depends_do() {
+    // Given: the checkout's `origin` remote names the fork's own repository,
+    // acme/demo, and the registry names another live one, acme/other, with
+    // no pull requests. The fork's #12 has feat/alpha as its head; the
+    // upstream's #12 is someone else's.
+    let fixture = fixture_with(ORIGIN, "https://forge.invalid/acme/other");
+
+    // When: feat/alpha is said to be #12.
+    let output = fixture.knives(&["--text", "track", "feat/alpha", "--pr", "12"]);
+
+    // Then: #12 is judged on the repository the checkout names, as `status`
+    // and `depends` judge it: feat/alpha's own review pull request, refused.
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("acme/demo#12"), "{stderr}");
     assert!(fixture.entries().is_empty(), "{:?}", fixture.entries());
 }
 
