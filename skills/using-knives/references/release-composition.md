@@ -41,10 +41,10 @@ An unreadable consumer, or a shared ledger that did not pull, blocks every plan,
 
 ## `knives release cut`
 
-- It audits first: each member's net diff from the members' fork point with upstream trunk must be in the cut tree. A failed audit writes nothing.
+- It audits first: the cut tree must hold each member's own lines, the change from that member's own fork point with upstream trunk to its tip. The audit names each line the tree lacks, with its path. A line that the previous release also lacks is carried forward, not a loss. A failed audit writes nothing.
 - Refused, exit `3`: a dated name that does not sort after the newest; the same tree and parents as the previous published cut (use `include`, `advance` or `rebase`); an unrecorded release in hand.
 - When every pin of the previous dated release is frozen, or it is published, a new later name may start identical (exit `0`). Edit it before you push.
-- The orphan gate and the member gate refuse to strand commits that only the previous lineage reaches, or to lose a member the previous cut recorded, and list them. `--allow-drop` states an intended drop; it is not a remedy for a refusal. Keep the reason and its dependency effects.
+- The orphan gate and the member gate refuse to strand commits that only the previous lineage reaches, or to lose a member the previous cut recorded, and list them. A bookmark that is not a release name keeps a commit when it is local, or on `origin` or the publish remote, tracked or not. A bookmark of `upstream` or of any other remote keeps nothing. `--allow-drop` states an intended drop; it is not a remedy for a refusal. Keep the reason and its dependency effects.
 - Under the fixed scheme, when the last cut event is missing or names another commit than the published branch, `cut` records the published commit instead of making one.
 
 ## `knives release rebase [REF]`
@@ -55,5 +55,6 @@ An unreadable consumer, or a shared ledger that did not pull, blocks every plan,
 ## `knives release members [REF]`
 
 - Bare: the direct parents of the release in hand, their commits and holding bookmarks, and branch tips advanced past them. Name `REF` for an older release.
-- `--verify` replays each member: exit `1` for missing or unexplained content, `3` for problems.
+- `--verify` reads each member's own lines in the release, from the member's fork point with upstream trunk. It names each line the release lacks, with its path, and each line the release holds only by its words. Exit `1` for a missing member, `3` for problems.
+- A member reads inconclusive only where the release, or the member's tip, holds an unresolved conflict in one of its paths and the member lacks nothing else. A member with such a path and a lost line elsewhere reads missing.
 - `--carries REV` and `--census`: SKILL.md, "Is this content carried?".

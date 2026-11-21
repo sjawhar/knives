@@ -856,21 +856,23 @@ fn is_unreleased_heading(line: &[u8]) -> bool {
 
 /// Whether `target` already holds what `member` added to `base`.
 ///
-/// A carriage check replays a member's change onto a target and reads what is
-/// left over. A member whose block a release's union holds verbatim has
-/// nothing left over, but the replay still conflicts, because the union's
-/// other blocks sit where the member's block ends. This says what such a
-/// replay means: a conflict every side of which only inserted, and whose
-/// member side the target holds as a whole run of its own lines, or holds as
-/// a union writes it where its lists joined another block's: the entries
-/// of each of its lists as one run of lines, in its order, under one list
-/// of the same `### ` heading inside the target's one `[Unreleased]`
-/// section ([`holds_joined`]), is the target carrying that block — the
-/// conflict is masked. The lines can be another member's or the target's
-/// own: no occurrence is counted. Lines in a released section count only as
-/// part of a whole run, and a target with no `## [Unreleased]` heading or
-/// more than one holds no joined entry. A member whose lines the target
-/// holds neither way is not carried, and says so.
+/// The hold on a fix by hand replays an adopt's change onto a target and
+/// reads what is left over ([`crate::jj::Repo::uncarried_resolution_paths`]).
+/// A member's carriage is read by its own lines instead
+/// ([`crate::own_lines`]). A change whose block a release's union holds
+/// verbatim has nothing left over, but the replay still conflicts, because
+/// the union's other blocks sit where the change's block ends. This says
+/// what such a replay means: a conflict every side of which only inserted,
+/// and whose member side the target holds as a whole run of its own lines,
+/// or holds as a union writes it where its lists joined another block's:
+/// the entries of each of its lists as one run of lines, in its order,
+/// under one list of the same `### ` heading inside the target's one
+/// `[Unreleased]` section ([`holds_joined`]), is the target carrying that
+/// block — the conflict is masked. The lines can be another member's or the
+/// target's own: no occurrence is counted. Lines in a released section count
+/// only as part of a whole run, and a target with no `## [Unreleased]`
+/// heading or more than one holds no joined entry. A change whose lines the
+/// target holds neither way is not carried, and says so.
 pub fn masks(target: &[u8], base: &[u8], member: &[u8], options: &MergeOptions) -> bool {
     let replay = Merge::from_removes_adds([base], [target, member]);
     match merge_hunks(&replay, options) {

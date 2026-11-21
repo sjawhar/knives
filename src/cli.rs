@@ -612,25 +612,26 @@ pub enum ReleaseAction {
     /// never pushed follows its rewrite. Pushed or published earlier releases
     /// keep their names and commit ids, and every tag stays; the copies the
     /// rebase makes of them are abandoned, except one something rests on,
-    /// which is kept and
-    /// named. A stale rule an earlier `knives start` wrote refuses first,
-    /// naming `start` as the refresh. The base is never a release parent —
-    /// this is how the members
-    /// change theirs. Bare, it targets the first upstream trunk commit that
-    /// contains every merged pull request, then drops the members whose landed
-    /// branches carry nothing more. A flat release has no base parent, so the
-    /// target reaches it only through a member on the target. Where no other
-    /// member is on the target, the drop keeps the landed members that are,
-    /// and says why; where none is, it drops nothing and exits 3. With
-    /// nothing merged there is no default, and which commit to move onto is
-    /// a decision — a cut does not make it for you. When the move leaves the
-    /// rebased tip of a member conflicted,
-    /// the report names that member, by its branch or by its short commit id,
+    /// which is kept and named. A stale rule an earlier `knives start` wrote
+    /// refuses first, naming `start` as the refresh. The base is never a
+    /// release parent — this is how the members change theirs. Bare, it
+    /// targets the first upstream trunk commit that contains every merged
+    /// pull request, then drops the members whose landed branches carry
+    /// nothing more. A flat release has no base parent, so the target
+    /// reaches it only through a member on the target. Where no other member
+    /// is on the target, the drop keeps the landed members that are, and
+    /// says why. Where none is, it drops nothing and exits 3. With nothing
+    /// merged there is no default, and which commit to move onto is a
+    /// decision — a cut does not make it for you.
+    ///
+    /// When the move leaves the rebased tip of a member conflicted, the
+    /// report names that member, by its branch or by its short commit id,
     /// with its conflicted files, and the command exits 1. The member stays
     /// in the release: resolve it on its branch. The report says "no
     /// conflicts in this release" only when neither the release nor a moved
     /// member holds a conflict. A conflicted release with no conflicted
-    /// member still exits 0.
+    /// member still exits 0. A landed drop that refuses exits 3, also when a
+    /// moved member is conflicted.
     Rebase {
         /// The rebase target. Bare, the first upstream trunk commit containing
         /// every merged pull request; required when nothing has merged.
@@ -644,9 +645,11 @@ pub enum ReleaseAction {
     /// Nothing else changes: every other parent stays at the commit the release
     /// already has. A member whose branch has advanced is not moved — that is a
     /// content change beyond including it, and `advance` is how it is asked for.
-    /// Like `drop` and `advance`, the write is checked before it is made: an
-    /// edit that would lose lines of a remaining member, away from any
-    /// conflict it leaves, writes nothing, names them, and exits 3.
+    /// Like `drop` and `advance`, the write is checked before it is made. An
+    /// edit that would lose a line of a remaining member, away from any
+    /// conflict that it leaves, writes nothing, names each such line with
+    /// its path and member, and exits 3. A line at a conflict that the edit
+    /// leaves is reported with that conflict and is not counted.
     Include {
         /// A branch name, or any revision when no bookmark fits.
         branch: String,
@@ -654,10 +657,12 @@ pub enum ReleaseAction {
         #[arg(long)]
         why: Option<String>,
         /// Write the edit even though it loses the named lines of a
-        /// remaining member, and record the loss with this reason. Put the
-        /// lines back by hand, then record that with `knives release adopt
-        /// <name> --why <reason>`. It must hold a reason: an empty or
-        /// whitespace-only value is refused.
+        /// remaining member. The edit names the lost lines. Its ledger event
+        /// records the loss as `; lost: <path> (<member>: <n> line(s))` for
+        /// each path and member, then `; why lost: <reason>`. Put the lines
+        /// back by hand, then record that with `knives release adopt <name>
+        /// --why <reason>`. The reason must not be empty or only whitespace.
+        /// Where the edit loses no line, the flag changes nothing.
         #[arg(long, value_name = "REASON", value_parser = reason_text)]
         allow_loss: Option<String>,
     },
@@ -725,6 +730,17 @@ pub enum ReleaseAction {
     /// nothing rests on are abandoned. A name the ledger records no cut of,
     /// a release cut outside knives, is recorded first with `knives release
     /// cut NAME --at <commit>`.
+    ///
+    /// A knives write that `jj describe`, `jj sign`, `jj metaedit` or a push
+    /// that signs rewrote has a new commit id, with the same change, parents
+    /// and tree. Run `adopt` on the machine that rewrote it, while the write
+    /// is unpublished, so that another machine can read the release. It
+    /// records the new commit in one event that holds no fix by hand. A
+    /// conflict that the write left does not refuse it. A published write
+    /// (the publish remote holds it, a tag is on it, or a `record:
+    /// published` note names it) is nothing to adopt. Where the write's
+    /// record is marked unchecked, `adopt` measures the new commit as it
+    /// measures any release that knives could not check.
     Adopt {
         /// The release name. Defaults to the release in hand.
         reference: Option<String>,
@@ -737,18 +753,27 @@ pub enum ReleaseAction {
     /// The release's parents, or whether a revision's content is carried.
     ///
     /// Bare: count, commits, and who still holds each parent — the repository's
-    /// own parent list, never `^parent` lines in prose. `--verify` replays every
-    /// member against the release and reports what it lacks. `--carries REV` asks
-    /// the other direction: is REV's net content carried — by REF when one is
-    /// given, otherwise by every live release and the upstream trunk before any
+    /// own parent list, never `^parent` lines in prose. `--verify` reads each
+    /// member's own lines in the release and names each line the release
+    /// lacks, with its path. A member's own lines are the lines that its
+    /// change adds and removes, from its fork point with the upstream trunk
+    /// to its tip. A member reads inconclusive only where the release, or the
+    /// member's tip, holds an unresolved conflict in one of its paths and the
+    /// release lacks nothing else of it. `--carries REV` asks the other
+    /// direction: is REV's content carried — by REF when one is given,
+    /// otherwise by every live release and the upstream trunk before any
     /// superseded cut (the rigorous "is this safe to delete"; grep answers a
-    /// different question). `--census` asks that of every maintained branch at once.
+    /// different question). Against a release it reads REV's own lines in
+    /// the same way, and it reads `conflicted` only for such a conflict.
+    /// Against the upstream trunk, ancestry and a replay of REV decide.
+    /// `--census` asks that of every maintained branch at once.
     Members {
         /// The release ref to inspect. Defaults to the release in hand. With
         /// `--carries`, the one target to check instead of every target.
         reference: Option<String>,
-        /// Replay each member's content against the release (heavier: one
-        /// replay per member) and report drop-guard anchors.
+        /// Read each member's own lines in the release, from the member's fork
+        /// point with the upstream trunk. Name each line the release lacks and
+        /// each line it holds only by its words. Report drop-guard anchors.
         #[arg(long, conflicts_with = "carries")]
         verify: bool,
         /// A branch name, or any revision when no bookmark fits.

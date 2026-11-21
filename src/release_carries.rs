@@ -2,9 +2,10 @@
 //!
 //! Content questions about a release, each a gather, an exit code and a
 //! renderer over a read-only repository. Bare `members` asks which parents the
-//! release has and who still holds each ([`run_release_members`]); `--carries
-//! REV` asks the other direction, whether a revision's net content is actually
-//! carried by a release or the trunk ([`run_revision_carries`]); `--census`
+//! release has and who still holds each ([`run_release_members`]), and
+//! `--verify` reads each member's own lines in it; `--carries REV` asks the
+//! other direction, whether a revision's content is actually carried by a
+//! release or the trunk ([`run_revision_carries`]); `--census`
 //! asks that of every maintained branch ([`run_release_census`]). The parser
 //! keeps the three apart, so `main` calls each directly.
 
@@ -20,7 +21,8 @@ use knives::jj::Repo;
 
 use super::parallelism;
 
-/// Inspect a release's direct parents and, on request, replay their content:
+/// Inspect a release's direct parents and, on request, read each member's
+/// own lines in it ([`release::audit_cut`]):
 /// the release `reference` names, or the one in hand.
 ///
 /// With no `reference`, the release in hand is the plan's, from a ledger

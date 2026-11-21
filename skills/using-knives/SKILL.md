@@ -44,19 +44,20 @@ Run `knives ledger migrate` once on each machine. Until then, commands that read
 
 ## Is this content carried?
 
-Use the replay probe, never a source-text search: a symbol's presence does not show that its change is carried.
+Use the carriage probe (`--carries`), never a source-text search: a symbol's presence does not show that its change is carried.
 
 - `knives release members <target> --carries <revision>` checks that one target. Exit `0` carried, `1` `NOT carried` or `conflicted`, `3` unresolved or uncheckable. A superseded target is a valid target.
 - With no target, it checks live releases and upstream trunk, then superseded cuts. Carriage only by a superseded cut does not make deletion safe.
 - `--census` asks this for every maintained branch. The `landed` column of `status` is the upstream-trunk probe.
+- Against a release, the probe reads the revision's own lines: the lines that its change adds and removes, from its fork point with upstream trunk to its tip. Under each verdict it names each line the release lacks, with its path. It also names each line the release holds only by its words, with the release lines that hold them. Read those lines before you act on the verdict.
 
-| Verdict | Evidence |
-|---|---|
-| `carried-exact` | The revision tip is an ancestor of the target. Against a release, its net change also replays empty onto the release's tree. |
-| `carried-rewritten` | Replaying its net change leaves the target unchanged: equivalent content arrived another way, or it has no net change. |
-| `carried-rebased` | Replay differs, but a commit with its change id is an ancestor. Weaker: divergent changes can name different trees. |
-| `NOT carried` (JSON `not-carried`) | Replay leaves a clean non-empty diff, and no rewrite is in the target. |
-| `conflicted` | Replay conflicts, and no rewrite is in the target. Some content can be present: judge it. |
+| Verdict | Against a release | Against upstream trunk |
+|---|---|---|
+| `carried-exact` | The release reaches the revision tip and holds its own lines. | The revision tip is an ancestor of the trunk. |
+| `carried-rewritten` | The release does not reach the tip and holds its own lines. | Its net change, replayed onto the trunk, leaves the trunk unchanged: equivalent content arrived another way, or it has no net change. |
+| `carried-rebased` | The release does not reach the tip. A standing rewrite of the change (a successor in jj's operation log, or a commit with its tree) is an ancestor, and the release holds the rewrite's own lines. Weaker: a rewrite can hold another tree. | The replay differs, but a standing rewrite of the change is an ancestor. Weaker: a rewrite can hold another tree. |
+| `NOT carried` (JSON `not-carried`) | The release lacks one of the revision's own lines, and no rewrite carries it. The probe names each line it lacks. | The replay leaves a clean non-empty diff, and no rewrite is in the trunk. |
+| `conflicted` | The release, or the revision tip, holds an unresolved conflict in a path of its change, and the release lacks nothing else. The probe cannot read that path: resolve the conflict, then probe again. | The replay of its net change conflicts, and no rewrite is in the trunk. Some content can be present: judge it. |
 
 ## Output and exit codes
 
