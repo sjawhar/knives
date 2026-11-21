@@ -288,12 +288,13 @@ pub(crate) fn run_rebase(
                 inline_human_text(name)
             );
         }
-        let (rebased_commit, rebased, recorded) = report_rebased_release(
+        let (rebased_commit, rebased, recorded, conflicted) = report_rebased_release(
             fork,
             RebasedRelease {
                 name: &release_name,
                 reference: &reference,
                 onto: &onto,
+                members: &members,
                 shed,
                 before: &before_rebase,
                 shed_unions,
@@ -366,13 +367,15 @@ pub(crate) fn run_rebase(
         report_hidden(repo, &release_name, &cleaned.hidden);
         recorded?;
         if no_drop {
-            return Ok(Exit::Ok);
+            return Ok(members_exit(&conflicted));
         }
         // What it drops next is dropped from the rebase's own write, so its
-        // event carries the same mark as the rebase's.
+        // event carries the same mark as the rebase's. The members the move
+        // left conflicted go with it: when the drop writes, its report ends
+        // the command and names them.
         drop_landed_members(
             fork,
-            (&release_name, &destination),
+            (&release_name, &destination, &conflicted),
             (bound, &unchecked, last),
         )
     })
@@ -630,7 +633,8 @@ fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option
         drop_landed_members_in(
             fork,
             (opened, writes),
-            (release_name, destination),
+            // Nothing moved, so no member was left conflicted by a move.
+            (release_name, destination, &[]),
             (bound, unchecked, last),
         )
     })
@@ -863,14 +867,19 @@ fn all_landed(
 /// [`drop_landed_members_in`] over the repository as it is now, opened here.
 ///
 /// With no landed tip a parent of the release there is nothing to drop, so
-/// the release's earlier writes are not read.
+/// the release's earlier writes are not read, and the rebase's own report
+/// ends the command: the exit is [`members_exit`] of `conflicted`.
 fn drop_landed_members(
     fork: &Fork<'_>,
-    (release_name, destination): (&str, &RebaseDestination),
+    (release_name, destination, conflicted): (
+        &str,
+        &RebaseDestination,
+        &[release::ConflictedMember],
+    ),
     (bound, unchecked, last): (Bound<'_>, &str, &mut Option<release::ReportedWrite>),
 ) -> anyhow::Result<Exit> {
     if destination.landed.is_empty() {
-        return Ok(Exit::Ok);
+        return Ok(members_exit(conflicted));
     }
     let opened = knives::jj::Repo::open(&fork.checkout.path)?;
     let release_parents = opened.parent_commits(release_name)?;
@@ -879,13 +888,13 @@ fn drop_landed_members(
             .local_bookmark_tip(&pull.head_ref_name)
             .is_some_and(|tip| release_parents.contains(&tip))
     }) {
-        return Ok(Exit::Ok);
+        return Ok(members_exit(conflicted));
     }
     let writes = release_writes(fork, &opened, release_name)?;
     drop_landed_members_in(
         fork,
         (&opened, &writes),
-        (release_name, destination),
+        (release_name, destination, conflicted),
         (bound, unchecked, last),
     )
 }
@@ -902,12 +911,19 @@ fn drop_landed_members(
 /// ends with ([`release::unchecked_suffix`]). The release it writes is read
 /// through one opening as soon as the write is done
 /// ([`release::ReportedWrite`]) and left in `last`, the command's last
-/// write, so a step after the write that fails still leaves it there. It
-/// gives the exit: [`Exit::Ok`] where it wrote.
+/// write, so a step after the write that fails still leaves it there.
+/// `conflicted` are the members the rebase before it moved and left
+/// conflicted, read once after the move; where the drop writes, its report
+/// ends the command and names them. It gives the exit: [`Exit::Incomplete`]
+/// where it refuses, else [`members_exit`] of `conflicted`.
 fn drop_landed_members_in(
     fork: &Fork<'_>,
     (opened, writes): (&knives::jj::Repo, &EarlierWrites),
-    (release_name, destination): (&str, &RebaseDestination),
+    (release_name, destination, conflicted): (
+        &str,
+        &RebaseDestination,
+        &[release::ConflictedMember],
+    ),
     (bound, unchecked, last): (Bound<'_>, &str, &mut Option<release::ReportedWrite>),
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
@@ -939,7 +955,7 @@ fn drop_landed_members_in(
         ));
     }
     if deltas.is_empty() {
-        return Ok(Exit::Ok);
+        return Ok(members_exit(conflicted));
     }
     let shown_release = inline_human_text(release_name);
     if kept.is_empty() {
@@ -990,9 +1006,14 @@ fn drop_landed_members_in(
     report_replaced(repo, release_name, &written);
     println!(
         "{}",
-        release::conflict_report(release_name, dropped.conflicts(), &written.unions)
+        release::rebase_conflict_report(
+            (repo, release_name),
+            dropped.conflicts(),
+            &written.unions,
+            conflicted
+        )
     );
-    Ok(Exit::Ok)
+    Ok(members_exit(conflicted))
 }
 
 /// A composition rebase that just happened: what moved, and onto what.
@@ -1000,6 +1021,9 @@ struct RebasedRelease<'a> {
     name: &'a str,
     reference: &'a str,
     onto: &'a knives::ids::CommitId,
+    /// The release's members before the move. A member that the target's
+    /// history already held keeps its commit, so it did not move.
+    members: &'a [knives::ids::CommitId],
     shed: usize,
     /// The release commit the rebase moved: what the fork had before it.
     before: &'a knives::ids::CommitId,
@@ -1015,9 +1039,11 @@ struct RebasedRelease<'a> {
 /// The release it writes is read through one opening as soon as the write is
 /// done ([`release::ReportedWrite`]) and left in `last`, the command's last
 /// write, so a step after the write that fails still leaves it there; it
-/// gives that write's commit, its reading, and the record's result. A failed
-/// record stops neither the report nor the caller's cleanup of the rebase's
-/// copies: the caller returns its error after that cleanup.
+/// gives that write's commit, its reading, the record's result, and the
+/// members the move left conflicted ([`conflicted_moved_members`]), which
+/// its report names. A failed record stops neither the report nor the
+/// caller's cleanup of the rebase's copies: the caller returns its error
+/// after that cleanup.
 fn report_rebased_release<'w>(
     fork: &Fork<'_>,
     rebased: RebasedRelease<'_>,
@@ -1027,6 +1053,7 @@ fn report_rebased_release<'w>(
     knives::ids::CommitId,
     &'w release::ReportedWrite,
     anyhow::Result<()>,
+    Vec<release::ConflictedMember>,
 )> {
     let repo = &fork.name;
     let entry = fork.entry;
@@ -1036,6 +1063,7 @@ fn report_rebased_release<'w>(
     let new_parents = reopened.parent_commits(rebased.name)?;
     let provenance =
         release::parent_sources(&reopened, entry, &entry.release_scheme(), &new_parents)?;
+    let conflicted = conflicted_moved_members(&reopened, &provenance, rebased.members)?;
     let delta = format!("rebased onto {}", rebased.reference);
     let message = release::composition_message(rebased.name, &provenance, &delta);
     let (described, described_unions) = knives::jj::describe_release(
@@ -1086,9 +1114,55 @@ fn report_rebased_release<'w>(
     );
     println!(
         "{}",
-        release::conflict_report(rebased.name, written.conflicts(), &unions)
+        release::rebase_conflict_report(
+            (repo, rebased.name),
+            written.conflicts(),
+            &unions,
+            &conflicted
+        )
     );
-    Ok((described, written, recorded))
+    Ok((described, written, recorded, conflicted))
+}
+
+/// Each member the move rebased whose new tip holds a conflict, with that
+/// tip's conflicted files, read once, right after the move.
+///
+/// `provenance` names each parent of the moved release ([`release::parent_sources`]:
+/// its branch, or its short commit id where no bookmark holds it). A parent
+/// that is among `before`, the members before the move, kept its commit:
+/// the target's history already held it, so the move did not touch it.
+fn conflicted_moved_members(
+    opened: &knives::jj::Repo,
+    provenance: &[(String, knives::ids::CommitId)],
+    before: &[knives::ids::CommitId],
+) -> Result<Vec<release::ConflictedMember>, knives::jj::JjError> {
+    let mut conflicted = Vec::new();
+    for (name, tip) in provenance {
+        if before.contains(tip) {
+            continue;
+        }
+        let files = opened.conflicted_files(tip.as_str())?;
+        if !files.is_empty() {
+            conflicted.push(release::ConflictedMember {
+                name: name.clone(),
+                files,
+            });
+        }
+    }
+    Ok(conflicted)
+}
+
+/// The exit a rebase gives once its writes are done.
+///
+/// It is [`Exit::Findings`] where the move left a member conflicted, which
+/// a person resolves on its branch, else [`Exit::Ok`]. A conflicted release
+/// with no conflicted member is reported, and exits [`Exit::Ok`].
+const fn members_exit(conflicted: &[release::ConflictedMember]) -> Exit {
+    if conflicted.is_empty() {
+        Exit::Ok
+    } else {
+        Exit::Findings
+    }
 }
 
 /// What a rebase unioned, said once for its two writes: every union the

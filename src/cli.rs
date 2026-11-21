@@ -620,7 +620,13 @@ pub enum ReleaseAction {
     /// contains every merged pull request, then drops the members whose landed
     /// branches carry nothing more; with nothing merged there is no default,
     /// and which commit to move onto is a decision — a cut does not make it
-    /// for you.
+    /// for you. When the move leaves the rebased tip of a member conflicted,
+    /// the report names that member, by its branch or by its short commit id,
+    /// with its conflicted files, and the command exits 1. The member stays
+    /// in the release: resolve it on its branch. The report says "no
+    /// conflicts in this release" only when neither the release nor a moved
+    /// member holds a conflict. A conflicted release with no conflicted
+    /// member still exits 0.
     Rebase {
         /// The rebase target. Bare, the first upstream trunk commit containing
         /// every merged pull request; required when nothing has merged.

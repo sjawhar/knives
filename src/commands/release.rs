@@ -25,8 +25,8 @@ use crate::detect::{
     stale_parents,
 };
 use crate::ids::{
-    BookmarkRef, BranchName, ChangeId, CommitId, ReleaseScheme, RemoteName, is_our_dated_cut,
-    is_our_release, is_release_name,
+    BookmarkRef, BranchName, ChangeId, CommitId, ReleaseScheme, RemoteName, RepoName,
+    is_our_dated_cut, is_our_release, is_release_name,
 };
 use crate::jj::{self, Repo};
 use crate::ledger::{Entry, Kind, Ledger, RecordedParent};
@@ -613,10 +613,12 @@ pub fn cut_keepers(
     Ok(keep)
 }
 
-/// Commits the recut would strand: reachable from the previous release or its
-/// local descendants, and from no keeper.
+/// Commits the recut would strand: reachable from the previous release or
+/// from any of its visible descendants, and from no keeper.
 ///
-/// Keepers are [`cut_keepers`]. The previous cut itself, empty undescribed working copies,
+/// A descendant counts whatever holds it: a local bookmark, a remote branch,
+/// tracked or not, or nothing at all. Keepers are [`cut_keepers`]. The
+/// previous cut itself, empty undescribed working copies,
 /// and commits identified by our strict dated release bookmarks are excluded as
 /// release machinery, not work. A legacy commit that only *describes* itself
 /// like release machinery is deliberately reported: refusing it is safer than
@@ -1390,8 +1392,12 @@ pub fn unchecked_line(name: &str, commit: &CommitId, standing: &InHandWrite) -> 
 /// `--allow-backwards` where the local name sits at R. The working copy moves
 /// off R to the trunk, never onto the write, where the new cut's restore
 /// would land in it. Where R is a descendant of the move's target that the
-/// publish remote lacks, the cut leaves R behind, so it takes `--allow-drop`
-/// and must find R and what rests on it still visible. Where the publish
+/// publish remote lacks, the cut leaves R behind. It then takes
+/// `--allow-drop`, names each commit the orphan gate would drop, R first,
+/// and must find them still visible. A bookmark keeps a commit off that
+/// list: a local one, or a branch of `origin` or of the publish remote,
+/// tracked or not, whose name is not a release name ([`cut_keepers`]). With
+/// nothing to drop, the cut takes no `--allow-drop`. Where the publish
 /// remote names another commit than the target, the cut reads the name as
 /// a double cut once. R is redone on the new name, and adopted; R itself,
 /// where the remote lacks it, is abandoned when nothing else rests on it,
@@ -4550,6 +4556,45 @@ pub fn check_test_count(fork: &Fork<'_>, cut: &CommitId, parent: &CommitId) -> T
 /// the guidance names that step for `release`.
 pub fn conflict_guidance(release: &str, files: &[String], unions: &[jj::UnionedFile]) -> String {
     use crate::ledger::inline_human_text;
+    let mut lines = union_guidance(unions);
+    if files.is_empty() {
+        lines.push(if unions.is_empty() {
+            "  no conflicts in this release".to_owned()
+        } else {
+            "  no other conflicts in this release".to_owned()
+        });
+        return lines.join("\n");
+    }
+    lines.push(format!(
+        "  {} conflicted file(s) left for a person:",
+        files.len()
+    ));
+    // The paths are jj's, named by the conflict it reports.
+    lines.extend(
+        files
+            .iter()
+            .map(|file| format!("    {}", inline_human_text(file))),
+    );
+    lines.push(
+        "  resolve as a union: keep every branch's addition, keep any shared helper \
+         defined exactly once, and land each config key in every loader"
+            .to_owned(),
+    );
+    lines.push("  then re-check the parent count and the test count before publishing".to_owned());
+    // The release is a name read from the repository, inside a command.
+    lines.push(format!(
+        "  after resolving them by hand, run `knives release adopt {}` before the next write, \
+         which refuses until then",
+        crate::ledger::shell_word(release)
+    ));
+    lines.join("\n")
+}
+
+/// The lines of [`conflict_guidance`] that name each release log written as
+/// the union of its sides, with each block's first line; none where the
+/// write unioned no log.
+fn union_guidance(unions: &[jj::UnionedFile]) -> Vec<String> {
+    use crate::ledger::inline_human_text;
     let mut lines = Vec::new();
     if !unions.is_empty() {
         lines.push(format!(
@@ -4589,37 +4634,7 @@ pub fn conflict_guidance(release: &str, files: &[String], unions: &[jj::UnionedF
             ));
         }
     }
-    if files.is_empty() {
-        lines.push(if unions.is_empty() {
-            "  no conflicts in this release".to_owned()
-        } else {
-            "  no other conflicts in this release".to_owned()
-        });
-        return lines.join("\n");
-    }
-    lines.push(format!(
-        "  {} conflicted file(s) left for a person:",
-        files.len()
-    ));
-    // The paths are jj's, named by the conflict it reports.
-    lines.extend(
-        files
-            .iter()
-            .map(|file| format!("    {}", inline_human_text(file))),
-    );
-    lines.push(
-        "  resolve as a union: keep every branch's addition, keep any shared helper \
-         defined exactly once, and land each config key in every loader"
-            .to_owned(),
-    );
-    lines.push("  then re-check the parent count and the test count before publishing".to_owned());
-    // The release is a name read from the repository, inside a command.
-    lines.push(format!(
-        "  after resolving them by hand, run `knives release adopt {}` before the next write, \
-         which refuses until then",
-        crate::ledger::shell_word(release)
-    ));
-    lines.join("\n")
+    lines
 }
 
 /// Run the steps of a command that writes the release, then print the
@@ -4767,6 +4782,58 @@ pub fn conflict_report(
             crate::ledger::problem_human_text(&error.to_string())
         ),
     }
+}
+
+/// A member that a rebase moved and left conflicted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictedMember {
+    /// Its name in the release's description ([`parent_sources`]): its
+    /// branch, or its short commit id where no bookmark holds it.
+    pub name: String,
+    /// The files its rebased tip leaves conflicted.
+    pub files: Vec<String>,
+}
+
+/// [`conflict_report`] for a write of `knives release rebase`: the rebase's
+/// own, or the write of the landed-member drop that follows it.
+///
+/// After the release's own lines comes one line for each of `members`, the
+/// members the rebase moved and left conflicted, with the files of each.
+/// `no conflicts in this release`, and its union form, say that nothing is
+/// left to resolve. So where a member is conflicted and the release commit
+/// is not, the release's line says only that the release commit holds no
+/// conflicted file. A member's name and files are read from the repository,
+/// so they reach the terminal escaped.
+pub fn rebase_conflict_report(
+    (repo, release): (&RepoName, &str),
+    conflicts: Result<&[String], &jj::JjError>,
+    unions: &[jj::UnionedFile],
+    members: &[ConflictedMember],
+) -> String {
+    use crate::ledger::inline_human_text;
+    let mut lines = match conflicts {
+        Ok([]) if !members.is_empty() => {
+            let mut lines = union_guidance(unions);
+            lines.push(format!("{repo}: no conflicted file in the release commit"));
+            lines
+        }
+        _ => vec![conflict_report(release, conflicts, unions)],
+    };
+    for member in members {
+        let files: Vec<String> = member
+            .files
+            .iter()
+            .map(|file| inline_human_text(file))
+            .collect();
+        lines.push(format!(
+            "{repo}: member {} holds {} conflicted file(s) after the rebase: {}; resolve them \
+             on its branch",
+            inline_human_text(&member.name),
+            member.files.len(),
+            files.join(", ")
+        ));
+    }
+    lines.join("\n")
 }
 
 /// Print one line for each `### ` heading that a release log of `commit`'s
@@ -4993,6 +5060,76 @@ mod conflict_tests {
                 "  could not read the release logs for repeated headings: {shown}"
             )]
         );
+    }
+
+    #[test]
+    fn a_rebase_with_no_conflicted_member_reports_as_every_write_does() {
+        // Given: a rebased release commit, clean or conflicted, and no
+        // conflicted member.
+        let repo = RepoName::new("demo");
+        let files = ["shared.txt".to_owned()];
+        for conflicts in [&[][..], &files[..]] {
+            // When: the rebase's report is rendered.
+            let rendered =
+                rebase_conflict_report((&repo, "release/2026-08-30"), Ok(conflicts), &[], &[]);
+
+            // Then: it is the conflict report of any other write.
+            assert_eq!(
+                rendered,
+                conflict_report("release/2026-08-30", Ok(conflicts), &[])
+            );
+        }
+    }
+
+    #[test]
+    fn a_conflicted_member_is_named_and_the_release_no_longer_says_no_conflicts() {
+        // Given: a clean release commit, one release log unioned, and one
+        // moved member whose name and file hold control characters.
+        let repo = RepoName::new("demo");
+        let union = jj::UnionedFile {
+            path: "CHANGELOG.md".to_owned(),
+            first_lines: vec!["### Fixed".to_owned()],
+            left_twice: Vec::new(),
+        };
+        let member = ConflictedMember {
+            name: "feat/d\u{1b}[2J".to_owned(),
+            files: vec!["f".to_owned(), "a\u{7}b".to_owned()],
+        };
+
+        // When: the rebase's report is rendered, with and without the union.
+        let plain = rebase_conflict_report(
+            (&repo, "release/2026-08-30"),
+            Ok(&[]),
+            &[],
+            std::slice::from_ref(&member),
+        );
+        let unioned = rebase_conflict_report(
+            (&repo, "release/2026-08-30"),
+            Ok(&[]),
+            std::slice::from_ref(&union),
+            &[member],
+        );
+
+        // Then: the release's line says only that its commit holds no
+        // conflicted file, and the member's line names it and its files,
+        // escaped.
+        let member_line = "demo: member feat/d\u{fffd}[2J holds 2 conflicted file(s) after the \
+                           rebase: f, a\u{fffd}b; resolve them on its branch";
+        assert_eq!(
+            plain,
+            format!("demo: no conflicted file in the release commit\n{member_line}")
+        );
+        assert!(
+            unioned.starts_with("  1 release log(s) written as the union of their sides"),
+            "{unioned}"
+        );
+        assert!(
+            unioned.ends_with(&format!(
+                "\ndemo: no conflicted file in the release commit\n{member_line}"
+            )),
+            "{unioned}"
+        );
+        assert!(!unioned.contains("conflicts in this release"), "{unioned}");
     }
 }
 
