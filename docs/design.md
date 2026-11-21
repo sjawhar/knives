@@ -496,8 +496,12 @@ requirements are judged too: one that is met says nothing, since nothing the dep
 carried later can change it; each one that is unmet or cannot be judged is a problem that
 names the dependent, what could not be read, what was seen of the requirement, and the
 `knives depends <dependent> --forget …` command that takes those back, with a fetch
-suggested only when the recorded commit is not here; a member is named by its branch name
-there, which takes back every spelling of it, unless that name holds a `#`. Under
+suggested only when the recorded commit is not here. The command takes each requirement's
+records whatever the forge answers: every record of its pull request number or member on a
+repository that is not another fork's and that the forge did not name as another, each as
+spelled (a member by its branch name when every such record spells a spelling here and the
+name holds no `#`); a record on another fork's repository, or one the forge named as
+another, alone. The problem says when the command takes a record it does not list. Under
 `--no-landed` a recorded commit can still be shown landed by its merged pull request's
 landing, not by a replay: one shown landed is judged as above, like a missing or
 unrecorded one, and one not shown landed has its requirements checked as a row's, with a
@@ -510,7 +514,11 @@ leaves the list as it was, never empty. `--forget` takes a requirement by any sp
 repository. A review pull request recorded under two names of the fork's repository, as
 before and after a rename, is one requirement: the forge ties the names, any spelling
 takes back every record of it, and `--on` names it as the list already holds it. A
-member recorded under two names is one requirement too, its former name's token included.
+member recorded under two spellings here is one requirement too. A member record on a
+repository that is neither a spelling here nor another fork's is a record of this fork's
+member only when the forge names that repository as the fork's own, as for a review pull
+request: with the forge down, a forget whose outcome depends on it is refused (exit 3),
+and `--on` writes this fork's spelling beside it.
 An upstream's `<owner>/<name>#<n>` is taken back without the forge. The forge has no
 answer that means a repository does not exist: GitHub answers a name it cannot resolve the
 same way for a repository that is gone, for one the token cannot see, and in some
@@ -520,16 +528,19 @@ together: when counting each such record as named would take back more than the 
 answers take, make a text ambiguous, or join two records a text names into one
 requirement, nothing is taken back (exit 3), so neither an outage nor a repository the
 token cannot see decides what a forget takes. Each such refusal prints a command that names
-every record of that pull request number or member, each as it is spelled (a member by its
-branch name, unless that holds a `#`): every candidate is then named directly, so no forge
-answer changes what it takes. It can take a record the forge showed is another
-repository's; to keep one, run the forget again when the forge answers. When the text may
+every record of that pull request number or member on a repository that is not another
+fork's, each as it is spelled (a member by its branch name when every such record spells a
+spelling here, and the name holds no `#`): every candidate is then named directly, so no
+forge answer changes what it takes. It can take a record the forge showed is another
+repository's: with the forge unable to say which repository one text names, any of them
+may be meant; to keep one, run the forget again when the forge answers. When the text may
 name two requirements, the refusal prints one such command for each, never one that takes
-both. A text spelled exactly as a held upstream record names that record alone, and a
-`<repo>#<n>` text the registry reads as a pull request names that pull request, as `--on`
-reads it, even when a member branch is named so. A bare branch name names this fork's
-member, never another fork's branch. A member token on another fork's repository is refused
-unless a record is spelled exactly so; then that record alone is taken back. Every machine
+both. A text spelled exactly as a held upstream record names that record alone, whether or
+not the registry knows its repository, and a `<repo>#<n>` text the registry reads as a pull
+request names that pull request, as `--on` reads it, even when a member branch is named
+so. A record on another fork's own repository is never a record of this fork's: a bare
+branch name never names it, and a member token on that repository is refused unless a
+record is spelled exactly so; then that record alone is taken back. Every machine
 running this knives folds the two into the same list. A knives from before fork requirements
 reads the same list only while it holds no member branch: it cannot read a list that
 holds one, so the forget is the newest statement it reads there, and the branch requires

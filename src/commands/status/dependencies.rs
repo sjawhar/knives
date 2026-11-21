@@ -84,6 +84,10 @@ struct DependencyResults<'a> {
     /// record on any other repository is named by its own token, never by a
     /// branch name that also names this fork's member.
     own: Vec<String>,
+    /// The repositories, lowercase, that are not this fork's: other forks'
+    /// own repositories, and those the forge named as another repository. A
+    /// record on one is never another record's ([`Self::tokens`]).
+    apart: Vec<String>,
 }
 
 /// What could not be read of a deleted dependent's work.
@@ -192,7 +196,7 @@ impl DependencyResults<'_> {
     /// One problem per uncertain dependent with a requirement that is unmet
     /// or cannot be judged: what could not be read, what was seen of each
     /// such requirement, and the command that forgets them
-    /// ([`Self::tokens`]).
+    /// ([`Self::tokens`]), with what else it takes back.
     fn report_deferred(&mut self) {
         for (branch, open) in std::mem::take(&mut self.deferred) {
             let Some(unread) = self.uncertain.get(&branch) else {
@@ -205,8 +209,19 @@ impl DependencyResults<'_> {
                     needs.push(shown);
                 }
             }
-            let tokens = self.tokens(&branch, open.iter().map(|(requirement, _)| requirement));
+            let requirements: Vec<&Requirement> =
+                open.iter().map(|(requirement, _)| requirement).collect();
+            let (tokens, besides) = self.tokens(&branch, &requirements);
             let seen: Vec<&str> = open.iter().map(|(_, seen)| seen.as_str()).collect();
+            let besides = if besides.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; the command takes back {} too, which may be the same requirement under \
+                     another name of its repository",
+                    besides.join(", ")
+                )
+            };
             let command = tokens.join(" --forget ");
             let next = if unread.fetchable {
                 "Fetch a ref that holds its work to judge it, or forget these once its work has \
@@ -216,7 +231,7 @@ impl DependencyResults<'_> {
             };
             self.problems.push(format!(
                 "cannot tell whether {branch} still needs {}: its branch is gone here and on \
-                 origin, and {}; {}. {next}: `knives depends {branch} --forget {command}`",
+                 origin, and {}; {}{besides}. {next}: `knives depends {branch} --forget {command}`",
                 needs.join(", "),
                 unread.why,
                 seen.join("; ")
@@ -225,51 +240,60 @@ impl DependencyResults<'_> {
     }
 
     /// The `--forget` texts that take back `open`, requirements of
-    /// `dependent`, in one run whatever the forge answers: every record it
-    /// holds of a review pull request number among them, each as spelled; a
-    /// member of this fork by its branch name (its records' tokens when the
-    /// name holds a `#`); a member record on any other repository, and an
-    /// upstream pull request, by its own token.
-    fn tokens<'r>(
-        &self,
-        dependent: &BranchName,
-        open: impl IntoIterator<Item = &'r Requirement>,
-    ) -> Vec<String> {
+    /// `dependent`, in one run whatever the forge answers, and the records
+    /// they take besides `open`'s. An upstream pull request, and a record on
+    /// a repository that is not this fork's ([`Self::apart`]), by its own
+    /// token alone. Otherwise every record `dependent` holds of the review
+    /// pull request number or member, on any repository that is not apart:
+    /// one whose repository the forge could not be asked about may be the
+    /// same requirement. A member by its branch name when every such record
+    /// spells a spelling here and the name holds no `#`; else each record as
+    /// it is spelled.
+    fn tokens(&self, dependent: &BranchName, open: &[&Requirement]) -> (Vec<String>, Vec<String>) {
         let held = self.held.get(dependent).map_or(&[][..], Vec::as_slice);
-        let ours = |repository: &str| self.own.contains(&repository.to_ascii_lowercase());
-        let mut tokens: Vec<String> = Vec::new();
-        let mut push = |token: String| {
-            if !tokens.contains(&token) {
-                tokens.push(token);
-            }
+        let spelled = |record: &Requirement, among: &[String]| {
+            record
+                .repository()
+                .is_some_and(|repository| among.contains(&repository.to_ascii_lowercase()))
         };
-        for requirement in open {
+        let mut tokens: Vec<String> = Vec::new();
+        let mut besides: Vec<String> = Vec::new();
+        for &requirement in open {
+            let of_it: Vec<&Requirement> = if requirement.repository().is_none()
+                || spelled(requirement, &self.apart)
+            {
+                vec![requirement]
+            } else {
+                held.iter()
+                    .filter(|record| {
+                        !spelled(record, &self.apart) && record.same_number_or_member(requirement)
+                    })
+                    .chain([requirement])
+                    .collect()
+            };
             match requirement {
-                Requirement::ForkPull { number, .. } => {
-                    for record in held {
-                        if matches!(record, Requirement::ForkPull { number: other, .. } if other == number)
-                        {
-                            push(record.to_string());
+                Requirement::ForkBranch { branch, .. }
+                    if !branch.as_str().contains('#')
+                        && of_it.iter().all(|record| spelled(record, &self.own)) =>
+                {
+                    if !tokens.contains(&branch.to_string()) {
+                        tokens.push(branch.to_string());
+                    }
+                }
+                _ => {
+                    for record in of_it {
+                        let token = record.to_string();
+                        if !tokens.contains(&token) {
+                            tokens.push(token.clone());
+                        }
+                        if !open.contains(&record) && !besides.contains(&token) {
+                            besides.push(token);
                         }
                     }
-                    push(requirement.to_string());
                 }
-                Requirement::ForkBranch { repository, branch } if ours(repository) => {
-                    if branch.as_str().contains('#') {
-                        for record in held {
-                            if matches!(record, Requirement::ForkBranch { repository: other, branch: name }
-                                if name == branch && ours(other))
-                            {
-                                push(record.to_string());
-                            }
-                        }
-                    }
-                    push(requirement.forget_token());
-                }
-                _ => push(requirement.to_string()),
             }
         }
-        tokens
+        (tokens, besides)
     }
 }
 
@@ -544,6 +568,7 @@ fn unmet_dependencies(
         deferred: BTreeMap::new(),
         held,
         own: own_spellings(context),
+        apart: other_forks_repositories(context),
     };
     let sorted = sort_requirements(repo, &checked, context, &mut outcomes);
     upstream_outcomes(repo, sorted.upstream, context, &mut outcomes);
@@ -834,14 +859,17 @@ fn placed_members(
             Ok(true) => {
                 placed.push((dependent.clone(), requirement.clone(), branch));
             }
-            Ok(false) => outcomes.not_judged(
+            Ok(false) => {
+                outcomes.apart.push(repository.to_ascii_lowercase());
+                outcomes.not_judged(
                 about,
                 format!(
                     "{dependent} requires {requirement}, a branch of {repository}, which is not \
                      {fork}'s own repository: no member of {fork}, so nothing here can judge it"
                 ),
                 &format!("a branch of {repository}, which is not {fork}'s own repository"),
-            ),
+                );
+            }
             Err(error) => outcomes.unchecked(
                 about,
                 format_args!(
@@ -851,6 +879,18 @@ fn placed_members(
         }
     }
     placed
+}
+
+/// The own repositories of the forks other than this one, lowercase, as the
+/// registry spells them.
+fn other_forks_repositories(context: &DependencyContext<'_, '_>) -> Vec<String> {
+    context
+        .registry
+        .repos
+        .iter()
+        .filter(|(key, entry)| entry.upstream_name(key) != context.fork.upstream)
+        .filter_map(|(_, entry)| remote_slug(&entry.origin).map(str::to_ascii_lowercase))
+        .collect()
 }
 
 /// The registry name of a fork other than this one whose own repository the
@@ -995,14 +1035,17 @@ fn fork_pull_outcomes(
         };
         match resolved {
             Ok(true) => ours.extend(requirements),
-            Ok(false) => outcomes.unchecked_each(
-                requirements,
-                format_args!(
-                    "{repository} is not {fork}'s own repository, and a review pull request on \
+            Ok(false) => {
+                outcomes.apart.push(repository.to_ascii_lowercase());
+                outcomes.unchecked_each(
+                    requirements,
+                    format_args!(
+                        "{repository} is not {fork}'s own repository, and a review pull request on \
                      another fork's repository cannot be judged here; forget it and name the \
                      upstream pull request its member becomes"
-                ),
-            ),
+                    ),
+                );
+            }
             Err(error) => outcomes.unchecked_each(
                 requirements,
                 format_args!(
