@@ -68,58 +68,81 @@ impl DependencyContext<'_, '_> {
 struct DependencyResults<'a> {
     findings: &'a mut Vec<Finding>,
     problems: &'a mut Vec<String>,
+    /// Deleted dependents whose later work this checkout cannot read
+    /// ([`dependents`]): a requirement of one that is unmet or cannot be
+    /// judged is held here, for one problem per dependent; a met one says
+    /// nothing.
+    uncertain: &'a BTreeMap<BranchName, Unread>,
+    /// Per uncertain dependent, each such requirement's token and what was
+    /// seen of it.
+    deferred: BTreeMap<BranchName, Vec<(String, String)>>,
+}
+
+/// What could not be read of a deleted dependent's work.
+struct Unread {
+    why: String,
+    /// Whether a fetch can bring it: its recorded commit is not here.
+    fetchable: bool,
+}
+
+/// One requirement of one dependent, `shown` as the report names it.
+#[derive(Clone, Copy)]
+struct About<'r> {
+    branch: &'r BranchName,
+    requirement: &'r Requirement,
+    shown: &'r str,
 }
 
 impl DependencyResults<'_> {
-    /// A pull request `branch` requires, `shown` as the report names it, by
-    /// the `state` the forge gave it.
-    fn record(&mut self, branch: &BranchName, shown: &str, state: Option<&str>) {
+    /// A pull request required, by the `state` the forge gave it.
+    fn record(&mut self, about: About<'_>, state: Option<&str>) {
+        let About { branch, shown, .. } = about;
         match state {
             Some(state) if state.eq_ignore_ascii_case("MERGED") => {}
-            Some(state) => self.unmet(
-                branch,
-                format!(
-                    "{branch} requires {shown}, which is {}",
-                    state.to_lowercase()
-                ),
-            ),
+            Some(state) => self.unmet(about, &format!("which is {}", state.to_lowercase())),
+            None if self.uncertain.contains_key(branch) => {
+                self.defer(about, format!("{shown}, which the forge did not report on"));
+            }
             None => self.problems.push(format!(
                 "{branch} requires {shown}, which the forge did not report on"
             )),
         }
     }
 
-    /// A member `branch` requires, `shown` as the report names it, by what
-    /// this checkout says of the member.
-    fn member(&mut self, branch: &BranchName, shown: &str, state: MemberState) {
+    /// A member required, by what this checkout says of it.
+    fn member(&mut self, about: About<'_>, state: MemberState) {
         match state {
             MemberState::Landed => {}
-            MemberState::Open(seen) => self.unmet(
-                branch,
-                format!("{branch} requires {shown}, which has not landed ({seen})"),
-            ),
+            MemberState::Open(seen) => self.unmet(about, &format!("which has not landed ({seen})")),
             MemberState::Unprobed => self.unmet(
-                branch,
-                format!(
-                    "{branch} requires {shown}, which is not known to have landed: the landed \
-                     probe did not run"
-                ),
+                about,
+                "which is not known to have landed: the landed probe did not run",
             ),
-            MemberState::Unknown(why) => self.unchecked(branch, shown, why),
+            MemberState::Unknown(why) => self.unchecked(about, why),
         }
     }
 
-    fn unmet(&mut self, branch: &BranchName, detail: String) {
+    fn unmet(&mut self, about: About<'_>, what: &str) {
+        let About { branch, shown, .. } = about;
+        if self.uncertain.contains_key(branch) {
+            self.defer(about, format!("{shown}, {what}"));
+            return;
+        }
         self.findings.push(Finding::new(
             FindingKind::UnmetDependency,
             Subject::Branch(branch.clone()),
-            detail,
+            format!("{branch} requires {shown}, {what}"),
         ));
     }
 
-    fn unchecked(&mut self, branch: &BranchName, requirement: impl Display, why: impl Display) {
+    fn unchecked(&mut self, about: About<'_>, why: impl Display) {
+        let About { branch, shown, .. } = about;
+        if self.uncertain.contains_key(branch) {
+            self.defer(about, format!("{shown}, which could not be judged: {why}"));
+            return;
+        }
         self.problems.push(format!(
-            "cannot check whether {branch} still needs {requirement}: {why}"
+            "cannot check whether {branch} still needs {shown}: {why}"
         ));
     }
 
@@ -130,7 +153,54 @@ impl DependencyResults<'_> {
         why: impl Display,
     ) {
         for (branch, requirement, _) in requirements {
-            self.unchecked(&branch, &requirement, &why);
+            let shown = requirement.to_string();
+            self.unchecked(
+                About {
+                    branch: &branch,
+                    requirement: &requirement,
+                    shown: &shown,
+                },
+                &why,
+            );
+        }
+    }
+
+    fn defer(&mut self, about: About<'_>, seen: String) {
+        self.deferred
+            .entry(about.branch.clone())
+            .or_default()
+            .push((about.requirement.to_string(), seen));
+    }
+
+    /// One problem per uncertain dependent with a requirement that is unmet
+    /// or cannot be judged: what could not be read, what was seen of each
+    /// such requirement, and the command that forgets them.
+    fn report_deferred(&mut self) {
+        for (branch, open) in std::mem::take(&mut self.deferred) {
+            let Some(unread) = self.uncertain.get(&branch) else {
+                continue;
+            };
+            let mut tokens: Vec<&str> = Vec::new();
+            for (token, _) in &open {
+                if !tokens.contains(&token.as_str()) {
+                    tokens.push(token);
+                }
+            }
+            let seen: Vec<&str> = open.iter().map(|(_, seen)| seen.as_str()).collect();
+            let command = tokens.join(" --forget ");
+            let next = if unread.fetchable {
+                "Fetch a ref that holds its work to judge it, or forget these once its work has \
+                 landed or been dropped"
+            } else {
+                "Forget these once its work has landed or been dropped"
+            };
+            self.problems.push(format!(
+                "cannot tell whether {branch} still needs {}: its branch is gone here and on \
+                 origin, and {}; {}. {next}: `knives depends {branch} --forget {command}`",
+                tokens.join(", "),
+                unread.why,
+                seen.join("; ")
+            ));
         }
     }
 }
@@ -372,41 +442,54 @@ fn unmet_dependencies(
     let mut findings = Vec::new();
     let mut problems = Vec::new();
     let repo = &context.fork.upstream;
-    let checked = dependents(members, context, notes, &mut problems);
+    let (checked, uncertain) = dependents(members, context, notes);
     let sorted = sort_requirements(repo, &checked, context, &mut problems);
     let mut outcomes = DependencyResults {
         findings: &mut findings,
         problems: &mut problems,
+        uncertain: &uncertain,
+        deferred: BTreeMap::new(),
     };
     upstream_outcomes(repo, sorted.upstream, context, &mut outcomes);
     fork_pull_outcomes(sorted.on_fork, members, context, &mut outcomes);
     for (dependent, requirement, member) in sorted.members {
-        outcomes.member(&dependent, &requirement.to_string(), members.judge(&member));
+        let shown = requirement.to_string();
+        let about = About {
+            branch: &dependent,
+            requirement: &requirement,
+            shown: &shown,
+        };
+        outcomes.member(about, members.judge(&member));
     }
+    outcomes.report_deferred();
     (findings, problems)
 }
 
-/// Every branch whose requirements a report checks: each row; each branch
-/// with a stated requirement that this checkout holds only as
-/// `<branch>@origin`, another machine's branch that nobody here claims; and
-/// each one held nowhere, deleted, whose newest recorded commit
-/// ([`crate::statement::Statements::recorded_head`]) is here and has not
-/// landed upstream: a branch merged into a review base before it was
-/// deleted still carries its work there, and still needs what it required.
+/// Every branch whose requirements a report checks, with the deleted ones
+/// whose later work cannot be read: each row; each branch with a stated
+/// requirement that this checkout holds only as `<branch>@origin`, another
+/// machine's branch that nobody here claims; and each one held nowhere,
+/// deleted. A deleted dependent is judged by its newest recorded commit
+/// ([`crate::statement::Statements::recorded_head`]): here and not landed,
+/// its requirements are checked as any branch's, with a note, since a
+/// branch merged into a review base before it was deleted still carries its
+/// work there.
 ///
 /// The recorded commit is a lower bound on a deleted dependent's work, not
-/// its final head: the branch can have moved on with nothing written. So a
-/// deleted dependent whose recorded commit landed, is not here, or was never
-/// recorded is not taken as done: it is a problem that names what could not
-/// be read, until its requirements are forgotten.
+/// its final head: the branch can have moved on with nothing written. So
+/// one whose recorded commit landed, is not here, or was never recorded is
+/// not taken as done: its requirements are judged too, and each that is
+/// unmet or cannot be judged is reported as a problem naming what could not
+/// be read ([`DependencyResults::report_deferred`]). One whose requirements
+/// are all met says nothing: what it carried later cannot change a met one.
 fn dependents(
     members: &Members<'_>,
     context: &DependencyContext<'_, '_>,
     notes: &mut Vec<String>,
-    problems: &mut Vec<String>,
-) -> Vec<BranchName> {
+) -> (Vec<BranchName>, BTreeMap<BranchName, Unread>) {
     let (repo, store) = (&context.fork.upstream, context.store);
     let mut dependents: Vec<BranchName> = members.rows.iter().map(|row| row.name.clone()).collect();
+    let mut uncertain = BTreeMap::new();
     for (branch, head) in store.dependents(repo) {
         if dependents.contains(&branch) {
             continue;
@@ -422,12 +505,18 @@ fn dependents(
             continue;
         }
         let unread = match head {
-            None => "the ledger records no commit for it".to_owned(),
+            None => Unread {
+                why: "the ledger records no commit for it".to_owned(),
+                fetchable: false,
+            },
             Some(head) => match members.repo.resolve_commit(head.as_str()) {
-                Err(_) => format!(
-                    "the newest commit the ledger records for it, {}, is not in this checkout",
-                    head.short()
-                ),
+                Err(_) => Unread {
+                    why: format!(
+                        "the newest commit the ledger records for it, {}, is not in this checkout",
+                        head.short()
+                    ),
+                    fetchable: true,
+                },
                 Ok(commit) => {
                     let shown = format!("{branch} at {}", commit.short());
                     if members.judge_commit(&branch, &commit, &shown) != MemberState::Landed {
@@ -440,28 +529,21 @@ fn dependents(
                         dependents.push(branch);
                         continue;
                     }
-                    format!(
-                        "the newest commit the ledger records for it, {}, has landed, which does \
-                         not show that work it carried later did",
-                        commit.short()
-                    )
+                    Unread {
+                        why: format!(
+                            "the newest commit the ledger records for it, {}, has landed, which \
+                             does not show that work it carried later did",
+                            commit.short()
+                        ),
+                        fetchable: false,
+                    }
                 }
             },
         };
-        let target = BranchTarget::new(repo.clone(), branch.clone());
-        let required: Vec<String> = store
-            .dependencies(&target)
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        problems.push(format!(
-            "cannot check whether {branch} still needs {}: its branch is gone here and on \
-             origin, and {unread}. Fetch a ref that holds its work, or forget its requirements \
-             (`knives depends {branch} --forget …`) once that work has landed or been dropped",
-            required.join(", ")
-        ));
+        let _ = uncertain.insert(branch.clone(), unread);
+        dependents.push(branch);
     }
-    dependents
+    (dependents, uncertain)
 }
 
 fn sort_requirements<'a>(
@@ -527,15 +609,17 @@ fn upstream_outcomes(
     for (required_repo, (entry, requirements)) in grouped {
         if required_repo == *repo {
             let Some(snapshot) = context.snapshot else {
-                for (branch, requirement, _) in requirements {
-                    outcomes.unchecked(&branch, &requirement, "no forge consulted");
-                }
+                outcomes.unchecked_each(requirements, "no forge consulted");
                 continue;
             };
             for (branch, requirement, number) in requirements {
+                let shown = requirement.to_string();
                 outcomes.record(
-                    &branch,
-                    &requirement.to_string(),
+                    About {
+                        branch: &branch,
+                        requirement: &requirement,
+                        shown: &shown,
+                    },
                     snapshot.fact(number).map(|fact| fact.pull.state.as_str()),
                 );
             }
@@ -543,9 +627,7 @@ fn upstream_outcomes(
         }
 
         let Some(forge) = context.forge else {
-            for (branch, requirement, _) in requirements {
-                outcomes.unchecked(&branch, &requirement, "no forge consulted");
-            }
+            outcomes.unchecked_each(requirements, "no forge consulted");
             continue;
         };
         let Some(identity) = upstream_identity(entry) else {
@@ -750,28 +832,29 @@ fn asked(
     match forge.pull_facts(path, &identity, &numbers) {
         Ok(facts) => {
             for (branch, requirement, number) in requirements {
-                match (facts.get(&number), heads.as_ref()) {
-                    (Some(fact), Some(heads)) => {
-                        let shown = format!(
-                            "{requirement} (head {}, {})",
-                            fact.pull.head_ref_name,
-                            fact.pull.state.to_lowercase()
-                        );
-                        outcomes.member(&branch, &shown, heads.judge(fact));
-                    }
-                    (fact, _) => outcomes.record(
-                        &branch,
-                        &requirement.to_string(),
-                        fact.map(|fact| fact.pull.state.as_str()),
+                let fact = facts.get(&number);
+                let shown = match (fact, heads.as_ref()) {
+                    (Some(fact), Some(_)) => format!(
+                        "{requirement} (head {}, {})",
+                        fact.pull.head_ref_name,
+                        fact.pull.state.to_lowercase()
                     ),
+                    _ => requirement.to_string(),
+                };
+                let about = About {
+                    branch: &branch,
+                    requirement: &requirement,
+                    shown: &shown,
+                };
+                match (fact, heads.as_ref()) {
+                    (Some(fact), Some(heads)) => outcomes.member(about, heads.judge(fact)),
+                    (fact, _) => {
+                        outcomes.record(about, fact.map(|fact| fact.pull.state.as_str()));
+                    }
                 }
             }
         }
-        Err(error) => {
-            for (branch, requirement, _) in requirements {
-                outcomes.unchecked(&branch, &requirement, &error);
-            }
-        }
+        Err(error) => outcomes.unchecked_each(requirements, &error),
     }
 }
 

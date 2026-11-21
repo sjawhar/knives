@@ -493,21 +493,30 @@ forgets and after the branch is deleted. It is a lower bound on the dependent's 
 its final head: the branch can move on with nothing written. So when that commit is here
 and has not landed, the dependent's requirements are checked (a branch merged into a review
 base and then deleted still carries its work there), and a note says so. When it has
-landed, is not here, or was never recorded, the dependent is not taken as done: the report
-has a problem that names the dependent, its requirements and what could not be read, until
-the requirements are forgotten. Under `--no-landed` no recorded commit can be shown landed,
-so every deleted dependent with a live list has its requirements checked.
+landed, is not here, or was never recorded, the dependent is not taken as done, and its
+requirements are judged too: one that is met says nothing, since nothing the dependent
+carried later can change it; each one that is unmet or cannot be judged is a problem that
+names the dependent, what could not be read, what was seen of the requirement, and the
+`knives depends <dependent> --forget …` command that takes those back, with a fetch
+suggested only when the recorded commit is not here. Under `--no-landed` a recorded commit
+can still be shown landed by its merged pull request's landing, not by a replay: one not
+shown landed has its requirements checked, and a missing or unrecorded one is judged as
+above.
 
 A requirement is taken back by a `depends` forget followed by the list without it, two
 entries stamped in that order and written newest first: a run cut short between them
 leaves the list as it was, never empty. `--forget` takes a requirement by any spelling
-`--on` takes or the record's own. A review pull request recorded under two names of the
-fork's repository, as before and after a rename, is one requirement: the forge ties the
-names, any spelling takes back every record of it, and `--on` names it as the list
-already holds it. An upstream's `<owner>/<name>#<n>` is taken back without the forge, and
-a record the forge cannot name is left as it is, never a reason to refuse another. A
-member token on another fork's repository is refused unless a record is spelled exactly
-so; then that record alone is taken back. Every machine running
+`--on` takes or the record's own; an `origin:` prefix always names this fork's own
+repository. A review pull request recorded under two names of the fork's repository, as
+before and after a rename, is one requirement: the forge ties the names, any spelling
+takes back every record of it, and `--on` names it as the list already holds it. A
+member recorded under two names is one requirement too, its former name's token included.
+An upstream's `<owner>/<name>#<n>` is taken back without the forge. A repository the forge
+answers does not exist ties nothing. When the forge cannot be asked whether a record is
+named, and counting it as named would change what is taken back or make it ambiguous,
+nothing is taken back (exit 3): the answer never depends on whether the forge was
+reachable. A member token on another fork's repository is refused unless a record is
+spelled exactly so; then that record alone is taken back. Every machine running
 this knives folds the two into the same list. A knives from before fork requirements
 reads the same list only while it holds no member branch: it cannot read a list that
 holds one, so the forget is the newest statement it reads there, and the branch requires
