@@ -369,8 +369,10 @@ pub enum Command {
     /// any state from any author: one opened before this tool existed, one the
     /// maintainer closed because they wanted a different approach, or somebody else's
     /// that we are carrying because ours was superseded. The number is asked of the
-    /// forge: one only the fork's own repository has is a review pull request, not
-    /// the upstream one this states, and is refused.
+    /// forge, because the fork's own repository numbers its review pull requests
+    /// apart: refused when the fork's pull request of that number has this branch
+    /// as its head and the upstream's does not, when only the fork has the number,
+    /// and when neither has it.
     Track {
         branch: String,
         /// The upstream pull request's number.
@@ -400,8 +402,10 @@ pub enum Command {
     /// repository, `origin:<owner>/<name>:<branch>` a member branch of this fork.
     ///
     /// `--forget` takes a requirement back; with `--on` it corrects one. The
-    /// removal is a ledger entry, so every machine that shares the ledger
-    /// reads the same list.
+    /// removal is a ledger entry, so every machine running this knives that
+    /// shares the ledger reads the same list. A knives from before fork
+    /// requirements cannot read a list holding a member branch, and reads a
+    /// forget whose list holds one as requiring nothing.
     Depends {
         branch: String,
         /// What it needs, repeatable. `<repo>#<number>`, `<repo>` the registry
