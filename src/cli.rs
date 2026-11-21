@@ -417,7 +417,8 @@ pub enum Command {
         #[arg(long = "on", required_unless_present = "forget")]
         on: Vec<String>,
         /// A requirement to take back, repeatable: as its record spells it, or
-        /// as `--on` would.
+        /// as `--on` would. Every record of it is taken back, whatever spelling
+        /// of the fork's repository each carries.
         #[arg(long)]
         forget: Vec<String>,
         /// Registry name. Defaults to the repo you are standing in.

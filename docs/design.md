@@ -448,16 +448,17 @@ it merged); or, for a member this checkout knows only as `<branch>@origin` (anot
 machine's, fetched), the same two tests on that copy: its merged upstream pull request
 with a landing the trunk holds and nothing past what it merged, or an empty replay onto
 the upstream trunk. A row judges the local tip only, so when `<branch>@origin` holds work
-the local tip lacks (a local bookmark that did not follow a fetch), that origin tip must
-pass too, as it would for a machine holding only it. A merge alone is not enough: a pull
+the local tip lacks (a local bookmark that did not follow a fetch), or the row has no single
+local tip (a conflicted bookmark), that origin tip must pass too, as it would for a machine
+holding only it. A merge alone is not enough: a pull
 request merged into anything but the trunk, or a branch advanced past what merged, leaves
 work the upstream lacks. A review pull request is satisfied once its head, the member it
 carries, has landed upstream, judged at the head commit the forge reports for it, not at
 whatever a branch of that name points at here: by that branch's row only when the local
 tip is that commit, else by the commit itself. A head commit this checkout lacks (the
-branch moved since the last fetch) is a problem until it is fetched, and the problem says
-that a head branch deleted on the forge cannot be fetched; for a merged review pull
-request it names the base that holds the member's work. The report names the head. Its
+branch moved since the last fetch) is a problem until it is fetched; if its branch was
+deleted, the problem says to fetch a ref that still holds the commit: the base it merged
+into, or the pull request's own `refs/pull/<n>/head`. The report names the head. Its
 own state is not the rule: a review pull request merges into a review base or into
 another member, which says nothing about the upstream, and while the member is in the
 fork's release only, dropping it from the release breaks the dependent. A review pull
@@ -475,19 +476,28 @@ differ, is one requirement.
 
 A report checks the requirements of every row; of a dependent this checkout holds only as
 `<branch>@origin`, another machine's branch nobody here claims; and of a dependent held
-nowhere, deleted, whose recorded head is here and has not landed upstream. Each `depends`
-entry records the dependent's tip when it was written, and that head outlives the branch:
-a branch merged into a review base and then deleted carries its work there, and still
-needs what it required, until that work lands. A deleted dependent whose recorded head
-landed is done; one whose recorded head is not here leaves no copy that says where its
-work is, and is not checked.
+nowhere, deleted. A deleted dependent is judged by the newest commit any ledger entry
+records for it: an entry about the branch records its tip when written, and a release
+write records each parent's commit and the bookmarks there; that record is kept across
+forgets and after the branch is deleted. It is a lower bound on the dependent's work, not
+its final head: the branch can move on with nothing written. So when that commit is here
+and has not landed, the dependent's requirements are checked (a branch merged into a review
+base and then deleted still carries its work there), and a note says so. When it has
+landed, is not here, or was never recorded, the dependent is not taken as done: the report
+has a problem that names the dependent, its requirements and what could not be read, until
+the requirements are forgotten. Under `--no-landed` no recorded commit can be shown landed,
+so every deleted dependent with a live list has its requirements checked.
 
 A requirement is taken back by a `depends` forget followed by the list without it, two
 entries stamped in that order and written newest first: a run cut short between them
 leaves the list as it was, never empty. `--forget` takes a requirement by any spelling
-`--on` takes or the record's own: a review pull request recorded under a repository's
-name from before a rename is taken back by the new spellings too, the forge tying the two
-names, and a member token on another fork's repository is refused. Every machine running
+`--on` takes or the record's own. A review pull request recorded under two names of the
+fork's repository, as before and after a rename, is one requirement: the forge ties the
+names, any spelling takes back every record of it, and `--on` names it as the list
+already holds it. An upstream's `<owner>/<name>#<n>` is taken back without the forge, and
+a record the forge cannot name is left as it is, never a reason to refuse another. A
+member token on another fork's repository is refused unless a record is spelled exactly
+so; then that record alone is taken back. Every machine running
 this knives folds the two into the same list. A knives from before fork requirements
 reads the same list only while it holds no member branch: it cannot read a list that
 holds one, so the forget is the newest statement it reads there, and the branch requires

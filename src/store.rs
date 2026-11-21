@@ -597,9 +597,9 @@ impl Store {
             .collect()
     }
 
-    /// Every branch of `repo` that requires something now, with the commit
-    /// it was at when its list was last recorded, where that was recorded
-    /// ([`crate::statement::Statements::depends_head`]).
+    /// Every branch of `repo` that requires something now, with the newest
+    /// commit the ledger records for it, where any entry records one
+    /// ([`crate::statement::Statements::recorded_head`]).
     pub fn dependents(&self, repo: &UpstreamName) -> Vec<(BranchName, Option<CommitId>)> {
         let stated = self.stated_in(repo);
         stated
@@ -607,7 +607,7 @@ impl Store {
             .map(|branch| {
                 (
                     BranchName::new(branch),
-                    stated.depends_head(branch).map(CommitId::new),
+                    stated.recorded_head(branch).map(CommitId::new),
                 )
             })
             .collect()
