@@ -1714,7 +1714,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_line_the_previous_release_lacked_too_is_carried_forward() {
+    fn a_lost_line_the_release_before_lacked_too_is_carried_forward() {
         // Given: a member that adds two lines; the candidate lacks both,
         // and the previous release lacks the first
         let (fork, tip) = (file("a\n"), file("a\nl1\nl2\n"));
