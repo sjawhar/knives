@@ -43,9 +43,10 @@ const REGISTRY_ORIGIN: &str = "https://forge.invalid/acme-old/demo";
 /// A fork with a dependent branch, `feat/alpha`, and member branches
 /// `feat/base` and `feat/landed` (whose content upstream's trunk has); its
 /// config home; and a forge on which the upstream has pull requests #7 and
-/// #12; the fork's own repository has, from `acme`'s branches, #12 (head
-/// `feat/alpha`), #13 (head `feat/base`), #14 (head `feat/landed`) and #15
-/// (merged, head `feat/base`), and #20 from `bob`'s `main`; and a sibling
+/// #12, and #16 from `bob`'s branch `feat/alpha`; the fork's own repository
+/// has, from `acme`'s branches, #12 (head `feat/alpha`), #13 (head
+/// `feat/base`), #14 (head `feat/landed`), #15 (merged, head `feat/base`)
+/// and #16 (head `feat/alpha`), and #20 from `bob`'s `main`; and a sibling
 /// fork, whose own repository `acme/sibling` has #5 (head `sib/feature`)
 /// and #6 (head `feat/landed`, the sibling's own branch of that name).
 struct Fixture {
@@ -81,17 +82,19 @@ fn fixture_with_origin(origin: &str) -> Fixture {
     let shim = tempfile::tempdir().expect("gh shim directory");
     let log = shim.path().join("calls.log");
     let upstream_pulls = format!(
-        "[{},{}]",
+        "[{},{},{}]",
         pull_record(7, "MERGED", "main", None),
-        pull_record(12, "OPEN", "upstream-twelve", None)
+        pull_record(12, "OPEN", "upstream-twelve", None),
+        review(16, "OPEN", "feat/alpha", "bob")
     );
     let fork_pulls = format!(
-        "[{},{},{},{},{}]",
+        "[{},{},{},{},{},{}]",
         review(12, "OPEN", "feat/alpha", "acme"),
         review(13, "OPEN", "feat/base", "acme"),
         review(14, "OPEN", "feat/landed", "acme"),
         review(15, "MERGED", "feat/base", "acme"),
-        review(20, "OPEN", "main", "bob")
+        review(20, "OPEN", "main", "bob"),
+        review(16, "OPEN", "feat/alpha", "acme")
     );
     let sibling_pulls = format!(
         "[{},{}]",
@@ -631,6 +634,25 @@ fn track_refuses_a_number_whose_fork_pull_request_is_the_branchs_own() {
     assert_eq!(output.status.code(), Some(2), "{}", said(&output));
     let stderr = String::from_utf8_lossy(&output.stderr);
     for named in ["maintainer/demo#12", "upstream-twelve", "acme/demo#12"] {
+        assert!(stderr.contains(named), "{named}: {stderr}");
+    }
+    assert!(fixture.entries().is_empty(), "{:?}", fixture.entries());
+}
+
+#[test]
+fn track_refuses_a_number_whose_upstream_head_only_shares_the_branchs_name() {
+    // Given: #16 is on both: the upstream's has bob's branch feat/alpha as its
+    // head, and the fork's has acme's feat/alpha.
+    let fixture = fixture();
+
+    // When: feat/alpha is said to be #16.
+    let output = fixture.knives(&["--text", "track", "feat/alpha", "--pr", "16"]);
+
+    // Then: the shared name does not make the upstream's #16 feat/alpha's:
+    // refused, naming both, as for any other head.
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for named in ["maintainer/demo#16", "acme/demo#16"] {
         assert!(stderr.contains(named), "{named}: {stderr}");
     }
     assert!(fixture.entries().is_empty(), "{:?}", fixture.entries());
