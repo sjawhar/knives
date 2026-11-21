@@ -823,6 +823,23 @@ fn track_reads_the_checkouts_origin_as_status_and_depends_do() {
 }
 
 #[test]
+fn track_falls_back_to_the_registry_when_the_checkouts_origin_is_a_local_path() {
+    // Given: the checkout's `origin` remote is a local path, which names no
+    // forge repository; the registry names the fork's own repository,
+    // acme/demo, whose #12 has feat/alpha as its head.
+    let fixture = fixture_on(UPSTREAM, "", ORIGIN);
+
+    // When: feat/alpha is said to be #12.
+    let output = fixture.knives(&["--text", "track", "feat/alpha", "--pr", "12"]);
+
+    // Then: the check still runs, on the registry's repository: refused.
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("acme/demo#12"), "{stderr}");
+    assert!(fixture.entries().is_empty(), "{:?}", fixture.entries());
+}
+
+#[test]
 fn track_judges_a_head_by_the_forges_owner_not_a_former_one() {
     // Given: the registry still spells the fork's own repository by its
     // former owner, acme-old; the forge names it acme/demo. #17 is on both:

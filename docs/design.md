@@ -427,8 +427,8 @@ An upstream #n whose head is another branch is accepted: it is someone else's PR
 A head is the branch's only by its name and its owner together, the owner of the fork's own
 repository as the forge names it now: an outside contributor's branch of the same name is
 another head, and so is one of a former owner that a remote here still spells. The fork's
-own repository is the one the checkout's `origin` remote names, else the registry's, as
-`status` and `depends` read it.
+own repository is the one the checkout's `origin` remote names when that is a forge
+repository, else the registry's, as `status` and `depends` read it.
 
 ### Dependencies
 
