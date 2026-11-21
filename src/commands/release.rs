@@ -570,13 +570,17 @@ pub fn shared_base(
 
 /// What a recut keeps reachable: the commits the orphan gate treats as work.
 ///
-/// Every non-release local bookmark tip; every commit a divergent non-release
-/// local bookmark names (it has no single tip, but each target is still
-/// bookmarked work — a member whose bookmark also pointed at its merged pull
-/// request head read as dropped by the cut that carried it); the previous
-/// release's own parents (the cut carries them verbatim by commit id, so they
-/// are kept by construction whatever their bookmarks are doing); and the
-/// upstream trunk, `trunk`.
+/// Every tip of a non-release bookmark that is local or of the fork's own
+/// remotes, `origin` and the publish remote, tracked or not: the fork's
+/// branches are on `origin` and its releases on the publish remote, so work
+/// a branch there holds is not lost when the cut drops it. A bookmark of
+/// `upstream` or of any other remote keeps nothing: its owner can delete it.
+/// Every commit a divergent such bookmark names (it has no single tip, but
+/// each target is still bookmarked work — a member whose bookmark also
+/// pointed at its merged pull request head read as dropped by the cut that
+/// carried it); the previous release's own parents (the cut carries them
+/// verbatim by commit id, so they are kept by construction whatever their
+/// bookmarks are doing); and the upstream trunk, `trunk`.
 pub fn cut_keepers(
     repo: &Repo,
     entry: &RepoEntry,
@@ -584,17 +588,23 @@ pub fn cut_keepers(
     previous: &CommitId,
 ) -> Result<Vec<CommitId>, crate::jj::JjError> {
     let scheme = &entry.release_scheme();
+    let publish_remote = entry.publish_remote();
+    let keeps = |reference: &BookmarkRef| {
+        !is_release_name(reference.branch(), scheme)
+            && match reference {
+                BookmarkRef::Local(_) => true,
+                BookmarkRef::Remote { remote, .. } => {
+                    remote.as_str() == "origin" || remote.as_str() == publish_remote
+                }
+            }
+    };
     let mut keep: Vec<CommitId> = tips
         .iter()
-        .filter_map(|(reference, commit)| match reference {
-            BookmarkRef::Local(branch) if !is_release_name(branch, scheme) => Some(commit.clone()),
-            BookmarkRef::Local(_) | BookmarkRef::Remote { .. } => None,
-        })
+        .filter(|&(reference, _)| keeps(reference))
+        .map(|(_, commit)| commit.clone())
         .collect();
     for (reference, commits) in repo.conflicted_bookmarks()? {
-        if let BookmarkRef::Local(branch) = reference
-            && !is_release_name(&branch, scheme)
-        {
+        if keeps(&reference) {
             keep.extend(commits);
         }
     }
