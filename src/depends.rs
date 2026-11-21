@@ -167,14 +167,15 @@ pub(crate) fn run(
 /// in the thousands, so most small fork numbers are also upstream numbers.
 ///
 /// `Ok` when the upstream's #n is `branch`'s: its head is a branch named
-/// `branch` of the fork's own repository's owner. `Ok` too when its head is
-/// another branch and the fork's #n is not `branch`'s: a branch may carry
-/// someone else's upstream pull request. A head is `branch`'s only by name
-/// and owner together: an outside contributor's branch of the same name is
-/// not. Refused when the fork's #n is `branch`'s and the upstream's is not
-/// (naming both), when only the fork has #n, and when neither does. `Ok`,
-/// with no forge call, when the fork has one forge repository at most,
-/// whose numbers are the only ones there are.
+/// `branch` of the fork's own repository's owner as the forge names it now,
+/// asked first: a former owner a remote here still spells is not that
+/// owner. `Ok` too when its head is another branch and the fork's #n is not
+/// `branch`'s: a branch may carry someone else's upstream pull request. A
+/// head is `branch`'s only by name and owner together: an outside
+/// contributor's branch of the same name is not. Refused when the fork's #n
+/// is `branch`'s and the upstream's is not (naming both), when only the fork
+/// has #n, and when neither does. `Ok`, with no forge call, when the fork has
+/// one forge repository at most, whose numbers are the only ones there are.
 pub(crate) fn upstream_pull(
     fork: &Fork<'_>,
     registry: &Registry,
@@ -196,47 +197,30 @@ pub(crate) fn upstream_pull(
         branch,
         forge: &CliForge,
     };
+    let own = context.identity(&entry.origin)?;
+    let own_name = own.name_with_owner.to_ascii_lowercase();
+    let own_owner = own_name
+        .split_once('/')
+        .map_or(own_name.as_str(), |(owner, _)| owner);
+    let branchs = |pull: &PullFacts| {
+        pull.pull.head_ref_name == branch.as_str() && pull.pull.is_from(own_owner)
+    };
     let theirs = RepoIdentity {
         name_with_owner: upstream.to_owned(),
         id: String::new(),
     };
     let on_upstream = context.pull(&theirs, number)?;
-    // The owners the remotes here spell the fork's own repository under:
-    // enough to accept the branch's own upstream pull request with one forge
-    // call. A renamed repository's new owner is asked of the forge below.
-    let spelled_owners: Vec<&str> = fork
-        .checkout
-        .remotes
-        .get(ORIGIN)
-        .map(String::as_str)
-        .into_iter()
-        .chain(std::iter::once(entry.origin.as_str()))
-        .filter_map(remote_slug)
-        .filter_map(|slug| slug.split_once('/').map(|(owner, _)| owner))
-        .collect();
-    let branchs = |pull: &PullFacts, owner: &str| {
-        pull.pull.head_ref_name == branch.as_str() && pull.pull.is_from(owner)
-    };
-    if on_upstream
-        .as_ref()
-        .is_some_and(|theirs| spelled_owners.iter().any(|owner| branchs(theirs, owner)))
-    {
+    if on_upstream.as_ref().is_some_and(branchs) {
         return Ok(());
     }
-    let own = context.identity(&entry.origin)?;
     let upstream_name = &fork.upstream;
-    let own_name = own.name_with_owner.to_ascii_lowercase();
-    let own_owner = own_name
-        .split_once('/')
-        .map_or(own_name.as_str(), |(owner, _)| owner);
     let suggested = context.accepted_spelling(&own_name, spelled);
     let waits = format!(
         "`track` states the upstream pull request {branch} becomes; a branch that waits for a \
          review pull request says so with `knives depends <branch> --on {suggested}#{number}`"
     );
     match (on_upstream, context.pull(&own, number)?) {
-        (Some(theirs), _) if branchs(&theirs, own_owner) => Ok(()),
-        (Some(theirs), Some(ours)) if branchs(&ours, own_owner) => refused(
+        (Some(theirs), Some(ours)) if branchs(&ours) => refused(
             Exit::Usage,
             format_args!(
                 "#{number} names two pull requests: {upstream_name}#{number} ({}, head {}:{}) is \

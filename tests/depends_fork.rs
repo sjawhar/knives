@@ -45,11 +45,11 @@ const REGISTRY_ORIGIN: &str = "https://forge.invalid/acme-old/demo";
 /// A fork with a dependent branch, `feat/alpha`, and member branches
 /// `feat/base` and `feat/landed` (whose content upstream's trunk has); its
 /// config home; and a forge ([`install_forge`]) on which the upstream has
-/// pull requests #7 and #12, and #16 from `bob`'s branch `feat/alpha`; the
-/// fork's own repository
+/// pull requests #7 and #12 (`track`'s tests add #16 and #17 by
+/// [`Fixture::forge`]); the fork's own repository
 /// has, from `acme`'s branches, #12 (head `feat/alpha`), #13 (head
 /// `feat/base`), #14 (head `feat/landed`), #15 (merged, head `feat/base`),
-/// #16 (head `feat/alpha`), #21 (head `main`) and #22 (merged into
+/// #16 and #17 (head `feat/alpha`), #21 (head `main`) and #22 (merged into
 /// `review/base`, head `feat/gone`, a branch no longer here), and #20 from
 /// `bob`'s `main`; and a sibling fork, whose own repository `acme/sibling`
 /// has #5 (head `sib/feature`) and #6 (head `feat/landed`, the sibling's own
@@ -130,7 +130,6 @@ fn install_forge(shim: &Path, log: &Path, state: &ForgeState) {
         [
             pull_record(7, "MERGED", "main", None),
             pull_record(12, "OPEN", "upstream-twelve", None),
-            review(16, "OPEN", "feat/alpha", "bob"),
         ]
         .iter()
         .chain(&state.upstream)
@@ -150,12 +149,13 @@ fn install_forge(shim: &Path, log: &Path, state: &ForgeState) {
         )
     };
     let fork_pulls = format!(
-        "[{},{},{},{},{},{},{},{}]",
+        "[{},{},{},{},{},{},{},{},{}]",
         at(12, "OPEN", "feat/alpha"),
         at(13, "OPEN", "feat/base"),
         at(14, "OPEN", "feat/landed"),
         at(15, "MERGED", "feat/base"),
         review(16, "OPEN", "feat/alpha", "acme"),
+        review(17, "OPEN", "feat/alpha", "acme"),
         review(20, "OPEN", "main", "bob"),
         review(21, "OPEN", "main", "acme"),
         pull_record_with_fields(
@@ -750,10 +750,33 @@ fn track_refuses_a_number_whose_fork_pull_request_is_the_branchs_own() {
 }
 
 #[test]
+fn track_judges_a_head_by_the_forges_owner_not_a_former_one() {
+    // Given: the registry still spells the fork's own repository by its
+    // former owner, acme-old; the forge names it acme/demo. #17 is on both:
+    // the upstream's has acme-old's branch feat/alpha as its head, the fork's
+    // has acme's feat/alpha.
+    let fixture = fixture();
+    fixture.forge(&[review(17, "MERGED", "feat/alpha", "acme-old")]);
+
+    // When: feat/alpha is said to be #17.
+    let output = fixture.knives(&["--text", "track", "feat/alpha", "--pr", "17"]);
+
+    // Then: the former owner's same-named branch is not feat/alpha's: #17
+    // is its review pull request on the fork, and is refused, naming both.
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for named in ["maintainer/demo#17", "acme-old:feat/alpha", "acme/demo#17"] {
+        assert!(stderr.contains(named), "{named}: {stderr}");
+    }
+    assert!(fixture.entries().is_empty(), "{:?}", fixture.entries());
+}
+
+#[test]
 fn track_refuses_a_number_whose_upstream_head_only_shares_the_branchs_name() {
     // Given: #16 is on both: the upstream's has bob's branch feat/alpha as its
     // head, and the fork's has acme's feat/alpha.
     let fixture = fixture();
+    fixture.forge(&[review(16, "OPEN", "feat/alpha", "bob")]);
 
     // When: feat/alpha is said to be #16.
     let output = fixture.knives(&["--text", "track", "feat/alpha", "--pr", "16"]);

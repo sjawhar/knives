@@ -424,6 +424,9 @@ the upstream numbers in the thousands, so most small fork numbers are upstream n
 too. So `track --pr <n>` is refused when the fork's #n has the branch as its head and the
 upstream's #n does not (naming both), when only the fork has #n, and when neither does.
 An upstream #n whose head is another branch is accepted: it is someone else's PR we carry.
+A head is the branch's only by its name and its owner together, the owner of the fork's own
+repository as the forge names it now: an outside contributor's branch of the same name is
+another head, and so is one of a former owner that a remote here still spells.
 
 ### Dependencies
 
