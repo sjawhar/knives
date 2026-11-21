@@ -63,7 +63,7 @@
 
 use std::borrow::Cow;
 use std::cell::OnceCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use jj_lib::files::{MergeResult, merge_hunks};
 use jj_lib::merge::Merge;
@@ -814,6 +814,28 @@ pub fn repeated_headings(content: &[u8]) -> Vec<(&[u8], usize)> {
                 .map(|&count| (heading, count))
         })
         .collect()
+}
+
+/// Each line of `content`'s one `[Unreleased]` section, with its trailing
+/// whitespace cut.
+///
+/// `None` where `content` holds no `## [Unreleased]` heading line, or more
+/// than one. The section is the one that [`UnreleasedReader`] reads: from
+/// the heading line, which is not one of its lines, to the next `#` or `##`
+/// heading or setext underline outside a code fence. A line inside a code
+/// fence there is one of its lines. Spec R8 holds a line that a member added
+/// to a release log where this set holds it ([`crate::own_lines`]), so a
+/// union that joined the member's entries into another list still reads as
+/// holding them.
+pub fn unreleased_lines(content: &[u8]) -> Option<HashSet<&[u8]>> {
+    let mut section = UnreleasedReader::default();
+    let mut held = HashSet::new();
+    for line in content.split_inclusive(|byte| *byte == b'\n') {
+        if section.read(line) != Kind::Section && section.inside {
+            held.insert(line.trim_ascii_end());
+        }
+    }
+    section.one().then_some(held)
 }
 
 /// `block`'s lines, each with its terminator.
@@ -1944,6 +1966,48 @@ mod tests {
                 String::from_utf8_lossy(content)
             );
         }
+    }
+
+    #[test]
+    fn the_unreleased_lines_are_the_one_sections_lines_as_knives_reads_it() {
+        // Given: a changelog whose one `[Unreleased]` section holds an entry
+        // with trailing spaces and a fenced `## ` line, above a released
+        // section
+        let log: &[u8] = b"# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- A fix.  \n\n\
+                           ```md\n## Not a heading\n```\n\n## [1.0.0]\n\n- Released.\n";
+
+        // When: its lines are read
+        let held = unreleased_lines(log).expect("one `[Unreleased]` section");
+
+        // Then: the section's lines are held, trailing whitespace cut, the
+        // fenced line among them
+        for line in [b"### Fixed".as_slice(), b"- A fix.", b"## Not a heading"] {
+            assert!(held.contains(line), "{}", String::from_utf8_lossy(line));
+        }
+        // And: the headings and the released section's lines are not
+        for line in [
+            b"# Changelog".as_slice(),
+            b"## [Unreleased]",
+            b"## [1.0.0]",
+            b"- Released.",
+        ] {
+            assert!(!held.contains(line), "{}", String::from_utf8_lossy(line));
+        }
+
+        // Given: a section that a setext underline ends
+        let setext: &[u8] = b"## [Unreleased]\n\n- New.\n\nRelease 1.0\n===========\n\n- Old.\n";
+        // When/Then: the line after the underline is not held
+        let held = unreleased_lines(setext).expect("one `[Unreleased]` section");
+        assert!(held.contains(b"- New.".as_slice()));
+        assert!(!held.contains(b"- Old.".as_slice()));
+
+        // Given: a changelog with no `## [Unreleased]` heading line, and one
+        // with two
+        let none: &[u8] = b"# Changelog\n\n## [1.0.0]\n\n- One.\n";
+        let two: &[u8] = b"## [Unreleased]\n\n- One.\n\n## [Unreleased]\n\n- Two.\n";
+        // When/Then: neither has one section
+        assert_eq!(unreleased_lines(none), None);
+        assert_eq!(unreleased_lines(two), None);
     }
 
     #[test]
