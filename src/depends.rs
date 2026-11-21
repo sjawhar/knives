@@ -137,6 +137,61 @@ pub(crate) fn run(
     Ok(Exit::Ok)
 }
 
+/// Refuse `knives track --pr <number>` when `number` is no pull request on
+/// the fork's upstream, the one `track` states. A fork and its upstream number
+/// their pull requests apart, and the fork's review pull request #n read as
+/// the upstream's #n names another pull request, or none. `Ok` when the
+/// upstream has it, and when the fork has one forge repository at most, whose
+/// numbers are the only ones there are. The refusal names the fork's pull
+/// request when the fork has one.
+pub(crate) fn upstream_pull(
+    fork: &Fork<'_>,
+    registry: &Registry,
+    branch: &BranchName,
+    number: u64,
+) -> Result<(), Exit> {
+    let entry = fork.entry;
+    let (Some(upstream), Some(origin)) = (remote_slug(&entry.upstream), remote_slug(&entry.origin))
+    else {
+        return Ok(());
+    };
+    if upstream.eq_ignore_ascii_case(origin) {
+        return Ok(());
+    }
+    let context = Context {
+        fork,
+        registry,
+        branch,
+        forge: &CliForge,
+    };
+    let theirs = RepoIdentity {
+        name_with_owner: upstream.to_owned(),
+        id: String::new(),
+    };
+    if context.pull(&theirs, number)?.is_some() {
+        return Ok(());
+    }
+    let own = context.identity(&entry.origin)?;
+    let upstream_name = &fork.upstream;
+    let own_name = own.name_with_owner.to_ascii_lowercase();
+    match context.pull(&own, number)? {
+        Some(ours) => refused(
+            Exit::Usage,
+            format_args!(
+                "{upstream_name} has no pull request #{number}; {own_name}#{number} is {}'s own \
+                 review pull request (head {}). `track` states the upstream pull request \
+                 {branch} becomes; a branch that waits for a review pull request says so with \
+                 `knives depends <branch> --on {own_name}#{number}`",
+                fork.name, ours.pull.head_ref_name,
+            ),
+        ),
+        None => refused(
+            Exit::Usage,
+            format_args!("neither {upstream_name} nor {own_name} has a pull request #{number}"),
+        ),
+    }
+}
+
 /// A `depends` statement of `value`, a forget when it is `None`.
 const fn depends(value: Option<String>, replaces: Option<jiff::Timestamp>) -> Stated {
     Stated {

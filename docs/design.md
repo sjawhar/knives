@@ -416,9 +416,11 @@ the number of sibling entries it masks. A disposition token prefixes that compac
 Inference finds an open pull request from our own copy of the repository, matched by head
 branch name, with a `pr-<n>` bookmark understood as the fetched head of that number.
 That is a good default and a bad rule, so `knives track` overrides it and accepts any
-number, in any state, from any author: a PR opened before this tool existed, one the
+upstream PR, in any state, from any author: a PR opened before this tool existed, one the
 maintainer closed because they wanted a different approach, or somebody else's that we
-carry because ours was superseded.
+carry because ours was superseded. It asks the forge first: a fork's review PR has its own
+number on the fork's repository, and stated as the upstream's number it named another PR,
+so a number only the fork's repository has is refused, naming that review PR.
 
 ### Dependencies
 

@@ -1037,11 +1037,44 @@ fn a_burst_of_concurrent_writes_reaches_the_remote_without_a_failure() {
     assert!(!home.path().join("ledger-sweep.log").exists());
 }
 
+/// A fake gh on which the lab fork's upstream, [`FORK`], has the pull
+/// requests these tests state with `track --pr` (#7, #13 and #1234), and its
+/// own repository has none: `track` asks the forge that a stated number is
+/// the upstream's.
+fn upstream_forge() -> tempfile::TempDir {
+    let shim = tempfile::tempdir().expect("gh shim directory");
+    let pulls = format!(
+        "[{},{},{}]",
+        forge_shim::pull_record(7, "OPEN", "feat/seven", None),
+        forge_shim::pull_record(13, "OPEN", "feat/thirteen", None),
+        forge_shim::pull_record(1234, "OPEN", "feat/alpha", None)
+    );
+    forge_shim::install_repository_gh(
+        shim.path(),
+        &[
+            forge_shim::Repository {
+                named: FORK,
+                canonical: FORK,
+                pulls: &pulls,
+            },
+            forge_shim::Repository {
+                named: "acme/work",
+                canonical: "acme/work",
+                pulls: "[]",
+            },
+        ],
+        &shim.path().join("calls.log"),
+    );
+    shim
+}
+
 /// `knives <args>` from `lab`'s work checkout, as the machine whose config
-/// home is `home`.
+/// home is `home`, with [`upstream_forge`] first on `PATH`.
 fn knives_on(lab: &lab::Lab, home: &Path, args: &[&str]) -> Output {
+    let forge = upstream_forge();
     lab::knives_command(&lab.work, home, lab.temp_path(), args)
         .env("KNIVES_OWNER", "ses_fff688")
+        .env("PATH", forge_shim::path_with_gh_shim(forge.path()))
         .output()
         .expect("run knives")
 }
