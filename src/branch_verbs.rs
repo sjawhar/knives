@@ -1502,7 +1502,10 @@ pub(crate) fn pulled_before_replacing(fork: &Fork<'_>, bound: Bound<'_>, what: &
 ///
 /// A forget pulls first ([`pulled_before_replacing`]) and writes a statement
 /// only when one is stated: a forget of nothing would erase, everywhere, a
-/// statement another machine made that this one has not seen.
+/// statement another machine made that this one has not seen. A stated
+/// number must be a pull request on the fork's upstream
+/// ([`crate::depends::upstream_pull`]), asked before the fork's lock is
+/// taken.
 #[allow(
     clippy::too_many_arguments,
     reason = "the fork, the branch, the three ways to state its pull request and the cwd binding are independent inputs"
@@ -1516,6 +1519,11 @@ pub(crate) fn run_track(
     bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
+    if let Some(number) = pr
+        && let Err(exit) = crate::depends::upstream_pull(fork, bound.registry, branch, number)
+    {
+        return Ok(exit);
+    }
     if forget && !pulled_before_replacing(fork, bound, "the forget") {
         return Ok(Exit::Incomplete);
     }
