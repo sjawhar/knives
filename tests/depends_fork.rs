@@ -523,14 +523,35 @@ fn track_refuses_a_number_only_the_forks_own_repository_has() {
 }
 
 #[test]
-fn track_states_a_number_the_upstream_has() {
-    // Given: #7 is on the upstream only; #12 is on both.
+fn track_refuses_a_number_whose_fork_pull_request_is_the_branchs_own() {
+    // Given: #12 is on both: the upstream's, head upstream-twelve, belongs to
+    // someone else, and the fork's has feat/alpha as its head.
     let fixture = fixture();
 
-    // When: each is stated as the branch's pull request.
+    // When: feat/alpha is said to be #12.
+    let output = fixture.knives(&["--text", "track", "feat/alpha", "--pr", "12"]);
+
+    // Then: refused, naming both pull requests: #12 is feat/alpha's review
+    // pull request on the fork, not the upstream one it becomes.
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for named in ["maintainer/demo#12", "upstream-twelve", "acme/demo#12"] {
+        assert!(stderr.contains(named), "{named}: {stderr}");
+    }
+    assert!(fixture.entries().is_empty(), "{:?}", fixture.entries());
+}
+
+#[test]
+fn track_states_a_number_the_upstream_has() {
+    // Given: #7 is on the upstream only; #12 is on both, and the fork's #12
+    // is feat/alpha's, not feat/base's.
+    let fixture = fixture();
+
+    // When: #7 is stated for feat/alpha, and #12 for feat/base, a branch
+    // carrying someone else's upstream pull request.
     let mut said_lines = Vec::new();
-    for number in ["7", "12"] {
-        let output = fixture.knives(&["--text", "track", "feat/alpha", "--pr", number]);
+    for (branch, number) in [("feat/alpha", "7"), ("feat/base", "12")] {
+        let output = fixture.knives(&["--text", "track", branch, "--pr", number]);
         assert!(output.status.success(), "#{number}: {}", said(&output));
         said_lines.push(
             String::from_utf8_lossy(&output.stdout)
@@ -539,16 +560,14 @@ fn track_states_a_number_the_upstream_has() {
         );
     }
 
-    // Then: both are recorded, as `track` always read a number: the
-    // upstream's.
+    // Then: both are recorded, as `track` reads a number: the upstream's.
     assert_eq!(
         said_lines,
-        ["demo/feat/alpha is #7", "demo/feat/alpha is #12"]
+        ["demo/feat/alpha is #7", "demo/feat/base is #12"]
     );
-    assert_eq!(
-        Statements::from_entries(&fixture.entries()).pull("feat/alpha"),
-        Some(12)
-    );
+    let live = Statements::from_entries(&fixture.entries());
+    assert_eq!(live.pull("feat/alpha"), Some(7));
+    assert_eq!(live.pull("feat/base"), Some(12));
 }
 
 /// The details of a status report's findings of `kind`; a report with no

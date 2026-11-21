@@ -147,13 +147,18 @@ pub(crate) fn run(
     Ok(Exit::Ok)
 }
 
-/// Refuse `knives track --pr <number>` when `number` is no pull request on
-/// the fork's upstream, the one `track` states. A fork and its upstream number
-/// their pull requests apart, and the fork's review pull request #n read as
-/// the upstream's #n names another pull request, or none. `Ok` when the
-/// upstream has it, and when the fork has one forge repository at most, whose
-/// numbers are the only ones there are. The refusal names the fork's pull
-/// request when the fork has one.
+/// Refuse `knives track --pr <number>` when `number` is not the upstream pull
+/// request `branch` becomes. A fork and its upstream number their pull
+/// requests apart, so the fork's review pull request #n read as the
+/// upstream's #n names another pull request, or none; the upstream numbers
+/// in the thousands, so most small fork numbers are also upstream numbers.
+///
+/// `Ok` when the upstream's #n has `branch` as its head, and when it has
+/// another head and the fork's #n is not `branch`'s: a branch may carry
+/// someone else's upstream pull request. Refused when the fork's #n has
+/// `branch` as its head (naming both), when only the fork has #n, and when
+/// neither does. `Ok`, with no forge call, when the fork has one forge
+/// repository at most, whose numbers are the only ones there are.
 pub(crate) fn upstream_pull(
     fork: &Fork<'_>,
     registry: &Registry,
@@ -161,11 +166,12 @@ pub(crate) fn upstream_pull(
     number: u64,
 ) -> Result<(), Exit> {
     let entry = fork.entry;
-    let (Some(upstream), Some(origin)) = (remote_slug(&entry.upstream), remote_slug(&entry.origin))
+    let (Some(upstream), Some(spelled)) =
+        (remote_slug(&entry.upstream), remote_slug(&entry.origin))
     else {
         return Ok(());
     };
-    if upstream.eq_ignore_ascii_case(origin) {
+    if upstream.eq_ignore_ascii_case(spelled) {
         return Ok(());
     }
     let context = Context {
@@ -178,24 +184,44 @@ pub(crate) fn upstream_pull(
         name_with_owner: upstream.to_owned(),
         id: String::new(),
     };
-    if context.pull(&theirs, number)?.is_some() {
+    let on_upstream = context.pull(&theirs, number)?;
+    if on_upstream
+        .as_ref()
+        .is_some_and(|theirs| theirs.pull.head_ref_name == branch.as_str())
+    {
         return Ok(());
     }
     let own = context.identity(&entry.origin)?;
     let upstream_name = &fork.upstream;
     let own_name = own.name_with_owner.to_ascii_lowercase();
-    match context.pull(&own, number)? {
-        Some(ours) => refused(
+    let suggested = context.accepted_spelling(&own_name, spelled);
+    let waits = format!(
+        "`track` states the upstream pull request {branch} becomes; a branch that waits for a \
+         review pull request says so with `knives depends <branch> --on {suggested}#{number}`"
+    );
+    match (on_upstream, context.pull(&own, number)?) {
+        (Some(theirs), Some(ours)) if ours.pull.head_ref_name == branch.as_str() => refused(
             Exit::Usage,
             format_args!(
-                "{upstream_name} has no pull request #{number}; {own_name}#{number} is {}'s own \
-                 review pull request (head {}). `track` states the upstream pull request \
-                 {branch} becomes; a branch that waits for a review pull request says so with \
-                 `knives depends <branch> --on {own_name}#{number}`",
+                "#{number} names two pull requests: {upstream_name}#{number} ({}, head {}) is not \
+                 {branch}'s, and {own_name}#{number} ({}, head {branch}) is {branch}'s review pull \
+                 request on {}'s own repository. {waits}",
+                theirs.pull.state.to_lowercase(),
+                theirs.pull.head_ref_name,
+                ours.pull.state.to_lowercase(),
+                fork.name,
+            ),
+        ),
+        (Some(_), _) => Ok(()),
+        (None, Some(ours)) => refused(
+            Exit::Usage,
+            format_args!(
+                "{upstream_name} has no pull request #{number}; {own_name}#{number} is a review \
+                 pull request on {}'s own repository (head {}). {waits}",
                 fork.name, ours.pull.head_ref_name,
             ),
         ),
-        None => refused(
+        (None, None) => refused(
             Exit::Usage,
             format_args!("neither {upstream_name} nor {own_name} has a pull request #{number}"),
         ),

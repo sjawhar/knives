@@ -418,9 +418,12 @@ branch name, with a `pr-<n>` bookmark understood as the fetched head of that num
 That is a good default and a bad rule, so `knives track` overrides it and accepts any
 upstream PR, in any state, from any author: a PR opened before this tool existed, one the
 maintainer closed because they wanted a different approach, or somebody else's that we
-carry because ours was superseded. It asks the forge first: a fork's review PR has its own
-number on the fork's repository, and stated as the upstream's number it named another PR,
-so a number only the fork's repository has is refused, naming that review PR.
+carry because ours was superseded. It asks the forge first. A fork's review PR has its own
+number on the fork's repository, and stated as the upstream's number it named another PR;
+the upstream numbers in the thousands, so most small fork numbers are upstream numbers
+too. So `track --pr <n>` is refused when the fork's #n has the branch as its head and the
+upstream's #n does not (naming both), when only the fork has #n, and when neither does.
+An upstream #n whose head is another branch is accepted: it is someone else's PR we carry.
 
 ### Dependencies
 
