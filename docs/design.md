@@ -486,9 +486,10 @@ differ, is one requirement.
 
 A report checks the requirements of every row; of a dependent this checkout holds only as
 `<branch>@origin`, another machine's branch nobody here claims; and of a dependent held
-nowhere, deleted. A deleted dependent is judged by the newest commit any ledger entry
-records for it: an entry about the branch records its tip when written, and a release
-write records each parent's commit and the bookmarks there; that record is kept across
+nowhere, deleted. The forge is asked about every pull request on this fork's upstream that
+any of them requires, row or not. A deleted dependent is judged by the newest commit any
+ledger entry records for it: an entry about the branch records its tip when written, and a
+release write records each parent's commit and the bookmarks there; that record is kept across
 forgets and after the branch is deleted. It is a lower bound on the dependent's work, not
 its final head: the branch can move on with nothing written. So when that commit is here
 and has not landed, the dependent's requirements are checked (a branch merged into a review
@@ -498,10 +499,11 @@ requirements are judged too: one that is met says nothing, since nothing the dep
 carried later can change it; each one that is unmet or cannot be judged is a problem that
 names the dependent, what could not be read, what was seen of the requirement, and the
 `knives depends <dependent> --forget …` command that takes those back, with a fetch
-suggested only when the recorded commit is not here. Under `--no-landed` a recorded commit
-can still be shown landed by its merged pull request's landing, not by a replay: one not
-shown landed has its requirements checked, and a missing or unrecorded one is judged as
-above.
+suggested only when the recorded commit is not here; a member is named by its branch name
+there, which takes back every spelling of it. Under `--no-landed` a recorded commit can still
+be shown landed by its merged pull request's landing, not by a replay: one shown landed is
+judged as above, like a missing or unrecorded one, and one not shown landed has its
+requirements checked as a row's.
 
 A requirement is taken back by a `depends` forget followed by the list without it, two
 entries stamped in that order and written newest first: a run cut short between them
@@ -511,11 +513,16 @@ repository. A review pull request recorded under two names of the fork's reposit
 before and after a rename, is one requirement: the forge ties the names, any spelling
 takes back every record of it, and `--on` names it as the list already holds it. A
 member recorded under two names is one requirement too, its former name's token included.
-An upstream's `<owner>/<name>#<n>` is taken back without the forge. A repository the forge
-answers does not exist ties nothing. When the forge cannot be asked whether a record is
-named, and counting it as named would change what is taken back or make it ambiguous,
-nothing is taken back (exit 3): the answer never depends on whether the forge was
-reachable. A member token on another fork's repository is refused unless a record is
+An upstream's `<owner>/<name>#<n>` is taken back without the forge. The forge has no
+answer that means a repository does not exist: GitHub answers a name it cannot resolve the
+same way for a repository that is gone, for one the token cannot see, and in some
+outages. So a record whose repository the forge does not name, by that answer or by a
+failure, is one the forge could not be asked about. The texts of one command are weighed
+together: when counting each such record as named would take back more than the forge's
+answers take, or make a text ambiguous, nothing is taken back (exit 3), so neither an
+outage nor a repository the token cannot see decides what a forget takes. Naming every
+record of a requirement, each as its record spells it, takes them all back whatever the
+forge answers. A member token on another fork's repository is refused unless a record is
 spelled exactly so; then that record alone is taken back. Every machine running
 this knives folds the two into the same list. A knives from before fork requirements
 reads the same list only while it holds no member branch: it cannot read a list that

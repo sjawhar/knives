@@ -552,16 +552,6 @@ pub enum ForgeError {
     },
 }
 
-impl ForgeError {
-    /// Whether the forge answered that the repository asked about does not
-    /// exist: gh's `Could not resolve to a Repository with the name …`. That
-    /// is an answer, not a failure to ask: no live repository has the name.
-    pub fn is_missing_repository(&self) -> bool {
-        matches!(self, Self::Command { stderr, .. }
-            if stderr.contains("Could not resolve to a Repository with the name"))
-    }
-}
-
 /// The pull request half of a hosting service.
 ///
 /// `Send + Sync` because `status` gathers repositories concurrently and probes
@@ -701,26 +691,6 @@ mod tests {
     }
 
     use super::*;
-
-    #[test]
-    fn a_repository_the_forge_cannot_resolve_is_an_answer_and_an_outage_is_not() {
-        let failed = |stderr: &str| ForgeError::Command {
-            command: "gh repo view gone/demo".to_owned(),
-            dir: "/work".to_owned(),
-            code: 1,
-            stderr: stderr.to_owned(),
-        };
-        assert!(
-            failed("GraphQL: Could not resolve to a Repository with the name 'gone/demo'.")
-                .is_missing_repository()
-        );
-        assert!(!failed("gh: Bad credentials (HTTP 401)").is_missing_repository());
-        assert!(!failed("error connecting to api.github.com").is_missing_repository());
-        assert!(
-            !failed("gh: Could not resolve to a PullRequest with the number of 7.")
-                .is_missing_repository()
-        );
-    }
 
     #[test]
     fn fixture_default_has_a_parseable_timestamp_and_hex_oid() {

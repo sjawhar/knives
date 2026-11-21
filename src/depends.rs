@@ -95,19 +95,10 @@ pub(crate) fn run(
         &[&fork.upstream],
     )?;
     let required = store.dependencies(&target);
-    let mut forgotten: Vec<Requirement> = Vec::new();
-    for (text, tie) in change.forget.iter().zip(&forged.ties) {
-        match context.forgotten(&required, text, tie) {
-            Ok(answering) => {
-                for requirement in answering {
-                    if !forgotten.contains(&requirement) {
-                        forgotten.push(requirement);
-                    }
-                }
-            }
-            Err(exit) => return Ok(exit),
-        }
-    }
+    let forgotten = match context.forgotten(&required, change.forget, &forged.ties) {
+        Ok(forgotten) => forgotten,
+        Err(exit) => return Ok(exit),
+    };
     // A requirement to add is named as a record already held only when that
     // record stays: one this command takes back is not held.
     let staying: Vec<Requirement> = required
@@ -279,6 +270,49 @@ enum Outcome {
     Nothing,
     One(Vec<Requirement>),
     Ambiguous(Vec<Requirement>),
+}
+
+/// What one `--forget` text takes back: `known`, by what the forge
+/// answered, and `at_most`, counting as named each record the forge could
+/// not be asked about; `unasked` holds those records, each with why.
+struct Weighed {
+    known: Vec<Requirement>,
+    at_most: Vec<Requirement>,
+    unasked: Vec<(Requirement, String)>,
+}
+
+impl Weighed {
+    /// A text whose records do not depend on what the forge says.
+    fn settled(records: Vec<Requirement>) -> Self {
+        Self {
+            known: records.clone(),
+            at_most: records,
+            unasked: Vec::new(),
+        }
+    }
+}
+
+/// Push each of `items` onto `into` that it does not hold yet.
+fn joined<T: PartialEq>(into: &mut Vec<T>, items: impl IntoIterator<Item = T>) {
+    for item in items {
+        if !into.contains(&item) {
+            into.push(item);
+        }
+    }
+}
+
+/// Why the forge could not be asked about any of `records`, each reason
+/// once.
+fn reasons(unasked: &[(Requirement, String)], records: &[&Requirement]) -> String {
+    let mut why: Vec<&str> = Vec::new();
+    joined(
+        &mut why,
+        unasked
+            .iter()
+            .filter(|(requirement, _)| records.contains(&requirement))
+            .map(|(_, error)| error.as_str()),
+    );
+    why.join("; ")
 }
 
 /// What the forge says, before the fork's lock, about the list the pulled
@@ -797,54 +831,88 @@ impl Context<'_, '_> {
         Ok(Requirement::ForkBranch { repository, branch })
     }
 
-    /// What `--forget <text>` takes back from `required`: the one requirement
-    /// it names, or every record of it, whatever repository spelling each
-    /// carries: a member's by its branch ([`same`]), a review pull request's
-    /// by the forge naming each record's repository as the one `text` names
-    /// (`tie`, asked before the fork's lock: [`Self::tied_by_forge`]). When
-    /// the forge could not be asked about a record, and counting that record
-    /// as tied would change what is taken back or make it ambiguous, nothing
-    /// is taken back and the refusal says so (exit 3): the answer never
-    /// depends on whether the forge was reachable. A member token on a
-    /// repository that is not this fork's own is refused, as `--on` refuses
-    /// it, unless a record is spelled exactly so (then that record alone);
-    /// one on a former name of this fork's repository, which the forge names
-    /// as its own, takes back every record of the member.
+    /// What the `--forget` texts take back from `required`: every record one
+    /// of them takes ([`Self::weighed`]), the texts weighed together. When
+    /// the forge could not be asked about a record, and counting it as named
+    /// would take back more than the forge's answers take, nothing is taken
+    /// back and the refusal says so (exit 3): neither an outage nor a
+    /// repository the token cannot see decides what a forget takes. Naming
+    /// every record of a requirement takes them all back whatever the forge
+    /// answers.
     fn forgotten(
         &self,
         required: &[Requirement],
-        text: &str,
-        tie: &Tie,
+        texts: &[String],
+        ties: &[Tie],
     ) -> Result<Vec<Requirement>, Exit> {
-        if let Some(decided) = self.member_token(required, text, tie) {
-            return decided;
+        let mut known: Vec<Requirement> = Vec::new();
+        let mut at_most: Vec<Requirement> = Vec::new();
+        let mut unasked: Vec<(Requirement, String)> = Vec::new();
+        for (text, tie) in texts.iter().zip(ties) {
+            let weighed = self.weighed(required, text, tie)?;
+            joined(&mut known, weighed.known);
+            joined(&mut at_most, weighed.at_most);
+            joined(&mut unasked, weighed.unasked);
         }
-        let known = self.outcome(required, text, &tie.same);
-        if !tie.unasked.is_empty() {
-            let mut tied = tie.same.clone();
-            tied.extend(
-                tie.unasked
-                    .iter()
-                    .map(|(requirement, _)| requirement.clone()),
-            );
-            if self.outcome(required, text, &tied) != known {
-                return refused(
-                    Exit::Incomplete,
-                    format_args!(
-                        "nothing recorded: whether {text} also names {} could not be asked of \
-                         the forge: {}",
-                        listed(tie.unasked.iter().map(|(requirement, _)| requirement)),
-                        tie.unasked
-                            .iter()
-                            .map(|(_, error)| error.as_str())
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ),
-                );
-            }
+        let also: Vec<&Requirement> = at_most
+            .iter()
+            .filter(|record| !known.contains(record))
+            .collect();
+        if also.is_empty() {
+            return Ok(known);
         }
-        match known {
-            Outcome::Nothing => refused(
+        let mut tokens: Vec<String> = Vec::new();
+        joined(&mut tokens, at_most.iter().map(Requirement::forget_token));
+        refused(
+            Exit::Incomplete,
+            format_args!(
+                "nothing recorded: whether {} also {} {} could not be asked of the forge: {}. \
+                 Run it again when the forge answers, or name every record to take back: \
+                 `knives depends {} --forget {}`",
+                texts.join(" or "),
+                if texts.len() == 1 { "names" } else { "name" },
+                listed(also.iter().copied()),
+                reasons(&unasked, &also),
+                self.branch,
+                tokens.join(" --forget ")
+            ),
+        )
+    }
+
+    /// What `--forget <text>` takes back from `required` ([`Weighed`]): the
+    /// one requirement it names, every record of it whatever repository
+    /// spelling each carries: a member's by its branch ([`same`]), a review
+    /// pull request's by the forge naming each record's repository as the
+    /// one `text` names (`tie`, asked before the fork's lock:
+    /// [`Self::tied_by_forge`]). Refused when, by what the forge answered,
+    /// it names two requirements or nothing (exit 2); and when counting a
+    /// record the forge could not be asked about as named would make it name
+    /// two, or name what it otherwise names nothing of (exit 3). A member
+    /// token on a repository that is not this fork's own is refused, as
+    /// `--on` refuses it, unless a record is spelled exactly so (then that
+    /// record alone); one on a former name of this fork's repository, which
+    /// the forge names as its own, takes back every record of the member.
+    fn weighed(&self, required: &[Requirement], text: &str, tie: &Tie) -> Result<Weighed, Exit> {
+        if let Some(weighed) = self.member_token(required, text, tie) {
+            return weighed;
+        }
+        let mut tied = tie.same.clone();
+        tied.extend(
+            tie.unasked
+                .iter()
+                .map(|(requirement, _)| requirement.clone()),
+        );
+        let at_most = self.outcome(required, text, &tied);
+        let two = matches!(at_most, Outcome::Ambiguous(_));
+        match (self.outcome(required, text, &tie.same), at_most) {
+            (Outcome::Ambiguous(records), _) => refused(
+                Exit::Usage,
+                format_args!(
+                    "{text} answers to {}; name the one to forget as its record spells it",
+                    listed(&records)
+                ),
+            ),
+            (Outcome::Nothing, Outcome::Nothing) => refused(
                 Exit::Usage,
                 format_args!(
                     "{}/{} does not require {text}; it requires {}",
@@ -857,14 +925,42 @@ impl Context<'_, '_> {
                     }
                 ),
             ),
-            Outcome::One(records) => Ok(records),
-            Outcome::Ambiguous(records) => refused(
-                Exit::Usage,
-                format_args!(
-                    "{text} answers to {}; name the one to forget as its record spells it",
-                    listed(&records)
-                ),
-            ),
+            (Outcome::One(known), Outcome::One(at_most)) => Ok(Weighed {
+                known,
+                at_most,
+                unasked: tie.unasked.clone(),
+            }),
+            (Outcome::One(known), Outcome::Nothing) => Ok(Weighed::settled(known)),
+            (known, Outcome::One(at_most) | Outcome::Ambiguous(at_most)) => {
+                let known = match known {
+                    Outcome::One(records) => records,
+                    _ => Vec::new(),
+                };
+                let also: Vec<&Requirement> = at_most
+                    .iter()
+                    .filter(|record| !known.contains(record))
+                    .collect();
+                refused(
+                    Exit::Incomplete,
+                    format_args!(
+                        "nothing recorded: whether {text} {} {} could not be asked of the \
+                         forge: {}{}",
+                        if known.is_empty() {
+                            "names"
+                        } else {
+                            "also names"
+                        },
+                        listed(also.iter().copied()),
+                        reasons(&tie.unasked, &also),
+                        if two {
+                            "; if it does, it names two requirements. Name the one to forget \
+                             as its record spells it"
+                        } else {
+                            ". Run it again when the forge answers"
+                        }
+                    ),
+                )
+            }
         }
     }
 
@@ -873,14 +969,15 @@ impl Context<'_, '_> {
     /// (a spelling here, or a former name the forge names as its own), for
     /// the general match. Another fork's repository, or one the forge names
     /// otherwise: the record spelled exactly so alone, or a refusal. One the
-    /// forge could not be asked about: exit 3 when counting it as this fork's
-    /// own would take back more.
+    /// forge could not be asked about: the record spelled exactly so, and
+    /// at most every record of the member ([`Weighed`]); exit 3 when no
+    /// record is spelled exactly so but the member is held.
     fn member_token(
         &self,
         required: &[Requirement],
         text: &str,
         tie: &Tie,
-    ) -> Option<Result<Vec<Requirement>, Exit>> {
+    ) -> Option<Result<Weighed, Exit>> {
         let Some(Requirement::ForkBranch { repository, branch }) = Requirement::parse(text) else {
             return None;
         };
@@ -893,7 +990,7 @@ impl Context<'_, '_> {
             .collect();
         if let Some(key) = self.other_fork(repository) {
             if !exact.is_empty() {
-                return Some(Ok(exact));
+                return Some(Ok(Weighed::settled(exact)));
             }
             return Some(refused(
                 Exit::Usage,
@@ -915,19 +1012,34 @@ impl Context<'_, '_> {
                 })
                 .cloned()
                 .collect();
-            if every != exact {
+            let also: Vec<Requirement> = every
+                .iter()
+                .filter(|held| !exact.contains(held))
+                .cloned()
+                .collect();
+            if exact.is_empty() && !also.is_empty() {
                 return Some(refused(
                     Exit::Incomplete,
                     format_args!(
                         "nothing recorded: whether {repository} is {fork}'s own repository, so \
-                         that {text} also names {}, could not be asked of the forge: {error}",
-                        listed(every.iter().filter(|held| !exact.contains(held)))
+                         that {text} names {}, could not be asked of the forge: {error}. Run it \
+                         again when the forge answers, or name the member by its branch: \
+                         `knives depends {} --forget {branch}`",
+                        listed(&also),
+                        self.branch
                     ),
                 ));
             }
+            if !exact.is_empty() {
+                return Some(Ok(Weighed {
+                    known: exact,
+                    at_most: every,
+                    unasked: also.into_iter().map(|held| (held, error.clone())).collect(),
+                }));
+            }
         }
         if !exact.is_empty() {
-            return Some(Ok(exact));
+            return Some(Ok(Weighed::settled(exact)));
         }
         Some(refused(
             Exit::Usage,
@@ -999,9 +1111,9 @@ impl Context<'_, '_> {
     /// otherwise; a repository renamed between two records, in either
     /// direction, ties them. Nothing, with no forge call, for a text that
     /// names an upstream by its `<owner>/<name>` without an `origin:`
-    /// prefix: no review pull request is on it. A repository the forge says
-    /// does not exist ties nothing; a record the forge cannot be asked about
-    /// is listed as unasked. For a member token on a repository no spelling
+    /// prefix: no review pull request is on it. A record whose repository the
+    /// forge does not name, by an answer or a failure, is listed as unasked
+    /// ([`Self::named`]). For a member token on a repository no spelling
     /// here gives: whether the forge names it as this fork's own, asked only
     /// when the list holds the member under another spelling.
     fn tied_by_forge(&self, required: &[Requirement], text: &str) -> Tie {
@@ -1061,8 +1173,7 @@ impl Context<'_, '_> {
         };
         let mut tie = Tie::default();
         let named = match self.named(&origin) {
-            Ok(Some(named)) => named,
-            Ok(None) => return tie,
+            Ok(named) => named,
             Err(error) => {
                 tie.unasked = candidates
                     .into_iter()
@@ -1081,7 +1192,7 @@ impl Context<'_, '_> {
                 Ok(true)
             } else {
                 self.named(&origin.replacen(slug, repository, 1))
-                    .map(|name| name.is_some_and(|name| name.eq_ignore_ascii_case(&named)))
+                    .map(|name| name.eq_ignore_ascii_case(&named))
             };
             match is_named {
                 Ok(true) => tie.same.push(requirement.clone()),
@@ -1119,8 +1230,7 @@ impl Context<'_, '_> {
             self.named(own),
             self.named(&own.replacen(slug, repository, 1)),
         ) {
-            (Ok(Some(own)), Ok(Some(named))) => Ok(own == named),
-            (Ok(_), Ok(_)) => Ok(false),
+            (Ok(own), Ok(named)) => Ok(own == named),
             (Err(error), _) | (_, Err(error)) => Err(error),
         };
         Tie {
@@ -1148,20 +1258,21 @@ impl Context<'_, '_> {
                     if held_number == number
                         && !other.eq_ignore_ascii_case(repository)
                         && matches!(self.named(&origin.replacen(slug, other, 1)),
-                            Ok(Some(name)) if name.eq_ignore_ascii_case(repository)))
+                            Ok(name) if name.eq_ignore_ascii_case(repository)))
             })
             .cloned()
     }
 
-    /// The name the forge gives the repository the remote `url` names;
-    /// `None` when the forge answers that no repository has that name; or why
-    /// it could not be asked.
-    fn named(&self, url: &str) -> Result<Option<String>, String> {
-        match self.forge.repo_identity(&self.fork.checkout.path, url, url) {
-            Ok(identity) => Ok(Some(identity.name_with_owner.to_ascii_lowercase())),
-            Err(error) if error.is_missing_repository() => Ok(None),
-            Err(error) => Err(format!("{url}: {error}")),
-        }
+    /// The name the forge gives the repository the remote `url` names, or
+    /// why it could not be asked. The forge's `Could not resolve to a
+    /// Repository` is such a reason, not an answer that no repository has the
+    /// name: GitHub says it for one that does not exist, for one the token
+    /// cannot see, and in some outages, and nothing tells those apart.
+    fn named(&self, url: &str) -> Result<String, String> {
+        self.forge
+            .repo_identity(&self.fork.checkout.path, url, url)
+            .map(|identity| identity.name_with_owner.to_ascii_lowercase())
+            .map_err(|error| format!("{url}: {error}"))
     }
 
     /// This fork's own `origin` URL when the forge names that repository

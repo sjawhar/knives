@@ -302,14 +302,28 @@ pub struct Repository<'a> {
 /// Install a fake `gh` that answers each of `repositories` apart, as a forge
 /// does: `repo view <owner>/<name>` gives that repository's identity, `pr
 /// list -R <owner>/<name>` its pull requests, and a by-number facts query
-/// (`api graphql -f owner=… -f name=…`) the pull requests of the repository
-/// its `owner` and `name` fields name, a number it does not have being
-/// absent from the reply. A status snapshot's warm sweep finds nothing. A
-/// call naming any other repository fails as gh does for one that does not
-/// exist, but a list of one is empty. A pull request row may repeat a field
-/// to replace [`pull_record_with_fields`]'s default: the last one is kept.
-/// Each call's arguments are appended to `log`.
+/// (`api graphql -f owner=… -f name=…`) the pull requests it asks about of
+/// the repository its `owner` and `name` fields name, a number that
+/// repository does not have, or the query does not ask about, being absent
+/// from the reply. A status snapshot's warm sweep finds nothing. A call
+/// naming any other repository fails as gh does for one that does not
+/// exist, or that the token cannot see, but a list of one is empty. A pull
+/// request row may repeat a field to replace [`pull_record_with_fields`]'s
+/// default: the last one is kept. Each call's arguments are appended to
+/// `log`.
 pub fn install_repository_gh(shim: &Path, repositories: &[Repository<'_>], log: &Path) {
+    install_repository_gh_failing(shim, repositories, &[], log);
+}
+
+/// [`install_repository_gh`], but every call naming one of `failing` (an
+/// `<owner>/<name>`) fails as an outage does, `HTTP 502`, not as a name the
+/// forge cannot resolve.
+pub fn install_repository_gh_failing(
+    shim: &Path,
+    repositories: &[Repository<'_>],
+    failing: &[&str],
+    log: &Path,
+) {
     let sweep = json_file(
         shim,
         "sweep.json",
@@ -327,6 +341,15 @@ pub fn install_repository_gh(shim: &Path, repositories: &[Repository<'_>], log: 
     let mut views = String::new();
     let mut lists = String::new();
     let mut facts = String::new();
+    let outage = "echo \"HTTP 502: Bad Gateway (https://api.github.com/graphql)\" >&2; exit 1 ;;";
+    for repository in failing {
+        let (owner, name) = repository
+            .split_once('/')
+            .expect("a repository is named <owner>/<name>");
+        writeln!(views, "  {repository}) {outage}").expect("write to a string");
+        writeln!(lists, "  {repository}) {outage}").expect("write to a string");
+        writeln!(facts, "  \"{owner} {name}\") {outage}").expect("write to a string");
+    }
     for (index, repository) in repositories.iter().enumerate() {
         let (owner, name) = repository
             .named
@@ -343,24 +366,9 @@ pub fn install_repository_gh(shim: &Path, repositories: &[Repository<'_>], log: 
         let pulls: Vec<serde_json::Value> =
             serde_json::from_str(repository.pulls).expect("parse fake pull request payload");
         let list = json_file(shim, &format!("list-{index}.json"), &pulls);
-        let reply = json_file(
-            shim,
-            &format!("facts-{index}.json"),
-            &facts_reply(&pulls, &[], &[]),
-        );
         cat_arm(&mut lists, repository.named, &list);
         cat_arm(&mut views, repository.named, &identity);
-        writeln!(
-            facts,
-            "  \"{owner} {name}\")\n\
-             \x20   case \"$*\" in\n\
-             \x20   *\"pullRequest(number:\"*) cat \"{}\"; exit 0 ;;\n\
-             \x20   *\"orderBy: {{field: UPDATED_AT\"*) cat \"{}\"; exit 0 ;;\n\
-             \x20   esac ;;",
-            reply.display(),
-            sweep.display(),
-        )
-        .expect("write to a string");
+        facts.push_str(&facts_arm(shim, (owner, name), &pulls, &sweep));
     }
     install_executable(
         &shim.join("gh"),
@@ -401,6 +409,53 @@ pub fn install_repository_gh(shim: &Path, repositories: &[Repository<'_>], log: 
             log = log.display(),
         ),
     );
+}
+
+/// The `case` arm that answers a by-number facts query on `owner`/`name`,
+/// whose pull requests are `pulls`, for the numbers the query asks about,
+/// as GitHub answers it: one fragment per pull request, put together for
+/// the `pullRequest(number: N)` fields the query holds. A reinstall can hide
+/// a repository, so the fragments are kept by the repository's name, and
+/// cleared first.
+fn facts_arm(
+    shim: &Path,
+    (owner, name): (&str, &str),
+    pulls: &[serde_json::Value],
+    sweep: &Path,
+) -> String {
+    let dir = shim.join(format!("facts-{owner}-{name}"));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("clear the facts directory");
+    }
+    std::fs::create_dir_all(&dir).expect("create the facts directory");
+    for pull in pulls {
+        let number = pull["number"].as_u64().expect("pull request number");
+        std::fs::write(
+            dir.join(format!("{number}.json")),
+            format!(
+                "\"p{number}\":{}",
+                serde_json::to_string(pull).expect("serialize a fake pull request")
+            ),
+        )
+        .expect("write a fake pull request's facts");
+    }
+    format!(
+        "  \"{owner} {name}\")\n\
+         \x20   case \"$*\" in\n\
+         \x20   *\"pullRequest(number:\"*)\n\
+         \x20     printf '{{\"data\":{{\"repository\":{{'\n\
+         \x20     separator=\n\
+         \x20     for number in $(printf '%s\\n' \"$*\" | grep -o 'pullRequest(number: [0-9]*' | grep -o '[0-9]*$'); do\n\
+         \x20       if [ -f \"{dir}/$number.json\" ]; then\n\
+         \x20         printf '%s' \"$separator\"; cat \"{dir}/$number.json\"; separator=,\n\
+         \x20       fi\n\
+         \x20     done\n\
+         \x20     printf '}}}}}}\\n'; exit 0 ;;\n\
+         \x20   *\"orderBy: {{field: UPDATED_AT\"*) cat \"{sweep}\"; exit 0 ;;\n\
+         \x20   esac ;;\n",
+        dir = dir.display(),
+        sweep = sweep.display(),
+    )
 }
 
 /// Write `value` as JSON to `name` in `shim`; its path.

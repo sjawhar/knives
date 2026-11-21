@@ -422,7 +422,11 @@ pub enum Command {
         on: Vec<String>,
         /// A requirement to take back, repeatable: as its record spells it, or
         /// as `--on` would. Every record of it is taken back, whatever spelling
-        /// of the fork's repository each carries.
+        /// of the fork's repository each carries. The texts are weighed
+        /// together: when the forge cannot say whether a record is named (it
+        /// is down, or cannot see a repository), and counting it would take
+        /// back more, nothing is taken back (exit 3); naming every record
+        /// takes them all back.
         #[arg(long)]
         forget: Vec<String>,
         /// Registry name. Defaults to the repo you are standing in.
