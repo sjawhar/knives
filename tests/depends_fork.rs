@@ -1289,3 +1289,56 @@ fn status_checks_a_dependent_this_checkout_holds_only_on_origin() {
     );
     assert_eq!(code, Some(1), "{report}");
 }
+
+#[test]
+fn one_review_pull_request_does_not_change_another_ones_answer_at_the_same_commit() {
+    // Given: the fork's #14, head feat/landed, and #13, head feat/base, both
+    // at feat/base's first commit, which no local bookmark points at any more
+    // (feat/base has new work). Upstream #40, from acme's feat/landed at that
+    // commit, landed it squash-merged with content the maintainer changed,
+    // so only the merge evidence for feat/landed shows it landed.
+    let fixture = fixture_with(ORIGIN, ORIGIN);
+    let lab = &fixture.lab;
+    let head = lab::commit_at(lab, "feat/base");
+    lab.jj_work(["new", "-r", "feat/base", "-m", "new local work"]);
+    std::fs::write(lab.work.join("later.txt"), "later local work\n").expect("write the new work");
+    lab.jj_work(["bookmark", "set", "feat/base", "-r", "@"]);
+    lab.jj_work(["new"]);
+    lab.upstream_trunk_file("base.txt", "base changed while merging\n");
+    let landing = lab::commit_at(lab, "main@upstream");
+    fixture.forge(&[merged_upstream(
+        40,
+        "feat/landed",
+        head.as_str(),
+        landing.as_str(),
+    )]);
+    fixture.move_head(14, head.as_str());
+    fixture.move_head(13, head.as_str());
+
+    // Then, with #14 alone: met, by #40's landing.
+    fixture.depends(&["--on", "acme/demo#14"]);
+    let (_, control) = status(&fixture);
+    assert_eq!(details(&control, "unmet-dependency"), Vec::<String>::new());
+    assert_eq!(problems(&control), Vec::<String>::new(), "{control}");
+
+    // When: #13 is required too, judged first: feat/base has no merge
+    // evidence, and its replay of that commit conflicts with the trunk.
+    fixture.depends(&["--on", "acme/demo#13"]);
+    let (_, both) = status(&fixture);
+
+    // Then: #13 is unmet, and #14's answer does not change: the same commit
+    // under another branch's evidence is judged again.
+    let unmet = details(&both, "unmet-dependency");
+    assert!(
+        unmet
+            .iter()
+            .any(|detail| detail.starts_with("feat/alpha requires origin:acme/demo#13")),
+        "{unmet:?}\n{both}"
+    );
+    assert!(
+        !unmet
+            .iter()
+            .any(|detail| detail.contains("origin:acme/demo#14")),
+        "{unmet:?}\n{both}"
+    );
+}
