@@ -528,8 +528,8 @@ fn a_change_no_member_explains_is_refused_outside_a_stacked_series() {
     // When: it is recorded.
     let recorded = record(&lab, &home, "release/2026-08-05", &commit);
 
-    // Then: it is refused as a stacked series refuses it, naming the file no
-    // member or trunk explains, and nothing is written.
+    // Then: it is refused, naming the file no member or trunk explains, and
+    // nothing is written.
     let out = text(&recorded);
     assert_eq!(recorded.status.code(), Some(3), "{out}");
     assert!(out.contains("unexplained.txt"), "{out}");
@@ -998,14 +998,12 @@ fn branch_on(lab: &Lab, base: &str, name: &str, (file, content): (&str, &str)) {
     lab.jj_work(["new"]);
 }
 
-/// The release-test home with a series `old` on the upstream branch `old`,
-/// plus whatever `extra` the test adds to its table.
-fn series_home(lab: &Lab, extra: &str) -> tempfile::TempDir {
+/// The release-test home with a series `old` on the upstream branch `old`.
+fn series_home(lab: &Lab) -> tempfile::TempDir {
     let (home, _consumer) = release_test_home(lab);
     let registry = home.path().join("repos.toml");
     let mut registered = std::fs::read_to_string(&registry).expect("read registry");
     registered.push_str("\n[repos.demo.series.old]\nbase = \"old\"\n");
-    registered.push_str(extra);
     std::fs::write(&registry, registered).expect("write registry");
     home
 }
@@ -1022,7 +1020,7 @@ fn a_series_hand_cut_is_recorded() {
     lab.jj_work(["bookmark", "create", SPEED, "-r", "@"]);
     lab.jj_work(["new"]);
     lab.push_branch(SPEED);
-    let home = series_home(&lab, "");
+    let home = series_home(&lab);
     let commit = commit_at(&lab, SPEED);
 
     // When: the release is recorded in its series.
@@ -1064,26 +1062,12 @@ fn previous_release_lab() -> (Lab, tempfile::TempDir) {
         ("lines.txt", "1\n2\n3\n4\n5\n"),
     );
     branch_on(&lab, "old@upstream", "fix/b", ("b.txt", "fix/b\n"));
-    let home = series_home(&lab, "");
+    let home = series_home(&lab);
     let cut = knives_release(&lab, &home, &["--series", "old", "cut", PREVIOUS]);
     assert!(cut.status.success(), "{}", text(&cut));
     lab.push_branch(PREVIOUS);
     lab.fetch_work();
-    let noted = lab::knives(
-        &lab,
-        &home,
-        &[
-            "notch",
-            PREVIOUS,
-            "-m",
-            "record: published as v1.0.0",
-            "--evidence",
-            commit_at(&lab, PREVIOUS).as_str(),
-            "--repo",
-            "demo",
-        ],
-    );
-    assert!(noted.status.success(), "{}", text(&noted));
+    mark_published(&lab, &home, PREVIOUS);
     (lab, home)
 }
 
@@ -1113,7 +1097,8 @@ fn chain_next(lab: &Lab) {
 
 #[test]
 fn a_chain_shaped_release_is_refused_as_not_a_flat_octopus_merge() {
-    // Given: the same chain in a series without the stacked key.
+    // Given: [`NEXT`] made by hand as the chain [`chain_next`] on
+    // [`PREVIOUS`].
     let (lab, home) = previous_release_lab();
     members_on_previous(&lab);
     chain_next(&lab);

@@ -25,7 +25,7 @@ use lab::{Lab, commit_at, knives_release, release_test_home};
 /// The series' first cut: the previous release of the release in hand.
 const PREVIOUS: &str = "release/old/2026-08-04";
 
-/// The series' next release, made by hand on [`PREVIOUS`], or cut.
+/// The series' next cut, after [`PREVIOUS`].
 const NEXT: &str = "release/old/2026-08-05";
 
 /// Whether `revision` resolves in the lab's work checkout.
@@ -54,13 +54,12 @@ fn branch_on(lab: &Lab, base: &str, name: &str, file: &str) {
 }
 
 /// The release-test home with the registry entry given a series `old` on the
-/// upstream branch `old`, plus whatever `extra` the test adds to that table.
-fn series_home(lab: &Lab, extra: &str) -> tempfile::TempDir {
+/// upstream branch `old`.
+fn series_home(lab: &Lab) -> tempfile::TempDir {
     let (home, _consumer) = release_test_home(lab);
     let registry = home.path().join("repos.toml");
     let mut text = std::fs::read_to_string(&registry).expect("read registry");
     text.push_str("\n[repos.demo.series.old]\nbase = \"old\"\n");
-    text.push_str(extra);
     std::fs::write(&registry, text).expect("write registry");
     home
 }
@@ -80,7 +79,7 @@ fn previous_release_lab() -> (Lab, tempfile::TempDir) {
     let lab = two_base_lab();
     branch_on(&lab, "old@upstream", "fix/a", "a.txt");
     branch_on(&lab, "old@upstream", "fix/b", "b.txt");
-    let home = series_home(&lab, "");
+    let home = series_home(&lab);
     let cut = knives_release(&lab, &home, &["--series", "old", "cut", PREVIOUS]);
     assert!(cut.status.success(), "{}", text(&cut));
     lab.push_branch(PREVIOUS);
@@ -124,9 +123,9 @@ fn mark_published(lab: &Lab, home: &tempfile::TempDir, name: &str) {
 
 #[test]
 fn without_stacked_an_include_stacked_on_the_previous_release_is_refused() {
-    // Given: the same series and branches without the stacked key, and the
-    // next release cut: it starts identical to the published first cut,
-    // which is now its previous release.
+    // Given: series `old` with its first cut published and three branches
+    // on it ([`previous_release_lab`]), and the next release cut: it starts
+    // identical to the first cut, which is now its previous release.
     let (lab, home) = previous_release_lab();
     let cut = knives_release(&lab, &home, &["--series", "old", "cut", NEXT]);
     assert!(resolves(&lab, NEXT), "{}", text(&cut));
@@ -134,8 +133,8 @@ fn without_stacked_an_include_stacked_on_the_previous_release_is_refused() {
     // When: a branch built on the previous release is included.
     let include = knives_release(&lab, &home, &["--series", "old", "include", "del"]);
 
-    // Then: the unstacked rule refuses it: its history past the trunk
-    // carries the previous release's merge.
+    // Then: it is refused: its history past the trunk carries the previous
+    // release's merge.
     let out = text(&include);
     assert_eq!(include.status.code(), Some(3), "{out}");
     assert!(out.contains("rebase it off the trunk"), "{out}");

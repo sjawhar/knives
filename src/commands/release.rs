@@ -1114,15 +1114,15 @@ pub fn in_hand_write(release: &InHand<'_>) -> Result<InHandWrite, crate::jj::JjE
     for (event, write) in crate::release_model::recorded_write_events(ledger, name) {
         any = true;
         if repo.is_same_or_metadata_rewrite(&write.commit, commit)? {
-            return Ok(unless_marked(event, write, InHandWrite::Recorded));
+            return Ok(unless_marked(event, write));
         }
     }
     // A release whose every parent is a carrier has no member to compose
     // from, so the in-between commit a write builds never stands on no
     // parent, whether or not the ledger records a write of the name.
-    let parents = repo.parent_commits(commit.as_str())?;
-    if let Some(into) = parents.first()
-        && parents.iter().all(|parent| writes.contains(parent))
+    let reading = read_release(repo, (writes, commit))?;
+    if let Some(into) = reading.carriers.first()
+        && reading.members.is_empty()
     {
         return Ok(InHandWrite::Unchecked(Unchecked::NoMatch(
             NoMatch::AllCarriers {
@@ -1134,7 +1134,6 @@ pub fn in_hand_write(release: &InHand<'_>) -> Result<InHandWrite, crate::jj::JjE
     if !any {
         return Ok(InHandWrite::NoRecord);
     }
-    let reading = read_release(repo, (writes, commit))?;
     let Some(matched) = matched_write(repo, (ledger, name), writes, &reading.members)? else {
         return Ok(InHandWrite::Unchecked(Unchecked::NoMatch(NoMatch::Members)));
     };
@@ -1156,11 +1155,7 @@ pub fn in_hand_write(release: &InHand<'_>) -> Result<InHandWrite, crate::jj::JjE
             write: matched.write,
         });
     }
-    Ok(unless_marked(
-        matched.event,
-        matched.write,
-        InHandWrite::Recorded,
-    ))
+    Ok(unless_marked(matched.event, matched.write))
 }
 
 /// What `write`, a recorded write of a release whose earlier writes are
@@ -1181,14 +1176,14 @@ pub fn write_composition(
         .collect())
 }
 
-/// How a release in hand that holds `write` stands (`held`), unless `event`,
-/// the write's own, says knives could not check the release it was written
-/// over: then the release is unchecked too ([`Unchecked::Inherited`]), since
+/// How a release in hand that holds `write` stands, unless `event`, the
+/// write's own, says knives could not check the release it was written over:
+/// then the release is unchecked too ([`Unchecked::Inherited`]), since
 /// nothing measured what it stands on. Only a release that is `write`, or a
 /// jj rebase or metadata rewrite of it, gets here: one whose tree carries a
 /// change on top of `write` is [`InHandWrite::Unrecorded`], marked or not.
-fn unless_marked(event: &Entry, write: RecordedWrite, held: InHandWrite) -> InHandWrite {
-    crate::release_model::unchecked_mark(event).map_or(held, |reason| {
+fn unless_marked(event: &Entry, write: RecordedWrite) -> InHandWrite {
+    crate::release_model::unchecked_mark(event).map_or(InHandWrite::Recorded, |reason| {
         InHandWrite::Unchecked(Unchecked::Inherited {
             write,
             reason: reason.to_owned(),

@@ -2696,8 +2696,8 @@ mod reading_tests {
     use crate::config::test_support::run_jj;
     use crate::jj::Repo;
 
-    /// The first cut of series `old`: the previous release of each release
-    /// these tests read.
+    /// The first cut of series `old`: the release that the chain the test
+    /// reads is made on.
     const PREVIOUS: &str = "release/old/2026-08-04";
 
     /// A commit on `parents`, described and bookmarked as `name`.
@@ -2713,8 +2713,7 @@ mod reading_tests {
 
     /// A repository with the series base `old`, two branches on it, their
     /// flat first cut [`PREVIOUS`], three branches on that cut (`del`, `m6`
-    /// and `m5`), and two next releases made from them by hand: the merge
-    /// `flat` of the cut and the three, and the chain `chain`, which is
+    /// and `m5`), and the chain `chain` made from them by hand, which is
     /// `merge(merge(merge(PREVIOUS, del), m6), m5)` through `inner1` and
     /// `inner2`.
     fn repository(directory: &Path) -> PathBuf {
@@ -2730,7 +2729,6 @@ mod reading_tests {
         for branch in ["del", "m6", "m5"] {
             commit(&path, &[PREVIOUS], branch);
         }
-        commit(&path, &[PREVIOUS, "del", "m6", "m5"], "flat");
         commit(&path, &[PREVIOUS, "del"], "inner1");
         commit(&path, &["inner1", "m6"], "inner2");
         commit(&path, &["inner2", "m5"], "chain");
@@ -2754,7 +2752,7 @@ mod reading_tests {
 
     #[test]
     fn outside_a_stacked_series_a_release_reads_its_own_parents() {
-        // Given: the chain, in a series without the stacked key.
+        // Given: the chain.
         let _environment = crate::config::test_support::environment_lock();
         let directory = tempfile::tempdir().expect("create test directory");
         let path = repository(directory.path());
@@ -2762,8 +2760,7 @@ mod reading_tests {
         // When: it is read.
         let reading = read(&path, "chain");
 
-        // Then: it has no previous release, and its own parents are its
-        // members.
+        // Then: its own parents are its members.
         assert_eq!(
             reading,
             ReleaseReading {

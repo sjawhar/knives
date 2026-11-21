@@ -3537,14 +3537,13 @@ fn without_carriers(source: &jj_lib::commit::Commit, carriers: &[CommitId]) -> V
 /// of its parents, onto the new parents. With a carrier among those parents
 /// the merge already holds every resolution the carrier holds, so the
 /// source's own change is empty there and a duplicate onto the members alone
-/// loses them. So a source whose parents are not
-/// `measured` is first written again as an in-between commit on `measured`
-/// with its own tree, description and author, which makes those resolutions
-/// its own change; that commit is duplicated; and it is recorded abandoned in
-/// the same transaction, so the write still leaves one new visible commit. A
-/// new commit, never a rewrite of the source: a rewrite would record the
-/// source rewritten and move everything resting on it, a working copy
-/// included.
+/// loses them. So a source whose parents are not `measured` is first written
+/// again as an in-between commit on `measured` with its own tree, description
+/// and author, which makes those resolutions its own change; that commit is
+/// duplicated; and it is recorded abandoned in the same transaction, so the
+/// write still leaves one new visible commit. A new commit, never a rewrite
+/// of the source: a rewrite would record the source rewritten and move
+/// everything resting on it, a working copy included.
 fn duplicated_from(
     tx: &mut Transaction,
     (source, message): (&jj_lib::commit::Commit, Option<&str>),
@@ -3752,10 +3751,9 @@ pub enum ResolutionBaseline<'a> {
     /// `members` as a knives write onto them builds it: `write`'s own change,
     /// its tree against the merge of `composed`, what it composes (its
     /// parents less its carriers), rebased onto them with the release-log
-    /// union, the tree
-    /// [`Repo::holds_rebased_write`] reads. A member rewritten in place,
-    /// which makes jj rebase the release, is then no change of the
-    /// resolution's.
+    /// union, the tree [`Repo::holds_rebased_write`] reads. A member
+    /// rewritten in place, which makes jj rebase the release, is then no
+    /// change of the resolution's.
     Rebuilt {
         write: &'a CommitId,
         composed: &'a [CommitId],

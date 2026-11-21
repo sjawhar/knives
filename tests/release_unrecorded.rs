@@ -710,8 +710,8 @@ fn a_cut_over_a_name_with_no_recorded_write_is_marked_until_adopted() {
 /// [`a_release_with_no_recorded_write`], then [`NEXT`] cut over it, which
 /// knives could not check, and `feat/delta`, which writes `shared.txt` too,
 /// included into that cut with `shared.txt` left conflicted: `NEXT`'s
-/// newest write is unchecked (`no record`), with no hand change on it, as
-/// F8 of the flat probe made its state. Returns the lab and its home.
+/// newest write is unchecked (`no record`), with no hand change on it.
+/// Returns the lab and its home.
 fn an_unchecked_write_left_conflicted() -> (Lab, tempfile::TempDir) {
     let (lab, home) = a_release_with_no_recorded_write();
     let out = release_ran(&lab, &home, &["cut", NEXT]);
@@ -739,7 +739,7 @@ fn an_include_over_a_hand_resolution_of_an_unchecked_write_is_refused_until_adop
     let (ledger, operations) = (ledger_entries(&home), operation_ids(&lab.work));
 
     // When: the branch is included.
-    let output = release_in(&lab, &home, &lab.work, &["include", "feat/epsilon"]);
+    let output = knives_release(&lab, &home, &["include", "feat/epsilon"]);
 
     // Then: the resolution is a change no knives write or adopt recorded,
     // though the write under it is unchecked: refused, naming adopt, and
@@ -755,7 +755,7 @@ fn an_include_over_a_hand_resolution_of_an_unchecked_write_is_refused_until_adop
         &home,
         &["adopt", NEXT, "--why", "hand resolution of shared.txt"],
     );
-    let included = release_in(&lab, &home, &lab.work, &["include", "feat/epsilon"]);
+    let included = knives_release(&lab, &home, &["include", "feat/epsilon"]);
 
     // Then: it goes through, and the release keeps the resolution.
     assert_eq!(included.status.code(), Some(0), "{}", text(&included));
