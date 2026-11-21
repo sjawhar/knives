@@ -8,6 +8,12 @@
 //! that make it that release finished: its members are a recorded write's
 //! (beside any earlier write of the name a fast-forward push added), no
 //! conflicts, and a reason for any change beyond the conflicts the write left.
+//!
+//! A release re-signed or metaedited after a knives write (by `jj describe`,
+//! `jj sign`, `jj metaedit` or a push that signs) holds the write's change,
+//! parents and tree under a new commit id. Adopting it records that commit,
+//! the one that is pushed, so another machine on the ledger, which holds
+//! only what was pushed, can read the release.
 
 use std::collections::BTreeMap;
 
@@ -220,7 +226,8 @@ struct Replaced {
     /// another machine and never pushed is not here.
     here: bool,
     /// Whether the adopted commit is this write, or it re-signed or
-    /// metaedited: an older recorded write adopted as the newest.
+    /// metaedited: an older recorded write adopted as the newest, or the
+    /// newest one re-signed or metaedited ([`Newest::Rewritten`]).
     equal: bool,
     /// What the write composes, where it is the baseline a resolution is
     /// measured against ([`release::baseline_write`]): this repository holds
@@ -344,35 +351,48 @@ impl Replaced {
     }
 }
 
-/// Whether `held` already is the newest recorded write of its name, saying
-/// so: the write itself, or the write re-signed or metaedited, which audit
-/// already reads as it. An older recorded write is recorded as the newest,
-/// and so is a newest one written over a release knives could not check
-/// (its event marked `; unchecked:`), which stays unchecked until adopted.
-fn is_newest(repo: &RepoName, held: &Held, ledger: &[Entry]) -> anyhow::Result<bool> {
+/// How the commit to adopt stands to the newest recorded write of its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Newest {
+    /// It is that write, and the write's event bears no `; unchecked:` mark:
+    /// there is nothing to adopt.
+    Itself,
+    /// It is that write re-signed or metaedited: the same change, parents and
+    /// tree under another commit id. Adopting it records the commit that is
+    /// pushed, which another machine can read, and changes no content.
+    Rewritten,
+    /// Neither: an older recorded write, a hand edit, or that write itself
+    /// where its event is marked `; unchecked:`, which stays unchecked until
+    /// adopted.
+    Neither,
+}
+
+/// How `held` stands to the newest recorded write of its name, saying so
+/// where it is that write itself ([`Newest::Itself`]).
+fn is_newest(repo: &RepoName, held: &Held, ledger: &[Entry]) -> anyhow::Result<Newest> {
     let Some((event, newest)) = recorded_write_events(ledger, &held.name).next() else {
-        return Ok(false);
+        return Ok(Newest::Neither);
     };
-    if knives::release_model::unchecked_mark(event).is_some() {
-        return Ok(false);
-    }
-    let (shown, at) = (held.shown_name(), held.commit.short());
-    let described = release::described_write(&newest);
     if held.commit == newest.commit {
-        println!("{repo}: {shown} is at {at}, {described}; nothing to adopt");
-        return Ok(true);
-    }
-    if held
-        .opened
-        .is_same_or_metadata_rewrite(&newest.commit, &held.commit)?
-    {
+        if knives::release_model::unchecked_mark(event).is_some() {
+            return Ok(Newest::Neither);
+        }
         println!(
-            "{repo}: {shown} is at {at}, {described} re-signed or metaedited (same change, parents \
-             and tree); nothing to adopt"
+            "{repo}: {} is at {}, {}; nothing to adopt",
+            held.shown_name(),
+            held.commit.short(),
+            release::described_write(&newest)
         );
-        return Ok(true);
+        return Ok(Newest::Itself);
     }
-    Ok(false)
+    let rewritten = held
+        .opened
+        .is_same_or_metadata_rewrite(&newest.commit, &held.commit)?;
+    Ok(if rewritten {
+        Newest::Rewritten
+    } else {
+        Newest::Neither
+    })
 }
 
 /// What every check reads: whose release, the commit to adopt, the ledger and
@@ -382,20 +402,27 @@ struct Adopting<'a, 'f> {
     held: &'a Held,
     ledger: &'a [Entry],
     replaced: &'a Replaced,
+    /// Whether the commit is the newest recorded write re-signed or
+    /// metaedited ([`Newest::Rewritten`]).
+    rewritten: bool,
 }
 
 impl Adopting<'_, '_> {
     /// Refuse, saying why, a commit that is not finished
     /// ([`refuse_unfinished_commit`]), and a hand edit of a published release
-    /// the publish remote does not hold. `true` after refusing.
+    /// the publish remote does not hold. For the newest recorded write
+    /// re-signed or metaedited ([`Self::rewritten`]), only the refusal of a
+    /// commit a workspace has checked out runs: its tree is that write's own,
+    /// conflicts included, and it changes no content, so it is no hand edit,
+    /// whatever tag names it or whether the publish remote holds it yet.
+    /// `true` after refusing.
     fn refuse_unfinished(&self) -> anyhow::Result<bool> {
         let held = self.held;
-        if refuse_unfinished_commit(
-            &self.fork.name,
-            &held.opened,
-            (&held.name, &held.commit),
-            ("adopt", "adopted"),
-        )? {
+        let release = (held.name.as_str(), &held.commit);
+        if self.rewritten {
+            return refuse_checked_out(&self.fork.name, &held.opened, release, "adopted");
+        }
+        if refuse_unfinished_commit(&self.fork.name, &held.opened, release, ("adopt", "adopted"))? {
             return Ok(true);
         }
         self.refuse_published()
@@ -459,6 +486,20 @@ pub(crate) fn refuse_unfinished_commit(
         }
         return Ok(true);
     }
+    refuse_checked_out(repo, opened, (name, commit), done)
+}
+
+/// Refuse, saying why, a commit a workspace has checked out, where an edit
+/// in that workspace would change it once it is recorded under `name`.
+/// `done` names what is refused, as `adopted`. `true` after refusing.
+fn refuse_checked_out(
+    repo: &RepoName,
+    opened: &Repo,
+    (name, commit): (&str, &CommitId),
+    done: &str,
+) -> anyhow::Result<bool> {
+    // The release is a name read from the repository.
+    let (shown, at) = (inline_human_text(name), commit.short());
     let change = opened.change_id_of(commit.as_str())?;
     let checked_out: Vec<String> = opened
         .workspaces()?
@@ -834,7 +875,8 @@ fn adopt(
             release::Unchecked::WriteAbsent(_) | release::Unchecked::Inherited { .. },
         ) => {}
     }
-    if is_newest(repo, held, &ledger)? {
+    let newest = is_newest(repo, held, &ledger)?;
+    if newest == Newest::Itself {
         return Ok(Exit::Ok);
     }
     let (carriers, members) = writes.partition(&held.parents);
@@ -848,6 +890,7 @@ fn adopt(
         held,
         ledger: &ledger,
         replaced: &replaced,
+        rewritten: newest == Newest::Rewritten,
     };
     if adopting.refuse_unfinished()? {
         return Ok(Exit::Incomplete);
@@ -977,21 +1020,30 @@ fn adopted_text(replaced: &Replaced, adoption: &Adoption<'_>) -> String {
     parts.join("; ")
 }
 
-/// Say what was adopted: the commit, the write it replaces and the baseline;
-/// the files resolved by hand; the files changed beyond the conflicts, with
-/// the reason; each member's lost lines; each carrier, labelled; and each
-/// `### ` heading that a release log's one `[Unreleased]` section holds more
-/// than once ([`release::report_repeated_headings`]).
+/// Say what was adopted: the commit, the write it replaces and the baseline,
+/// and whether the commit is that write re-signed or metaedited; the files
+/// resolved by hand; the files changed beyond the conflicts, with the
+/// reason; each member's lost lines; each carrier, labelled; and each `### `
+/// heading that a release log's one `[Unreleased]` section holds more than
+/// once ([`release::report_repeated_headings`]).
 fn report(adopting: &Adopting<'_, '_>, adoption: &Adoption<'_>) {
-    let (repo, held) = (&adopting.fork.name, adopting.held);
+    let (repo, held, replaced) = (&adopting.fork.name, adopting.held, adopting.replaced);
     // Names, paths and labels are read from the repository, and the reason is
     // the caller's; each is escaped.
     println!(
         "{repo}: adopted {} as the newest write of {}, replacing {}",
         held.commit.short(),
         held.shown_name(),
-        adopting.replaced.described()
+        replaced.described()
     );
+    if adopting.rewritten {
+        println!(
+            "  {} is {} re-signed or metaedited (same change, parents and tree): no content \
+             changed",
+            held.commit.short(),
+            replaced.write.commit.short()
+        );
+    }
     println!("  baseline: {}", adoption.baseline);
     let changes = &adoption.changes;
     if changes.resolved.is_empty() {

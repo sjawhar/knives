@@ -6,7 +6,7 @@ A **carrier** is a parent that is an earlier write of the same release name, as 
 
 ## `knives release adopt [NAME] [--why TEXT]`
 
-Records the commit a release name holds now as its newest knives write. It makes no commit and moves no bookmark. Run it after any hand change on the release commit: a conflict resolved, a release log renumbered, a repair or restore, or the fast-forward rebase before a push.
+Records the commit a release name holds now as its newest knives write. It makes no commit and moves no bookmark. Run it after any hand change on the release commit: a conflict resolved, a release log renumbered, a repair or restore, the fast-forward rebase before a push, or a new description or signature (below).
 
 1. Make sure the commit has no conflicts and is no workspace's working copy (run `jj new` there first).
 2. Run `knives release adopt <name>`. Add `--why '<reason>'` when the commit changes a file the baseline left without a conflict; without it, `adopt` refuses and names the files.
@@ -16,6 +16,9 @@ Records the commit a release name holds now as its newest knives write. It makes
 - With no local bookmark, `adopt` fetches and reads `<name>@<publish-remote>`.
 - After a hand `jj restore --from <commit> --into <name> <path>...`, adopt with `--why`, then cut.
 - `adopt` refuses a name the ledger records no write of; the next write over it records the name.
+- A release re-signed or metaedited after a knives write, by `jj describe`, `jj sign`, `jj metaedit` or a push that signs, has a new commit id with the same change, parents and tree. Adopt it on the machine that re-signed it, after the last rewrite. `adopt` records the new commit, so another machine can read the release once it fetches it. A tag on that commit, a publish remote that does not hold it yet, or conflicts that the knives write left, do not refuse this adopt.
+- Skip that adopt and the ledger names only the old commit, which no other machine holds: there `audit` reports `could not compare` and `release-drift`, and the next cut is refused.
+- An adopt of the newest recorded write itself writes nothing and prints `nothing to adopt`.
 
 ## Adopt a hand resolution before the next write
 
@@ -61,7 +64,7 @@ Runs after every dated cut, and alone. It forgets superseded dated refs locally 
 
 ## Publishing
 
-Release commands never push. Publish a new release name with `jj git push --remote <publish-remote> --bookmark <name>`.
+Release commands never push. Publish a new release name with `jj git push --remote <publish-remote> --bookmark <name>`. A push that signs (`git.sign-on-push`) pushes a new commit id: run `knives release adopt <name>` after it, on the same machine.
 
 A release the publish remote moves only forward (a fixed release branch) needs a fast-forward: a knives write does not descend from the published head.
 
