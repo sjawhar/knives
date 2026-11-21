@@ -47,6 +47,14 @@ use difflib::{SequenceMatcher, Tag};
 /// word diff.
 pub const WORD_LIMIT: usize = 30_000;
 
+/// The text of a [`LostKind::Conflict`] entry where the member's tip holds
+/// the unresolved conflict.
+pub const CONFLICT_AT_TIP: &str = "at the member's tip";
+
+/// The text of a [`LostKind::Conflict`] entry where the release holds the
+/// unresolved conflict.
+pub const CONFLICT_IN_RELEASE: &str = "in the release";
+
 /// The most characters of a line that a reading names, as the prototype of
 /// the rule showed a line; a longer line is cut there, with `…` after it.
 const TEXT_CAP: usize = 300;
@@ -230,11 +238,11 @@ impl MemberLines {
     pub fn read_path(&mut self, values: &PathValues) {
         let path = values.path.as_str();
         if values.tip == Value::Conflict {
-            let at = "at the member's tip".to_owned();
+            let at = CONFLICT_AT_TIP.to_owned();
             self.lost
                 .push(entry(path, LostKind::Conflict, None, Some(at)));
         } else if values.release == Value::Conflict {
-            let at = "in the release".to_owned();
+            let at = CONFLICT_IN_RELEASE.to_owned();
             self.lost
                 .push(entry(path, LostKind::Conflict, None, Some(at)));
         } else if values.tip != values.release {
@@ -258,6 +266,20 @@ impl MemberLines {
                 });
         }
         self.reading = self.settled();
+    }
+
+    /// Whether every path the member cannot be read at holds its unresolved
+    /// conflict at the member's tip, and none in the release. `false` where
+    /// no path holds a conflict.
+    #[must_use]
+    pub fn conflicted_only_at_tip(&self) -> bool {
+        let mut conflicts = self
+            .lost
+            .iter()
+            .filter(|lost| lost.kind == LostKind::Conflict)
+            .peekable();
+        conflicts.peek().is_some()
+            && conflicts.all(|lost| lost.text.as_deref() == Some(CONFLICT_AT_TIP))
     }
 
     /// The reading that the lost entries give.

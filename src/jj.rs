@@ -724,6 +724,9 @@ impl Repo {
     /// Compares a revision's net tree change with a target in one three-way
     /// merge. Unlike a per-commit rebase, this correctly recognizes a squashed
     /// series and a branch whose additions are later reverted.
+    ///
+    /// `--carries` and `--census` read the upstream trunk this way. A release
+    /// is read by a member's own lines instead ([`Self::member_lines`]).
     pub fn tree_replay_outcome(
         &self,
         revision: &CommitId,
@@ -752,25 +755,6 @@ impl Repo {
         } else {
             RebaseOutcome::CleanNonEmpty
         })
-    }
-
-    /// The net change `revision` makes from `fork_point`, its fork point with
-    /// the trunk ([`Self::fork_point`]), replayed onto `target`, with a
-    /// release log the target holds as a union left out ([`replayed_tree`]).
-    ///
-    /// This answers whether `target`'s tree holds a revision it already
-    /// reaches. [`Self::tree_replay_outcome`] cannot: its base is the common
-    /// ancestor of the two, which for such a revision is the revision itself,
-    /// so it always reads empty. A release merge reaches every member it names
-    /// as a parent whatever its tree holds, so a hand resolution that dropped
-    /// a member's change is seen only from the member's own fork point.
-    pub fn fork_point_replay_outcome(
-        &self,
-        revision: &CommitId,
-        fork_point: &CommitId,
-        target: &CommitId,
-    ) -> Result<RebaseOutcome, JjError> {
-        self.net_diff_outcome(fork_point.as_str(), revision.as_str(), target.as_str())
     }
 
     /// Where `revision` forked from `trunk`: their one common ancestor, or the
@@ -842,43 +826,6 @@ impl Repo {
             });
         }
         Ok(lines)
-    }
-
-    /// Replays the net tree effect of `base..revision` onto a target.
-    ///
-    /// A scratch child of `base` carrying `revision`'s tree has the range's net
-    /// effect as its diff by construction. Replaying that one synthetic commit
-    /// avoids the conflicts that replaying each source commit manufactures when an
-    /// intermediate commit is applied to a tree that already has the range's final
-    /// content.
-    ///
-    /// A release log whose block the target already holds as part of a union is
-    /// left out of the synthetic commit ([`replayed_tree`]): the replay reads what
-    /// the target lacks, and a union lacks nothing of the block it holds.
-    ///
-    /// A read, not a mutation: the replay runs inside a jj-lib transaction that is
-    /// dropped without ever becoming an operation (#18). No other reader of the
-    /// shared repository can observe it at any point, so there are no synthetic
-    /// bookmarks, no cleanup guard, and no crash-recovery machinery.
-    fn net_diff_outcome(
-        &self,
-        base: &str,
-        revision: &str,
-        onto: &str,
-    ) -> Result<RebaseOutcome, JjError> {
-        let base = self.commit(base)?;
-        let revision = self.commit(revision)?;
-        let onto = self.commit(onto)?;
-        // `base..revision` is empty exactly when the base already reaches the tip.
-        if self.backend_is_ancestor(revision.id(), base.id())? {
-            return Ok(RebaseOutcome::Empty);
-        }
-        let mut tx = self.repo.start_transaction();
-        let tree = replayed_tree(&base.tree(), revision.tree(), &onto.tree())?;
-        let outcome = replayed_outcome(&mut tx, (base.id(), tree), onto.id());
-        // Dropped, never committed: the probe leaves no trace in the op log.
-        drop(tx);
-        outcome
     }
 
     /// The paths of the change `resolution` holds against `baseline` that
@@ -2071,23 +2018,6 @@ fn replayed_commit(
         .map_err(|error| store_error(&error))
 }
 
-/// The replay of [`replayed_commit`]: empty when `onto` already holds the
-/// change `tree` makes to `base`, else conflicted or clean and non-empty.
-fn replayed_outcome(
-    tx: &mut Transaction,
-    (base, tree): (&JjCommitId, MergedTree),
-    onto: &JjCommitId,
-) -> Result<RebaseOutcome, JjError> {
-    let replayed = replayed_commit(tx, (base, tree), onto)?;
-    Ok(if replayed.has_conflict() {
-        RebaseOutcome::Conflicted
-    } else if block_on(replayed.is_empty(tx.repo())).map_err(|error| store_error(&error))? {
-        RebaseOutcome::Empty
-    } else {
-        RebaseOutcome::CleanNonEmpty
-    })
-}
-
 /// The paths of the change `resolution` holds against `base`, the tree of
 /// its baseline ([`baseline_tree`]), that `onto` does not carry, each
 /// repository-internal, replayed in `tx`, which the caller drops unwritten.
@@ -2100,11 +2030,11 @@ fn replayed_outcome(
 /// conflict can read it, so `onto` carries it when it holds the
 /// resolution's value there. Every other path replays: `base`, with each
 /// resolved path set to the resolution's value, becomes a scratch commit on
-/// `resolution`'s parents, and the replay runs from it as a replay of a
-/// range does ([`Repo::net_diff_outcome`]), with a release log `onto` holds
-/// as a union left out ([`replayed_tree`]). A path where the replayed tree
-/// differs from `onto`'s, a conflict included, is one `onto` does not
-/// carry.
+/// `resolution`'s parents, and the replay rebases a child of it, with the
+/// resolution's tree, onto `onto` ([`replayed_commit`]), with a release log
+/// `onto` holds as a union left out ([`replayed_tree`]). A path where the
+/// replayed tree differs from `onto`'s, a conflict included, is one `onto`
+/// does not carry.
 fn uncarried_change(
     tx: &mut Transaction,
     (base, resolution): (MergedTree, &jj_lib::commit::Commit),

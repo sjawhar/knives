@@ -980,6 +980,8 @@ fn a_wrapped_call_is_held_by_its_words_and_named() {
     // And: so does the audit of a next knives cut over the recorded release.
     let recorded = record(&lab, &home, RELEASE, &release);
     assert_eq!(recorded.status.code(), Some(0), "{}", text(&recorded));
+    // The working copy steps off the release, or the reap keeps it for that.
+    lab.jj_work(["new", "main@origin"]);
     let cut = knives_release(&lab, &home, &["cut", NEXT]);
     assert!(stdout(&cut).contains(WORD_HELD), "{}", text(&cut));
     assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
@@ -1747,10 +1749,15 @@ fn a_member_whose_tip_holds_a_conflict_reads_inconclusive_and_conflicted() {
     assert!(!out.contains(&missing_row(&member)), "{out}");
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
 
-    // And: `--carries` reads it `conflicted`.
+    // And: `--carries` reads it `conflicted`, and says the conflict is at
+    // the member's tip, not in the release.
     let carried = stdout(&carries(&lab, &home, M));
     assert!(
         carried.contains(&format!("conflicted         {RELEASE} @ ")),
+        "{carried}"
+    );
+    assert!(
+        carried.contains(": the member's tip holds an unresolved conflict in its path)"),
         "{carried}"
     );
 }

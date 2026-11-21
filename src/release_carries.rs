@@ -243,6 +243,7 @@ impl CarriesChecks<'_> {
                     role: target.role,
                     verdict: check.verdict,
                     evidence: check.evidence,
+                    lines: check.lines,
                 }),
                 Err(error) => report
                     .problems
