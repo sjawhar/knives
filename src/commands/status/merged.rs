@@ -163,7 +163,7 @@ pub(super) fn settle_merged_landed(
 }
 
 /// The landing commit of a merged pull request, when the forge recorded one.
-fn merged_landing(summary: &PullSummary) -> Option<&str> {
+pub(super) fn merged_landing(summary: &PullSummary) -> Option<&str> {
     if !summary.is_merged() {
         return None;
     }
