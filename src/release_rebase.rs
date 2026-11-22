@@ -19,6 +19,7 @@ use knives::ledger::inline_human_text;
 use knives::release_model::{
     BranchSuccessions, EarlierWrites, carried_from_tips, carrier_label, trunk_positions,
 };
+use knives::store::ForkLock;
 
 use super::release_edit::{
     EditRecord, record_edit_event, refuse_edit_in_hand, release_is_locally_movable, release_writes,
@@ -70,7 +71,6 @@ pub(crate) fn run_rebase(
     locals.dedup();
     let forge = CliForge;
     let heads = knives::consumer_pins::ConsumerHeadMemo::default();
-    let opened = knives::jj::Repo::open(path)?;
     let consumers = release::ConsumerInputs {
         slugs: &entry.consumers,
         locals: &locals,
@@ -78,7 +78,20 @@ pub(crate) fn run_rebase(
         cache_root,
         heads: &heads,
     };
-    let plan = release::pulled_plan(fork, bound.registry, &consumers)?;
+    let fetched = release::fetch(fork, bound.registry, &consumers);
+    // A bare rebase asks the forge which pull requests merged: network too,
+    // so it is asked here, and what it says is said where the target is
+    // placed ([`merged_rebase_target`]).
+    let asked = reference.map_or_else(
+        || Asked::Merged(merged_landings(fork, cache_root)),
+        Asked::Reference,
+    );
+    // Every network call is behind this rebase, so the fork's lock is taken
+    // now, and the plan, the repository and the ledger it decides from are
+    // read under it ([`release::Fetched::plan`]).
+    let _fork = ForkLock::acquire(&fork.upstream)?;
+    let opened = knives::jj::Repo::open(path)?;
+    let plan = fetched.plan(fork, &consumers)?;
     if !plan.problems.is_empty() {
         println!("{}", release::render(&plan));
         return Ok(Exit::Incomplete);
@@ -93,13 +106,7 @@ pub(crate) fn run_rebase(
     if let Some(exit) = stale_rule_exit(fork)? {
         return Ok(exit);
     }
-    let Some(destination) = rebase_target(RebaseTargetInput {
-        fork,
-        opened: &opened,
-        reference,
-        cache_root,
-    })?
-    else {
+    let Some(destination) = rebase_target(fork, &opened, asked)? else {
         return Ok(Exit::Incomplete);
     };
     let onto = destination.onto.clone();
@@ -583,12 +590,32 @@ struct RebaseDestination {
     landed: Vec<PullRequest>,
 }
 
-#[derive(Clone, Copy)]
-struct RebaseTargetInput<'a> {
-    fork: &'a Fork<'a>,
-    opened: &'a knives::jj::Repo,
-    reference: Option<&'a str>,
-    cache_root: Option<&'a std::path::Path>,
+/// Where a rebase was asked to go: onto a reference the caller named, or,
+/// with none, onto the trunk commit that covers every landing the forge
+/// named before the fork's lock ([`merged_landings`]).
+enum Asked<'a> {
+    Reference(&'a str),
+    Merged(Landings),
+}
+
+/// What the forge said, asked before the fork's lock, of which of our pull
+/// requests merged onto the trunk ([`merged_landings`]).
+struct Landings {
+    /// The pull requests that landed, or the line that says why the bare
+    /// rebase has no target, said where the target is placed.
+    landed: Result<Vec<PullRequest>, NoTarget>,
+    /// The forge cache's note, where writing it failed: said once the
+    /// target is placed, as it was when the forge was asked there.
+    persisted: Option<String>,
+}
+
+/// Why a bare rebase has no target, in the line that says so.
+enum NoTarget {
+    /// The forge could not be asked, or did not answer for each candidate:
+    /// a line on stderr.
+    Unasked(String),
+    /// The forge answered, and no pull request merged: a line on stdout.
+    NothingMerged(String),
 }
 
 #[derive(Clone, Copy)]
@@ -652,21 +679,19 @@ fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option
 /// An explicit reference is taken at its word. Without one, the default is the
 /// first upstream trunk commit that contains every merged pull request — merged,
 /// not closed, because closed landed nothing.
-fn rebase_target(input: RebaseTargetInput<'_>) -> anyhow::Result<Option<RebaseDestination>> {
-    let RebaseTargetInput {
-        fork,
-        opened,
-        reference,
-        cache_root,
-    } = input;
-    if let Some(explicit) = reference {
-        return Ok(Some(RebaseDestination {
+fn rebase_target(
+    fork: &Fork<'_>,
+    opened: &knives::jj::Repo,
+    asked: Asked<'_>,
+) -> anyhow::Result<Option<RebaseDestination>> {
+    match asked {
+        Asked::Reference(explicit) => Ok(Some(RebaseDestination {
             onto: opened.resolve_commit(explicit)?,
             reference: explicit.to_owned(),
             landed: Vec::new(),
-        }));
+        })),
+        Asked::Merged(landings) => merged_rebase_target(fork, opened, landings),
     }
-    merged_rebase_target(fork, opened, cache_root)
 }
 
 fn select_merged_numbers(discovery: &knives::snapshot::Discovery<'_>, trunk: &str) -> Vec<u64> {
@@ -676,20 +701,21 @@ fn select_merged_numbers(discovery: &knives::snapshot::Discovery<'_>, trunk: &st
         .collect()
 }
 
-/// The bare-rebase default target, or `None` with its reason already printed.
-///
-/// Rebasing to this point makes every merged branch's work part of the members'
-/// shared history without carrying anything upstream has not accepted. With
-/// nothing merged there is no such point, and which commit to move onto goes
-/// back to being a judgment the caller must make.
-fn merged_rebase_target(
-    fork: &Fork<'_>,
-    opened: &knives::jj::Repo,
-    cache_root: Option<&std::path::Path>,
-) -> anyhow::Result<Option<RebaseDestination>> {
+/// Which of our pull requests the forge says merged onto the trunk, asked
+/// before the fork's lock; each line it has to say is kept for
+/// [`merged_rebase_target`] to say, where the target is placed.
+fn merged_landings(fork: &Fork<'_>, cache_root: Option<&std::path::Path>) -> Landings {
     let repo = &fork.name;
     let entry = fork.entry;
-    let trunk = entry.trunk_ref();
+    // The forge's own text, which prints more than one line.
+    let unasked = |error: &dyn std::fmt::Display| Landings {
+        landed: Err(NoTarget::Unasked(format!(
+            "{repo}: could not ask the forge which pull requests merged: {}; provide a commit \
+             to rebase onto",
+            knives::ledger::problem_human_text(&error.to_string())
+        ))),
+        persisted: None,
+    };
     let forge = CliForge;
     let opened_snapshot = match knives::snapshot::open(knives::snapshot::SnapshotConfig {
         forge: &forge,
@@ -702,41 +728,63 @@ fn merged_rebase_target(
         cache_root,
     }) {
         Ok(opened_snapshot) => opened_snapshot,
-        Err(error) => {
-            // The forge's own text, which prints more than one line.
-            eprintln!(
-                "{repo}: could not ask the forge which pull requests merged: {}; \
-                 provide a commit to rebase onto",
-                knives::ledger::problem_human_text(&error.to_string())
-            );
-            return Ok(None);
-        }
+        Err(error) => return unasked(&error),
     };
     let snapshot = match opened_snapshot.complete_with(entry.trunk(), select_merged_numbers) {
         Ok(snapshot) => snapshot,
-        Err(error) => {
-            // The forge's own text, as above.
-            eprintln!(
-                "{repo}: could not ask the forge which pull requests merged: {}; \
-                 provide a commit to rebase onto",
-                knives::ledger::problem_human_text(&error.to_string())
-            );
-            return Ok(None);
-        }
+        Err(error) => return unasked(&error),
     };
     let candidates = knives::forge::merged_onto(snapshot.ours(), entry.trunk());
+    let landed = verified_merged_candidates(repo, &snapshot, &candidates, entry.trunk()).and_then(
+        |landed| {
+            if landed.is_empty() {
+                Err(NoTarget::NothingMerged(format!(
+                    "{repo}: no pull request has merged, so there is no default target; \
+                     provide a commit to rebase onto"
+                )))
+            } else {
+                Ok(landed)
+            }
+        },
+    );
+    // The note carries the OS's message and the cache path it names.
+    let persisted = snapshot.persist(None).err().map(|note| {
+        format!(
+            "{repo}: {}",
+            knives::ledger::problem_human_text(&note.to_string())
+        )
+    });
+    Landings { landed, persisted }
+}
+
+/// The bare-rebase default target, or `None` with its reason already printed.
+///
+/// Rebasing to this point makes every merged branch's work part of the members'
+/// shared history without carrying anything upstream has not accepted. With
+/// nothing merged there is no such point, and which commit to move onto goes
+/// back to being a judgment the caller must make. `landings` is what the
+/// forge said before the fork's lock ([`merged_landings`]); the merge commits
+/// are placed on the trunk as this repository holds it now.
+fn merged_rebase_target(
+    fork: &Fork<'_>,
+    opened: &knives::jj::Repo,
+    landings: Landings,
+) -> anyhow::Result<Option<RebaseDestination>> {
+    let repo = &fork.name;
+    let trunk = fork.entry.trunk_ref();
+    let Landings { landed, persisted } = landings;
     let result: anyhow::Result<Option<RebaseDestination>> = (|| {
-        let Some(landed) = verified_merged_candidates(repo, &snapshot, &candidates, entry.trunk())
-        else {
-            return Ok(None);
+        let landed = match landed {
+            Ok(landed) => landed,
+            Err(NoTarget::Unasked(line)) => {
+                eprintln!("{line}");
+                return Ok(None);
+            }
+            Err(NoTarget::NothingMerged(line)) => {
+                println!("{line}");
+                return Ok(None);
+            }
         };
-        if landed.is_empty() {
-            println!(
-                "{repo}: no pull request has merged, so there is no default target; \
-                 provide a commit to rebase onto"
-            );
-            return Ok(None);
-        }
         let tip = opened.resolve_commit(&trunk)?;
         let mut placed: Vec<(u64, knives::ids::CommitId)> = Vec::new();
         let mut unplaced: Vec<u64> = Vec::new();
@@ -767,44 +815,39 @@ fn merged_rebase_target(
             landed,
         }))
     })();
-    if let Err(note) = snapshot.persist(None) {
-        // The note carries the OS's message and the cache path it names.
-        eprintln!(
-            "{repo}: {}",
-            knives::ledger::problem_human_text(&note.to_string())
-        );
+    if let Some(note) = persisted {
+        eprintln!("{note}");
     }
     result
 }
 
+/// The candidates the forge says merged onto `trunk`, or why it cannot say:
+/// a candidate it reported no facts for.
 fn verified_merged_candidates(
     repo: &RepoName,
     snapshot: &knives::snapshot::CompletedSnapshot<'_>,
     candidates: &[knives::forge::PullSummary],
     trunk: &str,
-) -> Option<Vec<knives::forge::PullRequest>> {
+) -> Result<Vec<PullRequest>, NoTarget> {
     let unanswered: Vec<u64> = candidates
         .iter()
         .filter(|candidate| snapshot.fact(candidate.number).is_none())
         .map(|candidate| candidate.number)
         .collect();
     if !unanswered.is_empty() {
-        eprintln!(
+        return Err(NoTarget::Unasked(format!(
             "{repo}: could not ask the forge which pull requests merged: it did not report \
              facts for {}; provide a commit to rebase onto",
             numbered(&unanswered)
-        );
-        return None;
+        )));
     }
-    let mut landed = Vec::new();
-    for candidate in candidates {
-        let fact = snapshot.fact(candidate.number)?;
-        let pull = &fact.pull;
-        if pull.is_merged() && pull.base_ref_name.as_deref() == Some(trunk) {
-            landed.push(pull.clone());
-        }
-    }
-    Some(landed)
+    Ok(candidates
+        .iter()
+        .filter_map(|candidate| snapshot.fact(candidate.number))
+        .map(|fact| &fact.pull)
+        .filter(|pull| pull.is_merged() && pull.base_ref_name.as_deref() == Some(trunk))
+        .cloned()
+        .collect())
 }
 
 /// The first trunk commit containing every landing in `placed`: their maximum

@@ -285,7 +285,7 @@ pub fn destinations(root: &Path, registry: &Registry) -> Result<Destinations, Sw
 /// A command that routes one fork joins that fork's ledger alone. A ledger
 /// that cannot be joined is tried again on every read, so joining the
 /// ledger of a fork it does not route would make it wait on that one, up to
-/// the transport deadline, while it holds its own fork's lock. Its
+/// the transport deadline, while it holds its own branch's or fork's lock. Its
 /// [`Destinations::unreached`] names only forks of `routed`: of another
 /// fork's ledger, which it did not try to join, it has nothing true to say.
 pub(super) fn destinations_telling(

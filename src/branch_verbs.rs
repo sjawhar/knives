@@ -8,7 +8,7 @@
 //!
 //! On a fork that shares its ledger, the ledger's claim ref says who holds
 //! the branch, on every machine that shares it. `finish` reads it under the
-//! fork's lock, decides from it as `start` does, and releases it with one
+//! branch's lock, decides from it as `start` does, and releases it with one
 //! push, leased on the claim commit it read, that carries the entry
 //! recording the release; the state file and the workspace are touched only
 //! once the ledger took that push, so a release the ledger did not take
@@ -38,7 +38,7 @@ use knives::ledger_git::{ClaimError, ClaimRef, HeldClaim};
 use knives::ledger_sweep::{self, ClaimOutcome, NotApplied, SharedFork};
 use knives::seen::LastSeen;
 use knives::statement::{Statement, StatementKind};
-use knives::store::{Claim, Store, default_state_path};
+use knives::store::{BranchLock, Claim, ForkLock, Store, default_state_path};
 
 use super::release_edit::{release_writes, report_abandoned_earlier, report_hidden};
 use super::scribe_for;
@@ -186,23 +186,32 @@ pub(crate) fn run_finish(
         workspace: &workspace,
         directory: &directory,
     };
-    // The fork's lock is taken first and held to the end: between the snapshot
-    // and the removal, a `start` of this branch would otherwise take the lock,
-    // adopt the workspace, and write in it, and this removal would take that
-    // work with it. A claim writer on this fork waits for the removal, which a
-    // workspace with a build tree in it can make seconds long.
+    // The branch's lock is taken first and held to the end: between the
+    // snapshot and the removal, a `start` of this branch would otherwise
+    // adopt the workspace and write in it, and this removal would take that
+    // work with it. A `start` or `finish` of this branch waits for the
+    // removal, which a workspace with a build tree in it can make seconds
+    // long; one of any other branch does not ([`BranchLock`]), and neither
+    // waits on this finish's reads and push of the ledger.
     //
     // A fork ledger that cannot be read does not fail the open: a caller the
     // claim gate refuses needs the ledger only to search it for who ended
     // its own claim, and the refusal it gets must not turn into a failure
-    // because that search cannot run ([`read_ledger`]).
-    let store = Store::open_each_for_update(
-        default_state_path(),
-        &bound.registry.former_names(),
-        &[&fork.upstream],
-    )?;
+    // because that search cannot run ([`read_ledger`]). The fork's lock is
+    // held for the open alone, so that the open reads the ledger whole,
+    // before or after `knives ledger migrate` moves it under every fork's
+    // lock ([`Store::migrated`]).
+    let _branch = BranchLock::acquire(&fork.upstream, branch)?;
+    let store = {
+        let _fork = ForkLock::acquire(&fork.upstream)?;
+        Store::open_each(
+            default_state_path(),
+            &bound.registry.former_names(),
+            &[&fork.upstream],
+        )?
+    };
     // A fork that shares its ledger hands back the ledger's claim, which is
-    // read under the fork's lock by the gate below.
+    // read under the branch's lock by the gate below.
     let ledger = match ledgered(fork, target, bound.registry)? {
         Ok(ledger) => ledger,
         Err(exit) => return Ok(exit),
@@ -302,8 +311,10 @@ pub(crate) fn run_finish(
 
 /// Sweep the earlier writes of release `name` once `finish` has left jj no
 /// workspace of the release claim, as `knives release adopt` sweeps them
-/// after it records a write. A sweep that fails says so on stderr, and
-/// changes no exit.
+/// after it records a write, and under the fork's lock, as a release write
+/// holds it, since a sweep must not meet a write: the one `finish` holds is
+/// its branch's ([`BranchLock`]). A sweep that fails, its wait for that lock
+/// included, says so on stderr, and changes no exit.
 ///
 /// jj abandons a forgotten workspace's working copy where it is empty and
 /// undescribed, so a release commit a write replaced and kept for that
@@ -332,6 +343,7 @@ fn sweep_earlier_writes(fork: &Fork<'_>, name: &str) {
 /// says. Once the abandon is done and said, a failure to name what keeps
 /// the rest has its own line on stderr ([`naming_failure`]).
 fn sweep(fork: &Fork<'_>, name: &str) -> anyhow::Result<()> {
+    let _fork = ForkLock::acquire(&fork.upstream)?;
     let (repo, checkout) = (&fork.name, &fork.checkout.path);
     let opened = Repo::open(checkout)?;
     let writes = release_writes(fork, &opened, name)?;
@@ -1252,7 +1264,7 @@ fn forced_release(
 
 /// The claim gate of a `finish`. On a fork that shares no ledger it is that
 /// of this machine's state file ([`finish_claim_gate`]); on one that shares
-/// its ledger, it weighs the ledger's claim, read under the fork's lock,
+/// its ledger, it weighs the ledger's claim, read under the branch's lock,
 /// and a local claim an older knives left in this machine's state file, as
 /// `start` weighs them ([`SharedClaims`], [`release_decision`]).
 ///
@@ -1422,7 +1434,7 @@ fn unheld_gate(finishing: &Finishing<'_>, store: &Store) -> anyhow::Result<Finis
 
 /// `repo`'s ledger as the store read it, oldest first, or why it could not
 /// be read. `run_finish` opens its store keeping a ledger it cannot read
-/// ([`Store::open_each_for_update`]), on which every other ledger accessor
+/// ([`Store::open_each`]), on which every other ledger accessor
 /// of the store panics, so the claim gate asks for the ledger only this way.
 fn read_ledger<'a>(store: &'a Store, repo: &UpstreamName) -> Result<&'a [Entry], &'a LedgerError> {
     store

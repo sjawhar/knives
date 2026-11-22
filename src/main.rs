@@ -40,8 +40,7 @@ use knives::forge::Forge;
 use knives::forge::github::CliForge;
 use knives::ids::{BranchName, UpstreamName};
 use knives::ledger::{Ledger, Scribe};
-use knives::lock::LockError;
-use knives::store::{ForkLock, Store, StoreError, default_state_path};
+use knives::store::{ForkLock, Store, StoreError, SyncLock, default_state_path};
 use release_adopt::run_release_adopt;
 use release_carries::{run_release_census, run_release_members, run_revision_carries};
 use release_cut::{ReleaseInvocation, run_reap, run_release};
@@ -535,10 +534,14 @@ fn run_audit(
 /// one that writes the ledger derives who is acting from both.
 ///
 /// Every verb that writes holds its fork's lock ([`ForkLock`]) from before
-/// its first read until its last write, as the fork's claim writers do, so
-/// two writes about one fork take turns: concurrent records of one name
-/// write one event, and each later one reads it. A plan and `members` write
-/// nothing and take no lock.
+/// it reads anything it decides from until its last write, as `track` and
+/// `depends` hold it, so two writes about one fork take turns: concurrent
+/// records of one name write one event, and each later one reads it. Each
+/// takes the lock itself once it has asked the network what it asks: the
+/// pull of the ledger and the consumers' pins
+/// ([`knives::commands::release::fetch`]), and what `adopt` fetches and
+/// `rebase` asks the forge. A reap asks nothing, so it takes the lock here.
+/// A plan and `members` write nothing and take no lock.
 #[allow(
     clippy::too_many_arguments,
     reason = "the fork, the action, the extra consumers, the output format and the cwd binding are independent inputs"
@@ -550,19 +553,7 @@ fn dispatch_release(
     output: Output,
     bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
-    let writes = match &action {
-        None | Some(ReleaseAction::Members { .. }) => false,
-        Some(
-            ReleaseAction::Cut { .. }
-            | ReleaseAction::Rebase { .. }
-            | ReleaseAction::Include { .. }
-            | ReleaseAction::Drop { .. }
-            | ReleaseAction::Advance { .. }
-            | ReleaseAction::Adopt { .. }
-            | ReleaseAction::Reap,
-        ) => true,
-    };
-    let _lock = writes
+    let _lock = matches!(action, Some(ReleaseAction::Reap))
         .then(|| ForkLock::acquire(&fork.upstream))
         .transpose()?;
     match action {
@@ -683,19 +674,20 @@ fn open_store_for(
     })
 }
 
-/// [`open_store_for`] for a report that writes the state file, opened for
-/// update of `fork` alone ([`Store::open_for_update`]), as one row of a
-/// report of `many` rows or of one.
-fn open_store_for_update(
+/// [`open_store_for`] for a report that writes the state file once it has
+/// asked the network, as one row of a report of `many` rows or of one: opened
+/// with no lock, for the writer to take its fork's itself
+/// ([`Store::reread_locked`]).
+fn open_store_unlocked(
     registry: &Registry,
     many: bool,
     fork: &UpstreamName,
 ) -> Result<Store, StoreError> {
     let former = registry.former_names();
     if many {
-        Store::open_each_for_update(default_state_path(), &former, &[fork])
+        Store::open_each(default_state_path(), &former, &[fork])
     } else {
-        Store::open_for_update(default_state_path(), &former, &[fork])
+        Store::open(default_state_path(), &former, &[fork])
     }
 }
 
@@ -965,12 +957,23 @@ fn run_sync(
         // A repository that cannot be synced is still a row in the document,
         // carrying the error as a problem; the repositories before it already
         // fetched and wrote their events, and their rows are not lost to it.
-        // Each fork is synced under its own lock, opened for that fork alone,
-        // so a sync of every fork keeps no fork waiting past its own row.
+        // Each row holds its fork's sync lock for the whole row, so two syncs
+        // of one fork take turns and each reads what the other recorded
+        // ([`SyncLock`]), and takes its fork's lock for its writes alone, once
+        // it has fetched and asked the forge ([`sync::sync_repo`]), so a sync
+        // of every fork keeps no other writer of a fork waiting on a fetch or
+        // the forge; another sync keeping the fork past the wait is that
+        // row's problem.
         let (mut report, store) = match chosen {
             Selected::Bound(fork) => {
-                match open_store_for_update(registry, many, &fork.upstream) {
-                    Ok(mut store) => {
+                let opened = SyncLock::acquire(&fork.upstream)
+                    .map_err(StoreError::from)
+                    .and_then(|lock| {
+                        open_store_unlocked(registry, many, &fork.upstream)
+                            .map(|store| (lock, store))
+                    });
+                match opened {
+                    Ok((_sync, mut store)) => {
                         let report = if store.unreadable(&fork.upstream).is_some() {
                             sync::Report {
                                 repo: fork.name.to_string(),
@@ -1001,20 +1004,14 @@ fn run_sync(
                     // A fork whose store could not be opened is that fork's
                     // row when there are others: the forks before it already
                     // synced and wrote, and their rows are not lost to it.
-                    // Another writer keeping the fork past the wait is such a
-                    // row even alone; the next run may sync it.
-                    Err(error)
-                        if many || matches!(error, StoreError::Lock(LockError::Held { .. })) =>
-                    {
-                        (
-                            sync::Report {
-                                repo: fork.name.to_string(),
-                                problems: vec![format!("could not sync: {error}")],
-                                ..sync::Report::default()
-                            },
-                            None,
-                        )
-                    }
+                    Err(error) if many => (
+                        sync::Report {
+                            repo: fork.name.to_string(),
+                            problems: vec![format!("could not sync: {error}")],
+                            ..sync::Report::default()
+                        },
+                        None,
+                    ),
                     Err(error) => return Err(error.into()),
                 }
             }
