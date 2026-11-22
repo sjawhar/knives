@@ -1,5 +1,14 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 
@@ -1086,6 +1095,44 @@ test("a developer's or a session's environment reaches nothing this file starts"
     });
     // A pattern that matched no test would pass as well.
     expect(report).toContain("Ran 1 test");
+  } finally {
+    await rm(plant, { recursive: true, force: true });
+  }
+}, 60_000);
+
+// The setup stops a run whose PATH holds no git or jj but wrappers, naming them, instead of letting
+// each test fail on a spawn error that does not say why. It starts a whole `bun test`, so it is
+// given more than the default 5 s.
+test("a PATH whose only git and jj are wrappers stops the tests, naming them", async () => {
+  const plant = await mkdtemp(join(tmpdir(), "knives-plugin-wrappers-"));
+  try {
+    const bin = join(plant, "bin");
+    await write(join(bin, "git"), "#!/bin/sh\nexit 1\n");
+    await chmod(join(bin, "git"), 0o755);
+    await symlink(process.execPath, join(bin, "jj"));
+    const child = Bun.spawn(
+      [process.execPath, "test", import.meta.path, "--test-name-pattern", `^${environmentTest}$`],
+      {
+        cwd: join(import.meta.dir, ".."),
+        env: { PATH: bin, HOME: join(plant, "home"), TMPDIR: tmpdir() },
+        stdout: "pipe",
+        stderr: "pipe",
+      }
+    );
+    const [status, stdout, stderr] = await Promise.all([
+      child.exited,
+      child.stdout.text(),
+      child.stderr.text(),
+    ]);
+    const report = `${stdout}${stderr}`;
+    expect(status, report).not.toBe(0);
+    expect(report).toContain(
+      `knives tests: PATH has no real git: skipped ${join(bin, "git")}, a script`
+    );
+    expect(report).toContain(
+      `knives tests: PATH has no real jj: skipped ${join(bin, "jj")}, a link to ${await realpath(process.execPath)}`
+    );
+    expect(report).toContain(`knives tests: searched PATH=${bin}`);
   } finally {
     await rm(plant, { recursive: true, force: true });
   }

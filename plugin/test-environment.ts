@@ -14,7 +14,9 @@
 //   XDG_CONFIG_HOME, GIT_CONFIG_GLOBAL and JJ_CONFIG at it (configs that sign
 //   nothing), with GIT_CONFIG_NOSYSTEM set and both editors `false`;
 // - drops from PATH every directory whose git or jj is a wrapper (a script,
-//   or a link to a program of another name) rather than the program.
+//   or a link to a program of another name) rather than the program, and
+//   throws, naming each wrapper and the PATH it searched, when that leaves no
+//   real git or jj where it skipped a wrapper of one.
 //
 // Bun.spawn and Bun.spawnSync start a child with the environment this process
 // started with unless given `env`, so every spawn in the tests passes
@@ -35,48 +37,59 @@ import {
 import { tmpdir } from "node:os";
 import { basename, delimiter, join } from "node:path";
 
-/** Whether `candidate`, found on PATH as `program`, is that program: a file of
- * that name, links followed, that is not a script. */
-function isProgram(candidate: string, program: string): boolean {
-  let target: string;
+/** Why the `program` in `directory` is a wrapper rather than the program (a
+ * script, or a link to a program of another name), or null when `directory`
+ * has no such file or it is the program. */
+function wrapper(directory: string, program: string): string | null {
+  const candidate = join(directory, program);
   try {
-    target = realpathSync(candidate);
-  } catch {
-    return false;
-  }
-  if (basename(target) !== program) return false;
-  const start = Buffer.alloc(2);
-  let read = 0;
-  try {
+    if (!statSync(candidate).isFile()) return null;
+    const target = realpathSync(candidate);
+    if (basename(target) !== program) return `a link to ${target}`;
+    const start = Buffer.alloc(2);
     const descriptor = openSync(target, "r");
     try {
-      read = readSync(descriptor, start, 0, 2, 0);
+      readSync(descriptor, start, 0, 2, 0);
     } finally {
       closeSync(descriptor);
     }
-  } catch {
-    return false;
+    return start.toString("latin1") === "#!" ? "a script" : null;
+  } catch (error) {
+    return statSync(candidate, { throwIfNoEntry: false })?.isFile()
+      ? `unreadable (${error})`
+      : null;
   }
-  return read === 2 && start.toString("latin1") !== "#!";
 }
 
-/** Whether `directory` holds a git or jj that is a wrapper, not the program. */
-function wrapsGitOrJj(directory: string): boolean {
-  return ["git", "jj"].some((program) => {
-    const candidate = join(directory, program);
-    try {
-      if (!statSync(candidate).isFile()) return false;
-    } catch {
-      return false;
-    }
-    return !isProgram(candidate, program);
+const searched = process.env["PATH"] ?? "";
+const kept: string[] = [];
+const skipped: Array<{ program: string; file: string; why: string }> = [];
+for (const directory of searched.split(delimiter).filter((entry) => entry.length > 0)) {
+  const wrappers = ["git", "jj"].flatMap((program) => {
+    const why = wrapper(directory, program);
+    return why === null ? [] : [{ program, file: join(directory, program), why }];
   });
+  if (wrappers.length === 0) kept.push(directory);
+  else skipped.push(...wrappers);
 }
-
-const path = (process.env["PATH"] ?? "")
-  .split(delimiter)
-  .filter((directory) => directory.length > 0 && !wrapsGitOrJj(directory))
-  .join(delimiter);
+const unreplaced = skipped.filter(
+  ({ program }) =>
+    !kept.some((directory) =>
+      statSync(join(directory, program), { throwIfNoEntry: false })?.isFile()
+    )
+);
+if (unreplaced.length > 0) {
+  throw new Error(
+    [
+      ...unreplaced.map(
+        ({ program, file, why }) =>
+          `knives tests: PATH has no real ${program}: skipped ${file}, ${why}`
+      ),
+      `knives tests: searched PATH=${searched}`,
+    ].join("\n")
+  );
+}
+const path = kept.join(delimiter);
 
 /** This process's HOME, removed after the file's tests. */
 export const testHome = mkdtempSync(join(tmpdir(), "knives-plugin-test-home."));

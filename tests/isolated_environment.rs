@@ -267,6 +267,59 @@ fn wrappers_first_on_path_are_never_run() {
 }
 
 #[test]
+fn a_path_with_only_wrappers_of_git_and_jj_stops_the_test_process_naming_them() {
+    // Given: a PATH of one directory, whose git is a script and whose jj is a
+    // link to a program of another name, as on a machine whose only git and
+    // jj are wrappers.
+    let plant = Plant::new();
+    let git = plant.failing_script("bin/git", "wrappers.log");
+    let jj = plant.path("bin/jj");
+    let target = std::env::current_exe().expect("this test binary");
+    std::os::unix::fs::symlink(&target, &jj).expect("link jj to another program");
+
+    // When: this test binary starts with that PATH.
+    let output = Command::new(&target)
+        .arg("--list")
+        .env_clear()
+        .env("HOME", plant.home())
+        .env("PATH", plant.path("bin"))
+        .envs(std::env::var_os("TMPDIR").map(|temporary| ("TMPDIR", temporary)))
+        .output()
+        .expect("run this test binary");
+
+    // Then: it stops before listing a test, naming both wrappers and the PATH
+    // it searched, and runs neither.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stdout}\n{stderr}");
+    assert!(!stdout.contains(": test"), "{stdout}");
+    for line in [
+        format!(
+            "knives tests: PATH has no real git: skipped {}, a script",
+            git.display()
+        ),
+        format!(
+            "knives tests: PATH has no real jj: skipped {}, a link to {}",
+            jj.display(),
+            target
+                .canonicalize()
+                .expect("the test binary's real path")
+                .display()
+        ),
+        format!(
+            "knives tests: searched PATH={}",
+            plant.path("bin").display()
+        ),
+    ] {
+        assert!(
+            stderr.lines().any(|seen| seen == line),
+            "no line {line:?} in:\n{stderr}"
+        );
+    }
+    assert!(!plant.path("wrappers.log").exists());
+}
+
+#[test]
 fn a_sessions_variables_reach_nothing_a_test_starts() {
     // Given: the variables an agent session exports: its id under each
     // harness's name, a forge token and repository, an ssh agent, git

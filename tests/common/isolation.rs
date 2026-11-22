@@ -36,8 +36,11 @@
 //! - `JJ_EDITOR` and `GIT_EDITOR` are `false`, so a command that would open an
 //!   editor fails the same way everywhere instead of waiting on one.
 //! - `PATH` keeps its order but loses each directory whose `git` or `jj` is a
-//!   wrapper rather than the program ([`wraps_git_or_jj`]), so the first `git`
-//!   and `jj` on it are the programs themselves.
+//!   wrapper rather than the program ([`wrapper`]), so the first `git`
+//!   and `jj` on it are the programs themselves. A process whose `PATH` then
+//!   holds no `git` or no `jj` but the wrappers it skipped stops before `main`,
+//!   naming each such wrapper and the `PATH` it searched: its tests would
+//!   otherwise fail one by one on a spawn error that does not say why.
 //!
 //! Once for the whole process, rather than on each spawn, because tests also
 //! call knives in-process, and what it starts inherits this environment.
@@ -73,7 +76,15 @@ static HOME: OnceLock<PathBuf> = OnceLock::new();
 
 #[ctor::ctor(unsafe)]
 fn isolate() {
-    let path = std::env::var_os("PATH").map(|path| without_wrappers(&path));
+    let path = std::env::var_os("PATH").map(|path| {
+        without_wrappers(&path).unwrap_or_else(|skipped| {
+            eprintln!(
+                "{skipped}\nknives tests: searched PATH={}",
+                path.to_string_lossy()
+            );
+            std::process::exit(2)
+        })
+    });
     let home = tempfile::Builder::new()
         .prefix("knives-test-home.")
         .tempdir()
@@ -143,37 +154,66 @@ fn kept(name: &OsStr) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
-/// `path` without the directories that wrap git or jj ([`wraps_git_or_jj`]),
-/// in its own order.
-fn without_wrappers(path: &OsStr) -> OsString {
-    std::env::join_paths(
-        std::env::split_paths(path).filter(|directory| !wraps_git_or_jj(directory)),
-    )
-    .expect("directories split from PATH join again")
+/// `path` without the directories that hold a `git` or `jj` wrapper
+/// ([`wrapper`]), in its own order; or, when that leaves no real copy of a
+/// program it skipped a wrapper of, one line per such wrapper.
+fn without_wrappers(path: &OsStr) -> Result<OsString, String> {
+    let mut kept = Vec::new();
+    let mut skipped = Vec::new();
+    for directory in std::env::split_paths(path) {
+        let wrappers: Vec<_> = ["git", "jj"]
+            .into_iter()
+            .filter_map(|program| Some((program, wrapper(&directory, program)?)))
+            .map(|(program, why)| (program, directory.join(program), why))
+            .collect();
+        if wrappers.is_empty() {
+            kept.push(directory);
+        } else {
+            skipped.extend(wrappers);
+        }
+    }
+    let unreplaced: Vec<String> = skipped
+        .iter()
+        .filter(|(program, ..)| {
+            !kept
+                .iter()
+                .any(|directory| directory.join(program).is_file())
+        })
+        .map(|(program, wrapper, why)| {
+            format!(
+                "knives tests: PATH has no real {program}: skipped {}, {why}",
+                wrapper.display()
+            )
+        })
+        .collect();
+    if !unreplaced.is_empty() {
+        return Err(unreplaced.join("\n"));
+    }
+    Ok(std::env::join_paths(kept).expect("directories split from PATH join again"))
 }
 
-/// Whether `directory` holds a `git` or `jj` that is a wrapper rather than the
-/// program: a script (it starts with `#!`, as the dotfiles' shims and asdf's
-/// do), or a link to a program of another name (mise links every shim to
-/// itself). A wrapper runs the program found later on `PATH`, after doing what
-/// this module keeps out: reading the session, adding trailers and hooks.
-fn wraps_git_or_jj(directory: &Path) -> bool {
-    ["git", "jj"].into_iter().any(|program| {
-        let candidate = directory.join(program);
-        candidate.is_file() && !is_program(&candidate, program)
-    })
-}
-
-/// Whether `candidate`, found on `PATH` as `program`, is that program: a file
-/// of that name, links followed, that is not a script.
-fn is_program(candidate: &Path, program: &str) -> bool {
-    let Ok(target) = candidate.canonicalize() else {
-        return false;
+/// Why the `program` in `directory` is a wrapper rather than the program:
+/// a script (it starts with `#!`, as the dotfiles' shims and asdf's do), or a
+/// link to a program of another name (mise links every shim to itself). A
+/// wrapper runs the program found later on `PATH`, after doing what this
+/// module keeps out: reading the session, adding trailers and hooks. `None`
+/// when `directory` has no such file, or it is the program.
+fn wrapper(directory: &Path, program: &str) -> Option<String> {
+    let candidate = directory.join(program);
+    if !candidate.is_file() {
+        return None;
+    }
+    let target = match candidate.canonicalize() {
+        Ok(target) => target,
+        Err(error) => return Some(format!("unreadable ({error})")),
     };
+    if target.file_name() != Some(OsStr::new(program)) {
+        return Some(format!("a link to {}", target.display()));
+    }
     let mut start = [0_u8; 2];
-    target.file_name() == Some(OsStr::new(program))
-        && std::fs::File::open(&target)
-            .and_then(|mut file| file.read_exact(&mut start))
-            .is_ok()
-        && &start != b"#!"
+    match std::fs::File::open(&target).and_then(|mut file| file.read_exact(&mut start)) {
+        Ok(()) if &start == b"#!" => Some("a script".to_owned()),
+        Ok(()) => None,
+        Err(error) => Some(format!("unreadable ({error})")),
+    }
 }
