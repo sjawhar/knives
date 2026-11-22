@@ -534,6 +534,9 @@ impl Context<'_, '_> {
     /// names this fork's repository so, that upstream's otherwise. When the
     /// forge cannot be asked, nothing is recorded (exit 3): a review pull
     /// request recorded as an upstream one reads met once it merges anywhere.
+    /// A fork whose upstream is no forge repository, such as a path, is named
+    /// by its registry key exactly ([`Self::asked_which`]): its key in another
+    /// letter case is refused (exit 2), naming the key.
     fn pull_request(&self, text: &str, repo: &str, number: u64) -> Result<Requirement, Exit> {
         if let Some(fork) = self.registry.repos.get_key_value(repo) {
             return self.asked_which(text, fork, number);
@@ -542,8 +545,25 @@ impl Context<'_, '_> {
             return self.fork_pull(origin, number);
         }
         if let Some(upstream) = self.registry.resolve(repo) {
-            if upstream != self.fork.upstream && self.own_under(text, repo, &upstream)? {
-                return self.fork_pull(self.fork.own_origin(), number);
+            if upstream != self.fork.upstream {
+                if self.others_upstream(repo).is_none() {
+                    let key = self
+                        .registry
+                        .repos
+                        .iter()
+                        .find(|(key, entry)| entry.upstream_name(key) == upstream)
+                        .map_or(upstream.as_str(), |(key, _)| key.as_str());
+                    return refused(
+                        Exit::Usage,
+                        format_args!(
+                            "{repo} in {text} is no registry key: {key}'s upstream is no forge \
+                             repository, so it is named by its key exactly: `--on {key}#{number}`"
+                        ),
+                    );
+                }
+                if self.own_under(text, repo, &upstream)? {
+                    return self.fork_pull(self.fork.own_origin(), number);
+                }
             }
             return Ok(Requirement::Upstream {
                 repo: upstream,

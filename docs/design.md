@@ -542,10 +542,13 @@ again later or check the repository. The cost is that an offline `--on` to anoth
 pull request waits for the forge; and, with the forge up, one named by another fork's
 upstream is refused when the forge cannot resolve that upstream or this fork's own
 repository, since only those answers say whether the two are one. When this fork's `origin`
-names no forge repository, or the other fork's upstream names none, neither can be the other
-under another name on the forge, and that question is not asked: a pull request named by
-the upstream's `<owner>/<name>` is then recorded with no forge call, while one named by a
-registry key still asks the forge which of that fork's two repositories has the number.
+names no forge repository, it cannot be another fork's upstream under another name on the
+forge, and that question is not asked: a pull request named by that upstream's
+`<owner>/<name>` is then recorded with no forge call, while one named by the fork's registry
+key still asks the forge which of that fork's two repositories has the number. A fork whose
+upstream is no forge repository, such as a path, has no `<owner>/<name>`: its pull requests
+are named by its registry key exactly and recorded with no forge call, and the key in another
+letter case is refused (exit 2), naming the key.
 An upstream's `<owner>/<name>#<n>` is taken back without the forge. The forge has no
 answer that means a repository does not exist: GitHub answers a name it cannot resolve the
 same way for a repository that is gone, for one the token cannot see, and in some
