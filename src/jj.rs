@@ -1,3 +1,5 @@
+mod edit;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -8,7 +10,7 @@ use std::time::Duration;
 
 use futures_core::Stream as _;
 use jj_lib::backend::{
-    BackendError, CommitId as JjCommitId, CopyId, FileId, MergedTreeValue, TreeValue,
+    BackendError, BackendResult, CommitId as JjCommitId, CopyId, FileId, MergedTreeValue, TreeValue,
 };
 use jj_lib::config::{ConfigLayer, ConfigResolutionContext, ConfigSource, StackedConfig};
 use jj_lib::conflicts::extract_as_single_hunk;
@@ -43,6 +45,9 @@ use crate::ids::{
     BookmarkRef, BranchName, ChangeId, CommitId, ReleaseScheme, RemoteName, WorkspaceName,
     is_our_release, pull_number_from_bookmark, short_id,
 };
+use crate::own_lines::{self, MemberLines, PathValues};
+
+pub use edit::{Brought, EditCandidate, EditLoss, EditMember, edit_candidate};
 
 #[derive(Debug, Error)]
 pub enum JjError {
@@ -108,6 +113,33 @@ pub struct WorkspaceActivity {
     /// consumed. A bounded walk must carry this witness so callers never call
     /// an unsearched past "never".
     pub horizon: Option<jiff::Timestamp>,
+}
+
+/// Where a revision's own change starts (spec R6), before the release is
+/// known ([`Repo::change_base`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeBase {
+    /// The trunk does not contain the revision: its fork point with the
+    /// trunk ([`Repo::fork_point`]).
+    Fork(CommitId),
+    /// The trunk contains the revision. A release that reaches it carries
+    /// it by ancestry; otherwise how the trunk took it in gives its base
+    /// ([`Repo::taken_in`]).
+    Contained,
+}
+
+/// How the trunk took in a revision that it contains (spec R6)
+/// ([`Repo::taken_in`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TakenIn {
+    /// By a merge commit, also through another branch: the revision's fork
+    /// point with that merge's first parent.
+    Merged(CommitId),
+    /// The revision's tip is on the trunk's first-parent line, as after a
+    /// fast-forward or a direct push: the history does not record where the
+    /// revision began, so what a release holds gives its base
+    /// ([`Repo::line_base`]).
+    OnTrunkLine,
 }
 
 impl Repo {
@@ -729,6 +761,9 @@ impl Repo {
     /// Compares a revision's net tree change with a target in one three-way
     /// merge. Unlike a per-commit rebase, this correctly recognizes a squashed
     /// series and a branch whose additions are later reverted.
+    ///
+    /// `--carries` and `--census` read the upstream trunk this way. A release
+    /// is read by a member's own lines instead ([`Self::member_lines`]).
     pub fn tree_replay_outcome(
         &self,
         revision: &CommitId,
@@ -759,28 +794,10 @@ impl Repo {
         })
     }
 
-    /// The net change `revision` makes from `fork_point`, its fork point with
-    /// the trunk ([`Self::fork_point`]), replayed onto `target`, with a
-    /// release log the target holds as a union left out ([`replayed_tree`]).
-    ///
-    /// This answers whether `target`'s tree holds a revision it already
-    /// reaches. [`Self::tree_replay_outcome`] cannot: its base is the common
-    /// ancestor of the two, which for such a revision is the revision itself,
-    /// so it always reads empty. A release merge reaches every member it names
-    /// as a parent whatever its tree holds, so a hand resolution that dropped
-    /// a member's change is seen only from the member's own fork point.
-    pub fn fork_point_replay_outcome(
-        &self,
-        revision: &CommitId,
-        fork_point: &CommitId,
-        target: &CommitId,
-    ) -> Result<RebaseOutcome, JjError> {
-        self.net_diff_outcome(fork_point.as_str(), revision.as_str(), target.as_str())
-    }
-
     /// Where `revision` forked from `trunk`: their one common ancestor, or the
     /// trunk itself when the histories criss-cross to several, as
-    /// `uncarried_recorded_members` takes a member's base.
+    /// [`Self::change_base`] takes the base of a revision the trunk does not
+    /// contain.
     pub fn fork_point(&self, revision: &CommitId, trunk: &CommitId) -> Result<CommitId, JjError> {
         self.fork_point_of(std::slice::from_ref(revision), trunk)
     }
@@ -798,41 +815,214 @@ impl Repo {
             .unwrap_or_else(|| trunk.clone()))
     }
 
-    /// Replays the net tree effect of `base..revision` onto a target.
-    ///
-    /// A scratch child of `base` carrying `revision`'s tree has the range's net
-    /// effect as its diff by construction. Replaying that one synthetic commit
-    /// avoids the conflicts that replaying each source commit manufactures when an
-    /// intermediate commit is applied to a tree that already has the range's final
-    /// content.
-    ///
-    /// A release log whose block the target already holds as part of a union is
-    /// left out of the synthetic commit ([`replayed_tree`]): the replay reads what
-    /// the target lacks, and a union lacks nothing of the block it holds.
-    ///
-    /// A read, not a mutation: the replay runs inside a jj-lib transaction that is
-    /// dropped without ever becoming an operation (#18). No other reader of the
-    /// shared repository can observe it at any point, so there are no synthetic
-    /// bookmarks, no cleanup guard, and no crash-recovery machinery.
-    fn net_diff_outcome(
+    /// Where `revision`'s own change starts against `trunk` (spec R6),
+    /// before the release is known: one ancestry check, and the fork point
+    /// with the trunk where the trunk does not contain the revision. For a
+    /// revision that the trunk contains it reads no more: a release that
+    /// reaches the revision needs nothing else, so how the trunk took it in
+    /// ([`Self::taken_in`]) is read only by a reader that needs it.
+    pub fn change_base(
         &self,
-        base: &str,
-        revision: &str,
-        onto: &str,
-    ) -> Result<RebaseOutcome, JjError> {
-        let base = self.commit(base)?;
-        let revision = self.commit(revision)?;
-        let onto = self.commit(onto)?;
-        // `base..revision` is empty exactly when the base already reaches the tip.
-        if self.backend_is_ancestor(revision.id(), base.id())? {
-            return Ok(RebaseOutcome::Empty);
+        revision: &CommitId,
+        trunk: &CommitId,
+    ) -> Result<ChangeBase, JjError> {
+        Ok(if self.is_ancestor(revision, trunk)? {
+            ChangeBase::Contained
+        } else {
+            ChangeBase::Fork(self.fork_point(revision, trunk)?)
+        })
+    }
+
+    /// How `trunk`, which contains `revision`, took it in (spec R6). The
+    /// commits of the trunk's first-parent line that contain the revision,
+    /// `first_ancestors(trunk) & revision::`, form one chain, so the root of
+    /// that set is its one oldest commit, read in one evaluation
+    /// ([`Self::first_commit`]). Where that commit is the revision itself,
+    /// the revision is on that line. Else it is the merge that took the
+    /// revision in, and the revision's fork point with that merge's first
+    /// parent is its own.
+    pub fn taken_in(&self, revision: &CommitId, trunk: &CommitId) -> Result<TakenIn, JjError> {
+        let tip = self.commit(revision.as_str())?.id().clone();
+        let line = ResolvedRevsetExpression::commit(self.commit(trunk.as_str())?.id().clone())
+            .first_ancestors()
+            .intersection(&ResolvedRevsetExpression::commit(tip.clone()).descendants())
+            .roots();
+        let oldest =
+            self.first_commit(line, revision.as_str())?
+                .ok_or_else(|| JjError::Revision {
+                    revision: revision.as_str().to_owned(),
+                    detail: format!(
+                        "no commit of {}'s first-parent line contains it",
+                        trunk.as_str()
+                    ),
+                })?;
+        if oldest == tip {
+            return Ok(TakenIn::OnTrunkLine);
         }
-        let mut tx = self.repo.start_transaction();
-        let tree = replayed_tree(&base.tree(), revision.tree(), &onto.tree())?;
-        let outcome = replayed_outcome(&mut tx, (base.id(), tree), onto.id());
-        // Dropped, never committed: the probe leaves no trace in the op log.
-        drop(tx);
-        outcome
+        let merge = self
+            .repo
+            .store()
+            .get_commit(&oldest)
+            .map_err(|error| store_error(&error))?;
+        // The trunk's line before the merge, which did not contain the
+        // revision yet.
+        let before_merge = merge
+            .parent_ids()
+            .first()
+            .ok_or_else(|| JjError::Revision {
+                revision: oldest.hex(),
+                detail: "a commit that contains another has a parent".to_owned(),
+            })?;
+        Ok(TakenIn::Merged(
+            self.fork_point(revision, &commit_id(before_merge))?,
+        ))
+    }
+
+    /// The newest commit of `revision`'s own first-parent line, other than
+    /// jj's root commit, that one of `holders` contains (spec R6):
+    /// `first_ancestors(revision) & ::holders ~ root()`, of which only the
+    /// first commit is read ([`Self::first_commit`]). The line and
+    /// `::holders` meet in the older end of the line, so that commit is the
+    /// one answer. A holder that reaches the revision gives the revision
+    /// itself. `None` where there is none, as where the holders share no
+    /// commit but the root with the line.
+    pub fn line_base(
+        &self,
+        revision: &CommitId,
+        holders: &[CommitId],
+    ) -> Result<Option<CommitId>, JjError> {
+        if holders.is_empty() {
+            return Ok(None);
+        }
+        let mut held = Vec::with_capacity(holders.len());
+        for holder in holders {
+            held.push(self.commit(holder.as_str())?.id().clone());
+        }
+        let line = ResolvedRevsetExpression::commit(self.commit(revision.as_str())?.id().clone())
+            .first_ancestors()
+            .intersection(&ResolvedRevsetExpression::commits(held).ancestors())
+            .minus(&ResolvedRevsetExpression::root());
+        Ok(self
+            .first_commit(line, revision.as_str())?
+            .map(|newest| commit_id(&newest)))
+    }
+
+    /// The first commit that `expression` evaluates to, `None` where it
+    /// holds none. The revset's stream runs children before parents, so
+    /// that is its newest commit, and nothing past it is walked. A failure
+    /// names `revision`.
+    fn first_commit(
+        &self,
+        expression: Arc<ResolvedRevsetExpression>,
+        revision: &str,
+    ) -> Result<Option<JjCommitId>, JjError> {
+        let revision_error = revset_error(revision);
+        let revset = expression
+            .evaluate(self.repo.as_ref())
+            .map_err(revision_error)?;
+        let mut stream = std::pin::pin!(revset.stream());
+        block_on(std::future::poll_fn(|context| {
+            stream.as_mut().poll_next(context)
+        }))
+        .transpose()
+        .map_err(revision_error)
+    }
+
+    /// The base of `revision`'s own change in a release whose parents are
+    /// `parents` (spec R6): a release commit's parents, or a cut candidate's,
+    /// which is no commit of this repository. `base` is the revision's
+    /// [`ChangeBase`]. Where the trunk does not contain the revision, its
+    /// fork point is the base. Where the trunk contains it, reach is decided
+    /// first: where the release reaches it, the base is the revision itself,
+    /// so it is carried by ancestry, and `taken_in` is not called. Otherwise
+    /// `taken_in` gives how the trunk took it in ([`Self::taken_in`]): after
+    /// a merge, the revision's own fork point is the base, and on the
+    /// trunk's first-parent line the parents give it ([`Self::line_base`]).
+    /// Where they give none, the base is jj's root commit, so the revision's
+    /// whole tree is its change; a release that shares history with the
+    /// trunk never meets that, since it holds the trunk's oldest commit.
+    pub fn release_base(
+        &self,
+        (revision, base): (&CommitId, &ChangeBase),
+        parents: &[CommitId],
+        taken_in: impl FnOnce() -> Result<TakenIn, JjError>,
+    ) -> Result<CommitId, JjError> {
+        Ok(match base {
+            ChangeBase::Fork(fork) => fork.clone(),
+            ChangeBase::Contained
+                if parents.contains(revision) || self.reached_by(revision, parents)? =>
+            {
+                revision.clone()
+            }
+            ChangeBase::Contained => match taken_in()? {
+                TakenIn::Merged(fork) => fork,
+                TakenIn::OnTrunkLine => self
+                    .line_base(revision, parents)?
+                    .unwrap_or_else(|| commit_id(self.repo.store().root_commit_id())),
+            },
+        })
+    }
+
+    /// Whether one of `commits` is `revision` or descends from it, asked of
+    /// each in order until one is.
+    pub fn reached_by(&self, revision: &CommitId, commits: &[CommitId]) -> Result<bool, JjError> {
+        for commit in commits {
+            if self.is_ancestor(revision, commit)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// What `release` holds of a member's own lines (spec R6, R9): the
+    /// change `tip` makes from `fork_point`, its base by spec R6
+    /// ([`Self::release_base`]), read path by path by [`own_lines`].
+    /// `label` names the member in the reading. Nothing is written: no
+    /// transaction is started.
+    pub fn member_lines(
+        &self,
+        label: &str,
+        (fork_point, tip): (&CommitId, &CommitId),
+        release: &CommitId,
+    ) -> Result<MemberLines, JjError> {
+        let release = self.commit(release.as_str())?.tree();
+        self.member_lines_in(label, (fork_point, tip), &release)
+    }
+
+    /// [`Self::member_lines`] against `release`, a tree that no published
+    /// commit need hold: a candidate's ([`Candidate::member_lines`]).
+    ///
+    /// The member's paths are those where the trees of `fork_point` and
+    /// `tip` differ, read with no copy records, so a rename is the deletion
+    /// of one path and the addition of another. Each path is read with the
+    /// three values there ([`own_value`]); a path where the release holds
+    /// the tip's own resolved value loses nothing, and its contents are not
+    /// read.
+    fn member_lines_in(
+        &self,
+        label: &str,
+        (fork_point, tip): (&CommitId, &CommitId),
+        release: &MergedTree,
+    ) -> Result<MemberLines, JjError> {
+        let fork_tree = self.commit(fork_point.as_str())?.tree();
+        let tip_tree = self.commit(tip.as_str())?.tree();
+        let store = self.repo.store();
+        let mut lines = MemberLines::new(label.to_owned(), tip.clone(), fork_point.clone());
+        for entry in collect_stream(fork_tree.diff_stream(&tip_tree, &EverythingMatcher)) {
+            let values = entry.values.map_err(|error| store_error(&error))?;
+            let held =
+                block_on(release.path_value(&entry.path)).map_err(|error| store_error(&error))?;
+            if values.after.is_resolved() && held == values.after {
+                continue;
+            }
+            lines.read_path(&PathValues {
+                path: entry.path.as_internal_file_string().to_owned(),
+                fork: own_value(store, &entry.path, &values.before)?,
+                tip: own_value(store, &entry.path, &values.after)?,
+                release: own_value(store, &entry.path, &held)?,
+            });
+        }
+        Ok(lines)
     }
 
     /// The paths of the change `resolution` holds against `baseline` that
@@ -882,10 +1072,7 @@ impl Repo {
         expression: Arc<ResolvedRevsetExpression>,
         revision: &str,
     ) -> Result<HashSet<JjCommitId>, JjError> {
-        let revision_error = |error: RevsetEvaluationError| JjError::Revision {
-            revision: revision.to_owned(),
-            detail: error.to_string(),
-        };
+        let revision_error = revset_error(revision);
         let revset = expression
             .evaluate(self.repo.as_ref())
             .map_err(revision_error)?;
@@ -1247,8 +1434,7 @@ impl Repo {
     /// The visible rewrites of `commit` ([`Self::rewrites_of`]) that stand
     /// for it ([`Self::stands_for`]): its successors and its copies that keep
     /// its change id, never a commit it replaced. A copy with a new change id
-    /// is no rewrite; a caller that holds copies too compares trees
-    /// ([`crate::release_model::on_first_parent_line`]).
+    /// is no rewrite; a caller that holds copies too compares trees.
     pub fn standing_rewrites_of(&self, commit: &CommitId) -> Result<Vec<CommitId>, JjError> {
         let mut standing = Vec::new();
         for rewrite in self.rewrites_of(commit.as_str())? {
@@ -1327,11 +1513,7 @@ impl Repo {
     /// ([`duplicated_from`]), and `write`'s own tree, which a union puts
     /// under the blocks the members bring in.
     ///
-    /// `composed` is what `write` composes: its parents less its carriers,
-    /// or, for a release of a stacked series, its previous release and its
-    /// members. A release made as a chain of merges, one member each, holds
-    /// what each inner merge resolved, and that is its own change only
-    /// against the merge of all it composes, never against its own parents.
+    /// `composed` is what `write` composes: its parents less its carriers.
     ///
     /// Built in a transaction that is dropped, never committed, so it leaves
     /// nothing an operation names; the trees it wrote stay readable from the
@@ -1608,6 +1790,24 @@ impl Repo {
         let commit = self.commit(commit.as_str())?;
         let reasons = self.rests_on(commit.id())?;
         Ok((!reasons.is_empty()).then(|| reasons.join("; ")))
+    }
+
+    /// Why the earlier release write `commit` must stay, or `None` when
+    /// nothing keeps it: [`what_keeps`] in this repository's own view, by the
+    /// rules a write applies to a stray earlier write. So a ref of the release
+    /// name on its publish remote keeps it too: the next push replaces that
+    /// ref, and until then it names the write.
+    pub fn what_keeps_earlier_write(&self, commit: &CommitId) -> Result<Option<String>, JjError> {
+        let commit = self.commit(commit.as_str())?;
+        what_keeps(
+            self,
+            self.repo.as_ref(),
+            &commit,
+            &MovedName {
+                name: "",
+                publish_remote: None,
+            },
+        )
     }
 
     /// The reasons of [`Repo::what_rests_on`], one per kind of thing resting
@@ -1964,16 +2164,6 @@ pub fn carries_work_past(repo: &Path, base: &CommitId, tip: &CommitId) -> Result
     Ok(states.lines().any(|line| line.trim() == "false"))
 }
 
-/// [`Repo::net_diff_outcome`] in a repository opened for the one probe.
-pub fn probe_net_diff(
-    repo: &Path,
-    base: &str,
-    revision: &str,
-    onto: &str,
-) -> Result<RebaseOutcome, JjError> {
-    Repo::open(repo)?.net_diff_outcome(base, revision, onto)
-}
-
 /// `revision`'s tree, as the synthetic commit of a replay of `base..revision`
 /// onto `target` carries it: every release log whose block `target` already
 /// holds keeps `base`'s content instead.
@@ -2040,23 +2230,6 @@ fn replayed_commit(
         .map_err(|error| store_error(&error))
 }
 
-/// The replay of [`replayed_commit`]: empty when `onto` already holds the
-/// change `tree` makes to `base`, else conflicted or clean and non-empty.
-fn replayed_outcome(
-    tx: &mut Transaction,
-    (base, tree): (&JjCommitId, MergedTree),
-    onto: &JjCommitId,
-) -> Result<RebaseOutcome, JjError> {
-    let replayed = replayed_commit(tx, (base, tree), onto)?;
-    Ok(if replayed.has_conflict() {
-        RebaseOutcome::Conflicted
-    } else if block_on(replayed.is_empty(tx.repo())).map_err(|error| store_error(&error))? {
-        RebaseOutcome::Empty
-    } else {
-        RebaseOutcome::CleanNonEmpty
-    })
-}
-
 /// The paths of the change `resolution` holds against `base`, the tree of
 /// its baseline ([`baseline_tree`]), that `onto` does not carry, each
 /// repository-internal, replayed in `tx`, which the caller drops unwritten.
@@ -2069,11 +2242,11 @@ fn replayed_outcome(
 /// conflict can read it, so `onto` carries it when it holds the
 /// resolution's value there. Every other path replays: `base`, with each
 /// resolved path set to the resolution's value, becomes a scratch commit on
-/// `resolution`'s parents, and the replay runs from it as a replay of a
-/// range does ([`Repo::net_diff_outcome`]), with a release log `onto` holds
-/// as a union left out ([`replayed_tree`]). A path where the replayed tree
-/// differs from `onto`'s, a conflict included, is one `onto` does not
-/// carry.
+/// `resolution`'s parents, and the replay rebases a child of it, with the
+/// resolution's tree, onto `onto` ([`replayed_commit`]), with a release log
+/// `onto` holds as a union left out ([`replayed_tree`]). A path where the
+/// replayed tree differs from `onto`'s, a conflict included, is one `onto`
+/// does not carry.
 fn uncarried_change(
     tx: &mut Transaction,
     (base, resolution): (MergedTree, &jj_lib::commit::Commit),
@@ -2130,7 +2303,7 @@ fn regular_file_content(
     let Some(Some(TreeValue::File { id, .. })) = value.as_resolved() else {
         return Ok(None);
     };
-    file_content(store, path, id)
+    file_content(store, path, id).map_err(|error| store_error(&error))
 }
 
 /// The content of the file `id` at `path`, or `None` where it is not one
@@ -2139,14 +2312,52 @@ fn file_content(
     store: &jj_lib::store::Store,
     path: &RepoPath,
     id: &FileId,
-) -> Result<Option<Vec<u8>>, JjError> {
+) -> BackendResult<Option<Vec<u8>>> {
     let content = block_on(extract_as_single_hunk(
         &Merge::normal(id.clone()),
         store,
         path,
-    ))
-    .map_err(|error| store_error(&error))?;
+    ))?;
     Ok(content.into_resolved().ok().map(Vec::from))
+}
+
+/// What `value`, one tree's value at `path`, holds as [`own_lines`] reads
+/// it: a conflict, a regular file with its executable bit and content, a
+/// symlink by its target, a submodule by its commit, or no file at all, for
+/// nothing there or a directory.
+fn own_value(
+    store: &jj_lib::store::Store,
+    path: &RepoPath,
+    value: &MergedTreeValue,
+) -> Result<own_lines::Value, JjError> {
+    stored_value(store, path, value).map_err(|error| store_error(&error))
+}
+
+/// [`own_value`] with the store's own error, so that a reader can tell a
+/// value the store refuses to read ([`BackendError::ReadAccessDenied`]) from
+/// any other failure: spec R11's placement reads that value as a conflict
+/// ([`edit`]), where every other reader fails.
+fn stored_value(
+    store: &jj_lib::store::Store,
+    path: &RepoPath,
+    value: &MergedTreeValue,
+) -> BackendResult<own_lines::Value> {
+    Ok(match value.as_resolved() {
+        None => own_lines::Value::Conflict,
+        Some(Some(TreeValue::File { id, executable, .. })) => file_content(store, path, id)?
+            .map_or(own_lines::Value::Conflict, |content| {
+                own_lines::Value::File {
+                    executable: *executable,
+                    content,
+                }
+            }),
+        Some(Some(TreeValue::Symlink(id))) => own_lines::Value::Symlink {
+            target: block_on(store.read_symlink(path, id))?,
+        },
+        Some(Some(TreeValue::GitSubmodule(id))) => own_lines::Value::Submodule { commit: id.hex() },
+        // Nothing at the path, or a directory: no file.
+        Some(_) => own_lines::Value::Absent,
+    })
 }
 
 /// `path` as a repository-internal path, `/`-separated.
@@ -2184,8 +2395,9 @@ fn tree_holds(tree: &MergedTree, path: &str) -> Result<bool, JjError> {
 /// Replays `base..revision` onto a target and classifies the resulting content.
 ///
 /// A read, not a mutation, in the same dropped-transaction style as
-/// [`probe_net_diff`]. Each commit is placed where `jj duplicate -r <range> -d
-/// <onto>` puts it, by the rewrite that command runs (see [`replay_range`]).
+/// [`Repo::uncarried_resolution_paths`]. Each commit is placed where `jj
+/// duplicate -r <range> -d <onto>` puts it, by the rewrite that command runs
+/// (see [`replay_range`]).
 pub fn probe_revision(
     repo: &Path,
     base: &str,
@@ -2277,6 +2489,14 @@ fn replay_range(
 fn store_error(error: &jj_lib::backend::BackendError) -> JjError {
     JjError::Open {
         path: "commit store".to_owned(),
+        detail: error.to_string(),
+    }
+}
+
+/// A failure to evaluate a revset that reads `revision`, named for it.
+fn revset_error(revision: &str) -> impl Fn(RevsetEvaluationError) -> JjError + Copy {
+    move |error| JjError::Revision {
+        revision: revision.to_owned(),
         detail: error.to_string(),
     }
 }
@@ -2943,15 +3163,16 @@ pub enum Measured<'a> {
     /// so what the source resolved over a carrier becomes its own change and
     /// the duplicate keeps it.
     WithoutCarriers(&'a [CommitId]),
-    /// What it composes, never its own parents, its carriers left out. A
-    /// release of a stacked series composes its previous release and its
-    /// members. Made as a chain of merges, one member each, it holds what
-    /// each inner merge resolved, and none of that is its top commit's own
-    /// change. So the source is first written again on these with its own
-    /// tree, and that in-between commit is duplicated: the write keeps every
-    /// resolution the chain holds. A source whose own parents are these is
-    /// duplicated as it is.
-    Composed(&'a [CommitId]),
+}
+
+impl Measured<'_> {
+    /// `source`'s parents that its own change is measured against
+    /// ([`duplicated_from`]).
+    fn parents(self, source: &jj_lib::commit::Commit) -> Vec<JjCommitId> {
+        match self {
+            Self::WithoutCarriers(carriers) => without_carriers(source, carriers),
+        }
+    }
 }
 
 /// What a release write made, and what became of the commit it replaced.
@@ -3026,6 +3247,20 @@ pub struct ReplacedRelease {
     pub kept: Option<String>,
 }
 
+/// A file an edit wrote as the plain merge of its new parents
+/// ([`EditCandidate`]): the release's own change there answers a conflict
+/// that this merge does not leave (spec R11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainMergedFile {
+    /// The repository-internal path, `/`-separated.
+    pub path: String,
+    /// Whether the written release leaves the file conflicted.
+    pub conflicted: bool,
+    /// Whether the release had also changed lines outside that conflict, a
+    /// hand change the plain merge does not carry ([`edit::changed_outside`]).
+    pub hand_change_left_out: bool,
+}
+
 /// Write a release commit — and optionally its bookmark — as ONE operation.
 ///
 /// Explicit commit ids, never bookmark names: a name can move between the
@@ -3066,25 +3301,68 @@ pub struct ReplacedRelease {
 pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWritten, JjError> {
     validate_parents(write.source, write.parents)?;
     let repo = Repo::open_to_write(repo)?;
-    let (parent_commits, parent_ids) = resolved_parents(&repo, write.parents)?;
     let mut tx = repo.repo.start_transaction();
-    let (written, source, unions) = if let Some(source) = write.source {
-        let source = repo.commit(source.as_str())?;
-        let measured = match write.measured {
-            Measured::Composed(composed) => resolved_parents(&repo, composed)?.1,
-            Measured::WithoutCarriers(carriers) => without_carriers(&source, carriers),
-        };
-        let (written, unions) =
-            duplicated_from(&mut tx, (&source, write.message), measured, &parent_ids)?;
-        (written, Some(source), unions)
-    } else {
+    let built = built_release(&repo, &mut tx, write)?;
+    finished_release(&repo, tx, write, built)
+}
+
+/// What [`built_release`] wrote in a transaction.
+struct BuiltRelease {
+    written: jj_lib::commit::Commit,
+    /// The write's source, when it duplicates one.
+    source: Option<jj_lib::commit::Commit>,
+    unions: Vec<UnionedFile>,
+}
+
+/// The release commit `write` describes, written into `tx` and not yet
+/// named: a duplicate of its source onto its parents, or a fresh merge of
+/// them, with the release-log union. An edit writes its duplicate by spec
+/// R11's rule instead ([`edit`]).
+fn built_release(
+    repo: &Repo,
+    tx: &mut Transaction,
+    write: &ReleaseWrite<'_>,
+) -> Result<BuiltRelease, JjError> {
+    let (parent_commits, parent_ids) = resolved_parents(repo, write.parents)?;
+    let Some(source) = write.source else {
         let (written, unions) = merged_release(
-            &mut tx,
+            tx,
             (&parent_commits, parent_ids),
             write.message.unwrap_or_default(),
         )?;
-        (written, None, unions)
+        return Ok(BuiltRelease {
+            written,
+            source: None,
+            unions,
+        });
     };
+    let source = repo.commit(source.as_str())?;
+    let measured = write.measured.parents(&source);
+    let (written, unions, _) =
+        duplicated_from(tx, (&source, write.message), measured, (&parent_ids, None))?;
+    Ok(BuiltRelease {
+        written,
+        source: Some(source),
+        unions,
+    })
+}
+
+/// Name `built`, the commit [`built_release`] or an edit ([`edit`]) wrote
+/// into `tx`, as `write` says, and commit `tx` as one operation: the
+/// bookmark moved, a replaced source abandoned unless something rests on
+/// it, the earlier writes that nothing holds swept, and the heads this
+/// exposes hidden ([`hide_exposed`]).
+fn finished_release(
+    repo: &Repo,
+    mut tx: Transaction,
+    write: &ReleaseWrite<'_>,
+    built: BuiltRelease,
+) -> Result<ReleaseWritten, JjError> {
+    let BuiltRelease {
+        written,
+        source,
+        unions,
+    } = built;
     let same_tree_as_source = source
         .as_ref()
         .is_some_and(|source| source.tree_ids() == written.tree_ids());
@@ -3106,7 +3384,7 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
         tx.repo_mut()
             .set_local_bookmark_target(ref_name, RefTarget::normal(written.id().clone()));
         if let Some(source) = source {
-            let kept = what_keeps(&repo, tx.repo(), &source, &moved)?;
+            let kept = what_keeps(repo, tx.repo(), &source, &moved)?;
             if kept.is_none() {
                 tx.repo_mut().record_abandoned_commit(&source);
             }
@@ -3127,7 +3405,7 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
         let strays = if written.has_conflict() {
             Vec::new()
         } else {
-            unheld_heads(&repo, tx.repo(), write.earlier, &stray_rules)?
+            unheld_heads(repo, tx.repo(), write.earlier, &stray_rules)?
         };
         for stray in strays {
             let stray_id = commit_id(stray.id());
@@ -3148,7 +3426,7 @@ pub fn write_release(repo: &Path, write: &ReleaseWrite<'_>) -> Result<ReleaseWri
             conflicted: written.has_conflict(),
         },
     )?;
-    commit_mutation(&repo, tx, write.operation)?;
+    commit_mutation(repo, tx, write.operation)?;
     Ok(ReleaseWritten {
         commit: commit_id(written.id()),
         change: ChangeId::new(written.change_id().to_string()),
@@ -3558,31 +3836,38 @@ fn without_carriers(source: &jj_lib::commit::Commit, carriers: &[CommitId]) -> V
         .collect()
 }
 
+/// What [`duplicated_release`] wrote: the duplicate, the release logs the
+/// union wrote in it, and the files spec R11's rule wrote as the plain merge
+/// of the new parents.
+type Duplicated = (
+    jj_lib::commit::Commit,
+    Vec<UnionedFile>,
+    Vec<PlainMergedFile>,
+);
+
 /// [`duplicated_release`] of `source`, its own change measured against the
-/// merge of `measured`: its parents less its carriers ([`without_carriers`]),
-/// or what it composes ([`Measured::Composed`]).
+/// merge of `measured`: its parents less its carriers ([`without_carriers`]).
 ///
 /// A duplicate replays the source's own change, its tree against the merge
 /// of its parents, onto the new parents. With a carrier among those parents
 /// the merge already holds every resolution the carrier holds, so the
 /// source's own change is empty there and a duplicate onto the members alone
-/// loses them; a chain of merges holds what each inner merge resolved, which
-/// is no change of its top commit's own. So a source whose parents are not
-/// `measured` is first written again as an in-between commit on `measured`
-/// with its own tree, description and author, which makes those resolutions
-/// its own change; that commit is duplicated; and it is recorded abandoned in
-/// the same transaction, so the write still leaves one new visible commit. A
-/// new commit, never a rewrite of the source: a rewrite would record the
-/// source rewritten and move everything resting on it, a working copy
-/// included.
+/// loses them. So a source whose parents are not `measured` is first written
+/// again as an in-between commit on `measured` with its own tree, description
+/// and author, which makes those resolutions its own change; that commit is
+/// duplicated; and it is recorded abandoned in the same transaction, so the
+/// write still leaves one new visible commit. A new commit, never a rewrite
+/// of the source: a rewrite would record the source rewritten and move
+/// everything resting on it, a working copy included. `parents` are the
+/// new parents, as [`duplicated_release`] takes them.
 fn duplicated_from(
     tx: &mut Transaction,
     (source, message): (&jj_lib::commit::Commit, Option<&str>),
     measured: Vec<JjCommitId>,
-    parent_ids: &[JjCommitId],
-) -> Result<(jj_lib::commit::Commit, Vec<UnionedFile>), JjError> {
+    parents: (&[JjCommitId], Option<&MergedTree>),
+) -> Result<Duplicated, JjError> {
     if measured.as_slice() == source.parent_ids() {
-        return duplicated_release(tx, (source, message), parent_ids);
+        return duplicated_release(tx, (source, message), parents);
     }
     if measured.is_empty() {
         return Err(JjError::Revision {
@@ -3600,7 +3885,7 @@ fn duplicated_from(
             .write(),
     )
     .map_err(|error| store_error(&error))?;
-    let written = duplicated_release(tx, (&in_between, message), parent_ids)?;
+    let written = duplicated_release(tx, (&in_between, message), parents)?;
     tx.repo_mut().record_abandoned_commit(&in_between);
     Ok(written)
 }
@@ -3609,15 +3894,19 @@ fn duplicated_from(
 /// with every release log whose conflict is a union written resolved, and
 /// those logs.
 ///
-/// The union goes into the duplicate by rewriting it in the same
-/// transaction, so the write leaves one visible commit with the duplicate's
-/// change id. `source` is the earlier release: its content of a log goes
-/// under the blocks the new parents bring in.
+/// Where `ruled` holds the plain merge of the new parents (an edit), the
+/// duplicate is first written by spec R11's rule ([`edit::ruled_tree`]),
+/// and the files it wrote as that plain merge are returned too; `None` (a
+/// cut, a rebase's write) keeps the duplicate as it is. The union goes into
+/// the duplicate by rewriting it in the same transaction, so the write
+/// leaves one visible commit with the duplicate's change id. `source` is
+/// the earlier release: its content of a log goes under the blocks the new
+/// parents bring in.
 fn duplicated_release(
     tx: &mut Transaction,
     (source, message): (&jj_lib::commit::Commit, Option<&str>),
-    parent_ids: &[JjCommitId],
-) -> Result<(jj_lib::commit::Commit, Vec<UnionedFile>), JjError> {
+    (parent_ids, ruled): (&[JjCommitId], Option<&MergedTree>),
+) -> Result<Duplicated, JjError> {
     let mut descriptions = HashMap::new();
     if let Some(message) = message {
         descriptions.insert(source.id().clone(), message.to_owned());
@@ -3638,18 +3927,31 @@ fn duplicated_release(
             revision: source.id().to_string(),
             detail: "the duplicate produced no commit".to_owned(),
         })?;
-    let (tree, unions) = union_release_logs(duplicate.tree(), Some(&source.tree()))?;
-    if unions.is_empty() {
-        return Ok((duplicate, unions));
+    let (tree, plain) = match ruled {
+        Some(new) => edit::ruled_tree(tx.repo(), (source, duplicate.tree()), new)?,
+        None => (duplicate.tree(), Vec::new()),
+    };
+    let (tree, unions) = union_release_logs(tree, Some(&source.tree()))?;
+    if plain.is_empty() && unions.is_empty() {
+        return Ok((duplicate, unions, Vec::new()));
     }
-    let unioned = block_on(
+    let mut plain_merged = Vec::with_capacity(plain.len());
+    for (path, hand_change_left_out) in plain {
+        let written = block_on(tree.path_value(&path)).map_err(|error| store_error(&error))?;
+        plain_merged.push(PlainMergedFile {
+            path: path.as_internal_file_string().to_owned(),
+            conflicted: !written.is_resolved(),
+            hand_change_left_out,
+        });
+    }
+    let rewritten = block_on(
         tx.repo_mut()
             .rewrite_commit(&duplicate)
             .set_tree(tree)
             .write(),
     )
     .map_err(|error| store_error(&error))?;
-    Ok((unioned, unions))
+    Ok((rewritten, unions, plain_merged))
 }
 
 /// `tree` with every release log whose conflict is a union
@@ -3781,11 +4083,10 @@ pub enum ResolutionBaseline<'a> {
     /// A recorded write this repository holds, rebuilt on the resolution's
     /// `members` as a knives write onto them builds it: `write`'s own change,
     /// its tree against the merge of `composed`, what it composes (its
-    /// parents less its carriers, or a stacked write's previous release and
-    /// members), rebased onto them with the release-log union, the tree
-    /// [`Repo::holds_rebased_write`] reads. A member rewritten in place,
-    /// which makes jj rebase the release, is then no change of the
-    /// resolution's.
+    /// parents less its carriers), rebased onto them with the release-log
+    /// union, the tree [`Repo::holds_rebased_write`] reads. A member
+    /// rewritten in place, which makes jj rebase the release, is then no
+    /// change of the resolution's.
     Rebuilt {
         write: &'a CommitId,
         composed: &'a [CommitId],
@@ -3870,7 +4171,10 @@ pub fn resolution_changes(
             let mut sides = Vec::new();
             for term in values.before.adds() {
                 if let Some(TreeValue::File { id, .. }) = term {
-                    sides.extend(file_content(store, &entry.path, id)?);
+                    sides.extend(
+                        file_content(store, &entry.path, id)
+                            .map_err(|error| store_error(&error))?,
+                    );
                 }
             }
             sides
@@ -3898,7 +4202,7 @@ pub struct CutSpec {
 /// The cut audit needs to READ the merge it is judging. Committing the merge
 /// first meant a failed audit had to compensate with an abandon, and a crash
 /// between the two operations stranded an anonymous merge. A candidate gives
-/// the audit a real commit to read — conflicts, member replays, tree drift —
+/// the audit a real commit to read — conflicts, member lines, tree drift —
 /// inside a transaction that simply evaporates afterwards: a failed audit
 /// writes nothing at all. [`Candidate::publish`] rebuilds the spec in a fresh
 /// transaction and refuses if the rebuilt tree differs from the audited one,
@@ -3939,7 +4243,8 @@ pub fn candidate_release(repo: &Path, spec: CutSpec) -> Result<Candidate, JjErro
 /// The release commit `spec` describes, written into `tx`, and the release
 /// logs it unioned. A source with carriers goes through the in-between commit
 /// a release write uses ([`duplicated_from`]), in the audited candidate and in
-/// the published rebuild alike, so both hold the same tree.
+/// the published rebuild alike, so both hold the same tree. A cut keeps the
+/// duplicate as it is: spec R11's rule is an edit's.
 fn spec_commit(
     repo: &Repo,
     tx: &mut Transaction,
@@ -3948,12 +4253,13 @@ fn spec_commit(
     let (parent_commits, parent_ids) = resolved_parents(repo, &spec.parents)?;
     if let Some(source) = &spec.source {
         let source = repo.commit(source.as_str())?;
-        duplicated_from(
+        let (commit, unions, _) = duplicated_from(
             tx,
             (&source, Some(&spec.message)),
             without_carriers(&source, &spec.carriers),
-            &parent_ids,
-        )
+            (&parent_ids, None),
+        )?;
+        Ok((commit, unions))
     } else {
         merged_release(tx, (&parent_commits, parent_ids), &spec.message)
     }
@@ -3978,6 +4284,12 @@ impl Candidate {
         self.commit.parent_ids().len()
     }
 
+    /// The parents the candidate was built on, in order: its spec's
+    /// ([`CutSpec::parents`]).
+    pub fn parents(&self) -> &[CommitId] {
+        &self.spec.parents
+    }
+
     /// The release logs the candidate holds as the union of their sides; a
     /// publish rebuilds the same tree, so they are what ships.
     pub fn unions(&self) -> &[UnionedFile] {
@@ -3989,19 +4301,15 @@ impl Candidate {
         conflicted_paths(&self.commit.tree())
     }
 
-    /// [`probe_net_diff`] with the candidate as the target: the net effect of
-    /// `base..revision`, replayed onto the candidate in its own scratch
-    /// transaction, with a release log the candidate's union already holds
-    /// left out ([`replayed_tree`]).
-    pub fn replay_outcome(&mut self, base: &str, revision: &str) -> Result<RebaseOutcome, JjError> {
-        let base = self.repo.commit(base)?;
-        let revision = self.repo.commit(revision)?;
-        // `base..revision` is empty exactly when the base already reaches the tip.
-        if self.repo.backend_is_ancestor(revision.id(), base.id())? {
-            return Ok(RebaseOutcome::Empty);
-        }
-        let tree = replayed_tree(&base.tree(), revision.tree(), &self.commit.tree())?;
-        replayed_outcome(&mut self.tx, (base.id(), tree), self.commit.id())
+    /// [`Repo::member_lines`] with the candidate as the release, read from
+    /// its tree in its scratch transaction.
+    pub fn member_lines(
+        &self,
+        label: &str,
+        (fork_point, tip): (&CommitId, &CommitId),
+    ) -> Result<MemberLines, JjError> {
+        self.repo
+            .member_lines_in(label, (fork_point, tip), &self.commit.tree())
     }
 
     /// The paths of the change `resolution` holds against `baseline`, the
@@ -4828,26 +5136,6 @@ pub fn forget_and_abandon(
     )?;
     commit_mutation(&repo, tx, operation)?;
     Ok(outcome)
-}
-
-/// Forget every ref of each of `names`, locally and on every remote, as ONE
-/// operation, and abandon nothing.
-///
-/// The reap of a stacked series retires a superseded name this way when the
-/// live release descends from its commit: the commit stays, reachable from
-/// the live release, and only the name goes. Nothing changes on any remote; a
-/// later fetch re-materializes whatever still exists there, as after
-/// [`forget_and_abandon`].
-pub fn forget_bookmarks(repo: &Path, names: &[String], operation: &str) -> Result<(), JjError> {
-    if names.is_empty() {
-        return Ok(());
-    }
-    let repo = Repo::open_to_write(repo)?;
-    let mut tx = repo.repo.start_transaction();
-    for name in names {
-        forget_refs(tx.repo_mut(), name);
-    }
-    commit_mutation(&repo, tx, operation)
 }
 
 /// Refuse to abandon a commit that a local bookmark still names, other than a

@@ -7,18 +7,12 @@
 //! writing nothing: a conflicted commit, a commit that shares no history with
 //! the trunk, one that merges no member, a name that sorts before a release
 //! the series already holds or records, a change no member explains, and a
-//! release made as merges on its previous release outside a stacked series.
-//! A parent the trunk holds is never a member. The same commit recorded
-//! again writes nothing, and records of one name run at once take turns. In
-//! a stacked series a chain of merges, one member each, records its previous
-//! release and the side parents on its first-parent line, and an edit of it,
-//! or a member rewritten in place under it, keeps what its inner merges
-//! resolved. A record is held against the newest write of the newest release
-//! the ledger records, so a member that `include` added since that release's
-//! cut is held too, and in a stacked series that write must be on the
-//! record's first-parent line, so a commit built below it is refused, or
-//! with `--allow-drop` recorded with the drop stated. A clone that does not
-//! hold that write is refused, naming it and the fetch. A fix by hand is
+//! release made as merges on its previous release. A parent the trunk holds
+//! is never a member. The same commit recorded again writes nothing, and
+//! records of one name run at once take turns. A record is held against the
+//! newest write of the newest release the ledger records, so a member that
+//! `include` added since that release's cut is held too. A clone that does
+//! not hold that write is refused, naming it and the fetch. A fix by hand is
 //! held file by file, each file against its reference: the newest recorded
 //! write that holds the file with no conflict, so a write that leaves the
 //! file conflicted neither ends the hold nor stands for the fix. A file's
@@ -59,7 +53,7 @@ use std::process::{Output, Stdio};
 
 use knives::ids::CommitId;
 use knives::ledger::{Entry, Kind, Ledger, RecordedParent};
-use lab::{Lab, commit_at, file_at_revision, knives_release, release_parents, release_test_home};
+use lab::{Lab, commit_at, file_at_revision, knives_release, release_test_home};
 
 /// A release of the default series.
 const RELEASE: &str = "release/2026-08-04";
@@ -534,8 +528,8 @@ fn a_change_no_member_explains_is_refused_outside_a_stacked_series() {
     // When: it is recorded.
     let recorded = record(&lab, &home, "release/2026-08-05", &commit);
 
-    // Then: it is refused as a stacked series refuses it, naming the file no
-    // member or trunk explains, and nothing is written.
+    // Then: it is refused, naming the file no member or trunk explains, and
+    // nothing is written.
     let out = text(&recorded);
     assert_eq!(recorded.status.code(), Some(3), "{out}");
     assert!(out.contains("unexplained.txt"), "{out}");
@@ -713,7 +707,8 @@ fn a_hand_merge_on_the_previous_release_is_refused_outside_a_stacked_series() {
     let recorded = record(&lab, &home, "release/2026-08-05", &commit);
 
     // Then: it is refused, naming the previous release as never a member
-    // and the setting that reads a release made on it, and nothing is
+    // and saying that a release must be a flat octopus merge of the trunk
+    // and its member branches, with no setting named, and nothing is
     // written.
     let out = text(&recorded);
     assert_eq!(recorded.status.code(), Some(3), "{out}");
@@ -724,7 +719,15 @@ fn a_hand_merge_on_the_previous_release_is_refused_outside_a_stacked_series() {
         )),
         "{out}"
     );
-    assert!(out.contains("the default series has no table"), "{out}");
+    assert!(
+        out.contains(
+            "the series' previous release, which is never a member; a release must be a flat \
+             octopus merge of the trunk and its member branches: merge the members, not the \
+             previous release"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("stacked"), "{out}");
     assert_eq!(ledger_entries(&home), entries, "{out}");
     assert_eq!(bookmarks(&lab), refs, "{out}");
 }
@@ -995,14 +998,12 @@ fn branch_on(lab: &Lab, base: &str, name: &str, (file, content): (&str, &str)) {
     lab.jj_work(["new"]);
 }
 
-/// The release-test home with a series `old` on the upstream branch `old`,
-/// plus whatever `extra` the test adds to its table.
-fn series_home(lab: &Lab, extra: &str) -> tempfile::TempDir {
+/// The release-test home with a series `old` on the upstream branch `old`.
+fn series_home(lab: &Lab) -> tempfile::TempDir {
     let (home, _consumer) = release_test_home(lab);
     let registry = home.path().join("repos.toml");
     let mut registered = std::fs::read_to_string(&registry).expect("read registry");
     registered.push_str("\n[repos.demo.series.old]\nbase = \"old\"\n");
-    registered.push_str(extra);
     std::fs::write(&registry, registered).expect("write registry");
     home
 }
@@ -1019,7 +1020,7 @@ fn a_series_hand_cut_is_recorded() {
     lab.jj_work(["bookmark", "create", SPEED, "-r", "@"]);
     lab.jj_work(["new"]);
     lab.push_branch(SPEED);
-    let home = series_home(&lab, "");
+    let home = series_home(&lab);
     let commit = commit_at(&lab, SPEED);
 
     // When: the release is recorded in its series.
@@ -1049,10 +1050,10 @@ fn a_series_hand_cut_is_recorded() {
     );
 }
 
-/// Series `old`, with `stacked = true` when `stacked`: its first cut
-/// [`PREVIOUS`] of `fix/a` (which writes `lines.txt`) and `fix/b`, pushed
-/// and marked published by a `record: published` note.
-fn previous_release_lab(stacked: bool) -> (Lab, tempfile::TempDir) {
+/// Series `old`: its first cut [`PREVIOUS`] of `fix/a` (which writes
+/// `lines.txt`) and `fix/b`, pushed and marked published by a `record:
+/// published` note.
+fn previous_release_lab() -> (Lab, tempfile::TempDir) {
     let lab = two_base_lab();
     branch_on(
         &lab,
@@ -1061,26 +1062,12 @@ fn previous_release_lab(stacked: bool) -> (Lab, tempfile::TempDir) {
         ("lines.txt", "1\n2\n3\n4\n5\n"),
     );
     branch_on(&lab, "old@upstream", "fix/b", ("b.txt", "fix/b\n"));
-    let home = series_home(&lab, if stacked { "stacked = true\n" } else { "" });
+    let home = series_home(&lab);
     let cut = knives_release(&lab, &home, &["--series", "old", "cut", PREVIOUS]);
     assert!(cut.status.success(), "{}", text(&cut));
     lab.push_branch(PREVIOUS);
     lab.fetch_work();
-    let noted = lab::knives(
-        &lab,
-        &home,
-        &[
-            "notch",
-            PREVIOUS,
-            "-m",
-            "record: published as v1.0.0",
-            "--evidence",
-            commit_at(&lab, PREVIOUS).as_str(),
-            "--repo",
-            "demo",
-        ],
-    );
-    assert!(noted.status.success(), "{}", text(&noted));
+    mark_published(&lab, &home, PREVIOUS);
     (lab, home)
 }
 
@@ -1108,86 +1095,11 @@ fn chain_next(lab: &Lab) {
     lab.jj_work(["new"]);
 }
 
-/// [`previous_release_lab`] with the stacked key, its members, and the chain
-/// [`NEXT`] recorded with `cut --at`, which must exit 0.
-fn recorded_chain_lab() -> (Lab, tempfile::TempDir) {
-    let (lab, home) = previous_release_lab(true);
-    members_on_previous(&lab);
-    chain_next(&lab);
-    let recorded = record_in_series(&lab, &home, NEXT, NEXT);
-    assert_eq!(recorded.status.code(), Some(0), "{}", text(&recorded));
-    (lab, home)
-}
-
 #[test]
-fn a_chain_shaped_release_is_recorded_in_a_stacked_series() {
-    // Given: a stacked series whose next release is a chain of merges, one
-    // member each, on its published first cut, held only here.
-    let (lab, home) = previous_release_lab(true);
-    members_on_previous(&lab);
-    chain_next(&lab);
-    let (commit, previous) = (commit_at(&lab, NEXT), commit_at(&lab, PREVIOUS));
-
-    // When: the chain is recorded.
-    let recorded = record_in_series(&lab, &home, NEXT, NEXT);
-
-    // Then: it exits 0, so the audit found nothing missing, and the line
-    // says how to push it.
-    let out = text(&recorded);
-    assert_eq!(recorded.status.code(), Some(0), "{out}");
-    assert!(
-        out.contains(&format!(
-            "{}; push {NEXT} with jj git push --remote origin --bookmark {NEXT}",
-            recorded_line(NEXT, &commit)
-        )),
-        "{out}"
-    );
-
-    // And: the event records the previous release under its label, then the
-    // side parents on the chain's first-parent line, never its two literal
-    // parents.
-    let event = newest_event(&home, NEXT);
-    let members = ["m6", "m5", "m4"].map(|branch| (branch, commit_at(&lab, branch)));
-    let mut evidence = vec![commit.as_str().to_owned(), previous.as_str().to_owned()];
-    evidence.extend(members.iter().map(|(_, member)| member.as_str().to_owned()));
-    assert_eq!(event.evidence, evidence, "{event:?}");
-    let mut parents = vec![RecordedParent {
-        commit: previous.as_str().to_owned(),
-        branches: vec![format!("{PREVIOUS} previous release (not a member)")],
-    }];
-    parents.extend(members.iter().map(|(branch, member)| RecordedParent {
-        commit: member.as_str().to_owned(),
-        branches: vec![(*branch).to_owned()],
-    }));
-    assert_eq!(event.parents, parents, "{event:?}");
-    assert!(
-        event.text.contains("; recorded: composed outside knives"),
-        "{event:?}"
-    );
-
-    // And: `members --verify` reads those members back, each replayed empty.
-    let verify = knives_release(&lab, &home, &["--series", "old", "members", "--verify"]);
-    let out = text(&verify);
-    assert_eq!(verify.status.code(), Some(0), "{out}");
-    for (branch, member) in &members {
-        assert!(
-            out.contains(&format!("- {} {branch}", member.short())),
-            "{out}"
-        );
-        assert!(
-            out.contains(&format!(
-                "  {branch}@{}: carried (replay empty)",
-                member.short()
-            )),
-            "{out}"
-        );
-    }
-}
-
-#[test]
-fn a_chain_shaped_release_outside_a_stacked_series_is_refused_naming_the_setting() {
-    // Given: the same chain in a series without the stacked key.
-    let (lab, home) = previous_release_lab(false);
+fn a_chain_shaped_release_is_refused_as_not_a_flat_octopus_merge() {
+    // Given: [`NEXT`] made by hand as the chain [`chain_next`] on
+    // [`PREVIOUS`].
+    let (lab, home) = previous_release_lab();
     members_on_previous(&lab);
     chain_next(&lab);
     let (entries, refs) = (ledger_entries(&home), bookmarks(&lab));
@@ -1195,186 +1107,25 @@ fn a_chain_shaped_release_outside_a_stacked_series_is_refused_naming_the_setting
     // When: the chain is recorded.
     let recorded = record_in_series(&lab, &home, NEXT, NEXT);
 
-    // Then: it is refused, the series table and its setting named, and
+    // Then: it is refused, saying that a release must be a flat octopus
+    // merge of the trunk and its member branches, with no setting named, and
     // nothing is written.
     let out = text(&recorded);
     assert_eq!(recorded.status.code(), Some(3), "{out}");
-    assert!(out.contains("stacks on an earlier merge"), "{out}");
     assert!(
-        out.contains("set `stacked = true` on [repos.demo.series.\"old\"]"),
+        out.contains(
+            "a member above stacks on an earlier merge; a release must be a flat octopus merge \
+             of the trunk and its member branches: rebase each member above off the trunk"
+        ),
         "{out}"
     );
+    assert!(!out.contains("stacked = true"), "{out}");
     assert_eq!(ledger_entries(&home), entries, "{out}");
     assert_eq!(bookmarks(&lab), refs, "{out}");
 }
-
-#[test]
-fn an_edit_of_a_recorded_chain_keeps_what_its_inner_merge_changed() {
-    // Given: the recorded chain, whose inner merge of `m5` changed a line by
-    // hand, and one more branch on the previous release.
-    let (lab, home) = recorded_chain_lab();
-    branch_on(&lab, PREVIOUS, "m3", ("m3.txt", "m3\n"));
-
-    // When: that branch is included.
-    let include = knives_release(&lab, &home, &["--series", "old", "include", "m3"]);
-
-    // Then: the release is one merge of the previous release, the members
-    // and the branch, and it keeps the line the inner merge changed.
-    assert_eq!(include.status.code(), Some(0), "{}", text(&include));
-    let mut expected = vec![commit_at(&lab, PREVIOUS)];
-    expected.extend(["m6", "m5", "m4", "m3"].map(|branch| commit_at(&lab, branch)));
-    assert_eq!(release_parents(&lab, NEXT), expected);
-    assert_eq!(file_at_revision(&lab, NEXT, "lines.txt"), RESOLVED);
-    assert_eq!(file_at_revision(&lab, NEXT, "m3.txt"), "m3\n");
-}
-
-#[test]
-fn a_recorded_chain_whose_member_is_rewritten_in_place_reads_as_recorded() {
-    // Given: the recorded chain, then a member reworded in place, so jj
-    // rebases the chain onto it, and one more branch on the previous
-    // release.
-    let (lab, home) = recorded_chain_lab();
-    let recorded = commit_at(&lab, NEXT);
-    lab.jj_work(["describe", "m6", "-m", "m6, reworded"]);
-    assert_ne!(commit_at(&lab, NEXT), recorded);
-    branch_on(&lab, PREVIOUS, "m3", ("m3.txt", "m3\n"));
-
-    // When: that branch is included.
-    let include = knives_release(&lab, &home, &["--series", "old", "include", "m3"]);
-
-    // Then: the release reads as its recorded cut rebased by jj, so the
-    // include is not refused, and the release keeps the line the inner
-    // merge changed.
-    let out = text(&include);
-    assert_eq!(include.status.code(), Some(0), "{out}");
-    assert_eq!(file_at_revision(&lab, NEXT, "lines.txt"), RESOLVED);
-}
-
-#[test]
-fn a_start_commit_on_the_previous_release_is_recorded_with_no_member() {
-    // Given: a stacked series' published first cut, and a commit made on it
-    // by hand with its tree, the start of the next release, which merges no
-    // member yet.
-    let (lab, home) = previous_release_lab(true);
-    lab.jj_work(["new", "-r", PREVIOUS, "-m", NEXT]);
-    lab.jj_work(["new"]);
-    let (commit, previous) = (commit_of(&lab, "@-"), commit_at(&lab, PREVIOUS));
-
-    // When: it is recorded as the next release.
-    let recorded = record_in_series(&lab, &home, NEXT, commit.as_str());
-
-    // Then: it exits 0, and the event records the previous release under
-    // its label and no member: a start commit is a release with none.
-    let out = text(&recorded);
-    assert_eq!(recorded.status.code(), Some(0), "{out}");
-    let event = newest_event(&home, NEXT);
-    assert_eq!(
-        event.evidence,
-        vec![commit.as_str().to_owned(), previous.as_str().to_owned()],
-        "{event:?}"
-    );
-    assert_eq!(
-        event.parents,
-        vec![RecordedParent {
-            commit: previous.as_str().to_owned(),
-            branches: vec![format!("{PREVIOUS} previous release (not a member)")],
-        }],
-        "{event:?}"
-    );
-}
-
-/// Series `old`'s third release, recorded after [`NEXT`].
-const THIRD: &str = "release/old/2026-08-06";
-
-#[test]
-fn a_record_built_on_an_older_release_than_the_newest_recorded_one_is_refused_naming_its_members() {
-    // Given: a stacked series whose published first cut is PREVIOUS; a
-    // knives cut of NEXT on it, with `m6` and `m5` included; and a commit
-    // merged by hand of PREVIOUS and `m4` alone, so it is built on PREVIOUS
-    // and holds neither member of NEXT.
-    let (lab, home) = previous_release_lab(true);
-    members_on_previous(&lab);
-    let previous = commit_at(&lab, PREVIOUS);
-    let steps: [&[&str]; 3] = [&["cut", NEXT], &["include", "m6"], &["include", "m5"]];
-    for args in steps {
-        let mut series = vec!["--series", "old"];
-        series.extend_from_slice(args);
-        let ran = knives_release(&lab, &home, &series);
-        assert_eq!(ran.status.code(), Some(0), "{args:?}: {}", text(&ran));
-    }
-    lab.jj_work(["new", "-r", previous.as_str(), "-r", "m4", "-m", THIRD]);
-    lab.jj_work(["new"]);
-    let commit = commit_of(&lab, "@-");
-    let (entries, refs) = (ledger_entries(&home), bookmarks(&lab));
-
-    // When: it is recorded as the series' third release.
-    let refused = record_in_series(&lab, &home, THIRD, commit.as_str());
-
-    // Then: it is refused, naming NEXT, the newest release the ledger
-    // records, and both members of NEXT's newest write, which the commit
-    // does not carry; nothing is written.
-    let out = text(&refused);
-    assert_eq!(refused.status.code(), Some(3), "{out}");
-    assert!(
-        out.contains(&format!(
-            "demo: refusing to record {THIRD} at {}: it does not carry 2 member(s) of {NEXT}, \
-             the newest release that the ledger records in the series:\n",
-            commit.short()
-        )),
-        "{out}"
-    );
-    for branch in ["m6", "m5"] {
-        assert!(
-            out.contains(&format!(
-                "    {branch}@{}\n",
-                commit_at(&lab, branch).short()
-            )),
-            "{out}"
-        );
-    }
-    assert_eq!(ledger_entries(&home), entries, "{out}");
-    assert_eq!(bookmarks(&lab), refs, "{out}");
-
-    // When: it is recorded again, the drop stated.
-    let allowed = knives_release(
-        &lab,
-        &home,
-        &[
-            "--series",
-            "old",
-            "cut",
-            THIRD,
-            "--at",
-            commit.as_str(),
-            "--allow-drop",
-        ],
-    );
-
-    // Then: it is recorded, and its event states the drop as a cut's does.
-    let out = text(&allowed);
-    assert_eq!(allowed.status.code(), Some(0), "{out}");
-    assert!(out.contains(&recorded_line(THIRD, &commit)), "{out}");
-    let event = newest_event(&home, THIRD);
-    assert_eq!(
-        event.evidence.first().map(String::as_str),
-        Some(commit.as_str()),
-        "{event:?}"
-    );
-    assert!(
-        event.text.contains(&format!(
-            "; {NEXT}'s newest recorded write (an edit) holds 2 member(s); dropped: m6@{}, m5@{}",
-            commit_at(&lab, "m6").short(),
-            commit_at(&lab, "m5").short()
-        )),
-        "{event:?}"
-    );
-}
-
-/// Series `old`'s fourth release, recorded after [`THIRD`].
-const FOURTH: &str = "release/old/2026-08-07";
 
 /// A `record: published` note on release `name`, naming its commit, as the
-/// release owner writes one: a stacked cut starts on a published release.
+/// release owner writes one.
 fn mark_published(lab: &Lab, home: &tempfile::TempDir, name: &str) {
     let noted = lab::knives(
         lab,
@@ -1391,201 +1142,6 @@ fn mark_published(lab: &Lab, home: &tempfile::TempDir, name: &str) {
         ],
     );
     assert!(noted.status.success(), "{}", text(&noted));
-}
-
-/// [`previous_release_lab`] with the stacked key and its members, then a
-/// knives cut of [`NEXT`] on [`PREVIOUS`] with `m6` and `m5` included, each
-/// step exiting 0; and the commit of `PREVIOUS`, whose refs the reap after
-/// that cut forgets.
-fn next_with_members_lab() -> (Lab, tempfile::TempDir, CommitId) {
-    let (lab, home) = previous_release_lab(true);
-    members_on_previous(&lab);
-    let previous = commit_at(&lab, PREVIOUS);
-    let steps: [&[&str]; 3] = [&["cut", NEXT], &["include", "m6"], &["include", "m5"]];
-    for args in steps {
-        let mut series = vec!["--series", "old"];
-        series.extend_from_slice(args);
-        let ran = knives_release(&lab, &home, &series);
-        assert_eq!(ran.status.code(), Some(0), "{args:?}: {}", text(&ran));
-    }
-    (lab, home, previous)
-}
-
-/// A commit merged by hand of `previous` and `m4` alone, which no ref names:
-/// built on [`PREVIOUS`], so below every later release of the series.
-fn merged_on_previous(lab: &Lab, previous: &CommitId) -> CommitId {
-    lab.jj_work(["new", "-r", previous.as_str(), "-r", "m4", "-m", FOURTH]);
-    lab.jj_work(["new"]);
-    commit_of(lab, "@-")
-}
-
-/// The refusal of a record of [`FOURTH`] at `commit` that is not built on
-/// `write`, the newest write of [`THIRD`], a cut.
-fn not_built_on_third(commit: &CommitId, write: &CommitId) -> String {
-    format!(
-        "demo: refusing to record {FOURTH} at {}: it does not have {THIRD}'s newest recorded \
-         write (a cut) {} on its first-parent line, so it does not carry {THIRD}\n",
-        commit.short(),
-        write.short()
-    )
-}
-
-/// [`recorded_chain_lab`], then `m6` reworded in place, so jj rebases the
-/// chain and [`NEXT`]'s bookmark onto it: NEXT holds a rewrite of its
-/// recorded write, which knives reads as that write. Returns NEXT's
-/// rewritten commit.
-fn rewritten_chain_lab() -> (Lab, tempfile::TempDir, CommitId) {
-    let (lab, home) = recorded_chain_lab();
-    let recorded = commit_at(&lab, NEXT);
-    lab.jj_work(["describe", "m6", "-m", "m6, reworded"]);
-    let rewritten = commit_at(&lab, NEXT);
-    assert_ne!(rewritten, recorded, "jj rebased NEXT over the rewritten m6");
-    (lab, home, rewritten)
-}
-
-#[test]
-fn a_stacked_cut_on_a_release_jj_rewrote_in_place_goes_ahead() {
-    // Given: NEXT recorded as a chain, then rebased by jj over `m6`
-    // reworded in place, and published by a note.
-    let (lab, home, rewritten) = rewritten_chain_lab();
-    mark_published(&lab, &home, NEXT);
-
-    // When: the next release is cut.
-    let cut = knives_release(&lab, &home, &["--series", "old", "cut", THIRD]);
-
-    // Then: it goes ahead on the rewritten NEXT: a rewrite of the newest
-    // recorded write stands for that write on the start's first-parent
-    // line.
-    let out = text(&cut);
-    assert_eq!(cut.status.code(), Some(0), "{out}");
-    assert_eq!(release_parents(&lab, THIRD), vec![rewritten], "{out}");
-}
-
-#[test]
-fn a_record_built_on_a_release_jj_rewrote_in_place_is_recorded() {
-    // Given: NEXT recorded as a chain, then rebased by jj over `m6`
-    // reworded in place, and a start commit made by hand on the rewritten
-    // NEXT.
-    let (lab, home, rewritten) = rewritten_chain_lab();
-    lab.jj_work(["new", "-r", rewritten.as_str(), "-m", THIRD]);
-    lab.jj_work(["new"]);
-    let start = commit_of(&lab, "@-");
-
-    // When: it is recorded as the series' third release.
-    let recorded = record_in_series(&lab, &home, THIRD, start.as_str());
-
-    // Then: it is recorded: the rewritten NEXT, on its first-parent line,
-    // stands for NEXT's recorded write.
-    let out = text(&recorded);
-    assert_eq!(recorded.status.code(), Some(0), "{out}");
-    assert!(out.contains(&recorded_line(THIRD, &start)), "{out}");
-}
-
-#[test]
-fn a_record_built_below_a_stacked_start_of_the_newest_release_is_refused_naming_its_write() {
-    // Given: a stacked series whose published first cut is PREVIOUS; a
-    // knives cut of NEXT on it, with `m6` and `m5` included and marked
-    // published; a knives cut of THIRD on NEXT, a stacked start whose event
-    // records NEXT under its label and no member; and a commit merged by
-    // hand of PREVIOUS and `m4` alone.
-    let (lab, home, previous) = next_with_members_lab();
-    mark_published(&lab, &home, NEXT);
-    let cut = knives_release(&lab, &home, &["--series", "old", "cut", THIRD]);
-    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
-    let start = commit_at(&lab, THIRD);
-    let commit = merged_on_previous(&lab, &previous);
-    let (entries, refs) = (ledger_entries(&home), bookmarks(&lab));
-
-    // When: it is recorded as the series' fourth release.
-    let refused = record_in_series(&lab, &home, FOURTH, commit.as_str());
-
-    // Then: it is refused, naming THIRD's newest recorded write, a cut, its
-    // commit and THIRD, and saying to build the commit on that write;
-    // nothing is written. Its members alone hold none of NEXT's, which THIRD
-    // carries through NEXT.
-    let out = text(&refused);
-    assert_eq!(refused.status.code(), Some(3), "{out}");
-    assert!(out.contains(&not_built_on_third(&commit, &start)), "{out}");
-    assert!(
-        out.contains(&format!(
-            "  nothing was recorded; build the commit on {} and record that one, or re-run with \
-             --allow-drop to state the drop is intended\n",
-            start.short()
-        )),
-        "{out}"
-    );
-    assert_eq!(ledger_entries(&home), entries, "{out}");
-    assert_eq!(bookmarks(&lab), refs, "{out}");
-
-    // When: it is recorded again, the drop stated.
-    let allowed = knives_release(
-        &lab,
-        &home,
-        &[
-            "--series",
-            "old",
-            "cut",
-            FOURTH,
-            "--at",
-            commit.as_str(),
-            "--allow-drop",
-        ],
-    );
-
-    // Then: it is recorded, and both its line and its event name THIRD's
-    // newest recorded write, its release and its commit.
-    let out = text(&allowed);
-    assert_eq!(allowed.status.code(), Some(0), "{out}");
-    assert!(
-        out.contains(&format!(
-            "demo: --allow-drop: recording {FOURTH} at {} without {THIRD}'s newest recorded write \
-             (a cut) {} on its first-parent line\n",
-            commit.short(),
-            start.short()
-        )),
-        "{out}"
-    );
-    let event = newest_event(&home, FOURTH);
-    assert_eq!(
-        event.evidence.first().map(String::as_str),
-        Some(commit.as_str()),
-        "{event:?}"
-    );
-    assert!(
-        event.text.contains(&format!(
-            "; {THIRD}'s newest recorded write (a cut) holds 0 member(s); all carried; not built \
-             on {THIRD}'s newest recorded write (a cut) {}",
-            start.short()
-        )),
-        "{event:?}"
-    );
-}
-
-#[test]
-fn a_record_built_below_a_recorded_start_of_the_newest_release_is_refused_naming_its_write() {
-    // Given: the same series with NEXT cut by knives and `m6` and `m5`
-    // included; THIRD recorded with `cut --at` at a start commit made by
-    // hand on NEXT, a release with no member; and a commit merged by hand of
-    // PREVIOUS and `m4` alone.
-    let (lab, home, previous) = next_with_members_lab();
-    lab.jj_work(["new", "-r", NEXT, "-m", THIRD]);
-    lab.jj_work(["new"]);
-    let start = commit_of(&lab, "@-");
-    let recorded = record_in_series(&lab, &home, THIRD, start.as_str());
-    assert_eq!(recorded.status.code(), Some(0), "{}", text(&recorded));
-    let commit = merged_on_previous(&lab, &previous);
-    let (entries, refs) = (ledger_entries(&home), bookmarks(&lab));
-
-    // When: it is recorded as the series' fourth release.
-    let refused = record_in_series(&lab, &home, FOURTH, commit.as_str());
-
-    // Then: it is refused, naming THIRD's recorded start, a cut, its commit
-    // and THIRD; nothing is written.
-    let out = text(&refused);
-    assert_eq!(refused.status.code(), Some(3), "{out}");
-    assert!(out.contains(&not_built_on_third(&commit, &start)), "{out}");
-    assert_eq!(ledger_entries(&home), entries, "{out}");
-    assert_eq!(bookmarks(&lab), refs, "{out}");
 }
 
 #[test]
@@ -1660,90 +1216,6 @@ fn a_record_that_lacks_a_member_only_the_previous_cut_recorded_names_that_cut() 
 }
 
 #[test]
-fn a_stacked_cut_after_a_drop_from_a_recorded_chain_names_include_for_that_member() {
-    // Given: NEXT recorded as the chain of `m6`, `m5` and `m4` on PREVIOUS;
-    // `m4` dropped from it, an edit; and NEXT published by a note.
-    let (lab, home) = recorded_chain_lab();
-    let dropped = knives_release(
-        &lab,
-        &home,
-        &["--series", "old", "drop", "m4", "--why", "not this time"],
-    );
-    assert_eq!(dropped.status.code(), Some(0), "{}", text(&dropped));
-    mark_published(&lab, &home, NEXT);
-    let entries = ledger_entries(&home);
-
-    // When: the next release is cut on NEXT.
-    let cut = knives_release(&lab, &home, &["--series", "old", "cut", THIRD]);
-
-    // Then: it is refused, naming `m4` with the previous cut, NEXT's record,
-    // and `include` as its remedy. NEXT's newest write is the commit the cut
-    // starts on, so no other remedy is given; nothing is written.
-    let out = text(&cut);
-    assert_eq!(cut.status.code(), Some(3), "{out}");
-    assert!(
-        out.contains(&format!(
-            "demo: refusing to cut: the previous cut {NEXT} recorded 1 member(s) this cut does \
-             not carry:\n    m4@{}\n  the candidate was discarded; `knives release include \
-             <branch>` restores a member the previous cut recorded, or re-run with --allow-drop \
-             to state the drop is intended\n",
-            commit_at(&lab, "m4").short()
-        )),
-        "{out}"
-    );
-    assert!(!out.contains("first-parent line"), "{out}");
-    assert_eq!(ledger_entries(&home), entries, "{out}");
-}
-
-#[test]
-fn a_stacked_cut_below_a_recorded_chain_names_its_members_and_its_write() {
-    // Given: NEXT recorded as the chain of `m6`, `m5` and `m4` on PREVIOUS,
-    // whose record is both the series' previous cut and its newest write;
-    // and NEXT's bookmark forgotten here, so PREVIOUS is this machine's
-    // newest release.
-    let (lab, home) = recorded_chain_lab();
-    let next = commit_at(&lab, NEXT);
-    lab.jj_work(["bookmark", "forget", NEXT]);
-    let entries = ledger_entries(&home);
-
-    // When: the next release is cut, on PREVIOUS.
-    let cut = knives_release(&lab, &home, &["--series", "old", "cut", THIRD]);
-
-    // Then: it is refused, naming the three members with the previous cut,
-    // NEXT's record off the start's first-parent line, and the remedies of
-    // both; nothing is written.
-    let out = text(&cut);
-    assert_eq!(cut.status.code(), Some(3), "{out}");
-    assert!(
-        out.contains(&format!(
-            "demo: refusing to cut: the previous cut {NEXT} recorded 3 member(s) this cut does \
-             not carry:\n"
-        )),
-        "{out}"
-    );
-    assert!(
-        out.contains(&format!(
-            "demo: refusing to cut: this cut does not have {NEXT}'s newest recorded write (a \
-             cut) {} on its first-parent line, so it does not carry {NEXT}\n",
-            next.short()
-        )),
-        "{out}"
-    );
-    assert!(
-        out.contains(&format!(
-            "  the candidate was discarded; fetch, then move {NEXT} to {}, its newest recorded \
-             write: `jj bookmark set {NEXT} -r {} --allow-backwards`; `knives release include \
-             <branch>` restores a member the previous cut recorded, or re-run with --allow-drop \
-             to state the drop is intended\n",
-            next.short(),
-            next.short()
-        )),
-        "{out}"
-    );
-    assert_eq!(ledger_entries(&home), entries, "{out}");
-}
-
-#[test]
 fn a_record_that_lacks_a_member_both_records_hold_names_it_with_the_newest_write() {
     // Given: RELEASE recorded at a hand merge of `feat/alpha` and
     // `feat/beta`, whose record is both the previous cut and the newest
@@ -1802,122 +1274,6 @@ fn a_record_that_lacks_a_member_both_records_hold_names_it_with_the_newest_write
         )),
         "{event:?}"
     );
-}
-
-#[test]
-fn a_stacked_record_that_lacks_a_member_dropped_from_a_recorded_chain_names_the_previous_cut() {
-    // Given: NEXT recorded as the chain of `m6`, `m5` and `m4` on PREVIOUS;
-    // `m4` dropped from it, an edit; and a start commit made by hand on
-    // NEXT.
-    let (lab, home) = recorded_chain_lab();
-    let dropped = knives_release(
-        &lab,
-        &home,
-        &["--series", "old", "drop", "m4", "--why", "not this time"],
-    );
-    assert_eq!(dropped.status.code(), Some(0), "{}", text(&dropped));
-    lab.jj_work(["new", "-r", NEXT, "-m", THIRD]);
-    lab.jj_work(["new"]);
-    let start = commit_of(&lab, "@-");
-    let m4 = commit_at(&lab, "m4");
-    let entries = ledger_entries(&home);
-
-    // When: it is recorded as the series' third release.
-    let refused = record_in_series(&lab, &home, THIRD, start.as_str());
-
-    // Then: it is refused, naming `m4` with the previous cut, NEXT's
-    // record; NEXT's newest write is the start's parent, so nothing else is
-    // named, and nothing is written.
-    let out = text(&refused);
-    assert_eq!(refused.status.code(), Some(3), "{out}");
-    assert!(
-        out.contains(&format!(
-            "demo: refusing to record {THIRD} at {}: it does not carry 1 member(s) the previous \
-             cut {NEXT} recorded:\n    m4@{}\n  nothing was recorded; record a commit that \
-             carries each of them, or re-run with --allow-drop to state the drop is intended\n",
-            start.short(),
-            m4.short()
-        )),
-        "{out}"
-    );
-    assert!(!out.contains("first-parent line"), "{out}");
-    assert_eq!(ledger_entries(&home), entries, "{out}");
-
-    // When: it is recorded again, the drop stated.
-    let allowed = knives_release(
-        &lab,
-        &home,
-        &[
-            "--series",
-            "old",
-            "cut",
-            THIRD,
-            "--at",
-            start.as_str(),
-            "--allow-drop",
-        ],
-    );
-
-    // Then: its event names NEXT's newest write, the drop, first, then the
-    // member that only the previous cut held.
-    assert_eq!(allowed.status.code(), Some(0), "{}", text(&allowed));
-    let event = newest_event(&home, THIRD);
-    assert!(
-        event.text.contains(&format!(
-            "; {NEXT}'s newest recorded write (an edit) holds 2 member(s); dropped from previous \
-             cut {NEXT}: m4@{}",
-            m4.short()
-        )),
-        "{event:?}"
-    );
-}
-
-#[test]
-fn a_stacked_record_below_a_recorded_chain_names_its_members_and_its_write() {
-    // Given: NEXT recorded as the chain of `m6`, `m5` and `m4` on PREVIOUS,
-    // whose record is both the previous cut and the newest write; and a
-    // commit merged by hand of PREVIOUS and `m3`, a new branch on it.
-    let (lab, home) = recorded_chain_lab();
-    let next = commit_at(&lab, NEXT);
-    branch_on(&lab, PREVIOUS, "m3", ("m3.txt", "m3\n"));
-    lab.jj_work(["new", "-r", PREVIOUS, "-r", "m3", "-m", THIRD]);
-    lab.jj_work(["new"]);
-    let commit = commit_of(&lab, "@-");
-    let entries = ledger_entries(&home);
-
-    // When: it is recorded as the series' third release.
-    let refused = record_in_series(&lab, &home, THIRD, commit.as_str());
-
-    // Then: it is refused, naming NEXT's three members, NEXT's record off
-    // its first-parent line, and a commit built on that record that carries
-    // them as the remedy; nothing is written.
-    let out = text(&refused);
-    assert_eq!(refused.status.code(), Some(3), "{out}");
-    let at = commit.short();
-    assert!(
-        out.contains(&format!(
-            "demo: refusing to record {THIRD} at {at}: it does not carry 3 member(s) of {NEXT}, \
-             the newest release that the ledger records in the series:\n"
-        )),
-        "{out}"
-    );
-    assert!(
-        out.contains(&format!(
-            "demo: refusing to record {THIRD} at {at}: it does not have {NEXT}'s newest recorded \
-             write (a cut) {} on its first-parent line, so it does not carry {NEXT}\n",
-            next.short()
-        )),
-        "{out}"
-    );
-    assert!(
-        out.contains(&format!(
-            "  nothing was recorded; record a commit built on {} that carries each of them, or \
-             re-run with --allow-drop to state the drop is intended\n",
-            next.short()
-        )),
-        "{out}"
-    );
-    assert_eq!(ledger_entries(&home), entries, "{out}");
 }
 
 /// The forge repository the lab fork's upstream is reached by in the

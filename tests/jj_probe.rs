@@ -254,85 +254,22 @@ fn probe_landed_cleans_only_its_temporary_commits() {
 
 #[test]
 fn probes_write_nothing_to_the_shared_op_log() {
-    // Given: an open branch and upstream drift, so both probes do real replay
+    // Given: an open branch and upstream drift, so the probe does real replay
     // work. A probe answers a read-only question; in a repo shared by several
     // agents every operation it writes is a reconciliation point and op-log
     // noise (the shape that derailed the 2026-08-08 cut diagnosis).
     let lab = lab::Lab::new();
     lab.branch("feature", "feature.txt", "original\n");
     lab.advance_upstream("advance\n");
-    let trunk = lab.revision(&lab.work, "main@upstream", "commit_id");
-    let tip = lab.revision(&lab.work, "feature", "commit_id");
     let operations_before = operation_ids(&lab.work);
 
-    // When: the landed and net-diff probes both run.
+    // When: the landed probe runs.
     let landed = probe_landed(&lab.work, &BranchName::new("feature"), "main@upstream")
         .expect("probe landed");
-    let net = knives::jj::probe_net_diff(&lab.work, &trunk, &tip, &trunk).expect("probe net diff");
 
-    // Then: real answers, and the op log gained nothing at all.
+    // Then: a real answer, and the op log gained nothing at all.
     assert_eq!(landed, RebaseOutcome::CleanNonEmpty);
-    assert_eq!(net, RebaseOutcome::CleanNonEmpty);
     assert_eq!(operation_ids(&lab.work), operations_before);
-}
-
-#[test]
-fn the_net_probe_cleans_up_its_bookmark_and_commits() {
-    // Given: a multi-commit member range, which requires a bookmark-tracked synthetic probe.
-    let lab = lab::Lab::new();
-    lab.branch("feat/alpha", "alpha.txt", "first\n");
-    lab.jj_work(["new", "feat/alpha", "-m", "alpha follow-up"]);
-    std::fs::write(lab.work.join("alpha.txt"), "first\nsecond\n").expect("extend alpha");
-    lab.jj_work(["bookmark", "set", "feat/alpha", "-r", "@"]);
-    lab.jj_work(["new"]);
-    let before_commits = lab.revision(&lab.work, "all()", "commit_id ++ \"\\n\"");
-    let before_bookmarks = Command::new("jj")
-        .args([
-            "--repository",
-            lab.work.to_str().expect("utf-8 repository path"),
-            "--ignore-working-copy",
-            "bookmark",
-            "list",
-            "--all-remotes",
-        ])
-        .output()
-        .expect("list bookmarks before probe");
-    assert!(
-        before_bookmarks.status.success(),
-        "bookmark list failed: {}",
-        String::from_utf8_lossy(&before_bookmarks.stderr)
-    );
-
-    // When: the net probe creates, rewrites, and cleans up its synthetic commit.
-    knives::jj::probe_net_diff(&lab.work, "main@origin", "feat/alpha", "main@origin")
-        .expect("probe net diff");
-
-    // Then: both globally visible commits and bookmarks exactly match their prior state.
-    let after_commits = lab.revision(&lab.work, "all()", "commit_id ++ \"\\n\"");
-    let after_bookmarks = Command::new("jj")
-        .args([
-            "--repository",
-            lab.work.to_str().expect("utf-8 repository path"),
-            "--ignore-working-copy",
-            "bookmark",
-            "list",
-            "--all-remotes",
-        ])
-        .output()
-        .expect("list bookmarks after probe");
-    assert!(
-        after_bookmarks.status.success(),
-        "bookmark list failed: {}",
-        String::from_utf8_lossy(&after_bookmarks.stderr)
-    );
-    assert_eq!(
-        before_commits, after_commits,
-        "the net probe left commits behind"
-    );
-    assert_eq!(
-        before_bookmarks.stdout, after_bookmarks.stdout,
-        "the net probe left bookmarks behind"
-    );
 }
 
 #[test]
