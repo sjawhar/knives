@@ -690,6 +690,45 @@ kept over the member's, a line put back, a file deleted and written anew, moved 
 mode, link or submodule changed both ways. A mode the member set that the release lacks is
 missing.
 
+The cut's content audit (`release::audit_cut`, run by `cut`, `cut --at` and `members --verify`)
+reads the members' stacks (`Repo::stack_among`): for each member, the heads of the other members
+that are its ancestors, which it is stacked on, and the heads of those that descend from it, the
+ends of the stacks built on it. A member with neither replays its net change from the cut's base as
+it always did. A stacked member replays its own change, its tree against the one head it stacks on,
+the automatic merge of several, or the cut's base when it stacks on none
+(`Repo::stacked_member_outcome`). When that does not replay empty and members are stacked on it, the
+change is read again with each file it touches, and only those, as the automatic merge of the ends
+of its stacks holds them: its lines as the members built on it left them. Either reading empty
+carries it; otherwise the first reading's outcome stands, refused as missing or diverging unless
+the cut itself is conflicted. So a member is never charged with what the members below it wrote,
+nor with a rewrite of its lines by a member above it; a change of a member above at a file it did
+not touch is that member's alone. Only the listed members are read: a branch stacked on a member
+that the cut does not take is no stack end and excuses nothing.
+
+The composition gate (`release::uncarried_recorded_members`) reads each member the baseline records
+that is no parent of the subject. One that a parent reaches is carried; when a local branch still
+names its commit, that branch is one the record holds and the subject leaves out, and the parent is
+stacked on it (`CompositionCheck::missing_parents`). The cut or record is refused (exit `3`) naming
+both, whatever `--allow-drop` says: the branch's commits would ride in through the member,
+unreviewed as a member. A member that its own branch advanced past has no branch at its commit, and
+a branch landed into a member's line was never in the record, so neither is a missing parent.
+
+Before the audit, `cut` and `cut --at` read each member's base as `--carries` reads it
+(`carriage::MemberBase`, `release_cut::refuse_unbased_stacked_members`). A member built on a
+branch (the nearest maintained branch tip on its first-parent line) whose tip one of the cut's
+carriers reaches, its base, the previous release a stacked cut builds on, or a parent that is
+neither the member nor built on it (`release_cut::built_on_a_carried_branch`), is not read: the
+audit holds it to its own change. A member built on a branch the cut does not carry that records
+no base or several, one whose base took it with no merge (`Repo::member_fork_point` gives none),
+and one whose own change starts at a commit neither the trunk nor another member reaches each
+refuse the cut (exit `3`, whatever `--allow-drop` says), named with the record to write or the
+base left out. A member seen stacked on nothing and recording nothing starts from the trunk and is
+not read, so a flat cut is held as before.
+
+`knives release members --verify` reads a release whose commit has one parent, a hand edit on top
+of its cut, through the parents of the nearest merge on its first-parent line that the trunk does
+not reach (`release::composing_parents`), so the edit cannot hide a member whose change it dropped.
+
 `knives release members --census` turns that same check into a census. Its primary matrix contains
 every maintained branch against the live releases and upstream trunk. Superseded releases are
 checked only when that matrix is complete and every answered verdict is not-carried; an unanswered

@@ -4598,3 +4598,83 @@ fn status_judges_every_requirement_kind_for_every_holder_as_the_table_says() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+/// [`fixture`] with `feat/top` built on `feat/base`, whose review pull
+/// request is acme/demo#13, and a release made by hand of `feat/top` and
+/// `feat/alpha` that rewrites the line `feat/base` wrote: from the trunk,
+/// `feat/top`'s change conflicts with the release; from `feat/base`, it is
+/// `top.txt` alone, which the release holds.
+fn fixture_with_a_member_on_a_review_pull_request() -> Fixture {
+    let fixture = fixture();
+    let lab = &fixture.lab;
+    lab.jj_work(["new", "-r", "feat/base", "-m", "feat/top"]);
+    std::fs::write(lab.work.join("top.txt"), "top\n").expect("write feat/top");
+    lab.jj_work(["bookmark", "create", "feat/top", "-r", "@"]);
+    lab.jj_work(["new", "-r", "feat/top", "-r", "feat/alpha", "-m", "release"]);
+    std::fs::write(
+        lab.work.join("base.txt"),
+        "base, as the release rewrote it\n",
+    )
+    .expect("rewrite feat/base's line in the release");
+    lab.jj_work(["bookmark", "create", "release/2026-08-04", "-r", "@"]);
+    lab.jj_work(["new"]);
+    fixture
+}
+
+impl Fixture {
+    /// `knives --text release members release/2026-08-04 --carries <branch>`.
+    fn carries(&self, branch: &str) -> Output {
+        self.knives(&[
+            "--text",
+            "release",
+            "members",
+            "release/2026-08-04",
+            "--carries",
+            branch,
+        ])
+    }
+}
+
+#[test]
+fn carries_reads_a_member_from_the_head_of_the_review_pull_request_it_records() {
+    // Given: `feat/top` records that it needs acme/demo#13, the review pull
+    // request whose head the forge reports as `feat/base`'s tip.
+    let fixture = fixture_with_a_member_on_a_review_pull_request();
+    let recorded = fixture.depends_of("feat/top", &["--on", "acme/demo#13"]);
+    assert_eq!(
+        recorded.trim_end(),
+        "demo/feat/top now requires origin:acme/demo#13"
+    );
+
+    // When: carries asks the release about `feat/top`.
+    let output = fixture.carries("feat/top");
+
+    // Then: its own change starts at #13's head, and the release holds it.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{}", said(&output));
+    assert!(stdout.contains("carried-exact "), "{stdout}");
+
+    // And: when the forge reports #13's head somewhere the member was not
+    // built, the record is not borne out, and the reading from the trunk,
+    // which conflicts, is not answered.
+    let elsewhere = lab::commit_at(&fixture.lab, "main@origin");
+    fixture.move_head(13, elsewhere.as_str());
+    let moved = fixture.carries("feat/top");
+    assert_eq!(moved.status.code(), Some(3), "{}", said(&moved));
+    assert!(
+        String::from_utf8_lossy(&moved.stdout).contains("records origin:acme/demo#13"),
+        "{}",
+        said(&moved)
+    );
+
+    // And: with the forge down, #13's head cannot be read, and it is not
+    // answered either.
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+    let down = fixture.carries("feat/top");
+    assert_eq!(down.status.code(), Some(3), "{}", said(&down));
+    assert!(
+        String::from_utf8_lossy(&down.stdout).contains("whose head the forge did not report"),
+        "{}",
+        said(&down)
+    );
+}

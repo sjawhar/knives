@@ -29,7 +29,7 @@ use forge_shim::{install_failing_gh, path_with_gh_shim, pull_record};
 use knives::jj::Repo;
 use lab::{
     Lab, ReleaseOutput, commit_at, extend_branch, home_after_first_cut, knives_release,
-    release_command, release_parents, release_test_home,
+    release_command, release_parents, release_test_home, stack_branch,
 };
 use release_forge::{ReleaseWithSnapshotForgeInput, release_with_snapshot_forge};
 use std::process::Command;
@@ -334,15 +334,6 @@ fn census_answers_not_carried_for_a_parent_whose_change_the_release_dropped() {
         alpha.contains("carried-exact      release/2026-08-04"),
         "{alpha}"
     );
-}
-
-/// A branch `name` with one commit on `base` that writes `content` to
-/// `file`, its bookmark on that commit: a pull request into `base`'s branch.
-fn stack_branch(lab: &Lab, (name, base): (&str, &str), (file, content): (&str, &str)) {
-    lab.jj_work(["new", "-r", base, "-m", name]);
-    std::fs::write(lab.work.join(file), content).expect("write the stacked branch");
-    lab.jj_work(["bookmark", "create", name, "-r", "@"]);
-    lab.jj_work(["new"]);
 }
 
 /// `knives depends <branch> --on <on>` in `lab`'s work checkout with the
@@ -1370,6 +1361,17 @@ fn release_carries_answers_not_carried_for_members_a_resolution_discarded_under_
     // member's line, whatever commit last edited the text in its place.
     assert_carried_in(&lab, &home, "feat/alpha", false);
     assert_carried_in(&lab, &home, "feat/beta", false);
+
+    // And: `members --verify` names both as missing from the release, as it
+    // does before the later commit: the edit on top of the cut does not
+    // hide what the cut's resolution dropped.
+    let verify = knives_release(&lab, &home, &["members", "--verify"]);
+    let out = String::from_utf8_lossy(&verify.stdout);
+    assert_eq!(verify.status.code(), Some(1), "{out}");
+    assert!(
+        out.contains("feat/alpha") && out.contains("feat/beta"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -2084,6 +2086,34 @@ fn census_block<'a>(stdout: &'a str, branch: &str) -> &'a str {
         .split("\n\n")
         .find(|block| block.starts_with(&wanted))
         .unwrap_or_else(|| panic!("no census block for {branch}: {stdout}"))
+}
+
+#[test]
+fn census_answers_every_row_when_one_members_base_cannot_be_read() {
+    // Given: `feat/alpha`, cut into the release, and `feat/beta`, two
+    // commits, whose first commit's object is then removed from the store,
+    // so the line `feat/beta` was built on cannot be read.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    extend_branch(&lab, "feat/beta", "beta-more.txt", "more\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let first = lab.revision(lab.work_path(), "feat/beta-", "commit_id");
+    let git_dir = lab.jj_work_output(["git", "root"]);
+    let (prefix, rest) = first.trim().split_at(2);
+    let object = std::path::Path::new(git_dir.trim())
+        .join("objects")
+        .join(prefix)
+        .join(rest);
+    std::fs::remove_file(&object).expect("remove the loose object of feat/beta's first commit");
+
+    // When: the census checks every maintained branch.
+    let output = knives_release(&lab, &home, &["members", "--census", "--no-github"]);
+
+    // Then: it answers `feat/alpha`'s row; `feat/beta`'s trouble is its own.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let alpha = census_block(&stdout, "feat/alpha");
+    assert!(alpha.contains("carried-exact"), "{stdout}");
 }
 
 #[test]

@@ -212,12 +212,18 @@ pub fn census(
     let mut members = Vec::with_capacity(branches.len());
     for (branch, tip) in &branches {
         let recorded = (records.requirements)(branch.as_str());
+        // One member whose base cannot be read is that member's problem, not
+        // the census's: it is read from the trunk, and a conflict there is
+        // its row's problem.
         let base = MemberBase::read(
             &repo,
             (Some(branch.as_str()), tip),
             recorded.as_deref().map_err(String::as_str),
             &context,
-        )?;
+        )
+        .unwrap_or_else(|error| {
+            MemberBase::Unknown(format!("{branch}'s base could not be read: {error:#}"))
+        });
         members.push(CensusInput {
             in_open_pull: pull_requests_checked
                 .then(|| branch_pulls.get(branch).copied().unwrap_or(false)),

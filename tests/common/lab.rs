@@ -1210,6 +1210,15 @@ pub fn extend_branch(lab: &Lab, branch: &str, file: &str, content: &str) {
     lab.jj_work(["new"]);
 }
 
+/// A branch `name` with one commit on `base` that writes `content` to
+/// `file`, its bookmark on that commit: a pull request into `base`'s branch.
+pub fn stack_branch(lab: &Lab, (name, base): (&str, &str), (file, content): (&str, &str)) {
+    lab.jj_work(["new", "-r", base, "-m", name]);
+    std::fs::write(lab.work.join(file), content).expect("write the stacked branch");
+    lab.jj_work(["bookmark", "create", name, "-r", "@"]);
+    lab.jj_work(["new"]);
+}
+
 pub fn file_at_revision(lab: &Lab, revision: &str, file: &str) -> String {
     let output = Command::new("jj")
         .args([

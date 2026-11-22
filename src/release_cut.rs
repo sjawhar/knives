@@ -412,6 +412,15 @@ pub(crate) fn run_release(
                 }
             }
         }
+        let carriers = cut_carriers(&audit_base, None, &request.parents);
+        if let Some(exit) = refuse_unbased_stacked_members(
+            fork,
+            (bound, &ledger),
+            (&opened, &tips, &trunk),
+            (&members, &carriers),
+        )? {
+            return Ok(exit);
+        }
         // An audit error or failure simply DROPS the candidate: the merge
         // was never a published operation, so there is nothing to abandon
         // and no crash window that strands one. A file of a fix by hand that
@@ -958,6 +967,27 @@ fn recorded_composition_check(
             fixes: &gate.fixes,
         },
     )?;
+    // A member stacked on a branch the record holds and this cut leaves out
+    // would carry that branch's commits in unreviewed; no drop is stated by
+    // that, so `--allow-drop` does not apply. Each name is read from the
+    // repository or a peer's ledger, so each is escaped.
+    if !check.missing_parents.is_empty() {
+        for (member, parent) in &check.missing_parents {
+            println!(
+                "  !! {} is stacked on {}, which this release leaves out: its commits would \
+                 ride in through {}",
+                inline_human_text(member),
+                inline_human_text(&parent.name),
+                inline_human_text(member)
+            );
+        }
+        println!(
+            "{repo}: refusing the cut: include each branch named above again (`knives release \
+             include <branch>`), or leave out the members stacked on it too; `--allow-drop` \
+             does not apply"
+        );
+        return Ok(Err(Exit::Incomplete));
+    }
     let on_drop = match (allow_drop, &*subject) {
         (true, _) => DropDisposition::Allowed,
         (false, release::CutSubject::Candidate(_)) => DropDisposition::RefuseDiscardingCandidate,
@@ -2313,6 +2343,19 @@ fn record_hand_cut(
         .chain(&composed.bases)
         .cloned()
         .collect();
+    let carriers = cut_carriers(
+        &composed.base,
+        composed.previous.as_ref().map(|previous| &previous.commit),
+        &parents,
+    );
+    if let Some(exit) = refuse_unbased_stacked_members(
+        fork,
+        (bound, &ledger),
+        (opened, &tips, &trunk),
+        (&audited, &carriers),
+    )? {
+        return Ok(exit);
+    }
     let committed = CommittedCut {
         commit,
         members: &audited,
@@ -3079,6 +3122,195 @@ fn check_orphan_commits_before_cut(
     }))
 }
 
+/// Refuse a cut one of whose stacked members is built on a branch the cut
+/// does not carry and records no base the graph bears out, or whose recorded
+/// base the cut leaves out ([`knives::carriage::MemberBase`]): its own change
+/// cannot be told from its base's, or its base's commits would ride in
+/// through it unreviewed. A member built on a branch whose tip the cut's
+/// base or another of its `carriers` (its parents, and the previous release
+/// a stacked cut builds on) reaches, one that does not descend from the
+/// member, is not read here: the audit holds it to its own change
+/// ([`knives::jj::Repo::stacked_member_outcome`]). A member seen stacked on
+/// no maintained branch and recording no base starts from the trunk and is
+/// not read here either, so a flat cut is held as before. A base is an
+/// ancestor of the member's own change, so a branch whose tip descends from
+/// a commit the ledger recorded for the member ([`base_candidates`]: a
+/// review branch built on it and landed into its line) is never its base. A
+/// recorded base is carried when the trunk or another member reaches where
+/// the member's own change starts. `Some` is the refusal, already reported;
+/// `--allow-drop` does not apply.
+fn refuse_unbased_stacked_members(
+    fork: &Fork<'_>,
+    (bound, ledger): (Bound<'_>, &[knives::ledger::Entry]),
+    (opened, tips, trunk): (&knives::jj::Repo, &knives::detect::BookmarkTips, &CommitId),
+    (members, carriers): (&[(String, CommitId)], &[CommitId]),
+) -> anyhow::Result<Option<Exit>> {
+    use knives::carriage::{BaseContext, MemberBase};
+    let entry = fork.entry;
+    let branches: Vec<(BranchName, CommitId)> =
+        knives::release_model::carried_from_tips(tips, entry.trunk(), &entry.release_scheme())
+            .into_iter()
+            .map(|(branch, tip)| (BranchName::new(branch), tip))
+            .collect();
+    let store = knives::store::Store::open(
+        knives::store::default_state_path(),
+        &bound.registry.former_names(),
+        &[&fork.upstream],
+    )
+    .map_err(|error| error.to_string());
+    let forge = CliForge;
+    let pull_head = |repository: &str, number: u64| -> Result<String, String> {
+        let identity = knives::forge::RepoIdentity {
+            name_with_owner: repository.to_owned(),
+            id: String::new(),
+        };
+        let facts =
+            knives::forge::Forge::pull_facts(&forge, &fork.checkout.path, &identity, &[number])
+                .map_err(|error| error.to_string())?;
+        facts
+            .get(&number)
+            .map(|fact| fact.pull.head_ref_oid.clone())
+            .ok_or_else(|| format!("{repository} has no pull request #{number}"))
+    };
+    let own = knives::carriage::own_repository_spellings(fork);
+    let mut refusals = Vec::new();
+    for (name, tip) in members {
+        let candidates = base_candidates(opened, ledger, name, &branches)?;
+        if built_on_a_carried_branch(opened, (name, tip), (&candidates, carriers), trunk)? {
+            continue;
+        }
+        let context = BaseContext {
+            trunk,
+            own: &own,
+            branches: &candidates,
+            pull_head: &pull_head,
+        };
+        let recorded = store
+            .as_ref()
+            .map(|store| {
+                store.dependencies(&knives::ids::BranchTarget::new(
+                    fork.upstream.clone(),
+                    BranchName::new(name),
+                ))
+            })
+            .map_err(Clone::clone);
+        let base = MemberBase::read(
+            opened,
+            (Some(name), tip),
+            recorded.as_deref().map_err(String::as_str),
+            &context,
+        )?;
+        let (requirement, from) = match base {
+            MemberBase::Trunk => continue,
+            MemberBase::Unknown(reason) => {
+                refusals.push(reason);
+                continue;
+            }
+            MemberBase::Recorded { requirement, from } => (requirement, from),
+        };
+        let mut carried = opened.is_ancestor(&from, trunk)?;
+        for (other, other_tip) in members {
+            if carried {
+                break;
+            }
+            carried = other != name && opened.is_ancestor(&from, other_tip)?;
+        }
+        if !carried {
+            refusals.push(format!(
+                "{name} is stacked on {requirement}, which this release leaves out: its commits \
+                 would ride in through {name}"
+            ));
+        }
+    }
+    if refusals.is_empty() {
+        return Ok(None);
+    }
+    for refusal in &refusals {
+        println!("  !! {}", inline_human_text(refusal));
+    }
+    println!(
+        "{}: refusing the cut: record the base of each stacked member named above (`knives \
+         depends <member> --on <branch>`), and include that base or leave the member out too; \
+         `--allow-drop` does not apply",
+        fork.name
+    );
+    Ok(Some(Exit::Incomplete))
+}
+
+/// What a cut carries besides its members' own changes: its base, the
+/// previous release a stacked cut builds on, and its parents.
+fn cut_carriers(
+    base: &CommitId,
+    previous: Option<&CommitId>,
+    parents: &[CommitId],
+) -> Vec<CommitId> {
+    std::iter::once(base)
+        .chain(previous)
+        .chain(parents)
+        .cloned()
+        .collect()
+}
+
+/// Whether the member `name` at `tip` was built on a branch (the nearest of
+/// `candidates` on its first-parent line) whose tip one of the cut's
+/// `carriers` reaches, other than the member and those built on it: the
+/// audit holds such a member to its own change, with no record needed.
+fn built_on_a_carried_branch(
+    opened: &knives::jj::Repo,
+    (name, tip): (&str, &CommitId),
+    (candidates, carriers): (&[(BranchName, CommitId)], &[CommitId]),
+    trunk: &CommitId,
+) -> anyhow::Result<bool> {
+    let line = opened.first_parent_line(tip, trunk)?;
+    let built_on = line.iter().find_map(|commit| {
+        candidates
+            .iter()
+            .find(|(other, other_tip)| other_tip == commit && other.as_str() != name)
+    });
+    let Some((_, on_tip)) = built_on else {
+        return Ok(false);
+    };
+    for carrier in carriers {
+        if carrier != tip
+            && !opened.is_ancestor(tip, carrier)?
+            && opened.is_ancestor(on_tip, carrier)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The maintained `branches` that can be the base of the member branch
+/// `name`: each but those whose tip descends from a commit the ledger
+/// recorded for `name` as a release member (a parent of an event whose
+/// recorded bookmarks name it). Such a branch was built on the member, as a
+/// review branch is before it lands into the member's line.
+fn base_candidates(
+    opened: &knives::jj::Repo,
+    ledger: &[knives::ledger::Entry],
+    name: &str,
+    branches: &[(BranchName, CommitId)],
+) -> anyhow::Result<Vec<(BranchName, CommitId)>> {
+    let recorded: Vec<CommitId> = ledger
+        .iter()
+        .filter(|entry| entry.kind == knives::ledger::Kind::Event)
+        .flat_map(|entry| entry.parents.iter())
+        .filter(|parent| parent.branches.iter().any(|branch| branch == name))
+        .map(|parent| CommitId::new(parent.commit.as_str()))
+        .collect();
+    let mut candidates = Vec::with_capacity(branches.len());
+    'branches: for (branch, branch_tip) in branches {
+        for commit in &recorded {
+            if commit != branch_tip && opened.is_ancestor(commit, branch_tip)? {
+                continue 'branches;
+            }
+        }
+        candidates.push((branch.clone(), branch_tip.clone()));
+    }
+    Ok(candidates)
+}
+
 /// Refuse a first cut while any branch it would compose carries a merge past
 /// the trunk, naming each; `false` when every branch is linear.
 fn refuse_stacked_first_cut(
@@ -3525,6 +3757,7 @@ mod tests {
             absent_write: true,
             inconclusive_fixes: Vec::new(),
             dropped_fixes: Vec::new(),
+            missing_parents: Vec::new(),
         };
 
         let published = recorded_published_line(

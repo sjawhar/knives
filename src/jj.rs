@@ -843,6 +843,64 @@ impl Repo {
         Ok(outcome)
     }
 
+    /// Whether `onto` holds what a member stacked among a cut's other
+    /// members brings ([`stacked_outcome`]), `base` the cut's base for a
+    /// member that stacks on none, in a scratch transaction that is
+    /// dropped unwritten.
+    pub fn stacked_member_outcome(
+        &self,
+        base: &CommitId,
+        member: StackedMember<'_>,
+        onto: &CommitId,
+    ) -> Result<RebaseOutcome, JjError> {
+        let onto = self.commit(onto.as_str())?;
+        let mut tx = self.repo.start_transaction();
+        let outcome = stacked_outcome(self, &mut tx, (base, member), &onto);
+        // Dropped, never committed: the probe leaves no trace in the op log.
+        drop(tx);
+        outcome
+    }
+
+    /// Where `tip` stands among a cut's `members`: the heads of those that
+    /// are its ancestors, what it stacks on, and the heads of those that
+    /// descend from it, the ends of the stacks built on it
+    /// ([`StackedMember`]). A member at `tip` itself is neither.
+    pub fn stack_among(
+        &self,
+        tip: &CommitId,
+        members: &[CommitId],
+    ) -> Result<(Vec<CommitId>, Vec<CommitId>), JjError> {
+        let (mut below, mut above) = (Vec::new(), Vec::new());
+        for member in members {
+            if member == tip {
+                continue;
+            }
+            if self.is_ancestor(member, tip)? {
+                below.push(member.clone());
+            } else if self.is_ancestor(tip, member)? {
+                above.push(member.clone());
+            }
+        }
+        Ok((self.heads_of(&below)?, self.heads_of(&above)?))
+    }
+
+    /// Each of `commits` that is no ancestor of another of them, once.
+    fn heads_of(&self, commits: &[CommitId]) -> Result<Vec<CommitId>, JjError> {
+        let mut heads: Vec<CommitId> = Vec::new();
+        for commit in commits {
+            let mut under_another = false;
+            for other in commits {
+                if other != commit && self.is_ancestor(commit, other)? {
+                    under_another = true;
+                    break;
+                }
+            }
+            if !under_another && !heads.contains(commit) {
+                heads.push(commit.clone());
+            }
+        }
+        Ok(heads)
+    }
     /// Where `revision` forked from `trunk`: their one common ancestor, or the
     /// trunk itself when the histories criss-cross to several, as
     /// `uncarried_recorded_members` takes a member's base.
@@ -2211,6 +2269,106 @@ fn replayed_outcome(
     } else {
         RebaseOutcome::CleanNonEmpty
     })
+}
+
+/// A member of a cut, with the cut's other members it stacks on and the
+/// ones stacked on it, for [`Repo::stacked_member_outcome`].
+///
+/// A member that stacks on none and has none stacked on it replays as every
+/// member did before stacks were read ([`Repo::fork_point_replay_outcome`]).
+#[derive(Debug, Clone, Copy)]
+pub struct StackedMember<'a> {
+    /// The member's tip.
+    pub tip: &'a CommitId,
+    /// The heads of the cut's other members that are ancestors of the tip:
+    /// what the member is stacked on. Empty when it stacks on none.
+    pub below: &'a [CommitId],
+    /// The heads of the cut's other members that descend from the tip: the
+    /// ends of the stacks built on it. Empty when none is.
+    pub above: &'a [CommitId],
+}
+
+impl StackedMember<'_> {
+    /// Whether the member stacks on, or under, another member of the cut.
+    pub const fn is_stacked(&self) -> bool {
+        !self.below.is_empty() || !self.above.is_empty()
+    }
+}
+
+/// Whether `onto` holds what `member` brings to it, replayed in `tx`, which
+/// the caller drops unwritten.
+///
+/// The member's own change is its tree against what it stacks on: the one
+/// head in [`StackedMember::below`], the automatic merge of several, or
+/// `base`, the cut's base, when it stacks on no member. That change replays
+/// onto `onto` as a range's net change does ([`Repo::net_diff_outcome`]).
+/// When it does not replay empty and members are stacked on the member, the
+/// replay is read again with, at each file the member's own change touches
+/// and there alone, what the automatic merge of the stacks' ends
+/// ([`StackedMember::above`]) holds: the member's lines as the members
+/// built on it left them. Either replay reading empty is the member carried;
+/// otherwise the first replay's outcome stands. A member stacked on another
+/// is never charged with the change of the member below it, and a member
+/// whose lines a member above rewrote is not charged with the rewrite; a
+/// change of the member above at a file the member did not touch is that
+/// member's alone to answer for.
+fn stacked_outcome(
+    repo: &Repo,
+    tx: &mut Transaction,
+    (base, member): (&CommitId, StackedMember<'_>),
+    onto: &jj_lib::commit::Commit,
+) -> Result<RebaseOutcome, JjError> {
+    let tip = repo.commit(member.tip.as_str())?;
+    let below: Vec<jj_lib::commit::Commit> = member
+        .below
+        .iter()
+        .map(|commit| repo.commit(commit.as_str()))
+        .collect::<Result<_, _>>()?;
+    let base = match below.as_slice() {
+        [] => {
+            let base = repo.commit(base.as_str())?;
+            // `base..tip` is empty exactly when the base already reaches the tip.
+            if repo.backend_is_ancestor(tip.id(), base.id())? {
+                return Ok(RebaseOutcome::Empty);
+            }
+            base
+        }
+        [one] => one.clone(),
+        several => {
+            let ids = several.iter().map(|commit| commit.id().clone()).collect();
+            let merged = block_on(merge_commit_trees(tx.repo(), several))
+                .map_err(|error| store_error(&error))?;
+            block_on(tx.repo_mut().new_commit(ids, merged).write())
+                .map_err(|error| store_error(&error))?
+        }
+    };
+    let target = onto.tree();
+    let own = replayed_tree(&base.tree(), tip.tree(), &target)?;
+    let outcome = replayed_outcome(tx, (base.id(), own), onto.id())?;
+    if outcome == RebaseOutcome::Empty || member.above.is_empty() {
+        return Ok(outcome);
+    }
+    let above: Vec<jj_lib::commit::Commit> = member
+        .above
+        .iter()
+        .map(|commit| repo.commit(commit.as_str()))
+        .collect::<Result<_, _>>()?;
+    let built =
+        block_on(merge_commit_trees(tx.repo(), &above)).map_err(|error| store_error(&error))?;
+    let mut evolved = MergedTreeBuilder::new(base.tree());
+    for entry in collect_stream(base.tree().diff_stream(&tip.tree(), &EverythingMatcher)) {
+        entry.values.map_err(|error| store_error(&error))?;
+        let value = block_on(built.path_value(&entry.path)).map_err(|error| store_error(&error))?;
+        evolved.set_or_remove(entry.path, value);
+    }
+    let evolved = block_on(evolved.write_tree()).map_err(|error| store_error(&error))?;
+    let evolved = replayed_tree(&base.tree(), evolved, &target)?;
+    Ok(
+        match replayed_outcome(tx, (base.id(), evolved), onto.id())? {
+            RebaseOutcome::Empty => RebaseOutcome::Empty,
+            RebaseOutcome::Conflicted | RebaseOutcome::CleanNonEmpty => outcome,
+        },
+    )
 }
 
 /// The paths of the change `resolution` holds against `base`, the tree of
@@ -4279,6 +4437,17 @@ impl Candidate {
         }
         let tree = replayed_tree(&base.tree(), revision.tree(), &self.commit.tree())?;
         replayed_outcome(&mut self.tx, (base.id(), tree), self.commit.id())
+    }
+
+    /// [`Repo::stacked_member_outcome`] with the candidate as the target,
+    /// in the candidate's own scratch transaction.
+    pub fn stacked_member_outcome(
+        &mut self,
+        base: &CommitId,
+        member: StackedMember<'_>,
+    ) -> Result<RebaseOutcome, JjError> {
+        let onto = self.commit.clone();
+        stacked_outcome(&self.repo, &mut self.tx, (base, member), &onto)
     }
 
     /// The paths of the change `resolution` holds against `baseline`, the

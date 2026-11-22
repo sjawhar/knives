@@ -2493,10 +2493,14 @@ pub fn gather_members(
         remote: RemoteName::new(entry.publish_remote()),
     });
     let writes = EarlierWrites::read(opened, release.as_str(), ledger, published)?;
+    // A release whose commit is a hand edit on top of its cut names its
+    // members through that cut's parents, so the edit cannot hide from
+    // `--verify` a member whose change it dropped.
+    let composing = composing_parents(opened, parents, trunk.as_ref())?;
     let literal_rows = || {
         parent_rows(
             opened,
-            (release_parents(&tips, &parents), &writes),
+            (release_parents(&tips, &composing), &writes),
             (trunk.as_ref(), &successions),
         )
     };
@@ -2549,6 +2553,29 @@ pub fn gather_members(
         notes: Vec::new(),
         problems,
     })
+}
+
+/// The commits that name a release's members: its own `parents`, or, for a
+/// release whose commit has one parent (a hand edit on top of its cut), the
+/// parents of the nearest merge on its first-parent line that `trunk` does
+/// not reach. With no such merge, its own parents.
+fn composing_parents(
+    opened: &Repo,
+    parents: Vec<CommitId>,
+    trunk: Option<&CommitId>,
+) -> anyhow::Result<Vec<CommitId>> {
+    let mut below = parents.clone();
+    loop {
+        let [only] = below.as_slice() else {
+            return Ok(if below.len() > 1 { below } else { parents });
+        };
+        if let Some(trunk) = trunk
+            && opened.is_ancestor(only, trunk)?
+        {
+            return Ok(parents);
+        }
+        below = opened.parent_commits(only.as_str())?;
+    }
 }
 
 /// Render the gathered parent state and optional audit in the cut command's words.
@@ -3530,6 +3557,20 @@ impl CutSubject<'_> {
         }
     }
 
+    /// [`Self::replay_outcome`] for a member stacked among the cut's other
+    /// members ([`jj::Repo::stacked_member_outcome`]).
+    fn stacked_replay_outcome(
+        &mut self,
+        repo: &Repo,
+        base: &CommitId,
+        member: jj::StackedMember<'_>,
+    ) -> anyhow::Result<RebaseOutcome> {
+        match self {
+            Self::Candidate(candidate) => Ok(candidate.stacked_member_outcome(base, member)?),
+            Self::Committed(cut) => Ok(repo.stacked_member_outcome(base, member, cut)?),
+        }
+    }
+
     /// The paths of the change `resolution` holds against `baseline` that
     /// the subject does not carry, each judged on its own
     /// ([`jj::Repo::uncarried_resolution_paths`]).
@@ -3584,6 +3625,16 @@ impl CutSubject<'_> {
 /// member and fails the audit, unless `context.previous` diverged from the
 /// member exactly so: that is carried forward.
 ///
+/// A member stacked among the other members, as a pull request into another
+/// pull request's branch is, is held to its own change instead
+/// ([`jj::Repo::stacked_member_outcome`]): replayed from the heads of the
+/// members it stacks on, never from `trunk`, and, where members stacked on
+/// it rewrote its lines, read again with its files as the ends of those
+/// stacks left them. Only the members listed are read: a branch stacked on
+/// a member that the cut does not take is no member and excuses nothing. A
+/// member that stacks on no other member and has none stacked on it replays
+/// as above.
+///
 /// A release of a stacked series carries its previous release whole
 /// (`context.stacked_on`), and a member may stack on it. So each member
 /// replays from its fork point with the previous release, the merge base of
@@ -3615,17 +3666,26 @@ pub fn audit_cut(
 ) -> anyhow::Result<CutAudit> {
     let mut audit = CutAudit::default();
     let cut_is_conflicted = !subject.conflicted_files(repo)?.is_empty();
-    let stacked = context
-        .stacked_on
-        .map(|previous| Repo::open(repo).map(|opened| (opened, previous)))
-        .transpose()?;
+    let opened = Repo::open(repo)?;
+    let tips: Vec<CommitId> = members.iter().map(|(_, tip)| tip.clone()).collect();
     for (name, tip) in members {
-        let fork_point = stacked
-            .as_ref()
-            .map(|(opened, previous)| opened.fork_point(tip, previous))
+        let fork_point = context
+            .stacked_on
+            .map(|previous| opened.fork_point(tip, previous))
             .transpose()?;
         let base = fork_point.as_ref().unwrap_or(context.trunk);
-        match subject.replay_outcome(repo, base.as_str(), tip.as_str())? {
+        let (below, above) = opened.stack_among(tip, &tips)?;
+        let member = jj::StackedMember {
+            tip,
+            below: &below,
+            above: &above,
+        };
+        let outcome = if member.is_stacked() {
+            subject.stacked_replay_outcome(&opened, base, member)?
+        } else {
+            subject.replay_outcome(repo, base.as_str(), tip.as_str())?
+        };
+        match outcome {
             RebaseOutcome::Empty => {}
             RebaseOutcome::Conflicted if cut_is_conflicted => audit.inconclusive.push(name.clone()),
             RebaseOutcome::CleanNonEmpty | RebaseOutcome::Conflicted => {
@@ -3637,6 +3697,10 @@ pub fn audit_cut(
                 // edit nothing recorded may have dropped a member's change, so
                 // it is `knives release adopt` that measures it before a cut.
                 let carried_before = match context.previous {
+                    Some(previous) if member.is_stacked() => !matches!(
+                        opened.stacked_member_outcome(base, member, previous)?,
+                        RebaseOutcome::Empty
+                    ),
                     Some(previous) => !matches!(
                         crate::jj::probe_net_diff(
                             repo,
@@ -3738,6 +3802,13 @@ pub struct CompositionCheck {
     /// conflict for the person to resolve in place and `adopt`; the write
     /// it makes is no reference of those files, so the fix stays held.
     pub inconclusive_fixes: Vec<LackedFix>,
+    /// Members stacked on a branch that the release's record holds and the
+    /// subject leaves out, each with that branch's recorded member: the
+    /// member that reaches it, rendered, and the branch. Its commits would
+    /// ride into the release through the member, unreviewed as a member of
+    /// it, so this refuses the subject whatever `--allow-drop` says
+    /// ([`Self::refuses`] does not count it).
+    pub missing_parents: Vec<(String, RecordedMember)>,
 }
 
 impl CompositionCheck {
@@ -4423,7 +4494,29 @@ pub fn uncarried_recorded_members(
         if !newest.contains(member) && successors.contains(&repo.change_id_of(member.as_str())?) {
             continue;
         }
-        if reaches_any(repo, member, delta)? {
+        if repo.is_ancestor(member, delta.base)? {
+            continue;
+        }
+        if let Some(reaching) = first_reaching(repo, member, delta.parents)? {
+            // A recorded member that a parent reaches is carried by it. When
+            // a branch still names that member's commit, it is a branch the
+            // record holds and the subject leaves out, and the parent is
+            // stacked on it: a missing parent. A member that its own branch
+            // advanced past has no branch at its commit, and a branch landed
+            // into a member's line was never in the record. The commit a
+            // stacked series starts on, and anything it reaches, is the
+            // previous release, which carries its members: no member is
+            // stacked on them.
+            let started = match delta.start {
+                Some(start) => start == reaching || repo.is_ancestor(member, start)?,
+                None => false,
+            };
+            if has_local_branch(member, delta.tips) && !started {
+                check.missing_parents.push((
+                    recorded_member_name(reaching, delta.tips),
+                    recorded_member(member, delta.tips),
+                ));
+            }
             continue;
         }
         let rewrites = repo.standing_rewrites_of(member)?;
@@ -4568,6 +4661,26 @@ fn recorded_member(commit: &CommitId, tips: &BookmarkTips) -> RecordedMember {
         commit: commit.clone(),
         name: recorded_member_name(commit, tips),
     }
+}
+
+/// The first of `parents` that reaches `commit`, if any does.
+fn first_reaching<'p>(
+    repo: &Repo,
+    commit: &CommitId,
+    parents: &'p [CommitId],
+) -> anyhow::Result<Option<&'p CommitId>> {
+    for parent in parents {
+        if repo.is_ancestor(commit, parent)? {
+            return Ok(Some(parent));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a local bookmark holds `commit`.
+fn has_local_branch(commit: &CommitId, tips: &BookmarkTips) -> bool {
+    tips.iter()
+        .any(|(reference, tip)| matches!(reference, BookmarkRef::Local(_)) && tip == commit)
 }
 
 /// Whether the cut's base or any of its parents reaches `commit`.
