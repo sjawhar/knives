@@ -63,7 +63,7 @@
 
 use std::borrow::Cow;
 use std::cell::OnceCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use jj_lib::files::{MergeResult, merge_hunks};
 use jj_lib::merge::Merge;
@@ -816,6 +816,28 @@ pub fn repeated_headings(content: &[u8]) -> Vec<(&[u8], usize)> {
         .collect()
 }
 
+/// Each line of `content`'s one `[Unreleased]` section, with its trailing
+/// whitespace cut.
+///
+/// `None` where `content` holds no `## [Unreleased]` heading line, or more
+/// than one. The section is the one that [`UnreleasedReader`] reads: from
+/// the heading line, which is not one of its lines, to the next `#` or `##`
+/// heading or setext underline outside a code fence. A line inside a code
+/// fence there is one of its lines. Spec R8 holds a line that a member added
+/// to a release log where this set holds it ([`crate::own_lines`]), so a
+/// union that joined the member's entries into another list still reads as
+/// holding them.
+pub fn unreleased_lines(content: &[u8]) -> Option<HashSet<&[u8]>> {
+    let mut section = UnreleasedReader::default();
+    let mut held = HashSet::new();
+    for line in content.split_inclusive(|byte| *byte == b'\n') {
+        if section.read(line) != Kind::Section && section.inside {
+            held.insert(line.trim_ascii_end());
+        }
+    }
+    section.one().then_some(held)
+}
+
 /// `block`'s lines, each with its terminator.
 fn lines(block: &[u8]) -> Vec<&[u8]> {
     block.split_inclusive(|byte| *byte == b'\n').collect()
@@ -834,21 +856,23 @@ fn is_unreleased_heading(line: &[u8]) -> bool {
 
 /// Whether `target` already holds what `member` added to `base`.
 ///
-/// A carriage check replays a member's change onto a target and reads what is
-/// left over. A member whose block a release's union holds verbatim has
-/// nothing left over, but the replay still conflicts, because the union's
-/// other blocks sit where the member's block ends. This says what such a
-/// replay means: a conflict every side of which only inserted, and whose
-/// member side the target holds as a whole run of its own lines, or holds as
-/// a union writes it where its lists joined another block's: the entries
-/// of each of its lists as one run of lines, in its order, under one list
-/// of the same `### ` heading inside the target's one `[Unreleased]`
-/// section ([`holds_joined`]), is the target carrying that block — the
-/// conflict is masked. The lines can be another member's or the target's
-/// own: no occurrence is counted. Lines in a released section count only as
-/// part of a whole run, and a target with no `## [Unreleased]` heading or
-/// more than one holds no joined entry. A member whose lines the target
-/// holds neither way is not carried, and says so.
+/// The hold on a fix by hand replays an adopt's change onto a target and
+/// reads what is left over ([`crate::jj::Repo::uncarried_resolution_paths`]).
+/// A member's carriage is read by its own lines instead
+/// ([`crate::own_lines`]). A change whose block a release's union holds
+/// verbatim has nothing left over, but the replay still conflicts, because
+/// the union's other blocks sit where the change's block ends. This says
+/// what such a replay means: a conflict every side of which only inserted,
+/// and whose member side the target holds as a whole run of its own lines,
+/// or holds as a union writes it where its lists joined another block's:
+/// the entries of each of its lists as one run of lines, in its order,
+/// under one list of the same `### ` heading inside the target's one
+/// `[Unreleased]` section ([`holds_joined`]), is the target carrying that
+/// block — the conflict is masked. The lines can be another member's or the
+/// target's own: no occurrence is counted. Lines in a released section count
+/// only as part of a whole run, and a target with no `## [Unreleased]`
+/// heading or more than one holds no joined entry. A change whose lines the
+/// target holds neither way is not carried, and says so.
 pub fn masks(target: &[u8], base: &[u8], member: &[u8], options: &MergeOptions) -> bool {
     let replay = Merge::from_removes_adds([base], [target, member]);
     match merge_hunks(&replay, options) {
@@ -926,15 +950,34 @@ fn is_line_run(target: &[u8], text: &[u8]) -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "crate-visible test helpers are consumed from sibling test modules"
+)]
+pub(crate) mod test_support {
+    use jj_lib::files::FileMergeHunkLevel;
+    use jj_lib::merge::SameChange;
+    use jj_lib::tree_merge::MergeOptions;
+
+    /// jj's own defaults for `merge.hunk-level` and `merge.same-change`,
+    /// which is what a repository hands the caller unless it was configured
+    /// otherwise, and what `jj new` merges with.
+    pub(crate) fn merge_options() -> MergeOptions {
+        MergeOptions {
+            hunk_level: FileMergeHunkLevel::Line,
+            same_change: SameChange::Accept,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(
         clippy::expect_used,
         reason = "a union a test demands and does not get is the failure"
     )]
 
-    use jj_lib::files::FileMergeHunkLevel;
-    use jj_lib::merge::SameChange;
-
+    use super::test_support::merge_options;
     use super::*;
 
     const BASE_LOG: &[u8] =
@@ -973,16 +1016,6 @@ mod tests {
         include_bytes!("../tests/fixtures/changelog_union/oh-my-pi/member/CHANGELOG.md");
     const OMP_RELEASE: &[u8] =
         include_bytes!("../tests/fixtures/changelog_union/oh-my-pi/release/CHANGELOG.md");
-
-    /// jj's own defaults for `merge.hunk-level` and `merge.same-change`, which
-    /// is what a repository hands the caller unless it was configured
-    /// otherwise.
-    fn merge_options() -> MergeOptions {
-        MergeOptions {
-            hunk_level: FileMergeHunkLevel::Line,
-            same_change: SameChange::Accept,
-        }
-    }
 
     /// A merge of byte-string literals, so a test writes its terms as it
     /// reads them rather than casting each one.
@@ -1944,6 +1977,48 @@ mod tests {
                 String::from_utf8_lossy(content)
             );
         }
+    }
+
+    #[test]
+    fn the_unreleased_lines_are_the_one_sections_lines_as_knives_reads_it() {
+        // Given: a changelog whose one `[Unreleased]` section holds an entry
+        // with trailing spaces and a fenced `## ` line, above a released
+        // section
+        let log: &[u8] = b"# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- A fix.  \n\n\
+                           ```md\n## Not a heading\n```\n\n## [1.0.0]\n\n- Released.\n";
+
+        // When: its lines are read
+        let held = unreleased_lines(log).expect("one `[Unreleased]` section");
+
+        // Then: the section's lines are held, trailing whitespace cut, the
+        // fenced line among them
+        for line in [b"### Fixed".as_slice(), b"- A fix.", b"## Not a heading"] {
+            assert!(held.contains(line), "{}", String::from_utf8_lossy(line));
+        }
+        // And: the headings and the released section's lines are not
+        for line in [
+            b"# Changelog".as_slice(),
+            b"## [Unreleased]",
+            b"## [1.0.0]",
+            b"- Released.",
+        ] {
+            assert!(!held.contains(line), "{}", String::from_utf8_lossy(line));
+        }
+
+        // Given: a section that a setext underline ends
+        let setext: &[u8] = b"## [Unreleased]\n\n- New.\n\nRelease 1.0\n===========\n\n- Old.\n";
+        // When/Then: the line after the underline is not held
+        let held = unreleased_lines(setext).expect("one `[Unreleased]` section");
+        assert!(held.contains(b"- New.".as_slice()));
+        assert!(!held.contains(b"- Old.".as_slice()));
+
+        // Given: a changelog with no `## [Unreleased]` heading line, and one
+        // with two
+        let none: &[u8] = b"# Changelog\n\n## [1.0.0]\n\n- One.\n";
+        let two: &[u8] = b"## [Unreleased]\n\n- One.\n\n## [Unreleased]\n\n- Two.\n";
+        // When/Then: neither has one section
+        assert_eq!(unreleased_lines(none), None);
+        assert_eq!(unreleased_lines(two), None);
     }
 
     #[test]

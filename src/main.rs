@@ -611,27 +611,38 @@ fn dispatch_release(
                 }
             }
         }
-        Some(ReleaseAction::Reap) => run_reap(fork, output),
-        Some(ReleaseAction::Include { branch, why }) => run_release_edit(
+        Some(ReleaseAction::Reap) => run_reap(fork, output, bound),
+        Some(ReleaseAction::Include {
+            branch,
+            why,
+            allow_loss,
+        }) => run_release_edit(
             fork,
             extra_consumers,
-            &ReleaseEdit::Include { branch, why },
+            (&ReleaseEdit::Include { branch, why }, allow_loss.as_deref()),
             bound,
         ),
-        Some(ReleaseAction::Drop { branch, why }) => run_release_edit(
+        Some(ReleaseAction::Drop {
+            branch,
+            why,
+            allow_loss,
+        }) => run_release_edit(
             fork,
             extra_consumers,
-            &ReleaseEdit::Drop { branch, why },
+            (&ReleaseEdit::Drop { branch, why }, allow_loss.as_deref()),
             bound,
         ),
-        Some(ReleaseAction::Advance { branches, from }) => {
+        Some(ReleaseAction::Advance {
+            branches,
+            from,
+            allow_loss,
+        }) => {
             let branches = branches.into_iter().map(BranchName::new).collect();
-            run_release_edit(
-                fork,
-                extra_consumers,
+            let edit = (
                 &ReleaseEdit::Advance { branches, from },
-                bound,
-            )
+                allow_loss.as_deref(),
+            );
+            run_release_edit(fork, extra_consumers, edit, bound)
         }
         Some(ReleaseAction::Adopt { reference, why }) => run_release_adopt(
             fork,

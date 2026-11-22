@@ -147,7 +147,7 @@ fn members_verify_reports_a_dropped_members_content() {
     std::fs::write(lab.work.join("shared.txt"), "merged\n").expect("resolve by hand");
     lab.jj_work(["new"]);
 
-    // When: each member's content is replayed against the resolved release.
+    // When: each member is read by its own lines against the resolved release.
     let output = knives_release(&lab, &home, &["members", "--verify"]);
 
     // Then: the lost member is a finding, rather than a successful inspection.
@@ -283,25 +283,26 @@ fn release_carries_answers_not_carried_for_a_parent_whose_change_the_release_dro
     let alpha_output = knives_release(&lab, &home, &["members", "--carries", "feat/alpha"]);
 
     // Then: beta's ancestry does not make it carried; the release is the
-    // evidence its replay was judged against, and nothing makes it safe.
+    // evidence its own lines were read against, and nothing makes it safe.
     let beta = String::from_utf8_lossy(&beta_output.stdout);
     assert_eq!(beta_output.status.code(), Some(1), "{beta}");
     assert!(
         beta.contains(&format!(
-            "NOT carried        release/2026-08-04 @ {}  (evidence {}: replay leaves real diffs)",
+            "NOT carried        release/2026-08-04 @ {}  (evidence {}: the release lacks 1 of its \
+             own lines)",
             release.short(),
             release.short()
         )),
         "{beta}"
     );
-    // And: alpha, whose change the release's tree holds, is carried exactly,
-    // and the reason says the tree was read, not only the ancestry.
+    // And: alpha, whose own lines the release holds, is carried exactly,
+    // and the reason says its lines were read, not only the ancestry.
     let alpha_stdout = String::from_utf8_lossy(&alpha_output.stdout);
     assert!(alpha_output.status.success(), "{alpha_stdout}");
     assert!(
         alpha_stdout.contains(&format!(
             "carried-exact      release/2026-08-04 @ {}  (evidence {}: tip is an ancestor and \
-             the release's tree holds its change)",
+             the release holds its own lines)",
             release.short(),
             alpha.short()
         )),
@@ -401,11 +402,12 @@ fn release_carries_stops_before_superseded_targets_when_live_release_carries() {
 }
 
 #[test]
-fn release_carries_answers_carried_rebased_for_a_rewritten_member_the_release_holds() {
+fn release_carries_answers_carried_rewritten_for_a_rewritten_member_whose_words_the_release_holds()
+{
     // Given: a member rebased onto the advanced trunk and adapted there, then
     // advanced onto the release; the recorded commit (the pre-rebase one) is
-    // asked about. Its tree no longer replays cleanly, but the release holds a
-    // rewrite of the same change.
+    // asked about. The release does not reach it, and it holds the member's
+    // line as the rewrite changed it, with every word the member added.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let (home, _consumer) = home_after_first_cut(&lab);
@@ -419,24 +421,24 @@ fn release_carries_answers_carried_rebased_for_a_rewritten_member_the_release_ho
     )
     .expect("adapt the member on its new base");
     lab.jj_work(["squash", "--into", "feat/alpha"]);
-    let rewritten = commit_at(&lab, "feat/alpha");
     let advanced = knives_release(&lab, &home, &["advance", "feat/alpha"]);
     assert!(advanced.status.success(), "{advanced:?}");
+    let release = commit_at(&lab, "release/2026-08-04");
 
     // When: the pre-rebase commit is checked against the release.
     let output = knives_release(&lab, &home, &["members", "--carries", recorded.as_str()]);
 
-    // Then: carried, in rebased form, with the rewrite as the evidence — and
-    // the exit says carried, so a deletion-safety reader is not sent to judge
-    // by eye.
+    // Then: carried-rewritten, as the release holds the commit's own line by
+    // its words, with the release as the evidence — and the exit says
+    // carried, so a deletion-safety reader is not sent to judge by eye.
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     assert!(
-        stdout.contains("carried-rebased    release/2026-08-04"),
+        stdout.contains("carried-rewritten  release/2026-08-04"),
         "{stdout}"
     );
     assert!(
-        stdout.contains(&format!("evidence {}", rewritten.short())),
+        stdout.contains(&format!("evidence {}", release.short())),
         "{stdout}"
     );
 }

@@ -7,5 +7,5 @@ Read this before any `jj rebase -b`, `-s` or `-r` of a branch in a managed fork.
 3. Run `jj log -r 'MOVED:: & (REFS)'`.
 4. Empty: run `jj rebase -s 'MOVED' -d <trunk>@upstream`. It moves only the branch's own commits, keeps their change ids, and leaves every release merge on its commit id. Do not use `-b` or `-s '<ref>..<branch>'` instead: `-b` takes along a release merge the branch is built on, and `-s` with a range gives each commit in it the destination as parent.
 5. Not empty: the branch's commits feed the merges listed. Run `knives release members`; it shows the release in hand only.
-   - Listed there: move the branch only with `knives release rebase`, which moves every member and the merge together and replays recorded conflict resolutions.
+   - Listed there: move the branch only with `knives release rebase`, which moves the merge and each member's commits that the target's history does not hold, and replays recorded conflict resolutions.
    - Not listed: an older cut or a retention ref needs its exact commit, for a frozen pin or local descendants. Make no raw rebase. Get the release owner's sign-off, or wait until its last local descendant goes and `knives release reap` retires it.
