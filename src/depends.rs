@@ -34,7 +34,7 @@ use knives::commands::claim::Bound;
 use knives::config::{NonMember, Registry, RepoEntry};
 use knives::forge::github::CliForge;
 use knives::forge::{Forge, PullFacts, RepoIdentity};
-use knives::ids::{BranchName, BranchTarget, Requirement};
+use knives::ids::{BranchName, BranchTarget, Requirement, UpstreamName};
 use knives::jj::Repo;
 use knives::ledger::{Draft, Stated};
 use knives::remote_url::remote_slug;
@@ -593,13 +593,14 @@ impl Context<'_, '_> {
     /// The pull request `<repo>#<number>` names: by a registry name, the one
     /// the forge finds; by this fork's own repository, that repository's,
     /// even when a fork of this fork in the registry has it as its upstream;
-    /// by an upstream's `<owner>/<name>`, that upstream's. A name that is
-    /// another fork's upstream but no spelling here may be this fork's own
-    /// repository under its new name, when the other fork is a fork of this
-    /// one: the forge is asked, and when it names this fork's repository so,
-    /// the pull request is this fork's. When it cannot be asked, the name is
-    /// read as the other fork's upstream, unless that fork may be a fork of
-    /// this one ([`Self::fork_of_ours`]): then nothing is recorded (exit 3).
+    /// by this fork's registered upstream, that upstream's, with no forge
+    /// call. Another fork's upstream may be this fork's own repository under
+    /// another name (a fork of this fork registered after a rename or a
+    /// transfer), and nothing here tells the two apart: the forge is asked
+    /// ([`Self::own_under`]), and the pull request is this fork's when it
+    /// names this fork's repository so, that upstream's otherwise. When the
+    /// forge cannot be asked, nothing is recorded (exit 3): a review pull
+    /// request recorded as an upstream one reads met once it merges anywhere.
     fn pull_request(&self, text: &str, repo: &str, number: u64) -> Result<Requirement, Exit> {
         if let Some(fork) = self.registry.repos.get_key_value(repo) {
             return self.asked_which(text, fork, number);
@@ -608,28 +609,8 @@ impl Context<'_, '_> {
             return self.fork_pull(origin, number);
         }
         if let Some(upstream) = self.registry.resolve(repo) {
-            if upstream != self.fork.upstream {
-                let origin = self.fork.own_origin();
-                match self.named(origin) {
-                    Ok(own) if own.eq_ignore_ascii_case(repo) => {
-                        return self.fork_pull(origin, number);
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        if let Some(child) = self.fork_of_ours(repo) {
-                            return refused(
-                                Exit::Incomplete,
-                                format_args!(
-                                    "nothing recorded: {repo} in {text} is the upstream of \
-                                     {child}, which may be a fork of {}, and whether {}'s own \
-                                     repository is now called {repo} could not be asked of the \
-                                     forge: {error}. Run it again when the forge answers",
-                                    self.fork.name, self.fork.name
-                                ),
-                            );
-                        }
-                    }
-                }
+            if upstream != self.fork.upstream && self.own_under(text, repo, &upstream)? {
+                return self.fork_pull(self.fork.own_origin(), number);
             }
             return Ok(Requirement::Upstream {
                 repo: upstream,
@@ -661,6 +642,44 @@ impl Context<'_, '_> {
                 self.fork.name
             ),
         )
+    }
+
+    /// Whether `repo`, the upstream `upstream` of another registered fork,
+    /// is this fork's own repository under another name, as the forge says:
+    /// the name the forge gives this fork's `origin` is `repo`, or the one it
+    /// gives `repo` (a former name it redirects) is the same. False with no
+    /// forge call when this fork's `origin` names no forge repository: it
+    /// cannot have been renamed on the forge. Refused (exit 3) when the forge
+    /// cannot be asked.
+    fn own_under(&self, text: &str, repo: &str, upstream: &UpstreamName) -> Result<bool, Exit> {
+        let origin = self.fork.own_origin();
+        let Some(slug) = remote_slug(origin) else {
+            return Ok(false);
+        };
+        let asked = self.named(origin).and_then(|own| {
+            if own.eq_ignore_ascii_case(repo) {
+                return Ok(true);
+            }
+            self.named(&origin.replacen(slug, repo, 1))
+                .map(|named| named.eq_ignore_ascii_case(&own))
+        });
+        asked.or_else(|error| {
+            let key = self
+                .registry
+                .repos
+                .iter()
+                .find(|(key, entry)| entry.upstream_name(key) == *upstream)
+                .map_or(repo, |(key, _)| key.as_str());
+            refused(
+                Exit::Incomplete,
+                format_args!(
+                    "nothing recorded: {repo} in {text} is the upstream of {key}, and only the \
+                     forge can tell whether it is also {}'s own repository under another name: \
+                     {error}. Run it again when the forge answers",
+                    self.fork.name
+                ),
+            )
+        })
     }
 
     /// Pull request `number` of the fork `key` names: on its upstream or on
@@ -1703,41 +1722,6 @@ impl Context<'_, '_> {
                 ),
             ),
         }
-    }
-
-    /// The registry key of a fork, other than this one, whose upstream is
-    /// `repository` and that may be a fork of this one: `repository` is
-    /// owned by the owner of a registered fork's own repository (this one's
-    /// included, by any spelling here). Without the forge, a fork of this fork
-    /// whose upstream spells this fork's repository under a name nothing here
-    /// gives cannot be told from a fork of another project; a project's
-    /// upstream is owned by someone else, so only an upstream owned where the
-    /// registry keeps its forks is held as maybe this fork's.
-    fn fork_of_ours(&self, repository: &str) -> Option<&str> {
-        let (owner, _) = repository.split_once('/')?;
-        let ours = |url: &str| {
-            remote_slug(url)
-                .and_then(|slug| slug.split_once('/'))
-                .is_some_and(|(other, _)| other.eq_ignore_ascii_case(owner))
-        };
-        let owned_here = self
-            .registry
-            .repos
-            .values()
-            .any(|entry| ours(&entry.origin))
-            || ours(self.fork.own_origin());
-        if !owned_here {
-            return None;
-        }
-        self.registry
-            .repos
-            .iter()
-            .find(|(key, entry)| {
-                entry.upstream_name(key) != self.fork.upstream
-                    && remote_slug(&entry.upstream)
-                        .is_some_and(|slug| slug.eq_ignore_ascii_case(repository))
-            })
-            .map(|(key, _)| key.as_str())
     }
 
     /// This fork's `origin` URL that spells its own repository as
