@@ -531,7 +531,14 @@ member recorded under two spellings here is one requirement too. A member record
 repository that is neither a spelling here nor another fork's is a record of this fork's
 member only when the forge names that repository as the fork's own, as for a review pull
 request: with the forge down, a forget whose outcome depends on it is refused (exit 3),
-and `--on` writes this fork's spelling beside it.
+and `--on` writes this fork's spelling beside it and says the two may be one requirement.
+With the forge up, `--on` reuses a record the forge places as the fork's own, and writes
+its own beside one the forge names as another repository's, which is another requirement.
+A text spells a record when it parses to the same kind, number or branch, and repository,
+the repository's letter case aside; a branch name's case always counts. A pull request
+named `<owner>/<name>#<n>` by another fork's upstream that no spelling here gives is this
+fork's own when the forge names this fork's repository so, as when a fork of this fork is
+registered after a rename; when the forge cannot be asked, it is the other fork's.
 An upstream's `<owner>/<name>#<n>` is taken back without the forge. The forge has no
 answer that means a repository does not exist: GitHub answers a name it cannot resolve the
 same way for a repository that is gone, for one the token cannot see, and in some
