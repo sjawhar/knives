@@ -7,13 +7,13 @@ use std::{
 
 use crate::config::GuidanceRoot;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Guidance {
     pub bodies: Vec<InstructionFile>,
     pub mentions: Vec<PathBuf>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InstructionFile {
     pub path: PathBuf,
     pub body: String,
