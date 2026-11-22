@@ -10,9 +10,10 @@
 //! under one `### ` heading join that heading's one list, the heading written
 //! once — and the content checks read a member whose block the union holds
 //! as carried. A conflict that is not every side inserting its own block —
-//! a member that rewrote its block, sides on different bases, a code file, a
-//! drop that takes a block out — stays conflicted and is named as a
-//! person's.
+//! sides on different bases, a code file, a drop that takes a block out —
+//! stays conflicted and is named as a person's. An advance to a member that
+//! rewrote its block, where that would lose another member's lines, is
+//! refused with exit 3.
 //! The fixtures are the real ygo and oh-my-pi files, cut down; their README
 //! names each source.
 
@@ -22,7 +23,7 @@
     clippy::panic,
     reason = "a fixture or assertion that cannot proceed IS the test failure"
 )]
-// allow: SIZE_OK: 1144 lines - real-binary release-log union scenarios share one set of changelog fixtures and helpers.
+// allow: SIZE_OK: 1163 lines - real-binary release-log union scenarios share one set of changelog fixtures and helpers.
 
 #[path = "common/lab.rs"]
 mod lab;
@@ -378,7 +379,7 @@ fn an_advanced_member_with_a_new_section_above_its_own_is_unioned_on_top() {
 }
 
 #[test]
-fn an_advance_to_a_member_that_rewrote_its_block_stays_conflicted() {
+fn an_advance_that_loses_a_member_heading_in_the_notes_is_refused() {
     // Given: the ygo history's shape: the unioned cut of split-from-store and
     // sami11, client-count included on top of it, so its block sits right
     // above split-from-store's heading; then split-from-store grown into
@@ -388,21 +389,39 @@ fn an_advance_to_a_member_that_rewrote_its_block_stays_conflicted() {
     member(&lab, CLIENT, &logs(CLIENT_LOG, CLIENT_NOTES));
     release_ok(&lab, &home, &["include", CLIENT]);
     grow(&lab, SPLIT, &logs(SPLIT_ONE_PATH_LOG, SPLIT_ONE_PATH_NOTES));
+    let before = commit_at(&lab, RELEASE);
+    let entries = ledger_entries(&home);
 
     // When: the release advances it.
-    let advanced = release_ok(&lab, &home, &["advance", SPLIT]);
+    let output = knives_release(&lab, &home, &["advance", SPLIT]);
 
-    // Then: the changelog stays conflicted and is named as a person's, and
-    // nothing is reported as unioned. The notes are jj's own merge here, not
-    // a union: every member's notes open with the same `## v1.55.1-sami.11`
-    // line, so jj matches the rewritten heading against client-count's and
-    // resolves the file itself.
-    assert_eq!(conflicts(&lab), ["CHANGELOG.md"], "{advanced}");
+    // Then: every member's notes open with the same `## v1.55.1-sami.11`
+    // line, so jj's own merge of the notes matches the rewritten heading
+    // against client-count's and drops client-count's heading with no
+    // conflict. The advance writes nothing, exits 3, names the notes,
+    // client-count and its heading, and names the remedy.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
     assert!(
-        advanced.contains("  1 conflicted file(s) left for a person:\n    CHANGELOG.md\n"),
-        "{advanced}"
+        stdout.contains(&format!(
+            "demo: refusing to write {RELEASE}: RELEASE_NOTES.md would lose {CLIENT}'s lines; \
+             nothing written\n"
+        )),
+        "{stdout}"
     );
-    assert!(!advanced.contains("written as the union"), "{advanced}");
+    assert!(
+        stdout.contains("      RELEASE_NOTES.md:1: added line lost ‹## v1.55.1-sami.11›\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "demo: run the edit again with `--allow-loss <reason>`, put the named lines back by \
+             hand, and record that with `knives release adopt {RELEASE} --why <reason>`\n"
+        )),
+        "{stdout}"
+    );
+    assert_eq!(commit_at(&lab, RELEASE), before, "{stdout}");
+    assert_eq!(ledger_entries(&home), entries, "{stdout}");
 }
 
 #[test]

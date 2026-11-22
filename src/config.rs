@@ -262,13 +262,6 @@ pub struct SeriesEntry {
     /// The remote holding `base`. Defaults to upstream.
     #[serde(default, skip_serializing_if = "BaseRemote::is_upstream")]
     pub base_remote: BaseRemote,
-    /// Whether each release of this series stacks on the one before it. With
-    /// `true`, the series' next release is one merge of its previous release
-    /// and its new members. The previous release is the first parent, and it
-    /// is never a member. Defaults to false: a release is a flat merge of its
-    /// members.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub stacked: bool,
 }
 
 impl RepoEntry {
@@ -315,12 +308,6 @@ impl RepoEntry {
     fn selected(&self) -> Option<(&SeriesName, &SeriesEntry)> {
         let name = self.selected_series.as_ref()?;
         self.series.get(name.as_str()).map(|series| (name, series))
-    }
-
-    /// Whether the selected series stacks each release on the one before it
-    /// ([`SeriesEntry::stacked`]). The default series never does.
-    pub fn stacked(&self) -> bool {
-        self.selected().is_some_and(|(_, series)| series.stacked)
     }
 
     /// The remote for a role. Total: every role resolves.
@@ -2104,7 +2091,6 @@ release = "https://example.invalid/releases.git"
         let entry = &registry.repos["x"];
         assert_eq!(entry.release, None);
         assert_eq!(entry.series["9.2"].base, "old");
-        assert!(!entry.series["9.2"].stacked);
         assert_eq!(
             warnings,
             [
@@ -2132,21 +2118,6 @@ release = "https://example.invalid/releases.git"
     }
 
     #[test]
-    fn a_series_reads_its_stacked_key_and_defaults_it_to_false() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write(
-            dir.path(),
-            "[repos.x]\nupstream = \"u\"\norigin = \"o\"\n\n\
-             [repos.x.series.on]\nbase = \"on\"\nstacked = true\n\n\
-             [repos.x.series.off]\nbase = \"off\"\n",
-        );
-        let (registry, warnings) = read_registry(&path).unwrap();
-        assert!(registry.repos["x"].series["on"].stacked);
-        assert!(!registry.repos["x"].series["off"].stacked);
-        assert!(warnings.is_empty(), "{warnings:?}");
-    }
-
-    #[test]
     fn a_registry_that_sets_every_entry_and_series_key_warns_of_none() {
         // The known keys are read from the types; a key they do not list
         // would be warned of as unknown although knives reads it.
@@ -2157,7 +2128,7 @@ release = "https://example.invalid/releases.git"
              base = \"dev\"\nrelease = \"r\"\ntest_count_command = \"true\"\n\
              consumers = [\"org/consumer\"]\nworkspaces = \"/w\"\nforbidden = [\"term\"]\n\
              ledger = \"org/ledger\"\n\n\
-             [repos.x.series.old]\nbase = \"old\"\nbase_remote = \"origin\"\nstacked = true\n\n\
+             [repos.x.series.old]\nbase = \"old\"\nbase_remote = \"origin\"\n\n\
              [repos.y]\nupstream = \"https://forge.example/org/y\"\norigin = \"o\"\n\
              release_branch = \"integration\"\n",
         );
