@@ -422,13 +422,15 @@ pub enum Command {
         on: Vec<String>,
         /// A requirement to take back, repeatable: as its record spells it, or
         /// as `--on` would. Every record of it is taken back, whatever spelling
-        /// of the fork's repository each carries. The texts are weighed
+        /// of the fork's repository each carries; a record on another fork's
+        /// repository is never one of this fork's. The texts are weighed
         /// together: when the forge cannot say whether a record is named (it
         /// is down, or cannot see a repository), and counting it would take
         /// back more, or tell two requirements from one, nothing is taken
         /// back (exit 3), and the refusal prints a command no forge answer
-        /// changes: one that names every record of that number or member, or,
-        /// when the text may name two requirements, one such command for each.
+        /// changes: one that names every record of that number or member on a
+        /// repository that is not another fork's, or, when the text may name
+        /// two requirements, one such command for each.
         #[arg(long)]
         forget: Vec<String>,
         /// Registry name. Defaults to the repo you are standing in.

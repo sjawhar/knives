@@ -108,6 +108,7 @@ pub(crate) fn run(
         .collect();
     let own = context.own();
     let added = as_held(added, &staying, &forged.aliases, &own);
+    let beside = context.spelled_beside(&staying, &added);
     let pr = store.tracked_pull(&target);
     let replaces = store.statement_stamp(&target, StatementKind::Depends);
     let subject = Some(branch.as_str());
@@ -120,6 +121,9 @@ pub(crate) fn run(
         })?;
         drop(store);
         println!("{}/{branch} now requires {}", fork.name, listed(&added));
+        for line in &beside {
+            println!("{line}");
+        }
         return Ok(Exit::Ok);
     }
     let kept: Vec<Requirement> = required
@@ -153,6 +157,9 @@ pub(crate) fn run(
         fork.name,
         listed(&forgotten)
     );
+    for line in &beside {
+        println!("{line}");
+    }
     Ok(Exit::Ok)
 }
 
@@ -1685,6 +1692,43 @@ impl Context<'_, '_> {
             .into_iter()
             .map(|repository| repository.to_ascii_lowercase())
             .collect()
+    }
+
+    /// What to say of each member in `added` that this command writes under
+    /// this checkout's spelling while `staying` holds a record of the same
+    /// branch on a repository that is neither a spelling here nor another
+    /// fork's: the forge did not place that record as this fork's (it was
+    /// down, or names another repository), so the two are written apart. If
+    /// that repository is a former name of this fork's, the list now holds
+    /// one requirement under two spellings.
+    fn spelled_beside(&self, staying: &[Requirement], added: &[Requirement]) -> Vec<String> {
+        let mut lines = Vec::new();
+        for wanted in added {
+            let Requirement::ForkBranch { branch, .. } = wanted else {
+                continue;
+            };
+            if staying.contains(wanted) {
+                continue;
+            }
+            for held in staying {
+                if let Requirement::ForkBranch {
+                    repository,
+                    branch: other,
+                } = held
+                    && other == branch
+                    && !self.is_own_repository(repository)
+                    && self.other_fork(repository).is_none()
+                {
+                    lines.push(format!(
+                        "{wanted} is recorded beside {held}: the forge did not say {repository} \
+                         is {}'s own repository; if it is a former name, they are one \
+                         requirement under two spellings",
+                        self.fork.name
+                    ));
+                }
+            }
+        }
+        lines
     }
 
     /// The own repositories of the forks other than this one, lowercase, as

@@ -240,15 +240,17 @@ impl DependencyResults<'_> {
     }
 
     /// The `--forget` texts that take back `open`, requirements of
-    /// `dependent`, in one run whatever the forge answers, and the records
-    /// they take besides `open`'s. An upstream pull request, and a record on
-    /// a repository that is not this fork's ([`Self::apart`]), by its own
-    /// token alone. Otherwise every record `dependent` holds of the review
-    /// pull request number or member, on any repository that is not apart:
-    /// one whose repository the forge could not be asked about may be the
-    /// same requirement. A member by its branch name when every such record
-    /// spells a spelling here and the name holds no `#`; else each record as
-    /// it is spelled.
+    /// `dependent`, in one run while the forge answers as it did for this
+    /// report, and the records they take besides `open`'s. An upstream pull
+    /// request, and a record on a repository that is not this fork's
+    /// ([`Self::apart`]), by its own token alone: if the forge stops
+    /// answering before the forget, a record it named apart may be meant
+    /// again, and `depends` refuses and prints a broader command. Otherwise
+    /// every record `dependent` holds of the review pull request number or
+    /// member, on any repository that is not apart: one whose repository the
+    /// forge could not be asked about may be the same requirement. A member
+    /// by its branch name when every such record spells a spelling here and
+    /// the name holds no `#`; else each record as it is spelled.
     fn tokens(&self, dependent: &BranchName, open: &[&Requirement]) -> (Vec<String>, Vec<String>) {
         let held = self.held.get(dependent).map_or(&[][..], Vec::as_slice);
         let spelled = |record: &Requirement, among: &[String]| {
