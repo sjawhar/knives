@@ -565,11 +565,17 @@ fork whose upstream or own repository names no forge repository (such as `local#
 that fork is this one, its upstream is a path, or this fork's own repository names no forge
 repository. One exception: when this fork's checkout or registry `origin` spells its
 upstream, `<owner>/<name>#<n>` of that upstream names this fork's own repository first,
-which only the forge can place, so it is refused (exit 3) offline; with the forge up it is
-refused too (exit 2: the forge names that repository as the upstream, not this fork's own),
-and so is this fork's key, so no spelling records that upstream's pull requests. Such an
-`origin` is a configuration error: set it to this fork's own repository. Any other text that
-only the forge can read is refused (exit 3).
+which only the forge can place, so it is refused (exit 3) offline. Such an `origin` is a
+configuration error: set it to this fork's own repository. With the forge up, what each
+spelling does depends on which `origin` spells the upstream. When only the registry's does,
+and the checkout's names this fork's repository, that upstream's `<owner>/<name>` is refused
+(exit 2: not this fork's own repository), while this fork's key is read as usual against the
+checkout's repository: a number only the upstream has is the upstream's, one only the fork
+has is its review pull request, and one both have is refused without offering the upstream
+spelling, which has none while the registry `origin` spells the upstream. When this fork's
+own repository spells the upstream, its key takes the upstream's number with no lookup, and
+`<owner>/<name>` names a review pull request there. Any other text that only the forge can
+read is refused (exit 3).
 An upstream's `<owner>/<name>#<n>` is taken back without the forge. The forge has no
 answer that means a repository does not exist: GitHub answers a name it cannot resolve the
 same way for a repository that is gone, for one the token cannot see, and in some

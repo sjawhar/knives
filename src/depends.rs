@@ -657,14 +657,16 @@ impl Context<'_, '_> {
 
     /// Pull request `number` of the fork `key` names. Another fork's upstream
     /// may be this fork's own repository under another name (a fork of this
-    /// fork): the forge is asked first, as for the `<owner>/<name>` spelling
-    /// ([`Self::own_under`]), whatever forge repositories that fork has, and
-    /// the pull request is this fork's when it says so. Otherwise, when that
-    /// fork's upstream and own repository are both forge repositories: the
-    /// one the forge says has it, refused when both or neither do, or the
-    /// upstream's, with no lookup of the number, when the forge names that
-    /// own repository as the upstream; when either is no forge repository,
-    /// the upstream's, with no lookup of the number. A review pull request
+    /// fork): when that upstream is a forge repository, the forge is asked
+    /// first, as for the `<owner>/<name>` spelling ([`Self::own_under`]),
+    /// whether or not that fork's own repository is on the forge, and the
+    /// pull request is this fork's when it says so; a path upstream is never
+    /// asked about. Otherwise, when that fork's upstream and own repository
+    /// are both forge repositories: the one the forge says has it, refused
+    /// when both or neither do, or the upstream's, with no lookup of the
+    /// number, when the forge names that own repository as the upstream;
+    /// when either is no forge repository, the upstream's, with no lookup of
+    /// the number. A review pull request
     /// on the own repository of a fork other than this one is refused: its
     /// head is no member of this fork, so nothing here can say when it has
     /// landed ([`Self::another_forks_review`]).
@@ -713,19 +715,33 @@ impl Context<'_, '_> {
         let on_fork = self.pull(&own, number)?;
         let own = own.name_with_owner.to_ascii_lowercase();
         match (on_upstream, on_fork) {
-            (Some(theirs), Some(ours)) if this_fork => refused(
-                Exit::Usage,
-                format_args!(
-                    "{text} names two pull requests: {upstream_name}#{number} on {key}'s upstream \
-                     ({}, head {}) and {own}#{number} on {key}'s own repository ({}, head {}); \
-                     name the one meant: `--on {upstream_name}#{number}` or `--on {}#{number}`",
-                    theirs.pull.state.to_lowercase(),
-                    theirs.pull.head_ref_name,
-                    ours.pull.state.to_lowercase(),
-                    ours.pull.head_ref_name,
-                    self.accepted_spelling(&own, spelled),
-                ),
-            ),
+            (Some(theirs), Some(ours)) if this_fork => {
+                let review = format!("`--on {}#{number}`", self.accepted_spelling(&own, spelled));
+                // While an `origin` here spells the upstream, its `<owner>/<name>`
+                // names this fork's own repository first and is refused, so it is
+                // not offered ([`Self::own_origin_named`]).
+                let choice = if self.own_origin_named(upstream_name.as_str()).is_some() {
+                    format!(
+                        "the review pull request is named {review}; the upstream's #{number} has \
+                         no spelling here while the registry's {ORIGIN} for {key} spells its \
+                         upstream: set it to {key}'s own repository, {own}"
+                    )
+                } else {
+                    format!("name the one meant: `--on {upstream_name}#{number}` or {review}")
+                };
+                refused(
+                    Exit::Usage,
+                    format_args!(
+                        "{text} names two pull requests: {upstream_name}#{number} on {key}'s \
+                         upstream ({}, head {}) and {own}#{number} on {key}'s own repository ({}, \
+                         head {}); {choice}",
+                        theirs.pull.state.to_lowercase(),
+                        theirs.pull.head_ref_name,
+                        ours.pull.state.to_lowercase(),
+                        ours.pull.head_ref_name,
+                    ),
+                )
+            }
             (Some(theirs), Some(ours)) => refused(
                 Exit::Usage,
                 format_args!(
