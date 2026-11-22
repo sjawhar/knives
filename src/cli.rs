@@ -411,28 +411,32 @@ pub enum Command {
     Depends {
         branch: String,
         /// What it needs, repeatable. `<repo>#<number>`, `<repo>` the registry
-        /// name: knives asks the forge whether the upstream or the fork's own
-        /// repository has that pull request, and refuses when both or neither
-        /// do. `<owner>/<name>#<number>`: the upstream's pull request, or the
-        /// fork's when `<owner>/<name>` is its own repository. Another fork's
-        /// upstream, by either spelling, may be this fork's repository under
-        /// another name, so the forge is asked, and nothing is recorded (exit
-        /// 3) when it cannot say. The question is skipped when this fork's
-        /// `origin` names no forge repository, but a registry key still asks
-        /// the forge which of that fork's repositories has the number. Another
-        /// fork whose upstream is a path is named by its registry key exactly,
-        /// with no forge call, and its key in another letter case is refused
-        /// (exit 2); this fork's own path upstream is taken in any letter case.
-        /// With the forge down, a pull request is recorded only when naming it
-        /// needs no forge question: this fork's upstream's, by `<owner>/<name>`;
-        /// another fork's upstream's, by `<owner>/<name>`, when this fork's
-        /// `origin` names no forge repository; and, by a registry key, one of a
-        /// fork whose upstream or own repository names no forge repository,
-        /// when that fork is this one, its upstream is a path, or this fork's
-        /// `origin` names no forge repository. A review pull request on another
-        /// fork's repository is refused, and so is one whose head is not a
-        /// member branch of the fork's owner. A branch name: a member branch of
-        /// this fork.
+        /// name: when that fork's upstream and own repository are both forge
+        /// repositories, knives asks the forge which has that pull request, and
+        /// refuses when both or neither do; otherwise it is the upstream's,
+        /// with no forge call. `<owner>/<name>#<number>`: the upstream's pull
+        /// request, or the fork's when `<owner>/<name>` is its own repository.
+        /// Another fork's upstream, by either spelling, may be this fork's
+        /// repository under another name, so the forge is asked, and nothing
+        /// is recorded (exit 3) when it cannot say. The question is skipped
+        /// when this fork's own repository names no forge repository (neither
+        /// its checkout's nor its registry's `origin` is a forge URL); a
+        /// registry key still asks which of that fork's repositories has the
+        /// number when both are on the forge. Another fork whose upstream is a
+        /// path is named by its registry key exactly, with no forge call, and
+        /// its key in another letter case is refused (exit 2); this fork's own
+        /// path upstream is taken in any letter case. With the forge down, a
+        /// pull request is recorded only when naming it needs no forge
+        /// question: this fork's upstream's, by `<owner>/<name>`, unless this
+        /// fork's checkout or registry `origin` spells that upstream; another
+        /// fork's upstream's, by `<owner>/<name>`, when this fork's own
+        /// repository names no forge repository; and, by a registry key, one
+        /// of a fork whose upstream or own repository names no forge
+        /// repository, when that fork is this one, its upstream is a path, or
+        /// this fork's own repository names no forge repository. A review pull
+        /// request on another fork's repository is refused, and so is one whose
+        /// head is not a member branch of the fork's owner. A branch name: a
+        /// member branch of this fork.
         #[arg(long = "on", required_unless_present = "forget")]
         on: Vec<String>,
         /// A requirement to take back, repeatable: as its record spells it, or
