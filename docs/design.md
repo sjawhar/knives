@@ -486,9 +486,22 @@ hand resolution kept a member's change. The member's own change is the diff from
 with the upstream trunk (`Repo::fork_point`) to its tip, read with no rename detection. So the
 trunk's commits after that fork point are never charged to
 the member, and members that fork at different trunk commits are each measured from their own fork
-point. The rule follows each line of that change from the tip to the release, as
-`git blame --reverse` follows a line forward, instead of replaying the change as one commit. The
-member's hunks are the line diff of the fork point and the tip, and the survival diff is the line
+point. A revision that the trunk contains is its own fork point, so `Repo::change_base` reads how
+the trunk took it in: `first_ancestors(trunk) & revision::`, one revset, is the chain of the
+trunk's first-parent commits that contain it. Where the oldest of them is a merge, the base is the
+revision's fork point with that merge's first parent (`ChangeBase::Merged`). Where it is the
+revision itself, as after a fast-forward or a direct push (`ChangeBase::OnTrunkLine`), the base
+is the newest commit of the revision's first-parent line, other than the root commit, that one of
+the release's parents holds (`Repo::line_base`; for a cut, its candidate's parents). A release
+that reaches such a revision carries it by ancestry (`Repo::release_base`). The composition gate
+keeps its guard: a recorded member that the trunk contains and the subject does not reach is
+dropped with no reading. R11's check and adopt's measure read a member that the trunk contains
+from the same bases, though the release holds it as a parent (`release_edit::HeldBase`). On the
+first-parent line its holders are the release's other parents that do not contain its tip. The
+output names the base it read the member from, or says that it read no line of the member where
+no other parent gives a base. The rule follows each line of that change from the tip to the
+release, as `git blame --reverse` follows a line forward, instead of replaying the change as one
+commit. The member's hunks are the line diff of its base and the tip, and the survival diff is the line
 diff of the tip and the release (jj-lib's `ContentDiff::by_line`). The release carries the member
 when it holds each non-blank line that the member added, and does not hold again, at the hunk's
 place, all the non-blank lines of a hunk that the member removed. A line that the survival diff
@@ -498,7 +511,11 @@ one of its words and every word that the member's change added to it, and does n
 that line, all the words that the change removed from it. A line that the member changed only in
 whitespace is held only where the line diff keeps it byte for byte. A range of more than 30000
 words on either side (`own_lines::WORD_LIMIT`) is not followed by words: its lines count as lost,
-and the reading names the range. A release log follows its own clause (under "Expect real
+and the reading names the range. The word step builds a range's word diff before it asks for a
+line's pair, so the pairing of a member hunk's removed and added lines (`words::pair_hunk`) runs
+once per hunk, and only for a hunk where the word step follows a range. It pairs no line of more
+than 30000 words, so its matcher never compares a line longer than the word step's bound. A
+release log follows its own clause (under "Expect real
 conflicts" below). A path that is not text (a NUL byte in its first 8000 bytes, a symlink or a
 submodule) is carried where the release holds the tip's value there, a deletion where the release
 holds nothing there, an added text file with no non-blank line where the release holds a file
@@ -531,7 +548,7 @@ carried-rebased. Against a release, the revision's own lines decide, by the rule
 own lines, and carried-rewritten where the release does not reach the tip and holds them. Where the
 release does not reach the tip, it is carried-rebased where the release reaches a standing rewrite
 of it (`jj::Repo::standing_rewrites_of`) and holds that rewrite's own lines, read from the
-rewrite's own fork point with the trunk. It is conflicted where a path of its change holds an
+rewrite's own base by the rule above. It is conflicted where a path of its change holds an
 unresolved conflict, in the release or at the tip, and the release lacks nothing else, and
 not-carried otherwise. The text names the lines under the verdict, and each JSON check holds the
 reading (`TargetCheck::lines`).

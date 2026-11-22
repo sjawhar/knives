@@ -3239,9 +3239,9 @@ pub struct AuditContext<'a> {
     /// drop it.
     pub previous: Option<&'a CommitId>,
     /// The upstream trunk's tip. Each member's own change is the diff from
-    /// its fork point with it ([`Repo::fork_point`]) to its tip (spec R6), so
-    /// the trunk's commits after that fork point are never charged to the
-    /// member.
+    /// its base against it ([`Repo::change_base`], [`Repo::release_base`])
+    /// to its tip (spec R6), so the trunk's commits after the member's fork
+    /// point are never charged to the member.
     pub upstream_trunk: &'a CommitId,
     /// The parents of the subject that the trunk holds, each with where it
     /// came from: no member, but content the subject holds all the same.
@@ -3378,6 +3378,17 @@ impl CutSubject<'_> {
         }
     }
 
+    /// The subject's parents: the candidate's, which is no commit of the
+    /// repository ([`jj::Candidate::parents`]), or the cut commit's. Where
+    /// the trunk holds a member on its first-parent line, they give its base
+    /// ([`Repo::release_base`]).
+    fn parents(&self, repo: &Repo) -> anyhow::Result<Vec<CommitId>> {
+        match self {
+            Self::Candidate(candidate) => Ok(candidate.parents().to_vec()),
+            Self::Committed(cut) => Ok(repo.parent_commits(cut.as_str())?),
+        }
+    }
+
     /// What the subject holds of a member's own lines: the change from
     /// `fork_point` to `tip`, read path by path
     /// ([`jj::Repo::member_lines`]). `label` names the member in the reading.
@@ -3439,13 +3450,16 @@ impl CutSubject<'_> {
 /// Verify the cut actually contains what it merged (spec 1.3).
 ///
 /// Each member is read by its own lines (spec R9): its own change is the
-/// diff from its fork point with `context.upstream_trunk` to its tip (spec
-/// R6), and the cut carries it where it holds each line that the change
-/// adds and does not hold again what it removes ([`jj::Repo::member_lines`]).
+/// diff from its base by spec R6 to its tip, its fork point with
+/// `context.upstream_trunk`, or, for a member the trunk contains, the base
+/// that the subject's parents give it ([`Repo::release_base`]): a member is
+/// a parent, so one the trunk contains is carried by ancestry. The cut
+/// carries a member where it holds each line that the change adds and does
+/// not hold again what it removes ([`jj::Repo::member_lines`]).
 /// A member whose own path holds an unresolved conflict, in the cut or at
 /// the member's tip, cannot be read there: it is inconclusive where it
 /// lacks nothing else. A member that lacks a line fails the audit, unless
-/// `context.previous` lacks that line too, read from the same fork point:
+/// `context.previous` lacks that line too, read from the same base:
 /// a member whose every lost line the previous release lacked is carried
 /// forward ([`MemberLines::carry_forward`]). Each parent that the trunk
 /// holds (`context.trunk_parents`) is read beside the members, from
@@ -3473,6 +3487,7 @@ pub fn audit_cut(
     context: AuditContext<'_>,
 ) -> anyhow::Result<CutAudit> {
     let opened = Repo::open(repo)?;
+    let parents = subject.parents(&opened)?;
     let mut audit = CutAudit::default();
     let read = members.iter().map(|member| (member, None)).chain(
         context
@@ -3483,7 +3498,11 @@ pub fn audit_cut(
     for ((name, tip), base) in read {
         let fork_point = match base {
             Some(base) => base.clone(),
-            None => opened.fork_point(tip, context.upstream_trunk)?,
+            None => opened.release_base(
+                tip,
+                &opened.change_base(tip, context.upstream_trunk)?,
+                &parents,
+            )?,
         };
         let mut lines = subject.member_lines(&opened, name, (&fork_point, tip))?;
         // A line the release held against already lacked is that release's
@@ -4302,9 +4321,9 @@ pub struct CompositionDelta<'a> {
 /// clone. A member whose own path the subject leaves conflicted, or that is
 /// conflicted at the member's tip, and that lacks nothing else, is
 /// inconclusive. A member the trunk reaches but the cut subject does not is
-/// dropped without a reading: its fork point degenerates to the member
-/// itself, so its own change would be empty and read carried whatever the
-/// cut subject holds. A recorded commit this
+/// dropped without a reading, as at knives 5.1.0 (spec R6): the trunk
+/// carries it, and this subject does not. Every other member is read from
+/// its fork point with the trunk ([`Repo::change_base`]). A recorded commit this
 /// repository cannot resolve counts as dropped: unverifiable must not read as
 /// carried. So does the newest write itself: a subject held against a write
 /// this repository does not hold is refused ([`CompositionCheck::absent_write`]),
@@ -4395,7 +4414,10 @@ pub fn uncarried_recorded_members(
             check.dropped.push(recorded_member(member, delta.tips));
             continue;
         }
-        let base = repo.fork_point(member, delta.trunk)?;
+        // The guard leaves a member that the trunk does not contain, whose
+        // base is its fork point with the trunk.
+        let change_base = repo.change_base(member, delta.trunk)?;
+        let base = repo.release_base(member, &change_base, delta.parents)?;
         let recorded = recorded_member(member, delta.tips);
         let lines = subject.member_lines(repo, &recorded.name, (&base, member))?;
         match lines.reading {

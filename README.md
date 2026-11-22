@@ -451,9 +451,29 @@ Against a release, these commands, the audits of `release cut` and its compositi
 member, or a revision, by its own lines. Its own change is the diff from its fork point with the
 upstream trunk to its tip. So the upstream commits after that fork point are not charged to it,
 however far the trunk has moved, and members that fork at different trunk commits are each
-measured from their own fork point. The change is read with no rename detection: a rename is the
-deletion of the old path and the addition of the new one. The release carries the member when all
-of these hold:
+measured from their own fork point.
+
+A revision that the upstream trunk contains is its own fork point with the trunk, so its change
+is read from another base. A release that reaches the revision carries it. Otherwise the base
+depends on how the trunk took the revision in:
+
+* Upstream merged it by a merge commit, also through another branch: the base is its fork point
+  with the first parent of that merge.
+* Its tip is on the trunk's first-parent line, as after a fast-forward or a direct push: the
+  history does not record where it began. The base is the newest commit of that line below the
+  tip that a parent of the release holds. That base charges the revision with each trunk commit
+  between the base and the commit where the revision began.
+
+The composition gate reads a recorded member that the trunk contains and the release does not
+reach as dropped, with no reading. The check of `include`, `drop` and `advance` and the measure
+of `knives release adopt` read a member that the trunk contains from these bases too, although
+the release holds it as a parent. On the trunk's first-parent line its base comes from the other
+parents: the newest commit of that line below the member's tip that another parent holds, where
+that parent does not hold the tip. The output names that base. Where no other parent gives a
+base, the check and the measure read no line of the member, refuse nothing for it, and say so.
+
+The change is read with no rename detection: a rename is the deletion of the old path and the
+addition of the new one. The release carries the member when all of these hold:
 
 * The release holds each non-blank line that the member added.
 * The release does not hold again, at the place where the member removed them, all the non-blank
@@ -474,10 +494,13 @@ of these hold:
 An edit of another change next to the member's lines, or on the same line, that keeps the member's
 own words does not make the member read missing, unless it puts back what the member removed. A
 range of more than 30000 words on either side is not followed by its words: its lines count as
-lost, and the output says that the word step did not run there. Each command names each line that
-a member lacks, with its path. It also names each line that the release holds only by its words,
-with the release's lines that hold them, so that you see the words that another change put around
-the member's own. Such a line does not make the member read missing and changes no exit status.
+lost, and the output says that the word step did not run there. To find the line that an added
+line replaced, knives pairs the lines that the member's hunk removes with the lines it adds. It
+pairs only in a hunk where the word step follows a range. It pairs no line of more than 30000
+words: the line rule alone reads such a line. Each command names each line that a member lacks,
+with its path. It also names each line that the release holds only by its words, with the
+release's lines that hold them, so that you see the words that another change put around the
+member's own. Such a line does not make the member read missing and changes no exit status.
 Each command names these lines in its text. `members --verify`, `--carries` and `--census` also
 name them in their JSON report.
 
@@ -499,10 +522,10 @@ Against a release, `--carries` and `--census` give these verdicts:
 * `carried-rewritten`: the release does not reach the tip and holds its own lines.
 * `carried-rebased`: the release does not reach the tip, a rewrite that stands for the revision is
   an ancestor of the release, and the release holds the rewrite's own lines, read from the
-  rewrite's own fork point. Such a rewrite is a successor of the revision in jj's operation log, or
-  a commit with its tree. An older version that only shares its change id does not count. The
-  verdict is weaker than `carried-exact` and `carried-rewritten`, since a rewrite can hold another
-  tree.
+  rewrite's own base, by the rule above. Such a rewrite is a successor of the revision in jj's
+  operation log, or a commit with its tree. An older version that only shares its change id does
+  not count. The verdict is weaker than `carried-exact` and `carried-rewritten`, since a rewrite
+  can hold another tree.
 * `conflicted`: a path of its change holds an unresolved conflict, in the release or at the tip,
   and the release lacks nothing else.
 * `NOT carried` (JSON `not-carried`): none of these. The lines that the release lacks are named

@@ -767,7 +767,9 @@ fn edit_release(
 /// `--allow-loss` it writes the candidate, names the same lines as lost
 /// ([`allowed_loss_lines`]), and records the loss in its ledger event
 /// ([`loss_event_text`]). Where the check counts nothing, the flag changes
-/// nothing.
+/// nothing. After the check's own lines, in both cases, the edit names the
+/// base it read each member from that the trunk holds on its first-parent
+/// line, or that it read no line of it ([`HeldBase::line`]).
 ///
 /// `uncarried` is the target of a drop whose parent no remaining member's
 /// history carries. Whether the release lost that content is read from the
@@ -802,9 +804,12 @@ fn apply_edit(
         operation: &operation,
     };
     let candidate = knives::jj::edit_candidate(&fork.checkout.path, &write)?;
-    let losses = edit_losses(context, &candidate, (&provenance, &done.brought))?;
+    let (losses, bases) = edit_losses(context, &candidate, (&provenance, &done.brought))?;
     if !losses.is_empty() && context.allow_loss.is_none() {
-        for line in refusal_lines(repo, &release.name, &losses) {
+        for line in refusal_lines(repo, &release.name, &losses)
+            .into_iter()
+            .chain(bases)
+        {
             println!("{line}");
         }
         return Ok(Exit::Incomplete);
@@ -856,6 +861,7 @@ fn apply_edit(
     for line in plain_merged_lines(repo, &plain_merged)
         .into_iter()
         .chain(allowed_loss_lines(repo, &release.name, &losses))
+        .chain(bases)
     {
         println!("{line}");
     }
@@ -866,57 +872,170 @@ fn apply_edit(
     Ok(Exit::Ok)
 }
 
-/// What a remaining member is to spec R11's check, its fork points read
+/// What a remaining member is to spec R11's check, its bases read
 /// ([`edit_losses`], [`knives::jj::Brought`]).
 enum BroughtFrom {
     Nothing,
     Whole,
-    /// An advanced member: the fork point of its old tip, and that tip.
+    /// An advanced member: the base of its old tip, and that tip.
     Since(CommitId, CommitId),
 }
 
+/// Where spec R11's check and the measure of `knives release adopt` read a
+/// member X of the release in hand from (spec R6). The release holds X as a
+/// parent, so X is not carried by ancestry: a revision that the trunk
+/// contains is read from the base that the way the trunk took it in gives.
+pub(crate) enum HeldBase {
+    /// Its fork point with the trunk, or with the first parent of the merge
+    /// that took it in.
+    Fork(CommitId),
+    /// The trunk holds X on its first-parent line: the newest trunk commit
+    /// below X's tip that another parent of the release holds. The output
+    /// names it, since a parent that forks inside X's own commits gives a
+    /// base inside X.
+    Line(CommitId),
+    /// The trunk holds X on its first-parent line, and no other parent of
+    /// the release gives a base: no line of X is read, and the output says
+    /// so.
+    Unread,
+}
+
+impl HeldBase {
+    /// X's base from `base`, the [`knives::jj::ChangeBase`] of `tip`, X's
+    /// tip, against the trunk. On the trunk's first-parent line it is the
+    /// newest commit of that line that one of `others`, the release's
+    /// parents other than X, holds while it does not contain X's tip
+    /// ([`knives::jj::Repo::line_base`]). A parent that contains X's tip, as
+    /// a member that forks at or after X once a rebase moved it there, says
+    /// nothing about where X began; X's tip itself is such a parent. So the
+    /// base is never X's tip or the root commit.
+    pub(crate) fn read<'p>(
+        opened: &knives::jj::Repo,
+        (tip, base): (&CommitId, knives::jj::ChangeBase),
+        others: impl IntoIterator<Item = &'p CommitId>,
+    ) -> anyhow::Result<Self> {
+        Ok(match base {
+            knives::jj::ChangeBase::Fork(fork) | knives::jj::ChangeBase::Merged(fork) => {
+                Self::Fork(fork)
+            }
+            knives::jj::ChangeBase::OnTrunkLine => {
+                let mut holders = Vec::new();
+                for other in others {
+                    if !opened.is_ancestor(tip, other)? {
+                        holders.push(other.clone());
+                    }
+                }
+                opened
+                    .line_base(tip, &holders)?
+                    .map_or(Self::Unread, Self::Line)
+            }
+        })
+    }
+
+    /// The commit that X's change is read from; `None` where no line of X
+    /// is read.
+    pub(crate) const fn commit(&self) -> Option<&CommitId> {
+        match self {
+            Self::Fork(base) | Self::Line(base) => Some(base),
+            Self::Unread => None,
+        }
+    }
+
+    /// The line that the check or the measure prints for `member`, X's
+    /// label, in `release`, after its own lines: the base it read X from, or
+    /// that it read no line of X. None for a fork point. The label and the
+    /// release are read from the repository, so each is escaped.
+    pub(crate) fn line(&self, member: &str, release: &str) -> Option<String> {
+        let base = match self {
+            Self::Fork(_) => return None,
+            Self::Line(base) => Some(base),
+            Self::Unread => None,
+        };
+        let (member, release) = (inline_human_text(member), inline_human_text(release));
+        Some(base.map_or_else(
+            || {
+                format!(
+                    "  {member}: its lines are not read: the trunk holds it on its first-parent \
+                     line, and every other parent of {release} holds it or no trunk commit below \
+                     it"
+                )
+            },
+            |base| {
+                format!(
+                    "  {member}: read from {}, the newest trunk commit below it that another \
+                     parent of {release} holds",
+                    base.short()
+                )
+            },
+        ))
+    }
+}
+
 /// Spec R11's check of `candidate`
-/// ([`knives::jj::EditCandidate::lost_lines`]). Each remaining member is a
-/// parent of `provenance`, named as the release's description names it,
-/// and read from its fork point with the upstream trunk to its tip;
-/// `brought` gives each parent the edit brings in, with the one it replaces
-/// for an advance.
+/// ([`knives::jj::EditCandidate::lost_lines`]), and the lines that say
+/// where a member that the trunk holds on its first-parent line was read
+/// from ([`HeldBase::line`]). Each remaining member is a parent of
+/// `provenance`, named as the release's description names it, and read
+/// from its base by spec R6 to its tip ([`HeldBase`]); on the trunk's
+/// first-parent line the release in hand's parents other than the member,
+/// at its old tip and at its new one, give that base. A member that no
+/// other parent gives a base is not read. `brought` gives each parent the
+/// edit brings in, with the one it replaces for an advance. An advanced
+/// member whose old tip no other parent gives a base brings in all of its
+/// change.
 fn edit_losses(
     context: &EditContext<'_>,
     candidate: &knives::jj::EditCandidate<'_>,
     (provenance, brought): (&[(String, CommitId)], &[BroughtParent]),
-) -> anyhow::Result<Vec<knives::jj::EditLoss>> {
-    let opened = context.opened;
+) -> anyhow::Result<(Vec<knives::jj::EditLoss>, Vec<String>)> {
+    let (opened, release) = (context.opened, context.release);
     let trunk = opened.resolve_commit(&context.entry.trunk_ref())?;
     let mut read = Vec::with_capacity(provenance.len());
-    for (_, tip) in provenance {
-        let from = match brought.iter().find(|(new, _)| new == tip) {
+    let mut lines = Vec::new();
+    for (label, tip) in provenance {
+        let replaced = brought
+            .iter()
+            .find(|(new, _)| new == tip)
+            .map(|(_, old)| old.as_ref());
+        let old = replaced.flatten();
+        let others = move || {
+            release
+                .parents
+                .iter()
+                .chain(&release.carriers)
+                .filter(move |parent| Some(*parent) != old)
+        };
+        let base = HeldBase::read(opened, (tip, opened.change_base(tip, &trunk)?), others())?;
+        lines.extend(base.line(label, &release.name));
+        let Some(base) = base.commit() else {
+            continue;
+        };
+        let from = match replaced {
             None => BroughtFrom::Nothing,
-            Some((_, None)) => BroughtFrom::Whole,
-            Some((_, Some(old))) => {
-                BroughtFrom::Since(opened.fork_point(old, &trunk)?, old.clone())
+            Some(None) => BroughtFrom::Whole,
+            Some(Some(old)) => {
+                let old_base =
+                    HeldBase::read(opened, (old, opened.change_base(old, &trunk)?), others())?;
+                old_base.commit().map_or(BroughtFrom::Whole, |old_base| {
+                    BroughtFrom::Since(old_base.clone(), old.clone())
+                })
             }
         };
-        read.push((opened.fork_point(tip, &trunk)?, from));
+        read.push((label, tip, base.clone(), from));
     }
-    let members: Vec<knives::jj::EditMember<'_>> = provenance
+    let members: Vec<knives::jj::EditMember<'_>> = read
         .iter()
-        .zip(&read)
-        .map(
-            |((label, tip), (fork_point, from))| knives::jj::EditMember {
-                label,
-                change: (fork_point, tip),
-                brought: match from {
-                    BroughtFrom::Nothing => knives::jj::Brought::Nothing,
-                    BroughtFrom::Whole => knives::jj::Brought::Whole,
-                    BroughtFrom::Since(old_fork_point, old) => {
-                        knives::jj::Brought::Since((old_fork_point, old))
-                    }
-                },
+        .map(|(label, tip, base, from)| knives::jj::EditMember {
+            label: label.as_str(),
+            change: (base, *tip),
+            brought: match from {
+                BroughtFrom::Nothing => knives::jj::Brought::Nothing,
+                BroughtFrom::Whole => knives::jj::Brought::Whole,
+                BroughtFrom::Since(old_base, old) => knives::jj::Brought::Since((old_base, old)),
             },
-        )
+        })
         .collect();
-    Ok(candidate.lost_lines(&members)?)
+    Ok((candidate.lost_lines(&members)?, lines))
 }
 
 /// The lines an edit prints when spec R11's check counts lines of a

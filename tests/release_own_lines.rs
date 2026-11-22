@@ -1451,6 +1451,41 @@ fn the_gate_names_the_lines_a_refused_member_lacks() {
     }
 }
 
+#[test]
+fn a_cut_with_allow_drop_names_the_lines_a_dropped_member_lacks() {
+    // Given: a knives cut of M, which writes two lines of `m.txt`, and N;
+    // then M dropped from the release.
+    let lab = Lab::new();
+    lab.branch(M, "m.txt", "m one\nm two\n");
+    lab.branch(N, "n.txt", "n\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let dropped = knives_release(&lab, &home, &["drop", M, "--why", "not this time"]);
+    assert_eq!(dropped.status.code(), Some(0), "{}", text(&dropped));
+
+    // When: the next cut is taken with `--allow-drop`.
+    let output = knives_release(&lab, &home, &["cut", NEXT, "--allow-drop"]);
+
+    // Then: the cut goes ahead, its `--allow-drop` line names M, and after
+    // it the gate names each line of M that the cut lacks.
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{out}");
+    let (allowed, lacks) = out
+        .split_once("  lines each member lacks:\n")
+        .unwrap_or_else(|| panic!("no list of the lines each member lacks: {out}"));
+    assert!(
+        allowed
+            .lines()
+            .any(|line| line.contains("--allow-drop: ") && line.contains(M)),
+        "{out}"
+    );
+    for (line, content) in [(1, "m one"), (2, "m two")] {
+        assert!(
+            lacks.contains(&format!("m.txt:{line}: added line lost ‹{content}›")),
+            "{out}"
+        );
+    }
+}
+
 /// M adds a function to `lib.js`, N writes a file of its own, and a release
 /// made outside knives holds another text of M's function.
 fn another_text_release() -> (Lab, TempDir) {

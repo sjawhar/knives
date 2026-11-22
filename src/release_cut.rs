@@ -949,8 +949,9 @@ fn report_uncarried_cut(
 /// lacks, with the files where it lacks it ([`fix_lines`]). A refusal's
 /// remedy names the fetch of a commit that this repository does not hold
 /// only where one of `remotes` has a branch or tag at it ([`fix_remedy`]).
-/// Under each inconclusive member, and after a refusal for each member it
-/// names, the lines name what the member lacks ([`lacking_lines`]); last,
+/// Under each inconclusive member, and after a refusal or the `--allow-drop`
+/// lines for each member they name, the lines name what the member lacks
+/// ([`lacking_lines`]); last,
 /// whether or not the check refuses, each line of a member that the subject
 /// holds only by its words ([`release::labelled_words_lines`]).
 ///
@@ -1003,8 +1004,9 @@ fn uncarried_cut_lines(
 /// member the subject lacks with the record that names it
 /// ([`dropped_lines`]), the newest write that this repository does not
 /// hold, and each adopt whose fix the subject lacks ([`fix_lines`]); under
-/// `--allow-drop` each as a statement, else as a refusal with its remedy
-/// and, after it, what each member it names lacks ([`lacking_lines`]).
+/// `--allow-drop` each as a statement, else as a refusal with its remedy;
+/// after them, in both cases, what each member they name lacks
+/// ([`lacking_lines`]).
 fn refusal_lines(
     repo: &RepoName,
     held: HeldRecords<'_>,
@@ -1045,15 +1047,16 @@ fn refusal_lines(
             (&sources, absent, &check.dropped_fixes),
             (on_drop, remotes),
         ));
-        lines.extend(lacking_lines(check));
     }
+    lines.extend(lacking_lines(check));
     lines
 }
 
-/// What the members that a refusal names lack, after the whole refusal
-/// block, so that each line of the block stays as it reads: under the line
-/// `lines each member lacks:`, each such member that the check read, by its
-/// name, with the lines that name what it lacks ([`release::lost_lines`]).
+/// What the members that a refusal or `--allow-drop` names lack, after the
+/// whole block, so that each line of the block stays as it reads: under the
+/// line `lines each member lacks:`, each such member that the check read,
+/// by its name, with the lines that name what it lacks
+/// ([`release::lost_lines`]).
 /// None where the check read no line that such a member lacks.
 fn lacking_lines(check: &release::CompositionCheck) -> Vec<String> {
     let mut lines = Vec::new();

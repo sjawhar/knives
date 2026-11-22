@@ -7,8 +7,8 @@
 //! carried-exact, and a three-way tree merge for carried-rewritten (jj
 //! divergent change-ids force tree comparison — the same change id can name
 //! two different trees). Against a release: the revision's own lines, the
-//! change from its fork point with the trunk to its tip, which the release
-//! must hold ([`crate::own_lines`], spec R6 and R9). Only when the content
+//! change from its base by spec R6 to its tip, which the release must hold
+//! ([`crate::own_lines`], spec R6 and R9). Only when the content
 //! says otherwise does the change id speak, and it says something weaker on
 //! purpose: carried-rebased means a rewrite of the change (`jj rebase` keeps
 //! the change id) is in the target's ancestry, so the change lives on there
@@ -27,7 +27,7 @@ use crate::config::Role;
 use crate::detect::{BookmarkTips, RebaseOutcome};
 use crate::forge::{Forge, index_pulls};
 use crate::ids::{BookmarkRef, BranchName, CommitId, CutKey, ReleaseScheme, is_our_release};
-use crate::jj::Repo;
+use crate::jj::{ChangeBase, Repo};
 use crate::own_lines::{LostKind, MemberLines, Reading};
 use crate::release_model;
 use crate::snapshot::{self, SnapshotConfig};
@@ -859,11 +859,11 @@ pub struct CheckInput<'a> {
     pub revision: &'a str,
     pub tip: &'a CommitId,
     /// The upstream trunk: a release target reads the tip's own lines from
-    /// its fork point with it.
+    /// its base against it (spec R6).
     pub trunk: &'a CommitId,
-    /// The tip's fork point with the trunk, read once, by the first release
-    /// target that needs it.
-    fork_point: std::cell::OnceCell<CommitId>,
+    /// Where the tip's own change starts against the trunk, read once, by
+    /// the first release target that needs it.
+    change_base: std::cell::OnceCell<ChangeBase>,
 }
 
 impl<'a> CheckInput<'a> {
@@ -878,17 +878,18 @@ impl<'a> CheckInput<'a> {
             revision,
             tip,
             trunk,
-            fork_point: std::cell::OnceCell::new(),
+            change_base: std::cell::OnceCell::new(),
         }
     }
 
-    /// The tip's fork point with the trunk ([`Repo::fork_point`]).
-    fn fork_point(&self) -> Result<&CommitId, crate::jj::JjError> {
-        if let Some(fork_point) = self.fork_point.get() {
-            return Ok(fork_point);
+    /// Where the tip's own change starts against the trunk
+    /// ([`Repo::change_base`]).
+    fn change_base(&self) -> Result<&ChangeBase, crate::jj::JjError> {
+        if let Some(base) = self.change_base.get() {
+            return Ok(base);
         }
-        let fork_point = self.repo.fork_point(self.tip, self.trunk)?;
-        Ok(self.fork_point.get_or_init(|| fork_point))
+        let base = self.repo.change_base(self.tip, self.trunk)?;
+        Ok(self.change_base.get_or_init(|| base))
     }
 }
 
@@ -941,30 +942,35 @@ fn trunk_check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryC
 }
 
 /// The verdict of one revision against a release, from the revision's own
-/// lines (spec R6, R9): the change from its fork point with the upstream
-/// trunk to its tip, whether or not the release reaches the tip
-/// ([`Repo::member_lines`]). A release merge names its members as parents,
-/// so every member is an ancestor whatever the merge's tree holds, and a
-/// hand resolution can drop a member's change while keeping the member a
-/// parent. The verdicts, in this order:
+/// lines (spec R6, R9): the change from its base to its tip, whether or not
+/// the release reaches the tip ([`Repo::member_lines`]). The base is its
+/// fork point with the upstream trunk, or, for a revision the trunk
+/// contains, the base that the release's parents and the way the trunk took
+/// it in give ([`Repo::release_base`]); a revision the trunk contains and
+/// the release reaches is carried by ancestry. A release merge names its
+/// members as parents, so every member is an ancestor whatever the merge's
+/// tree holds, and a hand resolution can drop a member's change while
+/// keeping the member a parent. The verdicts, in this order:
 ///
 /// - carried-exact: the release reaches the tip and holds its own lines;
 /// - carried-rewritten: the release does not reach the tip and holds its
 ///   own lines;
 /// - carried-rebased: the release does not reach the tip, and it reaches a
 ///   standing rewrite of it and holds that rewrite's own lines, read from
-///   the rewrite's own fork point with the trunk. A release that reaches
-///   the tip is never read for a rewrite;
+///   the rewrite's own base by the same rule. A release that reaches the
+///   tip is never read for a rewrite;
 /// - conflicted: a path of the tip's change holds an unresolved conflict,
 ///   in the release or at the tip, and the release lacks nothing else;
 /// - not carried: anything else.
 fn release_check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryCheck> {
     let reaches = input.repo.is_ancestor(input.tip, &target.commit)?;
-    let lines = input.repo.member_lines(
-        input.revision,
-        (input.fork_point()?, input.tip),
-        &target.commit,
-    )?;
+    let parents = input.repo.parent_commits(target.commit.as_str())?;
+    let base = input
+        .repo
+        .release_base(input.tip, input.change_base()?, &parents)?;
+    let lines = input
+        .repo
+        .member_lines(input.revision, (&base, input.tip), &target.commit)?;
     if lines.reading == Reading::Carried {
         let (verdict, evidence) = if reaches {
             (CarryVerdict::CarriedExact, input.tip.clone())
@@ -982,11 +988,12 @@ fn release_check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<Carr
             if !input.repo.is_ancestor(&rewrite, &target.commit)? {
                 continue;
             }
-            let fork_point = input.repo.fork_point(&rewrite, input.trunk)?;
+            let change_base = input.repo.change_base(&rewrite, input.trunk)?;
+            let base = input.repo.release_base(&rewrite, &change_base, &parents)?;
             let held =
                 input
                     .repo
-                    .member_lines(input.revision, (&fork_point, &rewrite), &target.commit)?;
+                    .member_lines(input.revision, (&base, &rewrite), &target.commit)?;
             if held.reading == Reading::Carried {
                 return Ok(CarryCheck {
                     verdict: CarryVerdict::CarriedRebased,

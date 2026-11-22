@@ -34,7 +34,7 @@ use knives::release_model::{
 };
 
 use super::release_edit::{
-    edit_event_text, recorded_parents, refuse_plan_problems, refuse_unresolved_trunk,
+    HeldBase, edit_event_text, recorded_parents, refuse_plan_problems, refuse_unresolved_trunk,
     report_abandoned_earlier, report_hidden,
 };
 use super::scribe_for;
@@ -560,6 +560,10 @@ struct Adoption<'a> {
     /// The counts, one per member and changed file the baseline holds lines
     /// of it added.
     lost: Vec<LostLines>,
+    /// The line for each member that the trunk holds on its first-parent
+    /// line: the base it was read from, or that none of its lines was read
+    /// ([`HeldBase::line`]).
+    bases: Vec<String>,
     /// Whether the baseline is a recorded write ([`Replaced::is_baseline`]).
     /// An automerge stands in for a write this repository does not hold or
     /// one marked unchecked, so its counts are printed and never make
@@ -613,16 +617,22 @@ fn measure<'a>(
     // The trunk resolved before the release was read
     // (`refuse_unresolved_trunk`).
     let trunk = held.opened.resolve_commit(&entry.trunk_ref())?;
-    let member_sources: Vec<(String, CommitId)> = provenance
+    let mut forked = Vec::new();
+    let mut bases = Vec::new();
+    for (member, tip) in provenance
         .iter()
         .filter(|(_, commit)| members.contains(commit))
-        .cloned()
-        .collect();
-    let lost = lost_lines(
-        &held.opened,
-        (&trunk, &member_sources),
-        (&held.commit, &changes),
-    )?;
+    {
+        // The commit holds the member as a parent; on the trunk's
+        // first-parent line its other parents give the member its base.
+        let change_base = held.opened.change_base(tip, &trunk)?;
+        let base = HeldBase::read(&held.opened, (tip, change_base), &held.parents)?;
+        bases.extend(base.line(member, &held.name));
+        if let Some(base) = base.commit() {
+            forked.push((member.as_str(), tip, base.clone()));
+        }
+    }
+    let lost = lost_lines(&held.opened, &forked, (&held.commit, &changes))?;
     Ok(Some(Adoption {
         change: held.opened.change_id_of(held.commit.as_str())?,
         carriers,
@@ -631,6 +641,7 @@ fn measure<'a>(
         changes,
         why,
         lost,
+        bases,
         against_write: replaced.is_baseline(),
     }))
 }
@@ -673,12 +684,13 @@ impl LostLines {
 }
 
 /// For each file the commit changes against its baseline and each member
-/// that added lines to it, the member's added non-blank lines, from its fork
-/// point with `base` to its tip, that the baseline holds and the resolution
+/// of `forked` that added lines to it, the member's added non-blank lines,
+/// from its base to its tip, that the baseline holds and the resolution
 /// holds fewer times, and whether the resolution dropped every block of them
 /// the baseline held.
 ///
-/// `base` is the trunk. The fork point is the member's own, so a trunk that
+/// `forked` holds each member read, by its label, with its tip and its base
+/// by spec R6 ([`HeldBase`]). The base is the member's own, so a trunk that
 /// moved on since is never charged to it. Counted as a multiset because a
 /// release log repeats lines (`### Added`) that one member adding and
 /// another keeping must not cancel.
@@ -687,13 +699,9 @@ impl LostLines {
 /// resolving a conflict can.
 fn lost_lines(
     opened: &Repo,
-    (base, members): (&CommitId, &[(String, CommitId)]),
+    forked: &[(&str, &CommitId, CommitId)],
     (resolution, changes): (&CommitId, &ResolutionChanges),
 ) -> anyhow::Result<Vec<LostLines>> {
-    let mut forked = Vec::with_capacity(members.len());
-    for (member, tip) in members {
-        forked.push((member, tip, opened.fork_point(tip, base)?));
-    }
     let mut lost = Vec::new();
     let files = changes
         .resolved
@@ -708,7 +716,7 @@ fn lost_lines(
             .map(|sides| sides.iter().map(Vec::as_slice).collect())
             .unwrap_or_default();
         let lines = FileLines::new(&baseline, &resolved);
-        for (member, tip, fork_point) in &forked {
+        for &(member, tip, ref fork_point) in forked {
             // A member that left the file as it found it added no line of it.
             if opened.same_path_value(fork_point, tip, file)? {
                 continue;
@@ -718,7 +726,7 @@ fn lost_lines(
             let (counted, absent) = lines.counted_and_lost((&before, &after));
             if counted > 0 {
                 lost.push(LostLines {
-                    member: String::clone(member),
+                    member: member.to_owned(),
                     file: file.clone(),
                     counted,
                     lost: absent,
@@ -1051,7 +1059,9 @@ fn adopted_text(replaced: &Replaced, adoption: &Adoption<'_>) -> String {
 /// Say what was adopted: the commit, the write it replaces and the baseline,
 /// and whether the commit is that write re-signed or metaedited; the files
 /// resolved by hand; the files changed beyond the conflicts, with the
-/// reason; each member's lost lines; each carrier, labelled; and each `### `
+/// reason; each member's lost lines, then the base of each member that the
+/// trunk holds on its first-parent line ([`HeldBase::line`]); each carrier,
+/// labelled; and each `### `
 /// heading that a release log's one `[Unreleased]` section holds more than
 /// once ([`release::report_repeated_headings`]).
 fn report(adopting: &Adopting<'_, '_>, adoption: &Adoption<'_>) {
@@ -1114,6 +1124,9 @@ fn report(adopting: &Adopting<'_, '_>, adoption: &Adoption<'_>) {
         } else {
             println!("  !! {line}: a file the baseline left without a conflict");
         }
+    }
+    for line in &adoption.bases {
+        println!("{line}");
     }
     for carrier in &adoption.carriers {
         println!(

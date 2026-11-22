@@ -123,6 +123,23 @@ pub struct WorkspaceActivity {
     pub horizon: Option<jiff::Timestamp>,
 }
 
+/// Where a revision's own change starts (spec R6), before the release is
+/// known ([`Repo::change_base`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeBase {
+    /// The trunk does not contain the revision: its fork point with the
+    /// trunk ([`Repo::fork_point`]).
+    Fork(CommitId),
+    /// The trunk took the revision in by a merge commit, also through another
+    /// branch: its fork point with that merge's first parent.
+    Merged(CommitId),
+    /// The revision's tip is on the trunk's first-parent line, as after a
+    /// fast-forward or a direct push: the history does not record where the
+    /// revision began, so what a release holds gives its base
+    /// ([`Repo::line_base`]).
+    OnTrunkLine,
+}
+
 impl Repo {
     /// Whether this workspace's working copy is stale in the sense `jj` itself
     /// refuses to run: its checked-out tree no longer matches what the repository
@@ -764,7 +781,8 @@ impl Repo {
 
     /// Where `revision` forked from `trunk`: their one common ancestor, or the
     /// trunk itself when the histories criss-cross to several, as
-    /// `uncarried_recorded_members` takes a member's base.
+    /// [`Self::change_base`] takes the base of a revision the trunk does not
+    /// contain.
     pub fn fork_point(&self, revision: &CommitId, trunk: &CommitId) -> Result<CommitId, JjError> {
         self.fork_point_of(std::slice::from_ref(revision), trunk)
     }
@@ -782,9 +800,147 @@ impl Repo {
             .unwrap_or_else(|| trunk.clone()))
     }
 
+    /// Where `revision`'s own change starts against `trunk` (spec R6),
+    /// before the release is known. Where the trunk does not contain the
+    /// revision, its fork point with the trunk. Otherwise the commits of the
+    /// trunk's first-parent line that contain it, `first_ancestors(trunk) &
+    /// revision::`, are read in one evaluation. They form one chain, and its
+    /// oldest commit is the revision itself where the revision is on that
+    /// line. Else it is the merge that took the revision in, and the
+    /// revision's fork point with that merge's first parent is its own.
+    pub fn change_base(
+        &self,
+        revision: &CommitId,
+        trunk: &CommitId,
+    ) -> Result<ChangeBase, JjError> {
+        if !self.is_ancestor(revision, trunk)? {
+            return Ok(ChangeBase::Fork(self.fork_point(revision, trunk)?));
+        }
+        let tip = self.commit(revision.as_str())?.id().clone();
+        let line = ResolvedRevsetExpression::commit(self.commit(trunk.as_str())?.id().clone())
+            .first_ancestors()
+            .intersection(&ResolvedRevsetExpression::commit(tip.clone()).descendants());
+        let revision_error = |error: RevsetEvaluationError| JjError::Revision {
+            revision: revision.as_str().to_owned(),
+            detail: error.to_string(),
+        };
+        let revset = line.evaluate(self.repo.as_ref()).map_err(revision_error)?;
+        // The stream runs children before parents, so the oldest comes last.
+        let oldest = collect_stream(revset.stream())
+            .into_iter()
+            .try_fold(None, |_, id| id.map(Some))
+            .map_err(revision_error)?
+            .ok_or_else(|| JjError::Revision {
+                revision: revision.as_str().to_owned(),
+                detail: format!(
+                    "no commit of {}'s first-parent line contains it",
+                    trunk.as_str()
+                ),
+            })?;
+        if oldest == tip {
+            return Ok(ChangeBase::OnTrunkLine);
+        }
+        let merge = self
+            .repo
+            .store()
+            .get_commit(&oldest)
+            .map_err(|error| store_error(&error))?;
+        // The trunk's line before the merge, which did not contain the
+        // revision yet.
+        let before_merge = merge
+            .parent_ids()
+            .first()
+            .ok_or_else(|| JjError::Revision {
+                revision: oldest.hex(),
+                detail: "a commit that contains another has a parent".to_owned(),
+            })?;
+        Ok(ChangeBase::Merged(
+            self.fork_point(revision, &commit_id(before_merge))?,
+        ))
+    }
+
+    /// The newest commit of `revision`'s own first-parent line, other than
+    /// jj's root commit, that one of `holders` contains (spec R6):
+    /// `first_ancestors(revision) & ::holders ~ root()`, of which only the
+    /// first commit is read. The line and `::holders` meet in the older end
+    /// of the line, so that commit is the one answer. A holder that reaches
+    /// the revision gives the revision itself. `None` where there is none,
+    /// as where the holders share no commit but the root with the line.
+    pub fn line_base(
+        &self,
+        revision: &CommitId,
+        holders: &[CommitId],
+    ) -> Result<Option<CommitId>, JjError> {
+        if holders.is_empty() {
+            return Ok(None);
+        }
+        let mut held = Vec::with_capacity(holders.len());
+        for holder in holders {
+            held.push(self.commit(holder.as_str())?.id().clone());
+        }
+        let line = ResolvedRevsetExpression::commit(self.commit(revision.as_str())?.id().clone())
+            .first_ancestors()
+            .intersection(&ResolvedRevsetExpression::commits(held).ancestors())
+            .minus(&ResolvedRevsetExpression::root());
+        let revision_error = |error: RevsetEvaluationError| JjError::Revision {
+            revision: revision.as_str().to_owned(),
+            detail: error.to_string(),
+        };
+        let revset = line.evaluate(self.repo.as_ref()).map_err(revision_error)?;
+        // The stream runs children before parents: the first is the newest,
+        // and nothing past it is walked.
+        first_of_stream(revset.stream())
+            .transpose()
+            .map(|newest| newest.map(|id| commit_id(&id)))
+            .map_err(revision_error)
+    }
+
+    /// The base of `revision`'s own change in a release whose parents are
+    /// `parents` (spec R6): a release commit's parents, or a cut candidate's,
+    /// which is no commit of this repository. `base` is the revision's
+    /// [`ChangeBase`]. Where the trunk contains the revision and the release
+    /// reaches it, the base is the revision itself, so it is carried by
+    /// ancestry. Otherwise its fork point is the base, and on the trunk's
+    /// first-parent line the parents give it ([`Self::line_base`]). Where
+    /// they give none, the base is jj's root commit, so the revision's whole
+    /// tree is its change; a release that shares history with the trunk
+    /// never meets that, since it holds the trunk's oldest commit.
+    pub fn release_base(
+        &self,
+        revision: &CommitId,
+        base: &ChangeBase,
+        parents: &[CommitId],
+    ) -> Result<CommitId, JjError> {
+        if let ChangeBase::Fork(fork) = base {
+            return Ok(fork.clone());
+        }
+        if self.reached_by(revision, parents)? {
+            return Ok(revision.clone());
+        }
+        Ok(match base {
+            ChangeBase::Fork(fork) | ChangeBase::Merged(fork) => fork.clone(),
+            ChangeBase::OnTrunkLine => self
+                .line_base(revision, parents)?
+                .unwrap_or_else(|| commit_id(self.repo.store().root_commit_id())),
+        })
+    }
+
+    /// Whether one of `commits` is `revision` or descends from it.
+    fn reached_by(&self, revision: &CommitId, commits: &[CommitId]) -> Result<bool, JjError> {
+        if commits.contains(revision) {
+            return Ok(true);
+        }
+        for commit in commits {
+            if self.is_ancestor(revision, commit)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// What `release` holds of a member's own lines (spec R6, R9): the
-    /// change `tip` makes from `fork_point`, its fork point with the upstream
-    /// trunk ([`Self::fork_point`]), read path by path by [`own_lines`].
+    /// change `tip` makes from `fork_point`, its base by spec R6
+    /// ([`Self::release_base`]), read path by path by [`own_lines`].
     /// `label` names the member in the reading. Nothing is written: no
     /// transaction is started.
     pub fn member_lines(
@@ -3194,8 +3350,9 @@ pub fn edit_candidate<'w>(
 pub struct EditMember<'a> {
     /// How the report names the member.
     pub label: &'a str,
-    /// Its own change: from its fork point with the upstream trunk to its
-    /// tip (spec R6).
+    /// Its own change: from its base by spec R6 to its tip, the base read
+    /// from the release in hand's other parents where the trunk holds the
+    /// member on its first-parent line.
     pub change: (&'a CommitId, &'a CommitId),
     /// What of that change this edit brings into the release.
     pub brought: Brought<'a>,
@@ -4904,6 +5061,12 @@ impl Candidate {
         self.commit.parent_ids().len()
     }
 
+    /// The parents the candidate was built on, in order: its spec's
+    /// ([`CutSpec::parents`]).
+    pub fn parents(&self) -> &[CommitId] {
+        &self.spec.parents
+    }
+
     /// The release logs the candidate holds as the union of their sides; a
     /// publish rebuilds the same tree, so they are what ships.
     pub fn unions(&self) -> &[UnionedFile] {
@@ -5045,6 +5208,20 @@ fn collect_stream<S: futures_core::Stream>(stream: S) -> Vec<S::Item> {
         match stream.as_mut().poll_next(&mut context) {
             Poll::Ready(Some(item)) => items.push(item),
             Poll::Ready(None) => return items,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+/// The first item of a jj-lib stream, polled with [`collect_stream`]'s loop;
+/// the rest of the stream is never polled.
+fn first_of_stream<S: futures_core::Stream>(stream: S) -> Option<S::Item> {
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    let mut stream = std::pin::pin!(stream);
+    loop {
+        match stream.as_mut().poll_next(&mut context) {
+            Poll::Ready(item) => return item,
             Poll::Pending => std::thread::yield_now(),
         }
     }

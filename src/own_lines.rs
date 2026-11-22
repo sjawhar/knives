@@ -785,9 +785,11 @@ struct Added<'t> {
     /// Its index at the tip.
     index: usize,
     text: &'t [u8],
-    /// The line that it replaced, where the pairing pairs it with one. A
-    /// line that the survival diff deletes is not paired: it is lost
-    /// whatever it replaced.
+    /// The line that it replaced, where the pairing pairs it with one. Only
+    /// a line of a range that the word step follows asks for its pair
+    /// ([`TextPath::judge`]): a line that the survival diff deletes is lost
+    /// whatever it replaced, and so is a line of a range over
+    /// [`WORD_LIMIT`] words.
     fork: Option<&'t [u8]>,
 }
 
@@ -849,7 +851,10 @@ impl<'t> TextPath<'t> {
 
     /// Reads the non-blank lines that `hunk` adds: each that the survival
     /// diff keeps is held; each that R8 holds is held; each other is judged
-    /// ([`Self::judge`]).
+    /// ([`Self::judge`]). The pairing of the hunk's removed and added lines
+    /// ([`words::pair_hunk`]) runs once for the whole hunk, the first time a
+    /// line asks for its pair, so not at all for a hunk where the word step
+    /// follows no range.
     fn read_added(&self, hunk: &Hunk, steps: &mut [Option<WordStep<'t>>], out: &mut Out<'_>) {
         let removed = self.fork.get(hunk.old.clone()).unwrap_or_default();
         let added = self.tip.get(hunk.new.clone()).unwrap_or_default();
@@ -862,14 +867,7 @@ impl<'t> TextPath<'t> {
             if is_blank(text) || self.held_by_r8(text) {
                 continue;
             }
-            // A survival hunk that deletes the line loses it, whatever line
-            // it replaced ([`Self::judge`]), so only a replaced line is
-            // paired.
-            let replaces = self
-                .survival
-                .get(survival)
-                .is_some_and(|replacing| !replacing.new.is_empty());
-            let fork = if replaces {
+            let pair = || {
                 pairs
                     .get_or_insert_with(|| words::pair_hunk(removed, added))
                     .get(offset)
@@ -877,11 +875,8 @@ impl<'t> TextPath<'t> {
                     .flatten()
                     .and_then(|at| removed.get(at))
                     .copied()
-            } else {
-                None
             };
-            let line = Added { index, text, fork };
-            match self.judge(line, survival, steps) {
+            match self.judge((index, text), (survival, &mut *steps), pair) {
                 Judged::Lost(kind) => out.lost(
                     entry(self.path, kind, Some(number(index)), Some(shown(text))),
                     // The place of a line the survival diff deletes or
@@ -924,15 +919,18 @@ impl<'t> TextPath<'t> {
             .is_some_and(|held| held.contains(line.trim_ascii_end()))
     }
 
-    /// Judges `line`, which the survival hunk at `survival` deletes or
-    /// replaces. A deletion loses it. In a replaced range, the word diff of
-    /// the range decides ([`WordDiff::loses`]), unless the range holds more
-    /// than [`WORD_LIMIT`] words on either side.
+    /// Judges the tip's line `text` at `index`, which the survival hunk at
+    /// `survival` deletes or replaces. A deletion loses it. In a replaced
+    /// range, the range's word step is built first, or taken from `steps`:
+    /// a range that holds more than [`WORD_LIMIT`] words on either side
+    /// loses the line by the line rule, and its line is not paired. Else
+    /// `pair` gives the line that it replaced in the member's hunk, and the
+    /// word diff of the range decides ([`WordDiff::loses`]).
     fn judge(
         &self,
-        line: Added<'t>,
-        survival: usize,
-        steps: &mut [Option<WordStep<'t>>],
+        (index, text): (usize, &'t [u8]),
+        (survival, steps): (usize, &mut [Option<WordStep<'t>>]),
+        pair: impl FnOnce() -> Option<&'t [u8]>,
     ) -> Judged {
         let Some(hunk) = self.survival.get(survival) else {
             return Judged::Lost(LostKind::Added);
@@ -951,6 +949,11 @@ impl<'t> TextPath<'t> {
         });
         let WordStep::Followed(diff) = step else {
             return Judged::Lost(LostKind::WordLimit);
+        };
+        let line = Added {
+            index,
+            text,
+            fork: pair(),
         };
         let offset = line.index - hunk.old.start;
         if diff.loses(offset, line) {

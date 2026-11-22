@@ -18,6 +18,7 @@
 
 use std::cmp::Ordering;
 
+use super::WORD_LIMIT;
 use super::difflib::{Ratio, SequenceMatcher, Tag, real_quick_ratio};
 
 /// The words of `line`, in order, each a slice of it.
@@ -69,12 +70,30 @@ pub(super) fn tokens(line: &[u8]) -> Vec<&[u8]> {
 /// similarity is strictly higher. A removed line that finds none leaves the
 /// window where it was. This is the prototype's `pair_hunk`, step by step,
 /// with its early exits on the quick ratios.
+///
+/// A line of more than [`WORD_LIMIT`] words, removed or added, pairs with
+/// none, which the prototype does not bound (spec R9): by position its
+/// place gives `None`, whichever side is over; in the window such a removed
+/// line takes no line and leaves the window where it was, and such an added
+/// line is no candidate. So the matcher never compares a line longer than
+/// the word step's bound.
 pub(super) fn pair_hunk(removed: &[&[u8]], added: &[&[u8]]) -> Vec<Option<usize>> {
     if removed.is_empty() || added.is_empty() {
         return vec![None; added.len()];
     }
     if removed.len() == added.len() {
-        return (0..added.len()).map(Some).collect();
+        return removed
+            .iter()
+            .zip(added)
+            .enumerate()
+            .map(|(at, (old, new))| {
+                if over_the_limit(old) || over_the_limit(new) {
+                    None
+                } else {
+                    Some(at)
+                }
+            })
+            .collect();
     }
     let added_words: Vec<Vec<&[u8]>> = added.iter().map(|line| tokens(line)).collect();
     let window = removed.len().abs_diff(added.len()) + 3;
@@ -82,10 +101,15 @@ pub(super) fn pair_hunk(removed: &[&[u8]], added: &[&[u8]]) -> Vec<Option<usize>
     let mut next = 0;
     for (index, line) in removed.iter().enumerate() {
         let words = tokens(line);
+        if words.len() > WORD_LIMIT {
+            continue;
+        }
         let mut best: Option<usize> = None;
         let mut best_ratio = Ratio::HALF;
         for (candidate, candidate_words) in added_words.iter().enumerate().skip(next).take(window) {
-            if real_quick_ratio(words.len(), candidate_words.len()) < best_ratio {
+            if candidate_words.len() > WORD_LIMIT
+                || real_quick_ratio(words.len(), candidate_words.len()) < best_ratio
+            {
                 continue;
             }
             let matcher = SequenceMatcher::new(&words, candidate_words);
@@ -106,6 +130,13 @@ pub(super) fn pair_hunk(removed: &[&[u8]], added: &[&[u8]]) -> Vec<Option<usize>
         }
     }
     pairs
+}
+
+/// Whether `line` holds more than [`WORD_LIMIT`] words, as [`tokens`] reads
+/// them. A word is one byte or more, so a line of no more bytes than the
+/// limit is not read for its words.
+fn over_the_limit(line: &[u8]) -> bool {
+    line.len() > WORD_LIMIT && tokens(line).len() > WORD_LIMIT
 }
 
 /// A member's own words on a line that it changed ([`line_word_diff`]).
