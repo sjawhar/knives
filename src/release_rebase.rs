@@ -1,4 +1,5 @@
-//! `knives release rebase`: move the whole composition onto an upstream commit.
+//! `knives release rebase`: move the release onto an upstream commit, with
+//! each member whose commits the target's history does not hold.
 //!
 //! One ordered gate sequence — frozen pins, a published release in hand, stale
 //! bases, the target's provenance, the landed members a bare rebase sheds —
@@ -24,22 +25,27 @@ use super::release_edit::{
     report_hidden, report_replaced,
 };
 
-/// Rebase the whole composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
+/// Rebase the composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
 ///
-/// Every member branch's commits move onto the target and the release merge
-/// moves with them, member bookmarks following their rewritten commits —
-/// recorded conflict resolutions replay as ordinary rebase semantics. The
-/// upstream base is never a release parent; this is how the release's members
-/// change theirs. A cut deliberately does not do this: which upstream commit to
-/// move onto, and whether to move at all, is a judgment. A published release in
-/// hand is refused ([`release::published_release`]). Every other release name
-/// that is pushed or published is put back on its commit, and one never pushed
-/// follows its rewrite; tags stay where they were, and the copies the rebase
-/// makes of pushed, published or tagged releases are abandoned unless something
-/// rests on
-/// them. After a bare rebase, members whose pull requests landed and carry
-/// nothing more are dropped — the work reaches the release through its new
-/// base — unless `--no-drop` keeps them.
+/// Each member branch's commits that the target's history does not hold move
+/// onto the target, and the release merge moves with them, member bookmarks
+/// following their rewritten commits — recorded conflict resolutions replay
+/// as ordinary rebase semantics. A member that the target's history holds
+/// does not move. The upstream base is never a release parent; this is how
+/// the release's members change theirs. A cut deliberately does not do this:
+/// which upstream commit to move onto, and whether to move at all, is a
+/// judgment. A published release in hand is refused
+/// ([`release::published_release`]). Every other release name that is pushed
+/// or published is put back on its commit, and one never pushed follows its
+/// rewrite; tags stay where they were, and the copies the rebase makes of
+/// pushed, published or tagged releases are abandoned unless something rests
+/// on them. After a bare rebase, the members whose pull requests landed and
+/// that carry nothing more are dropped, unless `--no-drop` keeps them. A
+/// flat release has no base parent, so the target reaches it only through a
+/// parent on the target: a member, or a carrier (an earlier write of the
+/// release), which the drop leaves out. Where no other member is on the
+/// target, the drop keeps the landed members that are; where none is, it
+/// refuses and writes nothing ([`drop_landed_members_in`]).
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -81,19 +87,6 @@ pub(crate) fn run_rebase(
         println!("{repo}: no release to move");
         return Ok(Exit::Ok);
     };
-    // Each release of a stacked series is one merge of the previous release
-    // and its members, built on that release: there is no base to move, and
-    // a rebase would move the previous release's own commits under it.
-    if entry.stacked() {
-        println!(
-            "{repo}: refusing to rebase {}: the {} is stacked, so each release is built on its \
-             previous release and there is no base to move; `include` or `advance` a member \
-             rebased by hand instead",
-            inline_human_text(&release_name),
-            entry.series_label()
-        );
-        return Ok(Exit::Incomplete);
-    }
     if !release_is_locally_movable(&opened, repo, &release_name) {
         return Ok(Exit::Incomplete);
     }
@@ -134,7 +127,6 @@ pub(crate) fn run_rebase(
     let writes = EarlierWrites::read(&opened, &release_name, &ledger, plan.published.as_ref())?;
     // A release that carries a change knives did not write or adopt would
     // carry it onto the new base unmeasured, as every write would.
-    let tips = opened.bookmark_tips()?;
     let in_hand = release::InHand {
         repo: &opened,
         ledger: &ledger,
@@ -142,7 +134,6 @@ pub(crate) fn run_rebase(
         commit: &release_commit,
         writes: &writes,
         published: plan.published.as_ref(),
-        tips: &tips,
     };
     let unchecked =
         match refuse_edit_in_hand((repo, "rebase"), entry, &in_hand, ("rebasing", "rebase"))? {
@@ -303,12 +294,13 @@ pub(crate) fn run_rebase(
                 inline_human_text(name)
             );
         }
-        let (rebased_commit, rebased, recorded) = report_rebased_release(
+        let (rebased_commit, rebased, recorded, conflicted) = report_rebased_release(
             fork,
             RebasedRelease {
                 name: &release_name,
                 reference: &reference,
                 onto: &onto,
+                members: &members,
                 shed,
                 before: &before_rebase,
                 shed_unions,
@@ -381,13 +373,15 @@ pub(crate) fn run_rebase(
         report_hidden(repo, &release_name, &cleaned.hidden);
         recorded?;
         if no_drop {
-            return Ok(Exit::Ok);
+            return Ok(members_exit(&conflicted));
         }
         // What it drops next is dropped from the rebase's own write, so its
-        // event carries the same mark as the rebase's.
+        // event carries the same mark as the rebase's. The members the move
+        // left conflicted go with it: when the drop writes, its report ends
+        // the command and names them.
         drop_landed_members(
             fork,
-            (&release_name, &destination),
+            (&release_name, &destination, &conflicted),
             (bound, &unchecked, last),
         )
     })
@@ -645,7 +639,8 @@ fn existing_rebase_exit(input: ExistingRebaseInput<'_>) -> anyhow::Result<Option
         drop_landed_members_in(
             fork,
             (opened, writes),
-            (release_name, destination),
+            // Nothing moved, so no member was left conflicted by a move.
+            (release_name, destination, &[]),
             (bound, unchecked, last),
         )
     })
@@ -878,14 +873,19 @@ fn all_landed(
 /// [`drop_landed_members_in`] over the repository as it is now, opened here.
 ///
 /// With no landed tip a parent of the release there is nothing to drop, so
-/// the release's earlier writes are not read.
+/// the release's earlier writes are not read, and the rebase's own report
+/// ends the command: the exit is [`members_exit`] of `conflicted`.
 fn drop_landed_members(
     fork: &Fork<'_>,
-    (release_name, destination): (&str, &RebaseDestination),
+    (release_name, destination, conflicted): (
+        &str,
+        &RebaseDestination,
+        &[release::ConflictedMember],
+    ),
     (bound, unchecked, last): (Bound<'_>, &str, &mut Option<release::ReportedWrite>),
 ) -> anyhow::Result<Exit> {
     if destination.landed.is_empty() {
-        return Ok(Exit::Ok);
+        return Ok(members_exit(conflicted));
     }
     let opened = knives::jj::Repo::open(&fork.checkout.path)?;
     let release_parents = opened.parent_commits(release_name)?;
@@ -894,13 +894,13 @@ fn drop_landed_members(
             .local_bookmark_tip(&pull.head_ref_name)
             .is_some_and(|tip| release_parents.contains(&tip))
     }) {
-        return Ok(Exit::Ok);
+        return Ok(members_exit(conflicted));
     }
     let writes = release_writes(fork, &opened, release_name)?;
     drop_landed_members_in(
         fork,
         (&opened, &writes),
-        (release_name, destination),
+        (release_name, destination, conflicted),
         (bound, unchecked, last),
     )
 }
@@ -909,28 +909,46 @@ fn drop_landed_members(
 ///
 /// Only a member carrying nothing past the target is dropped: a branch with
 /// commits beyond its merged pull request still holds undelivered work, and
-/// that is said instead. The drop duplicates the release onto the kept parents,
-/// exactly as `drop` does, so recorded conflict resolutions carry forward, and
-/// leaves out the release's carriers, as every write composing from its
-/// parents does. `opened` is the repository as it is now, and `writes` the
-/// release's earlier writes read from it. `unchecked` is the mark its event
-/// ends with ([`release::unchecked_suffix`]). The release it writes is read
-/// through one opening as soon as the write is done
+/// that is said instead. A flat release has no base parent, so the target
+/// reaches it only through a parent that descends from it: a member, or a
+/// carrier (an earlier write of the release), which the drop leaves out.
+/// Where no other kept parent descends from the target, the drop keeps each
+/// landed member that does, and says why; where no landed member does
+/// either, it refuses and drops nothing ([`keep_the_target`]). Where no
+/// parent would remain, it refuses too. The drop writes the release as a
+/// duplicate onto the kept parents, which keeps every resolution the release
+/// holds. It does not follow `drop`'s rule (spec R11,
+/// `knives::jj::edit_candidate`): a member it drops carries nothing past the
+/// target, so its removal changes no merge of the kept parents. It leaves
+/// out the release's carriers, as every write composing from its parents
+/// does: a carrier never counts as a parent that remains. `opened` is the
+/// repository as it is now, and
+/// `writes` the release's earlier writes read from it. `unchecked` is the
+/// mark its event ends with ([`release::unchecked_suffix`]). The release it
+/// writes is read through one opening as soon as the write is done
 /// ([`release::ReportedWrite`]) and left in `last`, the command's last
-/// write, so a step after the write that fails still leaves it there. It
-/// gives the exit: [`Exit::Ok`] where it wrote.
+/// write, so a step after the write that fails still leaves it there.
+/// `conflicted` are the members the rebase before it moved and left
+/// conflicted, read once after the move; where the drop writes, its report
+/// ends the command and names them. It gives the exit: [`Exit::Incomplete`]
+/// where it refuses, else [`members_exit`] of `conflicted`.
 fn drop_landed_members_in(
     fork: &Fork<'_>,
     (opened, writes): (&knives::jj::Repo, &EarlierWrites),
-    (release_name, destination): (&str, &RebaseDestination),
+    (release_name, destination, conflicted): (
+        &str,
+        &RebaseDestination,
+        &[release::ConflictedMember],
+    ),
     (bound, unchecked, last): (Bound<'_>, &str, &mut Option<release::ReportedWrite>),
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
     let path = &fork.checkout.path;
     let (carriers, parents) = writes.partition(&opened.parent_commits(release_name)?);
-    let mut kept = parents.clone();
-    let mut deltas: Vec<String> = Vec::new();
+    // Each landed member the drop would take out, with its pull request, in
+    // the forge's order.
+    let mut dropped: Vec<(knives::ids::CommitId, &PullRequest)> = Vec::new();
     for pull in &destination.landed {
         let Some(tip) = opened.local_bookmark_tip(&pull.head_ref_name) else {
             continue;
@@ -947,26 +965,26 @@ fn drop_landed_members_in(
             );
             continue;
         }
-        kept.retain(|parent| parent != &tip);
-        deltas.push(format!(
-            "dropped {}: landed upstream as #{}",
-            pull.head_ref_name, pull.number
-        ));
+        dropped.push((tip, pull));
     }
-    if deltas.is_empty() {
-        return Ok(Exit::Ok);
+    if dropped.is_empty() {
+        return Ok(members_exit(conflicted));
     }
     let shown_release = inline_human_text(release_name);
-    if kept.is_empty() {
-        println!(
-            "{repo}: every member of {shown_release} landed; dropping them all would leave it \
-             without a parent, so nothing was dropped"
-        );
+    let Some((kept, delta)) = keep_the_target(
+        (repo, &shown_release, destination),
+        opened,
+        &parents,
+        dropped,
+    )?
+    else {
         return Ok(Exit::Incomplete);
+    };
+    if delta.is_empty() {
+        return Ok(members_exit(conflicted));
     }
     let release = opened.resolve_commit(release_name)?;
     let provenance = release::parent_sources(opened, entry, &entry.release_scheme(), &kept)?;
-    let delta = deltas.join("; ");
     let message = release::composition_message(release_name, &provenance, &delta);
     let written = knives::jj::write_release(
         path,
@@ -1005,9 +1023,117 @@ fn drop_landed_members_in(
     report_replaced(repo, release_name, &written);
     println!(
         "{}",
-        release::conflict_report(release_name, dropped.conflicts(), &written.unions)
+        release::rebase_conflict_report(
+            (repo, release_name),
+            dropped.conflicts(),
+            &written.unions,
+            conflicted
+        )
     );
-    Ok(Exit::Ok)
+    Ok(members_exit(conflicted))
+}
+
+/// The parents the landed drop keeps and the delta its write records, or
+/// `None` after a refusal, which writes nothing.
+///
+/// `parents` are the release's members, its carriers left out: a carrier
+/// never counts as a parent that remains. `dropped` are the landed members
+/// the drop would take out, each with its pull request, in the forge's
+/// order. Where no parent would remain, the drop refuses. A flat release
+/// has no base parent, so the target reaches it only through a parent that
+/// descends from the target or is it: a member, or a carrier (an earlier
+/// write of the release), which the drop leaves out. Where a kept member
+/// does, every landed member goes. Where none does, the landed members that
+/// descend from the target stay, named in one line, and the others go; with
+/// none left to go, the delta is empty and nothing is written. Where no
+/// landed member descends from it either, as where only a carrier is on the
+/// target, the drop refuses.
+fn keep_the_target(
+    (repo, shown_release, destination): (&RepoName, &str, &RebaseDestination),
+    opened: &knives::jj::Repo,
+    parents: &[knives::ids::CommitId],
+    dropped: Vec<(knives::ids::CommitId, &PullRequest)>,
+) -> anyhow::Result<Option<(Vec<knives::ids::CommitId>, String)>> {
+    let kept = parents_left(parents, &dropped);
+    if kept.is_empty() {
+        println!(
+            "{repo}: every member of {shown_release} landed; dropping them all would leave it \
+             without a parent, so nothing was dropped"
+        );
+        return Ok(None);
+    }
+    let onto = &destination.onto;
+    let mut carried = false;
+    for parent in &kept {
+        if opened.is_ancestor(onto, parent)? {
+            carried = true;
+            break;
+        }
+    }
+    if carried {
+        return Ok(Some((kept, dropped_delta(&dropped))));
+    }
+    let (mut on_target, mut rest) = (Vec::new(), Vec::new());
+    for landed in dropped {
+        if opened.is_ancestor(onto, &landed.0)? {
+            on_target.push(landed);
+        } else {
+            rest.push(landed);
+        }
+    }
+    // The target is the caller's argument or a commit id this run resolved.
+    let target = &destination.reference;
+    if on_target.is_empty() {
+        println!(
+            "{repo}: no member of {shown_release} would carry {target}: dropping {} would take \
+             {target}'s changes out of it, so nothing was dropped",
+            shown_branches(&rest)
+        );
+        return Ok(None);
+    }
+    println!(
+        "{repo}: kept {}: no member but the landed ones is on {target}; dropping them would \
+         take {target}'s changes out of {shown_release}",
+        shown_branches(&on_target)
+    );
+    Ok(Some((parents_left(parents, &rest), dropped_delta(&rest))))
+}
+
+/// `parents` less each landed member in `dropped`, in parent order.
+fn parents_left(
+    parents: &[knives::ids::CommitId],
+    dropped: &[(knives::ids::CommitId, &PullRequest)],
+) -> Vec<knives::ids::CommitId> {
+    parents
+        .iter()
+        .filter(|parent| !dropped.iter().any(|(tip, _)| tip == *parent))
+        .cloned()
+        .collect()
+}
+
+/// The delta the release records for the landed members it drops, empty
+/// for none.
+fn dropped_delta(dropped: &[(knives::ids::CommitId, &PullRequest)]) -> String {
+    dropped
+        .iter()
+        .map(|(_, pull)| {
+            format!(
+                "dropped {}: landed upstream as #{}",
+                pull.head_ref_name, pull.number
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The head branches of `landed`, as a line shows them. Each is the forge's
+/// name for it, a ref a remote gave.
+fn shown_branches(landed: &[(knives::ids::CommitId, &PullRequest)]) -> String {
+    landed
+        .iter()
+        .map(|(_, pull)| inline_human_text(&pull.head_ref_name))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A composition rebase that just happened: what moved, and onto what.
@@ -1015,6 +1141,9 @@ struct RebasedRelease<'a> {
     name: &'a str,
     reference: &'a str,
     onto: &'a knives::ids::CommitId,
+    /// The release's members before the move. A member that the target's
+    /// history already held keeps its commit, so it did not move.
+    members: &'a [knives::ids::CommitId],
     shed: usize,
     /// The release commit the rebase moved: what the fork had before it.
     before: &'a knives::ids::CommitId,
@@ -1030,9 +1159,11 @@ struct RebasedRelease<'a> {
 /// The release it writes is read through one opening as soon as the write is
 /// done ([`release::ReportedWrite`]) and left in `last`, the command's last
 /// write, so a step after the write that fails still leaves it there; it
-/// gives that write's commit, its reading, and the record's result. A failed
-/// record stops neither the report nor the caller's cleanup of the rebase's
-/// copies: the caller returns its error after that cleanup.
+/// gives that write's commit, its reading, the record's result, and the
+/// members the move left conflicted ([`conflicted_moved_members`]), which
+/// its report names. A failed record stops neither the report nor the
+/// caller's cleanup of the rebase's copies: the caller returns its error
+/// after that cleanup.
 fn report_rebased_release<'w>(
     fork: &Fork<'_>,
     rebased: RebasedRelease<'_>,
@@ -1042,6 +1173,7 @@ fn report_rebased_release<'w>(
     knives::ids::CommitId,
     &'w release::ReportedWrite,
     anyhow::Result<()>,
+    Vec<release::ConflictedMember>,
 )> {
     let repo = &fork.name;
     let entry = fork.entry;
@@ -1051,6 +1183,7 @@ fn report_rebased_release<'w>(
     let new_parents = reopened.parent_commits(rebased.name)?;
     let provenance =
         release::parent_sources(&reopened, entry, &entry.release_scheme(), &new_parents)?;
+    let conflicted = conflicted_moved_members(&reopened, &provenance, rebased.members)?;
     let delta = format!("rebased onto {}", rebased.reference);
     let message = release::composition_message(rebased.name, &provenance, &delta);
     let (described, described_unions) = knives::jj::describe_release(
@@ -1101,9 +1234,55 @@ fn report_rebased_release<'w>(
     );
     println!(
         "{}",
-        release::conflict_report(rebased.name, written.conflicts(), &unions)
+        release::rebase_conflict_report(
+            (repo, rebased.name),
+            written.conflicts(),
+            &unions,
+            &conflicted
+        )
     );
-    Ok((described, written, recorded))
+    Ok((described, written, recorded, conflicted))
+}
+
+/// Each member the move rebased whose new tip holds a conflict, with that
+/// tip's conflicted files, read once, right after the move.
+///
+/// `provenance` names each parent of the moved release ([`release::parent_sources`]:
+/// its branch, or its short commit id where no bookmark holds it). A parent
+/// that is among `before`, the members before the move, kept its commit:
+/// the target's history already held it, so the move did not touch it.
+fn conflicted_moved_members(
+    opened: &knives::jj::Repo,
+    provenance: &[(String, knives::ids::CommitId)],
+    before: &[knives::ids::CommitId],
+) -> Result<Vec<release::ConflictedMember>, knives::jj::JjError> {
+    let mut conflicted = Vec::new();
+    for (name, tip) in provenance {
+        if before.contains(tip) {
+            continue;
+        }
+        let files = opened.conflicted_files(tip.as_str())?;
+        if !files.is_empty() {
+            conflicted.push(release::ConflictedMember {
+                name: name.clone(),
+                files,
+            });
+        }
+    }
+    Ok(conflicted)
+}
+
+/// The exit a rebase gives once its writes are done.
+///
+/// It is [`Exit::Findings`] where the move left a member conflicted, which
+/// a person resolves on its branch, else [`Exit::Ok`]. A conflicted release
+/// with no conflicted member is reported, and exits [`Exit::Ok`].
+const fn members_exit(conflicted: &[release::ConflictedMember]) -> Exit {
+    if conflicted.is_empty() {
+        Exit::Ok
+    } else {
+        Exit::Findings
+    }
 }
 
 /// What a rebase unioned, said once for its two writes: every union the

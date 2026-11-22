@@ -68,26 +68,52 @@ fn an_unknown_key_in_an_entry_warns_and_is_ignored() {
 }
 
 #[test]
-fn a_series_reads_its_stacked_key() {
-    // Given: an upstream with a second base, `old`, and a registry whose series
-    // on it sets `stacked = true`.
+fn a_series_table_that_still_sets_stacked_warns_and_is_ignored() {
+    // Given: an upstream with a second base, `9.2`, and a registry whose
+    // series on it still sets `stacked = true`, a key no knives reads.
     let lab = Lab::new();
-    lab.upstream_branch("old", "old.txt", "old base\n");
-    lab.advance_upstream("new base\n");
+    lab.upstream_branch("9.2", "base.txt", "base 9.2\n");
     let (home, _consumer) = release_test_home(&lab);
     let registry = home.path().join("repos.toml");
     let mut text = std::fs::read_to_string(&registry).expect("read registry");
-    text.push_str("\n[repos.demo.series.old]\nbase = \"old\"\nstacked = true\n");
+    text.push_str("\n[repos.demo.series.\"9.2\"]\nbase = \"9.2\"\nstacked = true\n");
     std::fs::write(&registry, text).expect("write registry");
+    let line = format!(
+        "knives: warning: {}: [repos.demo.series.\"9.2\"] has an unknown key stacked; it is \
+         ignored\n",
+        registry.display()
+    );
+    let scan_home = tempfile::tempdir().expect("scan home");
+    let outside = tempfile::tempdir().expect("outside");
+
+    // When: the listing runs.
+    let listing = lab::knives_command(
+        outside.path(),
+        home.path(),
+        scan_home.path(),
+        &["--json", "repos"],
+    )
+    .output()
+    .expect("run knives");
+
+    // Then: it exits 0 with one JSON document on standard output that lists
+    // the entry, and standard error names the key and its table once, with
+    // the series name quoted as the file writes it.
+    let stdout = String::from_utf8_lossy(&listing.stdout);
+    let stderr = String::from_utf8_lossy(&listing.stderr);
+    assert_eq!(listing.status.code(), Some(0), "{stdout}\n{stderr}");
+    let report: Value = serde_json::from_str(&stdout).expect("json document");
+    assert_eq!(report["repos"][0]["name"], "demo", "{report}");
+    assert_eq!(stderr.matches(&line).count(), 1, "{line}: {stderr}");
 
     // When: the series' release plan runs.
-    let plan = knives_release(&lab, &home, &["--series", "old"]);
+    let plan = knives_release(&lab, &home, &["--series", "9.2"]);
 
-    // Then: the registry loads with no warning, and the plan answers for the
-    // series.
+    // Then: it exits 0, names the key once the same way, and answers for
+    // the series.
     let stdout = String::from_utf8_lossy(&plan.stdout);
     let stderr = String::from_utf8_lossy(&plan.stderr);
     assert_eq!(plan.status.code(), Some(0), "{stdout}\n{stderr}");
-    assert!(!stderr.contains("knives: warning"), "{stderr}");
-    assert!(stdout.contains("series old has no cut yet"), "{stdout}");
+    assert_eq!(stderr.matches(&line).count(), 1, "{line}: {stderr}");
+    assert!(stdout.contains("series 9.2 has no cut yet"), "{stdout}");
 }

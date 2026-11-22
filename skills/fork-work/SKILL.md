@@ -64,6 +64,7 @@ Shipping a fork member is part of the same work:
 1. `knives start <branch> --why "what you are doing"` claims the branch and opens a jj workspace on it. Work only there. A `start` that pauses is waiting for another agent's claim lock: let it finish.
 2. When your active work stops, also to wait for review, run `knives finish <branch>`. It returns the claim and removes the workspace; jj keeps the work by change id, and the branch, bookmark and PR stay.
 3. A subagent that runs as a session of its own runs knives with `KNIVES_OWNER` set to its parent's owner name (the parent reads it from its claim in `knives status` and passes it on), so its `knives start <branch>` resumes the parent's claim. The parent never releases its claim for the subagent.
+4. For a release name, `knives start <release name>` takes the release claim. Its workspace rests on the root commit, not on a release commit. A hand resolution on the release commit follows step 2 of `maintaining-fork-release`'s `references/release-wide-writes.md`.
 
 ## 6. Never improvise
 

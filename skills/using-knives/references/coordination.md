@@ -1,6 +1,6 @@
 # Fetching, claiming and stating work
 
-Read this before `sync`, `preflight`, `start`, `finish`, `track` or `depends`, and when a command waits on a lock. These change local state. `start` puts an existing branch on its tip, with `@` an empty child, and a new branch on the release's shared base (the upstream trunk when no release exists).
+Read this before `sync`, `preflight`, `start`, `finish`, `track` or `depends`, and when a command waits on a lock. These change local state. `start` puts an existing branch on its tip, with `@` an empty child, and a new branch on the release's shared base (the upstream trunk when no release exists). A release name is the exception: `start <release name>` takes the release claim, and its workspace's `@` is a new empty commit whose parent is the root commit, not a child of the release.
 
 ## `knives sync [REPO|--all]`
 

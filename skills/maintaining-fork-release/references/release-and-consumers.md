@@ -12,7 +12,7 @@ Read this whenever you do step 5. Do the five stages in order.
    - Before any parent leaves the candidate, read [drop-sweep.md](drop-sweep.md) and finish its sweep for every leaving parent, not only those a reviewer named. Without a finished sweep, keep the parent or its rebuild.
    - A heading, `--why`, `--allow-drop`, the drop note or a quiet orphan gate says nothing about the content behind a parent. A member's own content can be superseded while a line that reaches the release only through it is not.
 3. **Verify the composed candidate.** Run all applicable gates, exercise the changed public surface, and verify every member and integration resolution.
-   - Before you publish, run the resolution-delta guard. Each later write carries a recorded resolution forward, so a whole-file restore from one parent silently reverts the other parents' content in that file.
+   - Before you publish, run the resolution-delta guard. A cut and a rebase carry a recorded resolution forward. An edit (`include`, `drop`, `advance`) carries it only where the same conflict comes back. It also keeps what the duplicate writes in a release log whose conflict the release-log union joins, and in a file whose every conflict hunk the release still leaves open. Elsewhere it writes the plain merge of the new parents and names the file where that changed it. So a whole-file restore from one parent silently reverts the other parents' content in that file wherever it is carried.
 
      ```sh
      t=$(mktemp -d)                                                 # scratch outside the checkout, so jj does not snapshot it
