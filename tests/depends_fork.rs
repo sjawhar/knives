@@ -3,6 +3,8 @@
 //! member branch of the fork, and the record says which. A number both
 //! repositories have is refused, never guessed, and a requirement recorded
 //! wrongly can be taken back or corrected by an entry every machine reads.
+//! `knives track --pr` states an upstream pull request, and refuses the
+//! number of one only the fork has.
 
 #![allow(
     clippy::expect_used,
@@ -44,12 +46,13 @@ const REGISTRY_ORIGIN: &str = "https://forge.invalid/acme-old/demo";
 /// A fork with a dependent branch, `feat/alpha`, and member branches
 /// `feat/base` and `feat/landed` (whose content upstream's trunk has); its
 /// config home; and a forge ([`install_forge`]) on which the upstream has
-/// pull requests #7 and #12; the fork's own repository has, from `acme`'s
+/// pull requests #7 and #12 (`track`'s tests add #16 and #17 by
+/// [`Fixture::forge`]); the fork's own repository has, from `acme`'s
 /// branches, #12 (head `feat/alpha`), #13 (head `feat/base`), #14 (head
-/// `feat/landed`), #15 (merged, head `feat/base`), #21 (head `main`, at its
-/// commit) and #22 (merged into `review/base`, head `feat/gone`, a branch
-/// no longer here), and #20 from `bob`'s `main` (at its commit); and a
-/// sibling fork, whose own repository
+/// `feat/landed`), #15 (merged, head `feat/base`), #16 and #17 (head
+/// `feat/alpha`), #21 (head `main`, at its commit) and #22 (merged into
+/// `review/base`, head `feat/gone`, a branch no longer here), and #20 from
+/// `bob`'s `main` (at its commit); and a sibling fork, whose own repository
 /// `acme/sibling` has #5 (head `sib/feature`) and #6 (head `feat/landed`, the
 /// sibling's own branch of that name).
 struct Fixture {
@@ -203,11 +206,13 @@ fn install_forge(shim: &Path, log: &Path, state: &ForgeState) {
         )
     };
     let fork_pulls = format!(
-        "[{},{},{},{},{},{},{}]",
+        "[{},{},{},{},{},{},{},{},{}]",
         at(12, "OPEN", "feat/alpha", "acme"),
         at(13, "OPEN", "feat/base", "acme"),
         at(14, "OPEN", "feat/landed", "acme"),
         at(15, "MERGED", "feat/base", "acme"),
+        review(16, "OPEN", "feat/alpha", "acme"),
+        review(17, "OPEN", "feat/alpha", "acme"),
         at(20, "OPEN", "main", "bob"),
         at(21, "OPEN", "main", "acme"),
         pull_record_with_fields(
@@ -839,6 +844,160 @@ fn forgetting_a_number_two_requirements_answer_to_is_refused_naming_both() {
         &["--forget", "demo#12"],
         &["maintainer/demo#12", "origin:acme/demo#12"],
     );
+}
+
+#[test]
+fn track_refuses_a_number_only_the_forks_own_repository_has() {
+    // Given: #13 is a review pull request on the fork only, #99 is on neither.
+    let fixture = fixture();
+
+    // When / Then: `track` states the upstream pull request a branch becomes,
+    // so each is refused, the first naming the fork's pull request it is,
+    // and nothing is written.
+    for (number, reason) in [
+        ("13", "acme/demo#13"),
+        (
+            "99",
+            "neither maintainer/demo nor acme/demo has a pull request #99",
+        ),
+    ] {
+        let output = fixture.knives(&["--text", "track", "feat/alpha", "--pr", number]);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "#{number}: {}",
+            said(&output)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(reason), "#{number}: {stderr}");
+    }
+    assert!(fixture.entries().is_empty(), "{:?}", fixture.entries());
+}
+
+#[test]
+fn track_refuses_a_number_whose_fork_pull_request_is_the_branchs_own() {
+    // Given: #12 is on both: the upstream's, head upstream-twelve, belongs to
+    // someone else, and the fork's has feat/alpha as its head.
+    let fixture = fixture();
+
+    // When: feat/alpha is said to be #12.
+    let output = fixture.knives(&["--text", "track", "feat/alpha", "--pr", "12"]);
+
+    // Then: refused, naming both pull requests: #12 is feat/alpha's review
+    // pull request on the fork, not the upstream one it becomes.
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for named in ["maintainer/demo#12", "upstream-twelve", "acme/demo#12"] {
+        assert!(stderr.contains(named), "{named}: {stderr}");
+    }
+    assert!(fixture.entries().is_empty(), "{:?}", fixture.entries());
+}
+
+#[test]
+fn track_reads_the_checkouts_origin_as_status_and_depends_do() {
+    // Given: the checkout's `origin` remote names the fork's own repository,
+    // acme/demo, and the registry names another live one, acme/other, with
+    // no pull requests. The fork's #12 has feat/alpha as its head; the
+    // upstream's #12 is someone else's.
+    let fixture = fixture_with(ORIGIN, "https://forge.invalid/acme/other");
+
+    // When: feat/alpha is said to be #12.
+    let output = fixture.knives(&["--text", "track", "feat/alpha", "--pr", "12"]);
+
+    // Then: #12 is judged on the repository the checkout names, as `status`
+    // and `depends` judge it: feat/alpha's own review pull request, refused.
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("acme/demo#12"), "{stderr}");
+    assert!(fixture.entries().is_empty(), "{:?}", fixture.entries());
+}
+
+#[test]
+fn track_falls_back_to_the_registry_when_the_checkouts_origin_is_a_local_path() {
+    // Given: the checkout's `origin` remote is a local path, which names no
+    // forge repository; the registry names the fork's own repository,
+    // acme/demo, whose #12 has feat/alpha as its head.
+    let fixture = fixture_on(UPSTREAM, "", ORIGIN);
+
+    // When: feat/alpha is said to be #12.
+    let output = fixture.knives(&["--text", "track", "feat/alpha", "--pr", "12"]);
+
+    // Then: the check still runs, on the registry's repository: refused.
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("acme/demo#12"), "{stderr}");
+    assert!(fixture.entries().is_empty(), "{:?}", fixture.entries());
+}
+
+#[test]
+fn track_judges_a_head_by_the_forges_owner_not_a_former_one() {
+    // Given: the registry still spells the fork's own repository by its
+    // former owner, acme-old; the forge names it acme/demo. #17 is on both:
+    // the upstream's has acme-old's branch feat/alpha as its head, the fork's
+    // has acme's feat/alpha.
+    let fixture = fixture();
+    fixture.forge(&[review(17, "MERGED", "feat/alpha", "acme-old")]);
+
+    // When: feat/alpha is said to be #17.
+    let output = fixture.knives(&["--text", "track", "feat/alpha", "--pr", "17"]);
+
+    // Then: the former owner's same-named branch is not feat/alpha's: #17
+    // is its review pull request on the fork, and is refused, naming both.
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for named in ["maintainer/demo#17", "acme-old:feat/alpha", "acme/demo#17"] {
+        assert!(stderr.contains(named), "{named}: {stderr}");
+    }
+    assert!(fixture.entries().is_empty(), "{:?}", fixture.entries());
+}
+
+#[test]
+fn track_refuses_a_number_whose_upstream_head_only_shares_the_branchs_name() {
+    // Given: #16 is on both: the upstream's has bob's branch feat/alpha as its
+    // head, and the fork's has acme's feat/alpha.
+    let fixture = fixture();
+    fixture.forge(&[review(16, "OPEN", "feat/alpha", "bob")]);
+
+    // When: feat/alpha is said to be #16.
+    let output = fixture.knives(&["--text", "track", "feat/alpha", "--pr", "16"]);
+
+    // Then: the shared name does not make the upstream's #16 feat/alpha's:
+    // refused, naming both, as for any other head.
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for named in ["maintainer/demo#16", "acme/demo#16"] {
+        assert!(stderr.contains(named), "{named}: {stderr}");
+    }
+    assert!(fixture.entries().is_empty(), "{:?}", fixture.entries());
+}
+
+#[test]
+fn track_states_a_number_the_upstream_has() {
+    // Given: #7 is on the upstream only; #12 is on both, and the fork's #12
+    // is feat/alpha's, not feat/base's.
+    let fixture = fixture();
+
+    // When: #7 is stated for feat/alpha, and #12 for feat/base, a branch
+    // carrying someone else's upstream pull request.
+    let mut said_lines = Vec::new();
+    for (branch, number) in [("feat/alpha", "7"), ("feat/base", "12")] {
+        let output = fixture.knives(&["--text", "track", branch, "--pr", number]);
+        assert!(output.status.success(), "#{number}: {}", said(&output));
+        said_lines.push(
+            String::from_utf8_lossy(&output.stdout)
+                .trim_end()
+                .to_owned(),
+        );
+    }
+
+    // Then: both are recorded, as `track` reads a number: the upstream's.
+    assert_eq!(
+        said_lines,
+        ["demo/feat/alpha is #7", "demo/feat/base is #12"]
+    );
+    let live = Statements::from_entries(&fixture.entries());
+    assert_eq!(live.pull("feat/alpha"), Some(7));
+    assert_eq!(live.pull("feat/base"), Some(12));
 }
 
 /// The details of a status report's findings of `kind`; a report with no

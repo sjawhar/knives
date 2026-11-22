@@ -379,13 +379,17 @@ pub enum Command {
     /// State which pull request a branch belongs to, overriding inference.
     ///
     /// Inference finds an open pull request from our own copy of the repository, which
-    /// is a sensible default and a bad rule. This accepts any number in any state from
-    /// any author: one opened before this tool existed, one the maintainer closed
-    /// because they wanted a different approach, or somebody else's that we are
-    /// carrying because ours was superseded.
+    /// is a sensible default and a bad rule. This accepts any upstream pull request in
+    /// any state from any author: one opened before this tool existed, one the
+    /// maintainer closed because they wanted a different approach, or somebody else's
+    /// that we are carrying because ours was superseded. The number is asked of the
+    /// forge, because the fork's own repository numbers its review pull requests
+    /// apart: refused when the fork's pull request of that number has this branch
+    /// as its head and the upstream's does not, when only the fork has the number,
+    /// and when neither has it.
     Track {
         branch: String,
-        /// The pull request number.
+        /// The upstream pull request's number.
         #[arg(long = "pr")]
         pr: Option<u64>,
         /// This branch deliberately has no upstream pull request. Recorded so it does
