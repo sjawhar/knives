@@ -615,6 +615,70 @@ fn carries_reads_a_fast_forwarded_revision_from_the_trunk_commit_its_release_sta
     assert_eq!(carried.status.code(), Some(0), "{}", text(&carried));
 }
 
+#[test]
+fn carries_reads_a_fast_forwarded_revision_whole_against_a_release_of_unrelated_history() {
+    // Given: X forks at the trunk, which holds `README.md` and `l.txt`, and
+    // writes two lines of `x.txt`; upstream fast-forwards its trunk to X, so
+    // X's tip is on the trunk's first-parent line; a release made by hand of
+    // a member of an unrelated history, which holds X's `x.txt` and no other
+    // file.
+    let lab = trunk_with(&[("l.txt", l_txt("0").as_str())]);
+    member_on(&lab, "main@upstream", X, &[("x.txt", X_LINES)]);
+    lab.publish_pull(X, 1);
+    lab.fast_forward_pull(1);
+    member_on(&lab, "root()", "feat/x-alone", &[("x.txt", X_LINES)]);
+    let lacking = hand_release(&lab, RELEASE, &["feat/x-alone"], |_| {});
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: X's carriage is asked against that release.
+    let output = carries_against(&lab, &home, RELEASE, X);
+
+    // Then: the release's parents hold no commit of X's first-parent line
+    // but the root commit, so X's base is the root commit and X's whole tree
+    // is its change: the release does not carry X, with the findings exit.
+    // The lines of the trunk's files that the release lacks are named, and
+    // X's own lines, which it holds, are not.
+    let out = stdout(&output);
+    assert!(
+        out.contains(&not_carried(RELEASE, &lacking)),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
+    for line in [
+        "README.md:1: added line lost ‹seed›",
+        "l.txt:1: added line lost ‹first›",
+        "l.txt:2: added line lost ‹L = 0›",
+        "l.txt:3: added line lost ‹last›",
+    ] {
+        assert!(out.contains(line), "{out}");
+    }
+    assert!(!out.contains("x.txt:"), "{out}");
+
+    // Given: a release of a member of an unrelated history that holds X's
+    // whole tree.
+    member_on(
+        &lab,
+        "root()",
+        "feat/x-whole",
+        &[
+            ("README.md", "seed\n"),
+            ("l.txt", l_txt("0").as_str()),
+            ("x.txt", X_LINES),
+        ],
+    );
+    let holding = hand_release(&lab, NEXT, &["feat/x-whole"], |_| {});
+
+    // When/Then: X reads carried against it.
+    let carried = carries_against(&lab, &home, NEXT, X);
+    assert!(
+        stdout(&carried).contains(&carried_rewritten(NEXT, &holding)),
+        "{}",
+        text(&carried)
+    );
+    assert_eq!(carried.status.code(), Some(0), "{}", text(&carried));
+}
+
 /// K11 (20b): the trunk at an older commit, returned; then it moves to T1,
 /// where X forks and writes `x.txt` and Y forks and writes `y.txt`; Y
 /// merges X; the trunk moves to T2; and upstream merges Y's pull request by

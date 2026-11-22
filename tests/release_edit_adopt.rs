@@ -2,18 +2,21 @@
 //! conflict the release resolved (spec R11).
 //!
 //! An edit keeps the release's resolution of a conflict only where the plain
-//! merge of the new parents leaves the same conflict there. Everywhere else
-//! it writes that plain merge, names the file where that changed it, and
-//! says whether the file holds a conflict. The conflict is read from the
-//! plain merge of the release in hand's own parents, so the rule holds
-//! whether or not an adopt recorded the resolution. A release log whose
-//! conflict the release-log union joins is left to the union. The shape is
-//! INFRA-4895's drop-after-adopt probe: M adds a file of its own, D sets
-//! lines 5 and 6 of `f`, and A, made after the first cut, sets line 5 as D
-//! does. Before anything is written, the edit checks what it would write:
-//! where it would lose a remaining member's line away from any conflict it
-//! leaves, it writes nothing and exits 3, unless `--allow-loss` gives a
-//! reason. These tests drive only the knives binary.
+//! merge of the new parents leaves the same conflict there. Two other kinds
+//! of file keep what the duplicate writes in them: a `CHANGELOG.md` or
+//! `RELEASE_NOTES.md` whose conflict the release-log union joins, which is
+//! left to the union, and a file whose every conflict hunk the release still
+//! leaves open, with the sides it had. Everywhere else the edit writes that
+//! plain merge, names the file where that changed it, and says whether the
+//! file holds a conflict. The conflict is read from the plain merge of the
+//! release in hand's own parents, so the rule holds whether or not an adopt
+//! recorded the resolution. The shape is INFRA-4895's drop-after-adopt
+//! probe: M adds a file of its own, D sets lines 5 and 6 of `f`, and A,
+//! made after the first cut, sets line 5 as D does. Before anything is
+//! written, the edit checks what it would write: where it would lose a
+//! remaining member's line away from any conflict it leaves, it writes
+//! nothing and exits 3, unless `--allow-loss` gives a reason. These tests
+//! drive only the knives binary.
 
 #![allow(
     clippy::expect_used,
@@ -1768,6 +1771,47 @@ fn an_edit_and_an_adopt_read_a_fast_forwarded_member_from_a_parent_below_it() {
         "{out}"
     );
     assert!(has_line(&out, &base_line(A, &below)), "{out}");
+}
+
+#[test]
+fn an_advance_past_a_fast_forwarded_tip_reads_the_member_from_that_tip_and_goes_ahead() {
+    // Given: (20)'s shape, where M and D fork at T0, the trunk commit below
+    // A's first commit; upstream fast-forwards its trunk to A; then A's
+    // branch moves on by a commit that writes a file of its own.
+    let (lab, home) = union_resolved_by_hand(&d_log(), &d_log());
+    lab.publish_pull(A, 1);
+    lab.fast_forward_pull(1);
+    let landed = commit_at(&lab, A);
+    extend_branch(&lab, A, "a2.txt", "a2 line\n");
+    let moved_on = commit_at(&lab, A);
+
+    // When: A is advanced.
+    let output = knives_release(&lab, &home, &["advance", A]);
+
+    // Then: the advance matches A's new tip to the landed tip by the
+    // record. The trunk does not hold the new tip, so the check reads A
+    // from its fork point with the trunk, the landed tip: no line names a
+    // base for A, the check counts nothing, and the advance writes. The
+    // release holds A's new tip in place of the landed one, A's entry once,
+    // inside D's block, and A's new file.
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: {A} matched {} by the last cut or edit record; that parent has landed \
+             upstream, so the branch's tip continues it only by name",
+            landed.short()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains(&format!("  {A}: read from ")), "{out}");
+    assert!(!has_line(&out, &no_base_line(A)), "{out}");
+    assert!(!out.contains("refusing to write"), "{out}");
+    let parents = release_parents(&lab, RELEASE);
+    assert!(parents.contains(&moved_on), "{out}");
+    assert!(!parents.contains(&landed), "{out}");
+    assert_eq!(show(&lab, "CHANGELOG.md"), d_log(), "{out}");
+    assert_eq!(show(&lab, "a2.txt"), "a2 line\n", "{out}");
 }
 
 #[test]

@@ -3380,10 +3380,12 @@ impl CutSubject<'_> {
         }
     }
 
-    /// The subject's parents: the candidate's, which is no commit of the
-    /// repository ([`jj::Candidate::parents`]), or the cut commit's. Where
-    /// the trunk holds a member on its first-parent line, they give its base
-    /// ([`Repo::release_base`]).
+    /// The subject's parents, which [`Repo::release_base`] reads: the
+    /// candidate's, which is no commit of the repository
+    /// ([`jj::Candidate::parents`]), or the cut commit's. Every member of the
+    /// audit is one of them, so for a member that the trunk contains they
+    /// decide ancestry: its base is its tip. They never give such a member a
+    /// base on the trunk's first-parent line.
     fn parents(&self, repo: &Repo) -> anyhow::Result<Vec<CommitId>> {
         match self {
             Self::Candidate(candidate) => Ok(candidate.parents().to_vec()),
@@ -3501,9 +3503,9 @@ pub fn audit_cut(
         let base = match trunk_parent_base {
             Some(base) => base.clone(),
             None => opened.release_base(
-                tip,
-                &opened.change_base(tip, context.upstream_trunk)?,
+                (tip, &opened.change_base(tip, context.upstream_trunk)?),
                 &parents,
+                || opened.taken_in(tip, context.upstream_trunk),
             )?,
         };
         let mut lines = subject.member_lines(&opened, name, (&base, tip))?;
@@ -4423,7 +4425,9 @@ pub fn uncarried_recorded_members(
         // The guard leaves a member that the trunk does not contain, whose
         // base is its fork point with the trunk.
         let change_base = repo.change_base(member, delta.trunk)?;
-        let base = repo.release_base(member, &change_base, delta.parents)?;
+        let base = repo.release_base((member, &change_base), delta.parents, || {
+            repo.taken_in(member, delta.trunk)
+        })?;
         let recorded = recorded_member(member, delta.tips);
         let lines = subject.member_lines(repo, &recorded.name, (&base, member))?;
         match lines.reading {

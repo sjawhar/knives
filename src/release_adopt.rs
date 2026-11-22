@@ -373,9 +373,11 @@ enum Newest {
     ///
     /// Where the write's event bears no `; unchecked:` mark, the commit is
     /// an older recorded write or a hand edit. Adopt then measures the
-    /// commit against the recorded write it replaces ([`Replaced`]), or
-    /// against an automerge where this repository does not hold that write
-    /// ([`release::baseline_write`]). It can exit 1 for lost lines. The
+    /// commit against the recorded write it replaces ([`Replaced`]), and it
+    /// can exit 1 for lost lines. Where this repository does not hold that
+    /// write, or the event that records that write is marked `; unchecked:`,
+    /// adopt measures against an automerge instead
+    /// ([`release::baseline_write`]), and then it cannot exit 1. The newest
     /// event bears no mark, so the record ends none.
     ///
     /// Where the write's event is marked `; unchecked:`, the commit is any
@@ -635,7 +637,7 @@ fn measure<'a>(
         // The commit holds the member as a parent; on the trunk's
         // first-parent line its other parents give the member its base.
         let change_base = held.opened.change_base(tip, &trunk)?;
-        let base = HeldBase::read(&held.opened, (tip, change_base), &held.parents)?;
+        let base = HeldBase::read(&held.opened, (tip, &trunk), change_base, &held.parents)?;
         bases.extend(base.line(member, &held.name));
         if let Some(base) = base.into_commit() {
             forked.push((member.as_str(), tip, base));

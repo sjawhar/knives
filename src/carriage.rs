@@ -27,7 +27,7 @@ use crate::config::Role;
 use crate::detect::{BookmarkTips, RebaseOutcome};
 use crate::forge::{Forge, index_pulls};
 use crate::ids::{BookmarkRef, BranchName, CommitId, CutKey, ReleaseScheme, is_our_release};
-use crate::jj::{ChangeBase, Repo};
+use crate::jj::{ChangeBase, Repo, TakenIn};
 use crate::own_lines::{LostKind, MemberLines, Reading};
 use crate::release_model;
 use crate::snapshot::{self, SnapshotConfig};
@@ -867,6 +867,9 @@ pub struct CheckInput<'a> {
     /// Where the tip's own change starts against the trunk, read once, by
     /// the first release target that needs it.
     change_base: std::cell::OnceCell<ChangeBase>,
+    /// How the trunk took the tip in, where it contains the tip, read once,
+    /// by the first release target that does not reach the tip.
+    taken_in: std::cell::OnceCell<TakenIn>,
 }
 
 impl<'a> CheckInput<'a> {
@@ -882,6 +885,7 @@ impl<'a> CheckInput<'a> {
             tip,
             trunk,
             change_base: std::cell::OnceCell::new(),
+            taken_in: std::cell::OnceCell::new(),
         }
     }
 
@@ -893,6 +897,15 @@ impl<'a> CheckInput<'a> {
         }
         let base = self.repo.change_base(self.tip, self.trunk)?;
         Ok(self.change_base.get_or_init(|| base))
+    }
+
+    /// How the trunk took the tip in ([`Repo::taken_in`]).
+    fn taken_in(&self) -> Result<&TakenIn, crate::jj::JjError> {
+        if let Some(taken_in) = self.taken_in.get() {
+            return Ok(taken_in);
+        }
+        let taken_in = self.repo.taken_in(self.tip, self.trunk)?;
+        Ok(self.taken_in.get_or_init(|| taken_in))
     }
 }
 
@@ -970,7 +983,9 @@ fn release_check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<Carr
     let parents = input.repo.parent_commits(target.commit.as_str())?;
     let base = input
         .repo
-        .release_base(input.tip, input.change_base()?, &parents)?;
+        .release_base((input.tip, input.change_base()?), &parents, || {
+            input.taken_in().cloned()
+        })?;
     let lines = input
         .repo
         .member_lines(input.revision, (&base, input.tip), &target.commit)?;
@@ -992,7 +1007,11 @@ fn release_check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<Carr
                 continue;
             }
             let change_base = input.repo.change_base(&rewrite, input.trunk)?;
-            let base = input.repo.release_base(&rewrite, &change_base, &parents)?;
+            let base = input
+                .repo
+                .release_base((&rewrite, &change_base), &parents, || {
+                    input.repo.taken_in(&rewrite, input.trunk)
+                })?;
             let held =
                 input
                     .repo

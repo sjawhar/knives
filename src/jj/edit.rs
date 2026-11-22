@@ -84,10 +84,15 @@ impl Repo {
 /// before anything is written ([`EditCandidate::lost_lines`]).
 ///
 /// The candidate is [`super::write_release`]'s commit written by spec R11's
-/// rule ([`ruled_tree`]): a file whose conflict the release resolved keeps
-/// that resolution only where the plain merge of the new parents leaves the
-/// same conflict there, and elsewhere it is written as that plain merge.
-/// Then the release-log union runs, as on every write.
+/// rule ([`ruled_tree`]). A `CHANGELOG.md` or `RELEASE_NOTES.md` whose
+/// conflict the release-log union joins keeps what the duplicate writes
+/// there. So does a file whose every conflict hunk the release still leaves
+/// open, with the sides it had. Any other file whose conflict the release
+/// resolved keeps that resolution only where the plain merge of the new
+/// parents leaves the same conflict there. Elsewhere it is written as that
+/// plain merge, and the edit names the file where that changed it
+/// ([`EditCandidate::publish`]). Then the release-log union runs, as on
+/// every write.
 /// [`EditCandidate::publish`] rebuilds it in a fresh transaction, refuses if
 /// the rebuilt tree differs from the checked one, as
 /// [`super::Candidate::publish`] does, and then makes the write as

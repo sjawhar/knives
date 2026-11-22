@@ -828,12 +828,11 @@ fn apply_edit(
         opened,
         &EditRecord {
             release: &release.name,
-            delta,
+            delta: &format!("{delta}{}", loss_event_text(&losses, context.allow_loss)),
             created: &written.commit,
             change: &written.change,
             provenance: &provenance,
             unions: &written.unions,
-            loss: &loss_event_text(&losses, context.allow_loss),
             unchecked: context.unchecked,
         },
         context.bound,
@@ -897,23 +896,27 @@ pub(crate) enum HeldBase {
 
 impl HeldBase {
     /// X's base from `base`, the [`knives::jj::ChangeBase`] of `tip`, X's
-    /// tip, against the trunk. On the trunk's first-parent line it is the
-    /// newest commit of that line that one of `others`, the release's
-    /// parents other than X, holds while it does not contain X's tip
-    /// ([`knives::jj::Repo::line_base`]). A parent that contains X's tip, as
-    /// a member that forks at or after X once a rebase moved it there, says
-    /// nothing about where X began; X's tip itself is such a parent. So the
-    /// base is never X's tip or the root commit.
+    /// tip, against `trunk`. Where the trunk contains X, how the trunk took
+    /// X in gives it ([`knives::jj::Repo::taken_in`]). On the trunk's
+    /// first-parent line it is the newest commit of that line that one of
+    /// `others`, the release's parents other than X, holds while it does not
+    /// contain X's tip ([`knives::jj::Repo::line_base`]). A parent that
+    /// contains X's tip, as a member that forks at or after X once a rebase
+    /// moved it there, says nothing about where X began; X's tip itself is
+    /// such a parent. So the base is never X's tip or the root commit.
     pub(crate) fn read<'p>(
         opened: &knives::jj::Repo,
-        (tip, base): (&CommitId, knives::jj::ChangeBase),
+        (tip, trunk): (&CommitId, &CommitId),
+        base: knives::jj::ChangeBase,
         others: impl IntoIterator<Item = &'p CommitId>,
     ) -> anyhow::Result<Self> {
-        Ok(match base {
-            knives::jj::ChangeBase::Fork(fork) | knives::jj::ChangeBase::Merged(fork) => {
-                Self::Fork(fork)
-            }
-            knives::jj::ChangeBase::OnTrunkLine => {
+        let taken_in = match base {
+            knives::jj::ChangeBase::Fork(fork) => return Ok(Self::Fork(fork)),
+            knives::jj::ChangeBase::Contained => opened.taken_in(tip, trunk)?,
+        };
+        Ok(match taken_in {
+            knives::jj::TakenIn::Merged(fork) => Self::Fork(fork),
+            knives::jj::TakenIn::OnTrunkLine => {
                 let mut holders = Vec::new();
                 for other in others {
                     if !opened.is_ancestor(tip, other)? {
@@ -994,7 +997,8 @@ fn edit_losses(
                 .chain(&release.carriers)
                 .filter(move |parent| Some(*parent) != old)
         };
-        let base = HeldBase::read(opened, (tip, opened.change_base(tip, &trunk)?), others())?;
+        let change_base = opened.change_base(tip, &trunk)?;
+        let base = HeldBase::read(opened, (tip, &trunk), change_base, others())?;
         bases.extend(base.line(label, &release.name));
         let Some(base) = base.into_commit() else {
             continue;
@@ -1003,8 +1007,8 @@ fn edit_losses(
             None => knives::jj::Brought::Nothing,
             Some(None) => knives::jj::Brought::Whole,
             Some(Some(old)) => {
-                let old_base =
-                    HeldBase::read(opened, (old, opened.change_base(old, &trunk)?), others())?;
+                let change_base = opened.change_base(old, &trunk)?;
+                let old_base = HeldBase::read(opened, (old, &trunk), change_base, others())?;
                 old_base
                     .into_commit()
                     .map_or(knives::jj::Brought::Whole, |old_base| {
@@ -1266,20 +1270,20 @@ pub(crate) fn release_writes(
     )?)
 }
 
-/// What one release edit wrote: the name, the delta, the new merge with its
-/// change id, its parent set with the branch each parent came from, the
-/// release logs it unioned, the loss an `--allow-loss` write recorded
-/// ([`loss_event_text`]), and the mark of a release in hand knives could not
-/// check ([`release::unchecked_suffix`]).
+/// What one release edit wrote: the name, the delta with the loss an
+/// `--allow-loss` write recorded after it ([`loss_event_text`]), the new
+/// merge with its change id, its parent set with the branch each parent came
+/// from, the release logs it unioned, and the mark of a release in hand
+/// knives could not check ([`release::unchecked_suffix`]).
 pub(crate) struct EditRecord<'a> {
     pub(crate) release: &'a str,
+    /// The delta, then `; lost: …` and `; why lost: …` where an
+    /// `--allow-loss` write recorded a loss.
     pub(crate) delta: &'a str,
     pub(crate) created: &'a knives::ids::CommitId,
     pub(crate) change: &'a knives::ids::ChangeId,
     pub(crate) provenance: &'a [(String, knives::ids::CommitId)],
     pub(crate) unions: &'a [knives::jj::UnionedFile],
-    /// `; lost: …` and `; why lost: …`, or empty.
-    pub(crate) loss: &'a str,
     pub(crate) unchecked: &'a str,
 }
 
@@ -1289,7 +1293,7 @@ pub(crate) struct EditRecord<'a> {
 /// the written commit, its change id and its parents, and the commit leads the
 /// evidence: it is the position `audit` holds the release against. The release
 /// logs the edit unioned close the text ([`union_event_text`]). The loss an
-/// `--allow-loss` write recorded follows the delta, before the parents.
+/// `--allow-loss` write recorded ends the delta, before the parents.
 pub(crate) fn record_edit_event(
     fork: &Fork<'_>,
     opened: &knives::jj::Repo,
@@ -1314,7 +1318,7 @@ pub(crate) fn record_edit_event(
                     record.release,
                     (record.created, record.change),
                     record.provenance,
-                    &format!("{}{}", record.delta, record.loss)
+                    record.delta
                 ),
                 union_event_text(record.unions),
                 record.unchecked
@@ -1329,8 +1333,8 @@ pub(crate) fn record_edit_event(
 /// (change <id>) with <n> parent(s): <delta>; parents: <provenance>`. A
 /// write's unions and its unchecked mark close the text after it. The delta
 /// an edit's event holds ends with the loss an `--allow-loss` write
-/// recorded ([`record_edit_event`]), so a reason that holds `; unchecked: …`
-/// or `; parents: …` is never read as the event's mark or its parents.
+/// recorded ([`apply_edit`]), so a reason that holds `; unchecked: …` or
+/// `; parents: …` is never read as the event's mark or its parents.
 pub(crate) fn edit_event_text(
     release: &str,
     (created, change): (&knives::ids::CommitId, &knives::ids::ChangeId),

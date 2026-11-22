@@ -486,14 +486,16 @@ hand resolution kept a member's change. The member's own change is the diff from
 with the upstream trunk (`Repo::fork_point`) to its tip, read with no rename detection. So the
 trunk's commits after that fork point are never charged to
 the member, and members that fork at different trunk commits are each measured from their own fork
-point. A revision that the trunk contains is its own fork point, so `Repo::change_base` reads how
-the trunk took it in: `first_ancestors(trunk) & revision::`, one revset, is the chain of the
-trunk's first-parent commits that contain it. Where the oldest of them is a merge, the base is the
-revision's fork point with that merge's first parent (`ChangeBase::Merged`). Where it is the
-revision itself, as after a fast-forward or a direct push (`ChangeBase::OnTrunkLine`), the base
+point. A revision that the trunk contains is its own fork point (`Repo::change_base` reads only
+that the trunk contains it). `Repo::release_base` asks first whether the release reaches such a
+revision: then the release carries it by ancestry, and nothing more is read. Otherwise
+`Repo::taken_in` reads how the trunk took it in: `roots(first_ancestors(trunk) & revision::)`,
+one revset, is the oldest of the trunk's first-parent commits that contain it. Where that commit
+is a merge, the base is the
+revision's fork point with that merge's first parent (`TakenIn::Merged`). Where it is the
+revision itself, as after a fast-forward or a direct push (`TakenIn::OnTrunkLine`), the base
 is the newest commit of the revision's first-parent line, other than the root commit, that one of
-the release's parents holds (`Repo::line_base`; for a cut, its candidate's parents). A release
-that reaches such a revision carries it by ancestry (`Repo::release_base`). The composition gate
+the release's parents holds (`Repo::line_base`; for a cut, its candidate's parents). The composition gate
 keeps its guard: a recorded member that the trunk contains and the subject does not reach is
 dropped with no reading. R11's check and adopt's measure read a member that the trunk contains
 from the same bases, though the release holds it as a parent (`release_edit::HeldBase`). On the

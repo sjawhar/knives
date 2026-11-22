@@ -122,8 +122,18 @@ pub enum ChangeBase {
     /// The trunk does not contain the revision: its fork point with the
     /// trunk ([`Repo::fork_point`]).
     Fork(CommitId),
-    /// The trunk took the revision in by a merge commit, also through another
-    /// branch: its fork point with that merge's first parent.
+    /// The trunk contains the revision. A release that reaches it carries
+    /// it by ancestry; otherwise how the trunk took it in gives its base
+    /// ([`Repo::taken_in`]).
+    Contained,
+}
+
+/// How the trunk took in a revision that it contains (spec R6)
+/// ([`Repo::taken_in`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TakenIn {
+    /// By a merge commit, also through another branch: the revision's fork
+    /// point with that merge's first parent.
     Merged(CommitId),
     /// The revision's tip is on the trunk's first-parent line, as after a
     /// fast-forward or a direct push: the history does not record where the
@@ -793,41 +803,48 @@ impl Repo {
     }
 
     /// Where `revision`'s own change starts against `trunk` (spec R6),
-    /// before the release is known. Where the trunk does not contain the
-    /// revision, its fork point with the trunk. Otherwise the commits of the
-    /// trunk's first-parent line that contain it, `first_ancestors(trunk) &
-    /// revision::`, are read in one evaluation. They form one chain, and its
-    /// oldest commit is the revision itself where the revision is on that
-    /// line. Else it is the merge that took the revision in, and the
-    /// revision's fork point with that merge's first parent is its own.
+    /// before the release is known: one ancestry check, and the fork point
+    /// with the trunk where the trunk does not contain the revision. For a
+    /// revision that the trunk contains it reads no more: a release that
+    /// reaches the revision needs nothing else, so how the trunk took it in
+    /// ([`Self::taken_in`]) is read only by a reader that needs it.
     pub fn change_base(
         &self,
         revision: &CommitId,
         trunk: &CommitId,
     ) -> Result<ChangeBase, JjError> {
-        if !self.is_ancestor(revision, trunk)? {
-            return Ok(ChangeBase::Fork(self.fork_point(revision, trunk)?));
-        }
+        Ok(if self.is_ancestor(revision, trunk)? {
+            ChangeBase::Contained
+        } else {
+            ChangeBase::Fork(self.fork_point(revision, trunk)?)
+        })
+    }
+
+    /// How `trunk`, which contains `revision`, took it in (spec R6). The
+    /// commits of the trunk's first-parent line that contain the revision,
+    /// `first_ancestors(trunk) & revision::`, form one chain, so the root of
+    /// that set is its one oldest commit, read in one evaluation
+    /// ([`Self::first_commit`]). Where that commit is the revision itself,
+    /// the revision is on that line. Else it is the merge that took the
+    /// revision in, and the revision's fork point with that merge's first
+    /// parent is its own.
+    pub fn taken_in(&self, revision: &CommitId, trunk: &CommitId) -> Result<TakenIn, JjError> {
         let tip = self.commit(revision.as_str())?.id().clone();
         let line = ResolvedRevsetExpression::commit(self.commit(trunk.as_str())?.id().clone())
             .first_ancestors()
-            .intersection(&ResolvedRevsetExpression::commit(tip.clone()).descendants());
-        let revision_error = revset_error(revision.as_str());
-        let revset = line.evaluate(self.repo.as_ref()).map_err(revision_error)?;
-        // The stream runs children before parents, so the oldest comes last.
-        let oldest = collect_stream(revset.stream())
-            .into_iter()
-            .try_fold(None, |_, id| id.map(Some))
-            .map_err(revision_error)?
-            .ok_or_else(|| JjError::Revision {
-                revision: revision.as_str().to_owned(),
-                detail: format!(
-                    "no commit of {}'s first-parent line contains it",
-                    trunk.as_str()
-                ),
-            })?;
+            .intersection(&ResolvedRevsetExpression::commit(tip.clone()).descendants())
+            .roots();
+        let oldest =
+            self.first_commit(line, revision.as_str())?
+                .ok_or_else(|| JjError::Revision {
+                    revision: revision.as_str().to_owned(),
+                    detail: format!(
+                        "no commit of {}'s first-parent line contains it",
+                        trunk.as_str()
+                    ),
+                })?;
         if oldest == tip {
-            return Ok(ChangeBase::OnTrunkLine);
+            return Ok(TakenIn::OnTrunkLine);
         }
         let merge = self
             .repo
@@ -843,7 +860,7 @@ impl Repo {
                 revision: oldest.hex(),
                 detail: "a commit that contains another has a parent".to_owned(),
             })?;
-        Ok(ChangeBase::Merged(
+        Ok(TakenIn::Merged(
             self.fork_point(revision, &commit_id(before_merge))?,
         ))
     }
@@ -851,10 +868,11 @@ impl Repo {
     /// The newest commit of `revision`'s own first-parent line, other than
     /// jj's root commit, that one of `holders` contains (spec R6):
     /// `first_ancestors(revision) & ::holders ~ root()`, of which only the
-    /// first commit is read. The line and `::holders` meet in the older end
-    /// of the line, so that commit is the one answer. A holder that reaches
-    /// the revision gives the revision itself. `None` where there is none,
-    /// as where the holders share no commit but the root with the line.
+    /// first commit is read ([`Self::first_commit`]). The line and
+    /// `::holders` meet in the older end of the line, so that commit is the
+    /// one answer. A holder that reaches the revision gives the revision
+    /// itself. `None` where there is none, as where the holders share no
+    /// commit but the root with the line.
     pub fn line_base(
         &self,
         revision: &CommitId,
@@ -871,44 +889,64 @@ impl Repo {
             .first_ancestors()
             .intersection(&ResolvedRevsetExpression::commits(held).ancestors())
             .minus(&ResolvedRevsetExpression::root());
-        let revision_error = revset_error(revision.as_str());
-        let revset = line.evaluate(self.repo.as_ref()).map_err(revision_error)?;
-        // The stream runs children before parents: the first is the newest,
-        // and nothing past it is walked.
+        Ok(self
+            .first_commit(line, revision.as_str())?
+            .map(|newest| commit_id(&newest)))
+    }
+
+    /// The first commit that `expression` evaluates to, `None` where it
+    /// holds none. The revset's stream runs children before parents, so
+    /// that is its newest commit, and nothing past it is walked. A failure
+    /// names `revision`.
+    fn first_commit(
+        &self,
+        expression: Arc<ResolvedRevsetExpression>,
+        revision: &str,
+    ) -> Result<Option<JjCommitId>, JjError> {
+        let revision_error = revset_error(revision);
+        let revset = expression
+            .evaluate(self.repo.as_ref())
+            .map_err(revision_error)?;
         let mut stream = std::pin::pin!(revset.stream());
         block_on(std::future::poll_fn(|context| {
             stream.as_mut().poll_next(context)
         }))
         .transpose()
-        .map(|newest| newest.map(|id| commit_id(&id)))
         .map_err(revision_error)
     }
 
     /// The base of `revision`'s own change in a release whose parents are
     /// `parents` (spec R6): a release commit's parents, or a cut candidate's,
     /// which is no commit of this repository. `base` is the revision's
-    /// [`ChangeBase`]. Where the trunk contains the revision and the release
-    /// reaches it, the base is the revision itself, so it is carried by
-    /// ancestry. Otherwise its fork point is the base, and on the trunk's
-    /// first-parent line the parents give it ([`Self::line_base`]). Where
-    /// they give none, the base is jj's root commit, so the revision's whole
-    /// tree is its change; a release that shares history with the trunk
-    /// never meets that, since it holds the trunk's oldest commit.
+    /// [`ChangeBase`]. Where the trunk does not contain the revision, its
+    /// fork point is the base. Where the trunk contains it, reach is decided
+    /// first: where the release reaches it, the base is the revision itself,
+    /// so it is carried by ancestry, and `taken_in` is not called. Otherwise
+    /// `taken_in` gives how the trunk took it in ([`Self::taken_in`]): after
+    /// a merge, the revision's own fork point is the base, and on the
+    /// trunk's first-parent line the parents give it ([`Self::line_base`]).
+    /// Where they give none, the base is jj's root commit, so the revision's
+    /// whole tree is its change; a release that shares history with the
+    /// trunk never meets that, since it holds the trunk's oldest commit.
     pub fn release_base(
         &self,
-        revision: &CommitId,
-        base: &ChangeBase,
+        (revision, base): (&CommitId, &ChangeBase),
         parents: &[CommitId],
+        taken_in: impl FnOnce() -> Result<TakenIn, JjError>,
     ) -> Result<CommitId, JjError> {
         Ok(match base {
             ChangeBase::Fork(fork) => fork.clone(),
-            _ if parents.contains(revision) || self.reached_by(revision, parents)? => {
+            ChangeBase::Contained
+                if parents.contains(revision) || self.reached_by(revision, parents)? =>
+            {
                 revision.clone()
             }
-            ChangeBase::Merged(fork) => fork.clone(),
-            ChangeBase::OnTrunkLine => self
-                .line_base(revision, parents)?
-                .unwrap_or_else(|| commit_id(self.repo.store().root_commit_id())),
+            ChangeBase::Contained => match taken_in()? {
+                TakenIn::Merged(fork) => fork,
+                TakenIn::OnTrunkLine => self
+                    .line_base(revision, parents)?
+                    .unwrap_or_else(|| commit_id(self.repo.store().root_commit_id())),
+            },
         })
     }
 

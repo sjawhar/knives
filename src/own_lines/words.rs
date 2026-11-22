@@ -1473,7 +1473,7 @@ mod tests {
     fn pair_hunk_pairs_no_line_over_the_word_limit() {
         let over = drawn(30_001);
         let over_line = line_of(&over);
-        let over_copy = line_of(&changed(&over, 15_000));
+        let under = line_of(&over[..20_000]);
 
         // Given: a hunk that removes as many lines as it adds, the second
         // removed line over the limit
@@ -1483,17 +1483,18 @@ mod tests {
         assert_eq!(pair_hunk(&removed, &added), [Some(0), None, Some(2)]);
 
         // Given: a removed line over the limit, then a short one; the added
-        // lines: one like the short one, a copy of the long one, and two
-        // others
+        // lines: one like the short one, the long line's first 20000 words,
+        // under the limit, and two others
         let removed: [&[u8]; 2] = [&over_line, b"alpha beta gamma"];
-        let added: [&[u8]; 4] = [b"alpha beta delta", &over_copy, b"one", b"two"];
-        // Then: the long line takes none and leaves the window where it was,
-        // so the short one pairs from its start
+        let added: [&[u8]; 4] = [b"alpha beta delta", &under, b"one", b"two"];
+        // Then: the long line takes none, though the second added line
+        // reaches one half with it, and leaves the window where it was, so
+        // the short one pairs from its start
         assert_eq!(pair_hunk(&removed, &added), [Some(1), None, None, None]);
 
         // Given: a removed line of 20000 words; added: that line with 10001
         // more words, over the limit, then its first 10000 words
-        let removed = line_of(&over[..20_000]);
+        let removed = under;
         let half = line_of(&over[..10_000]);
         let added: [&[u8]; 2] = [&over_line, &half];
         // Then: the line over the limit is passed over for the next line
