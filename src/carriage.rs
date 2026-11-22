@@ -2,8 +2,8 @@
 //!
 //! The audit's worst near-miss class was a branch deleted while its content
 //! was uncarried. The verdicts here are content-based first: sha ancestry for
-//! carried-exact (for a release, ancestry and a replay that finds its change
-//! in the release's tree), a three-way tree merge for carried-rewritten (jj
+//! carried-exact (for a release, ancestry and no merge since that dropped
+//! its change), a three-way tree merge for carried-rewritten (jj
 //! divergent change-ids force tree comparison — the same change id can name
 //! two different trees). Only when the tree says otherwise does the change id
 //! speak, and it says something weaker on purpose: carried-rebased means a
@@ -52,9 +52,11 @@ pub enum TargetRole {
 #[serde(rename_all = "kebab-case")]
 pub enum CarryVerdict {
     /// The revision's tip is an ancestor of the target: carried as-is. For a
-    /// release target, the release's tree also holds the tip's change: a
-    /// release merge reaches every member it names as a parent whatever its
-    /// tree holds, so ancestry alone does not show a hand resolution kept it.
+    /// release target, the release also holds its change: a release merge
+    /// reaches every member it names as a parent whatever its tree holds, so
+    /// ancestry alone does not show a hand resolution kept it. Each hunk of
+    /// its change is in the release as it left it, or rewritten by a commit
+    /// that built on the lines it replaced ([`check`]).
     CarriedExact,
     /// Its net tree change leaves the target unchanged, whether the same content
     /// arrived through different commits or the revision itself has no net content.
@@ -67,8 +69,10 @@ pub enum CarryVerdict {
     /// shares its change id, carries nothing of what the newer one added.
     CarriedRebased,
     NotCarried,
-    /// The replay conflicted while the target itself is clean: some content
-    /// is there or unrelated work touched the same files; judge by eye.
+    /// The replay conflicted while the target itself is clean, and, for a
+    /// tip the target reaches, some hunk of its change was not rewritten by a
+    /// commit that built on its lines: some content is there or unrelated
+    /// work touched the same files; judge by eye.
     Conflicted,
 }
 
@@ -83,8 +87,8 @@ impl CarryVerdict {
 
 /// One verdict with the commit that proves it.
 ///
-/// The revision tip for carried-exact (it IS in the target's ancestry, and a
-/// release's tree holds its change), the rewrite for carried-rebased (the same
+/// The revision tip for carried-exact (it IS in the target's ancestry, and
+/// the target holds its change), the rewrite for carried-rebased (the same
 /// change, in the target's ancestry), the target commit otherwise (the tree
 /// the replay was judged against).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -161,6 +165,7 @@ pub fn census(
     fork: &Fork<'_>,
     forge: Option<&dyn Forge>,
     options: CensusOptions<'_>,
+    records: &Records<'_>,
 ) -> anyhow::Result<CensusReport> {
     let entry = fork.entry;
     let path = &fork.checkout.path;
@@ -198,15 +203,30 @@ pub fn census(
     } = census_pulls(forge, fork, branches.as_slice(), options.cache_root);
     notes.extend(pull_notes);
 
-    let members: Vec<CensusInput> = branches
-        .into_iter()
-        .map(|(branch, tip)| CensusInput {
+    let own = own_repository_spellings(fork);
+    let context = BaseContext {
+        trunk: &trunk,
+        own: &own,
+        branches: &branches,
+        pull_head: records.pull_head,
+    };
+    let mut members = Vec::with_capacity(branches.len());
+    for (branch, tip) in &branches {
+        let recorded = (records.requirements)(branch.as_str());
+        let base = MemberBase::read(
+            &repo,
+            (Some(branch.as_str()), tip),
+            recorded.as_deref().map_err(String::as_str),
+            &context,
+        )?;
+        members.push(CensusInput {
             in_open_pull: pull_requests_checked
-                .then(|| branch_pulls.get(&branch).copied().unwrap_or(false)),
+                .then(|| branch_pulls.get(branch).copied().unwrap_or(false)),
             branch: branch.to_string(),
-            tip,
-        })
-        .collect();
+            tip: tip.clone(),
+            base,
+        });
+    }
     let targets = CensusTargets {
         primary: &primary,
         superseded: &superseded,
@@ -310,6 +330,7 @@ fn census_pulls(
 struct CensusInput {
     branch: String,
     tip: CommitId,
+    base: MemberBase,
     in_open_pull: Option<bool>,
 }
 
@@ -372,7 +393,7 @@ fn census_rows(
                                 let check_input = CheckInput::new(
                                     &repo,
                                     &input.branch,
-                                    &input.tip,
+                                    (&input.tip, input.base.clone()),
                                     targets.trunk,
                                 );
                                 census_member(input, targets, &mut problems, |target| {
@@ -657,7 +678,7 @@ fn render_check(check: &TargetCheck, indent: &str) -> String {
     let reason = match (check.verdict, check.role) {
         (CarryVerdict::CarriedExact, TargetRole::UpstreamTrunk) => "tip is an ancestor",
         (CarryVerdict::CarriedExact, TargetRole::LiveRelease | TargetRole::SupersededRelease) => {
-            "tip is an ancestor and the release's tree holds its change"
+            "tip is an ancestor and the release holds its change or a rewrite built on it"
         }
         (CarryVerdict::CarriedRewritten, _) => "no net content remains",
         (CarryVerdict::CarriedRebased, _) => "a rewrite of the change is an ancestor",
@@ -776,24 +797,233 @@ pub fn targets(
     live
 }
 
+/// What [`MemberBase::read`] is told by the caller: what the ledger records
+/// each branch needs, and the forge's head of a review pull request.
+pub struct Records<'a> {
+    /// What branch `name` records it needs, or why that could not be read.
+    pub requirements: &'a dyn Fn(&str) -> Result<Vec<crate::ids::Requirement>, String>,
+    /// The head commit the forge reports for review pull request `number`
+    /// on `repository`, or why it could not be asked.
+    pub pull_head: &'a dyn Fn(&str, u64) -> Result<String, String>,
+}
+
+impl std::fmt::Debug for Records<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Records").finish_non_exhaustive()
+    }
+}
+
+/// Every spelling of `fork`'s own repository, lowercase: what its
+/// checkout's `origin` remote names, and the registry's `origin`, as
+/// `knives depends` records a member branch.
+pub fn own_repository_spellings(fork: &Fork<'_>) -> Vec<String> {
+    let mut own: Vec<String> = [
+        fork.checkout.remotes.get("origin").map(String::as_str),
+        Some(fork.entry.origin.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(crate::remote_url::remote_slug)
+    .map(str::to_ascii_lowercase)
+    .collect();
+    own.dedup();
+    own
+}
+
+/// Where a member's own change starts, for a release target's replay.
+///
+/// From the trunk, a member stacked on another branch (a pull request into
+/// that branch) brings that branch's whole line with it: lines its siblings
+/// rewrote and the release combined by hand read as dropped. So a stacked
+/// member is replayed from the branch it is stacked on, which its record
+/// names (`knives depends <member> --on <branch>`), never from the trunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberBase {
+    /// It is seen stacked on no maintained branch and records no one branch
+    /// it needs: its change starts where it forked from the trunk.
+    Trunk,
+    /// Its record names the one branch or review pull request on the fork's
+    /// own repository it needs, whose head is `head`.
+    Recorded { requirement: String, head: CommitId },
+    /// It is stacked, and which branch it is stacked on cannot be read: why.
+    /// Only a replay from the trunk that reads empty or clean answers it;
+    /// one that conflicts cannot be judged.
+    Unknown(String),
+}
+
+/// What [`MemberBase::read`] reads a member's base from.
+pub struct BaseContext<'a> {
+    /// The upstream trunk.
+    pub trunk: &'a CommitId,
+    /// Every spelling of the fork's own repository, lowercase: its
+    /// registry `origin` and its checkout's `origin` remote.
+    pub own: &'a [String],
+    /// The fork's maintained branches and their tips
+    /// ([`release_model::carried_from_tips`]).
+    pub branches: &'a [(BranchName, CommitId)],
+    /// The head the forge reports for review pull request `number` on the
+    /// fork's own repository `repository`, or why it could not be asked.
+    pub pull_head: &'a dyn Fn(&str, u64) -> Result<String, String>,
+}
+
+impl std::fmt::Debug for BaseContext<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BaseContext")
+            .field("trunk", &self.trunk)
+            .field("own", &self.own)
+            .field("branches", &self.branches)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MemberBase {
+    /// The base of the member at `tip`, named `branch` when a branch names
+    /// it, from what its record says it needs (`recorded`, or why the record
+    /// could not be read).
+    ///
+    /// It is stacked when the tip of another maintained branch is on its
+    /// first-parent line since the trunk: it was built on that branch. A
+    /// branch merged into its line (a review branch that landed into it by a
+    /// merge) is reached only through a merge's other parent, and stacks
+    /// nothing. When it records exactly one branch or review pull request on
+    /// the fork's own repository it needs, its base is that one's head,
+    /// stacked or not: a member that landed into its base is no longer seen
+    /// stacked, since the base's tip now descends from it, and for a member
+    /// that sits on none the base's fork point with it is the trunk's. A
+    /// head on another repository, from a forge that does not answer or not
+    /// in this checkout leaves it unknown. Recording none or several, it is
+    /// unknown when stacked and starts from the trunk otherwise.
+    pub fn read(
+        repo: &Repo,
+        (branch, tip): (Option<&str>, &CommitId),
+        recorded: Result<&[crate::ids::Requirement], &str>,
+        context: &BaseContext<'_>,
+    ) -> anyhow::Result<Self> {
+        use crate::ids::Requirement;
+        let line = repo.first_parent_line(tip, context.trunk)?;
+        // The nearest branch tip below the member is the one it was built on.
+        let stacked_on = line.iter().find_map(|commit| {
+            context
+                .branches
+                .iter()
+                .find(|(other, other_tip)| other_tip == commit && Some(other.as_str()) != branch)
+                .map(|(other, _)| other)
+        });
+        let name = branch.unwrap_or("this revision");
+        let record = |on: &str| {
+            branch.map_or_else(
+                || {
+                    "`knives depends <branch> --on <branch it is stacked on>` on its branch"
+                        .to_owned()
+                },
+                |branch| format!("`knives depends {branch} --on {on}`"),
+            )
+        };
+        let on_fork: Vec<&Requirement> = match recorded {
+            Ok(recorded) => recorded
+                .iter()
+                .filter(|requirement| !matches!(requirement, Requirement::Upstream { .. }))
+                .collect(),
+            Err(reason) => {
+                return Ok(stacked_on.map_or(Self::Trunk, |stacked_on| {
+                    Self::Unknown(format!(
+                        "{name} is stacked on {stacked_on}, and what it records it needs could \
+                         not be read: {reason}"
+                    ))
+                }));
+            }
+        };
+        let [requirement] = on_fork.as_slice() else {
+            let Some(stacked_on) = stacked_on else {
+                return Ok(Self::Trunk);
+            };
+            return Ok(Self::Unknown(if on_fork.is_empty() {
+                format!(
+                    "{name} is stacked on {stacked_on}, and no record says which branch its own \
+                     change starts from: record it with {}",
+                    record(stacked_on.as_str())
+                )
+            } else {
+                format!(
+                    "{name} is stacked on {stacked_on} and records {} branches or review pull \
+                     requests it needs ({}), so which one its own change starts from cannot be \
+                     told",
+                    on_fork.len(),
+                    on_fork
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }));
+        };
+        Ok(match Self::recorded_head(repo, requirement, context) {
+            Ok(head) => Self::Recorded {
+                requirement: requirement.to_string(),
+                head,
+            },
+            Err(why) => Self::Unknown(format!("{name} records {requirement}, {why}")),
+        })
+    }
+
+    /// The head of the one branch or review pull request a member records
+    /// it needs, or why it cannot be read here.
+    fn recorded_head(
+        repo: &Repo,
+        requirement: &crate::ids::Requirement,
+        context: &BaseContext<'_>,
+    ) -> Result<CommitId, String> {
+        use crate::ids::Requirement;
+        let own = |repository: &str| {
+            context
+                .own
+                .iter()
+                .any(|own| own.eq_ignore_ascii_case(repository))
+        };
+        match requirement {
+            Requirement::ForkBranch { repository, branch } if own(repository) => context
+                .branches
+                .iter()
+                .find(|(name, _)| name == branch)
+                .map(|(_, tip)| tip.clone())
+                .map_or_else(|| repo.resolve_commit(&format!("{branch}@origin")), Ok)
+                .map_err(|_| "which this checkout does not hold, here or on origin".to_owned()),
+            Requirement::ForkPull { repository, number } if own(repository) => {
+                let oid = (context.pull_head)(repository, *number)
+                    .map_err(|reason| format!("whose head the forge did not report: {reason}"))?;
+                repo.resolve_commit(&oid).map_err(|_| {
+                    format!(
+                        "whose head {} is not in this checkout: fetch origin",
+                        crate::ids::short_id(&oid)
+                    )
+                })
+            }
+            _ => Err("which is not on this fork's own repository".to_owned()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CheckInput<'a> {
     pub repo: &'a Repo,
     pub revision: &'a str,
     pub tip: &'a CommitId,
     /// The upstream trunk: a release target replays the tip's change from
-    /// its fork point with it.
+    /// its fork point with it, unless it is stacked (`base`).
     pub trunk: &'a CommitId,
+    /// Where the tip's own change starts ([`MemberBase`]).
+    pub base: MemberBase,
     /// The tip's fork point with the trunk, read once, by the first release
     /// target that needs it.
     fork_point: std::cell::OnceCell<CommitId>,
 }
 
 impl<'a> CheckInput<'a> {
-    pub const fn new(
+    pub fn new(
         repo: &'a Repo,
         revision: &'a str,
-        tip: &'a CommitId,
+        (tip, base): (&'a CommitId, MemberBase),
         trunk: &'a CommitId,
     ) -> Self {
         Self {
@@ -801,6 +1031,7 @@ impl<'a> CheckInput<'a> {
             revision,
             tip,
             trunk,
+            base,
             fork_point: std::cell::OnceCell::new(),
         }
     }
@@ -818,21 +1049,58 @@ impl<'a> CheckInput<'a> {
 /// The three-way verdict of one revision against one target.
 ///
 /// An ancestor tip is carried-exact against the upstream trunk, which knives
-/// does not compose. Against a release it is carried-exact only when its net
-/// change from its fork point with the trunk replays empty onto the release:
-/// a release merge names its members as parents, so every member is an
-/// ancestor whatever the merge's tree holds, and a hand resolution can drop a
-/// member's change while keeping the member a parent.
+/// does not compose. Against a release it is carried-exact only when the
+/// release holds its change: a release merge names its members as parents,
+/// so every member is an ancestor whatever the merge's tree holds, and a
+/// hand resolution can drop a member's change while keeping the member a
+/// parent. Its own change replaying empty onto the release shows the release
+/// holds it. Its own change starts where it forked from the trunk, or, for a
+/// member stacked on another branch, from that branch ([`MemberBase`]): from
+/// the trunk it would bring that branch's line, which the release can hold
+/// combined with the work of others by hand. A replay that leaves a clean
+/// diff shows part of it gone, reverted or dropped: not carried. A replay
+/// that conflicts can be later work rewriting its lines, a commit that built
+/// on them, so it is read file by file and hunk by hunk
+/// ([`Repo::rewritten_replay_outcome`]): carried-exact when every hunk is
+/// held or rewritten by a commit that built on the lines it replaced, not
+/// carried when the rest holds and a hunk of the tip's change is missing,
+/// and conflicted when any hunk was resolved otherwise. A stacked member
+/// whose base cannot be read is answered only by a replay from the trunk
+/// that reads empty or clean; one that conflicts is an error naming why.
 pub fn check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryCheck> {
     if input.repo.is_ancestor(input.tip, &target.commit)? {
         let verdict = match target.role {
             TargetRole::UpstreamTrunk => CarryVerdict::CarriedExact,
             TargetRole::LiveRelease | TargetRole::SupersededRelease => {
-                match input.repo.fork_point_replay_outcome(
+                let from = match &input.base {
+                    MemberBase::Trunk | MemberBase::Unknown(_) => input.fork_point()?.clone(),
+                    MemberBase::Recorded { requirement, head } => {
+                        match input.repo.member_fork_point(input.tip, head)? {
+                            Some(from) => from,
+                            None => anyhow::bail!(
+                                "its base {requirement} at {} reaches it with no merge that \
+                                 landed it, so its own change cannot be told from its base's",
+                                head.short()
+                            ),
+                        }
+                    }
+                };
+                let outcome = match input.repo.fork_point_replay_outcome(
                     input.tip,
-                    input.fork_point()?,
+                    &from,
                     &target.commit,
                 )? {
+                    RebaseOutcome::Conflicted => match &input.base {
+                        MemberBase::Unknown(reason) => anyhow::bail!(
+                            "its change since the trunk conflicts with the release, and {reason}"
+                        ),
+                        MemberBase::Trunk | MemberBase::Recorded { .. } => input
+                            .repo
+                            .rewritten_replay_outcome(input.tip, &from, &target.commit)?,
+                    },
+                    outcome => outcome,
+                };
+                match outcome {
                     RebaseOutcome::Empty => CarryVerdict::CarriedExact,
                     RebaseOutcome::CleanNonEmpty => CarryVerdict::NotCarried,
                     RebaseOutcome::Conflicted => CarryVerdict::Conflicted,
@@ -1114,6 +1382,7 @@ mod tests {
         let input = CensusInput {
             branch: "feat/unanswered".to_owned(),
             tip: CommitId::new("tip"),
+            base: super::MemberBase::Trunk,
             in_open_pull: None,
         };
         let trunk = CommitId::new("trunk");

@@ -602,10 +602,13 @@ fn dispatch_release(
             // The parser keeps `--census` apart from REF, `--carries` and
             // `--verify`, so a census request never has a target to lose here.
             match (census, carries.as_deref()) {
-                (true, _) => run_release_census(fork, no_github, output),
-                (false, Some(revision)) => {
-                    run_revision_carries(fork, revision, reference.as_deref(), output)
-                }
+                (true, _) => run_release_census(fork, bound.registry, no_github, output),
+                (false, Some(revision)) => run_revision_carries(
+                    fork,
+                    bound.registry,
+                    (revision, reference.as_deref()),
+                    output,
+                ),
                 (false, None) => {
                     run_release_members(fork, bound.registry, reference.as_deref(), verify, output)
                 }

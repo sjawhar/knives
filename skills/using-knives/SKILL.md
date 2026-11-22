@@ -49,14 +49,15 @@ Use the replay probe, never a source-text search: a symbol's presence does not s
 - `knives release members <target> --carries <revision>` checks that one target. Exit `0` carried, `1` `NOT carried` or `conflicted`, `3` unresolved or uncheckable. A superseded target is a valid target.
 - With no target, it checks live releases and upstream trunk, then superseded cuts. Carriage only by a superseded cut does not make deletion safe.
 - `--census` asks this for every maintained branch. The `landed` column of `status` is the upstream-trunk probe.
+- Against a release, a member's own change starts at its fork point with the trunk, or, for a member stacked on another branch (that branch's tip is on its first-parent line; a branch merged into it is not), at that branch, as `knives depends <member> --on <branch or review PR>` records it. A stacked member that records no such base, or several, answers `3` when its replay from the trunk conflicts, and the answer names what to record.
 
 | Verdict | Evidence |
 |---|---|
-| `carried-exact` | The revision tip is an ancestor of the target. Against a release, its net change also replays empty onto the release's tree. |
+| `carried-exact` | The revision tip is an ancestor of the target. Against a release, also its own change replays empty onto the release, or conflicts only where a one-parent commit that built on its lines rewrote them. |
 | `carried-rewritten` | Replaying its net change leaves the target unchanged: equivalent content arrived another way, or it has no net change. |
 | `carried-rebased` | Replay differs, but a commit with its change id is an ancestor. Weaker: divergent changes can name different trees. |
-| `NOT carried` (JSON `not-carried`) | Replay leaves a clean non-empty diff, and no rewrite is in the target. |
-| `conflicted` | Replay conflicts, and no rewrite is in the target. Some content can be present: judge it. |
+| `NOT carried` (JSON `not-carried`) | Replay leaves a clean non-empty diff, and no rewrite is in the target. For a tip the target reaches: part of its own change is gone, reverted by a later commit or dropped by a merge. |
+| `conflicted` | Replay conflicts, and either no rewrite is in the target or, for a tip the target reaches, a part was replaced otherwise than by a commit that built on its lines: a merge's resolution, a sibling's line, a line put back. Some content can be present: judge it. |
 
 ## Output and exit codes
 

@@ -7,7 +7,7 @@
 #[path = "common/lab.rs"]
 mod lab;
 
-use knives::carriage::{CarryVerdict, CheckInput, Target, TargetRole, check};
+use knives::carriage::{CarryVerdict, CheckInput, MemberBase, Target, TargetRole, check};
 use knives::ids::CommitId;
 use knives::jj::Repo;
 use lab::Lab;
@@ -24,9 +24,12 @@ fn check_against(repo: &Repo, revision: &str, target: &str) -> CarryVerdict {
     let tip = repo.resolve_commit(revision).expect("resolve revision");
     let trunk = repo.resolve_commit(target).expect("resolve target");
     let target = upstream_trunk_target(trunk.clone());
-    check(&CheckInput::new(repo, revision, &tip, &trunk), &target)
-        .expect("check carriage")
-        .verdict
+    check(
+        &CheckInput::new(repo, revision, (&tip, MemberBase::Trunk), &trunk),
+        &target,
+    )
+    .expect("check carriage")
+    .verdict
 }
 
 #[test]

@@ -100,21 +100,79 @@ fn print_members(report: &release::MembersReport, output: Output) -> anyhow::Res
     Ok(())
 }
 
+/// What the ledger records each branch of `fork` needs, and the forge's
+/// head of a review pull request on its own repository (none with
+/// `forge` absent), for [`carriage::MemberBase::read`].
+struct RecordsInput<'a> {
+    fork: &'a Fork<'a>,
+    store: Result<knives::store::Store, String>,
+    forge: Option<&'a dyn Forge>,
+}
+
+impl<'a> RecordsInput<'a> {
+    fn open(
+        fork: &'a Fork<'a>,
+        registry: &knives::config::Registry,
+        forge: Option<&'a dyn Forge>,
+    ) -> Self {
+        let store = knives::store::Store::open(
+            knives::store::default_state_path(),
+            &registry.former_names(),
+            &[&fork.upstream],
+        )
+        .map_err(|error| error.to_string());
+        Self { fork, store, forge }
+    }
+
+    fn requirements(&self, branch: &str) -> Result<Vec<knives::ids::Requirement>, String> {
+        let store = self.store.as_ref().map_err(Clone::clone)?;
+        Ok(store.dependencies(&knives::ids::BranchTarget::new(
+            self.fork.upstream.clone(),
+            knives::ids::BranchName::new(branch),
+        )))
+    }
+
+    fn pull_head(&self, repository: &str, number: u64) -> Result<String, String> {
+        let Some(forge) = self.forge else {
+            return Err("no forge was consulted (--no-github)".to_owned());
+        };
+        let identity = knives::forge::RepoIdentity {
+            name_with_owner: repository.to_owned(),
+            id: String::new(),
+        };
+        let facts = forge
+            .pull_facts(&self.fork.checkout.path, &identity, &[number])
+            .map_err(|error| error.to_string())?;
+        facts
+            .get(&number)
+            .map(|fact| fact.pull.head_ref_oid.clone())
+            .ok_or_else(|| format!("{repository} has no pull request #{number}"))
+    }
+}
+
 /// Census every maintained branch against the live releases and upstream trunk.
 pub(crate) fn run_release_census(
     fork: &Fork<'_>,
+    registry: &knives::config::Registry,
     no_github: bool,
     output: Output,
 ) -> anyhow::Result<Exit> {
     let forge = CliForge;
     let forge: Option<&dyn Forge> = (!no_github).then_some(&forge);
     let cache_root = knives::forge_cache::cache_root();
+    let input = RecordsInput::open(fork, registry, forge);
+    let requirements = |branch: &str| input.requirements(branch);
+    let pull_head = |repository: &str, number: u64| input.pull_head(repository, number);
     let report = carriage::census(
         fork,
         forge,
         CensusOptions {
             cache_root: cache_root.as_deref(),
             workers: parallelism(),
+        },
+        &carriage::Records {
+            requirements: &requirements,
+            pull_head: &pull_head,
         },
     )?;
     let exit = census_exit(&report);
@@ -124,10 +182,14 @@ pub(crate) fn run_release_census(
 
 /// Answer one revision's carriage: against `target` alone when given,
 /// otherwise against every live release and the upstream trunk.
+///
+/// A release target replays the revision's own change, read as the census
+/// reads a member's ([`carriage::MemberBase`]): its branch is the one
+/// `revision` names, else the one maintained branch whose tip it is.
 pub(crate) fn run_revision_carries(
     fork: &Fork<'_>,
-    revision: &str,
-    target: Option<&str>,
+    registry: &knives::config::Registry,
+    (revision, target): (&str, Option<&str>),
     output: Output,
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
@@ -187,8 +249,9 @@ pub(crate) fn run_revision_carries(
     {
         selected_target.role = TargetRole::UpstreamTrunk;
     }
+    let base = revision_base((fork, registry), &opened, (revision, &tip), (&tips, &trunk))?;
     let checks = CarriesChecks {
-        input: CheckInput::new(&opened, revision, &tip, &trunk),
+        input: CheckInput::new(&opened, revision, (&tip, base), &trunk),
         fallback: target.unwrap_or(trunk_name.as_str()),
     };
     let mut report = CarriesReport {
@@ -202,6 +265,51 @@ pub(crate) fn run_revision_carries(
     let exit = carries_exit(&mut report, &checks, superseded, target);
     print_carries(&report, output)?;
     Ok(exit)
+}
+
+/// Where `revision`'s own change starts ([`carriage::MemberBase`]): its
+/// branch is the maintained branch `revision` names, else the one whose tip
+/// it is, and that branch's record says what it is stacked on.
+fn revision_base(
+    (fork, registry): (&Fork<'_>, &knives::config::Registry),
+    opened: &Repo,
+    (revision, tip): (&str, &knives::ids::CommitId),
+    (tips, trunk): (&knives::detect::BookmarkTips, &knives::ids::CommitId),
+) -> anyhow::Result<carriage::MemberBase> {
+    let entry = fork.entry;
+    let branches: Vec<(knives::ids::BranchName, knives::ids::CommitId)> =
+        knives::release_model::carried_from_tips(tips, entry.trunk(), &entry.release_scheme())
+            .into_iter()
+            .map(|(branch, branch_tip)| (knives::ids::BranchName::new(branch), branch_tip))
+            .collect();
+    let named: Vec<&str> = branches
+        .iter()
+        .filter(|(branch, branch_tip)| branch.as_str() == revision || branch_tip == tip)
+        .map(|(branch, _)| branch.as_str())
+        .collect();
+    let branch = match named.as_slice() {
+        [one] => Some(*one),
+        several => several.iter().copied().find(|branch| *branch == revision),
+    };
+    let forge = CliForge;
+    let input = RecordsInput::open(fork, registry, Some(&forge));
+    let recorded = branch.map_or_else(
+        || Err(format!("no one maintained branch names {revision}")),
+        |branch| input.requirements(branch),
+    );
+    let own = carriage::own_repository_spellings(fork);
+    let pull_head = |repository: &str, number: u64| input.pull_head(repository, number);
+    carriage::MemberBase::read(
+        opened,
+        (branch, tip),
+        recorded.as_deref().map_err(String::as_str),
+        &carriage::BaseContext {
+            trunk,
+            own: &own,
+            branches: &branches,
+            pull_head: &pull_head,
+        },
+    )
 }
 
 /// The outcome: unanswered checks outrank everything; against an explicit

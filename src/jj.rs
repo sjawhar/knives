@@ -768,7 +768,9 @@ impl Repo {
     /// ancestor of the two, which for such a revision is the revision itself,
     /// so it always reads empty. A release merge reaches every member it names
     /// as a parent whatever its tree holds, so a hand resolution that dropped
-    /// a member's change is seen only from the member's own fork point.
+    /// a member's change is seen only from the member's own fork point. A
+    /// replay that conflicts does not show such a drop by itself: commits
+    /// after `revision` may have rewritten its lines ([`Self::rewritten_replay_outcome`]).
     pub fn fork_point_replay_outcome(
         &self,
         revision: &CommitId,
@@ -778,11 +780,399 @@ impl Repo {
         self.net_diff_outcome(fork_point.as_str(), revision.as_str(), target.as_str())
     }
 
+    /// The replay of [`Self::fork_point_replay_outcome`], read file by file and
+    /// hunk by hunk, where a hunk that conflicts only because later work
+    /// rewrote `revision`'s lines counts as held.
+    ///
+    /// That replay reads `revision`'s whole change since its fork point with
+    /// the trunk against `target`'s tree, which holds it as everything after
+    /// `revision` left it: a commit that built on it, or a branch stacked on
+    /// one of its ancestors and merged since, may have rewritten its lines,
+    /// and the replay then conflicts although nothing dropped them. So each
+    /// file `revision` changed is read three ways, its fork point's text as
+    /// the base ([`rewritten_path_outcome`]):
+    ///
+    /// - `target` holds `revision`'s value, or the hunk as `revision` left it:
+    ///   held;
+    /// - `target` holds the fork point's value, or the hunk as the fork point
+    ///   held it: what `revision` brought is missing there, a clean replay
+    ///   that is not empty;
+    /// - both changed it otherwise: held only when the hunk is regular file
+    ///   text whose `target` side is not empty and each of its lines was
+    ///   written by `revision`'s own side, or by a commit that has one
+    ///   parent, none conflicted at the file, and descends from every commit
+    ///   that wrote the lines of `revision`'s side ([`Self::rewrote`]); where
+    ///   `revision`'s side also deleted lines the fork point held, that
+    ///   commit descends from `revision` too. Anything else conflicts: a
+    ///   merge's own resolution, a sibling's line kept over `revision`'s, a
+    ///   line the fork point held put back, a file moved or deleted, a mode,
+    ///   link or submodule changed both ways.
+    ///
+    /// The outcome is conflicted when any file conflicts, else a clean
+    /// non-empty replay when anything is missing, else empty.
+    pub fn rewritten_replay_outcome(
+        &self,
+        revision: &CommitId,
+        fork_point: &CommitId,
+        target: &CommitId,
+    ) -> Result<RebaseOutcome, JjError> {
+        let tip = self.commit(revision.as_str())?;
+        let base = self.commit(fork_point.as_str())?;
+        let onto = self.commit(target.as_str())?;
+        let brought = replayed_tree(&base.tree(), tip.tree(), &onto.tree())?;
+        let mut outcome = RebaseOutcome::Empty;
+        for entry in collect_stream(base.tree().diff_stream(&brought, &EverythingMatcher)) {
+            let values = entry.values.map_err(|error| store_error(&error))?;
+            let held = block_on(onto.tree().path_value(&entry.path))
+                .map_err(|error| store_error(&error))?;
+            let path = match (held == values.after, held == values.before) {
+                (true, _) => RebaseOutcome::Empty,
+                (false, true) => RebaseOutcome::CleanNonEmpty,
+                (false, false) => self.rewritten_path_outcome(
+                    &entry.path,
+                    (&values.before, &values.after, &held),
+                    (&tip, base.id(), &onto),
+                )?,
+            };
+            outcome = match (outcome, path) {
+                (RebaseOutcome::Conflicted, _) | (_, RebaseOutcome::Conflicted) => {
+                    return Ok(RebaseOutcome::Conflicted);
+                }
+                (RebaseOutcome::CleanNonEmpty, _) | (_, RebaseOutcome::CleanNonEmpty) => {
+                    RebaseOutcome::CleanNonEmpty
+                }
+                (RebaseOutcome::Empty, RebaseOutcome::Empty) => RebaseOutcome::Empty,
+            };
+        }
+        Ok(outcome)
+    }
+
+    /// One file of [`Self::rewritten_replay_outcome`] that the fork point
+    /// (`before`), `tip`'s side (`after`) and `onto` (`held`) each hold
+    /// otherwise.
+    fn rewritten_path_outcome(
+        &self,
+        path: &RepoPath,
+        (before, after, held): (&MergedTreeValue, &MergedTreeValue, &MergedTreeValue),
+        (tip, fork_point, onto): (
+            &jj_lib::commit::Commit,
+            &JjCommitId,
+            &jj_lib::commit::Commit,
+        ),
+    ) -> Result<RebaseOutcome, JjError> {
+        let file = |value: &MergedTreeValue| match value.as_resolved() {
+            Some(None) => Some(None),
+            Some(Some(TreeValue::File { id, executable, .. })) => {
+                Some(Some((id.clone(), *executable)))
+            }
+            _ => None,
+        };
+        // A conflict in any of the three, a link, a submodule or a tree, a
+        // file deleted on one side, a file both added with other modes:
+        // nothing rewrote it line by line.
+        let (Some(Some(before_file)), Some(Some(after_file)), Some(Some(held_file))) =
+            (file(before), file(after), file(held))
+        else {
+            return Ok(match (file(before), file(after), file(held)) {
+                (Some(None), Some(Some(after_file)), Some(Some(held_file)))
+                    if after_file.1 == held_file.1 =>
+                {
+                    self.rewritten_text_outcome(path, (None, after, held), (tip, fork_point, onto))?
+                }
+                _ => RebaseOutcome::Conflicted,
+            });
+        };
+        let text = self.rewritten_text_outcome(
+            path,
+            (Some(&before_file.0), after, held),
+            (tip, fork_point, onto),
+        )?;
+        // A mode the tip set that the release does not hold is missing.
+        Ok(
+            if text == RebaseOutcome::Empty
+                && after_file.1 != before_file.1
+                && held_file.1 != after_file.1
+            {
+                RebaseOutcome::CleanNonEmpty
+            } else {
+                text
+            },
+        )
+    }
+
+    /// The text of one file of [`Self::rewritten_path_outcome`], hunk by hunk:
+    /// the fork point's (`before`, none when it held no file), `tip`'s side
+    /// (`after`) and `onto`'s (`held`), both regular files.
+    fn rewritten_text_outcome(
+        &self,
+        path: &RepoPath,
+        (before, after, held): (Option<&FileId>, &MergedTreeValue, &MergedTreeValue),
+        (tip, fork_point, onto): (
+            &jj_lib::commit::Commit,
+            &JjCommitId,
+            &jj_lib::commit::Commit,
+        ),
+    ) -> Result<RebaseOutcome, JjError> {
+        use jj_lib::diff::{ContentDiff, DiffHunkKind};
+        let store = self.repo.store();
+        let before = match before {
+            Some(id) => file_content(store, path, id)?.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let after = regular_file_content(store, path, after)?.unwrap_or_default();
+        let held = regular_file_content(store, path, held)?.unwrap_or_default();
+        let mut origins: Option<(LineOrigins, LineOrigins)> = None;
+        let (mut at_after, mut at_held) = (0, 0);
+        let mut outcome = RebaseOutcome::Empty;
+        for hunk in ContentDiff::by_line([&before, &held, &after]).hunks() {
+            let [base, theirs, ours] = [0, 1, 2].map(|side| {
+                hunk.contents
+                    .get(side)
+                    .map_or(&[][..], |text| -> &[u8] { text })
+            });
+            let (ours_lines, theirs_lines) = (line_count(ours), line_count(theirs));
+            if hunk.kind == DiffHunkKind::Different && theirs != ours && ours != base {
+                if theirs == base {
+                    outcome = RebaseOutcome::CleanNonEmpty;
+                } else {
+                    if origins.is_none() {
+                        origins = Some((
+                            self.line_origins((tip, path), &after, fork_point)?,
+                            self.line_origins((onto, path), &held, fork_point)?,
+                        ));
+                    }
+                    let Some((after_origins, held_origins)) = &origins else {
+                        return Ok(RebaseOutcome::Conflicted);
+                    };
+                    let replaced = after_origins
+                        .get(at_after..at_after + ours_lines)
+                        .unwrap_or_default();
+                    let rewriting = held_origins
+                        .get(at_held..at_held + theirs_lines)
+                        .unwrap_or_default();
+                    let deleted = replaced.iter().filter(|origin| origin.is_none()).count()
+                        < line_count(base);
+                    if !self.rewrote(
+                        [ours, theirs],
+                        (replaced, rewriting),
+                        (path, tip.id(), deleted),
+                    )? {
+                        return Ok(RebaseOutcome::Conflicted);
+                    }
+                }
+            }
+            at_after += ours_lines;
+            at_held += theirs_lines;
+        }
+        Ok(outcome)
+    }
+
+    /// Each line of `text`, as `start` holds it at `path`, with the commit
+    /// that wrote it since `fork_point`, or none for a line `fork_point`'s
+    /// history wrote.
+    fn line_origins(
+        &self,
+        (start, path): (&jj_lib::commit::Commit, &RepoPath),
+        text: &[u8],
+        fork_point: &JjCommitId,
+    ) -> Result<LineOrigins, JjError> {
+        let mut annotator =
+            jj_lib::annotate::FileAnnotator::with_file_content(start.id(), path, text.to_vec());
+        let domain = ResolvedRevsetExpression::commit(fork_point.clone())
+            .range(&ResolvedRevsetExpression::commit(start.id().clone()));
+        block_on(annotator.compute(self.repo.as_ref(), &domain)).map_err(|error| {
+            JjError::Revision {
+                revision: start.id().hex(),
+                detail: error.to_string(),
+            }
+        })?;
+        Ok(annotator
+            .to_annotation()
+            .line_origins()
+            .map(|(origin, _)| origin.ok().map(|origin| origin.commit_id.clone()))
+            .collect())
+    }
+
+    /// Whether, at one conflicting hunk of `path`, `onto`'s side (`sides[1]`,
+    /// its lines written by `rewriting`) rewrote `tip`'s side (`sides[0]`,
+    /// its lines written by `replaced`, none for a line from before the fork
+    /// point) rather than dropping it ([`Self::rewritten_replay_outcome`]).
+    ///
+    /// The two sides are compared line by line. Where `tip`'s side holds
+    /// lines `onto`'s lacks, `onto`'s holds lines in their place, each
+    /// written by a commit that built on them ([`Self::built_on`]). Where
+    /// `onto`'s side holds lines `tip`'s lacks, each was written by a commit
+    /// that has one parent, none conflicted at `path`, and is no ancestor of
+    /// `tip`: a line `tip`'s history removed and the release holds again is
+    /// no rewrite. Where `tip`'s side `deleted` lines the fork point held,
+    /// every line `onto`'s holds in their place built on `tip` itself.
+    fn rewrote(
+        &self,
+        sides: [&[u8]; 2],
+        (replaced, rewriting): (&[Option<JjCommitId>], &[Option<JjCommitId>]),
+        (path, tip, deleted): (&RepoPath, &JjCommitId, bool),
+    ) -> Result<bool, JjError> {
+        use jj_lib::diff::{ContentDiff, DiffHunkKind};
+        let (mut at_ours, mut at_theirs) = (0, 0);
+        for hunk in ContentDiff::by_line(sides).hunks() {
+            let [ours, theirs] = [0, 1].map(|side| {
+                hunk.contents
+                    .get(side)
+                    .map_or(&[][..], |text| -> &[u8] { text })
+            });
+            let (ours_lines, theirs_lines) = (line_count(ours), line_count(theirs));
+            if hunk.kind == DiffHunkKind::Different {
+                let lost = replaced
+                    .get(at_ours..at_ours + ours_lines)
+                    .unwrap_or_default();
+                let written = rewriting
+                    .get(at_theirs..at_theirs + theirs_lines)
+                    .unwrap_or_default();
+                let mut authors: Vec<&JjCommitId> = lost.iter().flatten().collect();
+                if deleted {
+                    authors.push(tip);
+                }
+                if !authors.is_empty() && written.is_empty() {
+                    return Ok(false);
+                }
+                for origin in written {
+                    let Some(origin) = origin else {
+                        return Ok(false);
+                    };
+                    let built = if authors.is_empty() {
+                        self.single_parent_resolved(origin, path)?
+                            && !self.backend_is_ancestor(origin, tip)?
+                    } else {
+                        self.built_on(origin, &authors, path)?
+                    };
+                    if !built {
+                        return Ok(false);
+                    }
+                }
+            }
+            at_ours += ours_lines;
+            at_theirs += theirs_lines;
+        }
+        Ok(true)
+    }
+
+    /// Whether `origin` built on each of `authors` at `path`: it has one
+    /// parent, none conflicted at `path` (no merge resolution, in the merge
+    /// or in a child of it), and descends from each of them.
+    fn built_on(
+        &self,
+        origin: &JjCommitId,
+        authors: &[&JjCommitId],
+        path: &RepoPath,
+    ) -> Result<bool, JjError> {
+        if !self.single_parent_resolved(origin, path)? {
+            return Ok(false);
+        }
+        for author in authors {
+            if !self.backend_is_ancestor(author, origin)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether `commit` has one parent, which holds no conflict at `path`.
+    fn single_parent_resolved(
+        &self,
+        commit: &JjCommitId,
+        path: &RepoPath,
+    ) -> Result<bool, JjError> {
+        let store = self.repo.store();
+        let commit = store
+            .get_commit(commit)
+            .map_err(|error| store_error(&error))?;
+        let [parent] = commit.parent_ids() else {
+            return Ok(false);
+        };
+        let parent = store
+            .get_commit(parent)
+            .map_err(|error| store_error(&error))?;
+        let at_parent =
+            block_on(parent.tree().path_value(path)).map_err(|error| store_error(&error))?;
+        Ok(at_parent.is_resolved())
+    }
+
     /// Where `revision` forked from `trunk`: their one common ancestor, or the
     /// trunk itself when the histories criss-cross to several, as
     /// `uncarried_recorded_members` takes a member's base.
     pub fn fork_point(&self, revision: &CommitId, trunk: &CommitId) -> Result<CommitId, JjError> {
         self.fork_point_of(std::slice::from_ref(revision), trunk)
+    }
+
+    /// The commits on `tip`'s first-parent line below it, newest first, down
+    /// to the first one `trunk` reaches, which is left out.
+    pub fn first_parent_line(
+        &self,
+        tip: &CommitId,
+        trunk: &CommitId,
+    ) -> Result<Vec<CommitId>, JjError> {
+        let store = self.repo.store();
+        let trunk = self.commit(trunk.as_str())?;
+        let mut at = self.commit(tip.as_str())?;
+        let mut line = Vec::new();
+        while let Some(first) = at.parent_ids().first() {
+            if self.backend_is_ancestor(first, trunk.id())? {
+                break;
+            }
+            line.push(CommitId::new(first.hex()));
+            at = store
+                .get_commit(first)
+                .map_err(|error| store_error(&error))?;
+        }
+        Ok(line)
+    }
+
+    /// Where the own change of `tip`, a member stacked on a branch whose head
+    /// is `base`, starts: its fork point with `base`. When `base` already
+    /// reaches `tip` (the member landed into its base), that fork point is
+    /// `tip` itself, so the base is read from before it landed. The walk
+    /// goes from `base` down to `tip`, at each commit through its first
+    /// parent that reaches `tip`; the merge nearest `tip` on that walk with
+    /// a parent that does not reach `tip` is the one that landed it, and the
+    /// fork point is taken with that parent. `None` when the walk meets no
+    /// such merge (`base` took `tip` by moving onto it): the member's
+    /// commits cannot be told from its base's.
+    pub fn member_fork_point(
+        &self,
+        tip: &CommitId,
+        base: &CommitId,
+    ) -> Result<Option<CommitId>, JjError> {
+        if !self.is_ancestor(tip, base)? {
+            return Ok(Some(self.fork_point(tip, base)?));
+        }
+        let store = self.repo.store();
+        let landed = self.commit(tip.as_str())?;
+        let mut at = self.commit(base.as_str())?;
+        let mut before_landing = None;
+        while at.id() != landed.id() {
+            let mut down = None;
+            let mut apart = None;
+            for parent in at.parent_ids() {
+                if self.backend_is_ancestor(landed.id(), parent)? {
+                    down = down.or_else(|| Some(parent.clone()));
+                } else {
+                    apart = apart.or_else(|| Some(parent.clone()));
+                }
+            }
+            let Some(down) = down else {
+                return Ok(None);
+            };
+            if apart.is_some() {
+                before_landing = apart;
+            }
+            at = store
+                .get_commit(&down)
+                .map_err(|error| store_error(&error))?;
+        }
+        match before_landing {
+            Some(parent) => Ok(Some(self.fork_point(tip, &CommitId::new(parent.hex()))?)),
+            None => Ok(None),
+        }
     }
 
     /// [`Self::fork_point`] of every one of `commits` together: the one
@@ -2148,6 +2538,16 @@ fn file_content(
     .map_err(|error| store_error(&error))?;
     Ok(content.into_resolved().ok().map(Vec::from))
 }
+
+/// How many lines `text` holds, the last one counted whether or not a
+/// newline ends it, as an annotation of the text splits it.
+fn line_count(text: &[u8]) -> usize {
+    text.split_inclusive(|byte| *byte == b'\n').count()
+}
+
+/// Each line of a file with the commit that wrote it since a fork point,
+/// or none for a line from before it ([`Repo::line_origins`]).
+type LineOrigins = Vec<Option<JjCommitId>>;
 
 /// `path` as a repository-internal path, `/`-separated.
 fn internal_path(path: &str) -> Result<&RepoPath, JjError> {

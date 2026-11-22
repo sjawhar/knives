@@ -295,13 +295,14 @@ fn release_carries_answers_not_carried_for_a_parent_whose_change_the_release_dro
         "{beta}"
     );
     // And: alpha, whose change the release's tree holds, is carried exactly,
-    // and the reason says the tree was read, not only the ancestry.
+    // and the reason says no merge dropped it, not only that it is an
+    // ancestor.
     let alpha_stdout = String::from_utf8_lossy(&alpha_output.stdout);
     assert!(alpha_output.status.success(), "{alpha_stdout}");
     assert!(
         alpha_stdout.contains(&format!(
             "carried-exact      release/2026-08-04 @ {}  (evidence {}: tip is an ancestor and \
-             the release's tree holds its change)",
+             the release holds its change or a rewrite built on it)",
             release.short(),
             alpha.short()
         )),
@@ -331,6 +332,1063 @@ fn census_answers_not_carried_for_a_parent_whose_change_the_release_dropped() {
         alpha.contains("carried-exact      release/2026-08-04"),
         "{alpha}"
     );
+}
+
+/// A branch `name` with one commit on `base` that writes `content` to
+/// `file`, its bookmark on that commit: a pull request into `base`'s branch.
+fn stack_branch(lab: &Lab, (name, base): (&str, &str), (file, content): (&str, &str)) {
+    lab.jj_work(["new", "-r", base, "-m", name]);
+    std::fs::write(lab.work.join(file), content).expect("write the stacked branch");
+    lab.jj_work(["bookmark", "create", name, "-r", "@"]);
+    lab.jj_work(["new"]);
+}
+
+/// `knives depends <branch> --on <on>` in `lab`'s work checkout with the
+/// config `home`: the record that says which branch `branch` is stacked on.
+fn depends(lab: &Lab, home: &tempfile::TempDir, branch: &str, on: &str) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args(["--text", "depends", branch, "--on", on])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .output()
+        .expect("run knives depends");
+    assert!(
+        output.status.success(),
+        "depends {branch} --on {on}: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A release whose members stack as pull requests into another pull
+/// request's branch do. `feat/base` writes `base.txt`; `feat/pr`, stacked
+/// on it, writes `pr.txt`; `feat/other`, stacked on `feat/base` beside
+/// `feat/pr`, rewrites the line `feat/base` wrote; `feat/later`, stacked on
+/// `feat/pr`, rewrites the line `feat/pr` wrote. The release is a merge of
+/// `feat/other` and `feat/later` made by hand, as a fork's hand-cut release
+/// is, with no conflict to resolve: it holds both lines as the later
+/// members left them, and every other branch is its ancestor. Each stacked
+/// branch records the branch it is stacked on.
+fn release_with_stacked_members() -> (Lab, tempfile::TempDir) {
+    let (lab, home) = release_with_unrecorded_stacked_members();
+    for (branch, on) in [
+        ("feat/pr", "feat/base"),
+        ("feat/other", "feat/base"),
+        ("feat/later", "feat/pr"),
+    ] {
+        depends(&lab, &home, branch, on);
+    }
+    (lab, home)
+}
+
+/// [`release_with_stacked_members`], with no branch recording its base.
+fn release_with_unrecorded_stacked_members() -> (Lab, tempfile::TempDir) {
+    let lab = Lab::new();
+    lab.branch("feat/base", "base.txt", "base\n");
+    stack_branch(&lab, ("feat/pr", "feat/base"), ("pr.txt", "pr\n"));
+    stack_branch(
+        &lab,
+        ("feat/other", "feat/base"),
+        ("base.txt", "base, as feat/other rewrote it\n"),
+    );
+    stack_branch(
+        &lab,
+        ("feat/later", "feat/pr"),
+        ("pr.txt", "pr, as feat/later rewrote it\n"),
+    );
+    lab.jj_work(["new", "feat/other", "feat/later", "-m", "release"]);
+    lab.jj_work(["bookmark", "create", "release/2026-08-04", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let (home, _consumer) = release_test_home(&lab);
+    (lab, home)
+}
+
+#[test]
+fn release_carries_names_the_nearest_branch_a_stacked_member_is_built_on() {
+    // Given: `feat/later`, stacked on `feat/pr`, which is stacked on
+    // `feat/base`; nothing records a base.
+    let (lab, home) = release_with_unrecorded_stacked_members();
+
+    // When, then: its replay from the trunk conflicts, and the answer names
+    // the branch it was built on, `feat/pr`, not one further down.
+    assert_unanswered(
+        &lab,
+        &home,
+        "feat/later",
+        "record it with `knives depends feat/later --on feat/pr`",
+    );
+}
+
+#[test]
+fn release_carries_answers_carried_exact_for_an_ancestor_whose_lines_later_members_rewrote() {
+    // Given: a release whose later members rewrote what `feat/base` and the
+    // pull request into its branch, `feat/pr`, wrote, and which merged its
+    // parents with no resolution of its own.
+    let (lab, home) = release_with_stacked_members();
+    let release = commit_at(&lab, "release/2026-08-04");
+    // `feat/later` is a parent of the release that holds `feat/base`'s line
+    // as `feat/other` rewrote it; `feat/other`'s change the release holds
+    // as it is.
+    for name in ["feat/base", "feat/pr", "feat/later", "feat/other"] {
+        let tip = commit_at(&lab, name);
+
+        // When: carries asks the release about it.
+        let output = knives_release(
+            &lab,
+            &home,
+            &["members", "release/2026-08-04", "--carries", name],
+        );
+
+        // Then: it is carried exactly, with its tip as the evidence: the
+        // release reaches it, and what changed its lines since are commits
+        // that built on them, not a merge that dropped them.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{name}: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(&format!(
+                "carried-exact      release/2026-08-04 @ {}  (evidence {}: tip is an ancestor \
+                 and the release holds its change or a rewrite built on it)",
+                release.short(),
+                tip.short()
+            )),
+            "{name}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn release_carries_answers_conflicted_for_outside_work_whose_replay_conflicts() {
+    // Given: the same release, and a branch it does not reach that writes
+    // another line where `feat/base` wrote its own.
+    let (lab, home) = release_with_stacked_members();
+    lab.branch("feat/stranger", "base.txt", "stranger\n");
+
+    // When: carries asks the release about it.
+    let output = knives_release(
+        &lab,
+        &home,
+        &[
+            "members",
+            "release/2026-08-04",
+            "--carries",
+            "feat/stranger",
+        ],
+    );
+
+    // Then: its replay conflicts and nothing in the release stands for it,
+    // so the answer is conflicted, a finding, as before.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "conflicted         release/2026-08-04 @ {}",
+            commit_at(&lab, "release/2026-08-04").short()
+        )),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_an_ancestor_a_hand_resolution_dropped() {
+    // Given: the same release, edited by hand to drop the file `feat/pr`
+    // wrote, which `feat/later` rewrote; both stay its ancestors.
+    let (lab, home) = release_with_stacked_members();
+    lab.jj_work(["edit", "release/2026-08-04"]);
+    std::fs::remove_file(lab.work.join("pr.txt")).expect("drop pr.txt by hand");
+    lab.jj_work(["new"]);
+    let release = commit_at(&lab, "release/2026-08-04");
+    for name in ["feat/pr", "feat/later"] {
+        assert!(
+            Repo::open(&lab.work)
+                .expect("open the lab")
+                .is_ancestor(&commit_at(&lab, name), &release)
+                .expect("ancestry answerable"),
+            "{name} must stay an ancestor of the release"
+        );
+
+        // When: carries asks the release about it.
+        let output = knives_release(
+            &lab,
+            &home,
+            &["members", "release/2026-08-04", "--carries", name],
+        );
+
+        // Then: ancestry does not make it carried: the release's own
+        // resolution dropped its change.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(1), "{name}: {stdout}");
+        assert!(!stdout.contains("carried-"), "{name}: {stdout}");
+    }
+}
+
+/// The branch the release-resolution tests ask about.
+const MEMBER: &str = "feat/member";
+
+/// Write each of `files` in the work checkout, or remove it for `None`.
+fn write_by_hand(lab: &Lab, files: &[(&str, Option<&str>)]) {
+    for (file, content) in files {
+        let path = lab.work.join(file);
+        match content {
+            Some(content) => std::fs::write(path, content).expect("write by hand"),
+            None => std::fs::remove_file(path).expect("remove by hand"),
+        }
+    }
+}
+
+/// `name`'s bookmark on a merge of `left` and `right` made by hand, with
+/// each of `files` then written, or removed, in the merge itself.
+fn merge_by_hand(
+    lab: &Lab,
+    name: &str,
+    (left, right): (&str, &str),
+    files: &[(&str, Option<&str>)],
+) {
+    lab.jj_work(["new", "-r", left, "-r", right, "-m", name]);
+    write_by_hand(lab, files);
+    lab.jj_work(["bookmark", "create", name, "-r", "@"]);
+    lab.jj_work(["new"]);
+}
+
+/// `name`'s bookmark on one commit on `base` that writes, or removes,
+/// each of `files`.
+fn child_by_hand(lab: &Lab, name: &str, base: &str, files: &[(&str, Option<&str>)]) {
+    lab.jj_work(["new", "-r", base, "-m", name]);
+    write_by_hand(lab, files);
+    lab.jj_work(["bookmark", "create", name, "-r", "@"]);
+    lab.jj_work(["new"]);
+}
+
+/// [`MEMBER`], which writes `shared.txt`, and `feat/other`, which writes a
+/// file of its own.
+fn member_and_other() -> Lab {
+    let lab = Lab::new();
+    lab.branch(MEMBER, "shared.txt", "member-line\n");
+    lab.branch("feat/other", "other.txt", "other\n");
+    lab
+}
+
+/// [`assert_carried`] for [`MEMBER`].
+fn assert_member_carried(lab: &Lab, carried: bool) {
+    assert_carried(lab, MEMBER, carried);
+}
+
+/// [`assert_carried_in`] with a config home of its own, which records no
+/// branch's base.
+fn assert_carried(lab: &Lab, name: &str, carried: bool) {
+    let (home, _consumer) = release_test_home(lab);
+    assert_carried_in(lab, &home, name, carried);
+}
+
+/// Ask whether the release carries `name`, by the release's ref and by its
+/// commit, with the config `home`, and check both answers: exit `0` and
+/// `carried-exact` when `carried`, else exit `1` and no carried verdict.
+fn assert_carried_in(lab: &Lab, home: &tempfile::TempDir, name: &str, carried: bool) {
+    let release = commit_at(lab, "release/2026-08-04");
+    assert!(
+        Repo::open(&lab.work)
+            .expect("open the lab")
+            .is_ancestor(&commit_at(lab, name), &release)
+            .expect("ancestry answerable"),
+        "{name} must be an ancestor of the release"
+    );
+    for target in ["release/2026-08-04", release.as_str()] {
+        let output = knives_release(lab, home, &["members", target, "--carries", name]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if carried {
+            assert_eq!(output.status.code(), Some(0), "{name} {target}: {stdout}");
+            assert!(
+                stdout.contains("carried-exact "),
+                "{name} {target}: {stdout}"
+            );
+        } else {
+            assert_eq!(output.status.code(), Some(1), "{name} {target}: {stdout}");
+            assert!(!stdout.contains("carried-"), "{name} {target}: {stdout}");
+        }
+    }
+}
+
+#[test]
+fn release_carries_answers_carried_exact_for_a_member_a_release_merged_as_it_is() {
+    // Given: the member and another branch merged by hand, the member's
+    // file as it wrote it.
+    let lab = member_and_other();
+    merge_by_hand(&lab, "release/2026-08-04", (MEMBER, "feat/other"), &[]);
+
+    // When, then: the member is carried exactly.
+    assert_member_carried(&lab, true);
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_member_the_release_merge_dropped() {
+    // Given: the member and another branch merged by hand, the member's
+    // file removed in the merge.
+    let lab = member_and_other();
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        (MEMBER, "feat/other"),
+        &[("shared.txt", None)],
+    );
+
+    // When, then: the member is not carried.
+    assert_member_carried(&lab, false);
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_member_a_merge_below_the_release_dropped() {
+    // Given: the member merged by hand with another branch, its file
+    // removed in that merge; and the release, a merge of that one with a
+    // third branch, which changes nothing by hand.
+    let lab = member_and_other();
+    merge_by_hand(
+        &lab,
+        "feat/resolved",
+        (MEMBER, "feat/other"),
+        &[("shared.txt", None)],
+    );
+    lab.branch("feat/third", "third.txt", "third\n");
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        ("feat/resolved", "feat/third"),
+        &[],
+    );
+
+    // When, then: the member is not carried.
+    assert_member_carried(&lab, false);
+}
+
+#[test]
+fn release_carries_answers_carried_exact_for_a_member_a_branch_built_on_it_rewrote() {
+    // Given: a branch built on the member that rewrites its line, merged by
+    // hand with another branch as the release.
+    let lab = member_and_other();
+    child_by_hand(
+        &lab,
+        "feat/rewrite",
+        MEMBER,
+        &[("shared.txt", Some("the member's line, rewritten\n"))],
+    );
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        ("feat/rewrite", "feat/other"),
+        &[],
+    );
+
+    // When, then: the member is carried exactly: the rewrite built on it.
+    assert_member_carried(&lab, true);
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_member_whose_line_a_merge_moved_to_another_file() {
+    // Given: the member and another branch merged by hand, the member's line
+    // moved in the merge from its file to another one.
+    let lab = member_and_other();
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        (MEMBER, "feat/other"),
+        &[("shared.txt", None), ("moved.txt", Some("member-line\n"))],
+    );
+
+    // When, then: the member is not carried.
+    assert_member_carried(&lab, false);
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_member_a_resolution_discarded_for_the_other_side() {
+    // Given: the member and another branch that write the same file their
+    // own ways, merged by hand with the conflict resolved to the other
+    // branch's side alone.
+    let lab = Lab::new();
+    lab.branch(MEMBER, "shared.txt", "member-line\n");
+    lab.branch("feat/other", "shared.txt", "other-side\n");
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        (MEMBER, "feat/other"),
+        &[("shared.txt", Some("other-side\n"))],
+    );
+
+    // When, then: the member is not carried: the resolution dropped it,
+    // and the other side never held its line.
+    assert_member_carried(&lab, false);
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_member_a_branch_built_on_it_reverted() {
+    // Given: a branch built on the member that removes the member's file,
+    // merged by hand with another branch as the release.
+    let lab = member_and_other();
+    child_by_hand(&lab, "feat/revert", MEMBER, &[("shared.txt", None)]);
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        ("feat/revert", "feat/other"),
+        &[],
+    );
+
+    // When, then: the member is not carried: nothing of its change is left.
+    assert_member_carried(&lab, false);
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_member_whose_deletion_a_merge_restored() {
+    // Given: the member, which empties `README.md`, and another branch,
+    // merged by hand with the line the member deleted written back.
+    let lab = Lab::new();
+    lab.branch(MEMBER, "README.md", "");
+    lab.branch("feat/other", "other.txt", "other\n");
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        (MEMBER, "feat/other"),
+        &[("README.md", Some("seed\n"))],
+    );
+
+    // When, then: the member is not carried.
+    assert_member_carried(&lab, false);
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_member_whose_lines_a_merge_reordered() {
+    // Given: the member, which writes two lines, and another branch, merged
+    // by hand with the member's two lines swapped.
+    let lab = Lab::new();
+    lab.branch(MEMBER, "shared.txt", "first\nsecond\n");
+    lab.branch("feat/other", "other.txt", "other\n");
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        (MEMBER, "feat/other"),
+        &[("shared.txt", Some("second\nfirst\n"))],
+    );
+
+    // When, then: the member is not carried exactly.
+    assert_member_carried(&lab, false);
+}
+
+#[test]
+fn release_carries_answers_conflicted_for_a_sibling_whose_rewrite_the_release_discarded() {
+    // Given: `feat/alpha` and `feat/beta`, stacked on `feat/base`, rewrite
+    // the line `b` it wrote each their own way; the release merges them by
+    // hand keeping `feat/beta`'s line.
+    let lab = Lab::new();
+    lab.branch("feat/base", "f.txt", "a\nb\nc\n");
+    child_by_hand(
+        &lab,
+        "feat/alpha",
+        "feat/base",
+        &[("f.txt", Some("a\nb-alpha\nc\n"))],
+    );
+    child_by_hand(
+        &lab,
+        "feat/beta",
+        "feat/base",
+        &[("f.txt", Some("a\nb-beta\nc\n"))],
+    );
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        ("feat/alpha", "feat/beta"),
+        &[("f.txt", Some("a\nb-beta\nc\n"))],
+    );
+    let (home, _consumer) = release_test_home(&lab);
+    depends(&lab, &home, "feat/alpha", "feat/base");
+    depends(&lab, &home, "feat/beta", "feat/base");
+
+    // When, then: `feat/alpha`, whose line the resolution discarded for a
+    // sibling's, is not carried; `feat/beta` is; and `feat/base`, whose line
+    // a branch built on it rewrote, is carried exactly.
+    assert_carried_in(&lab, &home, "feat/alpha", false);
+    assert_carried_in(&lab, &home, "feat/beta", true);
+    assert_carried_in(&lab, &home, "feat/base", true);
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_member_whose_deleted_line_the_release_put_back() {
+    // Given: `feat/del`, stacked on `feat/base`, deletes the line `b`; the
+    // release merges it with another branch and puts `b` back by hand.
+    let lab = Lab::new();
+    lab.branch("feat/base", "f.txt", "a\nb\nc\n");
+    child_by_hand(&lab, "feat/del", "feat/base", &[("f.txt", Some("a\nc\n"))]);
+    lab.branch("feat/x", "x.txt", "x\n");
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        ("feat/del", "feat/x"),
+        &[("f.txt", Some("a\nb\nc\n"))],
+    );
+    let (home, _consumer) = release_test_home(&lab);
+    depends(&lab, &home, "feat/del", "feat/base");
+
+    // When, then: `feat/del` is not carried.
+    assert_carried_in(&lab, &home, "feat/del", false);
+}
+
+/// `feat/line` changes `README.md`; `feat/member`, stacked on it, writes a
+/// file of its own; the release merges `feat/member` with another branch
+/// and adds a line to `README.md` by hand, as a release adds a dependency
+/// to a build file a branch below a member wrote.
+fn member_on_a_line_whose_file_the_release_changed() -> Lab {
+    let lab = Lab::new();
+    lab.branch("feat/line", "README.md", "seed, as feat/line left it\n");
+    child_by_hand(
+        &lab,
+        "feat/member",
+        "feat/line",
+        &[("member.txt", Some("member\n"))],
+    );
+    lab.branch("feat/other", "other.txt", "other\n");
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        ("feat/member", "feat/other"),
+        &[(
+            "README.md",
+            Some("seed, as feat/line left it\na dependency the release added\n"),
+        )],
+    );
+    lab
+}
+
+#[test]
+fn release_carries_answers_carried_exact_for_a_stacked_member_its_base_file_changed_under() {
+    // Given: a member stacked on `feat/line`, which records so, and a
+    // release that changed by hand a file `feat/line` wrote and the member
+    // never touched.
+    let lab = member_on_a_line_whose_file_the_release_changed();
+    let (home, _consumer) = release_test_home(&lab);
+    depends(&lab, &home, "feat/member", "feat/line");
+
+    // When, then: the member is carried exactly: its own change, from the
+    // branch it is stacked on, is in the release as it left it.
+    assert_carried_in(&lab, &home, "feat/member", true);
+}
+
+/// Ask whether the release carries `name` with the config `home`, and check
+/// that it cannot be answered (exit 3) for the reason `reason`.
+fn assert_unanswered(lab: &Lab, home: &tempfile::TempDir, name: &str, reason: &str) {
+    let output = knives_release(
+        lab,
+        home,
+        &["members", "release/2026-08-04", "--carries", name],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{name}: {stdout}");
+    assert!(!stdout.contains("carried-"), "{name}: {stdout}");
+    assert!(stdout.contains(reason), "{name}: {stdout}");
+}
+
+#[test]
+fn release_carries_cannot_answer_a_stacked_member_that_records_no_base() {
+    // Given: the same member and release, with no record of what the
+    // member is stacked on.
+    let lab = member_on_a_line_whose_file_the_release_changed();
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: its replay from the trunk conflicts, and nothing says
+    // which branch its own change starts from, so it is not answered, and
+    // the answer names the record that would answer it.
+    assert_unanswered(
+        &lab,
+        &home,
+        "feat/member",
+        "feat/member is stacked on feat/line, and no record says which branch its own change \
+         starts from: record it with `knives depends feat/member --on feat/line`",
+    );
+}
+
+#[test]
+fn release_carries_cannot_answer_a_stacked_member_that_records_several_bases() {
+    // Given: the same member and release; the member records two branches.
+    let lab = member_on_a_line_whose_file_the_release_changed();
+    let (home, _consumer) = release_test_home(&lab);
+    depends(&lab, &home, "feat/member", "feat/line");
+    depends(&lab, &home, "feat/member", "feat/other");
+
+    // When, then: which one its own change starts from cannot be told.
+    assert_unanswered(
+        &lab,
+        &home,
+        "feat/member",
+        "feat/member is stacked on feat/line and records 2 branches or review pull requests",
+    );
+}
+
+#[test]
+fn release_carries_does_not_see_a_branch_stacked_on_a_review_branch_merged_into_it() {
+    // Given: `feat/line` took `feat/review`, a pull request into it, by a
+    // merge, and `feat/review` keeps its bookmark; `feat/x`, stacked on
+    // `feat/line`, rewrites the line `feat/line` wrote; the release merges
+    // `feat/x` with another branch. `feat/line` records no base.
+    let lab = Lab::new();
+    lab.branch("feat/line", "line.txt", "line\n");
+    child_by_hand(
+        &lab,
+        "feat/review",
+        "feat/line",
+        &[("review.txt", Some("review\n"))],
+    );
+    child_by_hand(
+        &lab,
+        "feat/line-next",
+        "feat/line",
+        &[("next.txt", Some("next\n"))],
+    );
+    merge_by_hand(&lab, "landed", ("feat/line-next", "feat/review"), &[]);
+    lab.jj_work(["bookmark", "set", "feat/line", "-r", "landed"]);
+    lab.jj_work(["bookmark", "delete", "landed", "feat/line-next"]);
+    child_by_hand(
+        &lab,
+        "feat/x",
+        "feat/line",
+        &[("line.txt", Some("line, as feat/x rewrote it\n"))],
+    );
+    lab.branch("feat/other", "other.txt", "other\n");
+    merge_by_hand(&lab, "release/2026-08-04", ("feat/x", "feat/other"), &[]);
+
+    // When, then: `feat/line` is no branch stacked on `feat/review`, which
+    // it only merged, so it starts from the trunk, and the rewrite built on
+    // its line: carried exactly, with no record asked for.
+    assert_carried(&lab, "feat/line", true);
+}
+
+#[test]
+fn release_carries_reads_a_member_landed_as_a_merges_first_parent_under_a_later_merge() {
+    // Given: the member landed into `feat/line` by a merge whose first parent
+    // is the member; `feat/line` then merged an unrelated branch; the release
+    // merges `feat/line` with another branch and changes by hand the file
+    // `feat/line` wrote first.
+    let lab = Lab::new();
+    lab.branch("feat/line", "README.md", "seed, as feat/line left it\n");
+    child_by_hand(
+        &lab,
+        "feat/member",
+        "feat/line",
+        &[("member.txt", Some("member\n"))],
+    );
+    child_by_hand(
+        &lab,
+        "feat/line-next",
+        "feat/line",
+        &[("next.txt", Some("next\n"))],
+    );
+    merge_by_hand(&lab, "landed", ("feat/member", "feat/line-next"), &[]);
+    lab.branch("feat/unrelated", "unrelated.txt", "unrelated\n");
+    merge_by_hand(&lab, "after", ("landed", "feat/unrelated"), &[]);
+    lab.jj_work(["bookmark", "set", "feat/line", "-r", "after"]);
+    lab.jj_work(["bookmark", "delete", "landed", "after", "feat/line-next"]);
+    lab.branch("feat/other", "other.txt", "other\n");
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        ("feat/line", "feat/other"),
+        &[(
+            "README.md",
+            Some("seed, as feat/line left it\na dependency the release added\n"),
+        )],
+    );
+    let (home, _consumer) = release_test_home(&lab);
+    depends(&lab, &home, "feat/member", "feat/line");
+
+    // When, then: the merge nearest the member that has a parent apart from
+    // it is the one that landed it, and the release holds its own change.
+    assert_carried_in(&lab, &home, "feat/member", true);
+}
+
+#[test]
+fn release_carries_reads_a_member_landed_into_its_base_from_before_it_landed() {
+    // Given: the member landed into `feat/line` by a merge, then `feat/line`
+    // went on; the release merges `feat/line` with another branch and
+    // changes by hand the file `feat/line` wrote first.
+    let lab = Lab::new();
+    lab.branch("feat/line", "README.md", "seed, as feat/line left it\n");
+    child_by_hand(
+        &lab,
+        "feat/member",
+        "feat/line",
+        &[("member.txt", Some("member\n"))],
+    );
+    child_by_hand(
+        &lab,
+        "feat/line-next",
+        "feat/line",
+        &[("next.txt", Some("next\n"))],
+    );
+    merge_by_hand(&lab, "landed", ("feat/line-next", "feat/member"), &[]);
+    lab.jj_work(["bookmark", "set", "feat/line", "-r", "landed"]);
+    lab.jj_work(["bookmark", "delete", "landed", "feat/line-next"]);
+    lab.branch("feat/other", "other.txt", "other\n");
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        ("feat/line", "feat/other"),
+        &[(
+            "README.md",
+            Some("seed, as feat/line left it\na dependency the release added\n"),
+        )],
+    );
+    let (home, _consumer) = release_test_home(&lab);
+    depends(&lab, &home, "feat/member", "feat/line");
+
+    // When, then: its own change is read from where it left `feat/line`
+    // before it landed, and the release holds it.
+    assert_carried_in(&lab, &home, "feat/member", true);
+
+    // And: had `feat/line` taken the member by moving onto it, with no
+    // merge, its own change cannot be told from the base's.
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "feat/line",
+        "-r",
+        "feat/member",
+        "--allow-backwards",
+    ]);
+    child_by_hand(
+        &lab,
+        "feat/line-after",
+        "feat/line",
+        &[("after.txt", Some("after\n"))],
+    );
+    lab.jj_work(["bookmark", "set", "feat/line", "-r", "feat/line-after"]);
+    lab.jj_work(["bookmark", "delete", "feat/line-after"]);
+    merge_by_hand(
+        &lab,
+        "release/2026-08-05",
+        ("feat/line", "feat/other"),
+        &[(
+            "README.md",
+            Some("seed, as feat/line left it\na dependency the release added\n"),
+        )],
+    );
+    let output = knives_release(
+        &lab,
+        &home,
+        &["members", "release/2026-08-05", "--carries", "feat/member"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(
+        stdout.contains("reaches it with no merge that landed it"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_both_members_of_a_cut_conflict_resolved_to_neither() {
+    // Given: `feat/alpha` and `feat/beta` write the same file their own
+    // ways; knives cuts the release with the conflict stored, and the
+    // release is resolved by hand to a third text.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "shared.txt", "alpha\n");
+    lab.branch("feat/beta", "shared.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(
+        String::from_utf8_lossy(&cut.stdout).contains("cut release/2026-08-04 as"),
+        "{cut:?}"
+    );
+    lab.jj_work(["edit", "release/2026-08-04"]);
+    std::fs::write(lab.work.join("shared.txt"), "merged\n").expect("resolve by hand");
+    lab.jj_work(["new"]);
+
+    // When, then: neither member is carried, as `members --verify` says.
+    assert_carried_in(&lab, &home, "feat/alpha", false);
+    assert_carried_in(&lab, &home, "feat/beta", false);
+    let verify = knives_release(&lab, &home, &["members", "--verify"]);
+    assert_eq!(verify.status.code(), Some(1), "{verify:?}");
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_member_a_commit_below_a_later_merge_dropped() {
+    // Given: a merge of `feat/alpha` and `feat/beta`; a commit on it that
+    // removes `feat/alpha`'s file; and the release, a merge of that commit
+    // with `feat/gamma`.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "a.txt", "alpha\n");
+    lab.branch("feat/beta", "b.txt", "beta\n");
+    merge_by_hand(&lab, "m", ("feat/alpha", "feat/beta"), &[]);
+    child_by_hand(&lab, "f", "m", &[("a.txt", None)]);
+    lab.branch("feat/gamma", "c.txt", "gamma\n");
+    merge_by_hand(&lab, "release/2026-08-04", ("f", "feat/gamma"), &[]);
+
+    // When, then: `feat/alpha` is not carried.
+    assert_carried(&lab, "feat/alpha", false);
+}
+
+/// [`MEMBER`] on the trunk, one commit that writes each of `files`, with
+/// `mode` set on the file `shared.sh` when given.
+fn member_with(lab: &Lab, files: &[(&str, Option<&str>)], mode: Option<u32>) {
+    use std::os::unix::fs::PermissionsExt as _;
+    lab.jj_work(["new", "-r", "main@origin", "-m", MEMBER]);
+    write_by_hand(lab, files);
+    if let Some(mode) = mode {
+        std::fs::set_permissions(
+            lab.work.join("shared.sh"),
+            std::fs::Permissions::from_mode(mode),
+        )
+        .expect("set the mode");
+    }
+    lab.jj_work(["bookmark", "create", MEMBER, "-r", "@"]);
+    lab.jj_work(["new"]);
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_member_whose_mode_the_release_merge_dropped() {
+    // Given: the member makes `shared.sh` executable; the release merges it
+    // with another branch and clears the mode by hand.
+    use std::os::unix::fs::PermissionsExt as _;
+    let lab = Lab::new();
+    member_with(&lab, &[("shared.sh", Some("run\n"))], Some(0o755));
+    lab.branch("feat/other", "other.txt", "other\n");
+    lab.jj_work(["new", "-r", MEMBER, "-r", "feat/other", "-m", "release"]);
+    std::fs::set_permissions(
+        lab.work.join("shared.sh"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .expect("clear the mode");
+    lab.jj_work(["bookmark", "create", "release/2026-08-04", "-r", "@"]);
+    lab.jj_work(["new"]);
+
+    // When, then: the member is not carried.
+    assert_member_carried(&lab, false);
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_mode_dropped_where_a_later_branch_rewrote_the_line() {
+    // Given: the member writes an executable `shared.sh`; a branch built on
+    // it rewrites its line; the release merges that branch with another and
+    // clears the mode by hand.
+    use std::os::unix::fs::PermissionsExt as _;
+    let lab = Lab::new();
+    member_with(&lab, &[("shared.sh", Some("run\n"))], Some(0o755));
+    child_by_hand(
+        &lab,
+        "feat/rewrite",
+        MEMBER,
+        &[("shared.sh", Some("run, rewritten\n"))],
+    );
+    lab.branch("feat/other", "other.txt", "other\n");
+    lab.jj_work([
+        "new",
+        "-r",
+        "feat/rewrite",
+        "-r",
+        "feat/other",
+        "-m",
+        "release",
+    ]);
+    std::fs::set_permissions(
+        lab.work.join("shared.sh"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .expect("clear the mode");
+    lab.jj_work(["bookmark", "create", "release/2026-08-04", "-r", "@"]);
+    lab.jj_work(["new"]);
+
+    // When, then: the member is not carried: its line was rewritten by a
+    // branch built on it, but its mode is gone.
+    assert_member_carried(&lab, false);
+}
+
+#[test]
+fn release_carries_reads_a_link_a_member_wrote() {
+    // Given: the member writes a link; a branch built on it points the link
+    // elsewhere; and two releases, one dropping the link by hand, one
+    // holding it as the later branch left it.
+    let lab = Lab::new();
+    lab.jj_work(["new", "-r", "main@origin", "-m", MEMBER]);
+    std::os::unix::fs::symlink("README.md", lab.work.join("link")).expect("write the link");
+    lab.jj_work(["bookmark", "create", MEMBER, "-r", "@"]);
+    lab.jj_work(["new", "-r", MEMBER, "-m", "feat/repoint"]);
+    std::fs::remove_file(lab.work.join("link")).expect("remove the link");
+    std::os::unix::fs::symlink("elsewhere", lab.work.join("link")).expect("repoint the link");
+    lab.jj_work(["bookmark", "create", "feat/repoint", "-r", "@"]);
+    lab.branch("feat/other", "other.txt", "other\n");
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        (MEMBER, "feat/other"),
+        &[("link", None)],
+    );
+
+    // When, then: a release that dropped the link does not carry the member.
+    let (home, _consumer) = release_test_home(&lab);
+    assert_carried_in(&lab, &home, MEMBER, false);
+
+    // And: a release holding the link as the later branch left it does not
+    // carry it exactly either: a link is not text a rewrite is read in.
+    lab.jj_work([
+        "new",
+        "-r",
+        "feat/repoint",
+        "-r",
+        "feat/other",
+        "-m",
+        "release",
+    ]);
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "release/2026-08-04",
+        "-r",
+        "@",
+        "--allow-backwards",
+    ]);
+    lab.jj_work(["new"]);
+    assert_carried_in(&lab, &home, MEMBER, false);
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_member_whose_blank_lines_the_release_dropped() {
+    // Given: the member writes lines with blank lines between them; the
+    // release merges it with another branch and drops the blank lines.
+    let lab = Lab::new();
+    lab.branch(MEMBER, "shared.txt", "x\n\n\ny\n");
+    lab.branch("feat/other", "other.txt", "other\n");
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        (MEMBER, "feat/other"),
+        &[("shared.txt", Some("x\ny\n"))],
+    );
+
+    // When, then: the member is not carried.
+    assert_member_carried(&lab, false);
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_member_whose_file_later_work_moved() {
+    // Given: the member changes `README.md`, which the trunk holds; a branch
+    // built on it moves the file to `MOVED.md`; the release merges that
+    // branch with another and changes the moved file by hand.
+    let lab = Lab::new();
+    lab.branch(MEMBER, "README.md", "seed, as the member left it\n");
+    child_by_hand(
+        &lab,
+        "feat/move",
+        MEMBER,
+        &[
+            ("README.md", None),
+            ("MOVED.md", Some("seed, as the member left it\n")),
+        ],
+    );
+    lab.branch("feat/other", "other.txt", "other\n");
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        ("feat/move", "feat/other"),
+        &[("MOVED.md", Some("dropped\n"))],
+    );
+
+    // When, then: the member is not carried exactly: the file it changed is
+    // gone where it changed it, and a rewrite is not read across a move.
+    assert_member_carried(&lab, false);
+}
+
+/// `git` on the lab's work repository's own git store, with a scratch index
+/// at `index`, returning trimmed stdout: jj writes no submodule, so a
+/// fixture that holds one is written with git's plumbing.
+fn git_store(lab: &Lab, index: &std::path::Path, args: &[&str]) -> String {
+    let git_dir = lab.jj_work_output(["git", "root"]);
+    let output = std::process::Command::new("git")
+        .env("GIT_DIR", git_dir.trim())
+        .env("GIT_INDEX_FILE", index)
+        .env("GIT_AUTHOR_NAME", "Knives Lab")
+        .env("GIT_AUTHOR_EMAIL", "knives-lab@example.test")
+        .env("GIT_COMMITTER_NAME", "Knives Lab")
+        .env("GIT_COMMITTER_EMAIL", "knives-lab@example.test")
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// A commit on `parents` whose tree is `from`'s with `sub` set to the
+/// gitlink `link` (or removed for `None`), under bookmark `name`.
+fn commit_with_link(lab: &Lab, name: &str, (from, link): (&str, Option<&str>), parents: &[&str]) {
+    let scratch = tempfile::tempdir().expect("scratch index directory");
+    let index = scratch.path().join("index");
+    git_store(lab, &index, &["read-tree", from]);
+    let cacheinfo = link.map(|link| format!("160000,{link},sub"));
+    git_store(
+        lab,
+        &index,
+        &cacheinfo.as_deref().map_or_else(
+            || vec!["update-index", "--force-remove", "sub"],
+            |cacheinfo| vec!["update-index", "--add", "--cacheinfo", cacheinfo],
+        ),
+    );
+    let tree = git_store(lab, &index, &["write-tree"]);
+    let mut args = vec!["commit-tree", tree.as_str(), "-m", name];
+    for parent in parents {
+        args.extend(["-p", parent]);
+    }
+    let commit = git_store(lab, &index, &args);
+    git_store(
+        lab,
+        &index,
+        &["update-ref", &format!("refs/heads/{name}"), &commit],
+    );
+    lab.jj_work(["git", "import"]);
+}
+
+#[test]
+fn release_carries_reads_a_submodule_a_member_wrote() {
+    // Given: the member adds a submodule; a branch built on it moves the
+    // submodule to another commit; and two releases, one that dropped the
+    // submodule, one that holds it as the later branch left it.
+    let lab = Lab::new();
+    let trunk = commit_at(&lab, "main@origin");
+    lab.branch("feat/other", "other.txt", "other\n");
+    let other = commit_at(&lab, "feat/other");
+    let first = "1111111111111111111111111111111111111111";
+    let second = "2222222222222222222222222222222222222222";
+    commit_with_link(
+        &lab,
+        MEMBER,
+        (trunk.as_str(), Some(first)),
+        &[trunk.as_str()],
+    );
+    let member = commit_at(&lab, MEMBER);
+    commit_with_link(
+        &lab,
+        "feat/repoint",
+        (member.as_str(), Some(second)),
+        &[member.as_str()],
+    );
+    let repoint = commit_at(&lab, "feat/repoint");
+    commit_with_link(
+        &lab,
+        "release/2026-08-04",
+        (other.as_str(), None),
+        &[member.as_str(), other.as_str()],
+    );
+
+    // When, then: a release that dropped the submodule does not carry the
+    // member.
+    let (home, _consumer) = release_test_home(&lab);
+    assert_carried_in(&lab, &home, MEMBER, false);
+
+    // And: a release holding the submodule as the later branch left it does
+    // not carry it exactly either: a submodule is not text a rewrite is
+    // read in.
+    commit_with_link(
+        &lab,
+        "release/2026-08-04",
+        (other.as_str(), Some(second)),
+        &[repoint.as_str(), other.as_str()],
+    );
+    assert_carried_in(&lab, &home, MEMBER, false);
 }
 
 #[test]

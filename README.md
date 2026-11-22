@@ -450,6 +450,12 @@ name the merge.
 `knives release members --carries REVISION` compares the revision with every live release and the
 upstream trunk; `knives release members TARGET --carries REVISION` asks exactly one target;
 `knives release members --census` asks that of every maintained branch.
+Against a release, a member's own change is replayed: from its fork point with the trunk, or, for
+a member stacked on another branch, from that branch, which `knives depends <member> --on <branch>`
+(or a review pull request on the fork's own repository) records. A stacked member with no such
+record, or several, is not answered when its replay from the trunk conflicts (exit `3`, naming the
+record to write). A replay that conflicts only where a commit that built on the member's lines
+rewrote them is `carried-exact`; `docs/design.md` says how each hunk is read.
 A revision whose net change does not replay empty onto a target is `carried-rebased` there when a
 rewrite that stands for it is an ancestor of the target: a successor of it in jj's operation log,
 or a commit with its tree. An older version that only shares its change id does not count. The

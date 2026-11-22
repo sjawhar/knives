@@ -653,10 +653,34 @@ when no release exists, against the upstream trunk alone, rather than refusing; 
 target needed to decide whether unreleased work would be orphaned. A revision is safe only when a
 live release or the trunk carries its content; a superseded release is consulted only after those
 targets miss and does not make the result safe. Against the upstream trunk, which knives does not
-compose, an ancestor tip is carried-exact. Against a release it is carried-exact only when its net
-change from its fork point with the trunk replays empty onto the release, a release-log block the
-release holds as a union counting as held: a release merge names its members as parents, so every
-member is an ancestor whatever the merge's tree holds.
+compose, an ancestor tip is carried-exact. Against a release an ancestor tip is carried-exact only
+when the release holds its own change: a release merge names its members as parents, so every member
+is an ancestor whatever the merge's tree holds. Its own change starts at its fork point with the
+trunk, or, for a member stacked on another branch, at that branch (`carriage::MemberBase`): from
+the trunk a stacked member brings its base's whole line, whose lines siblings rewrote and a hand-cut
+release combined. A member is seen stacked when another maintained branch's tip is on its
+first-parent line since the trunk; a branch merged into its line is not. Its base is the head of the
+one branch or review pull request on the fork's own
+repository it records with `knives depends`, whether or not it is seen stacked (a member that landed
+into its base is not: the base's tip descends from it); the change starts at the member's fork point
+with that head, or, when the head already reaches the member, with the first parent of the merge on
+the head's first-parent line that brought the member in (`Repo::member_fork_point`). A stacked
+member that records none or several, a head the forge does not report or the checkout lacks, and a
+member its base took by a fast-forward are not answered when the replay conflicts: the check is an
+error naming what to record, so `--carries` exits `3`. The change replaying empty onto the release,
+a release-log block the release holds as a union counting as held, shows it is held. A replay that
+leaves a clean diff shows part of it gone, reverted by a later commit or dropped by a merge: not
+carried. A replay that conflicts is read file by file and hunk by hunk
+(`Repo::rewritten_replay_outcome`): a hunk the release holds as the fork point held it is missing
+(not carried); one both changed is held only when it is regular file text, the release side is not
+empty, and, comparing the two sides line by line, each line the release holds in place of the
+member's was written (by annotation) by a one-parent commit whose parent holds no conflict at the
+file and which descends from each commit that wrote the lines it replaced, and from the member when
+the member's side deleted lines the fork point held; a line the release holds where the member's
+side holds none was written by such a commit that is no ancestor of the member. Anything else
+conflicts: a merge's own resolution, a sibling's line kept over the member's, a line put back, a
+file moved or deleted, a mode, link or submodule changed both ways. A mode the member set that the
+release lacks is missing.
 
 `knives release members --census` turns that same check into a census. Its primary matrix contains
 every maintained branch against the live releases and upstream trunk. Superseded releases are
