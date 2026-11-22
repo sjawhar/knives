@@ -703,7 +703,9 @@ fn finishing_an_unheld_branch_with_a_reason_records_it_on_an_entry_that_changes_
 
 /// A fake gh in a new directory on which the sibling's upstream,
 /// `maintainer/other`, has pull requests #49 and #12, and its own repository,
-/// `acme/other`, has none.
+/// `acme/other`, has none. It also knows this fork's own repository,
+/// `acme/work`: `depends --on sibling#<n>` asks whether the sibling's upstream
+/// is this fork's repository under another name.
 fn sibling_forge() -> tempfile::TempDir {
     let shim = tempfile::tempdir().expect("gh shim directory");
     let sibling_pulls = format!(
@@ -722,6 +724,11 @@ fn sibling_forge() -> tempfile::TempDir {
             Repository {
                 named: "acme/other",
                 canonical: "acme/other",
+                pulls: "[]",
+            },
+            Repository {
+                named: "acme/work",
+                canonical: "acme/work",
                 pulls: "[]",
             },
         ],

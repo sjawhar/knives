@@ -12,7 +12,7 @@ use crate::ids::{
     BookmarkRef, BranchName, BranchTarget, CommitId, RemoteName, Requirement, UpstreamName,
 };
 use crate::jj::{JjError, Repo};
-use crate::remote_url::remote_slug;
+use crate::remote_url::{remote_slug, with_slug};
 use crate::store::Store;
 
 use super::merged::merged_landing;
@@ -846,8 +846,7 @@ fn placed_members(
             continue;
         };
         let resolved = own.clone().and_then(|own| {
-            let url = remote_slug(origin)
-                .map(|slug| origin.replacen(slug, repository, 1))
+            let url = with_slug(origin, repository)
                 .ok_or_else(|| format!("{fork}'s {ORIGIN} names no forge repository"))?;
             named(&url).map(|name| name == own)
         });
@@ -1029,11 +1028,8 @@ fn fork_pull_outcomes(
         let resolved = if repository.eq_ignore_ascii_case(&own) {
             Ok(true)
         } else {
-            remote_slug(origin)
-                .map(|slug| origin.replacen(slug, &repository, 1))
-                .map_or(Ok(false), |url: String| {
-                    named(url.as_str()).map(|name| name == own)
-                })
+            with_slug(origin, &repository)
+                .map_or(Ok(false), |url| named(url.as_str()).map(|name| name == own))
         };
         match resolved {
             Ok(true) => ours.extend(requirements),

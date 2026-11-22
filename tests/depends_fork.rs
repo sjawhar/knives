@@ -3558,6 +3558,124 @@ fn online_a_fork_of_this_fork_under_its_former_name_is_its_own() {
 }
 
 #[test]
+fn the_registry_key_of_a_fork_of_this_fork_names_this_forks_review_pull_request() {
+    // Given: config B; the registry holds `child`, a fork of this fork whose
+    // upstream is acme/demo, this fork's own repository; the forge answers.
+    let fixture = fixture_with(CONFIG_B.0, CONFIG_B.1);
+    register(&fixture, "child", "acme/demo", "acme/other");
+
+    // When: #13 is named by the child's registry key.
+    let output = on(&fixture, "child#13");
+
+    // Then: it is this fork's review pull request, as `--on acme/demo#13`
+    // records it, not an upstream pull request kept under the child (N93).
+    assert!(output.status.success(), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), ["origin:acme/demo#13"]);
+
+    // And: the same spelling takes it back (N96).
+    let output = fixture.knives(&["--text", "depends", "feat/alpha", "--forget", "child#13"]);
+    assert!(output.status.success(), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
+
+    // And: with the forge down, the key spelling is refused like the
+    // `<owner>/<name>` one, and nothing is recorded.
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+    let output = on(&fixture, "child#13");
+    assert_eq!(output.status.code(), Some(3), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with(
+            "nothing recorded: acme/demo in child#13 is the upstream of child, and only the forge \
+             can tell whether it is also demo's own repository under another name"
+        ) && stderr.contains("Run it again when the forge answers"),
+        "{stderr}"
+    );
+    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
+}
+
+#[test]
+fn a_failed_redirect_lookup_is_refused_never_read_as_another_repository() {
+    // Given: config B; a fork of this fork registered under this fork's
+    // former name; this fork's own name answers, and the former name's
+    // lookup fails as an outage does.
+    let fixture = fixture_with(CONFIG_B.0, CONFIG_B.1);
+    register(&fixture, "child", "acme-old/demo", "acme/child");
+    fixture.forge_now(ForgeNow::FormerNameFails);
+
+    // When / Then: nothing is recorded, and the refusal says to run it again
+    // (N94).
+    let output = on(&fixture, "acme-old/demo#13");
+    refused_for_the_forge(&fixture, &output, "acme-old/demo", "child");
+}
+
+#[test]
+fn a_repository_the_forge_cannot_resolve_is_named_and_an_outage_is_retried() {
+    // Given: `tool`, a fork whose upstream outsider/tool the forge cannot
+    // resolve.
+    let fixture = fixture();
+    register(&fixture, "tool", "outsider/tool", "maintainer/tool");
+
+    // When: one of its pull requests is named with the forge up.
+    let output = on(&fixture, "outsider/tool#5");
+
+    // Then: nothing is recorded, and the refusal names the repository the
+    // forge could not resolve, not a rerun (N95).
+    assert_eq!(output.status.code(), Some(3), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "The forge could not resolve outsider/tool: it is gone, or the token cannot see it, \
+             and a rerun gives the same answer until that changes"
+        ) && !stderr.contains("Run it again"),
+        "{stderr}"
+    );
+    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
+
+    // And: with the forge down, the refusal says to run it again.
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+    let output = on(&fixture, "outsider/tool#5");
+    refused_for_the_forge(&fixture, &output, "outsider/tool", "tool");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("could not resolve"),
+        "{}",
+        said(&output)
+    );
+}
+
+#[test]
+fn forgetting_by_a_fork_of_this_forks_former_name_takes_this_forks_review_pull_request() {
+    // Given: config B; a fork of this fork registered under this fork's
+    // former name; feat/alpha requires this fork's #13, named so.
+    let fixture = fixture_with(CONFIG_B.0, CONFIG_B.1);
+    register(&fixture, "child", "acme-old/demo", "acme/child");
+    let output = on(&fixture, "acme-old/demo#13");
+    assert!(output.status.success(), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), ["origin:acme/demo#13"]);
+
+    // When: it is forgotten by the same spelling with the forge down.
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+    let forget = [
+        "--text",
+        "depends",
+        "feat/alpha",
+        "--forget",
+        "acme-old/demo#13",
+    ];
+    let output = fixture.knives(&forget);
+
+    // Then: only the forge can say the spelling is this fork's: nothing is
+    // taken back (exit 3).
+    assert_eq!(output.status.code(), Some(3), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), ["origin:acme/demo#13"]);
+
+    // And: with the forge up, `--forget` reads it as `--on` did (N96).
+    fixture.forge_now(ForgeNow::Up);
+    let output = fixture.knives(&forget);
+    assert!(output.status.success(), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
+}
+
+#[test]
 fn offline_the_forks_new_name_with_no_fork_of_it_registered_is_refused_as_before() {
     // Given: config A, no fork of this fork registered, and the forge down.
     let fixture = fixture_with(CONFIG_A.0, CONFIG_A.1);
