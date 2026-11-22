@@ -952,6 +952,11 @@ impl Repo {
                         .unwrap_or_default();
                     let deleted = replaced.iter().filter(|origin| origin.is_none()).count()
                         < line_count(base);
+                    // A line the member deleted that the release holds again
+                    // was put back, whatever else changed beside it.
+                    if deleted && puts_back(base, ours, theirs) {
+                        return Ok(RebaseOutcome::Conflicted);
+                    }
                     if !self.rewrote(
                         [ours, theirs],
                         (replaced, rewriting),
@@ -1000,12 +1005,15 @@ impl Repo {
     ///
     /// The two sides are compared line by line. Where `tip`'s side holds
     /// lines `onto`'s lacks, `onto`'s holds lines in their place, each
-    /// written by a commit that built on them ([`Self::built_on`]). Where
-    /// `onto`'s side holds lines `tip`'s lacks, each was written by a commit
-    /// that has one parent, none conflicted at `path`, and is no ancestor of
-    /// `tip`: a line `tip`'s history removed and the release holds again is
-    /// no rewrite. Where `tip`'s side `deleted` lines the fork point held,
-    /// every line `onto`'s holds in their place built on `tip` itself.
+    /// written by a commit that built on them ([`Self::built_on`]) and took
+    /// them over ([`Self::took_over`]): what it replaced was the member's
+    /// lines, not what a resolution or a deletion had left in their place.
+    /// Where `onto`'s side holds lines `tip`'s lacks, each was written by a
+    /// commit that has one parent, none conflicted at `path`, and is no
+    /// ancestor of `tip`: a line `tip`'s history removed and the release
+    /// holds again is no rewrite. Where `tip`'s side `deleted` lines the fork
+    /// point held, every line `onto`'s holds in their place built on `tip`
+    /// itself.
     fn rewrote(
         &self,
         sides: [&[u8]; 2],
@@ -1028,6 +1036,13 @@ impl Repo {
                 let written = rewriting
                     .get(at_theirs..at_theirs + theirs_lines)
                     .unwrap_or_default();
+                // A rewrite is read line by line: a group that replaced the
+                // member's lines together with base text the member kept
+                // cannot tell which of the member's lines it rewrote and
+                // which it dropped.
+                if lost.iter().any(Option::is_some) && lost.iter().any(Option::is_none) {
+                    return Ok(false);
+                }
                 let mut authors: Vec<&JjCommitId> = lost.iter().flatten().collect();
                 if deleted {
                     authors.push(tip);
@@ -1035,6 +1050,7 @@ impl Repo {
                 if !authors.is_empty() && written.is_empty() {
                     return Ok(false);
                 }
+                let mut rewriters: Vec<&JjCommitId> = Vec::new();
                 for origin in written {
                     let Some(origin) = origin else {
                         return Ok(false);
@@ -1048,6 +1064,18 @@ impl Repo {
                     if !built {
                         return Ok(false);
                     }
+                    if !rewriters.contains(&origin) {
+                        rewriters.push(origin);
+                    }
+                }
+                let members_lines: Vec<&[u8]> = ours
+                    .split_inclusive(|byte| *byte == b'\n')
+                    .zip(lost)
+                    .filter(|(_, origin)| origin.is_some())
+                    .map(|(line, _)| line)
+                    .collect();
+                if !self.took_over(path, &rewriters, &members_lines)? {
+                    return Ok(false);
                 }
             }
             at_ours += ours_lines;
@@ -1074,6 +1102,53 @@ impl Repo {
             }
         }
         Ok(true)
+    }
+
+    /// Whether `rewriters`, the commits that wrote the lines a release holds
+    /// in place of `members_lines` at `path`, took those lines over: right
+    /// before each of them (in its parent) some of the member's lines stood,
+    /// and each of the member's lines stood right before one of them. A
+    /// commit whose parent held none of them replaced what a resolution, a
+    /// deletion or another branch had left there, not the member's lines.
+    /// With no member line (the member's side held only text from before
+    /// its fork point), there is nothing to take over.
+    fn took_over(
+        &self,
+        path: &RepoPath,
+        rewriters: &[&JjCommitId],
+        members_lines: &[&[u8]],
+    ) -> Result<bool, JjError> {
+        if members_lines.is_empty() {
+            return Ok(true);
+        }
+        let store = self.repo.store();
+        let mut seen = vec![false; members_lines.len()];
+        for rewriter in rewriters {
+            let commit = store
+                .get_commit(rewriter)
+                .map_err(|error| store_error(&error))?;
+            let [parent] = commit.parent_ids() else {
+                return Ok(false);
+            };
+            let parent = store
+                .get_commit(parent)
+                .map_err(|error| store_error(&error))?;
+            let held =
+                block_on(parent.tree().path_value(path)).map_err(|error| store_error(&error))?;
+            let held = regular_file_content(store, path, &held)?.unwrap_or_default();
+            let before: Vec<&[u8]> = held.split_inclusive(|byte| *byte == b'\n').collect();
+            let mut any = false;
+            for (line, seen) in members_lines.iter().zip(&mut seen) {
+                if before.contains(line) {
+                    *seen = true;
+                    any = true;
+                }
+            }
+            if !any {
+                return Ok(false);
+            }
+        }
+        Ok(seen.iter().all(|seen| *seen))
     }
 
     /// Whether `commit` has one parent, which holds no conflict at `path`.
@@ -2543,6 +2618,16 @@ fn file_content(
 /// newline ends it, as an annotation of the text splits it.
 fn line_count(text: &[u8]) -> usize {
     text.split_inclusive(|byte| *byte == b'\n').count()
+}
+
+/// Whether `theirs` holds a line of `base` that `ours` dropped: at one hunk
+/// of a replay, a line the member's side deleted from the fork point's text
+/// that the release's side holds again.
+fn puts_back(base: &[u8], ours: &[u8], theirs: &[u8]) -> bool {
+    let ours: Vec<&[u8]> = ours.split_inclusive(|byte| *byte == b'\n').collect();
+    let theirs: Vec<&[u8]> = theirs.split_inclusive(|byte| *byte == b'\n').collect();
+    base.split_inclusive(|byte| *byte == b'\n')
+        .any(|line| !ours.contains(&line) && theirs.contains(&line))
 }
 
 /// Each line of a file with the commit that wrote it since a fork point,

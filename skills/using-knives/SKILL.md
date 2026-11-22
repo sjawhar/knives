@@ -53,11 +53,11 @@ Use the replay probe, never a source-text search: a symbol's presence does not s
 
 | Verdict | Evidence |
 |---|---|
-| `carried-exact` | The revision tip is an ancestor of the target. Against a release, also its own change replays empty onto the release, or conflicts only where a one-parent commit that built on its lines rewrote them. |
+| `carried-exact` | The revision tip is an ancestor of the target. Against a release, also its own change replays empty onto the release, or conflicts only where one-parent commits that built on its lines, and had them in their parents, rewrote them. |
 | `carried-rewritten` | Replaying its net change leaves the target unchanged: equivalent content arrived another way, or it has no net change. |
 | `carried-rebased` | Replay differs, but a commit with its change id is an ancestor. Weaker: divergent changes can name different trees. |
 | `NOT carried` (JSON `not-carried`) | Replay leaves a clean non-empty diff, and no rewrite is in the target. For a tip the target reaches: part of its own change is gone, reverted by a later commit or dropped by a merge. |
-| `conflicted` | Replay conflicts, and either no rewrite is in the target or, for a tip the target reaches, a part was replaced otherwise than by a commit that built on its lines: a merge's resolution, a sibling's line, a line put back. Some content can be present: judge it. |
+| `conflicted` | Replay conflicts, and either no rewrite is in the target or, for a tip the target reaches, a part was replaced otherwise than by a commit that built on its lines and took them over: a merge's resolution, a later edit of what a resolution left, a sibling's line, a line put back, a file deleted and written anew. Some content can be present: judge it. |
 
 ## Output and exit codes
 

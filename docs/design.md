@@ -673,14 +673,18 @@ leaves a clean diff shows part of it gone, reverted by a later commit or dropped
 carried. A replay that conflicts is read file by file and hunk by hunk
 (`Repo::rewritten_replay_outcome`): a hunk the release holds as the fork point held it is missing
 (not carried); one both changed is held only when it is regular file text, the release side is not
-empty, and, comparing the two sides line by line, each line the release holds in place of the
-member's was written (by annotation) by a one-parent commit whose parent holds no conflict at the
-file and which descends from each commit that wrote the lines it replaced, and from the member when
-the member's side deleted lines the fork point held; a line the release holds where the member's
-side holds none was written by such a commit that is no ancestor of the member. Anything else
-conflicts: a merge's own resolution, a sibling's line kept over the member's, a line put back, a
-file moved or deleted, a mode, link or submodule changed both ways. A mode the member set that the
-release lacks is missing.
+empty, no line the member deleted from the fork point's text is in the release side again, and,
+comparing the two sides line by line, each group the release holds in place of the member's lines
+replaced the member's lines alone (not base text beside them) and was written (by annotation) by
+one-parent commits whose parents hold no conflict at the file, which descend from each commit that
+wrote the lines they replaced (and from the member when its side deleted lines the fork point
+held), and which took those lines over: some of the member's lines stood in each one's parent, and
+each of the member's lines stood in one's parent (`Repo::took_over`). A line the release holds
+where the member's side holds none was written by such a commit that is no ancestor of the member.
+Anything else conflicts: a merge's own resolution, a later edit of what a resolution left in the
+member's place, a sibling's line kept over the member's, a line put back, a file deleted and
+written anew, moved or deleted, a mode, link or submodule changed both ways. A mode the member set
+that the release lacks is missing.
 
 `knives release members --census` turns that same check into a census. Its primary matrix contains
 every maintained branch against the live releases and upstream trunk. Superseded releases are

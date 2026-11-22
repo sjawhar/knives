@@ -812,6 +812,134 @@ fn release_carries_answers_conflicted_for_a_sibling_whose_rewrite_the_release_di
 }
 
 #[test]
+fn release_carries_answers_not_carried_for_a_member_a_resolution_discarded_before_a_later_edit() {
+    // Given: the member and another branch write `shared.txt` their own
+    // ways; a merge of them resolves to the other side alone; a commit on
+    // that merge edits the file again; the release merges that commit with a
+    // third branch.
+    let lab = Lab::new();
+    lab.branch(MEMBER, "shared.txt", "member-line\n");
+    lab.branch("feat/other", "shared.txt", "other-side\n");
+    merge_by_hand(
+        &lab,
+        "feat/resolved",
+        (MEMBER, "feat/other"),
+        &[("shared.txt", Some("other-side\n"))],
+    );
+    child_by_hand(
+        &lab,
+        "feat/later",
+        "feat/resolved",
+        &[("shared.txt", Some("other-side edited later\n"))],
+    );
+    lab.branch("feat/third", "third.txt", "third\n");
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        ("feat/later", "feat/third"),
+        &[],
+    );
+
+    // When, then: the member is not carried: the later edit replaced what
+    // the resolution left, not the member's line, which the release lacks.
+    assert_member_carried(&lab, false);
+}
+
+/// `feat/foundation` writes `shared.txt` as `before`; the member, stacked on
+/// it and recording it, writes `member`; a branch built on the member
+/// writes `later`; the release merges that branch with another. Asks the
+/// release about the member and checks it is carried exactly or not.
+fn adjacent_edit((before, member, later): (&str, &str, &str), carried: bool) {
+    let lab = Lab::new();
+    lab.branch("feat/foundation", "shared.txt", before);
+    child_by_hand(
+        &lab,
+        MEMBER,
+        "feat/foundation",
+        &[("shared.txt", Some(member))],
+    );
+    child_by_hand(&lab, "feat/rewrite", MEMBER, &[("shared.txt", Some(later))]);
+    lab.branch("feat/other", "other.txt", "other\n");
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        ("feat/rewrite", "feat/other"),
+        &[],
+    );
+    let (home, _consumer) = release_test_home(&lab);
+    depends(&lab, &home, MEMBER, "feat/foundation");
+    assert_carried_in(&lab, &home, MEMBER, carried);
+}
+
+#[test]
+fn release_carries_answers_carried_exact_for_an_added_line_a_later_branch_rewrote() {
+    // The member adds a line before `keep`; a later branch rewrites the
+    // added line and keeps `keep`: carried exactly.
+    adjacent_edit(("keep\n", "added\nkeep\n", "rewritten-added\nkeep\n"), true);
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_an_added_line_a_later_branch_reverted() {
+    // The member adds a line; a later branch removes it again: not carried.
+    adjacent_edit(("keep\n", "added\nkeep\n", "keep\n"), false);
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_an_added_line_dropped_beside_a_rewrite_of_base_text() {
+    // The member adds a line before `keep`; a later branch drops the added
+    // line and rewrites `keep`: the rewrite beside it hides nothing.
+    adjacent_edit(("keep\n", "added\nkeep\n", "rewritten-keep\n"), false);
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_replacement_reverted_beside_a_rewrite_of_base_text() {
+    // The member replaces `old` with `new`; a later branch puts `old` back
+    // and rewrites `keep`.
+    adjacent_edit(
+        ("old\nkeep\n", "new\nkeep\n", "old\nrewritten-keep\n"),
+        false,
+    );
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_deletion_restored_beside_a_rewrite_of_base_text() {
+    // The member deletes `deleted`; a later branch puts it back and rewrites
+    // `keep`.
+    adjacent_edit(
+        ("deleted\nkeep\n", "keep\n", "deleted\nrewritten-keep\n"),
+        false,
+    );
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_member_deleted_then_recreated_by_later_work() {
+    // Given: a branch built on the member removes its file; another built
+    // on that one writes a new file at the same path; the release merges
+    // that with another branch.
+    let lab = member_and_other();
+    child_by_hand(&lab, "feat/drop", MEMBER, &[("shared.txt", None)]);
+    child_by_hand(
+        &lab,
+        "feat/recreate",
+        "feat/drop",
+        &[(
+            "shared.txt",
+            Some("new file after the member was removed\n"),
+        )],
+    );
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        ("feat/recreate", "feat/other"),
+        &[],
+    );
+
+    // When, then: the member is not carried: the new file replaced nothing
+    // of the member's, which was gone before it.
+    assert_member_carried(&lab, false);
+}
+
+#[test]
 fn release_carries_answers_not_carried_for_a_member_whose_deleted_line_the_release_put_back() {
     // Given: `feat/del`, stacked on `feat/base`, deletes the line `b`; the
     // release merges it with another branch and puts `b` back by hand.
