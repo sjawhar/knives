@@ -93,19 +93,32 @@ fn fixture_with(origin: &str, registered: &str) -> Fixture {
     fixture_on(UPSTREAM, origin, registered)
 }
 
-/// [`fixture_with`] with the fork's upstream at `upstream`.
+/// [`fixture_with`] with the fork's upstream at `upstream`. An empty
+/// `upstream` leaves it the lab's path, so this fork's upstream names no
+/// forge repository and its ledger is kept under its registry key, `demo`;
+/// an empty `registered` makes the registry's `origin` the lab's origin path.
 fn fixture_on(upstream: &str, origin: &str, registered: &str) -> Fixture {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/base", "base.txt", "base\n");
     lab.branch("feat/landed", "landed.txt", "landed\n");
     lab.upstream_trunk_file("landed.txt", "landed\n");
-    lab.upstream_at_forge_url(upstream);
+    let upstream = if upstream.is_empty() {
+        lab.upstream.display().to_string()
+    } else {
+        lab.upstream_at_forge_url(upstream);
+        upstream.to_owned()
+    };
     // An empty `origin` leaves the checkout's `origin` remote a local path,
     // which names no forge repository.
     if !origin.is_empty() {
         lab.origin_at_forge_url(origin);
     }
+    let registered = if registered.is_empty() {
+        lab.temp_origin().display().to_string()
+    } else {
+        registered.to_owned()
+    };
     let home = tempfile::tempdir().expect("config home");
     std::fs::write(
         home.path().join("repos.toml"),
@@ -2501,7 +2514,7 @@ fn recovered(row: &str) -> Vec<Vec<&'static str>> {
         "F5" | "F6" => vec![vec![F12], vec![U12]],
         "F41" => vec![vec![U7]],
         "F45" => vec![vec!["origin:acme/demo#14"]],
-        "F46" => vec![vec![SIBLING_M]],
+        "F46" | "F57" => vec![vec![SIBLING_M]],
         "F47" => vec![vec![F12, SIB12], vec![U12, SIB12]],
         _ => vec![Vec::new()],
     }
@@ -2940,6 +2953,17 @@ fn forgetting_a_member_branch_follows_the_table() {
             texts: &["origin:ACME-OLD/demo:feat/base"],
             exit: 0,
             left: &[],
+        },
+        // N110: F46 (the beside-other-requirements table) with the forge
+        // down, so the member refusal gives the outage advice.
+        ForgetRow {
+            row: "F57",
+            config: CONFIG_X,
+            held: &[M, SIBLING_M],
+            now: ForgeNow::Down,
+            texts: &["origin:gone/demo:feat/base"],
+            exit: 3,
+            left: &[M, SIBLING_M],
         },
     ]);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
@@ -3881,6 +3905,68 @@ fn a_local_upstream_fork_is_named_on_by_its_key_exactly() {
     let output = on(&fixture, "local#12");
     assert!(output.status.success(), "{}", said(&output));
     assert_eq!(fixture.required("feat/alpha"), ["local#12"]);
+}
+
+#[test]
+fn this_forks_path_upstream_is_named_by_its_key_in_any_letter_case() {
+    // Given: this fork's upstream is a filesystem path, so its upstream name
+    // is its registry key, `demo`.
+    let fixture = fixture_on("", ORIGIN, ORIGIN);
+
+    // When: its #12 is named by that key in another letter case.
+    let output = on(&fixture, "DEMO#12");
+
+    // Then: it is recorded under the key, with no forge call: the exact-key
+    // refusal is for another fork's path upstream only (N108).
+    assert!(output.status.success(), "{}", said(&output));
+    let required = || {
+        let read = Ledger::at(fixture.home.path().join("ledger").join("demo"))
+            .read()
+            .expect("read the ledger");
+        Statements::from_entries(&read.entries).depends("feat/alpha")
+    };
+    assert_eq!(required(), ["demo#12"]);
+    assert_eq!(fixture.forge_calls(), "");
+
+    // And: a review pull request, which only the forge can place, is a
+    // forge call the log records.
+    let output = on(&fixture, "acme/demo#13");
+    assert!(output.status.success(), "{}", said(&output));
+    assert_eq!(required(), ["demo#12", "origin:acme/demo#13"]);
+    assert_ne!(fixture.forge_calls(), "");
+}
+
+#[test]
+fn offline_what_needs_no_forge_question_is_recorded() {
+    // Given: this fork's `origin`, in the checkout and the registry, is a
+    // local path; `local`, a fork whose upstream is a path; the forge down.
+    let fixture = fixture_with("", "");
+    register_local(&fixture);
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+
+    // When / Then: another fork's upstream named by its `<owner>/<name>` is
+    // recorded, and so is the path-upstream fork's exact key, with no forge
+    // call: a local `origin` is never another fork's upstream under another
+    // name, and a path upstream has no second repository (N109).
+    let output = on(&fixture, "maintainer/sibling#51");
+    assert!(output.status.success(), "{}", said(&output));
+    let output = on(&fixture, "local#12");
+    assert!(output.status.success(), "{}", said(&output));
+    let both = ["local#12", "maintainer/sibling#51"];
+    assert_eq!(fixture.required("feat/alpha"), both);
+    assert_eq!(fixture.forge_calls(), "");
+
+    // And: the sibling's registry key still asks the forge which of its two
+    // repositories has #51: refused (exit 3), nothing added, and the
+    // question is in the log.
+    let output = on(&fixture, "sibling#51");
+    assert_eq!(output.status.code(), Some(3), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), both);
+    assert!(
+        fixture.forge_calls().contains("repo view acme/sibling"),
+        "{}",
+        fixture.forge_calls()
+    );
 }
 
 #[test]
