@@ -1,7 +1,7 @@
-//! Words, as spec R9's Design reads them, and the two uses of them that
-//! come before the word survival diff: the pairing of a member hunk's lines
-//! ([`pair_hunk`]) and the member's own words on a line it changed
-//! ([`line_word_diff`]).
+//! Words, as spec R9's Design reads them, and what the rule does with
+//! them: the pairing of a member hunk's lines ([`pair_hunk`]), the
+//! member's own words on a line it changed ([`line_word_diff`]), and the
+//! word step of a replaced range, its word survival diff ([`WordStep`]).
 //!
 //! The words of a line are the matches of `\w+|[^\w\s]`, punctuation
 //! included, as Python's `re` reads that pattern for a `str` pattern over
@@ -17,12 +17,14 @@
 //! compare by their bytes, as the decoded strings compare.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
+use std::ops::Range;
 
-use super::WORD_LIMIT;
 use super::difflib::{Ratio, SequenceMatcher, Tag, real_quick_ratio};
+use super::{Added, WORD_LIMIT, bare, is_subsequence, meet};
 
 /// The words of `line`, in order, each a slice of it.
-pub(super) fn tokens(line: &[u8]) -> Vec<&[u8]> {
+fn tokens(line: &[u8]) -> Vec<&[u8]> {
     let mut words = Vec::new();
     let mut offset = 0;
     for chunk in line.utf8_chunks() {
@@ -141,18 +143,18 @@ fn over_the_limit(line: &[u8]) -> bool {
 
 /// A member's own words on a line that it changed ([`line_word_diff`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct OwnWords<'l> {
+struct OwnWords<'l> {
     /// The new line's words that the change inserted or replaced, by index,
     /// in order.
-    pub(super) added: Vec<usize>,
+    added: Vec<usize>,
     /// The old line's words that the change deleted or replaced, in order.
-    pub(super) removed: Vec<&'l [u8]>,
+    removed: Vec<&'l [u8]>,
 }
 
 /// The word diff of `old`, the words of a line that a member replaced, and
 /// `new`, the words of the line that replaced it: the words that the member
 /// added to the line and the words that it removed from it.
-pub(super) fn line_word_diff<'l>(old: &[&'l [u8]], new: &[&'l [u8]]) -> OwnWords<'l> {
+fn line_word_diff<'l>(old: &[&'l [u8]], new: &[&'l [u8]]) -> OwnWords<'l> {
     let mut own = OwnWords {
         added: Vec::new(),
         removed: Vec::new(),
@@ -167,6 +169,172 @@ pub(super) fn line_word_diff<'l>(old: &[&'l [u8]], new: &[&'l [u8]]) -> OwnWords
         }
     }
     own
+}
+
+/// The word step of one replaced range: its word diff, or the sizes that
+/// put it over [`WORD_LIMIT`].
+pub(super) enum WordStep<'t> {
+    Followed(WordDiff<'t>),
+    Skipped {
+        tip_words: usize,
+        release_words: usize,
+    },
+}
+
+/// The word survival diff of one replaced range: the words of the tip's
+/// lines in the range against the words of the release's lines.
+pub(super) struct WordDiff<'t> {
+    /// The words of the tip's lines in the range.
+    tip_words: Vec<&'t [u8]>,
+    /// The words of each tip line of the range, as a range of `tip_words`.
+    spans: Vec<Range<usize>>,
+    /// Whether the diff deletes or replaces each of the tip's words.
+    lost: Vec<bool>,
+    /// The release's word that each of the tip's words matches, in an
+    /// `equal` run.
+    to_release: Vec<Option<usize>>,
+    /// The release's words, and the line of the range that holds each.
+    release_words: Vec<&'t [u8]>,
+    release_line: Vec<usize>,
+    /// Each insert and replace: the tip's words it covers, and the release's
+    /// words it inserts.
+    inserts: Vec<(Range<usize>, Range<usize>)>,
+}
+
+impl<'t> WordStep<'t> {
+    /// The word step of a range that replaces `tip`'s lines with
+    /// `release`'s.
+    pub(super) fn of(tip: &[&'t [u8]], release: &[&'t [u8]]) -> Self {
+        let mut tip_words = Vec::new();
+        let mut spans = Vec::new();
+        for &line in tip {
+            let start = tip_words.len();
+            tip_words.extend(tokens(line));
+            spans.push(start..tip_words.len());
+        }
+        let mut release_words = Vec::new();
+        let mut release_line = Vec::new();
+        for (offset, &line) in release.iter().enumerate() {
+            let line_words = tokens(line);
+            release_line.extend(std::iter::repeat_n(offset, line_words.len()));
+            release_words.extend(line_words);
+        }
+        if tip_words.len() > WORD_LIMIT || release_words.len() > WORD_LIMIT {
+            return Self::Skipped {
+                tip_words: tip_words.len(),
+                release_words: release_words.len(),
+            };
+        }
+        let mut lost = vec![false; tip_words.len()];
+        let mut to_release = vec![None; tip_words.len()];
+        let mut inserts = Vec::new();
+        for opcode in SequenceMatcher::new(&tip_words, &release_words).opcodes() {
+            if matches!(opcode.tag, Tag::Delete | Tag::Replace) {
+                for slot in lost.get_mut(opcode.a.clone()).unwrap_or_default() {
+                    *slot = true;
+                }
+            }
+            if matches!(opcode.tag, Tag::Insert | Tag::Replace) {
+                inserts.push((opcode.a.clone(), opcode.b.clone()));
+            }
+            if opcode.tag == Tag::Equal {
+                for (at, matched) in opcode.a.zip(opcode.b) {
+                    if let Some(slot) = to_release.get_mut(at) {
+                        *slot = Some(matched);
+                    }
+                }
+            }
+        }
+        Self::Followed(WordDiff {
+            tip_words,
+            spans,
+            lost,
+            to_release,
+            release_words,
+            release_line,
+            inserts,
+        })
+    }
+}
+
+impl<'t> WordDiff<'t> {
+    /// The words of the tip line at `offset` in the range, as a range of
+    /// the tip's words.
+    fn span(&self, offset: usize) -> Range<usize> {
+        self.spans.get(offset).cloned().unwrap_or_default()
+    }
+
+    /// Spec R9's three word tests, and its whitespace rule, for `line`, the
+    /// tip line at `offset` in the range. The line is lost where the diff
+    /// deletes or replaces one of the words that the member added to it;
+    /// where it inserts, at the line, all of the words that the member
+    /// removed from it, in order; where it keeps none of the line's words;
+    /// or where the member changed the line in whitespace alone. The words
+    /// that the member added are every word of a line that it added whole,
+    /// and of a line that it changed, those that the word diff of the line
+    /// it replaced and the new line inserts or replaces.
+    pub(super) fn loses(&self, offset: usize, line: Added<'t>) -> bool {
+        let span = self.span(offset);
+        // `line` is the tip line at `offset`, so its words are its span's.
+        let line_words = self.tip_words.get(span.clone()).unwrap_or_default();
+        let fork_words = line.fork.map(tokens);
+        let whitespace_only = line.fork.is_some_and(|fork| bare(fork) != bare(line.text))
+            && fork_words.as_deref() == Some(line_words);
+        if whitespace_only {
+            return true;
+        }
+        let (added_lost, removed) = fork_words.as_deref().map_or_else(
+            || {
+                let lost = self.lost.get(span.clone()).unwrap_or_default();
+                (lost.contains(&true), Vec::new())
+            },
+            |fork_words| {
+                let own = line_word_diff(fork_words, line_words);
+                let lost = own
+                    .added
+                    .iter()
+                    .any(|&at| self.lost.get(span.start + at) == Some(&true));
+                (lost, own.removed)
+            },
+        );
+        added_lost
+            || (!removed.is_empty() && is_subsequence(&removed, &self.inserted_at(&span)))
+            || self.kept(&span) == 0
+    }
+
+    /// The release's words that the diff inserts at a tip line whose words
+    /// are `span`: each insert and replace whose tip words' gaps meet the
+    /// line's ([`meet`]), inside the line or at either edge of it.
+    fn inserted_at(&self, span: &Range<usize>) -> Vec<&'t [u8]> {
+        self.inserts
+            .iter()
+            .filter(|(tip, _)| meet(tip, span))
+            .flat_map(|(_, release)| self.release_words.get(release.clone()).unwrap_or_default())
+            .copied()
+            .collect()
+    }
+
+    /// How many of the words `span` the diff keeps, in `equal` runs.
+    fn kept(&self, span: &Range<usize>) -> usize {
+        self.to_release
+            .get(span.clone())
+            .unwrap_or_default()
+            .iter()
+            .flatten()
+            .count()
+    }
+
+    /// The lines of the release's range, by offset, that hold, through
+    /// `equal` runs, words of the tip line at `offset`.
+    pub(super) fn holding_lines(&self, offset: usize) -> BTreeSet<usize> {
+        self.to_release
+            .get(self.span(offset))
+            .unwrap_or_default()
+            .iter()
+            .flatten()
+            .filter_map(|&at| self.release_line.get(at).copied())
+            .collect()
+    }
 }
 
 /// Whether `character` is a word character, as Python's `\w` reads it.

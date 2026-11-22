@@ -872,15 +872,6 @@ fn apply_edit(
     Ok(Exit::Ok)
 }
 
-/// What a remaining member is to spec R11's check, its bases read
-/// ([`edit_losses`], [`knives::jj::Brought`]).
-enum BroughtFrom {
-    Nothing,
-    Whole,
-    /// An advanced member: the base of its old tip, and that tip.
-    Since(CommitId, CommitId),
-}
-
 /// Where spec R11's check and the measure of `knives release adopt` read a
 /// member X of the release in hand from (spec R6). The release holds X as a
 /// parent, so X is not carried by ancestry: a revision that the trunk
@@ -990,7 +981,7 @@ fn edit_losses(
 ) -> anyhow::Result<(Vec<knives::jj::EditLoss>, Vec<String>)> {
     let (opened, release) = (context.opened, context.release);
     let trunk = opened.resolve_commit(&context.entry.trunk_ref())?;
-    let mut read = Vec::with_capacity(provenance.len());
+    let mut members = Vec::with_capacity(provenance.len());
     let mut lines = Vec::new();
     for (label, tip) in provenance {
         let replaced = brought
@@ -1010,31 +1001,25 @@ fn edit_losses(
         let Some(base) = base.commit() else {
             continue;
         };
-        let from = match replaced {
-            None => BroughtFrom::Nothing,
-            Some(None) => BroughtFrom::Whole,
+        let brought = match replaced {
+            None => knives::jj::Brought::Nothing,
+            Some(None) => knives::jj::Brought::Whole,
             Some(Some(old)) => {
                 let old_base =
                     HeldBase::read(opened, (old, opened.change_base(old, &trunk)?), others())?;
-                old_base.commit().map_or(BroughtFrom::Whole, |old_base| {
-                    BroughtFrom::Since(old_base.clone(), old.clone())
-                })
+                old_base
+                    .commit()
+                    .map_or(knives::jj::Brought::Whole, |old_base| {
+                        knives::jj::Brought::Since(old_base.clone(), old.clone())
+                    })
             }
         };
-        read.push((label, tip, base.clone(), from));
-    }
-    let members: Vec<knives::jj::EditMember<'_>> = read
-        .iter()
-        .map(|(label, tip, base, from)| knives::jj::EditMember {
+        members.push(knives::jj::EditMember {
             label: label.as_str(),
-            change: (base, *tip),
-            brought: match from {
-                BroughtFrom::Nothing => knives::jj::Brought::Nothing,
-                BroughtFrom::Whole => knives::jj::Brought::Whole,
-                BroughtFrom::Since(old_base, old) => knives::jj::Brought::Since((old_base, old)),
-            },
-        })
-        .collect();
+            change: (base.clone(), tip.clone()),
+            brought,
+        });
+    }
     Ok((candidate.lost_lines(&members)?, lines))
 }
 
@@ -1093,9 +1078,12 @@ fn loss_lines(
     for loss in losses {
         lines.push(header(
             &inline_human_text(&loss.path),
-            &inline_human_text(&loss.lines.label),
+            &inline_human_text(&loss.label),
         ));
-        lines.extend(release::lost_lines(&loss.lines, release::LOST_LINE_INDENT));
+        lines.extend(release::lost_lines(
+            (&loss.lost, &loss.word_step_skipped),
+            release::LOST_LINE_INDENT,
+        ));
     }
     lines
 }
@@ -1117,8 +1105,8 @@ fn loss_event_text(losses: &[knives::jj::EditLoss], reason: Option<&str>) -> Str
             text,
             "; lost: {} ({}: {} line(s))",
             loss.path,
-            loss.lines.label,
-            loss.lines.lost.len()
+            loss.label,
+            loss.lost.len()
         );
     }
     let _ = write!(text, "; why lost: {reason}");
@@ -1310,16 +1298,16 @@ pub(crate) fn record_edit_event(
     record: &EditRecord<'_>,
     bound: Bound<'_>,
 ) -> anyhow::Result<()> {
+    let parents: Vec<CommitId> = record
+        .provenance
+        .iter()
+        .map(|(_, commit)| commit.clone())
+        .collect();
     scribe_for(fork, bound)?.record(&Draft {
         evidence: std::iter::once(record.created.as_str().to_owned())
-            .chain(
-                record
-                    .provenance
-                    .iter()
-                    .map(|(_, commit)| commit.as_str().to_owned()),
-            )
+            .chain(parents.iter().map(|commit| commit.as_str().to_owned()))
             .collect(),
-        parents: provenance_parents(opened, fork.entry, record.provenance)?,
+        parents: recorded_parents(opened, fork.entry, &parents)?,
         ..Draft::event(
             Some(record.release),
             format!(
@@ -1384,19 +1372,6 @@ pub(crate) fn recorded_parents(
         &entry.release_scheme(),
         parents,
     ))
-}
-
-/// [`recorded_parents`] of a write's `provenance`, in its order.
-pub(crate) fn provenance_parents(
-    opened: &knives::jj::Repo,
-    entry: &knives::config::RepoEntry,
-    provenance: &[(String, knives::ids::CommitId)],
-) -> anyhow::Result<Vec<knives::ledger::RecordedParent>> {
-    let commits: Vec<knives::ids::CommitId> = provenance
-        .iter()
-        .map(|(_, commit)| commit.clone())
-        .collect();
-    recorded_parents(opened, entry, &commits)
 }
 
 /// Whether the release name has one local position to move, saying why not when
@@ -2032,22 +2007,18 @@ mod tests {
     /// What an edit loses of `member` at `path`: one added line, at its
     /// tip's line 2.
     fn loss(path: &str, member: &str, text: &str) -> knives::jj::EditLoss {
-        let mut lines = knives::own_lines::MemberLines::new(
-            member.to_owned(),
-            CommitId::new("tip"),
-            CommitId::new("fork"),
-        );
-        lines.reading = knives::own_lines::Reading::Missing;
-        lines.lost = vec![knives::own_lines::Lost {
-            path: path.to_owned(),
-            kind: knives::own_lines::LostKind::Added,
-            line: Some(2),
-            text: Some(text.to_owned()),
-            carried_forward: false,
-        }];
         knives::jj::EditLoss {
             path: path.to_owned(),
-            lines,
+            label: member.to_owned(),
+            lost: vec![knives::own_lines::Lost {
+                path: path.to_owned(),
+                kind: knives::own_lines::LostKind::Added,
+                line: Some(2),
+                text: Some(text.to_owned()),
+                carried_forward: false,
+                conflict: None,
+            }],
+            word_step_skipped: Vec::new(),
         }
     }
 

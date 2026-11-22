@@ -29,7 +29,7 @@ use crate::ids::{
 };
 use crate::jj::{self, Repo};
 use crate::ledger::{Entry, Kind, Ledger, RecordedParent};
-use crate::own_lines::{LostKind, MemberLines, Reading};
+use crate::own_lines::{Lost, LostKind, MemberLines, Reading, SkippedRange};
 use crate::pins::{Pin, PinKind};
 use crate::release_model::{
     BranchSuccessions, CompositionBaseline, EarlierWrites, MemberEvidence, MemberHistory,
@@ -3201,7 +3201,9 @@ impl CutAudit {
         self.members
             .iter()
             .find(|lines| lines.label == name)
-            .map_or_else(Vec::new, |lines| lost_lines(lines, LOST_LINE_INDENT))
+            .map_or_else(Vec::new, |lines| {
+                lost_lines((&lines.lost, &lines.word_step_skipped), LOST_LINE_INDENT)
+            })
     }
 
     /// Each line of every member that the cut holds only by its words, to
@@ -3556,8 +3558,11 @@ pub fn audit_cut(
 /// member's row ([`lost_lines`]).
 pub const LOST_LINE_INDENT: &str = "      ";
 
-/// The lines that name what `lines`, one member's reading against a release,
-/// lacks, each after `indent`.
+/// The lines that name what one member's reading against a release lacks,
+/// each after `indent`.
+///
+/// `entries` are the reading's lost entries, and `word_step_skipped` the
+/// ranges that the word step did not follow there.
 ///
 /// There is one line for each lost entry that the release before did not
 /// lack too, in the reading's order. A line that the member added and the
@@ -3572,11 +3577,14 @@ pub const LOST_LINE_INDENT: &str = "      ";
 /// `--census` print under the row that names the member;
 /// [`held_by_words_lines`] names the lines it holds only by their words.
 /// Each text is read from the repository, so it is escaped.
-pub fn lost_lines(lines: &MemberLines, indent: &str) -> Vec<String> {
+pub fn lost_lines(
+    (entries, word_step_skipped): (&[Lost], &[SkippedRange]),
+    indent: &str,
+) -> Vec<String> {
     use crate::ledger::inline_human_text;
     let mut named_ranges = Vec::new();
     let mut out = Vec::new();
-    for lost in lines.lost.iter().filter(|lost| !lost.carried_forward) {
+    for lost in entries.iter().filter(|lost| !lost.carried_forward) {
         let path = inline_human_text(&lost.path);
         let text = lost
             .text
@@ -3592,16 +3600,12 @@ pub fn lost_lines(lines: &MemberLines, indent: &str) -> Vec<String> {
             LostKind::Mode => format!("{path}: mode differs from the member's ({text})"),
             LostKind::Conflict => format!("{path}: unresolved conflict {text}"),
             LostKind::WordLimit => {
-                let skipped = lines
-                    .word_step_skipped
-                    .iter()
-                    .enumerate()
-                    .find(|(_, range)| {
-                        range.path == lost.path
-                            && lost.line.is_some_and(|line| {
-                                (range.first_line..=range.last_line).contains(&line)
-                            })
-                    });
+                let skipped = word_step_skipped.iter().enumerate().find(|(_, range)| {
+                    range.path == lost.path
+                        && lost.line.is_some_and(|line| {
+                            (range.first_line..=range.last_line).contains(&line)
+                        })
+                });
                 if skipped.is_some_and(|(index, _)| named_ranges.contains(&index)) {
                     continue;
                 }
@@ -3741,7 +3745,9 @@ impl CompositionCheck {
         self.members
             .iter()
             .find(|lines| lines.commit == *commit)
-            .map_or_else(Vec::new, |lines| lost_lines(lines, LOST_LINE_INDENT))
+            .map_or_else(Vec::new, |lines| {
+                lost_lines((&lines.lost, &lines.word_step_skipped), LOST_LINE_INDENT)
+            })
     }
 
     /// Each line of every recorded member that the subject holds only by

@@ -26,10 +26,11 @@
 //! returns the reading. It opens no repository.
 
 mod difflib;
+mod placement;
 mod words;
 
 use std::cell::OnceCell;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::ops::Range;
 
 use jj_lib::diff::{ContentDiff, DiffHunkKind};
@@ -37,7 +38,10 @@ use jj_lib::diff::{ContentDiff, DiffHunkKind};
 use crate::changelog_union;
 use crate::ids::CommitId;
 
-use difflib::{SequenceMatcher, Tag};
+use placement::Place;
+use words::WordStep;
+
+pub use placement::{Placed, PlacedLost, Version, change_lines, conflict_regions, place};
 
 /// The most words that the word step follows on either side of a replaced
 /// range.
@@ -157,6 +161,11 @@ pub struct Lost {
     /// Whether the release before this one lacks the same line too
     /// ([`MemberLines::carry_forward`]).
     pub carried_forward: bool,
+    /// For a conflict, which side holds it: the member's tip or the
+    /// release; `None` for every other kind. The report names the side by
+    /// `text`, so the JSON leaves this out.
+    #[serde(skip)]
+    pub conflict: Option<ConflictAt>,
 }
 
 /// Why a line or a path of a member's change counts as lost.
@@ -179,6 +188,16 @@ pub enum LostKind {
     /// An unresolved conflict in the path, in the release or at the
     /// member's tip: the rule cannot read the path.
     Conflict,
+}
+
+/// Which side holds the unresolved conflict of a [`LostKind::Conflict`]
+/// entry ([`Lost::conflict`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictAt {
+    /// The member's tip: the entry's text is `at the member's tip`.
+    Tip,
+    /// The release: the entry's text is `in the release`.
+    Release,
 }
 
 /// A line of the member that the release holds only by its words: the
@@ -247,16 +266,14 @@ impl MemberLines {
     pub fn read_path(&mut self, values: &PathValues) {
         let path = values.path.as_str();
         if values.tip == Value::Conflict {
-            let at = CONFLICT_AT_TIP.to_owned();
-            self.lost
-                .push(entry(path, LostKind::Conflict, None, Some(at)));
+            self.lost.push(conflict_entry(path, ConflictAt::Tip));
         } else if values.release == Value::Conflict {
-            let at = CONFLICT_IN_RELEASE.to_owned();
-            self.lost
-                .push(entry(path, LostKind::Conflict, None, Some(at)));
+            self.lost.push(conflict_entry(path, ConflictAt::Release));
         } else if values.tip != values.release {
             let mut out = Out {
-                lines: self,
+                lost: &mut self.lost,
+                held_by_words: &mut self.held_by_words,
+                word_step_skipped: &mut self.word_step_skipped,
                 places: None,
             };
             out.read_change(path, (&values.fork, &values.tip, &values.release));
@@ -282,9 +299,10 @@ impl MemberLines {
     }
 
     /// Whether every path the member cannot be read at holds its unresolved
-    /// conflict at the member's tip, whether or not the release holds one
-    /// there too: [`Self::read_path`] records a path conflicted at both as at
-    /// the tip. `false` where no path holds a conflict.
+    /// conflict at the member's tip ([`ConflictAt::Tip`]), whether or not
+    /// the release holds one there too: [`Self::read_path`] records a path
+    /// conflicted at both as at the tip. `false` where no path holds a
+    /// conflict.
     #[must_use]
     pub fn conflicted_only_at_tip(&self) -> bool {
         let mut conflicts = self
@@ -292,8 +310,7 @@ impl MemberLines {
             .iter()
             .filter(|lost| lost.kind == LostKind::Conflict)
             .peekable();
-        conflicts.peek().is_some()
-            && conflicts.all(|lost| lost.text.as_deref() == Some(CONFLICT_AT_TIP))
+        conflicts.peek().is_some() && conflicts.all(|lost| lost.conflict == Some(ConflictAt::Tip))
     }
 
     /// The reading that the lost entries give.
@@ -314,18 +331,21 @@ impl MemberLines {
     }
 }
 
-/// Where a reading puts what it finds: the member's reading, and, for spec
+/// Where a reading puts what it finds: each lost entry, each line held only
+/// by its words and each range the word step did not follow, and, for spec
 /// R11's placement, the place of each lost entry, in the order of the
 /// entries ([`place`]).
 struct Out<'o> {
-    lines: &'o mut MemberLines,
+    lost: &'o mut Vec<Lost>,
+    held_by_words: &'o mut Vec<HeldByWords>,
+    word_step_skipped: &'o mut Vec<SkippedRange>,
     places: Option<&'o mut Vec<Place>>,
 }
 
 impl Out<'_> {
     /// Pushes `lost`, and its place where places are kept.
     fn lost(&mut self, lost: Lost, place: impl FnOnce() -> Place) {
-        self.lines.lost.push(lost);
+        self.lost.push(lost);
         if let Some(places) = self.places.as_deref_mut() {
             places.push(place());
         }
@@ -348,260 +368,88 @@ impl Out<'_> {
     }
 
     /// Reads a path that the tip holds as a file, with its executable bit
-    /// and content: the bit, then the content.
+    /// and content: the bit, then the content, each as [`file_change`]
+    /// reads the member's change of it.
     fn read_file(
         &mut self,
         (path, fork, release): (&str, &Value, &Value),
         (executable, content): (bool, &[u8]),
     ) {
-        let fork = file_of(fork);
         let release = file_of(release);
-        if fork.is_some_and(|(bit, _)| bit != executable)
-            && release.is_none_or(|(bit, _)| bit != executable)
-        {
+        let change = file_change(fork, (executable, content));
+        if change.bit_changed && release.is_none_or(|(bit, _)| bit != executable) {
             let bit = bit_text(executable);
             self.lost(entry(path, LostKind::Mode, None, Some(bit)), || Place::Path);
         }
-        if fork.is_some_and(|(_, before)| before == content) {
-            // The member changed the bit alone.
-            return;
-        }
-        if is_binary(content) {
-            if release.is_none_or(|(_, held)| held != content) {
-                let made = BINARY_FILE.to_owned();
-                self.lost(entry(path, LostKind::File, None, Some(made)), || {
-                    Place::Path
-                });
+        match change.content {
+            ContentChange::Unchanged => {}
+            ContentChange::Binary => {
+                if release.is_none_or(|(_, held)| held != content) {
+                    let made = BINARY_FILE.to_owned();
+                    self.lost(entry(path, LostKind::File, None, Some(made)), || {
+                        Place::Path
+                    });
+                }
             }
-            return;
-        }
-        if fork.is_none() && is_blank(content) {
-            if release.is_none() {
-                let made = EMPTY_FILE.to_owned();
-                self.lost(entry(path, LostKind::File, None, Some(made)), || {
-                    Place::Path
-                });
+            ContentChange::Empty => {
+                if release.is_none() {
+                    let made = EMPTY_FILE.to_owned();
+                    self.lost(entry(path, LostKind::File, None, Some(made)), || {
+                        Place::Path
+                    });
+                }
             }
-            return;
-        }
-        let empty: &[u8] = &[];
-        let text = TextPath::new(
-            path,
-            fork.map_or(empty, |(_, before)| before),
-            content,
-            release.map_or(empty, |(_, held)| held),
-        );
-        text.read(self);
-    }
-}
-
-/// Where a lost entry lies in the version it was read against, as spec
-/// R11 places it ([`place`]).
-enum Place {
-    /// The whole path: a path read whole, or its executable bit.
-    Path,
-    /// The version's lines that the survival diff puts in the entry's
-    /// place, each a half-open range of 0-based line indices, read as the
-    /// gap interval it covers ([`meet`]); an empty range is the gap where a
-    /// deletion leaves nothing.
-    Lines(Vec<Range<usize>>),
-}
-
-/// One version of a path, as spec R11 places a member's lines in it: the
-/// release in hand, an edit's candidate, or the plain merge of the edit's
-/// new parents ([`place`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Version {
-    /// What the version holds at the path. A conflict that jj writes as
-    /// text is that text, in jj's snapshot style, as a file; any other
-    /// conflict is [`Value::Conflict`].
-    pub value: Value,
-    /// The conflict regions of that text ([`conflict_regions`]).
-    pub regions: Vec<Range<usize>>,
-    /// Whether the version holds an unresolved conflict at the path.
-    pub conflicted: bool,
-}
-
-/// A line, or a path, of a member's change that a version lacks, placed in
-/// that version (spec R11).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlacedLost {
-    pub lost: Lost,
-    /// Whether it is at a conflict there: its place meets a conflict region
-    /// of the version, the region's edge included, or, for a path read
-    /// whole or a mode, the version holds a conflict at the path.
-    pub at_conflict: bool,
-}
-
-/// What spec R11 reads of a member's change at one path in one version.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Placed {
-    /// Each line, or path, of the change that the version lacks, placed,
-    /// and each range the word step did not follow.
-    Lines {
-        lost: Vec<PlacedLost>,
-        word_step_skipped: Vec<SkippedRange>,
-    },
-    /// Nothing gives a place: the version is not text, or the member's tip
-    /// holds a conflict at the path. Every line of the change there is at a
-    /// conflict.
-    AtConflict,
-}
-
-/// Spec R11's placement: what `version` lacks of a member's change at
-/// `path`, from `fork` to `tip`, each line at its place there.
-///
-/// The survival diff is R9's whole rule ([`MemberLines::read_path`]), its
-/// word step and R8 included, run against the version's text. A conflicted
-/// release log can hold `## [Unreleased]` more than once, and then R8 holds
-/// no line. A line that the survival diff deletes or replaces is placed at
-/// the version's lines of that hunk. A hunk of removed lines that the
-/// version puts back is placed at the version's lines of the survival
-/// hunks at the hunk's place. Either is at a conflict where its place meets
-/// a conflict region, the region's edge included. A path read whole, and a
-/// mode, are at a conflict where the version holds a conflict at the path.
-/// A version that does not hold the path reads as empty text. A version
-/// that is not text (a symlink, a submodule, a file whose first 8000 bytes
-/// hold a NUL byte, a conflict jj does not write as text), and a tip that
-/// holds a conflict at the path, give no place. A line the version holds is
-/// not listed: it is held, wherever it is. What R9 reports does not change.
-pub fn place(path: &str, (fork, tip): (&Value, &Value), version: &Version) -> Placed {
-    let text = match &version.value {
-        Value::Absent => true,
-        Value::File { content, .. } => !is_binary(content),
-        Value::Symlink { .. } | Value::Submodule { .. } | Value::Conflict => false,
-    };
-    if !text || *tip == Value::Conflict {
-        return Placed::AtConflict;
-    }
-    let mut lines = MemberLines::new(String::new(), CommitId::new(""), CommitId::new(""));
-    let mut places = Vec::new();
-    if *tip != version.value {
-        let mut out = Out {
-            lines: &mut lines,
-            places: Some(&mut places),
-        };
-        out.read_change(path, (fork, tip, &version.value));
-    }
-    let lost = lines
-        .lost
-        .into_iter()
-        .zip(places)
-        .map(|(lost, place)| {
-            let at_conflict = match place {
-                Place::Path => version.conflicted,
-                Place::Lines(ranges) => ranges
-                    .iter()
-                    .any(|range| version.regions.iter().any(|region| meet(range, region))),
-            };
-            PlacedLost { lost, at_conflict }
-        })
-        .collect();
-    Placed::Lines {
-        lost,
-        word_step_skipped: lines.word_step_skipped,
-    }
-}
-
-/// The conflict regions of `text`, a file that jj wrote in its snapshot
-/// style with markers `marker_len` characters long.
-///
-/// Each region runs from the line that opens a conflict (`<` repeated)
-/// through the line that closes it (`>` repeated), as a half-open range of
-/// 0-based line indices. A marker line is read as jj reads one: a run of its
-/// character at least `marker_len` long, then whitespace or the line's end.
-/// A region left open runs to the end of the text.
-pub fn conflict_regions(text: &[u8], marker_len: usize) -> Vec<Range<usize>> {
-    let mut regions = Vec::new();
-    let mut open = None;
-    let mut lines = 0;
-    for (index, line) in text.split_inclusive(|byte| *byte == b'\n').enumerate() {
-        lines = index + 1;
-        match (open, marker(line, marker_len)) {
-            (None, Some(b'<')) => open = Some(index),
-            (Some(start), Some(b'>')) => {
-                regions.push(start..lines);
-                open = None;
+            ContentChange::Text(fork_text) => {
+                let empty: &[u8] = &[];
+                let held = release.map_or(empty, |(_, held)| held);
+                TextPath::new(path, fork_text, content, held).read(self);
             }
-            _ => {}
         }
     }
-    if let Some(start) = open {
-        regions.push(start..lines);
-    }
-    regions
 }
 
-/// The character of `line` where it is a conflict marker at least `len`
-/// characters long ([`conflict_regions`]): `<` or `>`.
-fn marker(line: &[u8], len: usize) -> Option<u8> {
-    let first = *line.first().filter(|&&byte| matches!(byte, b'<' | b'>'))?;
-    let run = line.iter().take_while(|&&byte| byte == first).count();
-    (run >= len && line.get(run).is_none_or(u8::is_ascii_whitespace)).then_some(first)
+/// What a member did to a file that its tip holds, from what its fork
+/// point holds at the path. This is the one reading of a file change: R9's
+/// rule reads a release against it ([`Out::read_file`]), and spec R11 lists
+/// the lines of a change by it ([`change_lines`]).
+struct FileChange<'v> {
+    /// Whether the fork point holds a file with the other executable bit.
+    bit_changed: bool,
+    content: ContentChange<'v>,
 }
 
-/// Each line, or path, of a member's change at `path`, from `fork` to
-/// `tip`.
-///
-/// Each is the lost entry it would be in a version that holds none of the
-/// change: each non-blank added line, each hunk of removed lines by its
-/// first non-blank line, a mode, and a path read whole. A tip that holds a
-/// conflict gives none. Spec R11 compares an advanced member's lines with
-/// those of its old tip by these, by path, kind and text.
-pub fn change_lines(path: &str, fork: &Value, tip: &Value) -> Vec<Lost> {
-    let mut lines = Vec::new();
-    if tip == fork {
-        return lines;
-    }
-    let Value::File {
-        executable,
-        content,
-    } = tip
-    else {
-        lines.extend(made_of(tip).map(|made| entry(path, LostKind::File, None, Some(made))));
-        return lines;
-    };
+/// What a member did to the content of a file ([`FileChange`]).
+enum ContentChange<'v> {
+    /// Nothing: the member changed the bit alone.
+    Unchanged,
+    /// A file that is not text, whose first 8000 bytes hold a NUL byte:
+    /// read whole.
+    Binary,
+    /// A text file that the member added with no non-blank line.
+    Empty,
+    /// Any other text file, read line by line from the fork point's text,
+    /// which is empty where the fork point holds no file.
+    Text(&'v [u8]),
+}
+
+/// The [`FileChange`] of a member whose tip holds a file with the bit
+/// `executable` and `content`, where its fork point holds `fork`.
+fn file_change<'v>(fork: &'v Value, (executable, content): (bool, &[u8])) -> FileChange<'v> {
     let before = file_of(fork);
-    if before.is_some_and(|(bit, _)| bit != *executable) {
-        lines.push(entry(
-            path,
-            LostKind::Mode,
-            None,
-            Some(bit_text(*executable)),
-        ));
-    }
-    if before.is_some_and(|(_, text)| text == content.as_slice()) {
-        return lines;
-    }
-    let made = if is_binary(content) {
-        Some(BINARY_FILE)
+    let content = if before.is_some_and(|(_, text)| text == content) {
+        ContentChange::Unchanged
+    } else if is_binary(content) {
+        ContentChange::Binary
     } else if before.is_none() && is_blank(content) {
-        Some(EMPTY_FILE)
+        ContentChange::Empty
     } else {
-        None
+        let empty: &[u8] = &[];
+        ContentChange::Text(before.map_or(empty, |(_, text)| text))
     };
-    if let Some(made) = made {
-        lines.push(entry(path, LostKind::File, None, Some(made.to_owned())));
-        return lines;
+    FileChange {
+        bit_changed: before.is_some_and(|(bit, _)| bit != executable),
+        content,
     }
-    let empty: &[u8] = &[];
-    let fork_text = before.map_or(empty, |(_, text)| text);
-    let fork_lines: Vec<&[u8]> = fork_text.split_inclusive(|byte| *byte == b'\n').collect();
-    let tip_lines: Vec<&[u8]> = content.split_inclusive(|byte| *byte == b'\n').collect();
-    for hunk in line_hunks(fork_text, content) {
-        for index in hunk.new.clone() {
-            if let Some(&text) = tip_lines.get(index).filter(|text| !is_blank(text)) {
-                let line = Some(number(index));
-                lines.push(entry(path, LostKind::Added, line, Some(shown(text))));
-            }
-        }
-        let removed = fork_lines.get(hunk.old.clone()).unwrap_or_default();
-        if let Some((offset, text)) = removed.iter().enumerate().find(|(_, line)| !is_blank(line)) {
-            let first = Some(number(hunk.old.start + offset));
-            lines.push(entry(path, LostKind::Removed, first, Some(shown(text))));
-        }
-    }
-    lines
 }
 
 /// What a member made of a path it does not leave a file: `deleted`, `a
@@ -625,7 +473,8 @@ fn bit_text(executable: bool) -> String {
     .to_owned()
 }
 
-/// A lost entry that no release before has been read for.
+/// A lost entry that no release before has been read for, and that no
+/// conflict side names ([`conflict_entry`]).
 fn entry(path: &str, kind: LostKind, line: Option<u32>, text: Option<String>) -> Lost {
     Lost {
         path: path.to_owned(),
@@ -633,6 +482,20 @@ fn entry(path: &str, kind: LostKind, line: Option<u32>, text: Option<String>) ->
         line,
         text,
         carried_forward: false,
+        conflict: None,
+    }
+}
+
+/// The lost entry of `path`, which holds an unresolved conflict at `at`:
+/// its text says where ([`CONFLICT_AT_TIP`], [`CONFLICT_IN_RELEASE`]).
+fn conflict_entry(path: &str, at: ConflictAt) -> Lost {
+    let text = match at {
+        ConflictAt::Tip => CONFLICT_AT_TIP,
+        ConflictAt::Release => CONFLICT_IN_RELEASE,
+    };
+    Lost {
+        conflict: Some(at),
+        ..entry(path, LostKind::Conflict, None, Some(text.to_owned()))
     }
 }
 
@@ -836,7 +699,7 @@ impl<'t> TextPath<'t> {
                 release_words,
             }) = step
             {
-                out.lines.word_step_skipped.push(SkippedRange {
+                out.word_step_skipped.push(SkippedRange {
                     path: self.path.to_owned(),
                     first_line: number(hunk.old.start),
                     // The 1-based number of the range's last line is the
@@ -890,7 +753,7 @@ impl<'t> TextPath<'t> {
                         )
                     },
                 ),
-                Judged::HeldByWords(holding) => out.lines.held_by_words.push(HeldByWords {
+                Judged::HeldByWords(holding) => out.held_by_words.push(HeldByWords {
                     path: self.path.to_owned(),
                     line: number(index),
                     text: shown(text),
@@ -925,7 +788,7 @@ impl<'t> TextPath<'t> {
     /// a range that holds more than [`WORD_LIMIT`] words on either side
     /// loses the line by the line rule, and its line is not paired. Else
     /// `pair` gives the line that it replaced in the member's hunk, and the
-    /// word diff of the range decides ([`WordDiff::loses`]).
+    /// word diff of the range decides ([`words::WordDiff::loses`]).
     fn judge(
         &self,
         (index, text): (usize, &'t [u8]),
@@ -1018,172 +881,6 @@ impl<'t> TextPath<'t> {
     }
 }
 
-/// The word step of one replaced range: its word diff, or the sizes that
-/// put it over [`WORD_LIMIT`].
-enum WordStep<'t> {
-    Followed(WordDiff<'t>),
-    Skipped {
-        tip_words: usize,
-        release_words: usize,
-    },
-}
-
-/// The word survival diff of one replaced range: the words of the tip's
-/// lines in the range against the words of the release's lines.
-struct WordDiff<'t> {
-    /// The words of the tip's lines in the range.
-    tip_words: Vec<&'t [u8]>,
-    /// The words of each tip line of the range, as a range of `tip_words`.
-    spans: Vec<Range<usize>>,
-    /// Whether the diff deletes or replaces each of the tip's words.
-    lost: Vec<bool>,
-    /// The release's word that each of the tip's words matches, in an
-    /// `equal` run.
-    to_release: Vec<Option<usize>>,
-    /// The release's words, and the line of the range that holds each.
-    release_words: Vec<&'t [u8]>,
-    release_line: Vec<usize>,
-    /// Each insert and replace: the tip's words it covers, and the release's
-    /// words it inserts.
-    inserts: Vec<(Range<usize>, Range<usize>)>,
-}
-
-impl<'t> WordStep<'t> {
-    /// The word step of a range that replaces `tip`'s lines with
-    /// `release`'s.
-    fn of(tip: &[&'t [u8]], release: &[&'t [u8]]) -> Self {
-        let mut tip_words = Vec::new();
-        let mut spans = Vec::new();
-        for &line in tip {
-            let start = tip_words.len();
-            tip_words.extend(words::tokens(line));
-            spans.push(start..tip_words.len());
-        }
-        let mut release_words = Vec::new();
-        let mut release_line = Vec::new();
-        for (offset, &line) in release.iter().enumerate() {
-            let line_words = words::tokens(line);
-            release_line.extend(std::iter::repeat_n(offset, line_words.len()));
-            release_words.extend(line_words);
-        }
-        if tip_words.len() > WORD_LIMIT || release_words.len() > WORD_LIMIT {
-            return Self::Skipped {
-                tip_words: tip_words.len(),
-                release_words: release_words.len(),
-            };
-        }
-        let mut lost = vec![false; tip_words.len()];
-        let mut to_release = vec![None; tip_words.len()];
-        let mut inserts = Vec::new();
-        for opcode in SequenceMatcher::new(&tip_words, &release_words).opcodes() {
-            if matches!(opcode.tag, Tag::Delete | Tag::Replace) {
-                for slot in lost.get_mut(opcode.a.clone()).unwrap_or_default() {
-                    *slot = true;
-                }
-            }
-            if matches!(opcode.tag, Tag::Insert | Tag::Replace) {
-                inserts.push((opcode.a.clone(), opcode.b.clone()));
-            }
-            if opcode.tag == Tag::Equal {
-                for (at, matched) in opcode.a.zip(opcode.b) {
-                    if let Some(slot) = to_release.get_mut(at) {
-                        *slot = Some(matched);
-                    }
-                }
-            }
-        }
-        Self::Followed(WordDiff {
-            tip_words,
-            spans,
-            lost,
-            to_release,
-            release_words,
-            release_line,
-            inserts,
-        })
-    }
-}
-
-impl<'t> WordDiff<'t> {
-    /// The words of the tip line at `offset` in the range, as a range of
-    /// the tip's words.
-    fn span(&self, offset: usize) -> Range<usize> {
-        self.spans.get(offset).cloned().unwrap_or_default()
-    }
-
-    /// Spec R9's three word tests, and its whitespace rule, for `line`, the
-    /// tip line at `offset` in the range. The line is lost where the diff
-    /// deletes or replaces one of the words that the member added to it;
-    /// where it inserts, at the line, all of the words that the member
-    /// removed from it, in order; where it keeps none of the line's words;
-    /// or where the member changed the line in whitespace alone. The words
-    /// that the member added are every word of a line that it added whole,
-    /// and of a line that it changed, those that the word diff of the line
-    /// it replaced and the new line inserts or replaces.
-    fn loses(&self, offset: usize, line: Added<'t>) -> bool {
-        let span = self.span(offset);
-        // `line` is the tip line at `offset`, so its words are its span's.
-        let line_words = self.tip_words.get(span.clone()).unwrap_or_default();
-        let fork_words = line.fork.map(words::tokens);
-        let whitespace_only = line.fork.is_some_and(|fork| bare(fork) != bare(line.text))
-            && fork_words.as_deref() == Some(line_words);
-        if whitespace_only {
-            return true;
-        }
-        let (added_lost, removed) = fork_words.as_deref().map_or_else(
-            || {
-                let lost = self.lost.get(span.clone()).unwrap_or_default();
-                (lost.contains(&true), Vec::new())
-            },
-            |fork_words| {
-                let own = words::line_word_diff(fork_words, line_words);
-                let lost = own
-                    .added
-                    .iter()
-                    .any(|&at| self.lost.get(span.start + at) == Some(&true));
-                (lost, own.removed)
-            },
-        );
-        added_lost
-            || (!removed.is_empty() && is_subsequence(&removed, &self.inserted_at(&span)))
-            || self.kept(&span) == 0
-    }
-
-    /// The release's words that the diff inserts at a tip line whose words
-    /// are `span`: each insert and replace whose tip words' gaps meet the
-    /// line's ([`meet`]), inside the line or at either edge of it.
-    fn inserted_at(&self, span: &Range<usize>) -> Vec<&'t [u8]> {
-        self.inserts
-            .iter()
-            .filter(|(tip, _)| meet(tip, span))
-            .flat_map(|(_, release)| self.release_words.get(release.clone()).unwrap_or_default())
-            .copied()
-            .collect()
-    }
-
-    /// How many of the words `span` the diff keeps, in `equal` runs.
-    fn kept(&self, span: &Range<usize>) -> usize {
-        self.to_release
-            .get(span.clone())
-            .unwrap_or_default()
-            .iter()
-            .flatten()
-            .count()
-    }
-
-    /// The lines of the release's range, by offset, that hold, through
-    /// `equal` runs, words of the tip line at `offset`.
-    fn holding_lines(&self, offset: usize) -> BTreeSet<usize> {
-        self.to_release
-            .get(self.span(offset))
-            .unwrap_or_default()
-            .iter()
-            .flatten()
-            .filter_map(|&at| self.release_line.get(at).copied())
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1194,7 +891,7 @@ mod tests {
     use super::*;
 
     /// A file that is not executable, holding `content`.
-    fn file(content: &str) -> Value {
+    pub(super) fn file(content: &str) -> Value {
         Value::File {
             executable: false,
             content: content.as_bytes().to_vec(),
@@ -1202,7 +899,7 @@ mod tests {
     }
 
     /// A file with the executable bit `executable`, holding `content`.
-    fn file_with_bit(executable: bool, content: &[u8]) -> Value {
+    pub(super) fn file_with_bit(executable: bool, content: &[u8]) -> Value {
         Value::File {
             executable,
             content: content.to_vec(),
@@ -1844,248 +1541,6 @@ mod tests {
                 "tip_words": 3,
                 "release_words": 30_004,
             }])
-        );
-    }
-
-    /// `content` as a version of a path with no conflict, as spec R11 reads
-    /// it.
-    fn clean(content: &str) -> Version {
-        Version {
-            value: file(content),
-            regions: Vec::new(),
-            conflicted: false,
-        }
-    }
-
-    /// The regions of a version that has one conflict region, the lines
-    /// `start..end`.
-    fn region(start: usize, end: usize) -> Vec<Range<usize>> {
-        std::iter::once(start..end).collect()
-    }
-
-    /// A placed line: its kind, line and text, and whether it is at a
-    /// conflict.
-    type PlacedRow<'l> = (LostKind, Option<u32>, Option<&'l str>, bool);
-
-    /// Each line a placement lists ([`PlacedRow`]); `None` where nothing
-    /// gives a place.
-    fn placed(reading: &Placed) -> Option<Vec<PlacedRow<'_>>> {
-        match reading {
-            Placed::AtConflict => None,
-            Placed::Lines { lost, .. } => Some(
-                lost.iter()
-                    .map(|line| {
-                        let lost = &line.lost;
-                        (lost.kind, lost.line, lost.text.as_deref(), line.at_conflict)
-                    })
-                    .collect(),
-            ),
-        }
-    }
-
-    #[test]
-    fn a_deleted_line_is_at_a_conflict_where_its_gap_meets_a_region_or_its_edge() {
-        // Given: a member that adds `x` after `a`, and a version that deletes
-        // it, so its place is the gap between `a` and `b`
-        let (fork, tip) = (file("a\nb\nc\nd\n"), file("a\nx\nb\nc\nd\n"));
-        let version = |regions: Vec<Range<usize>>| Version {
-            value: file("a\nb\nc\nd\n"),
-            regions,
-            conflicted: true,
-        };
-        let at = |regions| place("f.txt", (&fork, &tip), &version(regions));
-        let row = |at_conflict| Some(vec![(LostKind::Added, Some(2), Some("x"), at_conflict)]);
-
-        // Then: a region that starts or ends at that gap touches its edge, so
-        // the line is at a conflict; a region away from it leaves it at none
-        assert_eq!(placed(&at(region(1, 2))), row(true));
-        assert_eq!(placed(&at(region(0, 1))), row(true));
-        assert_eq!(placed(&at(region(2, 4))), row(false));
-    }
-
-    #[test]
-    fn a_line_replaced_inside_a_snapshot_conflict_is_at_it_and_one_kept_inside_is_held() {
-        // Given: a member that adds `x`, and a version whose conflict, written
-        // in jj's snapshot style, stands where `x` stood
-        let (fork, tip) = (file("a\nb\nc\n"), file("a\nx\nb\nc\n"));
-        let snapshot = |side: &str| {
-            format!(
-                "a\n<<<<<<< conflict 1 of 1\n+++++++ side #1\n{side}\n------- base\n+++++++ side \
-                 #2\nz\n>>>>>>> conflict 1 of 1 ends\nb\nc\n"
-            )
-        };
-        let version = |text: String| Version {
-            regions: conflict_regions(text.as_bytes(), 7),
-            value: file(&text),
-            conflicted: true,
-        };
-        let replaced = version(snapshot("y"));
-        assert_eq!(replaced.regions, region(1, 8));
-
-        // Then: the line the conflict replaces is lost at it
-        assert_eq!(
-            placed(&place("f.txt", (&fork, &tip), &replaced)),
-            Some(vec![(LostKind::Added, Some(2), Some("x"), true)])
-        );
-        // And: a line the survival diff keeps inside the conflict is held
-        assert_eq!(
-            placed(&place("f.txt", (&fork, &tip), &version(snapshot("x")))),
-            Some(vec![])
-        );
-    }
-
-    #[test]
-    fn a_removed_hunk_put_back_at_a_region_is_at_a_conflict() {
-        // Given: a member that removes `r`, and a version that puts it back
-        let (fork, tip) = (file("a\nr\nb\nc\nd\n"), file("a\nb\nc\nd\n"));
-        let version = |regions: Vec<Range<usize>>| Version {
-            value: file("a\nr\nb\nc\nd\n"),
-            regions,
-            conflicted: true,
-        };
-        let at = |regions| place("f.txt", (&fork, &tip), &version(regions));
-        let row = |at_conflict| Some(vec![(LostKind::Removed, Some(2), Some("r"), at_conflict)]);
-
-        // Then: placed at the line put back: at a conflict where a region
-        // holds it, and at none where the region is away from it
-        assert_eq!(placed(&at(region(1, 2))), row(true));
-        assert_eq!(placed(&at(region(3, 5))), row(false));
-    }
-
-    #[test]
-    fn a_version_that_is_not_text_or_a_conflicted_tip_gives_no_place() {
-        let (fork, tip) = (file("a\n"), file("a\nx\n"));
-        let version = |value| Version {
-            value,
-            regions: Vec::new(),
-            conflicted: false,
-        };
-
-        // A symlink, a submodule, a binary file and a conflict that is not
-        // text give no place
-        for value in [
-            Value::Symlink {
-                target: "t".to_owned(),
-            },
-            Value::Submodule {
-                commit: "c".to_owned(),
-            },
-            file_with_bit(false, b"a\0x\n"),
-            Value::Conflict,
-        ] {
-            let read = place("f.txt", (&fork, &tip), &version(value.clone()));
-            assert_eq!(read, Placed::AtConflict, "{value:?}");
-        }
-        // Nor does a tip that holds a conflict at the path
-        let read = place("f.txt", (&fork, &Value::Conflict), &clean("a\n"));
-        assert_eq!(read, Placed::AtConflict);
-        // A version that lacks the path reads as empty text: the added line
-        // is lost, at no conflict
-        assert_eq!(
-            placed(&place("f.txt", (&fork, &tip), &version(Value::Absent))),
-            Some(vec![(LostKind::Added, Some(2), Some("x"), false)])
-        );
-    }
-
-    #[test]
-    fn a_path_read_whole_is_at_a_conflict_only_where_the_version_holds_one() {
-        // Given: a member that deletes `f.txt`
-        let (fork, tip) = (file("a\n"), Value::Absent);
-        let conflicted = Version {
-            value: file("a\n"),
-            regions: region(0, 1),
-            conflicted: true,
-        };
-
-        // Then: a version that still holds the file lacks the deletion, at a
-        // conflict only where the version holds one there
-        assert_eq!(
-            placed(&place("f.txt", (&fork, &tip), &clean("a\n"))),
-            Some(vec![(LostKind::File, None, Some("deleted"), false)])
-        );
-        assert_eq!(
-            placed(&place("f.txt", (&fork, &tip), &conflicted)),
-            Some(vec![(LostKind::File, None, Some("deleted"), true)])
-        );
-    }
-
-    #[test]
-    fn a_snapshot_with_two_unreleased_headings_holds_no_line_by_r8() {
-        // Given: a member that adds `- a` at the top of `[Unreleased]`, and
-        // versions that hold it further down that section
-        let fork = file("# C\n## [Unreleased]\n- z1\n- z2\n- z3\n## [1.0]\n");
-        let tip = file("# C\n## [Unreleased]\n- a\n- z1\n- z2\n- z3\n## [1.0]\n");
-        let one = clean("# C\n## [Unreleased]\n- z1\n- z2\n- z3\n- a\n## [1.0]\n");
-        let two = clean("# C\n## [Unreleased]\n- z1\n- z2\n- z3\n- a\n## [1.0]\n## [Unreleased]\n");
-
-        // Then: with one `[Unreleased]` heading, R8 holds the moved line
-        assert_eq!(
-            placed(&place("CHANGELOG.md", (&fork, &tip), &one)),
-            Some(vec![])
-        );
-        // And: with two, R8 holds no line, and it reads as lost
-        assert_eq!(
-            placed(&place("CHANGELOG.md", (&fork, &tip), &two)),
-            Some(vec![(LostKind::Added, Some(3), Some("- a"), false)])
-        );
-    }
-
-    #[test]
-    fn conflict_regions_run_from_each_opening_marker_through_its_closing_one() {
-        // Given: a snapshot with two conflicts, the second left open, and,
-        // before the first, two lines that only look like markers: one too
-        // short, one with no space after its run
-        let text = b"a\n<<<<<< short\n<<<<<<<b\n<<<<<<< conflict 1 of 2\n>>>>>>> conflict 1 \
-                     of 2 ends\nc\n<<<<<<< conflict 2 of 2\nd\n";
-
-        // Then: neither look-alike opens a region; each region runs through
-        // its closing marker, and the open one to the end of the text
-        assert_eq!(conflict_regions(text, 7), [3..5, 6..8]);
-        // And: with longer markers, these lines are text
-        assert_eq!(conflict_regions(text, 8), Vec::<Range<usize>>::new());
-    }
-
-    #[test]
-    fn change_lines_lists_each_line_and_path_of_a_change() {
-        let rows = |lines: Vec<Lost>| -> Vec<(LostKind, Option<u32>, Option<String>)> {
-            lines
-                .into_iter()
-                .map(|lost| (lost.kind, lost.line, lost.text))
-                .collect()
-        };
-        let text = |value: &str| Some(value.to_owned());
-
-        // A changed line, its removed line, and an added line; a blank line
-        // is no line of the change
-        assert_eq!(
-            rows(change_lines(
-                "f.txt",
-                &file("a\nb\nc\n"),
-                &file("a\nB\nc\nd\n\n")
-            )),
-            [
-                (LostKind::Added, Some(2), text("B")),
-                (LostKind::Removed, Some(2), text("b")),
-                (LostKind::Added, Some(4), text("d")),
-            ]
-        );
-        // A deletion and a mode are paths read whole
-        assert_eq!(
-            rows(change_lines("f.txt", &file("a\n"), &Value::Absent)),
-            [(LostKind::File, None, text("deleted"))]
-        );
-        assert_eq!(
-            rows(change_lines(
-                "x.sh",
-                &file_with_bit(false, b"a\n"),
-                &file_with_bit(true, b"a\n")
-            )),
-            [(LostKind::Mode, None, text("executable yes"))]
-        );
-        // A tip that holds a conflict gives none
-        assert_eq!(
-            change_lines("f.txt", &file("a\n"), &Value::Conflict),
-            Vec::<Lost>::new()
         );
     }
 }

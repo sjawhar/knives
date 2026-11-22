@@ -740,7 +740,10 @@ fn render_check(check: &TargetCheck, indent: &str) -> Vec<String> {
     )];
     if let Some(lines) = &check.lines {
         let under = format!("{indent}  ");
-        out.extend(crate::commands::release::lost_lines(lines, &under));
+        out.extend(crate::commands::release::lost_lines(
+            (&lines.lost, &lines.word_step_skipped),
+            &under,
+        ));
         out.extend(crate::commands::release::held_by_words_lines(lines, &under));
     }
     out

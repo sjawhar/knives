@@ -24,9 +24,7 @@ use knives::release_model::{
     trunk_reaches,
 };
 
-use super::release_edit::{
-    announce_unchecked, provenance_parents, report_hidden, union_event_text,
-};
+use super::release_edit::{announce_unchecked, recorded_parents, report_hidden, union_event_text};
 use super::scribe_for;
 
 pub(crate) enum ReleaseInvocation {
@@ -186,12 +184,11 @@ pub(crate) fn run_release(
             }
             None => (release::CarriedFrom::Unledgered, String::new()),
         };
-        let (carried, members, audit_base) = if let Some((_, previous)) = &previous {
+        let (carried, audit_base) = if let Some((_, previous)) = &previous {
             let carried = release::parent_sources(&opened, entry, &scheme, &previous_members)?;
-            let members = carried.clone();
             let base =
                 release::shared_base(&opened, previous, &trunk)?.unwrap_or_else(|| trunk.clone());
-            (carried, members, base)
+            (carried, base)
         } else {
             // The first cut of a series composes only that series' branches:
             // a branch on another series' base would carry that base in.
@@ -227,7 +224,6 @@ pub(crate) fn run_release(
             if refuse_stacked_first_cut(repo, &opened, entry, &carried)? {
                 return Ok(Exit::Incomplete);
             }
-            let members = carried.clone();
             // The first cut's base is its members' fork point with the
             // trunk, not the trunk tip, which has every commit upstream
             // landed since the fork; the audit reads each member from its
@@ -235,7 +231,7 @@ pub(crate) fn run_release(
             let member_tips: Vec<knives::ids::CommitId> =
                 carried.iter().map(|(_, tip)| tip.clone()).collect();
             let base = opened.fork_point_of(&member_tips, &trunk)?;
-            (carried, members, base)
+            (carried, base)
         };
         let request = release::Cut::from_carried(name.clone(), &carried);
         let mut candidate = release::candidate_cut(
@@ -334,7 +330,7 @@ pub(crate) fn run_release(
                 {
                     let committed = CommittedCut {
                         commit: published,
-                        members: &members,
+                        members: &carried,
                         context,
                         carried_from,
                     };
@@ -389,7 +385,7 @@ pub(crate) fn run_release(
         // the gate holds is the gate's to judge, not the drift check's.
         let mut audit = release::audit_cut(
             path,
-            &members,
+            &carried,
             release::CutSubject::Candidate(&mut candidate),
             context,
         )?;
@@ -1931,8 +1927,9 @@ fn record_cut_event(
         )?),
     };
     let members_text = members_event_text(&members);
+    let parents: Vec<CommitId> = members.iter().map(|(_, commit)| commit.clone()).collect();
     let mut evidence = vec![cut.created.as_str().to_owned()];
-    evidence.extend(members.iter().map(|(_, commit)| commit.as_str().to_owned()));
+    evidence.extend(parents.iter().map(|commit| commit.as_str().to_owned()));
     // An unverified member stays in evidence so the next gate rechecks it:
     // dropping it from the baseline here would let one conflicted cut launder
     // a member out of the composition without anyone ever stating the drop.
@@ -1947,7 +1944,7 @@ fn record_cut_event(
     let delta = restated_delta(cut.held, cut.check);
     scribe_for(fork, bound)?.record(&Draft {
         evidence,
-        parents: provenance_parents(&opened, entry, &members)?,
+        parents: recorded_parents(&opened, entry, &parents)?,
         ..Draft::event(
             Some(cut.name),
             format!(
