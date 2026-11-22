@@ -301,8 +301,7 @@ pub struct Repository<'a> {
 
 /// Install a fake `gh` that answers each of `repositories` apart, as a forge
 /// does, matching a repository's name whatever its letter case, as GitHub
-/// does (each `named` is written in lower case): `repo view <owner>/<name>`
-/// gives that repository's identity, `pr
+/// does: `repo view <owner>/<name>` gives that repository's identity, `pr
 /// list -R <owner>/<name>` its pull requests, and a by-number facts query
 /// (`api graphql -f owner=… -f name=…`) the pull requests it asks about of
 /// the repository its `owner` and `name` fields name, a number that
@@ -345,6 +344,7 @@ pub fn install_repository_gh_failing(
     let mut facts = String::new();
     let outage = "echo \"HTTP 502: Bad Gateway (https://api.github.com/graphql)\" >&2; exit 1 ;;";
     for repository in failing {
+        let repository = repository.to_ascii_lowercase();
         let (owner, name) = repository
             .split_once('/')
             .expect("a repository is named <owner>/<name>");
@@ -353,8 +353,8 @@ pub fn install_repository_gh_failing(
         writeln!(facts, "  \"{owner} {name}\") {outage}").expect("write to a string");
     }
     for (index, repository) in repositories.iter().enumerate() {
-        let (owner, name) = repository
-            .named
+        let named = repository.named.to_ascii_lowercase();
+        let (owner, name) = named
             .split_once('/')
             .expect("a repository is named <owner>/<name>");
         let identity = json_file(
@@ -368,8 +368,8 @@ pub fn install_repository_gh_failing(
         let pulls: Vec<serde_json::Value> =
             serde_json::from_str(repository.pulls).expect("parse fake pull request payload");
         let list = json_file(shim, &format!("list-{index}.json"), &pulls);
-        cat_arm(&mut lists, repository.named, &list);
-        cat_arm(&mut views, repository.named, &identity);
+        cat_arm(&mut lists, &named, &list);
+        cat_arm(&mut views, &named, &identity);
         facts.push_str(&facts_arm(shim, (owner, name), &pulls, &sweep));
     }
     install_executable(
