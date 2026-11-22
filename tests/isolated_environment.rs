@@ -236,6 +236,8 @@ fn a_developers_home_reaches_no_git_or_jj_a_test_starts() {
     );
     let home = run.spawned("HOME").expect("a spawned process has a HOME");
     assert_ne!(PathBuf::from(home), plant.home());
+    // The machine's /etc/gitconfig is off too: a test cannot plant one there.
+    assert_eq!(run.spawned("GIT_CONFIG_NOSYSTEM").as_deref(), Some("1"));
 }
 
 #[test]
@@ -317,6 +319,136 @@ fn a_path_with_only_wrappers_of_git_and_jj_stops_the_test_process_naming_them() 
         );
     }
     assert!(!plant.path("wrappers.log").exists());
+}
+
+#[test]
+fn a_path_entry_the_process_cannot_stat_is_passed_over() {
+    // Given: a PATH whose first directory holds a failing git wrapper, then a
+    // directory this uid may not search (mode 0400: its names cannot be looked
+    // up, though it can still be listed and removed), a regular file, the test
+    // process's own PATH, and a symlink loop. A stat in each fails with an
+    // error other than "no such file": the file (ENOTDIR) and the loop for any
+    // uid, the directory for every uid but root, as in CI. Exec finds no
+    // program there either. The wrapper makes the setup look for a real git
+    // past the unsearchable entry too.
+    let plant = Plant::new();
+    plant.failing_script("bin/git", "wrappers.log");
+    let unsearchable = plant.path("unsearchable");
+    std::fs::create_dir(&unsearchable).expect("create the unsearchable directory");
+    std::fs::set_permissions(&unsearchable, std::fs::Permissions::from_mode(0o400))
+        .expect("make it unsearchable");
+    let file = plant.path("file");
+    std::fs::write(&file, "not a directory\n").expect("write a regular file");
+    let looped = plant.path("loop");
+    std::os::unix::fs::symlink("loop", &looped).expect("make a symlink loop");
+    let stat = std::fs::metadata(looped.join("git")).expect_err("a stat through a loop fails");
+    assert_ne!(stat.kind(), std::io::ErrorKind::NotFound, "{stat}");
+    let inherited = std::env::var_os("PATH").expect("PATH is set");
+    // The loop goes last: glibc's execvp gives up at the first entry that
+    // fails with ELOOP.
+    let path = std::env::join_paths(
+        [plant.path("bin"), unsearchable, file]
+            .into_iter()
+            .chain(std::env::split_paths(&inherited))
+            .chain([looped]),
+    )
+    .expect("join PATH");
+
+    // When: this test binary starts with that PATH.
+    let output = Command::new(std::env::current_exe().expect("this test binary"))
+        .arg("--list")
+        .env_clear()
+        .env("HOME", plant.home())
+        .env("PATH", path)
+        .envs(std::env::var_os("TMPDIR").map(|temporary| ("TMPDIR", temporary)))
+        .output()
+        .expect("run this test binary");
+
+    // Then: it lists its tests, and the wrapper never ran.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains(&format!("{SCENARIO}: test")),
+        "{stdout}\n{stderr}"
+    );
+    assert!(!plant.path("wrappers.log").exists());
+}
+
+/// The real `program` on the test process's own `PATH`, links followed.
+fn real(program: &str) -> PathBuf {
+    let path = std::env::var_os("PATH").expect("PATH is set");
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(program))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("no {program} on PATH"))
+        .canonicalize()
+        .expect("resolve the real program")
+}
+
+#[test]
+fn a_real_program_in_a_directory_dropped_for_its_wrapper_stops_the_test_process() {
+    // Given: a PATH whose first directory holds a git wrapper beside a link to
+    // the real jj, then a directory holding only a link to the real git. The
+    // first directory goes whole, for its wrapper, and the only jj with it.
+    let plant = Plant::new();
+    plant.failing_script("mixed/git", "wrappers.log");
+    let jj = plant.path("mixed/jj");
+    std::os::unix::fs::symlink(real("jj"), &jj).expect("link the real jj");
+    std::fs::create_dir(plant.path("gitonly")).expect("create a directory");
+    std::os::unix::fs::symlink(real("git"), plant.path("gitonly/git")).expect("link the real git");
+    let path =
+        std::env::join_paths([plant.path("mixed"), plant.path("gitonly")]).expect("join PATH");
+
+    // When: this test binary starts with that PATH.
+    let output = Command::new(std::env::current_exe().expect("this test binary"))
+        .arg("--list")
+        .env_clear()
+        .env("HOME", plant.home())
+        .env("PATH", &path)
+        .envs(std::env::var_os("TMPDIR").map(|temporary| ("TMPDIR", temporary)))
+        .output()
+        .expect("run this test binary");
+
+    // Then: it stops before listing a test, naming the jj it dropped and the
+    // PATH it searched; git has a real copy left, so it is not named.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stdout}\n{stderr}");
+    assert!(!stdout.contains(": test"), "{stdout}");
+    for line in [
+        format!(
+            "knives tests: PATH has no real jj: skipped {}, the program, in a directory dropped for its wrapper",
+            jj.display()
+        ),
+        format!("knives tests: searched PATH={}", path.to_string_lossy()),
+    ] {
+        assert!(
+            stderr.lines().any(|seen| seen == line),
+            "no line {line:?} in:\n{stderr}"
+        );
+    }
+    assert!(!stderr.contains("no real git"), "{stderr}");
+}
+
+#[test]
+fn links_to_the_real_git_and_jj_are_kept() {
+    // Given: a directory first on PATH holding links to the real git and jj,
+    // as a package manager's bin directory does.
+    let plant = Plant::new();
+    let links = plant.path("links");
+    std::fs::create_dir(&links).expect("create the links directory");
+    for program in ["git", "jj"] {
+        std::os::unix::fs::symlink(real(program), links.join(program)).expect("link a program");
+    }
+
+    // When: the scenario runs with that PATH.
+    let run = Run::scenario(&plant.home(), Some(&links), &[]);
+
+    // Then: it passes, and that directory is still first on the PATH of what
+    // it starts.
+    run.assert_passed();
+    let path = run.spawned("PATH").expect("a spawned process has a PATH");
+    assert_eq!(std::env::split_paths(&path).next(), Some(links), "{path}");
 }
 
 #[test]

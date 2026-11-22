@@ -38,9 +38,10 @@
 //! - `PATH` keeps its order but loses each directory whose `git` or `jj` is a
 //!   wrapper rather than the program ([`wrapper`]), so the first `git`
 //!   and `jj` on it are the programs themselves. A process whose `PATH` then
-//!   holds no `git` or no `jj` but the wrappers it skipped stops before `main`,
-//!   naming each such wrapper and the `PATH` it searched: its tests would
-//!   otherwise fail one by one on a spawn error that does not say why.
+//!   holds no `git` or no `jj` where it dropped one (a wrapper, or a real copy
+//!   beside a wrapper) stops before `main`, naming each such file and the
+//!   `PATH` it searched: its tests would otherwise fail one by one on a spawn
+//!   error that does not say why.
 //!
 //! Once for the whole process, rather than on each spawn, because tests also
 //! call knives in-process, and what it starts inherits this environment.
@@ -156,33 +157,40 @@ fn kept(name: &OsStr) -> bool {
 
 /// `path` without the directories that hold a `git` or `jj` wrapper
 /// ([`wrapper`]), in its own order; or, when that leaves no real copy of a
-/// program it skipped a wrapper of, one line per such wrapper.
+/// `git` or `jj` it dropped, one line per such file. A directory goes whole,
+/// so a real program beside a wrapper goes with it, and it counts too: when it
+/// was the only real copy, the tests would fail later on a bare spawn error.
 fn without_wrappers(path: &OsStr) -> Result<OsString, String> {
     let mut kept = Vec::new();
-    let mut skipped = Vec::new();
+    let mut dropped = Vec::new();
     for directory in std::env::split_paths(path) {
-        let wrappers: Vec<_> = ["git", "jj"]
+        let found: Vec<_> = ["git", "jj"]
             .into_iter()
-            .filter_map(|program| Some((program, wrapper(&directory, program)?)))
-            .map(|(program, why)| (program, directory.join(program), why))
+            .filter(|program| directory.join(program).is_file())
+            .map(|program| (program, wrapper(&directory, program)))
             .collect();
-        if wrappers.is_empty() {
+        if found.iter().all(|(_, why)| why.is_none()) {
             kept.push(directory);
-        } else {
-            skipped.extend(wrappers);
+            continue;
         }
+        dropped.extend(found.into_iter().map(|(program, why)| {
+            let why = why.unwrap_or_else(|| {
+                "the program, in a directory dropped for its wrapper".to_owned()
+            });
+            (program, directory.join(program), why)
+        }));
     }
-    let unreplaced: Vec<String> = skipped
+    let unreplaced: Vec<String> = dropped
         .iter()
         .filter(|(program, ..)| {
             !kept
                 .iter()
                 .any(|directory| directory.join(program).is_file())
         })
-        .map(|(program, wrapper, why)| {
+        .map(|(program, file, why)| {
             format!(
                 "knives tests: PATH has no real {program}: skipped {}, {why}",
-                wrapper.display()
+                file.display()
             )
         })
         .collect();
@@ -197,7 +205,9 @@ fn without_wrappers(path: &OsStr) -> Result<OsString, String> {
 /// link to a program of another name (mise links every shim to itself). A
 /// wrapper runs the program found later on `PATH`, after doing what this
 /// module keeps out: reading the session, adding trailers and hooks. `None`
-/// when `directory` has no such file, or it is the program.
+/// when `directory` has no such file, or it is the program. `is_file` is false
+/// on any error, so an entry this process cannot reach (a directory it may not
+/// search, a symlink loop) holds no program here, as it holds none for exec.
 fn wrapper(directory: &Path, program: &str) -> Option<String> {
     let candidate = directory.join(program);
     if !candidate.is_file() {

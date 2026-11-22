@@ -1,5 +1,14 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 
@@ -1122,6 +1131,89 @@ test("a PATH whose only git is a wrapper stops the tests, naming it", async () =
     );
     expect(report).not.toContain("knives tests: PATH has no real jj");
     expect(report).toContain(`knives tests: searched PATH=${bin}`);
+  } finally {
+    await rm(plant, { recursive: true, force: true });
+  }
+}, 60_000);
+
+// A PATH entry the setup cannot stat holds no program for it, as for exec, and must not stop the
+// tests: a directory this uid may not search (mode 0400: its names cannot be looked up, though it
+// can still be listed and removed), a regular file (ENOTDIR), and a symlink loop. The file and the
+// loop fail a stat for any uid; the directory for every uid but root, as in CI. A git wrapper
+// first on PATH makes the setup look for a real git past the unsearchable entry too.
+test("a PATH entry the setup cannot stat is passed over, not fatal", async () => {
+  const plant = await mkdtemp(join(tmpdir(), "knives-plugin-unreachable-"));
+  try {
+    const bin = join(plant, "bin");
+    const log = join(plant, "wrappers.log");
+    await write(join(bin, "git"), `#!/bin/sh\necho "$0 $*" >> '${log}'\nexit 1\n`);
+    await chmod(join(bin, "git"), 0o755);
+    const unsearchable = join(plant, "unsearchable");
+    await mkdir(unsearchable);
+    await chmod(unsearchable, 0o400);
+    const file = join(plant, "file");
+    await writeFile(file, "not a directory\n");
+    const loop = join(plant, "loop");
+    await symlink("loop", loop);
+    // The loop goes last: glibc's execvp gives up at the first entry that fails with ELOOP.
+    const path = [bin, unsearchable, file, process.env["PATH"] ?? "", loop].join(delimiter);
+    const child = Bun.spawn(
+      [process.execPath, "test", import.meta.path, "--test-name-pattern", `^${environmentTest}$`],
+      {
+        cwd: join(import.meta.dir, ".."),
+        env: { PATH: path, HOME: join(plant, "home"), TMPDIR: tmpdir() },
+        stdout: "pipe",
+        stderr: "pipe",
+      }
+    );
+    const [status, stdout, stderr] = await Promise.all([
+      child.exited,
+      child.stdout.text(),
+      child.stderr.text(),
+    ]);
+    const report = `${stdout}${stderr}`;
+    expect({ status, wrappersRan: await Bun.file(log).exists() }, report).toEqual({
+      status: 0,
+      wrappersRan: false,
+    });
+    // A pattern that matched no test would pass as well.
+    expect(report).toContain("Ran 1 test");
+  } finally {
+    await rm(plant, { recursive: true, force: true });
+  }
+}, 60_000);
+
+// A directory goes whole when its jj is a wrapper, so a real git beside it goes too; when that was
+// the only git, the setup stops and names it, as for a git wrapper.
+test("a real git in a directory dropped for its jj wrapper stops the tests, naming it", async () => {
+  const plant = await mkdtemp(join(tmpdir(), "knives-plugin-mixed-"));
+  try {
+    const mixed = join(plant, "mixed");
+    await write(join(mixed, "jj"), "#!/bin/sh\nexit 1\n");
+    await chmod(join(mixed, "jj"), 0o755);
+    const git = Bun.which("git", { PATH: process.env["PATH"] ?? "" });
+    expect(git).not.toBeNull();
+    await symlink(await realpath(git ?? ""), join(mixed, "git"));
+    const child = Bun.spawn(
+      [process.execPath, "test", import.meta.path, "--test-name-pattern", `^${environmentTest}$`],
+      {
+        cwd: join(import.meta.dir, ".."),
+        env: { PATH: mixed, HOME: join(plant, "home"), TMPDIR: tmpdir() },
+        stdout: "pipe",
+        stderr: "pipe",
+      }
+    );
+    const [status, stdout, stderr] = await Promise.all([
+      child.exited,
+      child.stdout.text(),
+      child.stderr.text(),
+    ]);
+    const report = `${stdout}${stderr}`;
+    expect(status, report).not.toBe(0);
+    expect(report).toContain(
+      `knives tests: PATH has no real git: skipped ${join(mixed, "git")}, the program, in a directory dropped for its wrapper`
+    );
+    expect(report).toContain(`knives tests: searched PATH=${mixed}`);
   } finally {
     await rm(plant, { recursive: true, force: true });
   }

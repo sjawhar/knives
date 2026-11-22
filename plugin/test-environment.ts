@@ -15,9 +15,10 @@
 //   nothing), with GIT_CONFIG_NOSYSTEM set and both editors `false`;
 // - drops from PATH every directory whose git or jj is a wrapper (a script,
 //   or a link to a program of another name) rather than the program, and
-//   throws, naming each git wrapper and the PATH it searched, when that leaves
-//   no real git. Only git: these tests start git and never jj, and CI's plugin
-//   job installs no jj.
+//   throws, naming each git it dropped (a wrapper, or a real git beside a
+//   wrapper) and the PATH it searched, when that leaves no real git. Only git:
+//   these tests start git and never jj, and CI's plugin job installs no jj. A
+//   PATH entry it cannot stat holds no program for it, as for exec.
 //
 // Bun.spawn and Bun.spawnSync start a child with the environment this process
 // started with unless given `env`, so every spawn in the tests passes
@@ -38,13 +39,24 @@ import {
 import { tmpdir } from "node:os";
 import { basename, delimiter, join } from "node:path";
 
+/** Whether a file is at `path`. Any stat error counts as no file: a missing
+ * entry, and one this process cannot reach (a PATH directory it may not
+ * search, a symlink loop), where exec would not find a program either. */
+function isFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
 /** Why the `program` in `directory` is a wrapper rather than the program (a
  * script, or a link to a program of another name), or null when `directory`
- * has no such file or it is the program. */
+ * has no such file it can reach (`isFile`) or it is the program. */
 function wrapper(directory: string, program: string): string | null {
   const candidate = join(directory, program);
+  if (!isFile(candidate)) return null;
   try {
-    if (!statSync(candidate).isFile()) return null;
     const target = realpathSync(candidate);
     if (basename(target) !== program) return `a link to ${target}`;
     const start = Buffer.alloc(2);
@@ -56,29 +68,31 @@ function wrapper(directory: string, program: string): string | null {
     }
     return start.toString("latin1") === "#!" ? "a script" : null;
   } catch (error) {
-    return statSync(candidate, { throwIfNoEntry: false })?.isFile()
-      ? `unreadable (${error})`
-      : null;
+    return `unreadable (${error})`;
   }
 }
 
 const searched = process.env["PATH"] ?? "";
 const kept: string[] = [];
-const skipped: Array<{ program: string; file: string; why: string }> = [];
+const dropped: Array<{ program: string; file: string; why: string }> = [];
 for (const directory of searched.split(delimiter).filter((entry) => entry.length > 0)) {
-  const wrappers = ["git", "jj"].flatMap((program) => {
-    const why = wrapper(directory, program);
-    return why === null ? [] : [{ program, file: join(directory, program), why }];
-  });
-  if (wrappers.length === 0) kept.push(directory);
-  else skipped.push(...wrappers);
+  const found = ["git", "jj"]
+    .filter((program) => isFile(join(directory, program)))
+    .map((program) => ({ program, why: wrapper(directory, program) }));
+  if (found.every(({ why }) => why === null)) {
+    kept.push(directory);
+    continue;
+  }
+  for (const { program, why } of found) {
+    dropped.push({
+      program,
+      file: join(directory, program),
+      why: why ?? "the program, in a directory dropped for its wrapper",
+    });
+  }
 }
-const unreplaced = skipped.filter(
-  ({ program }) =>
-    program === "git" &&
-    !kept.some((directory) =>
-      statSync(join(directory, program), { throwIfNoEntry: false })?.isFile()
-    )
+const unreplaced = dropped.filter(
+  ({ program }) => program === "git" && !kept.some((directory) => isFile(join(directory, program)))
 );
 if (unreplaced.length > 0) {
   throw new Error(
