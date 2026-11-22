@@ -1,16 +1,11 @@
 use std::{
-    collections::{BTreeMap, hash_map::RandomState},
+    collections::hash_map::RandomState,
     hash::{BuildHasher, Hash, Hasher},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::commands::claim::{owner_kind_label, render_claim_line};
 use crate::config::GuidanceRoot;
-use crate::ids::UpstreamName;
-use crate::jj::WorkspaceActivity;
-use crate::seen::{self, Seen};
-use crate::store::Claim;
 
 #[derive(Debug)]
 pub struct Guidance {
@@ -24,10 +19,10 @@ pub struct InstructionFile {
     pub body: String,
 }
 
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+pub(crate) const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-const fn fnv1a(mut hash: u64, mut bytes: &[u8]) -> u64 {
+pub(crate) const fn fnv1a(mut hash: u64, mut bytes: &[u8]) -> u64 {
     while let [byte, rest @ ..] = bytes {
         hash ^= *byte as u64;
         hash = hash.wrapping_mul(FNV_PRIME);
@@ -130,129 +125,6 @@ pub fn format_guidance(repo_name: &str, guidance: &Guidance, nonce: &str) -> Str
     format!("\n\n{header}\n{body}\n{footer}")
 }
 
-/// Returns the time-invariant digest of a fork's active claim roster: the
-/// claims kept under its upstream name `repo`.
-pub fn notice_digest(repo: &UpstreamName, root: &Path, claims: &[Claim]) -> String {
-    let mut claims = claims
-        .iter()
-        .filter(|claim| claim.repo == repo.as_str())
-        .collect::<Vec<_>>();
-    claims.sort_unstable_by(|left, right| {
-        left.repo
-            .cmp(&right.repo)
-            .then_with(|| left.branch.cmp(&right.branch))
-    });
-
-    let mut hash = FNV_OFFSET_BASIS;
-    hash = fnv1a(hash, repo.as_str().as_bytes());
-    hash = fnv1a(hash, b"\x1e");
-    hash = fnv1a(hash, root.as_os_str().as_encoded_bytes());
-    hash = fnv1a(hash, b"\x1e");
-    for (claim_index, claim) in claims.iter().enumerate() {
-        if claim_index != 0 {
-            hash = fnv1a(hash, b"\x1e");
-        }
-        for (field_index, field) in [
-            claim.branch.as_str(),
-            claim.owner.as_str(),
-            owner_kind_label(claim.kind),
-            claim.started.as_str(),
-            claim.why.as_str(),
-        ]
-        .iter()
-        .enumerate()
-        {
-            if field_index != 0 {
-                hash = fnv1a(hash, b"\x1f");
-            }
-            hash = fnv1a(hash, field.as_bytes());
-        }
-    }
-    format!("{hash:016x}")
-}
-
-/// Formats a direct notice that a managed fork may be actively edited elsewhere.
-pub fn format_notice(repo_name: &str, root: &Path, claims: &[String], digest: &str) -> String {
-    let nonce = envelope_nonce();
-    let held = if claims.is_empty() {
-        "No branch is claimed here right now.".to_owned()
-    } else {
-        format!("Branches claimed here: {}.", claims.join("; "))
-    };
-
-    [
-        String::new(),
-        String::new(),
-        format!(
-            "<knives-notice-{nonce} repo=\"{}\" digest=\"{digest}\">",
-            safe_attribute(repo_name)
-        ),
-        format!(
-            "{} is a fork managed by knives, and another agent may be working in it.",
-            root.display()
-        ),
-        held,
-        "Use knives rather than jj or git directly here: `knives status` for the state of"
-            .to_owned(),
-        "every branch, `knives start <branch>` to take a branch and get your own workspace,"
-            .to_owned(),
-        "`knives finish <branch>` as soon as your active work there stops — the branch,".to_owned(),
-        "its bookmark, and any open pull request all survive the release.".to_owned(),
-        format!("</knives-notice-{nonce}>"),
-    ]
-    .join("\n")
-}
-
-/// The notice in place of the claim roster when knives cannot read the claims:
-/// the agent must not take the silence as "nobody holds this branch".
-pub fn format_refusal(repo_name: &str, refusal: &str) -> String {
-    let nonce = envelope_nonce();
-    [
-        String::new(),
-        String::new(),
-        format!(
-            "<knives-notice-{nonce} repo=\"{}\">",
-            safe_attribute(repo_name)
-        ),
-        "knives cannot read who has claimed which branch of this fork, so do not assume a \
-         branch is free:"
-            .to_owned(),
-        refusal.to_owned(),
-        format!("</knives-notice-{nonce}>"),
-    ]
-    .join("\n")
-}
-
-/// Returns active claim summaries for the fork whose claims are kept under
-/// its upstream name `repo`.
-///
-/// Hooks never open a jj repository or walk operations — identity is read by
-/// git — so an empty operation stream is marked window-exhausted rather than
-/// claiming no activity.
-pub fn claim_lines(
-    claims: &[Claim],
-    repo: &UpstreamName,
-    observations: &Seen,
-    now: jiff::Timestamp,
-) -> Vec<String> {
-    let activity = WorkspaceActivity {
-        moves: BTreeMap::new(),
-        horizon: Some(now),
-    };
-    claims
-        .iter()
-        .filter(|claim| claim.repo == repo.as_str())
-        .map(|claim| {
-            render_claim_line(
-                &claim.branch,
-                claim,
-                seen::last_seen(claim, &activity, observations),
-                now,
-            )
-        })
-        .collect()
-}
-
 fn candidate_directory(candidate: &Path) -> Option<PathBuf> {
     // Unlike the TypeScript plugin's fail-closed stat path, `is_dir` treats metadata errors
     // as a file candidate so the parent directory's readable guidance remains available.
@@ -289,7 +161,7 @@ pub fn envelope_nonce() -> String {
     format!("{:016x}{timestamp:x}{counter:x}", hasher.finish())
 }
 
-fn safe_attribute(value: &str) -> String {
+pub(crate) fn safe_attribute(value: &str) -> String {
     // Registry names originate in directory basenames, so they are attacker-influenced
     // markup data rather than trusted attributes.
     value
@@ -310,21 +182,12 @@ mod tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::{
-        collections::BTreeMap,
-        path::{Path, PathBuf},
-    };
+    use std::path::PathBuf;
 
     use tempfile::TempDir;
 
-    use super::{
-        Guidance, InstructionFile, claim_lines, envelope_nonce, format_guidance, format_notice,
-        guidance_for, notice_digest,
-    };
+    use super::{Guidance, InstructionFile, envelope_nonce, format_guidance, guidance_for};
     use crate::config::GuidanceRoot;
-    use crate::ids::UpstreamName;
-    use crate::seen::Seen;
-    use crate::store::{Claim, OwnerKind};
 
     fn root(files: &[(&str, &str)]) -> (TempDir, GuidanceRoot) {
         let dir = tempfile::tempdir().unwrap();
@@ -432,132 +295,5 @@ mod tests {
         let text = format_guidance("evil\" ><inject>", &guidance, &envelope_nonce());
 
         assert!(!text.contains("<inject>"));
-    }
-
-    #[test]
-    fn notice_names_the_claims() {
-        let text = format_notice(
-            "r",
-            Path::new("/r"),
-            &["feat/x (agent-a): porting".into()],
-            "0123456789abcdef",
-        );
-
-        assert!(text.contains("digest=\"0123456789abcdef\""));
-        assert!(text.contains("Branches claimed here: feat/x (agent-a): porting."));
-    }
-
-    #[test]
-    fn claim_lines_include_owner_kind_claimed_age_and_last_seen() {
-        // Removing any claim provenance cell would make a live notice unable to
-        // distinguish both who took work and what evidence supports it.
-        let claims = [
-            Claim {
-                repo: "r".to_owned(),
-                branch: "feat/x".to_owned(),
-                owner: "agent-a".to_owned(),
-                kind: OwnerKind::HarnessSession,
-                why: "porting".to_owned(),
-                started: "2026-01-01T00:00:00Z".to_owned(),
-                files: Vec::new(),
-                place: None,
-                machine: None,
-                ledger_commit: None,
-            },
-            Claim {
-                repo: "r".to_owned(),
-                branch: "feat/y".to_owned(),
-                owner: "agent-b".to_owned(),
-                kind: OwnerKind::HarnessSession,
-                why: "waiting".to_owned(),
-                started: "2026-01-01T00:00:00Z".to_owned(),
-                files: Vec::new(),
-                place: None,
-                machine: None,
-                ledger_commit: None,
-            },
-        ];
-        let seen = Seen {
-            owners: BTreeMap::from([(
-                OwnerKind::HarnessSession,
-                BTreeMap::from([("agent-a".to_owned(), "2026-01-02T00:00:00Z".to_owned())]),
-            )]),
-            workspaces: BTreeMap::new(),
-        };
-        let now = "2026-01-03T00:00:00Z".parse().expect("valid timestamp");
-
-        let rows = claim_lines(&claims, &UpstreamName::new("r"), &seen, now);
-
-        assert_eq!(
-            rows,
-            [
-                "feat/x (agent-a, harness-session, claimed 2d ago, last seen 1d ago): porting",
-                "feat/y (agent-b, harness-session, claimed 2d ago, not seen within the observation window): waiting",
-            ]
-        );
-    }
-
-    #[test]
-    fn the_digest_ignores_rolling_ages() {
-        // Rendering must continue to roll elapsed-time language while the
-        // content identity remains strictly a function of persisted claims.
-        let root = Path::new("/repos/beta");
-        let beta = UpstreamName::new("beta");
-        let claims = vec![Claim {
-            repo: "beta".to_owned(),
-            branch: "feat/first".to_owned(),
-            owner: "agent-one".to_owned(),
-            kind: OwnerKind::HarnessSession,
-            why: "porting".to_owned(),
-            started: "2026-01-01T00:00:00Z".to_owned(),
-            files: Vec::new(),
-            place: None,
-            machine: None,
-            ledger_commit: None,
-        }];
-        let seen = Seen::default();
-        let early = claim_lines(
-            &claims,
-            &beta,
-            &seen,
-            "2026-01-01T01:00:00Z".parse().expect("valid timestamp"),
-        );
-        let late = claim_lines(
-            &claims,
-            &beta,
-            &seen,
-            "2026-01-01T03:00:00Z".parse().expect("valid timestamp"),
-        );
-
-        assert_ne!(early, late, "ages must roll for this test to bite");
-        let digest = notice_digest(&beta, root, &claims);
-        assert_eq!(digest, notice_digest(&beta, root, &claims));
-
-        let mut grown = claims;
-        grown.push(Claim {
-            repo: "beta".to_owned(),
-            branch: "feat/second".to_owned(),
-            owner: "agent-two".to_owned(),
-            kind: OwnerKind::WorkspaceDerived,
-            why: "reviewing".to_owned(),
-            started: "2026-01-02T00:00:00Z".to_owned(),
-            files: Vec::new(),
-            place: None,
-            machine: None,
-            ledger_commit: None,
-        });
-        let expected = "03b4a0b08163a78c";
-        assert_eq!(notice_digest(&beta, root, &grown), expected);
-        let mut reordered = grown.clone();
-        reordered.reverse();
-        assert_eq!(notice_digest(&beta, root, &reordered), expected);
-        assert_ne!(digest, notice_digest(&beta, root, &grown));
-    }
-
-    #[test]
-    fn notice_without_claims_says_so() {
-        let text = format_notice("r", Path::new("/r"), &[], "0123456789abcdef");
-
-        assert!(text.contains("No branch is claimed here right now."));
     }
 }

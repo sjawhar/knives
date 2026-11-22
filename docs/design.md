@@ -539,11 +539,12 @@ does not interrupt an agent session.
 | B | OpenCode | The in-process TypeScript plugin is a shim that spawns `knives hook opencode`. | `tool.execute.after` uses the notice and guidance parts in one response budget. `chat.system` returns formatted guidance and its raw bodies. `shell.env` uses `KNIVES_OWNER` when set, then resolves an owner from a managed working directory. `compacting` clears session state. |
 | C | oh-my-pi | The `omp/extensions/knives.ts` extension adapts the OpenCode hook core. | `resources_discover` exposes bundled skills. `tool_result` and `before_agent_start` apply the notice and guidance hooks, and `session.compacting` clears state. It leaves Pi's built-in `bash` tool intact, preserving its approval and sandbox behavior. |
 
-Each session records `noticed` and `guided` flags for every repository. The Claude Code adapter
-marks only `noticed` at `SessionStart`, then marks guidance after a relevant foreign-repository
-tool use. It omits guidance when the event working directory is in that repository, because
-Claude Code already loads the session repository's `CLAUDE.md`. The OpenCode adapter marks both
-flags after any nonempty addition, so its notice and guidance consume one budget.
+Each session records, per repository, the notices it had and whether it was `guided`, and per
+fork the claim roster it was told. The Claude Code adapter records the notice at `SessionStart`,
+then marks guidance after a relevant foreign-repository tool use. It omits guidance when the
+event working directory is in that repository, because Claude Code already loads the session
+repository's `CLAUDE.md`. The OpenCode adapter records both after any nonempty addition, so its
+notice and guidance consume one budget.
 
 The OpenCode protocol fails soft. For a parsed event, a processing failure returns that event's
 empty response envelope. Malformed input returns an empty object. Both cases keep the hook exit
@@ -621,6 +622,21 @@ trusted repository, or both — the adapters can produce these two parts:
   git directly. This is the one place the tool addresses the reader directly. It is emitted
   even when the repository has no `AGENTS.md`, which used to mean nothing was emitted at
   all and an agent was never told where it had walked into.
+
+  A fork with many agents has many claims, and one notice with every claim and its whole
+  reason ran to about 10k tokens; it came again after any claim in the fork changed, and for
+  every workspace a session touched. So the session keeps the roster it was told, and the
+  notice says only what the session lacks. The first notice of a fork in a session lists
+  every claim, each reason cut to one line of 80 characters. A later notice, after the roster
+  changed, lists only the claims taken, changed or released since the digest the session
+  holds. The claim on the branch of the workspace a call touched (the workspace directory
+  is named for its branch, as `knives start` names it) is given with its whole reason, once
+  per version of that claim. A roster the session holds already is said again only as one
+  line, the first time a call touches another workspace of the fork: it names the digest and
+  whether a claimed branch has its workspace there. Nothing is said again at a workspace that
+  had the current digest. Compaction clears all of it, so the next notice lists every claim
+  again. The digest attribute is the roster's: a hash of the stored claims, never of their
+  ages, so an ageing roster is not told again.
 - **The repository's own guidance**, for a repository `[trust]` names, when it has any, framed
   as data. A managed fork that no trust rule names gets the notice and no guidance.
 
@@ -630,8 +646,8 @@ batch of `gh` and `git` calls whose working directory sat inside a repository us
 spend that repository's one injection while touching no repository content, so a later
 read of a real file got nothing.
 
-The record is stored in a file for each harness and session. Its per-repository `noticed` and
-`guided` flags survive calls made through different OpenCode plugin instances and prevent a
+The record is stored in a file for each harness and session. Its per-repository records and
+per-fork rosters survive calls made through different OpenCode plugin instances and prevent a
 repository from spending the same announcement budget more than once.
 
 ### OpenCode configuration
@@ -655,9 +671,9 @@ For development from a checkout, use its plugin path instead:
 ```
 
 All default to on, and a plain string entry keeps them that way. They are separable
-because they cost very different amounts: the notice is a couple of hundred bytes,
-the guidance can be 35KB of somebody else's contribution rules, and `owner` only exports
-`KNIVES_OWNER` into shell environments.
+because they cost very different amounts: the notice is a line per claim the first time
+and a few lines after that, the guidance can be 35KB of somebody else's contribution
+rules, and `owner` only exports `KNIVES_OWNER` into shell environments.
 
 ### OpenCode binary discovery
 

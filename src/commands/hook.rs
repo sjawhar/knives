@@ -11,12 +11,12 @@ use crate::hook::claude_code::{
     Event, EventKind, POST_TOOL_USE_WIRE_NAME, SESSION_START_WIRE_NAME, response,
 };
 use crate::hook::guidance::{
-    Guidance, body_digest, claim_lines, envelope_nonce, format_guidance, format_notice,
-    format_refusal, guidance_for, mention_line, notice_digest,
+    Guidance, body_digest, envelope_nonce, format_guidance, guidance_for, mention_line,
 };
+use crate::hook::notice::{self, Holding, format_notice, format_refusal};
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
 use crate::hook::resolve::{Match, argument_paths, match_checkout};
-use crate::hook::state::{Envelope, SessionState};
+use crate::hook::state::{Envelope, HeldRoster, SessionState};
 use crate::ids::UpstreamName;
 use crate::ledger::problem_human_text;
 use crate::lock::LockError;
@@ -316,7 +316,7 @@ impl<'a> Candidates<'a> {
     fn outstanding(&self, state: &SessionState) -> Outstanding {
         let notice = self
             .notice
-            .is_some_and(|notice| !state.notice_seen(&self.repo.root, &notice.update.digest));
+            .is_some_and(|notice| notice.update.is_due(state, &self.repo.root));
         let guidance = self.guidance.is_some() && !state.repo(&self.repo.root).guided;
         if !guidance {
             return Outstanding {
@@ -352,7 +352,7 @@ impl<'a> Candidates<'a> {
         if outstanding.notice
             && let Some(notice) = self.notice
         {
-            state.record_notice(&self.repo.root, notice.update.digest.clone());
+            notice.update.apply(state, &self.repo.root);
         }
         if outstanding.guidance {
             state.mark_guided(&self.repo.root);
@@ -706,13 +706,80 @@ impl PreparedNotice {
     }
 }
 
+/// What delivering a notice records in the session, and what the notice was
+/// decided against.
 struct NoticeStateUpdate {
+    /// The digest the workspace root has had a notice of once delivered.
     digest: String,
+    /// For the claims notice: what else it records, and what it was planned
+    /// against. `None` for a refusal in its place.
+    claims: Option<ClaimsUpdate>,
+}
+
+struct ClaimsUpdate {
+    target: Target,
+    /// The roster the session holds once the notice is delivered.
+    roster: HeldRoster,
+    /// What the session held when the notice was planned.
+    basis: Basis,
+}
+
+/// Whom a claims notice is about.
+struct Target {
+    /// The name the fork's claims are kept under.
+    fork: String,
+    /// The claims on the touched workspace's branch, by
+    /// [`notice::whole_key`], each with whether the notice gives it whole.
+    here: Vec<(String, bool)>,
+}
+
+/// What a claims notice is planned against, in the session: the digest of
+/// its roster of the fork, whether the root had a notice of the roster's
+/// digest, and which claims on the touched workspace's branch it had whole.
+#[derive(Debug, PartialEq, Eq)]
+struct Basis {
+    held: Option<String>,
+    noticed: bool,
+    whole: Vec<bool>,
+}
+
+impl Basis {
+    fn of(state: &SessionState, root: &Path, digest: &str, target: &Target) -> Self {
+        Self {
+            held: state.roster(&target.fork).map(|held| held.digest.clone()),
+            noticed: state.notice_seen(root, digest),
+            whole: target
+                .here
+                .iter()
+                .map(|(key, _)| state.had_whole(key))
+                .collect(),
+        }
+    }
 }
 
 impl NoticeStateUpdate {
-    fn apply(self, state: &mut SessionState, root: &Path) {
-        state.record_notice(root, self.digest);
+    /// Whether `state` still lacks the notice: a refusal until `root` had it;
+    /// a claims notice while the session holds what it was planned against,
+    /// for it was written for that, and a parallel call that recorded
+    /// another notice first leaves whatever is still due to a later call.
+    fn is_due(&self, state: &SessionState, root: &Path) -> bool {
+        self.claims.as_ref().map_or_else(
+            || !state.notice_seen(root, &self.digest),
+            |claims| Basis::of(state, root, &self.digest, &claims.target) == claims.basis,
+        )
+    }
+
+    fn apply(&self, state: &mut SessionState, root: &Path) {
+        state.record_notice(root, self.digest.clone());
+        let Some(claims) = &self.claims else {
+            return;
+        };
+        state.hold_roster(claims.target.fork.clone(), claims.roster.clone());
+        for (key, whole) in &claims.target.here {
+            if *whole {
+                state.record_whole(key.clone());
+            }
+        }
     }
 }
 
@@ -722,8 +789,12 @@ impl NoticeStateUpdate {
 /// whose `upstream` disagrees with the registry ([`crate::bind::Disagreement`]),
 /// nothing for any other match.
 ///
-/// The roster is the claims kept under the fork's upstream name; the notice
-/// names the fork by its registry key.
+/// The claims notice is planned against what the session holds
+/// ([`notice::plan`]): the whole roster when it holds none of this fork, the
+/// changes when it holds an older one, one line when it holds this one and the
+/// root has not had it, and nothing more once it has. The roster is the
+/// claims kept under the fork's upstream name; the notice names the fork by
+/// its registry key.
 ///
 /// A state file this knives refuses to read ([`StoreError::Unmigrated`], or
 /// [`StoreError::FormerNames`] for one still keeping forks under their registry
@@ -761,13 +832,46 @@ fn notice_if_requested(
         Err(error) => return Err(error.into()),
     };
     let claims = all_claims(&store);
-    let digest = notice_digest(&managed.upstream, &repo.root, &claims);
-    if state.notice_seen(&repo.root, &digest) {
+    let roster = notice::roster(&claims, &managed.upstream);
+    let digest = notice::roster_digest(&managed.upstream, &roster);
+    let fork = managed.upstream.as_str().to_owned();
+    let workspace = repo.root.file_name().and_then(|name| name.to_str());
+    let holding = Holding {
+        roster: state.roster(&fork),
+        noticed: state.notice_seen(&repo.root, &digest),
+        had_whole: |claim: &crate::store::Claim| state.had_whole(&notice::whole_key(claim)),
+    };
+    let Some(plan) = notice::plan(&roster, &digest, workspace, &holding) else {
         return Ok(None);
-    }
+    };
+    let text = format_notice(
+        &repo.name,
+        &repo.root,
+        &plan,
+        &notice::Sightings {
+            seen: &crate::seen::load(),
+            now: jiff::Timestamp::now(),
+        },
+    );
+    let target = Target {
+        fork,
+        here: plan
+            .here
+            .iter()
+            .map(|(claim, whole)| (notice::whole_key(claim), *whole))
+            .collect(),
+    };
+    let update = ClaimsUpdate {
+        basis: Basis::of(state, &repo.root, &digest, &target),
+        roster: notice::held(&roster, &digest),
+        target,
+    };
     Ok(Some(PreparedNotice {
-        text: format_notice_for(repo, &managed.upstream, &digest, &claims),
-        update: NoticeStateUpdate { digest },
+        text,
+        update: NoticeStateUpdate {
+            digest,
+            claims: Some(update),
+        },
     }))
 }
 
@@ -795,19 +899,11 @@ fn refusal_notice(
     }
     Some(PreparedNotice {
         text: format_refusal(&repo.name, &problem_human_text(text)),
-        update: NoticeStateUpdate { digest },
+        update: NoticeStateUpdate {
+            digest,
+            claims: None,
+        },
     })
-}
-
-fn format_notice_for(
-    repo: &GuidanceRoot,
-    upstream: &UpstreamName,
-    digest: &str,
-    claims: &[crate::store::Claim],
-) -> String {
-    let observations = crate::seen::load();
-    let visible_claims = claim_lines(claims, upstream, &observations, jiff::Timestamp::now());
-    format_notice(&repo.name, &repo.root, &visible_claims, digest)
 }
 
 fn all_claims(store: &Store) -> Vec<crate::store::Claim> {

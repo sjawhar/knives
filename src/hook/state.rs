@@ -40,12 +40,25 @@ pub struct Envelope<'a> {
     pub turn: &'a str,
 }
 
+/// One fork's claim roster as the session was last told it: the roster's
+/// digest and each claimed branch's claim fingerprint
+/// ([`crate::hook::notice::claim_fingerprint`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldRoster {
+    pub digest: String,
+    pub claims: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct DiskState {
     #[serde(default)]
     repos: HashMap<PathBuf, RepoFlags>,
     #[serde(default)]
     seen_notices: HashMap<PathBuf, BTreeSet<String>>,
+    #[serde(default)]
+    rosters: BTreeMap<String, HeldRoster>,
+    #[serde(default)]
+    whole_claims: BTreeSet<String>,
     #[serde(default)]
     guidance_bodies: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,7 +68,13 @@ struct DiskState {
 #[derive(Debug, Default)]
 pub struct SessionState {
     repos: HashMap<PathBuf, RepoFlags>,
+    /// Per workspace root: the digests of the notices it had.
     seen_notices: HashMap<PathBuf, BTreeSet<String>>,
+    /// Per fork, by the name its claims are kept under: the roster the
+    /// session was last told.
+    rosters: BTreeMap<String, HeldRoster>,
+    /// The claims the session had whole ([`crate::hook::notice::whole_key`]).
+    whole_claims: BTreeSet<String>,
     /// Digests of the instruction bodies injected since the last compaction.
     guidance_bodies: BTreeSet<String>,
     /// The guidance blocks injected into tool results, by envelope nonce, once
@@ -110,6 +129,24 @@ impl SessionState {
         self.seen_notices
             .get(root)
             .is_some_and(|notices| notices.contains(digest))
+    }
+
+    /// The roster of the fork whose claims are kept under `fork` that the
+    /// session was last told.
+    pub fn roster(&self, fork: &str) -> Option<&HeldRoster> {
+        self.rosters.get(fork)
+    }
+
+    pub fn hold_roster(&mut self, fork: String, roster: HeldRoster) {
+        self.rosters.insert(fork, roster);
+    }
+
+    pub fn had_whole(&self, key: &str) -> bool {
+        self.whole_claims.contains(key)
+    }
+
+    pub fn record_whole(&mut self, key: String) {
+        self.whole_claims.insert(key);
     }
 
     pub fn record_guidance_body(&mut self, digest: String) {
@@ -191,6 +228,8 @@ impl SessionState {
     pub fn clear(&mut self) {
         self.repos.clear();
         self.seen_notices.clear();
+        self.rosters.clear();
+        self.whole_claims.clear();
         self.guidance_bodies.clear();
         if let Some(deliveries) = &mut self.deliveries {
             deliveries.clear();
@@ -214,6 +253,8 @@ impl SessionState {
             .map_or_else(Self::default, |disk| Self {
                 repos: disk.repos,
                 seen_notices: disk.seen_notices,
+                rosters: disk.rosters,
+                whole_claims: disk.whole_claims,
                 guidance_bodies: disk.guidance_bodies,
                 deliveries: disk.deliveries,
             })
@@ -227,6 +268,8 @@ impl SessionState {
             &DiskState {
                 repos: self.repos.clone(),
                 seen_notices: self.seen_notices.clone(),
+                rosters: self.rosters.clone(),
+                whole_claims: self.whole_claims.clone(),
                 guidance_bodies: self.guidance_bodies.clone(),
                 deliveries: self.deliveries.clone(),
             },
