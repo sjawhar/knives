@@ -11,13 +11,14 @@
 //! match no recorded write (a child of the release included), conflicts, a
 //! working copy on the commit, a hand edit of a published release the publish
 //! remote does not hold, and a change beyond the conflicts with no reason. The
-//! newest write itself, or a re-signed copy, is nothing to adopt; an older one
-//! is recorded as the newest. The resolution is measured against the replaced
-//! write rebuilt on its members (D7), so a member rewritten in place is no
-//! change beyond the conflicts. A member's lost lines are counted against the
-//! baseline (D8): exit 1 for any line lost from a plain file the baseline left
-//! without a conflict, or every line lost from a conflicted file or a release
-//! log.
+//! newest write itself is nothing to adopt. That write re-signed or
+//! metaedited while it is unpublished, or an older one, is recorded as the
+//! newest (`tests/release_resign.rs` has the rest of the re-signed case). The
+//! resolution is measured against the replaced write rebuilt on its members
+//! (D7), so a member rewritten in place is no change beyond the conflicts. A
+//! member's lost lines are counted against the baseline (D8): exit 1 for any
+//! line lost from a plain file the baseline left without a conflict, or
+//! every line lost from a conflicted file or a release log.
 
 #![allow(
     clippy::expect_used,
@@ -328,19 +329,42 @@ fn adopting_the_recorded_write_itself_writes_nothing() {
     assert_ne!(rewritten, cut, "the metaedit made no new commit");
     let output = adopt(&lab, &home, &[]);
 
-    // Then: that is the same write, and nothing is recorded either.
+    // Then: the cut is unpublished, so the re-signed commit is recorded as
+    // the newest write, in one event that names it and holds no file as a
+    // fix by hand.
+    let out = stdout(&output);
     assert!(output.status.success(), "{}", text(&output));
     assert!(
-        stdout(&output).contains(&format!(
-            "demo: {RELEASE} is at {}, the recorded cut {} re-signed or metaedited (same \
-             change, parents and tree); nothing to adopt",
+        out.contains(&format!(
+            "demo: adopted {0} as the newest write of {RELEASE}, replacing the recorded cut {1}\n  \
+             {0} is {1} re-signed or metaedited (same change, parents and tree): no content \
+             changed\n  baseline: the recorded cut {1}\n  no file resolved by hand\n",
             rewritten.short(),
             cut.short()
         )),
-        "{}",
-        text(&output)
+        "{out}"
     );
-    assert_eq!(ledger_entries(&home), before);
+    let after = ledger_entries(&home);
+    assert_eq!(after.len(), before.len() + 1, "{after:?}");
+    let event = newest_event(&home, RELEASE);
+    assert_eq!(
+        event.evidence.first().map(String::as_str),
+        Some(rewritten.as_str()),
+        "{event:?}"
+    );
+    assert!(
+        event.text.contains(&format!(
+            " parent(s): adopted: replaces the recorded cut {0}; measured against the recorded \
+             cut {0}; parents: ",
+            cut.short()
+        )),
+        "{event:?}"
+    );
+    assert!(event.fix_files.is_empty(), "{event:?}");
+    assert!(
+        !event.text.contains("resolved by hand:") && !event.text.contains("changed beyond"),
+        "{event:?}"
+    );
 }
 
 #[test]
@@ -1041,11 +1065,20 @@ fn a_renumber_by_hand_is_adopted_only_with_a_why_and_keeps_the_recorded_parents(
     assert!(findings(&report, "orphan-commit").is_empty(), "{report}");
 }
 
+/// The block a ygo member's `notes` insert above the base's notes.
+fn notes_block(notes: &str) -> &str {
+    notes
+        .strip_suffix(BASE_NOTES)
+        .expect("a member's notes end with the base's")
+}
+
 #[test]
 fn the_ygo_rewritten_member_conflict_resolved_by_hand_is_adopted() {
     // Given: the ygo history's shape: the unioned cut, client-count included,
     // then split-from-store grown into split-one-path, which rewrote its
-    // block, and advanced: CHANGELOG.md is left conflicted for a person.
+    // block. Its advance would lose client-count's notes heading, so it is
+    // refused, and then run with `--allow-loss`: CHANGELOG.md is left
+    // conflicted for a person, and client-count's heading is named as lost.
     let (lab, home) = unioned_first_cut();
     ygo_member(&lab, CLIENT, (CLIENT_LOG, CLIENT_NOTES));
     release_ok(&lab, &home, &["include", CLIENT]);
@@ -1057,15 +1090,41 @@ fn the_ygo_rewritten_member_conflict_resolved_by_hand_is_adopted() {
             ("RELEASE_NOTES.md", SPLIT_ONE_PATH_NOTES),
         ],
     );
-    release_ok(&lab, &home, &["advance", SPLIT]);
+    let refused = knives_release(&lab, &home, &["advance", SPLIT]);
+    assert_eq!(refused.status.code(), Some(3), "{}", text(&refused));
+    assert!(
+        stdout(&refused).contains(&format!(
+            "refusing to write {RELEASE}: RELEASE_NOTES.md would lose {CLIENT}'s lines"
+        )),
+        "{}",
+        text(&refused)
+    );
+    let allowed = release_ok(
+        &lab,
+        &home,
+        &[
+            "advance",
+            SPLIT,
+            "--allow-loss",
+            "jj pairs the rewritten heading with client-count's",
+        ],
+    );
+    assert!(
+        allowed.contains(&format!(
+            "demo: RELEASE_NOTES.md: {CLIENT}'s lines lost by this write (--allow-loss)\n"
+        )),
+        "{allowed}"
+    );
     assert_eq!(
         knives::jj::conflicted_files(&lab.work, RELEASE).expect("list conflicts"),
         ["CHANGELOG.md"]
     );
     let advanced = commit_at(&lab, RELEASE);
 
-    // When: a person resolves it with every member's block, the rewritten
-    // one in place of the block it replaced, and the release is adopted.
+    // When: a person resolves CHANGELOG.md with every member's block, the
+    // rewritten one in place of the block it replaced, puts client-count's
+    // heading back in RELEASE_NOTES.md with every member's block, and adopts
+    // the release with `--why`.
     let (preamble, sections) = ygo_preamble_and_sections();
     let resolution = format!(
         "{preamble}{}{}{}{sections}",
@@ -1073,11 +1132,21 @@ fn the_ygo_rewritten_member_conflict_resolved_by_hand_is_adopted() {
         block(SPLIT_ONE_PATH_LOG),
         block(SAMI11_LOG)
     );
-    finish_in_place(&lab, &[("CHANGELOG.md", &resolution)]);
-    let output = adopt(&lab, &home, &[]);
+    let notes = format!(
+        "{}{}{}{BASE_NOTES}",
+        notes_block(CLIENT_NOTES),
+        notes_block(SPLIT_ONE_PATH_NOTES),
+        notes_block(SAMI11_NOTES)
+    );
+    finish_in_place(
+        &lab,
+        &[("CHANGELOG.md", &resolution), ("RELEASE_NOTES.md", &notes)],
+    );
+    let output = adopt(&lab, &home, &["--why", "put client-count's heading back"]);
 
     // Then: recorded against the advance, CHANGELOG.md resolved by hand,
-    // every member's added lines held.
+    // RELEASE_NOTES.md changed beyond the baseline's conflicts, and every
+    // member's added lines held.
     let out = stdout(&output);
     assert!(output.status.success(), "{}", text(&output));
     assert!(
@@ -1085,6 +1154,13 @@ fn the_ygo_rewritten_member_conflict_resolved_by_hand_is_adopted() {
             "  baseline: the recorded edit {}\n  1 file(s) resolved by hand:\n    CHANGELOG.md\n",
             advanced.short()
         )),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "  1 file(s) changed beyond the baseline's conflicts, because: put client-count's \
+             heading back\n    RELEASE_NOTES.md\n"
+        ),
         "{out}"
     );
     for member in [SPLIT, SAMI11, CLIENT] {
@@ -1454,6 +1530,44 @@ fn a_plain_file_the_baseline_left_clean_losing_one_member_line_exits_with_findin
         "{out}"
     );
     assert!(out.contains("as the newest write of"), "{out}");
+}
+
+#[test]
+fn an_adopt_counts_the_lost_lines_of_a_member_the_trunk_merged() {
+    // Given (K14 32): X and Z each write `f` their own way, and their cut
+    // leaves `f` conflicted; `f` is resolved by hand to Z's line, which drops
+    // X's; then upstream merges X's pull request by a merge commit, so the
+    // trunk contains X.
+    let lab = Lab::new();
+    lab.branch("feat/x", "f", "x\n");
+    lab.branch("feat/z", "f", "z\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert!(
+        stdout(&cut).contains(&format!("cut {RELEASE} as")),
+        "{}",
+        text(&cut)
+    );
+    finish_in_place(&lab, &[("f", "z\n")]);
+    lab.publish_pull("feat/x", 1);
+    lab.merge_pull_with_merge_commit(1);
+
+    // When: the release is adopted.
+    let output = adopt(&lab, &home, &[]);
+
+    // Then: X's change is read from its fork point with the merge's first
+    // parent, so its line is counted absent and flagged, with the findings
+    // exit.
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "  !! feat/x: 1 of 1 added line(s) of f absent from the resolution: every line it \
+             added is gone\n"
+        ),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
 }
 
 /// Alpha and beta each creating `shared.txt` with three lines of their own,

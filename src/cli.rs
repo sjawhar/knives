@@ -254,7 +254,9 @@ pub enum Command {
         /// One line per finding rather than one line per kind.
         #[arg(long)]
         verbose: bool,
-        /// Skip the landed probe, which replays every branch onto the trunk.
+        /// Skip the landed probe, which replays every branch onto the trunk. A
+        /// required member branch not shown to have landed then stays an unmet
+        /// dependency: a merge alone does not show it.
         #[arg(long)]
         no_landed: bool,
         /// Skip pull request lookups. Branch pull request state reads as unknown.
@@ -277,10 +279,14 @@ pub enum Command {
         #[arg(long)]
         timeline: bool,
     },
-    /// Take a branch and open a workspace on the fetched upstream trunk.
+    /// Take a branch and open your own workspace for it.
     ///
     /// Claiming a branch and opening a workspace for it were two commands for no
     /// reason: starting work on a branch is one act. `finish` is its inverse.
+    ///
+    /// The start of a release name takes the release claim, the write lease
+    /// for the release's refs. Its new workspace rests on a new empty commit
+    /// off the root commit, not on a release commit, and its line says so.
     ///
     /// A `--why` from the claim's own holder replaces the reason on the claim,
     /// from inside the workspace or outside it. The claim keeps the time and the
@@ -340,6 +346,14 @@ pub enum Command {
     /// back is the one on that ledger's remote, read before `finish` decides. When
     /// it cannot read that claim or push its release, it leaves the state file and
     /// the workspace as they were, and exits 3.
+    ///
+    /// The finish of a release name releases the release claim. Once jj holds
+    /// no workspace of the claim (it forgot it, or there was none), `finish`
+    /// abandons the earlier commits of the release that nothing holds, in one
+    /// jj operation. It names each earlier commit that something other than
+    /// the release holds, with what holds it. While the release holds
+    /// conflicts, it abandons none and says so. The sweep does not change the
+    /// exit.
     Finish {
         branch: String,
         /// Registry name. Defaults to the repo you are standing in.
@@ -365,13 +379,17 @@ pub enum Command {
     /// State which pull request a branch belongs to, overriding inference.
     ///
     /// Inference finds an open pull request from our own copy of the repository, which
-    /// is a sensible default and a bad rule. This accepts any number in any state from
-    /// any author: one opened before this tool existed, one the maintainer closed
-    /// because they wanted a different approach, or somebody else's that we are
-    /// carrying because ours was superseded.
+    /// is a sensible default and a bad rule. This accepts any upstream pull request in
+    /// any state from any author: one opened before this tool existed, one the
+    /// maintainer closed because they wanted a different approach, or somebody else's
+    /// that we are carrying because ours was superseded. The number is asked of the
+    /// forge, because the fork's own repository numbers its review pull requests
+    /// apart: refused when the fork's pull request of that number has this branch
+    /// as its head and the upstream's does not, when only the fork has the number,
+    /// and when neither has it.
     Track {
         branch: String,
-        /// The pull request number.
+        /// The upstream pull request's number.
         #[arg(long = "pr")]
         pr: Option<u64>,
         /// This branch deliberately has no upstream pull request. Recorded so it does
@@ -385,16 +403,76 @@ pub enum Command {
         #[arg(long)]
         repo: Option<String>,
     },
-    /// Record that a branch cannot land before something else does.
+    /// Record that a branch cannot land before something else does, or take a
+    /// requirement back.
     ///
     /// Dependencies cross forks: a branch here can require a pull request in another
     /// managed repo. Dropping the thing it needs from a release, without dropping
     /// this too, ships something that cannot work.
+    ///
+    /// A requirement is a pull request or a member branch, and the record says
+    /// which: `<upstream>#<n>` is a pull request on the fork's upstream,
+    /// `origin:<owner>/<name>#<n>` a review pull request on the fork's own
+    /// repository, `origin:<owner>/<name>:<branch>` a member branch of this fork.
+    ///
+    /// `--forget` takes a requirement back; with `--on` it corrects one. The
+    /// removal is a ledger entry, so every machine running this knives that
+    /// shares the ledger reads the same list. A knives from before fork
+    /// requirements cannot read a list holding a member branch, and reads a
+    /// forget whose list holds one as requiring nothing.
     Depends {
         branch: String,
-        /// What it needs, as `<repo>#<number>`, repeatable.
-        #[arg(long = "on", required = true)]
+        /// What it needs, repeatable. `<repo>#<number>`, `<repo>` the registry
+        /// name: another fork's key is first asked about as below, and names
+        /// this fork's own repository when its upstream is that. Otherwise,
+        /// when that fork's upstream and own repository are both forge
+        /// repositories, knives asks the forge which has that pull request, and
+        /// refuses when both or neither do (when the forge names that fork's
+        /// own repository as its upstream, the upstream's, with no lookup of
+        /// the number); when either is no forge repository, there is no such
+        /// lookup, and it is the upstream's. `<owner>/<name>#<number>`: the
+        /// upstream's pull request, or the fork's when `<owner>/<name>` is its
+        /// own repository. Another fork's upstream, by either spelling, may be
+        /// this fork's repository under another name, so the forge is asked,
+        /// and nothing is recorded (exit 3) when it cannot say. The question is
+        /// skipped when this fork's own repository names no forge repository
+        /// (neither its checkout's nor its registry's `origin` is a forge URL).
+        /// Another fork whose upstream is a path is named by its registry key
+        /// exactly, with no forge call, and its key in another letter case is
+        /// refused (exit 2); this fork's own path upstream is taken in any
+        /// letter case. With the forge down, a pull request is recorded only
+        /// when naming it needs no forge question: this fork's upstream's, by
+        /// `<owner>/<name>`, unless this fork's checkout or registry `origin`
+        /// spells that upstream; another fork's upstream's, by `<owner>/<name>`,
+        /// when this fork's own repository names no forge repository; and, by a
+        /// registry key, one of a fork whose upstream or own repository names no
+        /// forge repository, when that fork is this one, its upstream is a
+        /// path, or this fork's own repository names no forge repository. An
+        /// `origin` that spells this fork's upstream is a configuration error.
+        /// With the forge up, when only the registry's `origin` spells it,
+        /// that upstream's `<owner>/<name>` is refused (exit 2: not this fork's
+        /// own repository), while this fork's key is read as usual against the
+        /// checkout's repository, and a number both have is refused without
+        /// offering the upstream spelling; when this fork's own repository
+        /// spells it, this fork's key takes the upstream's number with no
+        /// lookup. A review pull request on another fork's repository is
+        /// refused, and so is one whose head is not a member branch of the
+        /// fork's owner. A branch name: a member branch of this fork.
+        #[arg(long = "on", required_unless_present = "forget")]
         on: Vec<String>,
+        /// A requirement to take back, repeatable: as its record spells it, or
+        /// as `--on` would. Every record of it is taken back, whatever spelling
+        /// of the fork's repository each carries; a record on another fork's
+        /// repository is never one of this fork's. The texts are weighed
+        /// together: when the forge cannot say whether a record is named (it
+        /// is down, or cannot see a repository), and counting it would take
+        /// back more, or tell two requirements from one, nothing is taken
+        /// back (exit 3), and the refusal prints a command no forge answer
+        /// changes: one that names every record of that number or member on a
+        /// repository that is not another fork's, or, when the text may name
+        /// two requirements, one such command for each.
+        #[arg(long)]
+        forget: Vec<String>,
         /// Registry name. Defaults to the repo you are standing in.
         #[arg(long)]
         repo: Option<String>,
@@ -441,6 +519,8 @@ pub enum Command {
         repo: Option<String>,
     },
     /// Plan, curate and cut releases.
+    ///
+    /// A release is a flat octopus merge of member branches.
     ///
     /// With no subcommand, plans: what a cut would contain, whether every parent is
     /// still its branch tip, and who pins the current release.
@@ -574,13 +654,8 @@ pub enum ReleaseAction {
     /// the last resort there: it also waives the checks of each recorded
     /// member, of the newest recorded write and of each other fix by hand. A
     /// repository that does not hold the newest write is refused and told to
-    /// fetch it.
-    /// In a stacked series that write, a successor of it or a copy with its
-    /// tree must be on its first-parent line. The ledger event records its
-    /// members: in a stacked series the side parents on its first-parent
-    /// line, with its previous release labelled as no member. No reap runs,
-    /// and the release is not signed or pushed; its ledger event is pushed
-    /// as a cut's is.
+    /// fetch it. No reap runs, and the release is not signed or pushed; its
+    /// ledger event is pushed as a cut's is.
     Cut {
         /// The dated release name, `release/[<series>/]YYYY-MM-DD[.N|-<label>]`.
         /// It must sort after the newest release of the series. Omit it for a
@@ -592,10 +667,9 @@ pub enum ReleaseAction {
         /// newest release the ledger records in the series holds, a file of
         /// a fix by hand that an `adopt` of any release of the series
         /// recorded and the file's reference still holds, a fix by hand
-        /// whose files this repository cannot read whole, the newest write
-        /// itself where this repository does not hold it, or in a stacked
-        /// series that write, off the line the cut starts on. The refusal
-        /// lists exactly what, each file of a fix by name.
+        /// whose files this repository cannot read whole, or the newest write
+        /// itself where this repository does not hold it. The refusal lists
+        /// exactly what, each file of a fix by name.
         #[arg(long)]
         allow_drop: bool,
         /// Record a release cut outside knives: the commit becomes NAME's
@@ -607,24 +681,38 @@ pub enum ReleaseAction {
     },
     /// Rebase the composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
     ///
-    /// Every member branch's commits move onto the target and the release
-    /// merge moves with them, member bookmarks and workspaces following;
-    /// recorded conflict resolutions replay as ordinary rebase semantics. A
-    /// published release in hand (a tag, or a `record: published` note, names
-    /// its commit) is refused: cut a new dated release first. Every other
-    /// release name that is pushed or published stays on its commit, and one
-    /// never pushed follows its rewrite. Pushed or published earlier releases
-    /// keep their names and commit ids, and every tag stays; the copies the
-    /// rebase makes of them are abandoned, except one something rests on,
-    /// which is kept and
-    /// named. A stale rule an earlier `knives start` wrote refuses first,
-    /// naming `start` as the refresh. The base is never a release parent —
-    /// this is how the members
-    /// change theirs. Bare, it targets the first upstream trunk commit that
-    /// contains every merged pull request, then drops the members whose landed
-    /// branches carry nothing more; with nothing merged there is no default,
-    /// and which commit to move onto is a decision — a cut does not make it
-    /// for you.
+    /// Each member branch's commits that the target's history does not hold
+    /// move onto the target, and the release merge moves with them, member
+    /// bookmarks and workspaces following; recorded conflict resolutions
+    /// replay as ordinary rebase semantics. A member that the target's
+    /// history holds does not move. A published release in hand (a tag, or a
+    /// `record: published` note, names its commit) is refused: cut a new
+    /// dated release first. Every other release name that is pushed or
+    /// published stays on its commit, and one never pushed follows its
+    /// rewrite. Pushed or published earlier releases keep their names and
+    /// commit ids, and every tag stays; the copies the rebase makes of them
+    /// are abandoned, except one something rests on, which is kept and named.
+    /// A stale rule an earlier `knives start` wrote refuses first, naming
+    /// `start` as the refresh. The base is never a release parent — this is
+    /// how the members change theirs. Bare, it targets the first upstream
+    /// trunk commit that contains every merged pull request, then drops the
+    /// members whose landed branches carry nothing more. A flat release has
+    /// no base parent, so the target reaches it only through a parent on the
+    /// target: a member, or a carrier (an earlier write of the release). The
+    /// drop does not keep the carriers, so a carrier on the target does not
+    /// count. Where no member that stays is on the target, the drop keeps the
+    /// landed members that are, and says why. Where none is, it drops nothing
+    /// and exits 3. With nothing merged there is no default, and which commit
+    /// to move onto is a decision — a cut does not make it for you.
+    ///
+    /// When the move leaves the rebased tip of a member conflicted, the
+    /// report names that member, by its branch or by its short commit id,
+    /// with its conflicted files, and the command exits 1. The member stays
+    /// in the release: resolve it on its branch. The report says "no
+    /// conflicts in this release" only when neither the release nor a moved
+    /// member holds a conflict. A conflicted release with no conflicted
+    /// member still exits 0. A landed drop that refuses exits 3, also when a
+    /// moved member is conflicted.
     Rebase {
         /// The rebase target. Bare, the first upstream trunk commit containing
         /// every merged pull request; required when nothing has merged.
@@ -638,18 +726,34 @@ pub enum ReleaseAction {
     /// Nothing else changes: every other parent stays at the commit the release
     /// already has. A member whose branch has advanced is not moved — that is a
     /// content change beyond including it, and `advance` is how it is asked for.
+    /// Like `drop` and `advance`, the write is checked before it is made. An
+    /// edit that would lose a line of a remaining member, away from any
+    /// conflict that it leaves, writes nothing, names each such line with
+    /// its path and member, and exits 3. A line at a conflict that the edit
+    /// leaves is not counted. The edit's conflict report names the file of
+    /// that conflict.
     Include {
         /// A branch name, or any revision when no bookmark fits.
         branch: String,
         /// Why it belongs. Recorded on the release itself.
         #[arg(long)]
         why: Option<String>,
+        /// Write the edit even though it loses the named lines of a
+        /// remaining member. The edit names the lost lines. Its ledger event
+        /// records the loss as `; lost: <path> (<member>: <n> line(s))` for
+        /// each path and member, then `; why lost: <reason>`. Put the lines
+        /// back by hand, then record that with `knives release adopt <name>
+        /// --why <reason>`. The reason must not be empty or only whitespace.
+        /// Where the edit loses no line, the flag changes nothing.
+        #[arg(long, value_name = "REASON", value_parser = reason_text)]
+        allow_loss: Option<String>,
     },
     /// Remove a branch's parent from the release in hand.
     ///
     /// The branch and its bookmark are untouched — only the release changes. When
     /// the branch has advanced past its released parent, ancestry finds the
-    /// parent; a commit id works when no bookmark does.
+    /// parent; a commit id works when no bookmark does. The write is checked
+    /// as `include`'s is.
     Drop {
         /// A branch name, or the parent's commit id when no bookmark fits.
         branch: String,
@@ -659,6 +763,10 @@ pub enum ReleaseAction {
         /// whitespace-only value is refused.
         #[arg(long, value_parser = reason_text)]
         why: String,
+        /// Write the drop even though it loses the named lines of a
+        /// remaining member, as `include --allow-loss` does.
+        #[arg(long, value_name = "REASON", value_parser = reason_text)]
+        allow_loss: Option<String>,
     },
     /// Advance member parents to their branches' current tips.
     ///
@@ -670,7 +778,8 @@ pub enum ReleaseAction {
     /// duplicate` rebuild breaks: the rebuilt tip shares no history with the
     /// commit it replaces. `--from` names that old commit directly, for exactly
     /// one branch, so the caller asserts the mapping instead of losing the
-    /// release's recorded conflict resolution to a `drop` + `include`.
+    /// release's recorded conflict resolution to a `drop` + `include`. The
+    /// write is checked as `include`'s is.
     Advance {
         /// Branches to advance. Empty means every member that has advanced.
         branches: Vec<String>,
@@ -678,6 +787,10 @@ pub enum ReleaseAction {
         /// Requires exactly one branch; bypasses the ancestry search.
         #[arg(long)]
         from: Option<String>,
+        /// Write the advance even though it loses the named lines of a
+        /// remaining member, as `include --allow-loss` does.
+        #[arg(long, value_name = "REASON", value_parser = reason_text)]
+        allow_loss: Option<String>,
     },
     /// Record the commit a release name holds now as its newest knives write.
     ///
@@ -685,20 +798,32 @@ pub enum ReleaseAction {
     /// renumbered, a repair made on the release commit itself. Until it is
     /// recorded, audit reads that commit as drift from the write knives
     /// recorded, and `cut`, `include`, `drop`, `advance` and `rebase` refuse
-    /// to write over a hand change it carries. The commit must have no
-    /// conflicts, and the parents of the write it replaces, plus any earlier
-    /// write of the same name a fast-forward push added. It is measured
-    /// against that write rebuilt on the commit's member parents (the write
-    /// itself when the commit is an older recorded write), or, where this
-    /// repository lacks that write or the write's own record is marked
-    /// unchecked, against a fresh merge of its member parents with the
-    /// release-log union: the files it resolved are reported, with the lines
-    /// each member added that it no longer holds, and a file changed outside
-    /// the conflicts needs `--why`. Writes no commit and moves no bookmark:
-    /// the record is a ledger event, and earlier writes of the name that
-    /// nothing rests on are abandoned. A name the ledger records no cut of,
-    /// a release cut outside knives, is recorded first with `knives release
-    /// cut NAME --at <commit>`.
+    /// to write over a hand change it carries. The commit must have the
+    /// parents of the write it replaces, plus any earlier write of the same
+    /// name a fast-forward push added. A commit finished by hand must also
+    /// have no conflicts. It is measured against that write rebuilt on the
+    /// commit's member parents (the write itself when the commit is an older
+    /// recorded write), or, where this repository lacks that write or the
+    /// write's own record is marked unchecked, against a fresh merge of its
+    /// member parents with the release-log union: the files it resolved are
+    /// reported, with the lines each member added that it no longer holds,
+    /// and a file changed outside the conflicts needs `--why`. Writes no
+    /// commit and moves no bookmark: the record is a ledger event, and
+    /// earlier writes of the name that nothing rests on are abandoned. A name
+    /// the ledger records no cut of, a release cut outside knives, is
+    /// recorded first with `knives release cut NAME --at <commit>`.
+    ///
+    /// A knives write that `jj describe`, `jj sign`, `jj metaedit` or a push
+    /// that signs rewrote has a new commit id, with the same change, parents
+    /// and tree. Run `adopt` on the machine that rewrote it, while the write
+    /// is unpublished, so that another machine can read the release. It
+    /// records the new commit in one event that holds no fix by hand. A
+    /// conflict that the write left does not refuse it. The write is
+    /// published when the publish remote holds its old commit, a tag is on
+    /// that commit, or a `record: published` note names that commit. A copy
+    /// of a published write is nothing to adopt. Where the write's record is
+    /// marked unchecked, `adopt` measures the new commit as it measures any
+    /// release that knives could not check.
     Adopt {
         /// The release name. Defaults to the release in hand.
         reference: Option<String>,
@@ -711,18 +836,32 @@ pub enum ReleaseAction {
     /// The release's parents, or whether a revision's content is carried.
     ///
     /// Bare: count, commits, and who still holds each parent — the repository's
-    /// own parent list, never `^parent` lines in prose. `--verify` replays every
-    /// member against the release and reports what it lacks. `--carries REV` asks
-    /// the other direction: is REV's net content carried — by REF when one is
-    /// given, otherwise by every live release and the upstream trunk before any
+    /// own parent list, never `^parent` lines in prose. `--verify` reads each
+    /// member's own lines in the release and names each line the release
+    /// lacks, with its path. A member's own lines are the lines that its
+    /// change adds and removes, from its fork point with the upstream trunk
+    /// to its tip. A revision that the upstream trunk contains is read from
+    /// where the trunk took it in. Where a merge commit took it in, that is
+    /// its fork point with the first parent of that merge. Where it is on
+    /// the trunk's first-parent line, that is the newest commit of that line
+    /// below it that the release holds. A release that reaches the revision
+    /// carries it. A member reads inconclusive only where the release, or the
+    /// member's tip, holds an unresolved conflict in one of its paths and the
+    /// release lacks nothing else of it. `--carries REV` asks the other
+    /// direction: is REV's content carried — by REF when one is given,
+    /// otherwise by every live release and the upstream trunk before any
     /// superseded cut (the rigorous "is this safe to delete"; grep answers a
-    /// different question). `--census` asks that of every maintained branch at once.
+    /// different question). Against a release it reads REV's own lines in
+    /// the same way, and it reads `conflicted` only for such a conflict.
+    /// Against the upstream trunk, ancestry and a replay of REV decide.
+    /// `--census` asks that of every maintained branch at once.
     Members {
         /// The release ref to inspect. Defaults to the release in hand. With
         /// `--carries`, the one target to check instead of every target.
         reference: Option<String>,
-        /// Replay each member's content against the release (heavier: one
-        /// replay per member) and report drop-guard anchors.
+        /// Read each member's own lines in the release, from the member's fork
+        /// point with the upstream trunk. Name each line the release lacks and
+        /// each line it holds only by its words.
         #[arg(long, conflicts_with = "carries")]
         verify: bool,
         /// A branch name, or any revision when no bookmark fits.
@@ -750,11 +889,8 @@ pub enum ReleaseAction {
     /// knives remote, and upstream's tags, which `knives start` writes) those refs pin nothing
     /// for `jj rebase`, so reaping is tidiness, never an unlock.
     ///
-    /// In a stacked series, a superseded name the live release descends from loses only its
-    /// refs, even while the live cut still carries conflicts: its commit stays, exit 0.
-    ///
-    /// Otherwise, keeps every superseded cut while the live one still carries conflicts: the
-    /// previous cut is the only record of how they were last resolved.
+    /// Keeps every superseded cut while the live one still carries conflicts: the previous
+    /// cut is the only record of how they were last resolved.
     ///
     /// Keeps a superseded cut, refs and all, while something rests on it: a workspace's
     /// working copy on it or above it, empty or not, or any other descendant, on the cut, on
@@ -762,6 +898,10 @@ pub enum ReleaseAction {
     /// what rests on it; the next reap after that moves on retires it. A cut a tag, an
     /// untracked remote bookmark or a local bookmark of another name (`keep/…`) still names
     /// has its refs forgotten and its commit kept, exit 0. `--json` prints one document.
+    ///
+    /// Keeps a superseded name that a live release claim holds (`knives start <name>`),
+    /// exit 1. Its line names the holder and `knives finish <name>`, which releases the
+    /// claim. When it cannot read the claims, it keeps every superseded name and says so.
     Reap,
 }
 
@@ -885,6 +1025,10 @@ mod tests {
             vec!["knives", "release", "members", "r", "--carries", "x"],
             vec!["knives", "release", "members", "--census"],
             vec!["knives", "depends", "a-branch", "--on", "other#1"],
+            vec!["knives", "depends", "a-branch", "--forget", "other#1"],
+            vec![
+                "knives", "depends", "a-branch", "--forget", "other#1", "--on", "o/r#1",
+            ],
             vec!["knives", "track", "a-branch", "--pr", "7"],
             vec!["knives", "notch"],
             vec!["knives", "notch", "feat/alpha"],

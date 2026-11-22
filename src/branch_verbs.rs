@@ -1,10 +1,10 @@
-//! The branch verbs after `start`: `finish`, `track` and `depends`.
+//! The branch verbs after `start`: `finish` and `track`.
 //!
 //! `finish` hands a claimed branch back and removes its workspace; `track`
-//! states which pull request a branch belongs to, overriding inference;
-//! `depends` records that a branch cannot land before something else does.
+//! states which pull request a branch belongs to, overriding inference.
 //! Each records one ledger event, and a statement rides on that event;
-//! `finish` also writes the released claim to the state file.
+//! `finish` also writes the released claim to the state file. `depends`, the
+//! third statement verb, is [`crate::depends`].
 //!
 //! On a fork that shares its ledger, the ledger's claim ref says who holds
 //! the branch, on every machine that shares it. `finish` reads it under the
@@ -26,9 +26,9 @@ use knives::commands::claim::{
 };
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
 use knives::config::Registry;
-use knives::ids::{BranchName, BranchTarget, CommitId, Requirement, UpstreamName};
+use knives::ids::{BranchName, BranchTarget, CommitId, RepoName, UpstreamName, is_release_name};
 use knives::jj::{
-    Repo, StaleRegistration, WorkspaceIdentity, path_occupant, remove_finished_worktree,
+    JjError, Repo, StaleRegistration, WorkspaceIdentity, path_occupant, remove_finished_worktree,
 };
 use knives::ledger::{
     ClaimChange, Displaced, Draft, Entry, LedgerError, Scribe, Stated, default_ledger_root,
@@ -40,6 +40,7 @@ use knives::seen::LastSeen;
 use knives::statement::{Statement, StatementKind};
 use knives::store::{Claim, Store, default_state_path};
 
+use super::release_edit::{release_writes, report_abandoned_earlier, report_hidden};
 use super::scribe_for;
 
 /// What a `finish` did, or nothing when it did nothing.
@@ -280,8 +281,8 @@ pub(crate) fn run_finish(
         );
         return Ok(Exit::Incomplete);
     }
-    let disposal = if let Some(displaced) = released.displaced.as_ref() {
-        left_to_its_owner(&place, &displaced.owner)
+    let (disposal, unregistered) = if let Some(displaced) = released.displaced.as_ref() {
+        (left_to_its_owner(&place, &displaced.owner), false)
     } else {
         ordinary_disposal(
             &place,
@@ -291,7 +292,153 @@ pub(crate) fn run_finish(
         )?
     };
     println!("{}/{branch}: claim {claim}; {disposal}", fork.name);
+    // With no workspace of a release claim left in jj, nothing of it holds a
+    // release commit any more: sweep as the next release write would.
+    if unregistered && is_release_name(branch, &fork.entry.release_scheme()) {
+        sweep_earlier_writes(fork, branch.as_str());
+    }
     Ok(if lost { Exit::Findings } else { Exit::Ok })
+}
+
+/// Sweep the earlier writes of release `name` once `finish` has left jj no
+/// workspace of the release claim, as `knives release adopt` sweeps them
+/// after it records a write. A sweep that fails says so on stderr, and
+/// changes no exit.
+///
+/// jj abandons a forgotten workspace's working copy where it is empty and
+/// undescribed, so a release commit a write replaced and kept for that
+/// working copy is now a head nothing rests on, which `audit` reports as an
+/// orphan commit. A working copy with changes stays and holds what it rests
+/// on, as every other workspace's does; each earlier write something keeps
+/// is named with what keeps it ([`kept_lines`]). While the release in hand
+/// holds conflicts, its earlier writes are the record of their last
+/// resolution, so nothing is swept, as a write sweeps nothing then.
+///
+/// The release name is the caller's argument and the reasons name
+/// bookmarks, tags and jj workspaces, so each line goes out escaped
+/// ([`inline_human_text`]).
+fn sweep_earlier_writes(fork: &Fork<'_>, name: &str) {
+    if let Err(error) = sweep(fork, name) {
+        eprintln!(
+            "{}: could not sweep the earlier {} commits: {}",
+            fork.name,
+            inline_human_text(name),
+            problem_human_text(&format!("{error:#}"))
+        );
+    }
+}
+
+/// What [`sweep_earlier_writes`] reads, abandons in one jj operation, and
+/// says. Once the abandon is done and said, a failure to name what keeps
+/// the rest has its own line on stderr ([`naming_failure`]).
+fn sweep(fork: &Fork<'_>, name: &str) -> anyhow::Result<()> {
+    let (repo, checkout) = (&fork.name, &fork.checkout.path);
+    let opened = Repo::open(checkout)?;
+    let writes = release_writes(fork, &opened, name)?;
+    let release = opened
+        .local_bookmark_tip(name)
+        .ok_or_else(|| anyhow::anyhow!("{name} has no local bookmark"))?;
+    if !opened.conflicted_files(release.as_str())?.is_empty() {
+        println!(
+            "{repo}: swept no earlier {} commit: the release holds conflicts, and its earlier \
+             writes are the record of their last resolution",
+            inline_human_text(name)
+        );
+        return Ok(());
+    }
+    let swept = knives::jj::abandon_unheld_writes(
+        checkout,
+        writes.commits(),
+        Some(&release),
+        &format!("knives: {name}: finish abandons earlier writes nothing rests on"),
+    )?;
+    report_abandoned_earlier(repo, name, &swept.abandoned);
+    report_hidden(repo, name, &swept.hidden);
+    match kept_after_sweep(
+        (repo, checkout, name),
+        opened,
+        (writes.commits(), &release),
+        &swept.abandoned,
+    ) {
+        Ok(kept) => {
+            for line in kept {
+                println!("{line}");
+            }
+        }
+        Err(error) => eprintln!("{}", naming_failure(repo, name, &error)),
+    }
+    Ok(())
+}
+
+/// The `note: kept` lines of the earlier writes `writes` of release `name`
+/// that the abandon left and something keeps ([`kept_lines`]), read once
+/// the abandon of `abandoned` is done. `opened` is the repository as
+/// [`sweep`] read it before the abandon.
+fn kept_after_sweep(
+    (repo, checkout, name): (&RepoName, &Path, &str),
+    opened: Repo,
+    (writes, release): (&[CommitId], &CommitId),
+    abandoned: &[CommitId],
+) -> anyhow::Result<Vec<String>> {
+    // An abandon that abandoned nothing committed no operation, so the
+    // repository is still as `opened` read it.
+    let reopened = if abandoned.is_empty() {
+        opened
+    } else {
+        Repo::open(checkout)?
+    };
+    let mut left = Vec::new();
+    for write in writes {
+        let in_release = write == release || reopened.is_ancestor(write, release)?;
+        if in_release || reopened.is_visible(write)? {
+            left.push((write.clone(), in_release));
+        }
+    }
+    Ok(kept_lines(repo, name, &left, |write| {
+        reopened.what_keeps_earlier_write(write)
+    })?)
+}
+
+/// The line on stderr where the sweep of release `name` abandoned what
+/// nothing holds, and then could not name what keeps the rest of its
+/// earlier writes: `error`. The release name is the caller's argument and
+/// the error can quote jj, so each goes out escaped.
+fn naming_failure(repo: &RepoName, name: &str, error: &anyhow::Error) -> String {
+    format!(
+        "{repo}: abandoned what nothing holds; could not name what keeps the rest of the \
+         earlier {} commits: {}",
+        inline_human_text(name),
+        problem_human_text(&format!("{error:#}"))
+    )
+}
+
+/// The `note: kept` line of each earlier write of `release` in `writes`
+/// that something keeps, with what keeps it (`keeps`,
+/// [`Repo::what_keeps_earlier_write`]). `writes` pairs each visible earlier
+/// write with whether the release descends from it: the release's own
+/// commit, a carrier, or a commit behind one. The release holds each of
+/// those itself, so none is named, and `keeps` is never asked about one.
+fn kept_lines(
+    repo: &RepoName,
+    release: &str,
+    writes: &[(CommitId, bool)],
+    mut keeps: impl FnMut(&CommitId) -> Result<Option<String>, JjError>,
+) -> Result<Vec<String>, JjError> {
+    let shown = inline_human_text(release);
+    let mut lines = Vec::new();
+    for (write, in_release) in writes {
+        if *in_release {
+            continue;
+        }
+        if let Some(reason) = keeps(write)? {
+            lines.push(format!(
+                "{repo}: note: kept {}, an earlier {shown} commit: {}",
+                write.short(),
+                inline_human_text(&reason)
+            ));
+        }
+    }
+    Ok(lines)
 }
 
 /// Where a `finish` of `target` releases its claim on the ledger, when its
@@ -543,19 +690,24 @@ fn copy_superseded(branch: &BranchName, holder: &str) -> String {
 }
 
 /// Forgets this branch's workspace and removes its directory, and says what
-/// became of each.
+/// became of each; and whether jj now holds no workspace of the name: it
+/// forgot it, or never had it.
 fn ordinary_disposal(
     place: &Place<'_>,
     identity: Option<&WorkspaceIdentity>,
     present: bool,
     cleanup: bool,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, bool)> {
     let registration =
         release_registration(place.checkout, place.workspace, place.directory, present);
     let removal = removal_note(place, identity, &registration, cleanup)?;
-    Ok(format!(
-        "workspace {} {registration}; {removal}",
-        place.workspace
+    let unregistered = matches!(
+        registration,
+        Registration::Forgotten | Registration::NotRegistered
+    );
+    Ok((
+        format!("workspace {} {registration}; {removal}", place.workspace),
+        unregistered,
     ))
 }
 
@@ -1474,14 +1626,16 @@ fn place_gate(
 /// A forget erases the statement before it, and the newest statement wins on
 /// every machine, so built from a ledger missing another machine's newer
 /// statement it would erase that statement everywhere, as a release write
-/// would check its drop guard against the wrong cut. A `depends` statement
-/// erases nothing, since the live list is every requirement stated since the
-/// last forget, but it records that the branch must wait from what this
-/// machine last pulled, and says "now requires …" from it: from a ledger it
-/// knows is stale, that would tell the caller a list other machines may
-/// already have changed. So each refuses, like a release write, rather than
-/// write from what this machine happens to have.
-fn pulled_before_replacing(fork: &Fork<'_>, bound: Bound<'_>, what: &str) -> bool {
+/// would check its drop guard against the wrong cut; a `depends --forget`
+/// restates the list it leaves, which would drop another machine's newer
+/// requirement. A `depends` that only adds erases nothing, since the live list
+/// is every requirement stated since the last forget, but it records that the
+/// branch must wait from what this machine last pulled, and says "now
+/// requires …" from it: from a ledger it knows is stale, that would tell the
+/// caller a list other machines may already have changed. So each refuses,
+/// like a release write, rather than write from what this machine happens to
+/// have.
+pub(crate) fn pulled_before_replacing(fork: &Fork<'_>, bound: Bound<'_>, what: &str) -> bool {
     let problems =
         knives::ledger_sweep::pull(bound.registry, &[&fork.upstream]).problems_for(&fork.upstream);
     for problem in &problems {
@@ -1500,7 +1654,10 @@ fn pulled_before_replacing(fork: &Fork<'_>, bound: Bound<'_>, what: &str) -> boo
 ///
 /// A forget pulls first ([`pulled_before_replacing`]) and writes a statement
 /// only when one is stated: a forget of nothing would erase, everywhere, a
-/// statement another machine made that this one has not seen.
+/// statement another machine made that this one has not seen. A stated
+/// number must be a pull request on the fork's upstream
+/// ([`crate::depends::upstream_pull`]), asked before the fork's lock is
+/// taken.
 #[allow(
     clippy::too_many_arguments,
     reason = "the fork, the branch, the three ways to state its pull request and the cwd binding are independent inputs"
@@ -1514,6 +1671,11 @@ pub(crate) fn run_track(
     bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
+    if let Some(number) = pr
+        && let Err(exit) = crate::depends::upstream_pull(fork, bound.registry, branch, number)
+    {
+        return Ok(exit);
+    }
     if forget && !pulled_before_replacing(fork, bound, "the forget") {
         return Ok(Exit::Incomplete);
     }
@@ -1595,102 +1757,15 @@ fn spoken(text: &str) -> String {
     }
 }
 
-/// Record what a branch cannot land before.
-///
-/// Requirements are validated against the registry, because a dependency on a repo
-/// knives does not manage is a typo, and a typo that records silently is worse than
-/// no dependency at all: it reads as satisfied forever.
-pub(crate) fn run_depends(
-    fork: &Fork<'_>,
-    branch: &BranchName,
-    on: &[String],
-    bound: Bound<'_>,
-) -> anyhow::Result<Exit> {
-    let registry = bound.registry;
-    let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
-    let mut requirements = Vec::new();
-    for text in on {
-        let Some(written) = Requirement::parse(text) else {
-            eprintln!("cannot read {text} as a requirement; write it as `<repo>#<number>`");
-            return Ok(Exit::Usage);
-        };
-        // Recorded under the required fork's repository name, whichever way it
-        // was typed, so the statement means the same fork on every machine.
-        let Some(upstream) = registry.resolve(written.repo.as_str()) else {
-            let known: Vec<String> = registry.names().map(|n| n.to_string()).collect();
-            eprintln!(
-                "unknown repo {} in {text}; known: {}",
-                written.repo,
-                known.join(", ")
-            );
-            return Ok(Exit::Usage);
-        };
-        requirements.push(Requirement {
-            repo: upstream,
-            number: written.number,
-        });
-    }
-    if !pulled_before_replacing(fork, bound, "the dependency") {
-        return Ok(Exit::Incomplete);
-    }
-    // The fork's lock is held while the list is read and the next statement
-    // appended, so two concurrent `depends` on this machine each add to the
-    // other's list rather than racing; the pull above brought in what other
-    // machines stated. Nothing here writes the state file.
-    let store = Store::open_for_update(
-        default_state_path(),
-        &registry.former_names(),
-        &[&fork.upstream],
-    )?;
-    let required = with_requirements(&store.dependencies(target), &requirements);
-    let pr = store.tracked_pull(target);
-    let listed: Vec<String> = requirements.iter().map(ToString::to_string).collect();
-    scribe_for(fork, bound)?.record(&Draft {
-        statement: Some(Stated {
-            statement: Statement {
-                kind: StatementKind::Depends,
-                value: Some(required.join(",")),
-            },
-            replaces: store.statement_stamp(target, StatementKind::Depends),
-        }),
-        ..Draft::event(
-            Some(branch.as_str()),
-            format!("requires {}", listed.join(", ")),
-            pr,
-        )
-    })?;
-    drop(store);
-    println!("{}/{branch} now requires {}", fork.name, listed.join(", "));
-    Ok(Exit::Ok)
-}
-
-/// Everything a branch requires once `added` joins what it already `required`.
-///
-/// Additive and deduplicated, so declaring the same requirement twice is not an
-/// error and re-running a script does not accumulate duplicates. The result is
-/// the whole list, so each entry reads on its own as everything the branch
-/// needed when it was written.
-fn with_requirements(required: &[Requirement], added: &[Requirement]) -> Vec<String> {
-    let mut texts: Vec<String> = required.iter().map(ToString::to_string).collect();
-    for requirement in added {
-        let text = requirement.to_string();
-        if !texts.contains(&text) {
-            texts.push(text);
-        }
-    }
-    texts.sort();
-    texts
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::{
-        Place, Registration, copy_superseded, finish_provenance, left_to_its_owner, no_claim_now,
-        removal_note, shared_holder, spoken, with_requirements,
+        Place, Registration, copy_superseded, finish_provenance, kept_lines, left_to_its_owner,
+        naming_failure, no_claim_now, removal_note, shared_holder, spoken,
     };
-    use knives::ids::{BranchName, Requirement};
+    use knives::ids::BranchName;
     use knives::jj::WorkspaceIdentity;
     use knives::store::{Claim, OwnerKind};
 
@@ -1713,18 +1788,6 @@ mod tests {
         ] {
             assert_eq!(spoken(event), expected);
         }
-    }
-
-    #[test]
-    fn requirements_join_what_was_already_required_without_duplicates() {
-        let parse = |text: &str| Requirement::parse(text).expect("a requirement");
-        assert_eq!(
-            with_requirements(
-                &[parse("sibling#49"), parse("other#7")],
-                &[parse("sibling#49"), parse("another#3")],
-            ),
-            ["another#3", "other#7", "sibling#49"]
-        );
     }
 
     /// The disposal line `finish` prints names the path jj recorded for the
@@ -1945,5 +2008,77 @@ mod tests {
              workspace and its registration stay as they are\n\
              use `knives start 'feat/a$b' --force --why \"…\"` to take the branch back"
         );
+    }
+
+    mod release_claim_finish {
+        use knives::ids::{CommitId, RepoName};
+
+        use super::{kept_lines, naming_failure};
+
+        #[test]
+        fn kept_lines_never_name_a_write_the_release_descends_from() {
+            // Given: four visible earlier writes of a release, each of which
+            // something keeps: the release's own commit, a carrier, an older
+            // carrier behind it, and a replaced commit that a working copy
+            // rests on
+            let commit = |digit: &str| CommitId::new(digit.repeat(40));
+            let (own, carrier, older) = (commit("a"), commit("b"), commit("c"));
+            let replaced = commit("d");
+            let writes = [
+                (own, true),
+                (carrier, true),
+                (older, true),
+                (replaced.clone(), false),
+            ];
+            let reason = "it has descendants, whose heads are eeeeeeeeeeee, the working copy of \
+                          default";
+            let mut asked = Vec::new();
+
+            // When: finish names the earlier writes something keeps
+            let lines = kept_lines(
+                &RepoName::new("demo"),
+                "release/2026-08-04",
+                &writes,
+                |write| {
+                    asked.push(write.clone());
+                    Ok(Some(reason.to_owned()))
+                },
+            )
+            .expect("name the kept writes");
+
+            // Then: only the replaced commit is named, with what keeps it,
+            // and what keeps the others is never read
+            assert_eq!(
+                lines,
+                [format!(
+                    "demo: note: kept {}, an earlier release/2026-08-04 commit: {reason}",
+                    replaced.short()
+                )]
+            );
+            assert_eq!(asked, [replaced]);
+        }
+
+        #[test]
+        fn a_failure_after_the_abandon_says_the_abandon_is_done_and_the_naming_failed() {
+            // Given: a sweep that abandoned what nothing holds, and then got
+            // jj's two-line error, which holds a control character, when it
+            // read what keeps the rest
+            let error = anyhow::anyhow!(
+                "Concurrent modification detected\nError: \u{1b}[31mno such commit"
+            );
+
+            // When: finish says so
+            let line = naming_failure(&RepoName::new("demo"), "release/2026-08-04", &error);
+
+            // Then: the line says that the abandon is done and that the naming
+            // failed, not that the sweep failed, with the error on one line
+            // and escaped
+            assert_eq!(
+                line,
+                "demo: abandoned what nothing holds; could not name what keeps the rest of the \
+                 earlier release/2026-08-04 commits: Concurrent modification detected; Error: \
+                 \u{fffd}[31mno such commit"
+            );
+        }
     }
 }

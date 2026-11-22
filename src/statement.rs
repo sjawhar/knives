@@ -32,10 +32,12 @@ pub enum StatementKind {
     ForkOnly,
     /// The branch was superseded: the branch that replaced it.
     Superseded,
-    /// What the branch cannot land before: every `<repo>#<number>` it needs,
-    /// comma-joined. The live list is every requirement each `depends`
-    /// statement since the newest `depends` forget names, so a statement adds
-    /// to it whatever order machines make them in.
+    /// What the branch cannot land before: every requirement it needs, each
+    /// as [`crate::ids::Requirement`] writes it, comma-joined. The live list
+    /// is every requirement each `depends` statement since the newest
+    /// `depends` forget names, so a statement adds to it whatever order
+    /// machines make them in; a requirement is taken back by a forget
+    /// followed by the list without it.
     Depends,
     /// A kind a newer knives writes and this one does not know. Ledgers are
     /// shared between machines that upgrade at different times, so an entry
@@ -99,6 +101,7 @@ impl Statement {
                 .any(|text| Requirement::parse(text).is_none())
                 .then_some(
                     "a `depends` statement holds every requirement as `<owner>/<name>#<number>`, \
+                     `origin:<owner>/<name>#<number>` or `origin:<owner>/<name>:<branch>`, \
                      comma-joined",
                 ),
             StatementKind::ForkOnly | StatementKind::Superseded | StatementKind::Unknown => None,
@@ -113,6 +116,9 @@ pub struct Statements {
     /// The live statement per subject and kind; a `None` value is a live
     /// forget.
     live: BTreeMap<String, BTreeMap<StatementKind, Live>>,
+    /// Per branch, the newest commit any entry records for it
+    /// ([`Self::recorded_head`]).
+    recorded_heads: BTreeMap<String, String>,
 }
 
 /// One live statement: its value, and the stamp a statement replacing it is
@@ -129,6 +135,24 @@ struct Live {
 /// then its place in the slice, so between equal stamps the later one is
 /// newer.
 type Place = (Option<jiff::Timestamp>, usize);
+
+/// The newest commit any entry records for one branch, by where that entry
+/// falls.
+type Recorded<'e> = (Place, &'e str);
+
+/// Keep `commit` as `branch`'s recorded head when it is recorded at or after
+/// the one held.
+fn record_head<'e>(
+    recorded: &mut BTreeMap<&'e str, Recorded<'e>>,
+    branch: &'e str,
+    commit: &'e str,
+    place: Place,
+) {
+    let held = recorded.entry(branch).or_insert((place, commit));
+    if place >= held.0 {
+        *held = (place, commit);
+    }
+}
 
 impl Statements {
     /// Fold `entries` into the statements live now.
@@ -148,6 +172,18 @@ impl Statements {
             BTreeMap::new();
         let mut forgotten: BTreeMap<&str, Place> = BTreeMap::new();
         let mut required: BTreeMap<&str, Vec<(Place, &str)>> = BTreeMap::new();
+        let mut recorded: BTreeMap<&str, Recorded<'_>> = BTreeMap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            let place = (entry.ts.parse::<jiff::Timestamp>().ok(), index);
+            if let (Some(subject), Some(anchor)) = (entry.subject.as_deref(), &entry.anchor) {
+                record_head(&mut recorded, subject, anchor, place);
+            }
+            for parent in &entry.parents {
+                for branch in &parent.branches {
+                    record_head(&mut recorded, branch, &parent.commit, place);
+                }
+            }
+        }
         for (index, entry) in entries.iter().enumerate() {
             let (Some(subject), Some(statement)) = (entry.subject.as_deref(), &entry.statement)
             else {
@@ -212,7 +248,13 @@ impl Statements {
                 .or_default()
                 .insert(StatementKind::Depends, stated);
         }
-        Self { live }
+        Self {
+            live,
+            recorded_heads: recorded
+                .into_iter()
+                .map(|(branch, (_, commit))| (branch.to_owned(), commit.to_owned()))
+                .collect(),
+        }
     }
 
     /// The pull request stated for `branch`. Every value read from an entry
@@ -231,13 +273,36 @@ impl Statements {
         self.value(branch, StatementKind::Superseded)
     }
 
-    /// Everything `branch` is stated to need first, as `<repo>#<number>`.
-    /// Every part read from an entry file is one ([`Statement::check`]).
+    /// Everything `branch` is stated to need first, each as a
+    /// [`Requirement`] token. Every part read from an entry file is one
+    /// ([`Statement::check`]).
     pub fn depends(&self, branch: &str) -> Vec<String> {
         self.value(branch, StatementKind::Depends)
             .map_or_else(Vec::new, |list| {
                 list.split(',').map(str::to_owned).collect()
             })
+    }
+
+    /// Every branch that requires something now.
+    pub fn dependents(&self) -> impl Iterator<Item = &str> {
+        self.live
+            .iter()
+            .filter(|(_, kinds)| {
+                kinds
+                    .get(&StatementKind::Depends)
+                    .is_some_and(|live| live.value.is_some())
+            })
+            .map(|(branch, _)| branch.as_str())
+    }
+
+    /// The newest commit any entry records for `branch`: an entry about it
+    /// records its tip when written ([`Entry::anchor`]), a release write
+    /// each parent's commit and the bookmarks there ([`Entry::parents`]).
+    /// Kept across forgets and after the branch is deleted. A lower bound on
+    /// the branch's work, not its final head: the branch can have moved
+    /// since, with nothing written.
+    pub fn recorded_head(&self, branch: &str) -> Option<&str> {
+        self.recorded_heads.get(branch).map(String::as_str)
     }
 
     /// The live statement of `kind` about `branch`: `Some(None)` for a live
@@ -573,6 +638,64 @@ mod tests {
         assert_eq!(
             Statements::from_entries(&[unparseable]).pull("feat/alpha"),
             Some(9)
+        );
+    }
+
+    #[test]
+    fn a_branchs_recorded_head_is_the_newest_commit_any_entry_records() {
+        // Given: a depends list anchored at c1; a note about the branch at c2;
+        // a forget written after the branch was gone, with no anchor; and a
+        // release write naming the branch on a parent at c3.
+        let listed = Entry {
+            anchor: Some("c1".to_owned()),
+            ..stated(
+                "2026-08-15T22:00:00Z",
+                "feat/alpha",
+                StatementKind::Depends,
+                Some("acme/demo#1"),
+            )
+        };
+        let noted = Entry {
+            anchor: Some("c2".to_owned()),
+            ..prose("2026-08-15T22:01:00Z", "feat/alpha", "noted")
+        };
+        let forgot = stated(
+            "2026-08-15T22:02:00Z",
+            "feat/alpha",
+            StatementKind::Depends,
+            None,
+        );
+        let released = Entry {
+            parents: vec![crate::ledger::RecordedParent {
+                commit: "c3".to_owned(),
+                branches: vec!["feat/beta".to_owned(), "feat/alpha".to_owned()],
+            }],
+            ..prose("2026-08-15T22:03:00Z", "release/x", "cut")
+        };
+
+        // When / Then: each newer entry moves the recorded head, a forget with
+        // no anchor keeps it, and a branch no entry names has none.
+        let heads = |entries: &[Entry]| {
+            Statements::from_entries(entries)
+                .recorded_head("feat/alpha")
+                .map(str::to_owned)
+        };
+        assert_eq!(heads(std::slice::from_ref(&listed)), Some("c1".to_owned()));
+        assert_eq!(
+            heads(&[listed.clone(), noted.clone()]),
+            Some("c2".to_owned())
+        );
+        assert_eq!(
+            heads(&[listed.clone(), noted.clone(), forgot.clone()]),
+            Some("c2".to_owned())
+        );
+        assert_eq!(
+            heads(&[released.clone(), forgot, noted, listed]),
+            Some("c3".to_owned())
+        );
+        assert_eq!(
+            Statements::from_entries(&[released]).recorded_head("feat/gamma"),
+            None
         );
     }
 }

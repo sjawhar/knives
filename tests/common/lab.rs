@@ -12,7 +12,7 @@
 )]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
@@ -263,6 +263,27 @@ impl Lab {
             &self.trunk,
             ["push", "origin", self.trunk.as_str()],
         );
+    }
+
+    /// Fast-forward upstream's trunk to a published pull, as a fast-forward
+    /// merge or a direct push lands it: the branch's commits become the
+    /// trunk's own first-parent line, with no merge commit.
+    pub(crate) fn fast_forward_pull(&self, number: u64) {
+        let pull = format!("refs/pull/{number}/head:refs/remotes/origin/pull/{number}/head");
+        git(&self.maintainer, &self.trunk, ["fetch", "origin", &pull]);
+        git(
+            &self.maintainer,
+            &self.trunk,
+            ["checkout", self.trunk.as_str()],
+        );
+        let pull = format!("origin/pull/{number}/head");
+        git(&self.maintainer, &self.trunk, ["merge", "--ff-only", &pull]);
+        git(
+            &self.maintainer,
+            &self.trunk,
+            ["push", "origin", self.trunk.as_str()],
+        );
+        jj(&self.work, ["git", "fetch", "--remote", "upstream"]);
     }
 
     /// Bring the fork's trunk up to upstream's and fetch it into the work
@@ -1182,4 +1203,269 @@ pub fn home_after_first_cut(lab: &Lab) -> (tempfile::TempDir, PathBuf) {
     let cut = knives_release(lab, &home, &["cut", "release/2026-08-04"]);
     assert!(cut.status.success(), "{cut:?}");
     (home, consumer)
+}
+
+/// Both streams of `output`, for an assertion's message.
+pub fn text(output: &Output) -> String {
+    format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// The standard output of `output` alone.
+pub fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// [`jj`] for an argument list of any length. The command must succeed.
+pub fn jj_in(directory: &Path, args: &[&str]) {
+    let status = Command::new("jj")
+        .args(args)
+        .current_dir(directory)
+        .env("JJ_USER", "Knives Lab")
+        .env("JJ_EMAIL", "knives-lab@example.test")
+        .status()
+        .expect("run jj");
+    assert!(status.success(), "jj {args:?} failed");
+}
+
+/// A lab whose trunk, upstream and on the fork, holds `files`: the base every
+/// member forks from.
+pub fn trunk_with(files: &[(&str, &str)]) -> Lab {
+    let lab = Lab::new();
+    for (file, content) in files {
+        lab.upstream_trunk_file(file, content);
+    }
+    lab.mirror_upstream_trunk_to_origin();
+    lab
+}
+
+/// A release verb run in the work checkout that must exit 0; its stdout.
+pub fn release_ok(lab: &Lab, home: &TempDir, args: &[&str]) -> String {
+    let output = knives_release(lab, home, args);
+    assert_eq!(output.status.code(), Some(0), "{args:?}: {}", text(&output));
+    stdout(&output)
+}
+
+/// A release verb run in the work checkout that must go through, though the
+/// plan around it may exit with findings of its own; its stdout.
+pub fn release_ran(lab: &Lab, home: &TempDir, args: &[&str]) -> String {
+    release_ran_in(lab, home, &lab.work, args)
+}
+
+/// [`release_ran`] from `cwd`, a workspace of the work checkout, say.
+pub fn release_ran_in(lab: &Lab, home: &TempDir, cwd: &Path, args: &[&str]) -> String {
+    let output = release_command(lab, home, ReleaseOutput::Text, args)
+        .current_dir(cwd)
+        .output()
+        .expect("run knives release");
+    assert!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "{args:?}: {}",
+        text(&output)
+    );
+    stdout(&output)
+}
+
+/// Whether `commit` is still a visible commit of the work checkout.
+pub fn is_visible(lab: &Lab, commit: &knives::ids::CommitId) -> bool {
+    knives::jj::commits_matching(&lab.work, "all()")
+        .expect("list visible commits")
+        .contains(commit)
+}
+
+/// The forge repository the lab fork's upstream is reached by where two
+/// machines share a ledger, so the ledger keeps the fork under its
+/// `<owner>/<name>`: a filesystem upstream names no repository that another
+/// machine could share a ledger for.
+pub const UPSTREAM: &str = "https://forge.invalid/acme/demo";
+/// The repository each machine's registry entry says its ledger belongs to.
+pub const LEDGER: &str = "acme/ledger";
+/// [`LEDGER`] as each ledger root's `origin` spells it; git reaches it at a
+/// bare remote through `insteadOf`.
+pub const LEDGER_URL: &str = "https://forge.invalid/acme/ledger";
+
+/// A config home whose registry calls the lab fork `demo`, with [`UPSTREAM`]
+/// as its upstream and its ledger shared with [`LEDGER`], and the lab's work
+/// checkout pointing there too.
+pub fn shared_home(lab: &Lab) -> TempDir {
+    let (home, _consumer) = release_test_home(lab);
+    lab.upstream_at_forge_url(UPSTREAM);
+    let registry = home.path().join("repos.toml");
+    let registered = std::fs::read_to_string(&registry).expect("read the registry");
+    std::fs::write(
+        &registry,
+        format!(
+            "{}ledger = \"{LEDGER}\"\n",
+            registered.replace(&lab.upstream.display().to_string(), UPSTREAM)
+        ),
+    )
+    .expect("write the registry");
+    home
+}
+
+/// Make `home`'s ledger root a repository whose `origin` is [`LEDGER_URL`],
+/// reached at `remote`, committing as `machine`.
+pub fn share(home: &Path, machine: &str, remote: &Path) {
+    let root = home.join("ledger");
+    git_repository(&root, &[("origin", LEDGER_URL)]);
+    let reached = format!("url.{}.insteadOf", remote.display());
+    git_output(&root, ["config", reached.as_str(), LEDGER_URL]);
+    git_output(&root, ["config", "knives.machine", machine]);
+}
+
+/// A second machine's config home: the same registry, nothing else yet.
+pub fn second_machine(first: &Path) -> TempDir {
+    let home = tempfile::tempdir().expect("second config home");
+    std::fs::copy(first.join("repos.toml"), home.path().join("repos.toml"))
+        .expect("copy the registry");
+    home
+}
+
+/// A config home whose registry releases the lab fork `demo` on the fixed
+/// branch `branch`, with an empty local consumer.
+pub fn fixed_home(lab: &Lab, branch: &str) -> TempDir {
+    let home = tempfile::tempdir().expect("create config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n\
+             release_branch = \"{branch}\"\n",
+            lab.upstream.display(),
+        ),
+    )
+    .expect("write fixed-scheme registry");
+    let consumer = home.path().join("consumer");
+    std::fs::create_dir_all(&consumer).expect("create local consumer");
+    std::fs::write(
+        home.path().join("local-consumer"),
+        consumer.display().to_string(),
+    )
+    .expect("write local consumer fixture path");
+    home
+}
+
+/// The fork recipe's fast-forward, as `tests/release_unrecorded.rs` makes
+/// it: the release `name` rebased onto its parents and the publish remote's
+/// commit of it, its tree put back.
+pub fn fast_forward(lab: &Lab, name: &str) {
+    let before = commit_at(lab, name);
+    let destination = format!("parents({name}) | {name}@origin");
+    lab.jj_work(["rebase", "-r", name, "-d", destination.as_str()]);
+    lab.jj_work(["restore", "--from", before.as_str(), "--into", name]);
+}
+
+/// Upstream squash-merges `branch`'s pull request `number`. Returns the
+/// squash commit.
+pub fn squash_land(lab: &Lab, branch: &str, number: u64) -> knives::ids::CommitId {
+    lab.publish_pull(branch, number);
+    lab.squash_merge_pull(number, None);
+    commit_at(lab, "main@upstream")
+}
+
+/// The files `revision` leaves conflicted in the work checkout.
+pub fn conflicts_of(lab: &Lab, revision: &str) -> Vec<String> {
+    knives::jj::conflicted_files(&lab.work, revision).expect("list the conflicted files")
+}
+
+/// Edit `release` by hand, as a person does: `jj edit`, the files written,
+/// the working copy moved off it.
+pub fn edit_by_hand(lab: &Lab, release: &str, files: &[(&str, &str)]) {
+    lab.jj_work(["edit", release]);
+    for (file, content) in files {
+        std::fs::write(lab.work.join(file), content).expect("write by hand");
+    }
+    lab.jj_work(["new", "main@origin"]);
+}
+
+/// `knives release adopt <release> --why <why>`, which must record the
+/// release as its newest write.
+pub fn adopt(lab: &Lab, home: &TempDir, release: &str, why: &str) {
+    let adopted = release_ran(lab, home, &["adopt", release, "--why", why]);
+    assert!(
+        adopted.contains(&format!("as the newest write of {release}")),
+        "{adopted}"
+    );
+}
+
+/// The release of INFRA-4895's drop-after-adopt probe ([`included_release`]).
+const PROBE_RELEASE: &str = "release/2026-08-04";
+/// The probe's member that sets lines 5 and 6 of `f`, as `d809` did.
+const PROBE_D: &str = "feat/d";
+/// The probe's member, made after the first cut, that sets line 5 of `f` as
+/// [`PROBE_D`] does.
+const PROBE_A: &str = "feat/a";
+
+/// The probe's `f`: thirty lines `let lN = N`, with each line of `changed`
+/// set to its value.
+pub fn f_with(changed: &[(usize, &str)]) -> String {
+    use std::fmt::Write as _;
+    let mut f = String::new();
+    for line in 1..=30 {
+        match changed.iter().find(|(at, _)| *at == line) {
+            Some((_, value)) => writeln!(f, "let l{line} = {value}"),
+            None => writeln!(f, "let l{line} = {line}"),
+        }
+        .expect("write to a String");
+    }
+    f
+}
+
+/// The probe's D's `f`: A's change to line 5, and its own line 6 next to it.
+pub fn d_f() -> String {
+    f_with(&[(5, "compare_fix ()"), (6, "d809_only ()")])
+}
+
+/// The probe's A's `f`: line 5 only.
+pub fn a_f() -> String {
+    f_with(&[(5, "compare_fix ()")])
+}
+
+/// The probe's shape up to its include: a trunk holding `f` ([`f_with`]);
+/// `feat/m` adds `m.txt`; [`PROBE_D`] writes `d` as its `f`; a first cut
+/// [`PROBE_RELEASE`] of the two; [`PROBE_A`], made after the cut, writes
+/// [`a_f`]; `include feat/a`, which must exit 0. Returns the lab, its home
+/// and the include's stdout.
+pub fn included_release(d: &str) -> (Lab, TempDir, String) {
+    let lab = trunk_with(&[("f", &f_with(&[]))]);
+    lab.branch("feat/m", "m.txt", "m\n");
+    lab.branch(PROBE_D, "f", d);
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = release_ran(&lab, &home, &["cut", PROBE_RELEASE]);
+    assert_eq!(release_parents(&lab, PROBE_RELEASE).len(), 2, "{cut}");
+    lab.branch(PROBE_A, "f", &a_f());
+    let include = release_ok(&lab, &home, &["include", PROBE_A]);
+    (lab, home, include)
+}
+
+/// How `f` is resolved by hand after the probe's `include feat/a`
+/// conflicts there ([`adopted_release`]).
+#[derive(Clone, Copy)]
+pub enum Resolution {
+    /// `f` as [`PROBE_D`] has it, which holds A's line too.
+    DVersion,
+    /// A text that keeps neither side.
+    Neither,
+}
+
+/// [`included_release`] with [`d_f`]: the include conflicts in `f`, which is
+/// resolved by hand as `resolution` says and adopted. Returns the lab and
+/// its home.
+pub fn adopted_release(resolution: Resolution) -> (Lab, TempDir) {
+    let (lab, home, include) = included_release(&d_f());
+    assert_eq!(conflicts_of(&lab, PROBE_RELEASE), ["f"], "{include}");
+    match resolution {
+        Resolution::DVersion => {
+            lab.jj_work(["restore", "--from", PROBE_D, "--into", PROBE_RELEASE, "f"]);
+        }
+        Resolution::Neither => edit_by_hand(&lab, PROBE_RELEASE, &[("f", "merged\n")]),
+    }
+    adopt(&lab, &home, PROBE_RELEASE, "resolve f");
+    assert!(
+        conflicts_of(&lab, PROBE_RELEASE).is_empty(),
+        "the adopt left a conflict"
+    );
+    (lab, home)
 }

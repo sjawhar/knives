@@ -1,6 +1,6 @@
 # Fetching, claiming and stating work
 
-Read this before `sync`, `preflight`, `start`, `finish`, `track` or `depends`, and when a command waits on a lock. These change local state. `start` puts an existing branch on its tip, with `@` an empty child, and a new branch on the release's shared base (the upstream trunk when no release exists).
+Read this before `sync`, `preflight`, `start`, `finish`, `track` or `depends`, and when a command waits on a lock. These change local state. `start` puts an existing branch on its tip, with `@` an empty child, and a new branch on the release's shared base (the upstream trunk when no release exists). A release name is the exception: `start <release name>` takes the release claim, and its workspace's `@` is a new empty commit whose parent is the root commit, not a child of the release.
 
 ## `knives sync [REPO|--all]`
 
@@ -57,11 +57,15 @@ Reports upstream contribution facts: convention files and their changes since la
 Inference matches branches to PR heads from our copies and reads a `pr-<n>` bookmark as that PR's head. It can miss older or closed PRs and a superseding PR by someone else. State them:
 
 ```text
-knives track <branch> --pr 4545     # any number, state or author
-knives track <branch> --forget      # back to inference
-knives depends <branch> --on <repo>#<number>
+knives track <branch> --pr 4545                 # an upstream PR, any state or author
+knives track <branch> --forget                  # back to inference
+knives depends <branch> --on <repo>#<number>    # an upstream PR, or a review PR on the fork's own repository
+knives depends <branch> --on <member-branch>    # a member branch of this fork
+knives depends <branch> --forget <requirement>  # take it back; with --on, correct it
 ```
 
 - `depends` is never inferred and can cross forks. `status` reports requirements that have not merged.
+- A knives older than v6.1.0 cannot read a member-branch or review-PR requirement: record one only when every machine that shares the fork's ledger runs v6.1.0 or later.
+- `track --pr` refuses a number that is the fork's review PR, not an upstream one.
 - `depends` and `track --forget` pull the shared ledger first and refuse (exit `3`) when the pull fails.
 - `track --fork-only` is a legacy statement; placement never records fork-only (fork-work §3).

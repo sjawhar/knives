@@ -16,6 +16,8 @@
     reason = "a fixture or assertion that cannot proceed IS the test failure"
 )]
 
+#[path = "common/forge_shim.rs"]
+mod forge_shim;
 #[path = "common/lab.rs"]
 mod lab;
 
@@ -178,22 +180,48 @@ fn track_depends_and_finish_name_the_fork_by_its_registry_key() {
     // `maintainer/demo`.
     let (lab, home) = forge_fork();
     claim_gamma(&lab, home.path());
+    // A forge whose upstream has #9, which `track --pr 9` asks it.
+    let forge = tempfile::tempdir().expect("gh shim directory");
+    forge_shim::install_repository_gh(
+        forge.path(),
+        &[
+            forge_shim::Repository {
+                named: "Maintainer/Demo",
+                canonical: "Maintainer/Demo",
+                pulls: &format!(
+                    "[{}]",
+                    forge_shim::pull_record(9, "OPEN", "feat/gamma", None)
+                ),
+            },
+            forge_shim::Repository {
+                named: "acme/work",
+                canonical: "acme/work",
+                pulls: "[]",
+            },
+        ],
+        &forge.path().join("calls.log"),
+    );
     let said = |args: &[&str]| {
-        let output = succeeded(&knives_as(
-            &lab,
-            home.path(),
-            &lab.work,
-            Some("agent-one"),
-            args,
-        ))
-        .clone();
+        let mut command = lab::knives_command(&lab.work, home.path(), lab.temp_path(), args);
+        command
+            .env("USER", "terminal-user")
+            .env("KNIVES_OWNER", "agent-one")
+            .env("PATH", forge_shim::path_with_gh_shim(forge.path()));
+        let output = succeeded(&command.output().expect("run knives")).clone();
         String::from_utf8_lossy(&output.stdout).into_owned()
     };
 
     // When: its pull request is stated, a dependency recorded, and the
     // branch finished.
     let tracked = said(&["--text", "track", "feat/gamma", "--pr", "9"]);
-    let depends = said(&["--text", "depends", "feat/gamma", "--on", "demo#3"]);
+    // Named by the upstream's own `<owner>/<name>`, which needs no forge.
+    let depends = said(&[
+        "--text",
+        "depends",
+        "feat/gamma",
+        "--on",
+        "maintainer/demo#3",
+    ]);
     let finished = said(&["--text", "finish", "feat/gamma", "--repo", "demo"]);
 
     // Then: each line a person reads names the fork as the registry does,

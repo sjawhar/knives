@@ -630,10 +630,7 @@ fn settle_rows_after_phases(
     })?);
     let trunks = crate::release_model::trunk_positions(input.repo, entry)?;
     if !trunks.is_empty() {
-        // The store already read the fork's ledger: it names a stacked
-        // series' release whose refs the reap forgot.
-        let releases =
-            crate::release_model::releases_of_every_series(input.tips, entry, input.notches);
+        let releases = crate::release_model::releases_of_every_series(input.tips, entry);
         findings.extend(stacked_pull_findings(
             report,
             crate::release_model::StackedHistoryContext {
@@ -827,10 +824,8 @@ fn fold_phase_outcome(
     add_dependency_findings(DependencyInput {
         report,
         findings,
-        name,
-        path: &input.fork.checkout.path,
-        store: input.store,
-        options: input.options,
+        post: input,
+        index,
         snapshot,
         timings,
     });

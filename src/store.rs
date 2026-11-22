@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{FormerNames, default_config_path};
-use crate::ids::{BranchTarget, Requirement, UpstreamName};
+use crate::ids::{BranchName, BranchTarget, CommitId, Requirement, UpstreamName};
 use crate::ledger::{Entry, Ledger, LedgerError, inline_human_text, unmigrated};
 use crate::lock::{FileLock, LockError, LockWait};
 use crate::statement::{StatementKind, Statements};
@@ -597,6 +597,22 @@ impl Store {
             .collect()
     }
 
+    /// Every branch of `repo` that requires something now, with the newest
+    /// commit the ledger records for it, where any entry records one
+    /// ([`crate::statement::Statements::recorded_head`]).
+    pub fn dependents(&self, repo: &UpstreamName) -> Vec<(BranchName, Option<CommitId>)> {
+        let stated = self.stated_in(repo);
+        stated
+            .dependents()
+            .map(|branch| {
+                (
+                    BranchName::new(branch),
+                    stated.recorded_head(branch).map(CommitId::new),
+                )
+            })
+            .collect()
+    }
+
     /// The pull request stated for `target`, if any. Overrides inference.
     ///
     /// Inference matches an open pull request from our own copy of the
@@ -1148,11 +1164,11 @@ mod tests {
         assert_eq!(
             subject.dependencies(&target()),
             [
-                Requirement {
+                Requirement::Upstream {
                     repo: repo(),
                     number: 7
                 },
-                Requirement {
+                Requirement::Upstream {
                     repo: UpstreamName::new("sibling"),
                     number: 49
                 },

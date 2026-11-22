@@ -1,4 +1,5 @@
-//! `knives release rebase`: the whole composition moves onto a newer trunk.
+//! `knives release rebase`: the release moves onto a newer trunk, with each
+//! member whose commits the trunk does not hold.
 //!
 //! Refused when every pin is frozen, when a stale parent cannot be mapped, when
 //! every member landed, or when the release is held only as a remote ref; a
@@ -307,8 +308,9 @@ fn a_rebase_keeps_a_landed_bookmark_held_member() {
 fn a_rebase_moves_the_whole_composition_onto_the_target() {
     // Given: two members forked from the old trunk, their merge conflict
     // resolved on the release, and an upstream that has advanced. `rebase` is
-    // `jj rebase -b <release> -d <target>`: the members move onto the target
-    // and the release moves with them — the trunk never becomes a parent.
+    // `jj rebase -b <release> -d <target>`: the members whose commits the
+    // target's history does not hold move onto the target, and the release
+    // moves with them — the trunk never becomes a parent.
     let lab = Lab::new();
     lab.branch("feat/alpha", "shared.txt", "alpha\n");
     lab.branch("feat/beta", "shared.txt", "beta\n");

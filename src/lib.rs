@@ -6,6 +6,8 @@
 //! The crate is split so the rules can be tested without a repository:
 //!
 //! - [`detect`] is pure. Functions from parsed values to findings, no I/O.
+//! - [`own_lines`] is pure too. It reads which of a member's own lines a
+//!   release holds, from the bytes that [`jj`] read.
 //! - [`ids`] gives every identifier its own type, because mixing a change id
 //!   with a commit id, or a local bookmark with its remote counterpart, are the
 //!   two mistakes this domain actually invites.
@@ -42,6 +44,7 @@ pub mod ledger_git;
 pub mod ledger_sweep;
 pub mod liveness;
 pub mod lock;
+pub mod own_lines;
 pub mod pins;
 pub mod release_model;
 pub mod remote_url;
