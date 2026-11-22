@@ -21,6 +21,23 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::ops::Range;
 
+#[cfg(test)]
+thread_local! {
+    /// The lengths of the two sequences of each matcher made on this
+    /// thread, in the order they were made ([`made`]). Tests run on threads
+    /// of their own, so each test reads its own matchers.
+    static MADE: std::cell::RefCell<Vec<(usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The lengths of the two sequences of each matcher made on this thread
+/// since the last call, which takes them: what a test reads to see which
+/// lines a reading compared.
+#[cfg(test)]
+pub(super) fn made() -> Vec<(usize, usize)> {
+    MADE.take()
+}
+
 /// `2 * matches / length`, as Python's `difflib` computes a ratio, kept as
 /// an exact fraction; 1 where both sequences are empty.
 #[derive(Debug, Clone, Copy)]
@@ -119,6 +136,8 @@ pub(super) struct SequenceMatcher<'s, T> {
 
 impl<'s, T: Eq + Hash> SequenceMatcher<'s, T> {
     pub(super) fn new(a: &'s [T], b: &'s [T]) -> Self {
+        #[cfg(test)]
+        MADE.with_borrow_mut(|made| made.push((a.len(), b.len())));
         let mut b2j: HashMap<&'s T, Vec<usize>> = HashMap::new();
         for (j, element) in b.iter().enumerate() {
             b2j.entry(element).or_default().push(j);

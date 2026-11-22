@@ -1195,4 +1195,85 @@ mod tests {
         assert_eq!(added, [b"timeout".as_slice(), b"5"]);
         assert_eq!(own.removed, [b"insecure".as_slice(), b"True"]);
     }
+
+    /// `count` words drawn from a vocabulary of 50, `w0` to `w49`, in a
+    /// fixed sequence.
+    fn drawn(count: usize) -> Vec<String> {
+        (0..count).map(|at| format!("w{}", at * 7 % 50)).collect()
+    }
+
+    /// `words` with the word at `at` changed.
+    fn changed(words: &[String], at: usize) -> Vec<String> {
+        let mut changed = words.to_vec();
+        changed[at] = "changed".to_owned();
+        changed
+    }
+
+    /// `words` as one line.
+    fn line_of(words: &[String]) -> Vec<u8> {
+        words.join(" ").into_bytes()
+    }
+
+    /// The two lengths of each matcher made on this thread, since the
+    /// matchers were last read, that had a side of more than `WORD_LIMIT`
+    /// words.
+    fn matched_a_line_over_the_limit() -> Vec<(usize, usize)> {
+        let limit = super::super::WORD_LIMIT;
+        super::super::difflib::made()
+            .into_iter()
+            .filter(|&(a, b)| a > limit || b > limit)
+            .collect()
+    }
+
+    #[test]
+    fn pair_hunk_never_matches_a_line_over_the_word_limit() {
+        // Given (K11 21): L, 40000 words drawn from 50; a hunk that removes L
+        // and adds L', L with one word changed, and one short line
+        let words = drawn(40_000);
+        let removed = line_of(&words);
+        let copy = line_of(&changed(&words, 20_000));
+        super::super::difflib::made();
+
+        // When: the hunk is paired
+        let added: [&[u8]; 2] = [&copy, b"a short line"];
+        let pairs = pair_hunk(&[removed.as_slice()], &added);
+
+        // Then: no matcher compared a line of more than 30000 words, and
+        // neither L nor L' is paired
+        let over = matched_a_line_over_the_limit();
+        assert!(over.is_empty(), "{over:?}");
+        assert_eq!(pairs, [None, None]);
+    }
+
+    #[test]
+    fn pair_hunk_pairs_no_line_over_the_word_limit() {
+        let over = drawn(30_001);
+        let over_line = line_of(&over);
+        let over_copy = line_of(&changed(&over, 15_000));
+
+        // Given: a hunk that removes as many lines as it adds, the second
+        // removed line over the limit
+        let removed: [&[u8]; 3] = [b"one two three", &over_line, b"seven eight"];
+        let added: [&[u8]; 3] = [b"one two four", b"five six", b"seven nine"];
+        // Then: the other positions pair, and that one does not
+        assert_eq!(pair_hunk(&removed, &added), [Some(0), None, Some(2)]);
+
+        // Given: a removed line over the limit, then a short one; the added
+        // lines: one like the short one, a copy of the long one, and two
+        // others
+        let removed: [&[u8]; 2] = [&over_line, b"alpha beta gamma"];
+        let added: [&[u8]; 4] = [b"alpha beta delta", &over_copy, b"one", b"two"];
+        // Then: the long line takes none and leaves the window where it was,
+        // so the short one pairs from its start
+        assert_eq!(pair_hunk(&removed, &added), [Some(1), None, None, None]);
+
+        // Given: a removed line of 20000 words; added: that line with 10001
+        // more words, over the limit, then its first 10000 words
+        let removed = line_of(&over[..20_000]);
+        let half = line_of(&over[..10_000]);
+        let added: [&[u8]; 2] = [&over_line, &half];
+        // Then: the line over the limit is passed over for the next line
+        // whose similarity reaches one half
+        assert_eq!(pair_hunk(&[removed.as_slice()], &added), [None, Some(0)]);
+    }
 }

@@ -301,6 +301,27 @@ impl Lab {
         );
     }
 
+    /// Fast-forward upstream's trunk to a published pull, as a rebase merge
+    /// or a direct push lands it: the branch's commits become the trunk's own
+    /// first-parent line, with no merge commit.
+    pub(crate) fn fast_forward_pull(&self, number: u64) {
+        let pull = format!("refs/pull/{number}/head:refs/remotes/origin/pull/{number}/head");
+        git(&self.maintainer, &self.trunk, ["fetch", "origin", &pull]);
+        git(
+            &self.maintainer,
+            &self.trunk,
+            ["checkout", self.trunk.as_str()],
+        );
+        let pull = format!("origin/pull/{number}/head");
+        git(&self.maintainer, &self.trunk, ["merge", "--ff-only", &pull]);
+        git(
+            &self.maintainer,
+            &self.trunk,
+            ["push", "origin", self.trunk.as_str()],
+        );
+        jj(&self.work, ["git", "fetch", "--remote", "upstream"]);
+    }
+
     /// Bring the fork's trunk up to upstream's and fetch it into the work
     /// checkout, so `main@origin` is ahead of a `main@upstream` view nobody
     /// refreshed.

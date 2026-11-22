@@ -1532,6 +1532,44 @@ fn a_plain_file_the_baseline_left_clean_losing_one_member_line_exits_with_findin
     assert!(out.contains("as the newest write of"), "{out}");
 }
 
+#[test]
+fn an_adopt_counts_the_lost_lines_of_a_member_the_trunk_merged() {
+    // Given (K14 32): X and Z each write `f` their own way, and their cut
+    // leaves `f` conflicted; `f` is resolved by hand to Z's line, which drops
+    // X's; then upstream merges X's pull request by a merge commit, so the
+    // trunk contains X.
+    let lab = Lab::new();
+    lab.branch("feat/x", "f", "x\n");
+    lab.branch("feat/z", "f", "z\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert!(
+        stdout(&cut).contains(&format!("cut {RELEASE} as")),
+        "{}",
+        text(&cut)
+    );
+    finish_in_place(&lab, &[("f", "z\n")]);
+    lab.publish_pull("feat/x", 1);
+    lab.merge_pull_with_merge_commit(1);
+
+    // When: the release is adopted.
+    let output = adopt(&lab, &home, &[]);
+
+    // Then: X's change is read from its fork point with the merge's first
+    // parent, so its line is counted absent and flagged, with the findings
+    // exit.
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "  !! feat/x: 1 of 1 added line(s) of f absent from the resolution: every line it \
+             added is gone\n"
+        ),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+}
+
 /// Alpha and beta each creating `shared.txt` with three lines of their own,
 /// cut, the conflict resolved by hand to `resolution`, then adopted.
 fn three_line_conflict_adopted(resolution: &str) -> std::process::Output {

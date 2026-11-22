@@ -1629,6 +1629,34 @@ mod tests {
     }
 
     #[test]
+    fn a_hunk_where_the_word_step_follows_no_range_is_not_paired() {
+        // Given: a hunk that removes one line of 20000 words and adds two
+        // such lines, each with one word changed; a release that replaces
+        // both with one line, so that the range holds 40000 words
+        let words: Vec<String> = (0..20_000).map(|at| format!("w{}", at * 7 % 50)).collect();
+        let changed = |at: usize, word: &str| {
+            let mut edited = words.clone();
+            edited[at] = word.to_owned();
+            edited.join(" ")
+        };
+        let (one, two) = (changed(5_000, "one"), changed(15_000, "two"));
+        let fork = file(&format!("keep\n{}\nend\n", words.join(" ")));
+        let tip = file(&format!("keep\n{one}\n{two}\nend\n"));
+        let release = file(&format!("keep\n{one} {two}\nend\n"));
+        super::difflib::made();
+
+        // When: the member is read
+        let lines = read("big.txt", fork, tip, release);
+
+        // Then: the word step follows no range of the hunk, so no matcher
+        // was made: its lines are not paired
+        let made = super::difflib::made();
+        assert!(made.is_empty(), "{made:?}");
+        // And: the range is named as not followed
+        assert_eq!(lines.word_step_skipped.len(), 1);
+    }
+
+    #[test]
     fn a_removed_argument_put_back_beside_another_is_lost() {
         // Given: M changes `call(a, insecure=True)` to `call(a)`, and the
         // release holds `call(a, insecure=True, timeout=5)` (K11 (12))

@@ -76,6 +76,9 @@ const F: &str = "feat/f";
 const G: &str = "feat/g";
 /// A branch that merges E and F and rewrites a line of E.
 const C: &str = "feat/c";
+/// A member that forks inside A, at A's first commit, once A is a member of
+/// two commits (K14 35).
+const N: &str = "feat/n";
 /// A's entry in `CHANGELOG.md`, which D's block holds too.
 const A_ENTRY: &str = "- a entry\n";
 /// The line a person adds to `f` by hand, after its line 20: unchanged lines
@@ -1571,4 +1574,289 @@ fn allow_loss_with_nothing_counted_changes_nothing() {
     );
     assert!(!event.text.contains("; lost: "), "{}", event.text);
     assert!(!event.text.contains("; why lost: "), "{}", event.text);
+}
+
+// ---------------------------------------------------------------------------
+// R6 in R11's check and adopt's measure: a remaining member that the trunk
+// contains is read from the base the trunk took it in on.
+// ---------------------------------------------------------------------------
+
+/// D24's line for a member that the trunk holds on its first-parent line,
+/// read from `base`, which another parent of the release holds.
+fn base_line(member: &str, base: &knives::ids::CommitId) -> String {
+    format!(
+        "  {member}: read from {}, the newest trunk commit below it that another parent of \
+         {RELEASE} holds",
+        base.short()
+    )
+}
+
+/// D24's line for a member that the trunk holds on its first-parent line,
+/// and that no other parent of the release gives a base.
+fn no_base_line(member: &str) -> String {
+    format!(
+        "  {member}: its lines are not read: the trunk holds it on its first-parent line, and \
+         every other parent of {RELEASE} holds it or no trunk commit below it"
+    )
+}
+
+/// Whether `out` holds `line` as one whole line.
+fn has_line(out: &str, line: &str) -> bool {
+    out.lines().any(|candidate| candidate == line)
+}
+
+/// `knives release adopt <release> --why <why>`, whatever its exit.
+fn adopt_why(lab: &Lab, home: &tempfile::TempDir, why: &str) -> Output {
+    knives_release(lab, home, &["adopt", RELEASE, "--why", why])
+}
+
+/// `CHANGELOG.md` as D writes it, with A's entry taken out by hand.
+fn without_a_entry() -> String {
+    log_with("- d entry\n")
+}
+
+#[test]
+fn a_remaining_member_the_trunk_merged_is_refused_when_the_edit_drops_its_lines() {
+    // Given (K14 31): (20)'s shape; then upstream merges A's pull request by
+    // a merge commit, so the trunk contains A.
+    let (lab, home) = union_resolved_by_hand(&d_log(), &d_log());
+    lab.publish_pull(A, 1);
+    lab.merge_pull_with_merge_commit(1);
+    let before = Untouched::read(&lab, &home);
+
+    // When: D is dropped.
+    let output = knives_release(&lab, &home, &["drop", D, "--why", "not ready"]);
+
+    // Then: A is read from its fork point with the merge's first parent, so
+    // the drop writes nothing, exits 3, and names CHANGELOG.md, A and A's
+    // entry.
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    before.assert_kept(&lab, &home, &out);
+    assert!(out.contains(&refusal_line("CHANGELOG.md", A)), "{out}");
+    assert!(
+        out.contains(&added_lost("CHANGELOG.md", 2, "- a entry")),
+        "{out}"
+    );
+}
+
+/// (20)'s shape, where A is two commits, the first writing a file of its
+/// own and the second adding A's entry; then upstream fast-forwards its
+/// trunk to A and moves on by one commit, and the release is rebased onto
+/// that trunk with `knives release rebase main@upstream`: M and D move onto
+/// the trunk past A's tip, and A stays a parent, the usual shape after a
+/// rebase. Returns the lab and its home.
+fn rebased_onto_a_fast_forwarded_member() -> (Lab, tempfile::TempDir) {
+    let lab = trunk_with(&[("CHANGELOG.md", &log_with(""))]);
+    member(&lab, M, &[("m.txt", "m\n")]);
+    member(&lab, A, &[("a.txt", "a\n")]);
+    extend_branch(&lab, A, "CHANGELOG.md", &a_log());
+    member(&lab, D, &[("CHANGELOG.md", &d_log())]);
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = release_ran(&lab, &home, &["cut", RELEASE]);
+    let unioned = show(&lab, "CHANGELOG.md");
+    assert_eq!(unioned.matches(A_ENTRY).count(), 2, "{cut}\n{unioned}");
+    edit_by_hand(&lab, RELEASE, &[("CHANGELOG.md", &d_log())]);
+    adopt(
+        &lab,
+        &home,
+        RELEASE,
+        "keep A's entry once, inside D's block",
+    );
+    lab.publish_pull(A, 1);
+    lab.fast_forward_pull(1);
+    lab.advance_upstream("past A\n");
+    let target = commit_at(&lab, "main@upstream");
+    let rebased = release_ran(&lab, &home, &["rebase", "main@upstream"]);
+    assert!(
+        release_parents(&lab, RELEASE).contains(&commit_at(&lab, A)),
+        "A stays a parent: {rebased}"
+    );
+    for member in [M, D] {
+        assert_eq!(
+            lab.revision(&lab.work, &format!("{member}-"), "commit_id"),
+            target.as_str(),
+            "{member} forks past A's tip: {rebased}"
+        );
+    }
+    (lab, home)
+}
+
+#[test]
+fn an_edit_and_an_adopt_read_no_line_of_a_fast_forwarded_member_every_parent_holds() {
+    // Given (K14 33): A, fast-forwarded onto the trunk, and M and D, which
+    // fork past A's tip after the rebase; D's block in CHANGELOG.md holds
+    // A's entry, as the hand resolution left it; then A's entry taken out of
+    // CHANGELOG.md by hand.
+    let (lab, home) = rebased_onto_a_fast_forwarded_member();
+    edit_by_hand(&lab, RELEASE, &[("CHANGELOG.md", &without_a_entry())]);
+
+    // When: the release is adopted with a reason.
+    let adopted = adopt_why(&lab, &home, "take out A's entry");
+
+    // Then: it is recorded; every other parent holds A's tip, so no base
+    // says where A began: the measure reads no line of A and says so,
+    // naming A, and counts nothing of A as absent.
+    let out = text(&adopted);
+    assert!(
+        out.contains(&format!("as the newest write of {RELEASE}")),
+        "{out}"
+    );
+    assert!(has_line(&out, &no_base_line(A)), "{out}");
+    assert!(
+        !out.lines()
+            .any(|line| line.contains(&format!("{A}: "))
+                && line.contains("absent from the resolution")),
+        "{out}"
+    );
+
+    // Given: the same release again, as the rebase left it.
+    let (lab, home) = rebased_onto_a_fast_forwarded_member();
+
+    // When: D is dropped.
+    let output = knives_release(&lab, &home, &["drop", D, "--why", "not ready"]);
+
+    // Then: the check reads no line of A and says so, naming A, and the
+    // drop goes ahead, though its write loses A's entry.
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{out}");
+    assert!(!show(&lab, "CHANGELOG.md").contains(A_ENTRY), "{out}");
+    assert!(has_line(&out, &no_base_line(A)), "{out}");
+}
+
+#[test]
+fn an_edit_and_an_adopt_read_a_fast_forwarded_member_from_a_parent_below_it() {
+    // Given (K14 34): (20)'s shape, where M and D fork at T0, the trunk
+    // commit below A's first commit; then upstream fast-forwards its trunk
+    // to A.
+    let (lab, home) = union_resolved_by_hand(&d_log(), &d_log());
+    let below = commit_at(&lab, "main@upstream");
+    lab.publish_pull(A, 1);
+    lab.fast_forward_pull(1);
+    let before = Untouched::read(&lab, &home);
+
+    // When: D is dropped.
+    let output = knives_release(&lab, &home, &["drop", D, "--why", "not ready"]);
+
+    // Then: A is read from T0, which the other parents hold: the drop writes
+    // nothing, exits 3, names CHANGELOG.md, A and A's entry, and names T0
+    // as A's base.
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    before.assert_kept(&lab, &home, &out);
+    assert!(out.contains(&refusal_line("CHANGELOG.md", A)), "{out}");
+    assert!(
+        out.contains(&added_lost("CHANGELOG.md", 2, "- a entry")),
+        "{out}"
+    );
+    assert!(has_line(&out, &base_line(A, &below)), "{out}");
+
+    // Given: A's entry taken out of CHANGELOG.md by hand.
+    edit_by_hand(&lab, RELEASE, &[("CHANGELOG.md", &without_a_entry())]);
+
+    // When: the release is adopted with a reason.
+    let adopted = adopt_why(&lab, &home, "take out A's entry");
+
+    // Then: A's entry is counted absent and flagged, with the findings
+    // exit, and T0 is named as A's base.
+    let out = text(&adopted);
+    assert_eq!(adopted.status.code(), Some(1), "{out}");
+    assert!(
+        out.contains(&format!(
+            "  !! {A}: 1 of 1 added line(s) of CHANGELOG.md absent from the resolution"
+        )),
+        "{out}"
+    );
+    assert!(has_line(&out, &base_line(A, &below)), "{out}");
+}
+
+#[test]
+fn an_edit_reads_a_fast_forwarded_member_from_a_base_inside_it_and_names_it() {
+    // Given (K14 35): (20)'s shape, where A is two commits: c1 adds an entry
+    // on top of CHANGELOG.md and c2 another above it; D's block holds both;
+    // N forks at c1 and writes a file of its own. The cut's union holds
+    // each of A's entries twice; CHANGELOG.md is resolved by hand to D's
+    // version and adopted; then upstream fast-forwards its trunk to A.
+    let (first_entry, second_entry) = ("- a1 entry\n", "- a2 entry\n");
+    let lab = trunk_with(&[("CHANGELOG.md", &log_with(""))]);
+    member(&lab, M, &[("m.txt", "m\n")]);
+    member(&lab, A, &[("CHANGELOG.md", &log_with(first_entry))]);
+    let first = commit_at(&lab, A);
+    let both = format!("{second_entry}{first_entry}");
+    extend_branch(&lab, A, "CHANGELOG.md", &log_with(&both));
+    lab.jj_work(["new", "-r", first.as_str(), "-m", N]);
+    std::fs::write(lab.work.join("n.txt"), "n\n").expect("write N's file");
+    lab.jj_work(["bookmark", "create", N, "-r", "@"]);
+    lab.jj_work(["new", "main@origin"]);
+    let d = log_with(&format!("- d entry\n{both}"));
+    member(&lab, D, &[("CHANGELOG.md", &d)]);
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = release_ran(&lab, &home, &["cut", RELEASE]);
+    let unioned = show(&lab, "CHANGELOG.md");
+    for entry in [first_entry, second_entry] {
+        assert_eq!(unioned.matches(entry).count(), 2, "{cut}\n{unioned}");
+    }
+    edit_by_hand(&lab, RELEASE, &[("CHANGELOG.md", &d)]);
+    adopt(
+        &lab,
+        &home,
+        RELEASE,
+        "keep A's entries once, inside D's block",
+    );
+    lab.publish_pull(A, 1);
+    lab.fast_forward_pull(1);
+    let before = Untouched::read(&lab, &home);
+
+    // When: D is dropped.
+    let output = knives_release(&lab, &home, &["drop", D, "--why", "not ready"]);
+
+    // Then: A is read from c1, the newest trunk commit below its tip that N
+    // holds, and the output names c1; of A's two entries, which the write
+    // would lose, only c2's is counted: the drop writes nothing, exits 3,
+    // and names CHANGELOG.md, A and c2's entry, not c1's.
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    before.assert_kept(&lab, &home, &out);
+    assert!(out.contains(&refusal_line("CHANGELOG.md", A)), "{out}");
+    assert!(
+        out.contains(&added_lost("CHANGELOG.md", 2, "- a2 entry")),
+        "{out}"
+    );
+    assert!(!out.contains("‹- a1 entry›"), "{out}");
+    assert!(has_line(&out, &base_line(A, &first)), "{out}");
+}
+
+#[test]
+fn an_edit_reads_no_line_of_a_fast_forwarded_member_whose_other_parents_share_no_trunk_commit() {
+    // Given: (20)'s shape, where M and D fork from a commit of an unrelated
+    // history that holds the trunk's CHANGELOG.md, and A from the trunk; the
+    // cut's CHANGELOG.md resolved by hand to D's version, whose block holds
+    // A's entry, and adopted; then upstream fast-forwards its trunk to A.
+    let lab = trunk_with(&[("CHANGELOG.md", &log_with(""))]);
+    lab.jj_work(["new", "root()", "-m", "an unrelated history"]);
+    std::fs::write(lab.work.join("CHANGELOG.md"), log_with("")).expect("write the log");
+    lab.jj_work(["new"]);
+    let unrelated = lab.revision(&lab.work, "@-", "commit_id");
+    for (name, file, content) in [(M, "m.txt", "m\n".to_owned()), (D, "CHANGELOG.md", d_log())] {
+        lab.jj_work(["new", "-r", unrelated.as_str(), "-m", name]);
+        std::fs::write(lab.work.join(file), content).expect("write a member's file");
+        lab.jj_work(["bookmark", "create", name, "-r", "@"]);
+    }
+    member(&lab, A, &[("CHANGELOG.md", &a_log())]);
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = release_ran(&lab, &home, &["cut", RELEASE]);
+    edit_by_hand(&lab, RELEASE, &[("CHANGELOG.md", &d_log())]);
+    adopt(&lab, &home, RELEASE, "resolve the changelog to D's version");
+    lab.publish_pull(A, 1);
+    lab.fast_forward_pull(1);
+
+    // When: D is dropped.
+    let output = knives_release(&lab, &home, &["drop", D, "--why", "not ready"]);
+
+    // Then: the other parents share no trunk commit with A, so no base says
+    // where A began: the check reads no line of A and says so, naming A,
+    // and the drop goes ahead.
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{cut}\n{out}");
+    assert!(has_line(&out, &no_base_line(A)), "{out}");
 }

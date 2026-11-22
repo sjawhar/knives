@@ -24,11 +24,12 @@ mod lab;
 
 use std::path::Path;
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 use knives::ids::CommitId;
 use lab::{
-    Lab, ReleaseOutput, commit_at, home_after_first_cut, jj_in, knives_release, release_command,
-    release_test_home, stdout, text, trunk_with,
+    Lab, ReleaseOutput, commit_at, extend_branch, home_after_first_cut, jj_in, knives_release,
+    release_command, release_test_home, stdout, text, trunk_with,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -433,6 +434,362 @@ fn a_record_with_a_trunk_parent_that_lacks_an_earlier_trunk_change_reads_it_miss
         Vec::<&str>::new(),
         "{out}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// R6: a revision that the upstream trunk contains is read from the base the
+// trunk took it in on: the first parent of the merge that took it in, or,
+// on the trunk's first-parent line, the newest commit of that line that the
+// release's parents hold.
+// ---------------------------------------------------------------------------
+
+/// The revision that upstream takes into its trunk, whose carriage each test
+/// of K11 (19) to (20c) asks.
+const X: &str = "feat/x";
+/// In K11 (20b), the branch that merges X and that upstream merges by a merge
+/// commit; in (20c), a member that upstream merges by a merge commit before
+/// it fast-forwards its trunk to X.
+const Y: &str = "feat/y";
+/// X's two lines, in `x.txt`.
+const X_LINES: &str = "x one\nx two\n";
+/// How `--carries` and `--census` name X's two lines where a release lacks
+/// them.
+const X_LINES_LOST: [&str; 2] = [
+    "x.txt:1: added line lost ‹x one›",
+    "x.txt:2: added line lost ‹x two›",
+];
+/// How `--carries` and `--census` name the line that c1, X's first commit,
+/// adds to `a.txt`, where a release lacks it.
+const C1_LINE_LOST: &str = "a.txt:1: added line lost ‹c1 line›";
+
+/// The start of a check that reads the revision as not carried by
+/// `release` at `commit`, up to its evidence; f6a1ef95 prints it too.
+fn not_carried(release: &str, commit: &CommitId) -> String {
+    format!(
+        "NOT carried        {release} @ {}  (evidence ",
+        commit.short()
+    )
+}
+
+/// The start of a check that reads the revision as carried by `release` at
+/// `commit`, which does not reach its tip, up to its evidence.
+fn carried_rewritten(release: &str, commit: &CommitId) -> String {
+    format!(
+        "carried-rewritten  {release} @ {}  (evidence ",
+        commit.short()
+    )
+}
+
+/// `knives release members <release> --carries <revision>`, whatever its
+/// exit.
+fn carries_against(lab: &Lab, home: &TempDir, release: &str, revision: &str) -> Output {
+    knives_release(lab, home, &["members", release, "--carries", revision])
+}
+
+/// A member `name` forked at `base` that writes `files`: a cherry-pick of a
+/// revision's change onto a release's trunk commit, say.
+fn member_on(lab: &Lab, base: &str, name: &str, files: &[(&str, &str)]) {
+    branch_on(lab, base, name, |work| {
+        for (file, content) in files {
+            write_file(work, file, content);
+        }
+    });
+}
+
+#[test]
+fn carries_reads_a_trunk_merged_revision_from_before_its_merge() {
+    // Given (K11 19): X forks at T0 and writes two lines of `x.txt`; the
+    // trunk moves to T1, where N forks; a release made by hand on T1 of N,
+    // which does not hold X's change; then upstream merges X's pull request
+    // by a merge commit, so the trunk contains X's tip.
+    let lab = trunk_with(&[("l.txt", l_txt("0").as_str())]);
+    member_on(&lab, "main@upstream", X, &[("x.txt", X_LINES)]);
+    lab.upstream_trunk_file("l.txt", &l_txt("1"));
+    let before_merge = commit_at(&lab, "main@upstream");
+    member_on(&lab, "main@upstream", N, &[("n.txt", "n\n")]);
+    let lacking = hand_release(&lab, RELEASE, &[N], |_| {});
+    lab.publish_pull(X, 1);
+    lab.merge_pull_with_merge_commit(1);
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: X's carriage is asked against that release.
+    let output = carries_against(&lab, &home, RELEASE, X);
+
+    // Then: X's change is read from its fork point with the merge's first
+    // parent, T0: the release does not carry it, with the findings exit,
+    // and both its lines are named.
+    let out = stdout(&output);
+    assert!(
+        out.contains(&not_carried(RELEASE, &lacking)),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
+    for line in X_LINES_LOST {
+        assert!(out.contains(line), "{out}");
+    }
+
+    // And: the census, whose live release that is, reads it the same way.
+    let census_out = census(&lab, &home);
+    let block = census_block(&census_out, X);
+    assert!(
+        block.contains(&not_carried(RELEASE, &lacking)),
+        "{census_out}"
+    );
+    for line in X_LINES_LOST {
+        assert!(block.contains(line), "{census_out}");
+    }
+
+    // Given: a later release on T1 of N and a cherry-pick of X's change.
+    member_on(
+        &lab,
+        before_merge.as_str(),
+        "feat/x-pick",
+        &[("x.txt", X_LINES)],
+    );
+    let holding = hand_release(&lab, NEXT, &[N, "feat/x-pick"], |_| {});
+
+    // When/Then: `--carries` against it, and the census, whose live release
+    // it is now, read X as carried.
+    let carried = carries_against(&lab, &home, NEXT, X);
+    assert!(
+        stdout(&carried).contains(&carried_rewritten(NEXT, &holding)),
+        "{}",
+        text(&carried)
+    );
+    assert_eq!(carried.status.code(), Some(0), "{}", text(&carried));
+    let census_out = census(&lab, &home);
+    assert!(
+        census_block(&census_out, X).contains(&carried_rewritten(NEXT, &holding)),
+        "{census_out}"
+    );
+}
+
+#[test]
+fn carries_reads_a_fast_forwarded_revision_from_the_trunk_commit_its_release_stands_on() {
+    // Given (K11 20): X of two commits on c0: c1 adds `a.txt` and c2 adds
+    // `b.txt`; upstream fast-forwards its trunk to X, so X's tip is on the
+    // trunk's first-parent line; a release on c0 of a cherry-pick of c2.
+    let lab = trunk_with(&[("l.txt", l_txt("0").as_str())]);
+    let c0 = commit_at(&lab, "main@upstream");
+    member_on(&lab, "main@upstream", X, &[("a.txt", "c1 line\n")]);
+    extend_branch(&lab, X, "b.txt", "c2 line\n");
+    lab.publish_pull(X, 1);
+    lab.fast_forward_pull(1);
+    member_on(&lab, c0.as_str(), "feat/c2-pick", &[("b.txt", "c2 line\n")]);
+    let lacking = hand_release(&lab, RELEASE, &["feat/c2-pick"], |_| {});
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: X's carriage is asked against that release.
+    let output = carries_against(&lab, &home, RELEASE, X);
+
+    // Then: X's change is read from c0, the newest commit of the trunk's
+    // line that the release holds: X reads missing, and c1's line is named,
+    // not c2's, which the release holds.
+    let out = stdout(&output);
+    assert!(
+        out.contains(&not_carried(RELEASE, &lacking)),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
+    assert!(out.contains(C1_LINE_LOST), "{out}");
+    assert!(!out.contains("b.txt:"), "{out}");
+
+    // Given: a release on c0 of a member that holds both commits' changes.
+    member_on(
+        &lab,
+        c0.as_str(),
+        "feat/x-picks",
+        &[("a.txt", "c1 line\n"), ("b.txt", "c2 line\n")],
+    );
+    let holding = hand_release(&lab, NEXT, &["feat/x-picks"], |_| {});
+
+    // When/Then: X reads carried against it.
+    let carried = carries_against(&lab, &home, NEXT, X);
+    assert!(
+        stdout(&carried).contains(&carried_rewritten(NEXT, &holding)),
+        "{}",
+        text(&carried)
+    );
+    assert_eq!(carried.status.code(), Some(0), "{}", text(&carried));
+}
+
+/// K11 (20b): the trunk at an older commit, returned; then it moves to T1,
+/// where X forks and writes `x.txt` and Y forks and writes `y.txt`; Y
+/// merges X; the trunk moves to T2; and upstream merges Y's pull request by
+/// a merge commit, so the trunk contains X through Y.
+fn merged_through_another_branch() -> (Lab, CommitId) {
+    let lab = trunk_with(&[("l.txt", l_txt("0").as_str())]);
+    let older = commit_at(&lab, "main@upstream");
+    lab.upstream_trunk_file("l.txt", &l_txt("1"));
+    member_on(&lab, "main@upstream", X, &[("x.txt", X_LINES)]);
+    member_on(&lab, "main@upstream", Y, &[("y.txt", "y\n")]);
+    lab.jj_work(["new", "-r", Y, "-r", X, "-m", "merge feat/x into feat/y"]);
+    lab.jj_work(["bookmark", "set", Y, "-r", "@"]);
+    lab.jj_work(["new"]);
+    lab.upstream_trunk_file("l.txt", &l_txt("2"));
+    lab.publish_pull(Y, 1);
+    lab.merge_pull_with_merge_commit(1);
+    (lab, older)
+}
+
+#[test]
+fn carries_reads_a_revision_merged_through_another_branch_carried_where_the_release_holds_it() {
+    // Given (K11 20b, a control): X merged upstream through Y; a release on
+    // a trunk commit older than X's fork point, of a cherry-pick of X.
+    let (lab, older) = merged_through_another_branch();
+    member_on(&lab, older.as_str(), "feat/x-pick", &[("x.txt", X_LINES)]);
+    let release = hand_release(&lab, RELEASE, &["feat/x-pick"], |_| {});
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: X's carriage is asked against that release.
+    let output = carries_against(&lab, &home, RELEASE, X);
+
+    // Then: X's change is read from its own fork point, T1, so the trunk's
+    // change of `l.txt` is not charged to it: carried.
+    assert!(
+        stdout(&output).contains(&carried_rewritten(RELEASE, &release)),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+}
+
+#[test]
+fn carries_reads_a_revision_merged_through_another_branch_missing_where_the_release_lacks_it() {
+    // Given (K11 20b): X merged upstream through Y; a release on a trunk
+    // commit older than X's fork point, of a member that writes a file of
+    // its own.
+    let (lab, older) = merged_through_another_branch();
+    member_on(&lab, older.as_str(), O, &[("o.txt", "o\n")]);
+    let release = hand_release(&lab, RELEASE, &[O], |_| {});
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: X's carriage is asked against that release.
+    let output = carries_against(&lab, &home, RELEASE, X);
+
+    // Then: X reads missing, and its two lines are named.
+    let out = stdout(&output);
+    assert!(
+        out.contains(&not_carried(RELEASE, &release)),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
+    for line in X_LINES_LOST {
+        assert!(out.contains(line), "{out}");
+    }
+}
+
+/// K11 (20c): Y forks at T0's parent and writes `y.txt`; the trunk moves
+/// to T0, returned, where N forks and writes `n.txt`; upstream merges Y's
+/// pull request by a merge commit, then fast-forwards its trunk to X, two
+/// commits on that merge: c1 adds `a.txt` and c2 adds `b.txt`.
+fn fast_forward_after_a_merged_member() -> (Lab, CommitId) {
+    let lab = trunk_with(&[("l.txt", l_txt("0").as_str())]);
+    member_on(&lab, "main@upstream", Y, &[("y.txt", "y\n")]);
+    lab.upstream_trunk_file("l.txt", &l_txt("1"));
+    let t0 = commit_at(&lab, "main@upstream");
+    member_on(&lab, "main@upstream", N, &[("n.txt", "n\n")]);
+    lab.publish_pull(Y, 1);
+    lab.merge_pull_with_merge_commit(1);
+    member_on(&lab, "main@upstream", X, &[("a.txt", "c1 line\n")]);
+    extend_branch(&lab, X, "b.txt", "c2 line\n");
+    lab.publish_pull(X, 2);
+    lab.fast_forward_pull(2);
+    (lab, t0)
+}
+
+#[test]
+fn carries_reads_a_fast_forward_after_a_merged_member_carried_where_the_release_holds_it() {
+    // Given (K11 20c, a control): a release on T0 of Y, N, whose lines X
+    // lacks, and a member that holds c1's and c2's changes.
+    let (lab, t0) = fast_forward_after_a_merged_member();
+    member_on(
+        &lab,
+        t0.as_str(),
+        "feat/x-picks",
+        &[("a.txt", "c1 line\n"), ("b.txt", "c2 line\n")],
+    );
+    let release = hand_release(&lab, RELEASE, &[Y, N, "feat/x-picks"], |_| {});
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: X's carriage is asked against that release.
+    let output = carries_against(&lab, &home, RELEASE, X);
+
+    // Then: X's change is read from T0, the newest commit of the trunk's
+    // line that the release holds: Y's change and X's own, all of which the
+    // release holds, and not the absence of N's file: carried.
+    assert!(
+        stdout(&output).contains(&carried_rewritten(RELEASE, &release)),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+}
+
+#[test]
+fn carries_reads_a_fast_forward_after_a_merged_member_missing_where_the_release_lacks_c1() {
+    // Given (K11 20c): a release on T0 of Y, N and a member that holds c2's
+    // change alone.
+    let (lab, t0) = fast_forward_after_a_merged_member();
+    member_on(&lab, t0.as_str(), "feat/c2-pick", &[("b.txt", "c2 line\n")]);
+    let release = hand_release(&lab, RELEASE, &[Y, N, "feat/c2-pick"], |_| {});
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: X's carriage is asked against that release.
+    let output = carries_against(&lab, &home, RELEASE, X);
+
+    // Then: X reads missing, and only c1's line is named: not c2's or Y's,
+    // which the release holds, nor N's file.
+    let out = stdout(&output);
+    assert!(
+        out.contains(&not_carried(RELEASE, &release)),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
+    assert!(out.contains(C1_LINE_LOST), "{out}");
+    for other in ["b.txt", "y.txt", "n.txt"] {
+        assert!(!out.contains(other), "{out}");
+    }
+}
+
+#[test]
+fn a_member_the_trunk_contains_and_the_release_reaches_is_carried_by_ancestry() {
+    // Given (a control): X and N write `f.txt` each its own way; a release
+    // made by hand merges both and resolves `f.txt` to N's line, dropping
+    // X's; then upstream merges X's pull request by a merge commit, so the
+    // trunk contains X, which the release reaches.
+    let lab = trunk_with(&[("f.txt", "base line\n")]);
+    lab.branch(X, "f.txt", "x line\n");
+    lab.branch(N, "f.txt", "n line\n");
+    let release = hand_release(&lab, RELEASE, &[X, N], |work| {
+        write_file(work, "f.txt", "n line\n");
+    });
+    lab.publish_pull(X, 1);
+    lab.merge_pull_with_merge_commit(1);
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When/Then: `--verify` reads nothing missing, X included, which the
+    // trunk holds and the release reaches: exit 0, and no `!!` row.
+    let verified = verify(&lab, &home, RELEASE);
+    let out = stdout(&verified);
+    assert_eq!(verified.status.code(), Some(0), "{}", text(&verified));
+    assert!(!out.contains("!!"), "{out}");
+
+    // And: `--carries` of X against the release reads carried-exact.
+    let carried = carries_against(&lab, &home, RELEASE, X);
+    assert!(
+        stdout(&carried).contains(&format!(
+            "carried-exact      {RELEASE} @ {}",
+            release.short()
+        )),
+        "{}",
+        text(&carried)
+    );
+    assert_eq!(carried.status.code(), Some(0), "{}", text(&carried));
 }
 
 // ---------------------------------------------------------------------------
@@ -1618,6 +1975,114 @@ fn a_range_over_30000_words_is_not_followed_by_words() {
 
     // Then: the line reads lost, and the output says that the word step did
     // not run in that range.
+    assert!(
+        out.contains(
+            "      big.txt:2-2: the word step did not run (more than 30000 words); its lines \
+             count as lost"
+        ),
+        "{out}"
+    );
+}
+
+/// How long `members --verify` may take over K11 (21)'s hunk before the
+/// test kills it.
+const VERIFY_LIMIT: Duration = Duration::from_secs(60);
+
+/// K11 (21): `count` words drawn from a vocabulary of 50, `w0` to `w49`, in
+/// a fixed sequence.
+fn drawn_words(count: usize) -> Vec<String> {
+    (0..count).map(|at| format!("w{}", at * 7 % 50)).collect()
+}
+
+/// `words` with the word at `at` changed.
+fn word_changed(words: &[String], at: usize) -> Vec<String> {
+    let mut changed = words.to_vec();
+    changed[at] = "changed".to_owned();
+    changed
+}
+
+/// `words` as one line, with its line feed.
+fn word_line(words: &[String]) -> String {
+    format!("{}\n", words.join(" "))
+}
+
+/// [`verify`] run as a child process, killed when it has not finished
+/// within [`VERIFY_LIMIT`], so that a reading with no bound fails the test
+/// instead of hanging it. Its streams go to files, which no full pipe can
+/// stall. It prints how long the command took.
+fn verify_within_the_limit(lab: &Lab, home: &TempDir, release: &str) -> Output {
+    let (out_path, err_path) = (
+        lab.temp_path().join("verify.stdout"),
+        lab.temp_path().join("verify.stderr"),
+    );
+    let mut child = release_command(
+        lab,
+        home,
+        ReleaseOutput::Text,
+        &["members", release, "--verify"],
+    )
+    .stdout(std::fs::File::create(&out_path).expect("create the stdout file"))
+    .stderr(std::fs::File::create(&err_path).expect("create the stderr file"))
+    .spawn()
+    .expect("start knives release members --verify");
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll knives") {
+            break status;
+        }
+        if started.elapsed() >= VERIFY_LIMIT {
+            child.kill().expect("kill knives");
+            let killed = child.wait().expect("reap knives");
+            panic!(
+                "`knives release members {release} --verify` did not finish in {} s ({killed})",
+                VERIFY_LIMIT.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    eprintln!(
+        "`knives release members {release} --verify` took {:?}",
+        started.elapsed()
+    );
+    Output {
+        status,
+        stdout: std::fs::read(&out_path).expect("read the stdout file"),
+        stderr: std::fs::read(&err_path).expect("read the stderr file"),
+    }
+}
+
+#[test]
+fn verify_reads_a_line_over_30000_words_by_the_line_rule_in_bounded_time() {
+    // Given (K11 21, a control): M's hunk replaces L, a line of 40000 words
+    // drawn from 50, by L', L with one word changed, and a short line; N
+    // writes a file of its own; the release holds another text of L', one
+    // more word changed, and the short line.
+    let removed = drawn_words(40_000);
+    let copy = word_changed(&removed, 10_000);
+    let other = word_changed(&copy, 30_000);
+    let short = "a short line\n";
+    let fork = format!("keep\n{}end\n", word_line(&removed));
+    let lab = trunk_with(&[("big.txt", fork.as_str())]);
+    lab.branch(
+        M,
+        "big.txt",
+        &format!("keep\n{}{short}end\n", word_line(&copy)),
+    );
+    lab.branch(N, "n.txt", "n\n");
+    let release = format!("keep\n{}{short}end\n", word_line(&other));
+    hand_release(&lab, RELEASE, &[M, N], |work| {
+        write_file(work, "big.txt", &release);
+    });
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: the release's members are verified, within 60 s.
+    let output = verify_within_the_limit(&lab, &home, RELEASE);
+
+    // Then: M reads missing: L' is read by the line rule, lost, and the
+    // output says that the word step did not run in its range.
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
+    assert!(out.contains(&missing_row(&label(&lab, M))), "{out}");
     assert!(
         out.contains(
             "      big.txt:2-2: the word step did not run (more than 30000 words); its lines \
