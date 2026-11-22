@@ -493,6 +493,102 @@ fn compact_session_start_resets_the_notice_budget() {
 }
 
 #[test]
+fn a_clear_session_start_tells_the_roster_again() {
+    // Given: a managed session has already received its notice.
+    let repos = Repositories::new();
+    repos.configure(false);
+    let start = event("session-start", &repos.beta, None);
+    let first = run_hook(repos.home.path(), &start);
+    assert!(additional_context(&first).contains("fork managed by knives"));
+    let again = run_hook(repos.home.path(), &start);
+    assert!(
+        again.is_empty(),
+        "the control: a held roster is not told again: {again}"
+    );
+
+    // When: SessionStart reports a `/clear`, which keeps the session id.
+    let mut clear = event("session-start", &repos.beta, None);
+    clear["source"] = json!("clear");
+    let cleared = run_hook(repos.home.path(), &clear);
+
+    // Then: the roster comes at once, as for a new session (N28).
+    assert!(
+        additional_context(&cleared).contains("fork managed by knives"),
+        "was: {cleared}"
+    );
+}
+
+#[test]
+fn a_subagent_is_told_the_roster_its_parent_was_told() {
+    // Given: a session that was told beta's roster on a read.
+    let repos = Repositories::new();
+    repos.configure(false);
+    let read = event(
+        "post-tool-read",
+        &repos.alpha,
+        Some(&repos.beta.join("file.txt")),
+    );
+    let parent = run_hook(repos.home.path(), &read);
+    assert!(
+        additional_context(&parent).contains("feat/claimed"),
+        "was: {parent}"
+    );
+    let again = run_hook(repos.home.path(), &read);
+    assert!(
+        !again.contains("feat/claimed"),
+        "the control: the parent is not told again: {again}"
+    );
+
+    // When: a subagent of that session reads the same file. Its events carry
+    // the parent's session id and its own agent id.
+    let mut subagent = read.clone();
+    subagent["agent_id"] = json!("agent-def456");
+    subagent["agent_type"] = json!("Explore");
+    let told = run_hook(repos.home.path(), &subagent);
+
+    // Then: the subagent, whose context holds none of it, is told the roster
+    // (N22).
+    assert!(
+        additional_context(&told).contains("feat/claimed"),
+        "was: {told}"
+    );
+}
+
+#[test]
+fn a_notice_the_hook_could_not_write_is_not_recorded_as_told() {
+    // Given: a session start whose stdout nobody reads: the write fails.
+    let repos = Repositories::new();
+    repos.configure(false);
+    let start = event("session-start", &repos.beta, None);
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let mut command = hook_command(repos.home.path());
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .expect("hook stdin")
+        .write_all(start.to_string().as_bytes())
+        .expect("write hook input");
+    let lost = child.wait_with_output().expect("wait for hook");
+    assert!(lost.status.success(), "a hook must never fail the session");
+
+    // When: the session starts again with a stdout that is read.
+    let output = run_hook(repos.home.path(), &start);
+
+    // Then: the notice comes, since none was delivered (N24).
+    assert!(
+        additional_context(&output).contains("fork managed by knives"),
+        "was: {output}"
+    );
+}
+
+#[test]
 fn session_start_inside_a_trusted_root_emits_nothing() {
     // Given: Claude Code starts in a trusted root.
     let repos = Repositories::new();

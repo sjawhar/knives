@@ -324,13 +324,15 @@ fn the_same_roster_at_another_workspace_is_one_line() {
     let second = run_hook(repos.home.path(), &tool(&other.join("file.txt"), None));
     let third = run_hook(repos.home.path(), &tool(&other.join("file.txt"), None));
 
-    // Then: one line saying so, naming no claim; then nothing.
+    // Then: one line saying so, naming no claim; then nothing. The checkout
+    // has no commit, so no branch is read checked out there, and nothing is
+    // said of claims on it.
     let short = addition(&second);
     assert_eq!(notice_attribute(short, "digest"), digest);
     assert!(
         short.contains(&format!(
             "the claims on this fork are unchanged since the notice with digest {digest}.\n\
-             No claimed branch has its workspace here.\n"
+             </knives-notice-"
         )),
         "was: {short}"
     );
@@ -407,6 +409,217 @@ fn the_claim_on_a_touched_workspaces_branch_is_given_whole() {
         "was: {whole}"
     );
     assert_eq!(addition(&third), "");
+}
+
+/// Commits in `workspace` and checks out `branch` there, as a checkout made
+/// by hand has it.
+fn check_out(workspace: &Path, branch: &str) {
+    for args in [
+        &["add", "file.txt"][..],
+        &[
+            "-c",
+            "user.name=lab",
+            "-c",
+            "user.email=lab@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "work",
+        ][..],
+        &["checkout", "--quiet", "-b", branch][..],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(workspace)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+}
+
+#[test]
+fn a_checkout_of_a_claimed_branch_is_told_the_claim_whatever_its_name() {
+    // Given: a session that had beta's roster through the main checkout, and
+    // a checkout named `my-fix` with the claimed branch checked out.
+    let repos = Repositories::new();
+    let _ = run_hook(repos.home.path(), &tool(&repos.beta.join("file.txt"), None));
+    let workspace = repos.beta_workspace("my-fix");
+    check_out(&workspace, "feat/claimed");
+
+    // When: a file there is read.
+    let output = run_hook(repos.home.path(), &tool(&workspace.join("file.txt"), None));
+
+    // Then: the claim on the branch checked out is told, never that no
+    // claimed branch has its workspace here (B1).
+    let text = addition(&output);
+    assert!(
+        text.contains("This workspace's branch is claimed: feat/claimed (agent-one,"),
+        "was: {text}"
+    );
+    assert!(!text.contains("No claim"), "was: {text}");
+}
+
+#[test]
+fn a_session_that_lost_its_context_is_told_its_roster_again() {
+    // Given: a session that had beta's guidance and roster in one block.
+    let repos = Repositories::new();
+    let file = repos.beta.join("file.txt");
+    let first = run_hook(repos.home.path(), &tool_in_context(&file, "first", &[]));
+    assert!(addition(&first).contains("feat/claimed"), "was: {first}");
+    let nonces = guidance_nonces(addition(&first));
+    let held = run_hook(repos.home.path(), &tool_in_context(&file, "held", &nonces));
+    assert_eq!(addition(&held), "");
+
+    // When: the context no longer holds the block, as after `/clear`, a shake
+    // or a compaction of the harness.
+    let lost = run_hook(repos.home.path(), &tool_in_context(&file, "lost", &[]));
+
+    // Then: the guidance and the roster both come again.
+    let text = addition(&lost);
+    assert!(text.contains("beta instructions"), "the control: {text}");
+    assert!(text.contains("Branches claimed here (1)"), "was: {text}");
+    assert!(text.contains("feat/claimed"), "was: {text}");
+}
+
+#[test]
+fn after_a_lost_context_a_changed_claim_comes_with_the_whole_roster() {
+    // Given: a session that had the roster of two claims through feat/claimed's
+    // workspace, and then lost the block that told it.
+    let repos = Repositories::new();
+    repos.write_state(&json!({"claims": {
+        "maintainer/beta/feat/claimed": claim("feat/claimed"),
+        "maintainer/beta/feat/other": claim("feat/other")
+    }}));
+    let file = repos.beta_workspace("feat-claimed").join("file.txt");
+    let first = run_hook(repos.home.path(), &tool_in_context(&file, "first", &[]));
+    assert!(addition(&first).contains("feat/other"), "was: {first}");
+
+    // When: the other claim changes, and a file is read with the context lost.
+    repos.write_state(&json!({"claims": {
+        "maintainer/beta/feat/claimed": claim("feat/claimed"),
+        "maintainer/beta/feat/other": claim_with_reason("feat/other", "review fixes")
+    }}));
+    let lost = run_hook(repos.home.path(), &tool_in_context(&file, "lost", &[]));
+
+    // Then: the touched branch's claim and the changed one, not the delta.
+    let text = addition(&lost);
+    assert!(text.contains("review fixes"), "the control: {text}");
+    assert!(
+        text.contains("This workspace's branch is claimed: feat/claimed (agent-one,"),
+        "was: {text}"
+    );
+    assert!(!text.contains("only the changes follow"), "was: {text}");
+}
+
+#[test]
+fn a_reason_changed_back_is_told_where_it_was_last_shown_otherwise() {
+    // Given: a session shown feat/claimed's claim whole in its workspace,
+    // then shown it changed elsewhere.
+    let repos = Repositories::new();
+    let here = tool(&repos.beta_workspace("feat-claimed").join("file.txt"), None);
+    let elsewhere = tool(&repos.beta.join("file.txt"), None);
+    let _ = run_hook(repos.home.path(), &here);
+    repos.write_state(&json!({"claims": {
+        "maintainer/beta/feat/claimed": claim_with_reason("feat/claimed", "review fixes")
+    }}));
+    let changed = run_hook(repos.home.path(), &elsewhere);
+    assert!(
+        addition(&changed).contains("review fixes"),
+        "was: {changed}"
+    );
+
+    // When: the reason changes back, and the workspace is read again.
+    repos.write_state(&json!({"claims": {
+        "maintainer/beta/feat/claimed": claim("feat/claimed")
+    }}));
+    let reverted = run_hook(repos.home.path(), &here);
+
+    // Then: the claim as it is now, since the last the session saw was the
+    // other reason (older than #169: main also said nothing).
+    let text = addition(&reverted);
+    assert!(
+        text.contains("This workspace's branch is claimed: feat/claimed (agent-one,"),
+        "was: {text}"
+    );
+    assert!(text.contains("): porting\n"), "was: {text}");
+}
+
+#[test]
+fn a_claim_taken_again_after_its_release_is_told() {
+    // Given: a session shown feat/claimed's claim in its workspace, then its
+    // release elsewhere.
+    let repos = Repositories::new();
+    let here = tool(&repos.beta_workspace("feat-claimed").join("file.txt"), None);
+    let _ = run_hook(repos.home.path(), &here);
+    repos.write_state(&json!({"claims": {}}));
+    let released = run_hook(repos.home.path(), &tool(&repos.beta.join("file.txt"), None));
+    assert!(
+        addition(&released).contains("- released: feat/claimed"),
+        "was: {released}"
+    );
+
+    // When: the same claim is taken again, and the workspace is read.
+    repos.write_state(&json!({"claims": {
+        "maintainer/beta/feat/claimed": claim("feat/claimed")
+    }}));
+    let restored = run_hook(repos.home.path(), &here);
+
+    // Then: it is told, since the last the session saw was its release
+    // (older than #169).
+    let text = addition(&restored);
+    assert!(
+        text.contains("This workspace's branch is claimed: feat/claimed (agent-one,"),
+        "was: {text}"
+    );
+}
+
+#[test]
+fn a_reason_changed_back_is_told_at_a_new_workspace_too() {
+    // Given: as above, but the changed-back claim read at another workspace
+    // of the branch, never touched before.
+    let repos = Repositories::new();
+    let first = tool(&repos.beta_workspace("feat-claimed").join("file.txt"), None);
+    let _ = run_hook(repos.home.path(), &first);
+    repos.write_state(&json!({"claims": {
+        "maintainer/beta/feat/claimed": claim_with_reason("feat/claimed", "review fixes")
+    }}));
+    let _ = run_hook(repos.home.path(), &tool(&repos.beta.join("file.txt"), None));
+    repos.write_state(&json!({"claims": {
+        "maintainer/beta/feat/claimed": claim("feat/claimed")
+    }}));
+
+    // When: the other workspace is read.
+    let second = repos.beta_workspace("copy/feat-claimed");
+    let reverted = run_hook(repos.home.path(), &tool(&second.join("file.txt"), None));
+
+    // Then: the claim as it is now.
+    let text = addition(&reverted);
+    assert!(text.contains("agent-one"), "was: {text}");
+    assert!(text.contains("porting"), "was: {text}");
+}
+
+#[test]
+fn a_new_holder_of_a_touched_branch_is_named_whole() {
+    // Given: a session shown feat/claimed's claim in its workspace.
+    let repos = Repositories::new();
+    let here = tool(&repos.beta_workspace("feat-claimed").join("file.txt"), None);
+    let _ = run_hook(repos.home.path(), &here);
+
+    // When: another agent holds the branch now.
+    let mut newer = claim_with_reason("feat/claimed", LONG_REASON);
+    newer["owner"] = json!("agent-two");
+    newer["started"] = json!("2026-01-02T00:00:00Z");
+    repos.write_state(&json!({"claims": {"maintainer/beta/feat/claimed": newer}}));
+    let output = run_hook(repos.home.path(), &here);
+
+    // Then: the new holder, with the whole reason, and not the old one.
+    let text = addition(&output);
+    assert!(
+        text.contains("This workspace's branch is claimed: feat/claimed (agent-two,"),
+        "was: {text}"
+    );
+    assert!(text.contains(LONG_REASON), "was: {text}");
+    assert!(!text.contains("agent-one"), "was: {text}");
 }
 
 #[test]
