@@ -2970,6 +2970,27 @@ fn forgetting_a_record_on_another_repository_follows_the_table() {
             exit: 2,
             left: &[F13],
         },
+        // T7: a member token on a live repository that is no fork's names
+        // that record alone when the forge says the repository is another;
+        // with the forge down, it might be this fork's former name.
+        ForgetRow {
+            row: "F51",
+            config: CONFIG_X,
+            held: &[OTHER_M, M],
+            now: ForgeNow::Up,
+            texts: &[OTHER_M],
+            exit: 0,
+            left: &[M],
+        },
+        ForgetRow {
+            row: "F52",
+            config: CONFIG_X,
+            held: &[OTHER_M, M],
+            now: ForgeNow::Down,
+            texts: &[OTHER_M],
+            exit: 3,
+            left: &[OTHER_M, M],
+        },
     ]);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
@@ -3157,6 +3178,31 @@ fn forgetting_beside_other_requirements_follows_the_table() {
         },
     ]);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+fn naming_a_member_offline_beside_another_spelling_says_it_writes_a_second_one() {
+    // Given: config A, where nothing here spells acme/demo; feat/alpha holds
+    // feat/base as a peer machine spells it, and the forge is down.
+    let fixture = fixture_with(CONFIG_A.0, CONFIG_A.1);
+    fixture.hold("feat/alpha", &[M]);
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+
+    // When: feat/base is named.
+    let output = fixture.depends(&["--on", "feat/base"]);
+
+    // Then: this checkout's spelling is written beside the peer's, and the
+    // output says so (N79).
+    let mut held = fixture.required("feat/alpha");
+    held.sort();
+    assert_eq!(held, [M_OLD, M], "{output}");
+    assert!(
+        output.contains(&format!(
+            "{M_OLD} is recorded beside {M}: the forge did not say acme/demo is demo's own \
+             repository; if it is a former name, they are one requirement under two spellings"
+        )),
+        "{output}"
+    );
 }
 
 #[test]
