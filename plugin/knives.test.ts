@@ -1,14 +1,5 @@
 import { expect, test } from "bun:test";
-import {
-  chmod,
-  mkdir,
-  mkdtemp,
-  readFile,
-  realpath,
-  rm,
-  symlink,
-  writeFile,
-} from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 
@@ -1100,10 +1091,10 @@ test("a developer's or a session's environment reaches nothing this file starts"
   }
 }, 60_000);
 
-// The setup stops a run whose PATH holds no git or jj but wrappers, naming them, instead of letting
-// each test fail on a spawn error that does not say why. It starts a whole `bun test`, so it is
-// given more than the default 5 s.
-test("a PATH whose only git and jj are wrappers stops the tests, naming them", async () => {
+// The setup stops a run whose PATH holds no git but wrappers, naming them, instead of letting each
+// test fail on a spawn error that does not say why; a jj wrapper is dropped without stopping, since
+// these tests never start jj. It starts a whole `bun test`, so it is given more than the default 5 s.
+test("a PATH whose only git is a wrapper stops the tests, naming it", async () => {
   const plant = await mkdtemp(join(tmpdir(), "knives-plugin-wrappers-"));
   try {
     const bin = join(plant, "bin");
@@ -1129,9 +1120,7 @@ test("a PATH whose only git and jj are wrappers stops the tests, naming them", a
     expect(report).toContain(
       `knives tests: PATH has no real git: skipped ${join(bin, "git")}, a script`
     );
-    expect(report).toContain(
-      `knives tests: PATH has no real jj: skipped ${join(bin, "jj")}, a link to ${await realpath(process.execPath)}`
-    );
+    expect(report).not.toContain("knives tests: PATH has no real jj");
     expect(report).toContain(`knives tests: searched PATH=${bin}`);
   } finally {
     await rm(plant, { recursive: true, force: true });

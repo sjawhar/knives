@@ -15,8 +15,9 @@
 //   nothing), with GIT_CONFIG_NOSYSTEM set and both editors `false`;
 // - drops from PATH every directory whose git or jj is a wrapper (a script,
 //   or a link to a program of another name) rather than the program, and
-//   throws, naming each wrapper and the PATH it searched, when that leaves no
-//   real git or jj where it skipped a wrapper of one.
+//   throws, naming each git wrapper and the PATH it searched, when that leaves
+//   no real git. Only git: these tests start git and never jj, and CI's plugin
+//   job installs no jj.
 //
 // Bun.spawn and Bun.spawnSync start a child with the environment this process
 // started with unless given `env`, so every spawn in the tests passes
@@ -74,6 +75,7 @@ for (const directory of searched.split(delimiter).filter((entry) => entry.length
 }
 const unreplaced = skipped.filter(
   ({ program }) =>
+    program === "git" &&
     !kept.some((directory) =>
       statSync(join(directory, program), { throwIfNoEntry: false })?.isFile()
     )
