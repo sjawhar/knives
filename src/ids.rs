@@ -594,6 +594,40 @@ impl Requirement {
             _ => false,
         }
     }
+
+    /// Whether `text` spells this record: the same kind, number or branch,
+    /// and repository, the repository's letter case aside (a forge's
+    /// `<owner>/<name>` is case-blind; a branch name is not). A text that is
+    /// no token is compared as it is written.
+    pub fn spelled_as(&self, text: &str) -> bool {
+        let Some(named) = Self::parse(text) else {
+            return self.to_string() == text;
+        };
+        match (self, &named) {
+            (
+                Self::Upstream { repo, number },
+                Self::Upstream {
+                    repo: other,
+                    number: other_number,
+                },
+            ) => number == other_number && repo.as_str().eq_ignore_ascii_case(other.as_str()),
+            (
+                Self::ForkPull { repository, number },
+                Self::ForkPull {
+                    repository: other,
+                    number: other_number,
+                },
+            ) => number == other_number && repository.eq_ignore_ascii_case(other),
+            (
+                Self::ForkBranch { repository, branch },
+                Self::ForkBranch {
+                    repository: other,
+                    branch: other_branch,
+                },
+            ) => branch == other_branch && repository.eq_ignore_ascii_case(other),
+            _ => false,
+        }
+    }
 }
 
 /// Whether `text` is a forge repository's `<owner>/<name>`, holding none of

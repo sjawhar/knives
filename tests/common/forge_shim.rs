@@ -300,7 +300,9 @@ pub struct Repository<'a> {
 }
 
 /// Install a fake `gh` that answers each of `repositories` apart, as a forge
-/// does: `repo view <owner>/<name>` gives that repository's identity, `pr
+/// does, matching a repository's name whatever its letter case, as GitHub
+/// does (each `named` is written in lower case): `repo view <owner>/<name>`
+/// gives that repository's identity, `pr
 /// list -R <owner>/<name>` its pull requests, and a by-number facts query
 /// (`api graphql -f owner=… -f name=…`) the pull requests it asks about of
 /// the repository its `owner` and `name` fields name, a number that
@@ -387,18 +389,18 @@ pub fn install_repository_gh_failing(
              done\n\
              case \"$1 $2\" in\n\
              \"repo view\")\n\
-               case \"$3\" in\n\
+               case \"$(printf '%s' \"$3\" | tr 'A-Z' 'a-z')\" in\n\
              {views}\
                esac\n\
                echo \"GraphQL: Could not resolve to a Repository with the name '$3'.\" >&2\n\
                exit 1 ;;\n\
              \"pr list\")\n\
-               case \"$4\" in\n\
+               case \"$(printf '%s' \"$4\" | tr 'A-Z' 'a-z')\" in\n\
              {lists}\
                esac\n\
                echo '[]'; exit 0 ;;\n\
              \"api graphql\")\n\
-               case \"$owner $name\" in\n\
+               case \"$(printf '%s %s' \"$owner\" \"$name\" | tr 'A-Z' 'a-z')\" in\n\
              {facts}\
                esac\n\
                echo \"GraphQL: Could not resolve to a Repository with the name '$owner/$name'.\" >&2\n\

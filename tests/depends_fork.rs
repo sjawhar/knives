@@ -2741,6 +2741,18 @@ fn forgetting_a_member_branch_follows_the_table() {
             exit: 3,
             left: both,
         },
+        // N86: a token whose repository differs from the record's only in
+        // letter case spells that record, and takes every record of the
+        // member the forge places with it.
+        ForgetRow {
+            row: "F55",
+            config: CONFIG_B,
+            held: both,
+            now: ForgeNow::Up,
+            texts: &["origin:ACME-OLD/demo:feat/base"],
+            exit: 0,
+            left: &[],
+        },
     ]);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
@@ -2899,6 +2911,27 @@ fn forgetting_where_only_the_forge_could_decide_follows_the_table() {
             exit: 0,
             left: &[OTHER13],
         },
+        // T8: the same in config A, where nothing here spells acme/demo and
+        // this fork's member reaches the forget only through the forge
+        // placing acme/demo as the fork's own.
+        ForgetRow {
+            row: "F53",
+            config: CONFIG_A,
+            held: &[OTHER_M, M],
+            now: ForgeNow::Up,
+            texts: &[OTHER_M],
+            exit: 0,
+            left: &[M],
+        },
+        ForgetRow {
+            row: "F54",
+            config: CONFIG_A,
+            held: &[OTHER_M, M],
+            now: ForgeNow::Down,
+            texts: &[OTHER_M],
+            exit: 3,
+            left: &[OTHER_M, M],
+        },
     ]);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
@@ -3033,17 +3066,35 @@ fn naming_a_member_offline_beside_another_spelling_says_it_writes_a_second_one()
     let output = fixture.depends(&["--on", "feat/base"]);
 
     // Then: this checkout's spelling is written beside the peer's, and the
-    // output says so (N79).
+    // output says so (N79), without calling acme/demo a former name: it is
+    // the repository's current name (N84).
     let mut held = fixture.required("feat/alpha");
     held.sort();
     assert_eq!(held, [M_OLD, M], "{output}");
     assert!(
         output.contains(&format!(
-            "{M_OLD} is recorded beside {M}: the forge did not say acme/demo is demo's own \
-             repository; if it is a former name, they are one requirement under two spellings"
+            "{M_OLD} is recorded beside {M}: whether acme/demo is another name of demo's own \
+             repository could not be asked of the forge; if it is, they are one requirement under \
+             two spellings"
         )),
         "{output}"
     );
+}
+
+#[test]
+fn naming_a_member_the_forge_places_reuses_its_record_and_says_nothing_more() {
+    // Given: config A; feat/alpha holds feat/base as a peer machine spells
+    // it, under the repository's current name; the forge answers.
+    let fixture = fixture_with(CONFIG_A.0, CONFIG_A.1);
+    fixture.hold("feat/alpha", &[M]);
+
+    // When: feat/base is named.
+    let output = fixture.depends(&["--on", "feat/base"]);
+
+    // Then: the held record is reused, and no line speaks of two spellings
+    // (N85).
+    assert_eq!(fixture.required("feat/alpha"), [M], "{output}");
+    assert!(!output.contains("is recorded beside"), "{output}");
 }
 
 #[test]
@@ -3067,6 +3118,9 @@ fn naming_a_member_beside_a_record_on_another_repository_records_this_forks_memb
         ],
         "{output}"
     );
+    // And: the forge named acme/other as another repository, so no line
+    // says the two may be one requirement (N84).
+    assert!(!output.contains("is recorded beside"), "{output}");
 }
 
 #[test]
@@ -3093,6 +3147,37 @@ fn a_review_pull_request_of_a_fork_of_this_fork_is_this_forks_review_pull_reques
         fixture.required("feat/alpha"),
         ["origin:acme/demo#13"],
         "{output}"
+    );
+}
+
+#[test]
+fn a_review_pull_request_under_the_forks_new_name_is_its_own_beside_a_fork_of_this_fork() {
+    // Given: config A, where nothing here spells acme/demo, the fork's
+    // current name; the registry holds a fork of this fork whose upstream is
+    // acme/demo.
+    let fixture = fixture_with(CONFIG_A.0, CONFIG_A.1);
+    let registry = fixture.home.path().join("repos.toml");
+    let text = std::fs::read_to_string(&registry).expect("read the registry");
+    std::fs::write(
+        &registry,
+        format!(
+            "{text}[repos.child]\nupstream = \"{ORIGIN}\"\n\
+             origin = \"https://forge.invalid/acme/child\"\n"
+        ),
+    )
+    .expect("rewrite the registry");
+
+    // When: #13 is named by the fork's current name.
+    let output = fixture.depends(&["--on", "acme/demo#13"]);
+
+    // Then: the forge names this fork's repository acme/demo, so it is this
+    // fork's review pull request #13, not the child's upstream pull request
+    // (N83).
+    let held = fixture.required("feat/alpha");
+    assert_eq!(held.len(), 1, "{output}");
+    assert!(
+        held[0].starts_with("origin:") && held[0].ends_with("/demo#13"),
+        "{held:?}\n{output}"
     );
 }
 
@@ -3249,7 +3334,7 @@ fn naming_a_member_beside_another_forks_branch_of_its_name_records_this_forks_me
     fixture.hold("feat/alpha", &["origin:acme/sibling:feat/landed"]);
 
     // When: this fork's feat/landed is named.
-    let _ = fixture.depends(&["--on", "feat/landed"]);
+    let output = fixture.depends(&["--on", "feat/landed"]);
 
     // Then: it is recorded as this fork's member, beside the other fork's
     // branch (N61(b)).
@@ -3260,8 +3345,11 @@ fn naming_a_member_beside_another_forks_branch_of_its_name_records_this_forks_me
         [
             "origin:acme/demo:feat/landed",
             "origin:acme/sibling:feat/landed"
-        ]
+        ],
+        "{output}"
     );
+    // And: no line says the two may be one requirement (N85).
+    assert!(!output.contains("is recorded beside"), "{output}");
 }
 
 #[test]

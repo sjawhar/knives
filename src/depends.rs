@@ -108,7 +108,7 @@ pub(crate) fn run(
         .collect();
     let own = context.own();
     let added = as_held(added, &staying, &forged.aliases, &own);
-    let beside = context.spelled_beside(&staying, &added);
+    let beside = context.spelled_beside(&staying, &added, &forged.unplaced);
     let pr = store.tracked_pull(&target);
     let replaces = store.statement_stamp(&target, StatementKind::Depends);
     let subject = Some(branch.as_str());
@@ -216,11 +216,12 @@ struct MemberText<'t> {
     branch: BranchName,
 }
 
-/// The records of `required` spelled exactly `text`.
+/// The records of `required` that `text` spells exactly, the repository's
+/// letter case aside ([`Requirement::spelled_as`]).
 fn exactly(required: &[Requirement], text: &str) -> Vec<Requirement> {
     required
         .iter()
-        .filter(|held| held.to_string() == text)
+        .filter(|held| held.spelled_as(text))
         .cloned()
         .collect()
 }
@@ -251,14 +252,16 @@ fn reasons(unasked: &[(Requirement, String)], records: &[&Requirement]) -> Strin
 /// What the forge says, before the fork's lock, about the list the pulled
 /// ledger states: per `--forget` text, its [`Tie`]; per requirement to add,
 /// the record already held under another name of its repository
-/// ([`Context::held_alias`]). Asked before the lock, so no forge round trip
-/// holds it. A list another writer changes before the lock is taken can
-/// only make a forget refuse or an add write a second spelling, never
-/// forget the wrong requirement.
+/// ([`Context::held_alias`]), and the member records held under a name
+/// whose repository the forge could not be asked about (`unplaced`). Asked
+/// before the lock, so no forge round trip holds it. A list another writer
+/// changes before the lock is taken can only make a forget refuse or an add
+/// write a second spelling, never forget the wrong requirement.
 #[derive(Default)]
 struct Forged {
     ties: Vec<Tie>,
     aliases: Vec<Option<Requirement>>,
+    unplaced: Vec<Requirement>,
 }
 
 fn forged(
@@ -273,8 +276,8 @@ fn forged(
             .all(|wanted| matches!(wanted, Requirement::Upstream { .. }))
     {
         return Ok(Forged {
-            ties: Vec::new(),
             aliases: vec![None; added.len()],
+            ..Forged::default()
         });
     }
     let read = Store::open(
@@ -291,11 +294,18 @@ fn forged(
         .iter()
         .map(|text| context.tied_by_forge(&required, text))
         .collect();
-    let aliases = added
-        .iter()
-        .map(|wanted| context.held_alias(&required, wanted))
-        .collect();
-    Ok(Forged { ties, aliases })
+    let mut aliases = Vec::new();
+    let mut unplaced = Vec::new();
+    for wanted in added {
+        let (alias, unasked) = context.held_alias(&required, wanted);
+        aliases.push(alias);
+        joined(&mut unplaced, unasked);
+    }
+    Ok(Forged {
+        ties,
+        aliases,
+        unplaced,
+    })
 }
 
 /// `added`, each as `required` already holds it when it holds it under
@@ -487,7 +497,12 @@ impl Context<'_, '_> {
     /// The pull request `<repo>#<number>` names: by a registry name, the one
     /// the forge finds; by this fork's own repository, that repository's,
     /// even when a fork of this fork in the registry has it as its upstream;
-    /// by an upstream's `<owner>/<name>`, that upstream's.
+    /// by an upstream's `<owner>/<name>`, that upstream's. A name that is
+    /// another fork's upstream but no spelling here may be this fork's own
+    /// repository under its new name, when the other fork is a fork of this
+    /// one: the forge is asked, and when it names this fork's repository so,
+    /// the pull request is this fork's. When it cannot be asked, the name is
+    /// read as the other fork's upstream, as before.
     fn pull_request(&self, text: &str, repo: &str, number: u64) -> Result<Requirement, Exit> {
         if let Some(fork) = self.registry.repos.get_key_value(repo) {
             return self.asked_which(text, fork, number);
@@ -496,6 +511,12 @@ impl Context<'_, '_> {
             return self.fork_pull(origin, number);
         }
         if let Some(upstream) = self.registry.resolve(repo) {
+            let origin = self.fork.own_origin();
+            if upstream != self.fork.upstream
+                && matches!(self.named(origin), Ok(own) if own.eq_ignore_ascii_case(repo))
+            {
+                return self.fork_pull(origin, number);
+            }
             return Ok(Requirement::Upstream {
                 repo: upstream,
                 number,
@@ -938,7 +959,7 @@ impl Context<'_, '_> {
     fn weighed(&self, required: &[Requirement], text: &str, tie: &Tie) -> Result<Weighed, Exit> {
         if let Some(exact) = required
             .iter()
-            .find(|held| matches!(held, Requirement::Upstream { .. }) && held.to_string() == text)
+            .find(|held| matches!(held, Requirement::Upstream { .. }) && held.spelled_as(text))
         {
             return Ok(Weighed::settled(vec![exact.clone()]));
         }
@@ -1279,9 +1300,9 @@ impl Context<'_, '_> {
         // A text spelled exactly as a held upstream record names that record
         // alone, as an exact member token does: no forge is asked.
         if !explicit
-            && required.iter().any(|held| {
-                matches!(held, Requirement::Upstream { .. }) && held.to_string() == text
-            })
+            && required
+                .iter()
+                .any(|held| matches!(held, Requirement::Upstream { .. }) && held.spelled_as(text))
         {
             return Tie::default();
         }
@@ -1388,7 +1409,7 @@ impl Context<'_, '_> {
             .iter()
             .filter(|held| {
                 matches!(held, Requirement::ForkBranch { branch: other, .. } if *other == named.branch)
-                    && held.to_string() != named.text
+                    && !held.spelled_as(named.text)
             })
             .collect();
         let text_elsewhere = repository.filter(|on| elsewhere(on));
@@ -1435,24 +1456,32 @@ impl Context<'_, '_> {
     /// forge resolves to this fork's repository, as one written before a
     /// rename, or by a machine whose `origin` spells the repository so.
     /// `None` when there is none, or the forge cannot say: then `wanted` is
-    /// written as it is.
-    fn held_alias(&self, required: &[Requirement], wanted: &Requirement) -> Option<Requirement> {
+    /// written as it is. With it, for a member, the records of its branch on
+    /// a repository the forge could not be asked about.
+    fn held_alias(
+        &self,
+        required: &[Requirement],
+        wanted: &Requirement,
+    ) -> (Option<Requirement>, Vec<Requirement>) {
         let origin = self.fork.own_origin();
-        let slug = remote_slug(origin)?;
-        let names = |other: &str, repository: &str| {
-            matches!(self.named(&origin.replacen(slug, other, 1)),
-                Ok(name) if name.eq_ignore_ascii_case(repository))
+        let Some(slug) = remote_slug(origin) else {
+            return (None, Vec::new());
         };
+        let named_as = |other: &str| self.named(&origin.replacen(slug, other, 1));
         match wanted {
-            Requirement::ForkPull { repository, number } => required
-                .iter()
-                .find(|held| {
-                    matches!(held, Requirement::ForkPull { repository: other, number: held_number }
-                        if held_number == number
-                            && !other.eq_ignore_ascii_case(repository)
-                            && names(other, repository))
-                })
-                .cloned(),
+            Requirement::ForkPull { repository, number } => (
+                required
+                    .iter()
+                    .find(|held| {
+                        matches!(held, Requirement::ForkPull { repository: other, number: held_number }
+                            if held_number == number
+                                && !other.eq_ignore_ascii_case(repository)
+                                && matches!(named_as(other),
+                                    Ok(name) if name.eq_ignore_ascii_case(repository)))
+                    })
+                    .cloned(),
+                Vec::new(),
+            ),
             Requirement::ForkBranch { repository, branch } => {
                 let elsewhere: Vec<&Requirement> = required
                     .iter()
@@ -1465,15 +1494,26 @@ impl Context<'_, '_> {
                     })
                     .collect();
                 if elsewhere.is_empty() {
-                    return None;
+                    return (None, Vec::new());
                 }
-                let own = self.named(origin).ok()?;
-                elsewhere
-                    .into_iter()
-                    .find(|held| held.repository().is_some_and(|other| names(other, &own)))
-                    .cloned()
+                let own = self.named(origin);
+                let mut alias = None;
+                let mut unplaced = Vec::new();
+                for held in elsewhere {
+                    let Some(other) = held.repository() else {
+                        continue;
+                    };
+                    match own.as_ref().map_err(Clone::clone).and_then(|own| {
+                        named_as(other).map(|name| name.eq_ignore_ascii_case(own))
+                    }) {
+                        Ok(true) if alias.is_none() => alias = Some(held.clone()),
+                        Ok(_) => {}
+                        Err(_) => unplaced.push(held.clone()),
+                    }
+                }
+                (alias, unplaced)
             }
-            Requirement::Upstream { .. } => None,
+            Requirement::Upstream { .. } => (None, Vec::new()),
         }
     }
 
@@ -1600,12 +1640,17 @@ impl Context<'_, '_> {
 
     /// What to say of each member in `added` that this command writes under
     /// this checkout's spelling while `staying` holds a record of the same
-    /// branch on a repository that is neither a spelling here nor another
-    /// fork's: the forge did not place that record as this fork's (it was
-    /// down, or names another repository), so the two are written apart. If
-    /// that repository is a former name of this fork's, the list now holds
-    /// one requirement under two spellings.
-    fn spelled_beside(&self, staying: &[Requirement], added: &[Requirement]) -> Vec<String> {
+    /// branch whose repository the forge could not be asked about
+    /// (`unplaced`, from [`Self::held_alias`]): the two are written apart,
+    /// and if that repository is another name of this fork's, the list now
+    /// holds one requirement under two spellings. Nothing is said of a
+    /// record the forge named as another repository's.
+    fn spelled_beside(
+        &self,
+        staying: &[Requirement],
+        added: &[Requirement],
+        unplaced: &[Requirement],
+    ) -> Vec<String> {
         let mut lines = Vec::new();
         for wanted in added {
             let Requirement::ForkBranch { branch, .. } = wanted else {
@@ -1620,13 +1665,12 @@ impl Context<'_, '_> {
                     branch: other,
                 } = held
                     && other == branch
-                    && !self.is_own_repository(repository)
-                    && self.other_fork(repository).is_none()
+                    && unplaced.contains(held)
                 {
                     lines.push(format!(
-                        "{wanted} is recorded beside {held}: the forge did not say {repository} \
-                         is {}'s own repository; if it is a former name, they are one \
-                         requirement under two spellings",
+                        "{wanted} is recorded beside {held}: whether {repository} is another \
+                         name of {}'s own repository could not be asked of the forge; if it is, \
+                         they are one requirement under two spellings",
                         self.fork.name
                     ));
                 }
