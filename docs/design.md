@@ -538,7 +538,11 @@ A text spells a record when it parses to the same kind, number or branch, and re
 the repository's letter case aside; a branch name's case always counts. A pull request
 named `<owner>/<name>#<n>` by another fork's upstream that no spelling here gives is this
 fork's own when the forge names this fork's repository so, as when a fork of this fork is
-registered after a rename; when the forge cannot be asked, it is the other fork's.
+registered after a rename. When the forge cannot be asked, it is the other fork's, unless
+the repository is owned by the owner of a registered fork's own repository, so the other
+fork may be a fork of this one: then nothing is recorded (exit 3), and the refusal names
+that fork. A project's upstream is owned by someone else, so this costs no offline `--on`
+in a registry without a fork of a fork.
 An upstream's `<owner>/<name>#<n>` is taken back without the forge. The forge has no
 answer that means a repository does not exist: GitHub answers a name it cannot resolve the
 same way for a repository that is gone, for one the token cannot see, and in some

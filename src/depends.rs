@@ -598,7 +598,8 @@ impl Context<'_, '_> {
     /// repository under its new name, when the other fork is a fork of this
     /// one: the forge is asked, and when it names this fork's repository so,
     /// the pull request is this fork's. When it cannot be asked, the name is
-    /// read as the other fork's upstream, as before.
+    /// read as the other fork's upstream, unless that fork may be a fork of
+    /// this one ([`Self::fork_of_ours`]): then nothing is recorded (exit 3).
     fn pull_request(&self, text: &str, repo: &str, number: u64) -> Result<Requirement, Exit> {
         if let Some(fork) = self.registry.repos.get_key_value(repo) {
             return self.asked_which(text, fork, number);
@@ -607,11 +608,28 @@ impl Context<'_, '_> {
             return self.fork_pull(origin, number);
         }
         if let Some(upstream) = self.registry.resolve(repo) {
-            let origin = self.fork.own_origin();
-            if upstream != self.fork.upstream
-                && matches!(self.named(origin), Ok(own) if own.eq_ignore_ascii_case(repo))
-            {
-                return self.fork_pull(origin, number);
+            if upstream != self.fork.upstream {
+                let origin = self.fork.own_origin();
+                match self.named(origin) {
+                    Ok(own) if own.eq_ignore_ascii_case(repo) => {
+                        return self.fork_pull(origin, number);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        if let Some(child) = self.fork_of_ours(repo) {
+                            return refused(
+                                Exit::Incomplete,
+                                format_args!(
+                                    "nothing recorded: {repo} in {text} is the upstream of \
+                                     {child}, which may be a fork of {}, and whether {}'s own \
+                                     repository is now called {repo} could not be asked of the \
+                                     forge: {error}. Run it again when the forge answers",
+                                    self.fork.name, self.fork.name
+                                ),
+                            );
+                        }
+                    }
+                }
             }
             return Ok(Requirement::Upstream {
                 repo: upstream,
@@ -1685,6 +1703,41 @@ impl Context<'_, '_> {
                 ),
             ),
         }
+    }
+
+    /// The registry key of a fork, other than this one, whose upstream is
+    /// `repository` and that may be a fork of this one: `repository` is
+    /// owned by the owner of a registered fork's own repository (this one's
+    /// included, by any spelling here). Without the forge, a fork of this fork
+    /// whose upstream spells this fork's repository under a name nothing here
+    /// gives cannot be told from a fork of another project; a project's
+    /// upstream is owned by someone else, so only an upstream owned where the
+    /// registry keeps its forks is held as maybe this fork's.
+    fn fork_of_ours(&self, repository: &str) -> Option<&str> {
+        let (owner, _) = repository.split_once('/')?;
+        let ours = |url: &str| {
+            remote_slug(url)
+                .and_then(|slug| slug.split_once('/'))
+                .is_some_and(|(other, _)| other.eq_ignore_ascii_case(owner))
+        };
+        let owned_here = self
+            .registry
+            .repos
+            .values()
+            .any(|entry| ours(&entry.origin))
+            || ours(self.fork.own_origin());
+        if !owned_here {
+            return None;
+        }
+        self.registry
+            .repos
+            .iter()
+            .find(|(key, entry)| {
+                entry.upstream_name(key) != self.fork.upstream
+                    && remote_slug(&entry.upstream)
+                        .is_some_and(|slug| slug.eq_ignore_ascii_case(repository))
+            })
+            .map(|(key, _)| key.as_str())
     }
 
     /// This fork's `origin` URL that spells its own repository as
