@@ -497,11 +497,14 @@ carried later can change it; each one that is unmet or cannot be judged is a pro
 names the dependent, what could not be read, what was seen of the requirement, and the
 `knives depends <dependent> --forget …` command that takes those back, with a fetch
 suggested only when the recorded commit is not here. The command takes each requirement's
-records whatever the forge answers: every record of its pull request number or member on a
-repository that is not another fork's and that the forge did not name as another, each as
-spelled (a member by its branch name when every such record spells a spelling here and the
-name holds no `#`); a record on another fork's repository, or one the forge named as
-another, alone. The problem says when the command takes a record it does not list. Under
+records in one run while the forge answers as it did for `status`: every record of its pull
+request number or member on a repository that is not another fork's and that the forge did
+not name as another, each as spelled (a member by its branch name when every such record
+spells a spelling here and the name holds no `#`); a record on another fork's repository,
+or one the forge named as another, alone. If the forge stops answering between `status`
+and the forget, a record `status` left out because the forge named it apart may be meant
+again: the forget is refused (exit 3) and prints a command that takes it too. The problem
+says when the command takes a record it does not list. Under
 `--no-landed` a recorded commit can still be shown landed by its merged pull request's
 landing, not by a replay: one shown landed is judged as above, like a missing or
 unrecorded one, and one not shown landed has its requirements checked as a row's, with a
