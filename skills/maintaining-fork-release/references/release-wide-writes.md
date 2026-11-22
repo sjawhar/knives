@@ -9,7 +9,7 @@ Read this before a release-wide write: a release rebase, a member rehome an owne
    - `knives start <release name> --why <reason>` takes the release claim. Its workspace rests on the root commit, not on a release commit. `knives finish <release name>` releases the claim.
    - Make each hand resolution on the release commit in the claim's workspace. The claim's working copy rests on the root commit, and a release write moves no working copy. So before each hand resolution, run `jj new <release name>` there. Resolve, run `jj squash`, and record it with `knives release adopt`.
    - A working copy that rests on a release commit that a write replaces keeps that commit, and the write says so. A release write runs from the checkout, whichever workspace you start it in.
-   - `finish` forgets the claim's workspace and abandons each such commit that nothing else holds. A working copy of another workspace (the main checkout's, say) that rests on a release commit keeps it after `finish`, so move that working copy off (`jj new 'root()'`) before `finish`.
+   - `finish` forgets the claim's workspace and abandons each such commit that nothing else holds. While the release holds conflicts, `finish` abandons nothing and says so. A working copy of another workspace (the main checkout's, say) that rests on a release commit keeps it after `finish`, so move that working copy off (`jj new 'root()'`) before `finish`.
    - A newer cut keeps a release that a live claim holds. After `finish`, the next cut or `knives release reap` retires it, unless another rule of the reap keeps it. The reap names that rule.
 3. Check again just before the write that no member claim exists. A new external claim means back off. Other repositories continue.
 

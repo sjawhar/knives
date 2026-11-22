@@ -643,10 +643,14 @@ fn refuse_if_frozen(
 ///
 /// The whole command is the jj sequence agents fumble — duplicate the release
 /// onto the changed parent set, describe it, move its name — with the same pin
-/// gate a rebase has. A file whose conflict the release resolved keeps that
-/// resolution only where the plain merge of the new parents leaves the same
-/// conflict there. Elsewhere the write puts that plain merge in the file and
-/// names the file ([`knives::jj::edit_candidate`]), whether or not an adopt
+/// gate a rebase has. A `CHANGELOG.md` or `RELEASE_NOTES.md` whose conflict
+/// the release-log union joins keeps what the duplicate writes there,
+/// whatever the plain merge of the new parents holds. So does a file whose
+/// every conflict hunk the release still leaves open. Any other file whose
+/// conflict the release resolved keeps that resolution only where the plain
+/// merge of the new parents leaves the same conflict there. Elsewhere the
+/// write puts that plain merge in the file, and names the file where that
+/// changed it ([`knives::jj::edit_candidate`]), whether or not an adopt
 /// recorded the resolution. Every conflict the write leaves is reported. The
 /// write is checked before it is made, and an edit that would lose a
 /// remaining member's lines writes nothing, unless `--allow-loss` gave a

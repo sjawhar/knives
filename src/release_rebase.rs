@@ -26,23 +26,25 @@ use super::release_edit::{
 
 /// Rebase the whole composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
 ///
-/// Every member branch's commits move onto the target and the release merge
-/// moves with them, member bookmarks following their rewritten commits —
-/// recorded conflict resolutions replay as ordinary rebase semantics. The
-/// upstream base is never a release parent; this is how the release's members
-/// change theirs. A cut deliberately does not do this: which upstream commit to
-/// move onto, and whether to move at all, is a judgment. A published release in
-/// hand is refused ([`release::published_release`]). Every other release name
-/// that is pushed or published is put back on its commit, and one never pushed
-/// follows its rewrite; tags stay where they were, and the copies the rebase
-/// makes of pushed, published or tagged releases are abandoned unless something
-/// rests on
-/// them. After a bare rebase, the members whose pull requests landed and
+/// Each member branch's commits that the target's history does not hold move
+/// onto the target, and the release merge moves with them, member bookmarks
+/// following their rewritten commits — recorded conflict resolutions replay
+/// as ordinary rebase semantics. A member that the target's history holds
+/// does not move. The upstream base is never a release parent; this is how
+/// the release's members change theirs. A cut deliberately does not do this:
+/// which upstream commit to move onto, and whether to move at all, is a
+/// judgment. A published release in hand is refused
+/// ([`release::published_release`]). Every other release name that is pushed
+/// or published is put back on its commit, and one never pushed follows its
+/// rewrite; tags stay where they were, and the copies the rebase makes of
+/// pushed, published or tagged releases are abandoned unless something rests
+/// on them. After a bare rebase, the members whose pull requests landed and
 /// that carry nothing more are dropped, unless `--no-drop` keeps them. A
 /// flat release has no base parent, so the target reaches it only through a
-/// member on it. Where no other member is on it, the drop keeps the landed
-/// members that are; where none is, it refuses and writes nothing
-/// ([`drop_landed_members_in`]).
+/// parent on the target: a member, or a carrier (an earlier write of the
+/// release), which the drop leaves out. Where no other member is on the
+/// target, the drop keeps the landed members that are; where none is, it
+/// refuses and writes nothing ([`drop_landed_members_in`]).
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -907,17 +909,19 @@ fn drop_landed_members(
 /// Only a member carrying nothing past the target is dropped: a branch with
 /// commits beyond its merged pull request still holds undelivered work, and
 /// that is said instead. A flat release has no base parent, so the target
-/// reaches it only through a member that descends from it. Where no other
-/// kept parent descends from the target, the drop keeps each landed member
-/// that does, and says why; where no landed member does either, it refuses
-/// and drops nothing ([`keep_the_target`]). Where no parent would remain, it
-/// refuses too. The drop writes the release as a duplicate onto the kept
-/// parents, which keeps every resolution the release holds. It does not
-/// follow `drop`'s rule (spec R11, `knives::jj::edit_candidate`): a
-/// member it drops carries nothing past the target, so its removal changes
-/// no merge of the kept parents. It leaves out the release's carriers, as every
-/// write composing from its parents does: a carrier never counts as a
-/// parent that remains. `opened` is the repository as it is now, and
+/// reaches it only through a parent that descends from it: a member, or a
+/// carrier (an earlier write of the release), which the drop leaves out.
+/// Where no other kept parent descends from the target, the drop keeps each
+/// landed member that does, and says why; where no landed member does
+/// either, it refuses and drops nothing ([`keep_the_target`]). Where no
+/// parent would remain, it refuses too. The drop writes the release as a
+/// duplicate onto the kept parents, which keeps every resolution the release
+/// holds. It does not follow `drop`'s rule (spec R11,
+/// `knives::jj::edit_candidate`): a member it drops carries nothing past the
+/// target, so its removal changes no merge of the kept parents. It leaves
+/// out the release's carriers, as every write composing from its parents
+/// does: a carrier never counts as a parent that remains. `opened` is the
+/// repository as it is now, and
 /// `writes` the release's earlier writes read from it. `unchecked` is the
 /// mark its event ends with ([`release::unchecked_suffix`]). The release it
 /// writes is read through one opening as soon as the write is done
@@ -1036,13 +1040,14 @@ fn drop_landed_members_in(
 /// never counts as a parent that remains. `dropped` are the landed members
 /// the drop would take out, each with its pull request, in the forge's
 /// order. Where no parent would remain, the drop refuses. A flat release
-/// has no base parent, so the target reaches it only through a member that
-/// descends from it, or is it. Where a kept member does, every landed member
-/// goes. Where none does, the landed members that descend from the target
-/// stay, named in one line, and the others go; with none left to go, the
-/// delta is empty and nothing is written. Where no landed member descends
-/// from it either, as where only a carrier is on the target, the drop
-/// refuses.
+/// has no base parent, so the target reaches it only through a parent that
+/// descends from the target or is it: a member, or a carrier (an earlier
+/// write of the release), which the drop leaves out. Where a kept member
+/// does, every landed member goes. Where none does, the landed members that
+/// descend from the target stay, named in one line, and the others go; with
+/// none left to go, the delta is empty and nothing is written. Where no
+/// landed member descends from it either, as where only a carrier is on the
+/// target, the drop refuses.
 fn keep_the_target(
     (repo, shown_release, destination): (&RepoName, &str, &RebaseDestination),
     opened: &knives::jj::Repo,

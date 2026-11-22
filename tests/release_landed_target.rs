@@ -2,15 +2,16 @@
 //! not lose the target.
 //!
 //! A flat release has no base parent, so the target reaches it only through
-//! a member that descends from the target. Where a member that stays does,
-//! the drop goes ahead. Where none does, the drop keeps the landed members
-//! that do and says why in one line. Where none of those does either, as
-//! where only a carrier is on the target, the drop refuses with exit 3 and
-//! writes nothing. Where no member would stay, it refuses as before. The
-//! same holds whether the rebase moved the release or found that it already
-//! contains the target. The shapes are those of INFRA-4895's
-//! drop-after-adopt probe (versions 3 and 4), with the forge faked by the
-//! snapshot shim. These tests drive only the knives binary.
+//! a parent that descends from the target: a member, or a carrier (an
+//! earlier write of the release), which the drop leaves out. Where a member
+//! that stays does, the drop goes ahead. Where none does, the drop keeps the
+//! landed members that do and says why in one line. Where none of those does
+//! either, as where only a carrier is on the target, the drop refuses with
+//! exit 3 and writes nothing. Where no member would stay, it refuses as
+//! before. The same holds whether the rebase moved the release or found
+//! that it already contains the target. The shapes are those of
+//! INFRA-4895's drop-after-adopt probe (versions 3 and 4), with the forge
+//! faked by the snapshot shim. These tests drive only the knives binary.
 
 #![allow(
     clippy::expect_used,

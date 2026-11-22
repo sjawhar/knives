@@ -369,10 +369,19 @@ enum Newest {
     /// it records the commit that is pushed, which another machine can read,
     /// and changes no content.
     Rewritten,
-    /// Neither: an older recorded write or a hand edit; or any commit where
-    /// the write's event is marked `; unchecked:`, the write itself and a
-    /// copy of it included. Adopt then checks and measures the commit as any
-    /// release knives could not check, and its record ends the mark.
+    /// Neither, in one of two cases.
+    ///
+    /// Where the write's event bears no `; unchecked:` mark, the commit is
+    /// an older recorded write or a hand edit. Adopt then measures the
+    /// commit against the recorded write it replaces ([`Replaced`]), or
+    /// against an automerge where this repository does not hold that write
+    /// ([`release::baseline_write`]). It can exit 1 for lost lines. The
+    /// event bears no mark, so the record ends none.
+    ///
+    /// Where the write's event is marked `; unchecked:`, the commit is any
+    /// commit, the write itself and a copy of it included. Adopt then checks
+    /// and measures the commit as any release knives could not check, and
+    /// its record ends the mark.
     Neither,
 }
 

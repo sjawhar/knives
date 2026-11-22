@@ -304,7 +304,8 @@ pub(crate) fn run_finish(
 
 /// Sweep the earlier writes of release `name` once `finish` has left jj no
 /// workspace of the release claim, as `knives release adopt` sweeps them
-/// after it records a write. A sweep that fails says so, and changes no exit.
+/// after it records a write. A sweep that fails says so on stderr, and
+/// changes no exit.
 ///
 /// jj abandons a forgotten workspace's working copy where it is empty and
 /// undescribed, so a release commit a write replaced and kept for that
@@ -330,7 +331,8 @@ fn sweep_earlier_writes(fork: &Fork<'_>, name: &str) {
 }
 
 /// What [`sweep_earlier_writes`] reads, abandons in one jj operation, and
-/// says.
+/// says. Once the abandon is done and said, a failure to name what keeps
+/// the rest has its own line on stderr ([`naming_failure`]).
 fn sweep(fork: &Fork<'_>, name: &str) -> anyhow::Result<()> {
     let (repo, checkout) = (&fork.name, &fork.checkout.path);
     let opened = Repo::open(checkout)?;
@@ -354,27 +356,62 @@ fn sweep(fork: &Fork<'_>, name: &str) -> anyhow::Result<()> {
     )?;
     report_abandoned_earlier(repo, name, &swept.abandoned);
     report_hidden(repo, name, &swept.hidden);
+    match kept_after_sweep(
+        (repo, checkout, name),
+        opened,
+        (writes.commits(), &release),
+        &swept.abandoned,
+    ) {
+        Ok(kept) => {
+            for line in kept {
+                println!("{line}");
+            }
+        }
+        Err(error) => eprintln!("{}", naming_failure(repo, name, &error)),
+    }
+    Ok(())
+}
+
+/// The `note: kept` lines of the earlier writes `writes` of release `name`
+/// that the abandon left and something keeps ([`kept_lines`]), read once
+/// the abandon of `abandoned` is done. `opened` is the repository as
+/// [`sweep`] read it before the abandon.
+fn kept_after_sweep(
+    (repo, checkout, name): (&RepoName, &Path, &str),
+    opened: Repo,
+    (writes, release): (&[CommitId], &CommitId),
+    abandoned: &[CommitId],
+) -> anyhow::Result<Vec<String>> {
     // An abandon that abandoned nothing committed no operation, so the
     // repository is still as `opened` read it.
-    let reopened = if swept.abandoned.is_empty() {
+    let reopened = if abandoned.is_empty() {
         opened
     } else {
         Repo::open(checkout)?
     };
     let mut left = Vec::new();
-    for write in writes.commits() {
-        let in_release = *write == release || reopened.is_ancestor(write, &release)?;
+    for write in writes {
+        let in_release = write == release || reopened.is_ancestor(write, release)?;
         if in_release || reopened.is_visible(write)? {
             left.push((write.clone(), in_release));
         }
     }
-    let kept = kept_lines(repo, name, &left, |write| {
+    Ok(kept_lines(repo, name, &left, |write| {
         reopened.what_keeps_earlier_write(write)
-    })?;
-    for line in kept {
-        println!("{line}");
-    }
-    Ok(())
+    })?)
+}
+
+/// The line on stderr where the sweep of release `name` abandoned what
+/// nothing holds, and then could not name what keeps the rest of its
+/// earlier writes: `error`. The release name is the caller's argument and
+/// the error can quote jj, so each goes out escaped.
+fn naming_failure(repo: &RepoName, name: &str, error: &anyhow::Error) -> String {
+    format!(
+        "{repo}: abandoned what nothing holds; could not name what keeps the rest of the \
+         earlier {} commits: {}",
+        inline_human_text(name),
+        problem_human_text(&format!("{error:#}"))
+    )
 }
 
 /// The `note: kept` line of each earlier write of `release` in `writes`
@@ -1805,7 +1842,7 @@ mod tests {
 
     use super::{
         Place, Registration, copy_superseded, finish_provenance, kept_lines, left_to_its_owner,
-        no_claim_now, removal_note, shared_holder, spoken, with_requirements,
+        naming_failure, no_claim_now, removal_note, shared_holder, spoken, with_requirements,
     };
     use knives::ids::{BranchName, Requirement};
     use knives::jj::WorkspaceIdentity;
@@ -2067,7 +2104,7 @@ mod tests {
     mod release_claim_finish {
         use knives::ids::{CommitId, RepoName};
 
-        use super::kept_lines;
+        use super::{kept_lines, naming_failure};
 
         #[test]
         fn kept_lines_never_name_a_write_the_release_descends_from() {
@@ -2110,6 +2147,29 @@ mod tests {
                 )]
             );
             assert_eq!(asked, [replaced]);
+        }
+
+        #[test]
+        fn a_failure_after_the_abandon_says_the_abandon_is_done_and_the_naming_failed() {
+            // Given: a sweep that abandoned what nothing holds, and then got
+            // jj's two-line error, which holds a control character, when it
+            // read what keeps the rest
+            let error = anyhow::anyhow!(
+                "Concurrent modification detected\nError: \u{1b}[31mno such commit"
+            );
+
+            // When: finish says so
+            let line = naming_failure(&RepoName::new("demo"), "release/2026-08-04", &error);
+
+            // Then: the line says that the abandon is done and that the naming
+            // failed, not that the sweep failed, with the error on one line
+            // and escaped
+            assert_eq!(
+                line,
+                "demo: abandoned what nothing holds; could not name what keeps the rest of the \
+                 earlier release/2026-08-04 commits: Concurrent modification detected; Error: \
+                 \u{fffd}[31mno such commit"
+            );
         }
     }
 }

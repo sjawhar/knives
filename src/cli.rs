@@ -615,26 +615,29 @@ pub enum ReleaseAction {
     },
     /// Rebase the composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
     ///
-    /// Every member branch's commits move onto the target and the release
-    /// merge moves with them, member bookmarks and workspaces following;
-    /// recorded conflict resolutions replay as ordinary rebase semantics. A
-    /// published release in hand (a tag, or a `record: published` note, names
-    /// its commit) is refused: cut a new dated release first. Every other
-    /// release name that is pushed or published stays on its commit, and one
-    /// never pushed follows its rewrite. Pushed or published earlier releases
-    /// keep their names and commit ids, and every tag stays; the copies the
-    /// rebase makes of them are abandoned, except one something rests on,
-    /// which is kept and named. A stale rule an earlier `knives start` wrote
-    /// refuses first, naming `start` as the refresh. The base is never a
-    /// release parent — this is how the members change theirs. Bare, it
-    /// targets the first upstream trunk commit that contains every merged
-    /// pull request, then drops the members whose landed branches carry
-    /// nothing more. A flat release has no base parent, so the target
-    /// reaches it only through a member on the target. Where no member that
-    /// stays is on the target, the drop keeps the landed members that are,
-    /// and says why. Where none is, it drops nothing and exits 3. With nothing
-    /// merged there is no default, and which commit to move onto is a
-    /// decision — a cut does not make it for you.
+    /// Each member branch's commits that the target's history does not hold
+    /// move onto the target, and the release merge moves with them, member
+    /// bookmarks and workspaces following; recorded conflict resolutions
+    /// replay as ordinary rebase semantics. A member that the target's
+    /// history holds does not move. A published release in hand (a tag, or a
+    /// `record: published` note, names its commit) is refused: cut a new
+    /// dated release first. Every other release name that is pushed or
+    /// published stays on its commit, and one never pushed follows its
+    /// rewrite. Pushed or published earlier releases keep their names and
+    /// commit ids, and every tag stays; the copies the rebase makes of them
+    /// are abandoned, except one something rests on, which is kept and named.
+    /// A stale rule an earlier `knives start` wrote refuses first, naming
+    /// `start` as the refresh. The base is never a release parent — this is
+    /// how the members change theirs. Bare, it targets the first upstream
+    /// trunk commit that contains every merged pull request, then drops the
+    /// members whose landed branches carry nothing more. A flat release has
+    /// no base parent, so the target reaches it only through a parent on the
+    /// target: a member, or a carrier (an earlier write of the release),
+    /// which the drop leaves out. Where no member that stays is on the
+    /// target, the drop keeps the landed members that are, and says why.
+    /// Where none is, it drops nothing and exits 3. With nothing merged there
+    /// is no default, and which commit to move onto is a decision — a cut
+    /// does not make it for you.
     ///
     /// When the move leaves the rebased tip of a member conflicted, the
     /// report names that member, by its branch or by its short commit id,
