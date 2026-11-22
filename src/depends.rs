@@ -628,10 +628,12 @@ impl Context<'_, '_> {
 
     /// Whether the repository `repo` (`<owner>/<name>`) is this fork's own
     /// repository under another name, as the forge says: the name the forge
-    /// gives this fork's `origin` is `repo`, or the one it gives `repo` (a
-    /// former name it redirects) is the same. False with no forge call when
-    /// this fork's `origin` names no forge repository: it cannot have been
-    /// renamed on the forge. What could not be asked, and why, otherwise.
+    /// gives this fork's own repository ([`Fork::own_origin`]) is `repo`, or
+    /// the one it gives `repo` (a former name it redirects) is the same.
+    /// False with no forge call when this fork's own repository names no
+    /// forge repository (neither its checkout's nor its registry's `origin`
+    /// is a forge URL): it cannot have been renamed on the forge. What could
+    /// not be asked, and why, otherwise.
     fn is_own_under(&self, repo: &str) -> Result<bool, Unasked> {
         let origin = self.fork.own_origin();
         let (Some(own_slug), Some(typed)) = (remote_slug(origin), with_slug(origin, repo)) else {
