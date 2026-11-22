@@ -61,6 +61,10 @@ struct Fixture {
     shim: tempfile::TempDir,
     log: PathBuf,
     forge: RefCell<ForgeState>,
+    /// What this fork's ledger is kept under, as the code names it: its
+    /// upstream's lowercase `<owner>/<name>`, or its registry key, `demo`,
+    /// when its upstream is a path.
+    kept_under: String,
 }
 
 /// What the fixture's fake forge answers beyond its fixed pull requests:
@@ -145,12 +149,35 @@ fn fixture_on(upstream: &str, origin: &str, registered: &str) -> Fixture {
     };
     install_forge(shim.path(), &log, &state);
     Fixture {
+        kept_under: knives::remote_url::remote_slug(&upstream)
+            .map_or_else(|| "demo".to_owned(), str::to_ascii_lowercase),
         lab,
         home,
         shim,
         log,
         forge: RefCell::new(state),
     }
+}
+
+/// Every file under `root`, at any depth, but none under a directory or file
+/// whose name starts with `.`; none when `root` does not exist.
+fn files_under(root: &Path) -> Vec<PathBuf> {
+    let Ok(read) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for entry in read.flatten() {
+        let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            files.extend(files_under(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
 }
 
 /// The fixture's fake forge, as `state` says.
@@ -315,10 +342,24 @@ impl Fixture {
         assert_eq!(self.entries().len(), before, "{args:?} wrote an entry");
     }
 
+    /// Every entry of this fork's ledger. Every file under the ledger root
+    /// must be this fork's: a ledger written under another name would leave
+    /// this one empty, and a "nothing recorded" check would pass without
+    /// reading what was written. So the ledger read is either found, or the
+    /// root holds no file at all.
     fn entries(&self) -> Vec<Entry> {
-        let read = Ledger::at(self.home.path().join("ledger").join(KEPT_UNDER))
-            .read()
-            .expect("read the ledger");
+        let root = self.home.path().join("ledger");
+        let dir = root.join(&self.kept_under);
+        let stray: Vec<PathBuf> = files_under(&root)
+            .into_iter()
+            .filter(|file| !file.starts_with(&dir))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "the ledger holds files outside {}: {stray:?}",
+            dir.display()
+        );
+        let read = Ledger::at(dir).read().expect("read the ledger");
         assert!(read.problems.is_empty(), "{:?}", read.problems);
         read.entries
     }
@@ -373,7 +414,7 @@ impl Fixture {
     /// [`Self::rewrite_ledger`] in the entries about `subject` alone, when
     /// it is given.
     fn rewrite_entries(&self, subject: Option<&str>, from: &str, to: &str) -> usize {
-        let dir = self.home.path().join("ledger").join(KEPT_UNDER);
+        let dir = self.home.path().join("ledger").join(&self.kept_under);
         let about = subject.map(|subject| format!("subject = \"{subject}\""));
         let mut rewritten = 0;
         for file in std::fs::read_dir(&dir).expect("read the ledger directory") {
@@ -3917,22 +3958,20 @@ fn this_forks_path_upstream_is_named_by_its_key_in_any_letter_case() {
     let output = on(&fixture, "DEMO#12");
 
     // Then: it is recorded under the key, with no forge call: the exact-key
-    // refusal is for another fork's path upstream only (N108).
+    // refusal is for another fork's path upstream only (N108). The fixture
+    // reads the ledger kept under `demo`, as the code writes it.
     assert!(output.status.success(), "{}", said(&output));
-    let required = || {
-        let read = Ledger::at(fixture.home.path().join("ledger").join("demo"))
-            .read()
-            .expect("read the ledger");
-        Statements::from_entries(&read.entries).depends("feat/alpha")
-    };
-    assert_eq!(required(), ["demo#12"]);
+    assert_eq!(fixture.required("feat/alpha"), ["demo#12"]);
     assert_eq!(fixture.forge_calls(), "");
 
     // And: a review pull request, which only the forge can place, is a
     // forge call the log records.
     let output = on(&fixture, "acme/demo#13");
     assert!(output.status.success(), "{}", said(&output));
-    assert_eq!(required(), ["demo#12", "origin:acme/demo#13"]);
+    assert_eq!(
+        fixture.required("feat/alpha"),
+        ["demo#12", "origin:acme/demo#13"]
+    );
     assert_ne!(fixture.forge_calls(), "");
 }
 
@@ -3967,6 +4006,68 @@ fn offline_what_needs_no_forge_question_is_recorded() {
         "{}",
         fixture.forge_calls()
     );
+}
+
+#[test]
+fn offline_a_registry_key_with_one_forge_repository_is_recorded() {
+    // Given: this fork's own repository is local, in the checkout and the
+    // registry; `tool`, a fork whose upstream is on the forge and whose own
+    // repository is a local path; the forge down.
+    let fixture = fixture_with("", "");
+    let registry = fixture.home.path().join("repos.toml");
+    let text = std::fs::read_to_string(&registry).expect("read the registry");
+    std::fs::write(
+        &registry,
+        format!(
+            "{text}[repos.tool]\nupstream = \"https://forge.invalid/maintainer/tool\"\n\
+             origin = \"{}\"\n",
+            fixture.home.path().display()
+        ),
+    )
+    .expect("rewrite the registry");
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+
+    // When / Then: `tool#5`, and this fork's own `demo#12`, each name a fork
+    // whose only forge repository is its upstream, and this fork's own
+    // repository is no forge repository: each is that upstream's pull
+    // request, recorded with no forge call (N114).
+    let output = on(&fixture, "tool#5");
+    assert!(output.status.success(), "{}", said(&output));
+    let output = on(&fixture, "demo#12");
+    assert!(output.status.success(), "{}", said(&output));
+    assert_eq!(
+        fixture.required("feat/alpha"),
+        ["maintainer/demo#12", "maintainer/tool#5"]
+    );
+    assert_eq!(fixture.forge_calls(), "");
+}
+
+#[test]
+fn offline_an_upstream_this_forks_registry_origin_spells_is_refused() {
+    // Given: this fork's registry `origin` spells its upstream,
+    // maintainer/demo, and its checkout's `origin` is acme/demo; the forge
+    // down.
+    let fixture = fixture_with(ORIGIN, UPSTREAM);
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+
+    // When: the upstream's #12 is named by its `<owner>/<name>`.
+    let output = on(&fixture, "maintainer/demo#12");
+
+    // Then: the name spells this fork's own repository first, which only
+    // the forge can place: nothing is recorded (exit 3), and the forge was
+    // asked (N112).
+    assert_eq!(output.status.code(), Some(3), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
+    assert_ne!(fixture.forge_calls(), "");
+
+    // And: when the registry `origin` is this fork's own repository, the
+    // same text records offline, with no forge call.
+    let fixture = fixture_with(ORIGIN, ORIGIN);
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+    let output = on(&fixture, "maintainer/demo#12");
+    assert!(output.status.success(), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), ["maintainer/demo#12"]);
+    assert_eq!(fixture.forge_calls(), "");
 }
 
 #[test]
