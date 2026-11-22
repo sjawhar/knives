@@ -50,3 +50,9 @@ pub mod snapshot;
 pub mod statement;
 pub mod store;
 pub mod timing;
+
+/// The unit tests' environment: the one every integration test runs git, jj
+/// and knives in, set once for the process before `main`.
+#[cfg(test)]
+#[path = "../tests/common/isolation.rs"]
+mod test_isolation;

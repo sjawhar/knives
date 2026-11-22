@@ -296,13 +296,12 @@ fn a_record_whose_event_fails_after_it_made_the_bookmark_names_a_heading_held_tw
     std::fs::write(home.path().join("state.json"), "{not json").expect("corrupt state");
 
     // When: an anonymous terminal user records it as a name no ref holds.
-    let output = lab::without_harness_session(&mut lab::release_command(
+    let output = lab::release_command(
         &lab,
         &home,
         lab::ReleaseOutput::Text,
         &["cut", RELEASE, "--at", commit.as_str()],
-    ))
-    .env_remove("KNIVES_OWNER")
+    )
     .output()
     .expect("run knives release cut --at");
 

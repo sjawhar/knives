@@ -1362,8 +1362,7 @@ mod comment_activity_tests {
         let origin = temp.path().join("origin");
         let jj = || {
             let mut cmd = Command::new("jj");
-            cmd.env("JJ_CONFIG", "/dev/null")
-                .env("JJ_USER", "Knives Lab")
+            cmd.env("JJ_USER", "Knives Lab")
                 .env("JJ_EMAIL", "knives-lab@example.test");
             cmd
         };

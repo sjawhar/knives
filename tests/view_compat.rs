@@ -17,27 +17,19 @@
     reason = "a fixture or assertion that cannot proceed IS the test failure"
 )]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-/// Same process-wide jj config isolation as `tests/common/lab.rs`, for the
-/// same reasons: jj mints per-repository config directories on first contact,
+/// The environment every git, jj and knives a test starts runs in, as for the
+/// lab's tests: jj mints per-repository config directories on first contact,
 /// and an inherited `JJ_CONFIG` would reach the jj knives spawns in-process.
-#[ctor::ctor(unsafe)]
-fn isolate_jj_config() {
-    let xdg = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("xdg");
-    // SAFETY: a constructor runs before `main`, hence before libtest spawns its
-    // first thread; nothing can read the environment concurrently.
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", xdg);
-        std::env::set_var("JJ_CONFIG", "/dev/null");
-    }
-}
+#[path = "common/isolation.rs"]
+mod isolation;
 
 /// Runs the installed `jj` — the binary whose on-disk format knives must agree
-/// with — and returns stdout. The constructor above empties `JJ_CONFIG`: a
-/// developer's own config (commit signing, attribution layers) must not reach
-/// the fixture.
+/// with — and returns stdout, in the test process's own environment
+/// ([`isolation`]): a developer's own config (commit signing, attribution
+/// layers) must not reach the fixture.
 fn jj(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("jj")
         .args([

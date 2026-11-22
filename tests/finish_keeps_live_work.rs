@@ -385,8 +385,8 @@ fn a_duplicate_under_the_same_launcher_counts() {
         .args(["--text", "finish", "feat/gamma", "--repo", "demo"])
         .current_dir(&lab.work)
         .env("KNIVES_CONFIG_HOME", home.path())
-        .env("HOME", lab.temp_path());
-    lab::without_harness_session(&mut command).env("KNIVES_OWNER", OWNER);
+        .env("HOME", lab.temp_path())
+        .env("KNIVES_OWNER", OWNER);
     let refused = command.output().expect("run the launcher");
 
     // Then: the duplicate is named and nothing changed
