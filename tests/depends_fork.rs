@@ -2467,6 +2467,27 @@ fn refusal_says(row: &str) -> &'static str {
     }
 }
 
+/// The advice of a `--forget` refusal when the forge was down or failing.
+const OUTAGE_ADVICE: &str = "Run it again when the forge answers, or take back";
+/// The advice of a `--forget` refusal when a reason is the forge's "Could
+/// not resolve to a Repository" (N104).
+const UNRESOLVED_ADVICE: &str = "The forge could not resolve a repository it was asked about: it \
+                                 is gone, the token cannot see it, or the forge is failing. Run \
+                                 it again later, or check the repository, or take back";
+
+/// What is wrong with an exit-3 `--forget` refusal's advice for the reasons
+/// it prints, if anything (N107): every refusal site, `choices` included,
+/// gives the advice its reasons call for, and not the other.
+fn advice_wrong(stderr: &str) -> Option<String> {
+    let (advice, not) = if stderr.contains("Could not resolve to a Repository") {
+        (UNRESOLVED_ADVICE, OUTAGE_ADVICE)
+    } else {
+        (OUTAGE_ADVICE, UNRESOLVED_ADVICE)
+    };
+    (!stderr.contains(advice) || stderr.contains(not))
+        .then(|| format!("the refusal does not advise `{advice}` alone: {stderr}"))
+}
+
 /// What the list holds after each command an exit-3 refusal prints, by
 /// row, in any order, one list per command: every candidate record of the
 /// text taken back, and nothing else; one requirement per command when the
@@ -2570,6 +2591,10 @@ fn forget_rows(rows: &[ForgetRow]) -> Vec<String> {
             continue;
         }
         if row.exit != 3 {
+            continue;
+        }
+        if let Some(wrong) = advice_wrong(&stderr) {
+            failed.push(format!("{shown}: {wrong}"));
             continue;
         }
         let commands = printed_commands(&stderr);
@@ -3782,11 +3807,9 @@ fn a_forget_the_forge_could_not_resolve_says_so_and_an_outage_is_retried() {
     assert_eq!(fixture.required("feat/alpha"), ["origin:acme/demo#5"]);
 }
 
-#[test]
-fn a_local_upstream_forks_key_in_another_case_is_never_asked_of_the_forge() {
-    // Given: `local`, a fork whose upstream is a filesystem path; feat/alpha
-    // requires this fork's #12.
-    let fixture = fixture();
+/// Add to the fixture's registry `local`, a fork whose upstream is a
+/// filesystem path, so its upstream name is its registry key.
+fn register_local(fixture: &Fixture) {
     let registry = fixture.home.path().join("repos.toml");
     let text = std::fs::read_to_string(&registry).expect("read the registry");
     std::fs::write(
@@ -3797,6 +3820,14 @@ fn a_local_upstream_forks_key_in_another_case_is_never_asked_of_the_forge() {
         ),
     )
     .expect("rewrite the registry");
+}
+
+#[test]
+fn a_local_upstream_forks_key_in_another_case_is_never_asked_of_the_forge() {
+    // Given: `local`, a fork whose upstream is a filesystem path; feat/alpha
+    // requires this fork's #12.
+    let fixture = fixture();
+    register_local(&fixture);
     fixture.hold("feat/alpha", &[F12]);
 
     // When: `Local#12` is forgotten with the forge up.
@@ -3807,6 +3838,33 @@ fn a_local_upstream_forks_key_in_another_case_is_never_asked_of_the_forge() {
     // 2, N103), and this fork's #12 stays.
     assert_eq!(output.status.code(), Some(2), "{}", said(&output));
     assert_eq!(fixture.required("feat/alpha"), [F12]);
+}
+
+#[test]
+fn a_local_upstream_fork_is_named_on_by_its_key_exactly() {
+    // Given: `local`, a fork whose upstream is a filesystem path.
+    let fixture = fixture();
+    register_local(&fixture);
+
+    // When: its #12 is named by its key in another letter case, with the
+    // forge up.
+    let output = on(&fixture, "Local#12");
+
+    // Then: nothing is recorded, and the refusal is a usage error that names
+    // the key, never a forge question a rerun could not answer (exit 2,
+    // N105).
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim_end(),
+        "Local in Local#12 is no registry key: local's upstream is no forge repository, so it is \
+         named by its key exactly: `--on local#12`"
+    );
+    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
+
+    // And: the key as the refusal spells it records the pull request.
+    let output = on(&fixture, "local#12");
+    assert!(output.status.success(), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), ["local#12"]);
 }
 
 #[test]
@@ -4096,16 +4154,7 @@ fn a_deleted_dependents_requirement_on_a_fork_with_a_local_upstream_is_in_its_on
     // Given: a fork whose upstream is a filesystem path; feat/ghost, never a
     // branch here, requires its #3.
     let fixture = fixture();
-    let registry = fixture.home.path().join("repos.toml");
-    let text = std::fs::read_to_string(&registry).expect("read the registry");
-    std::fs::write(
-        &registry,
-        format!(
-            "{text}[repos.local]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/local\"\n",
-            fixture.home.path().display()
-        ),
-    )
-    .expect("rewrite the registry");
+    register_local(&fixture);
     fixture.hold("feat/ghost", &["local#3"]);
 
     // When: status reports the fork.

@@ -418,12 +418,14 @@ pub enum Command {
         /// upstream, by either spelling, may be this fork's repository under
         /// another name, so the forge is asked, and nothing is recorded (exit
         /// 3) when it cannot say; with the forge down, only this fork's own
-        /// upstream's pull requests are recorded. The question is skipped when that
-        /// upstream or this fork's `origin` names no forge repository, but a
-        /// registry key still asks the forge which of that fork's repositories
-        /// has the number. A review pull request on another fork's repository
-        /// is refused, and so is one whose head is not a member branch of the
-        /// fork's owner. A branch name: a member branch of this fork.
+        /// upstream's pull requests are recorded. The question is skipped when
+        /// this fork's `origin` names no forge repository, but a registry key
+        /// still asks the forge which of that fork's repositories has the
+        /// number. A fork whose upstream is a path is named by its registry
+        /// key exactly, with no forge call. A review pull request on another
+        /// fork's repository is refused, and so is one whose head is not a
+        /// member branch of the fork's owner. A branch name: a member branch of
+        /// this fork.
         #[arg(long = "on", required_unless_present = "forget")]
         on: Vec<String>,
         /// A requirement to take back, repeatable: as its record spells it, or
