@@ -2327,6 +2327,72 @@ fn claim_refs_stay_outside_the_machine_refs_and_another_machine_reads_the_ledger
 }
 
 #[test]
+fn a_shell_that_exported_another_object_store_still_writes_the_ledger_into_its_own() {
+    // Given: machine one sharing the lab fork's ledger, run from a shell
+    // that exported another repository's git directory, an object store of
+    // its own, and that repository's objects as alternates, for some other
+    // work: a shell keeps such exports from one command to the next.
+    let shared = Shared::new();
+    let elsewhere = tempfile::tempdir().expect("another repository");
+    let other = elsewhere.path().join("other");
+    lab::git_repository(&other, &[]);
+    let store = elsewhere.path().join("objects");
+    std::fs::create_dir(&store).expect("an empty object store");
+
+    // When: it takes a branch, notes something, and finishes the branch,
+    // each from that shell.
+    for args in [
+        &[
+            "--text", "start", BRANCH, "--repo", "demo", "--why", "port it",
+        ][..],
+        &["--text", "notch", "-m", "noted from that shell"],
+        &[
+            "--text", "finish", BRANCH, "--repo", "demo", "--why", "ported",
+        ],
+    ] {
+        let output = shared
+            .one
+            .command("owner-one", args)
+            .env("GIT_DIR", other.join(".git"))
+            .env("GIT_OBJECT_DIRECTORY", &store)
+            .env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                other.join(".git/objects"),
+            )
+            .output()
+            .expect("run knives");
+
+        // Then: each succeeds.
+        assert!(
+            output.status.success(),
+            "`knives {}`: {}",
+            args.join(" "),
+            stderr_of(&output)
+        );
+    }
+
+    // And: every ref in machine one's ledger git directory names objects
+    // that git directory holds, as a git run without those exports reads
+    // it: no other machine's read stops on one of them.
+    let git_dir = shared.one.root().join(".git");
+    assert!(
+        git_in(&git_dir, &["rev-list", "--objects", "--all"]).is_some(),
+        "a ref in {} names an object it does not hold: {}",
+        git_dir.display(),
+        git_in(&git_dir, &["for-each-ref"]).unwrap_or_default()
+    );
+    // And: nothing went into the exported object store.
+    let written: Vec<PathBuf> = std::fs::read_dir(&store)
+        .expect("read the exported object store")
+        .map(|entry| entry.expect("an entry").path())
+        .collect();
+    assert!(written.is_empty(), "{written:?}");
+    // And: the remote holds every entry machine one wrote, and no claim.
+    assert_eq!(shared.listed("machine-one"), shared.one.entries());
+    assert!(shared.claim(BRANCH).is_none());
+}
+
+#[test]
 fn a_branch_whose_name_jj_would_quote_is_claimed_on_the_ledger_and_released_by_finish() {
     // Given: machine one sharing the lab fork's ledger, and branches nobody
     // holds whose workspace names jj quotes in a revset (`"feat-a%2Fb"`).

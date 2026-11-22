@@ -366,22 +366,54 @@ pub fn checkout_of_root(root: &Path) -> PathBuf {
         .unwrap_or_else(|| root.to_owned())
 }
 
-/// A `git` invocation that reads only the repository it is pointed at.
+/// The variables that point git at parts of a repository other than the one
+/// it is run on: what git itself clears when it enters another repository
+/// (`git rev-parse --local-env-vars`), less its configuration variables,
+/// which [`git_command`] clears and a caller may hand back.
 ///
-/// git hooks, `rebase -x`, `bisect run`, and some editors export `GIT_DIR` and
-/// its companions, and `git -c` exports `GIT_CONFIG_PARAMETERS` to every
-/// subprocess; inherited, they would make a root report another repository's
-/// configuration, or configuration that lives in no repository at all.
-pub(crate) fn git_command() -> std::process::Command {
-    let mut command = std::process::Command::new("git");
-    for variable in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_INDEX_FILE",
-    ] {
+/// git hooks, `rebase -x`, `bisect run`, some editors, and a shell that
+/// exported them for its own work hand these down. Inherited, they send a
+/// command elsewhere: `GIT_DIR` to another repository, and
+/// `GIT_OBJECT_DIRECTORY` to another object store while refs are still read
+/// and written where `--git-dir` says, so a ledger commit lands in the other
+/// store and the ledger's refs name an object its git directory does not
+/// have.
+pub(crate) const REPOSITORY_VARIABLES: [&str; 12] = [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
+/// `command` with none of [`REPOSITORY_VARIABLES`]: for every git or jj
+/// knives runs, since jj runs git with the environment it was given.
+pub(crate) fn without_repository_variables(
+    command: &mut std::process::Command,
+) -> &mut std::process::Command {
+    for variable in REPOSITORY_VARIABLES {
         command.env_remove(variable);
     }
+    command
+}
+
+/// A `git` invocation that reads only the repository it is pointed at.
+///
+/// Without [`REPOSITORY_VARIABLES`], and without the configuration the
+/// environment carries: `git -c` exports `GIT_CONFIG_PARAMETERS` to every
+/// subprocess, and inherited it would make a root report configuration that
+/// lives in no repository at all.
+pub(crate) fn git_command() -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    without_repository_variables(&mut command);
+    command.env_remove("GIT_CONFIG");
     for (name, _) in std::env::vars_os() {
         if name.as_encoded_bytes().starts_with(b"GIT_CONFIG_") {
             command.env_remove(name);
@@ -776,9 +808,34 @@ mod tests {
     use crate::ids::RepoName;
 
     use super::{
-        BindError, Checkout, Disagreement, Fork, Unbound, Unresolved, error_line, has_jj_directory,
-        jj_only_ancestor, nearest_root,
+        BindError, Checkout, Disagreement, Fork, REPOSITORY_VARIABLES, Unbound, Unresolved,
+        error_line, has_jj_directory, jj_only_ancestor, nearest_root,
     };
+
+    #[test]
+    fn every_variable_git_clears_for_another_repository_is_cleared_or_is_configuration() {
+        // Given: the variables git itself clears when it enters another
+        // repository, as the git on PATH lists them.
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "--local-env-vars"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git rev-parse --local-env-vars");
+        let listed = String::from_utf8(output.stdout).unwrap();
+        let listed: Vec<&str> = listed.lines().collect();
+        // An empty list would pass every check below.
+        assert!(listed.contains(&"GIT_OBJECT_DIRECTORY"), "{listed:?}");
+
+        // Then: each is one knives clears from every git and jj it runs, or
+        // one of git's configuration variables, which `git_command` clears
+        // and the ledger hands back only as the session's own.
+        let configuration = ["GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"];
+        let missed: Vec<&&str> = listed
+            .iter()
+            .filter(|name| !REPOSITORY_VARIABLES.contains(name) && !configuration.contains(name))
+            .collect();
+        assert!(missed.is_empty(), "not cleared: {missed:?}");
+    }
 
     #[test]
     fn the_nearest_root_is_the_nearest_git_and_a_jj_alone_marks_nothing() {

@@ -2928,7 +2928,7 @@ fn changed_files_for_diff_args(repo: &Path, diff_args: &[&str]) -> Result<Vec<St
         "--name-only",
     ];
     args.extend_from_slice(diff_args);
-    let output = Command::new("jj")
+    let output = crate::bind::without_repository_variables(&mut Command::new("jj"))
         .current_dir(repo)
         .args(args)
         .output()
@@ -3018,6 +3018,7 @@ fn fetch_retry_pause(retry: u8) -> Duration {
 /// jj's colour is off here as in [`command_args`].
 fn command_output(program: &str, args: &[&str]) -> Result<(String, String), JjError> {
     let mut command = Command::new(program);
+    crate::bind::without_repository_variables(&mut command);
     if program == "jj" {
         command.arg("--color=never");
     }
@@ -3045,6 +3046,7 @@ fn command_output(program: &str, args: &[&str]) -> Result<(String, String), JjEr
 /// says: `always` would otherwise thread escape codes into ids and TOML.
 fn command_args(program: &str, args: &[&str]) -> Result<String, JjError> {
     let mut command = Command::new(program);
+    crate::bind::without_repository_variables(&mut command);
     if program == "jj" {
         command.arg("--color=never");
     }
