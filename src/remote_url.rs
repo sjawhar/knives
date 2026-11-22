@@ -136,6 +136,17 @@ pub fn remote_slug(url: &str) -> Option<&str> {
     (!owner.is_empty() && !repository.is_empty() && !repository.contains('/')).then_some(path)
 }
 
+/// The same remote with its `<owner>/<name>` replaced by `slug`.
+///
+/// Same host, same form; `None` for a non-URL. The path is the last place
+/// the remote's own slug appears, so a host or owner that spells part of it
+/// (`https://github.com/m/m`, whose `com/m` spells `m/m`) is left as it is.
+pub fn with_slug(url: &str, slug: &str) -> Option<String> {
+    let own = remote_slug(url)?;
+    let at = url.rfind(own)?;
+    Some(format!("{}{slug}{}", &url[..at], &url[at + own.len()..]))
+}
+
 /// The last path segment of a remote URL without `.git`: the repository's own
 /// name, whichever owner or forge holds it.
 pub fn repository_name(url: &str) -> Option<&str> {
@@ -148,7 +159,7 @@ pub fn repository_name(url: &str) -> Option<&str> {
 mod tests {
     use super::{
         authority_and_path, remote_host, remote_slug, repository_name, same_remote, url_owner,
-        without_userinfo,
+        with_slug, without_userinfo,
     };
 
     #[test]
@@ -303,6 +314,35 @@ mod tests {
             Some("Tool")
         );
         assert_eq!(repository_name("https://forge.invalid/someone/.git"), None);
+    }
+
+    #[test]
+    fn another_slug_replaces_the_path_and_nothing_else() {
+        for (url, slug, wanted) in [
+            (
+                "https://github.com/m/m",
+                "acme/demo",
+                "https://github.com/acme/demo",
+            ),
+            (
+                "https://github.com/m/m.git/",
+                "acme/demo",
+                "https://github.com/acme/demo.git/",
+            ),
+            (
+                "git@forge.example:org/tool.git",
+                "acme/demo",
+                "git@forge.example:acme/demo.git",
+            ),
+            (
+                "ssh://git@forge.example:2222/org/tool",
+                "acme/demo",
+                "ssh://git@forge.example:2222/acme/demo",
+            ),
+        ] {
+            assert_eq!(with_slug(url, slug).as_deref(), Some(wanted), "{url}");
+        }
+        assert_eq!(with_slug("/tmp/lab/upstream", "acme/demo"), None);
     }
 
     #[test]
