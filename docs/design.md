@@ -546,12 +546,16 @@ otherwise. `--forget` reads either spelling the same way. When the forge cannot 
 nothing is recorded (exit 3), and the refusal names that fork: a review pull request
 recorded as an upstream one reads met once it merges anywhere, so refusing is the safe
 failure. The refusal says to run it again when the forge answers, or, when the forge said it
-cannot resolve a repository (gone, or the token cannot see it), names that repository: a
-rerun gives the same answer until that changes. The cost is that an offline `--on` to
-another project's pull request waits for the forge, and one to a repository the forge
-cannot resolve is refused with it up. When this fork's `origin` names no forge repository,
-or the other fork's upstream names none, neither can be the other under another name on the
-forge, and the pull request is recorded with no forge call.
+cannot resolve a repository, names the repository it could not resolve (that upstream, or
+this fork's own): it is gone, the token cannot see it, or the forge is failing, so run it
+again later or check the repository. The cost is that an offline `--on` to another project's
+pull request waits for the forge; and, with the forge up, one named by another fork's
+upstream is refused when the forge cannot resolve that upstream or this fork's own
+repository, since only those answers say whether the two are one. When this fork's `origin`
+names no forge repository, or the other fork's upstream names none, neither can be the other
+under another name on the forge, and that question is not asked: a pull request named by
+the upstream's `<owner>/<name>` is then recorded with no forge call, while one named by a
+registry key still asks the forge which of that fork's two repositories has the number.
 An upstream's `<owner>/<name>#<n>` is taken back without the forge. The forge has no
 answer that means a repository does not exist: GitHub answers a name it cannot resolve the
 same way for a repository that is gone, for one the token cannot see, and in some

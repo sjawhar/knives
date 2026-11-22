@@ -3619,14 +3619,14 @@ fn a_repository_the_forge_cannot_resolve_is_named_and_an_outage_is_retried() {
     let output = on(&fixture, "outsider/tool#5");
 
     // Then: nothing is recorded, and the refusal names the repository the
-    // forge could not resolve, not a rerun (N95).
+    // forge could not resolve, and why that may be (N95, N101).
     assert_eq!(output.status.code(), Some(3), "{}", said(&output));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains(
-            "The forge could not resolve outsider/tool: it is gone, or the token cannot see it, \
-             and a rerun gives the same answer until that changes"
-        ) && !stderr.contains("Run it again"),
+            "The forge could not resolve outsider/tool: it is gone, the token cannot see it, or \
+             the forge is failing. Run it again later, or check the repository"
+        ) && !stderr.contains("Run it again when the forge answers"),
         "{stderr}"
     );
     assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
@@ -3673,6 +3673,140 @@ fn forgetting_by_a_fork_of_this_forks_former_name_takes_this_forks_review_pull_r
     let output = fixture.knives(&forget);
     assert!(output.status.success(), "{}", said(&output));
     assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
+}
+
+#[test]
+fn forgetting_by_a_fork_of_this_forks_key_offline_takes_nothing_but_by_a_printed_command() {
+    // Given: config B; `child`, a fork of this fork, registered; feat/alpha
+    // holds #13 as the child's upstream pull request, as round 14 wrote it,
+    // and as this fork's review pull request; the forge is down.
+    let fixture = fixture_with(CONFIG_B.0, CONFIG_B.1);
+    register(&fixture, "child", "acme/demo", "acme/other");
+    fixture.hold("feat/alpha", &["acme/demo#13", F13]);
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+
+    // When: #13 is forgotten by the child's registry key.
+    let output = fixture.knives(&["--text", "depends", "feat/alpha", "--forget", "child#13"]);
+
+    // Then: only the forge can say whether the key names this fork's review
+    // pull request too, so nothing is taken back (exit 3, N99), and the
+    // refusal prints a command for each requirement.
+    assert_eq!(output.status.code(), Some(3), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), ["acme/demo#13", F13]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Run it again when the forge answers")
+            && stderr.contains("`knives depends feat/alpha --forget acme/demo#13`")
+            && stderr.contains(&format!("`knives depends feat/alpha --forget {F13}`")),
+        "{stderr}"
+    );
+
+    // And: the printed command for this fork's review pull request takes it
+    // alone, with the forge still down.
+    let output = fixture.knives(&["--text", "depends", "feat/alpha", "--forget", F13]);
+    assert!(output.status.success(), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), ["acme/demo#13"]);
+}
+
+#[test]
+fn another_forks_key_is_refused_when_the_forge_cannot_resolve_this_forks_own_repository() {
+    // Given: the sibling fork registered, and a forge that answers but
+    // cannot resolve this fork's own repository, acme/demo.
+    let fixture = fixture();
+    fixture.forge_now(ForgeNow::OwnUnseen);
+
+    // When: the sibling's #5 is named by its registry key.
+    let output = on(&fixture, "sibling#5");
+
+    // Then: whether the sibling's upstream is this fork's repository under
+    // another name needs this fork's own name, which the forge could not
+    // resolve: nothing is recorded (exit 3), and the refusal names this
+    // fork's repository, not the sibling's (N100).
+    assert_eq!(output.status.code(), Some(3), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with(
+            "nothing recorded: maintainer/sibling in sibling#5 is the upstream of sibling, and \
+             only the forge can tell whether it is also demo's own repository under another name"
+        ) && stderr.contains(
+            "The forge could not resolve acme/demo: it is gone, the token cannot see it, or the \
+             forge is failing. Run it again later, or check the repository"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
+}
+
+#[test]
+fn a_forget_the_forge_could_not_resolve_says_so_and_an_outage_is_retried() {
+    // Given: `tool`, a fork whose upstream outsider/tool the forge cannot
+    // resolve; feat/alpha requires this fork's #5.
+    let fixture = fixture();
+    register(&fixture, "tool", "outsider/tool", "maintainer/tool");
+    fixture.hold("feat/alpha", &["origin:acme/demo#5"]);
+    let forget = [
+        "--text",
+        "depends",
+        "feat/alpha",
+        "--forget",
+        "outsider/tool#5",
+    ];
+
+    // When: tool's #5 is forgotten with the forge up.
+    let output = fixture.knives(&forget);
+
+    // Then: nothing is taken back (exit 3), and the refusal says the forge
+    // could not resolve a repository, as `--on` does (N104).
+    assert_eq!(output.status.code(), Some(3), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "The forge could not resolve a repository it was asked about: it is gone, the token \
+             cannot see it, or the forge is failing. Run it again later, or check the \
+             repository, or take back"
+        ) && !stderr.contains("Run it again when the forge answers"),
+        "{stderr}"
+    );
+    assert_eq!(fixture.required("feat/alpha"), ["origin:acme/demo#5"]);
+
+    // And: with the forge down, the refusal says to run it again.
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+    let output = fixture.knives(&forget);
+    assert_eq!(output.status.code(), Some(3), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Run it again when the forge answers")
+            && !stderr.contains("could not resolve"),
+        "{stderr}"
+    );
+    assert_eq!(fixture.required("feat/alpha"), ["origin:acme/demo#5"]);
+}
+
+#[test]
+fn a_local_upstream_forks_key_in_another_case_is_never_asked_of_the_forge() {
+    // Given: `local`, a fork whose upstream is a filesystem path; feat/alpha
+    // requires this fork's #12.
+    let fixture = fixture();
+    let registry = fixture.home.path().join("repos.toml");
+    let text = std::fs::read_to_string(&registry).expect("read the registry");
+    std::fs::write(
+        &registry,
+        format!(
+            "{text}[repos.local]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/local\"\n",
+            fixture.home.path().display()
+        ),
+    )
+    .expect("rewrite the registry");
+    fixture.hold("feat/alpha", &[F12]);
+
+    // When: `Local#12` is forgotten with the forge up.
+    let output = fixture.knives(&["--text", "depends", "feat/alpha", "--forget", "Local#12"]);
+
+    // Then: a path names no forge repository, so it is never this fork's
+    // repository under another name: feat/alpha does not require it (exit
+    // 2, N103), and this fork's #12 stays.
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), [F12]);
 }
 
 #[test]
