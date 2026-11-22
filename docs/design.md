@@ -623,20 +623,15 @@ trusted repository, or both — the adapters can produce these two parts:
   even when the repository has no `AGENTS.md`, which used to mean nothing was emitted at
   all and an agent was never told where it had walked into.
 
-  A fork with many agents has many claims, and one notice with every claim and its whole
-  reason ran to about 10k tokens; it came again after any claim in the fork changed, and for
-  every workspace a session touched. So the session keeps the roster it was told, and the
-  notice says only what the session lacks. The first notice of a fork in a session lists
-  every claim, each reason cut to one line of 80 characters. A later notice, after the roster
-  changed, lists only the claims taken, changed or released since the digest the session
-  holds. The claim on the branch of the workspace a call touched (the workspace directory
-  is named for its branch, as `knives start` names it) is given with its whole reason, once
-  per version of that claim. A roster the session holds already is said again only as one
-  line, the first time a call touches another workspace of the fork: it names the digest and
-  whether a claimed branch has its workspace there. Nothing is said again at a workspace that
-  had the current digest. Compaction clears all of it, so the next notice lists every claim
-  again. The digest attribute is the roster's: a hash of the stored claims, never of their
-  ages, so an ageing roster is not told again.
+  One notice with every claim and its whole reason ran to about 10k tokens in a busy fork,
+  and came again after any claim changed and at every workspace. So a session keeps the
+  roster it was told and how each claim was last shown, and the notice says only what it
+  lacks: the whole roster once (a line per claim, cut to fit Claude Code's 10,000-character
+  limit, the rest counted), then only what changed, and the claim on the touched workspace's
+  branch whole whenever it was not last shown whole as it is now. The session forgets what it
+  was told when its context loses the block that told it: at compaction and `/clear`, and in
+  oh-my-pi when a shake drops the block. A Claude Code subagent keeps its own record. Claude
+  Code plans a notice without the session lock, so two parallel calls can both deliver it.
 - **The repository's own guidance**, for a repository `[trust]` names, when it has any, framed
   as data. A managed fork that no trust rule names gets the notice and no guidance.
 

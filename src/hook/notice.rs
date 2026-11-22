@@ -1,17 +1,22 @@
 //! The claims notice: who holds which branch of a managed fork, told once per
 //! session and afterwards only as it changes.
 //!
-//! The session keeps the roster it was told ([`HeldRoster`]). The first notice
-//! in a session lists every claim with its reason cut to one line; a later one
-//! lists only the claims taken, changed or released since; and the claim on
-//! the branch of the workspace a call touched is given whole, once. A roster
-//! the session already holds is said again only as one line, the first time a
-//! call touches another workspace of the fork.
+//! The session keeps the roster it was told ([`HeldRoster`]) and how each
+//! claim was last shown to it. The first notice in a session lists every
+//! claim with its reason cut to one line; a later one lists only the claims
+//! taken, changed or released since; and the claim on the branch of the
+//! workspace a call touched is given whole whenever the session was not
+//! last shown it whole as it is now. A roster the session already holds is
+//! said again only as one line, the first time a call touches another
+//! workspace of the fork. What the session was told rests on the block that
+//! told it, where the harness shows the context: once that block is gone,
+//! the roster is told whole again ([`crate::hook::state::SessionState::reconcile`]).
 
-use std::{collections::BTreeMap, path::Path};
+use std::collections::BTreeMap;
 
 use crate::commands::claim::{owner_kind_label, render_claim_line};
 use crate::commands::wip::workspace_for;
+use crate::config::GuidanceRoot;
 use crate::hook::guidance::{FNV_OFFSET_BASIS, envelope_nonce, fnv1a, safe_attribute};
 use crate::hook::state::HeldRoster;
 use crate::ids::UpstreamName;
@@ -59,15 +64,10 @@ pub fn claim_fingerprint(claim: &Claim) -> String {
     format!("{:016x}", hash_fields(FNV_OFFSET_BASIS, &fields(claim)))
 }
 
-/// The key a session remembers a claim given whole by: its fork, its branch
-/// and its [`claim_fingerprint`], so a changed claim is given whole again.
-pub fn whole_key(claim: &Claim) -> String {
-    format!(
-        "{}\x1f{}\x1f{}",
-        claim.repo,
-        claim.branch,
-        claim_fingerprint(claim)
-    )
+/// The key a session remembers how the claim on a branch was last shown by:
+/// the fork its claims are kept under, and the branch.
+pub fn branch_key(claim: &Claim) -> String {
+    format!("{}\x1f{}", claim.repo, claim.branch)
 }
 
 /// The time-invariant digest of a fork's [`roster`]: the name its claims are
@@ -101,9 +101,38 @@ pub struct NoticePlan<'a> {
     /// The digest of the roster the notice tells ([`roster_digest`]).
     pub digest: String,
     pub form: Form<'a>,
-    /// The claims on the branch of the workspace the call touched, each with
-    /// whether to give it whole: the session has not had it whole yet.
+    /// The claims on the branch of the workspace the call touched
+    /// ([`Workspace`]), each with whether to give it whole: it was not last
+    /// shown to the session whole as it is now.
     pub here: Vec<(&'a Claim, bool)>,
+    /// The branches read checked out in that workspace that hold no claim.
+    pub unclaimed: Vec<String>,
+}
+
+/// The workspace a call touched: the name of its directory, and the branches
+/// its checkout has checked out ([`crate::bind::checked_out_branches`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Workspace<'a> {
+    pub name: Option<&'a str>,
+    pub branches: &'a [String],
+}
+
+impl Workspace<'_> {
+    /// Whether `claim` is on this workspace's branch: the branch checked out
+    /// here, else, when none was read, the branch the directory is named for,
+    /// as `knives start` names a workspace ([`workspace_for`]). The name is
+    /// only the fallback: a checkout made by hand is named as anyone liked,
+    /// and `workspace_for` flattens `/` to `-`, so `feat/a-b` and `feat-a/b`
+    /// share a name. A jj workspace whose bookmark has not caught up with its
+    /// working copy has no branch checked out, and has the name.
+    fn holds(&self, claim: &Claim) -> bool {
+        if self.branches.is_empty() {
+            self.name
+                .is_some_and(|name| workspace_for(&claim.branch) == name)
+        } else {
+            self.branches.contains(&claim.branch)
+        }
+    }
 }
 
 /// What a claim row's sighting and age are read from, and when.
@@ -135,7 +164,7 @@ pub struct Holding<'a, F: Fn(&Claim) -> bool> {
     pub roster: Option<&'a HeldRoster>,
     /// Whether a notice of this digest reached the session for this workspace.
     pub noticed: bool,
-    /// Whether the session had a claim given whole ([`whole_key`]).
+    /// Whether the claim was last shown to the session whole, as it is now.
     pub had_whole: F,
 }
 
@@ -149,24 +178,28 @@ impl<F: Fn(&Claim) -> bool> std::fmt::Debug for Holding<'_, F> {
     }
 }
 
-/// The notice for a call that touched the workspace directory `workspace` of
-/// a fork whose [`roster`] has the digest `digest`; `None`: nothing to tell.
+/// The notice for a call that touched `workspace` of a fork whose
+/// [`roster`] has the digest `digest`; `None`: nothing to tell.
 ///
-/// `workspace` is the directory's name, `None` when it has none. The claims
-/// "here" are those on the branch whose workspace the directory is: a
-/// workspace's directory is named for its branch ([`workspace_for`]), the
-/// convention sightings key on ([`crate::seen`]).
+/// The claims "here" are those on the workspace's branch
+/// ([`Workspace::holds`]).
 pub fn plan<'a, F: Fn(&Claim) -> bool>(
     roster: &[&'a Claim],
     digest: &str,
-    workspace: Option<&str>,
+    workspace: &Workspace<'_>,
     holding: &Holding<'_, F>,
 ) -> Option<NoticePlan<'a>> {
     let here = roster
         .iter()
         .copied()
-        .filter(|claim| workspace.is_some_and(|name| workspace_for(&claim.branch) == name))
+        .filter(|claim| workspace.holds(claim))
         .map(|claim| (claim, !(holding.had_whole)(claim)))
+        .collect::<Vec<_>>();
+    let unclaimed = workspace
+        .branches
+        .iter()
+        .filter(|branch| !roster.iter().any(|claim| &claim.branch == *branch))
+        .cloned()
         .collect::<Vec<_>>();
     let elsewhere = |claim: &&Claim| !here.iter().any(|(held, _)| std::ptr::eq(*held, *claim));
     let Some(held) = holding.roster else {
@@ -175,6 +208,7 @@ pub fn plan<'a, F: Fn(&Claim) -> bool>(
             digest: digest.to_owned(),
             form: Form::Roster(others),
             here,
+            unclaimed,
         });
     };
     if held.digest != digest {
@@ -211,6 +245,7 @@ pub fn plan<'a, F: Fn(&Claim) -> bool>(
                     released,
                 },
                 here,
+                unclaimed,
             });
         }
     }
@@ -221,28 +256,74 @@ pub fn plan<'a, F: Fn(&Claim) -> bool>(
         digest: digest.to_owned(),
         form: Form::Unchanged,
         here,
+        unclaimed,
     })
 }
 
+/// Each claim the notice `plan` shows, with whether whole: what the session
+/// was last shown of it once the notice is delivered.
+pub fn shown<'a>(plan: &NoticePlan<'a>) -> Vec<(&'a Claim, bool)> {
+    let cut = |claims: &[&'a Claim]| {
+        claims
+            .iter()
+            .map(|claim| (*claim, false))
+            .collect::<Vec<_>>()
+    };
+    let mut shown = match &plan.form {
+        Form::Roster(others) => cut(others),
+        Form::Changes {
+            claimed, changed, ..
+        } => cut(claimed).into_iter().chain(cut(changed)).collect(),
+        Form::Unchanged => Vec::new(),
+    };
+    // A Changes notice gives only the claims here it gives whole
+    // ([`notice_lines`]); every other form gives them all.
+    let changes = matches!(plan.form, Form::Changes { .. });
+    shown.extend(
+        plan.here
+            .iter()
+            .filter(|(_, whole)| !changes || *whole)
+            .copied(),
+    );
+    shown
+}
+
+/// The lines of a notice: those always given (the header, then the claim on
+/// the touched workspace's branch), the claim rows the cap may leave out,
+/// and the usage lines that close a roster.
+struct Lines {
+    head: Vec<String>,
+    rows: Vec<String>,
+    tail: Vec<String>,
+}
+
 /// The lines of the notice `plan` describes, for the workspace `root`.
-fn notice_lines(root: &Path, plan: &NoticePlan<'_>, sightings: &Sightings<'_>) -> Vec<String> {
+fn notice_lines(root: &std::path::Path, plan: &NoticePlan<'_>, sightings: &Sightings<'_>) -> Lines {
     let digest = &plan.digest;
     let line = |claim: &Claim, whole: bool| claim_line(claim, whole, sightings);
-    let here = plan.here.iter().map(|(claim, whole)| {
-        format!(
-            "This workspace's branch is claimed: {}",
-            line(claim, *whole)
-        )
-    });
-    let mut lines = Vec::new();
+    let here = |filter: &dyn Fn(bool) -> bool| {
+        plan.here
+            .iter()
+            .filter(|(_, whole)| filter(*whole))
+            .map(|(claim, whole)| {
+                format!(
+                    "This workspace's branch is claimed: {}",
+                    line(claim, *whole)
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut head = Vec::new();
+    let mut rows = Vec::new();
+    let mut tail = Vec::new();
     match &plan.form {
         Form::Roster(others) => {
-            lines.push(format!(
+            head.push(format!(
                 "{} is a fork managed by knives, and another agent may be working in it.",
                 root.display()
             ));
-            lines.extend(here);
-            lines.push(match (others.len(), plan.here.is_empty()) {
+            head.extend(here(&|_| true));
+            head.push(match (others.len(), plan.here.is_empty()) {
                 (0, true) => "No branch is claimed here right now.".to_owned(),
                 (0, false) => "No other branch is claimed here right now.".to_owned(),
                 (count, true) => {
@@ -252,12 +333,12 @@ fn notice_lines(root: &Path, plan: &NoticePlan<'_>, sightings: &Sightings<'_>) -
                     format!("Other branches claimed here ({count}), each reason cut to one line:")
                 }
             });
-            lines.extend(
+            rows.extend(
                 others
                     .iter()
                     .map(|claim| format!("- {}", line(claim, false))),
             );
-            lines.extend(USAGE.iter().map(|line| (*line).to_owned()));
+            tail.extend(USAGE.iter().map(|line| (*line).to_owned()));
         }
         Form::Changes {
             since,
@@ -265,46 +346,58 @@ fn notice_lines(root: &Path, plan: &NoticePlan<'_>, sightings: &Sightings<'_>) -
             changed,
             released,
         } => {
-            lines.push(format!(
+            head.push(format!(
                 "The claims on this fork changed since the notice with digest {since}; only the \
                  changes follow."
             ));
-            lines.extend(
+            // A claim here the session had whole and that did not change is
+            // no change.
+            head.extend(here(&|whole| whole));
+            rows.extend(
                 claimed
                     .iter()
                     .map(|claim| format!("- newly claimed: {}", line(claim, false))),
             );
-            lines.extend(
+            rows.extend(
                 changed
                     .iter()
                     .map(|claim| format!("- claim changed: {}", line(claim, false))),
             );
-            lines.extend(
+            rows.extend(
                 released.iter().map(|branch| {
                     format!("- released: {}", crate::ledger::inline_human_text(branch))
                 }),
             );
-            // A claim here the session had whole and that did not change is
-            // no change.
-            lines.extend(
-                here.zip(&plan.here)
-                    .filter(|(_, (_, whole))| *whole)
-                    .map(|(line, _)| line),
-            );
         }
         Form::Unchanged => {
-            lines.push(format!(
+            // That no claim is here is said only of a branch read checked
+            // out here: one neither checked out nor its directory's name may
+            // be claimed all the same, and the roster above names every claim.
+            head.push(format!(
                 "{}: the claims on this fork are unchanged since the notice with digest {digest}.",
                 root.display()
             ));
-            if plan.here.is_empty() {
-                lines.push("No claimed branch has its workspace here.".to_owned());
+            if plan.here.is_empty() && !plan.unclaimed.is_empty() {
+                head.push(format!(
+                    "No claim is on the branch checked out here: {}.",
+                    plan.unclaimed
+                        .iter()
+                        .map(|branch| crate::ledger::inline_human_text(branch))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
             }
-            lines.extend(here);
+            head.extend(here(&|_| true));
         }
     }
-    lines
+    Lines { head, rows, tail }
 }
+
+/// The most characters a notice runs to. Claude Code takes a hook's
+/// `additionalContext` whole only up to 10,000 characters, and above that
+/// shows the model a file path and the first 2,000; this leaves room for the
+/// envelope's JSON. Every harness gets the same notice.
+pub const NOTICE_CHARS: usize = 9_500;
 
 /// How to work in a managed fork, said with the full roster.
 const USAGE: [&str; 4] = [
@@ -314,29 +407,54 @@ const USAGE: [&str; 4] = [
     "its bookmark, and any open pull request all survive the release.",
 ];
 
-/// The notice `plan` describes for the workspace `root` of the fork the
-/// registry names `repo_name`.
+/// The notice `plan` describes for the workspace `repo`.
+///
+/// `repo` is the workspace's root and the name the registry gives its fork;
+/// `nonce` names the envelope: the call's, which its guidance shares
+/// ([`crate::hook::state::Envelope`]).
 pub fn format_notice(
-    repo_name: &str,
-    root: &Path,
+    repo: &GuidanceRoot,
     plan: &NoticePlan<'_>,
     sightings: &Sightings<'_>,
+    nonce: &str,
 ) -> String {
-    let nonce = envelope_nonce();
-    [
-        String::new(),
-        String::new(),
+    let Lines { head, rows, tail } = notice_lines(&repo.root, plan, sightings);
+    let open = format!(
+        "\n\n<knives-notice-{nonce} repo=\"{}\" digest=\"{}\">",
+        safe_attribute(&repo.name),
+        plan.digest
+    );
+    let close = format!("</knives-notice-{nonce}>");
+    let more = |left: usize| {
         format!(
-            "<knives-notice-{nonce} repo=\"{}\" digest=\"{}\">",
-            safe_attribute(repo_name),
-            plan.digest
-        ),
-    ]
-    .into_iter()
-    .chain(notice_lines(root, plan, sightings))
-    .chain([format!("</knives-notice-{nonce}>")])
-    .collect::<Vec<_>>()
-    .join("\n")
+            "… and {left} more not shown here: `knives status {} --no-landed` lists every \
+             claim.",
+            crate::ledger::inline_human_text(&repo.name)
+        )
+    };
+    // Each line costs its characters and the newline before it.
+    let cost = |line: &String| line.chars().count() + 1;
+    let fixed = open.chars().count()
+        + head.iter().chain(&tail).map(cost).sum::<usize>()
+        + close.chars().count()
+        + 1;
+    let mut kept = rows.len();
+    let mut used = fixed + rows.iter().map(cost).sum::<usize>();
+    while used > NOTICE_CHARS && kept > 0 {
+        kept -= 1;
+        used = fixed
+            + rows.iter().take(kept).map(cost).sum::<usize>()
+            + cost(&more(rows.len() - kept));
+    }
+    let left = (kept < rows.len()).then(|| more(rows.len() - kept));
+    std::iter::once(open)
+        .chain(head)
+        .chain(rows.into_iter().take(kept))
+        .chain(left)
+        .chain(tail)
+        .chain([close])
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The notice in place of the claim roster when knives cannot read the claims:
@@ -402,16 +520,27 @@ mod tests {
     )]
 
     use std::collections::BTreeMap;
-    use std::path::Path;
+    use std::path::PathBuf;
 
     use super::{
-        Form, Holding, NoticePlan, REASON_CHARS, Sightings, claim_fingerprint, claim_line,
-        format_notice, held, one_line, plan, roster, roster_digest, whole_key,
+        Form, Holding, NOTICE_CHARS, NoticePlan, REASON_CHARS, Sightings, Workspace,
+        claim_fingerprint, claim_line, format_notice, held, one_line, plan, roster, roster_digest,
+        shown,
     };
+    use crate::config::GuidanceRoot;
     use crate::hook::state::HeldRoster;
     use crate::ids::UpstreamName;
     use crate::seen::Seen;
     use crate::store::{Claim, OwnerKind};
+
+    /// A workspace in a directory named `name`, whose checked-out branch
+    /// was not read.
+    const fn named(name: &str) -> Workspace<'_> {
+        Workspace {
+            name: Some(name),
+            branches: &[],
+        }
+    }
 
     fn claim(branch: &str, owner: &str, why: &str) -> Claim {
         Claim {
@@ -446,13 +575,16 @@ mod tests {
 
     fn text(root: &str, planned: &NoticePlan<'_>) -> String {
         format_notice(
-            "beta",
-            Path::new(root),
+            &GuidanceRoot {
+                name: "beta".to_owned(),
+                root: PathBuf::from(root),
+            },
             planned,
             &Sightings {
                 seen: &Seen::default(),
                 now: at("2026-01-03T00:00:00Z"),
             },
+            "0123",
         )
     }
 
@@ -554,7 +686,7 @@ mod tests {
         let roster = roster(&[], &beta);
         let digest = roster_digest(&beta, &roster);
         let planned =
-            plan(&roster, &digest, Some("main"), &holding(None, false)).expect("a notice");
+            plan(&roster, &digest, &named("main"), &holding(None, false)).expect("a notice");
 
         let text = text("/w/main", &planned);
 
@@ -579,7 +711,7 @@ mod tests {
 
         // When: the session holds no roster.
         let planned =
-            plan(&roster, "d1", Some("feat-here"), &holding(None, false)).expect("a notice");
+            plan(&roster, "d1", &named("feat-here"), &holding(None, false)).expect("a notice");
 
         // Then: the touched branch's claim is whole, the other cut.
         assert_eq!(
@@ -588,6 +720,7 @@ mod tests {
                 digest: "d1".to_owned(),
                 form: Form::Roster(vec![&claims[1]]),
                 here: vec![(&claims[0], true)],
+                unclaimed: Vec::new(),
             }
         );
         let text = text("/w/feat-here", &planned);
@@ -633,7 +766,7 @@ mod tests {
         let planned = plan(
             &roster,
             "new",
-            Some("main"),
+            &named("main"),
             &holding(Some(&held_roster), false),
         )
         .expect("a notice");
@@ -667,7 +800,7 @@ mod tests {
         let first = plan(
             &roster,
             &digest,
-            Some("main"),
+            &named("main"),
             &holding(Some(&held_roster), false),
         )
         .expect("a line");
@@ -676,7 +809,7 @@ mod tests {
         assert!(
             text.contains(&format!(
                 "/w/main: the claims on this fork are unchanged since the notice with digest \
-                 {digest}.\nNo claimed branch has its workspace here.\n"
+                 {digest}.\n</knives-notice-0123>"
             )),
             "{text}"
         );
@@ -686,7 +819,7 @@ mod tests {
             plan(
                 &roster,
                 &digest,
-                Some("main"),
+                &named("main"),
                 &holding(Some(&held_roster), true)
             ),
             None
@@ -700,17 +833,17 @@ mod tests {
         let roster_before = roster(&claims, &beta);
         let digest = roster_digest(&beta, &roster_before);
         let held_roster = held(&roster_before, &digest);
-        let key = whole_key(&claims[0]);
+        let fingerprint = claim_fingerprint(&claims[0]);
         let holding = Holding {
             roster: Some(&held_roster),
             noticed: true,
-            had_whole: |claim: &Claim| whole_key(claim) == key,
+            had_whole: |claim: &Claim| claim_fingerprint(claim) == fingerprint,
         };
 
         // A workspace of the branch, once the session had its claim whole and
         // had this digest here: nothing.
         assert_eq!(
-            plan(&roster_before, &digest, Some("feat-a"), &holding),
+            plan(&roster_before, &digest, &named("feat-a"), &holding),
             None
         );
 
@@ -719,7 +852,7 @@ mod tests {
         let roster_after = roster(&changed, &beta);
         let digest_after = roster_digest(&beta, &roster_after);
         let planned =
-            plan(&roster_after, &digest_after, Some("feat-a"), &holding).expect("the change");
+            plan(&roster_after, &digest_after, &named("feat-a"), &holding).expect("the change");
         assert_eq!(planned.here, vec![(&changed[0], true)]);
         assert!(
             matches!(&planned.form, Form::Changes { claimed, changed, released, .. }
@@ -730,5 +863,276 @@ mod tests {
             claim_fingerprint(&changed[0]),
             claim_fingerprint(&claims[0])
         );
+    }
+
+    #[test]
+    fn a_workspace_holds_the_claim_on_the_branch_it_has_checked_out_whatever_its_name() {
+        // Given: a claim on feat/a, and a checkout named `my-fix` with feat/a
+        // checked out; the session holds the roster.
+        let beta = UpstreamName::new("beta");
+        let claims = [claim("feat/a", "agent-a", "porting")];
+        let roster = roster(&claims, &beta);
+        let digest = roster_digest(&beta, &roster);
+        let held_roster = held(&roster, &digest);
+        let branches = ["feat/a".to_owned()];
+        let workspace = Workspace {
+            name: Some("my-fix"),
+            branches: &branches,
+        };
+
+        // When: a call touches it.
+        let planned = plan(
+            &roster,
+            &digest,
+            &workspace,
+            &holding(Some(&held_roster), true),
+        )
+        .expect("the claim here");
+
+        // Then: the claim is here, whole (B1).
+        assert_eq!(planned.here, vec![(&claims[0], true)]);
+        let text = text("/w/my-fix", &planned);
+        assert!(
+            text.contains("This workspace's branch is claimed: feat/a (agent-a,"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_unclaimed_branch_read_checked_out_is_named_and_nothing_is_claimed_otherwise() {
+        let beta = UpstreamName::new("beta");
+        let claims = [claim("feat/a", "agent-a", "porting")];
+        let roster = roster(&claims, &beta);
+        let digest = roster_digest(&beta, &roster);
+        let held_roster = held(&roster, &digest);
+        let branches = ["feat/b".to_owned()];
+        let read = Workspace {
+            name: Some("my-fix"),
+            branches: &branches,
+        };
+
+        // A branch read checked out and holding no claim is named as such.
+        let planned =
+            plan(&roster, &digest, &read, &holding(Some(&held_roster), false)).expect("a line");
+        let text_read = text("/w/my-fix", &planned);
+        assert!(
+            text_read.contains("\nNo claim is on the branch checked out here: feat/b.\n"),
+            "{text_read}"
+        );
+
+        // With no branch read, nothing is said of claims here.
+        let planned = plan(
+            &roster,
+            &digest,
+            &named("my-fix"),
+            &holding(Some(&held_roster), false),
+        )
+        .expect("a line");
+        let text_unread = text("/w/my-fix", &planned);
+        assert!(!text_unread.contains("No claim"), "{text_unread}");
+    }
+
+    #[test]
+    fn shown_lists_what_each_form_prints() {
+        let beta = UpstreamName::new("beta");
+        let claims = [
+            claim("feat/a", "agent-a", "porting"),
+            claim("feat/b", "agent-b", "review"),
+        ];
+        let roster = roster(&claims, &beta);
+        let first = plan(&roster, "d", &named("feat-a"), &holding(None, false)).expect("roster");
+        assert_eq!(shown(&first), vec![(&claims[1], false), (&claims[0], true)]);
+
+        // A Changes notice that leaves the claim here out shows only the delta.
+        let before = [claim("feat/a", "agent-a", "porting")];
+        let held_roster = held(&super::roster(&before, &beta), "old");
+        let key_a = claim_fingerprint(&claims[0]);
+        let holding_a = Holding {
+            roster: Some(&held_roster),
+            noticed: false,
+            had_whole: |claim: &Claim| claim_fingerprint(claim) == key_a,
+        };
+        let changes = plan(&roster, "new", &named("feat-a"), &holding_a).expect("changes");
+        assert_eq!(shown(&changes), vec![(&claims[1], false)]);
+    }
+
+    /// The first notice of `claims` for the workspace `feat-here`, whose
+    /// claim is `claims[0]`.
+    fn first_notice(claims: &[Claim]) -> String {
+        let beta = UpstreamName::new("beta");
+        let roster = roster(claims, &beta);
+        let planned =
+            plan(&roster, "d1", &named("feat-here"), &holding(None, false)).expect("a notice");
+        text("/w/feat-here", &planned)
+    }
+
+    #[test]
+    fn a_notice_at_its_cap_keeps_every_row_and_one_character_more_leaves_rows_out() {
+        // Given: the claim here, with a whole reason longer than a row, and
+        // as many other claims as fit under the cap.
+        let long = "z".repeat(300);
+        let mut claims = vec![claim("feat/here", "agent-a", &long)];
+        let mut index = 0;
+        while first_notice(&claims).chars().count() <= NOTICE_CHARS {
+            index += 1;
+            claims.push(claim(&format!("feat/x{index:03}"), "agent-b", "review"));
+        }
+        claims.pop();
+        let below = first_notice(&claims).chars().count();
+        // Padded to exactly the cap by the last claim's branch, which a row
+        // prints whole.
+        let last = claims.len() - 1;
+        claims[last]
+            .branch
+            .push_str(&"p".repeat(NOTICE_CHARS - below));
+
+        // When / Then: at the cap, every row and no count.
+        let at = first_notice(&claims);
+        assert_eq!(at.chars().count(), NOTICE_CHARS, "{at}");
+        assert!(!at.contains("more not shown here"), "{at}");
+        assert!(at.contains(&claims[last].branch), "{at}");
+
+        // And: one character more leaves the last rows out, counts them, and
+        // keeps the claim here whole, the usage lines and the cap.
+        claims[last].branch.push('p');
+        let over = first_notice(&claims);
+        assert!(
+            over.chars().count() <= NOTICE_CHARS,
+            "{}",
+            over.chars().count()
+        );
+        assert!(over.contains(&format!("): {long}\n")), "{over}");
+        assert!(!over.contains(&claims[last].branch), "{over}");
+        let others = claims.len() - 1;
+        let kept = over.lines().filter(|line| line.starts_with("- ")).count();
+        assert!(
+            over.contains(&format!(
+                "… and {} more not shown here: `knives status beta --no-landed` lists every claim.",
+                others - kept
+            )),
+            "{over}"
+        );
+        assert!(over.contains("`knives start <branch>`"), "{over}");
+    }
+
+    #[test]
+    fn a_claim_seized_with_the_same_reason_reads_changed() {
+        // Given: a session that holds feat/a as agent-a's.
+        let beta = UpstreamName::new("beta");
+        let before = [claim("feat/a", "agent-a", "porting")];
+        let held_roster = held(&roster(&before, &beta), "old");
+
+        // When: agent-b holds it now, with the same reason.
+        let after = [claim("feat/a", "agent-b", "porting")];
+        let roster = roster(&after, &beta);
+        let planned = plan(
+            &roster,
+            "new",
+            &named("main"),
+            &holding(Some(&held_roster), false),
+        )
+        .expect("a notice");
+
+        // Then: a changed claim, naming the new holder.
+        assert_eq!(
+            planned.form,
+            Form::Changes {
+                since: "old".to_owned(),
+                claimed: Vec::new(),
+                changed: vec![&after[0]],
+                released: Vec::new(),
+            }
+        );
+        assert!(text("/w/main", &planned).contains("- claim changed: feat/a (agent-b,"));
+    }
+
+    #[test]
+    fn an_unchanged_roster_with_a_claim_here_says_no_absence_and_gives_the_claim() {
+        // Given: a session that holds the roster, and a workspace whose
+        // claimed branch is read checked out there.
+        let beta = UpstreamName::new("beta");
+        let claims = [claim("feat/a", "agent-a", "porting")];
+        let roster = roster(&claims, &beta);
+        let digest = roster_digest(&beta, &roster);
+        let held_roster = held(&roster, &digest);
+        let branches = ["feat/a".to_owned()];
+        let workspace = Workspace {
+            name: Some("my-fix"),
+            branches: &branches,
+        };
+
+        // When / Then: the one line and the claim, never a line of absence.
+        let planned = plan(
+            &roster,
+            &digest,
+            &workspace,
+            &holding(Some(&held_roster), false),
+        )
+        .expect("a line");
+        assert_eq!(planned.form, Form::Unchanged);
+        let text = text("/w/my-fix", &planned);
+        assert!(
+            text.contains("This workspace's branch is claimed: feat/a"),
+            "{text}"
+        );
+        assert!(!text.contains("No claim"), "{text}");
+    }
+
+    #[test]
+    fn a_changes_notice_gives_the_claim_here_before_the_other_changes() {
+        // Given: a session holding an older roster; feat/a is here and new.
+        let beta = UpstreamName::new("beta");
+        let before = [claim("feat/b", "agent-b", "review")];
+        let held_roster = held(&roster(&before, &beta), "old");
+        let after = [
+            claim("feat/a", "agent-a", "porting"),
+            claim("feat/c", "agent-c", "fresh"),
+        ];
+        let roster = roster(&after, &beta);
+
+        // When: a call touches feat/a's workspace.
+        let planned = plan(
+            &roster,
+            "new",
+            &named("feat-a"),
+            &holding(Some(&held_roster), false),
+        )
+        .expect("a notice");
+        let text = text("/w/feat-a", &planned);
+
+        // Then: right after the header, the claim here; then the rest.
+        let here = text
+            .find("This workspace's branch is claimed: feat/a")
+            .expect("here");
+        let new = text.find("- newly claimed: feat/c").expect("new");
+        let gone = text.find("- released: feat/b").expect("released");
+        assert!(here < new && new < gone, "{text}");
+    }
+
+    #[test]
+    fn a_branch_read_checked_out_decides_and_the_name_is_only_a_fallback() {
+        // Given: claims on feat/a-b and feat-a/b, which both flatten to
+        // `feat-a-b`.
+        let beta = UpstreamName::new("beta");
+        let claims = [
+            claim("feat-a/b", "agent-x", "one"),
+            claim("feat/a-b", "agent-y", "two"),
+        ];
+        let roster = roster(&claims, &beta);
+        let branches = ["feat/a-b".to_owned()];
+        let read = Workspace {
+            name: Some("feat-a-b"),
+            branches: &branches,
+        };
+
+        // When / Then: with feat/a-b read checked out, only its claim is here
+        // (N29).
+        let planned = plan(&roster, "d", &read, &holding(None, false)).expect("a notice");
+        assert_eq!(planned.here, vec![(&claims[1], true)]);
+
+        // And: with no branch read, the name holds both: the safe side.
+        let planned =
+            plan(&roster, "d", &named("feat-a-b"), &holding(None, false)).expect("a notice");
+        assert_eq!(planned.here.len(), 2);
     }
 }

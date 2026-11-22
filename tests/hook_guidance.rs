@@ -4,12 +4,12 @@
     reason = "fixture setup and envelope inspection failures are test failures"
 )]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use knives::{
     config::GuidanceRoot,
     hook::guidance::{Guidance, InstructionFile, envelope_nonce, format_guidance, guidance_for},
-    hook::notice::{Holding, Sightings, claim_line, format_notice, held, plan, roster},
+    hook::notice::{Holding, Sightings, Workspace, claim_line, format_notice, held, plan, roster},
     ids::UpstreamName,
     seen::Seen,
     store::{Claim, OwnerKind},
@@ -81,8 +81,9 @@ fn notice_claim(repo: &str, branch: &str, owner: &str, why: &str) -> Claim {
 
 #[test]
 fn each_notice_form_reads_exactly_so() {
-    // Given: two claims of one fork, one on the branch of the workspace
-    // `feat-x`, and a later roster where one changed and one is new.
+    // Given: two claims of one fork, one on feat/x, checked out in the
+    // workspace `my-x`; a later roster where feat/y changed and feat/z is
+    // new; and one where feat/y is gone.
     let repo = UpstreamName::new("example-repo");
     let first = [
         notice_claim("example-repo", "feat/x", "x", "porting the walker"),
@@ -91,6 +92,10 @@ fn each_notice_form_reads_exactly_so() {
     let later = [
         notice_claim("example-repo", "feat/x", "x", "porting the walker"),
         notice_claim("example-repo", "feat/y", "y", "review fixes"),
+        notice_claim("example-repo", "feat/z", "z", "new work"),
+    ];
+    let last = [
+        notice_claim("example-repo", "feat/x", "x", "porting the walker"),
         notice_claim("example-repo", "feat/z", "z", "new work"),
     ];
     let sightings = Sightings {
@@ -105,62 +110,163 @@ fn each_notice_form_reads_exactly_so() {
     };
     let first_roster = roster(&first, &repo);
     let later_roster = roster(&later, &repo);
+    let last_roster = roster(&last, &repo);
     let held_first = held(&first_roster, "1111111111111111");
     let held_later = held(&later_roster, "2222222222222222");
+    let x = ["feat/x".to_owned()];
+    let at_x = Workspace {
+        name: Some("my-x"),
+        branches: &x,
+    };
+    let at_main = Workspace {
+        name: Some("main"),
+        branches: &[],
+    };
     let render = |root: &str, planned| {
-        normalize_nonce(
-            &format_notice("example-repo", Path::new(root), &planned, &sightings),
-            "notice",
+        format_notice(
+            &GuidanceRoot {
+                name: "example-repo".to_owned(),
+                root: PathBuf::from(root),
+            },
+            &planned,
+            &sightings,
+            "NONCE",
         )
     };
 
-    // When: the session holds nothing; then the first roster; then the later one.
+    // When: each form is planned.
     let actual = [
+        // A roster with a claim here and others.
         render(
-            "/example/feat-x",
+            "/example/my-x",
             plan(
                 &first_roster,
                 "1111111111111111",
-                Some("feat-x"),
+                &at_x,
                 &holding(None, false),
             )
             .expect("roster"),
         ),
+        // A roster with claims and none here.
+        render(
+            "/example/main",
+            plan(
+                &first_roster,
+                "1111111111111111",
+                &at_main,
+                &holding(None, false),
+            )
+            .expect("roster, none here"),
+        ),
+        // A roster whose only claim is here.
+        render(
+            "/example/my-x",
+            plan(
+                &first_roster[..1],
+                "4444444444444444",
+                &at_x,
+                &holding(None, false),
+            )
+            .expect("roster, only here"),
+        ),
+        // Changes, none here.
         render(
             "/example/main",
             plan(
                 &later_roster,
                 "2222222222222222",
-                Some("main"),
+                &at_main,
                 &holding(Some(&held_first), false),
             )
             .expect("changes"),
         ),
+        // Changes with a release and the claim here.
+        render(
+            "/example/my-x",
+            plan(
+                &last_roster,
+                "5555555555555555",
+                &at_x,
+                &holding(Some(&held_later), false),
+            )
+            .expect("changes, released, here"),
+        ),
+        // Unchanged, none here.
         render(
             "/example/main",
             plan(
                 &later_roster,
                 "2222222222222222",
-                Some("main"),
+                &at_main,
                 &holding(Some(&held_later), false),
             )
             .expect("unchanged"),
         ),
+        // Unchanged with the claim here.
+        render(
+            "/example/my-x",
+            plan(
+                &later_roster,
+                "2222222222222222",
+                &at_x,
+                &holding(Some(&held_later), false),
+            )
+            .expect("unchanged, here"),
+        ),
+        // No claim at all.
         render(
             "/example/main",
-            plan(&[], "3333333333333333", Some("main"), &holding(None, false)).expect("empty"),
+            plan(&[], "3333333333333333", &at_main, &holding(None, false)).expect("empty"),
         ),
     ];
 
-    // Then: every non-nonce byte is as written here.
+    // Then: every byte is as written here.
     let meta = "os-user, claimed 1d ago, not seen within the observation window";
     let usage = "Use knives rather than jj or git directly here: `knives status` for the state of\nevery branch, `knives start <branch>` to take a branch and get your own workspace,\n`knives finish <branch>` as soon as your active work there stops — the branch,\nits bookmark, and any open pull request all survive the release.";
-    assert_eq!(actual, [
-        format!("\n\n<knives-notice-NONCE repo=\"example-repo\" digest=\"1111111111111111\">\n/example/feat-x is a fork managed by knives, and another agent may be working in it.\nThis workspace's branch is claimed: feat/x (x, {meta}): porting the walker\nOther branches claimed here (1), each reason cut to one line:\n- feat/y (y, {meta}): {}…\n{usage}\n</knives-notice-NONCE>", "why ".repeat(20)),
-        format!("\n\n<knives-notice-NONCE repo=\"example-repo\" digest=\"2222222222222222\">\nThe claims on this fork changed since the notice with digest 1111111111111111; only the changes follow.\n- newly claimed: feat/z (z, {meta}): new work\n- claim changed: feat/y (y, {meta}): review fixes\n</knives-notice-NONCE>"),
-        "\n\n<knives-notice-NONCE repo=\"example-repo\" digest=\"2222222222222222\">\n/example/main: the claims on this fork are unchanged since the notice with digest 2222222222222222.\nNo claimed branch has its workspace here.\n</knives-notice-NONCE>".to_owned(),
-        format!("\n\n<knives-notice-NONCE repo=\"example-repo\" digest=\"3333333333333333\">\n/example/main is a fork managed by knives, and another agent may be working in it.\nNo branch is claimed here right now.\n{usage}\n</knives-notice-NONCE>"),
-    ]);
+    let open = |digest: &str| {
+        format!("\n\n<knives-notice-NONCE repo=\"example-repo\" digest=\"{digest}\">")
+    };
+    let close = "</knives-notice-NONCE>";
+    let x_whole =
+        format!("This workspace's branch is claimed: feat/x (x, {meta}): porting the walker");
+    let y_cut = format!("- feat/y (y, {meta}): {}…", "why ".repeat(20));
+    assert_eq!(
+        actual,
+        [
+            format!(
+                "{}\n/example/my-x is a fork managed by knives, and another agent may be working in it.\n{x_whole}\nOther branches claimed here (1), each reason cut to one line:\n{y_cut}\n{usage}\n{close}",
+                open("1111111111111111")
+            ),
+            format!(
+                "{}\n/example/main is a fork managed by knives, and another agent may be working in it.\nBranches claimed here (2), each reason cut to one line:\n- feat/x (x, {meta}): porting the walker\n{y_cut}\n{usage}\n{close}",
+                open("1111111111111111")
+            ),
+            format!(
+                "{}\n/example/my-x is a fork managed by knives, and another agent may be working in it.\n{x_whole}\nNo other branch is claimed here right now.\n{usage}\n{close}",
+                open("4444444444444444")
+            ),
+            format!(
+                "{}\nThe claims on this fork changed since the notice with digest 1111111111111111; only the changes follow.\n- newly claimed: feat/z (z, {meta}): new work\n- claim changed: feat/y (y, {meta}): review fixes\n{close}",
+                open("2222222222222222")
+            ),
+            format!(
+                "{}\nThe claims on this fork changed since the notice with digest 2222222222222222; only the changes follow.\n{x_whole}\n- released: feat/y\n{close}",
+                open("5555555555555555")
+            ),
+            format!(
+                "{}\n/example/main: the claims on this fork are unchanged since the notice with digest 2222222222222222.\n{close}",
+                open("2222222222222222")
+            ),
+            format!(
+                "{}\n/example/my-x: the claims on this fork are unchanged since the notice with digest 2222222222222222.\n{x_whole}\n{close}",
+                open("2222222222222222")
+            ),
+            format!(
+                "{}\n/example/main is a fork managed by knives, and another agent may be working in it.\nNo branch is claimed here right now.\n{usage}\n{close}",
+                open("3333333333333333")
+            ),
+        ]
+    );
 }
 
 #[test]
