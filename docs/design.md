@@ -536,13 +536,15 @@ With the forge up, `--on` reuses a record the forge places as the fork's own, an
 its own beside one the forge names as another repository's, which is another requirement.
 A text spells a record when it parses to the same kind, number or branch, and repository,
 the repository's letter case aside; a branch name's case always counts. A pull request
-named `<owner>/<name>#<n>` by another fork's upstream that no spelling here gives is this
-fork's own when the forge names this fork's repository so, as when a fork of this fork is
-registered after a rename. When the forge cannot be asked, it is the other fork's, unless
-the repository is owned by the owner of a registered fork's own repository, so the other
-fork may be a fork of this one: then nothing is recorded (exit 3), and the refusal names
-that fork. A project's upstream is owned by someone else, so this costs no offline `--on`
-in a registry without a fork of a fork.
+named `<owner>/<name>#<n>` by this fork's registered upstream is recorded with no forge
+call. One named by another fork's upstream may be this fork's own repository under another
+name, when a fork of this fork is registered after a rename or a transfer, and nothing
+here tells the two apart: the forge is asked, and it is this fork's review pull request
+when the forge names this fork's repository so, or redirects the name to it; the other
+fork's upstream pull request otherwise. When the forge cannot be asked, nothing is recorded
+(exit 3), and the refusal names that fork: a review pull request recorded as an upstream
+one reads met once it merges anywhere, so refusing is the safe failure. The cost is that an
+offline `--on` to another project's pull request waits for the forge.
 An upstream's `<owner>/<name>#<n>` is taken back without the forge. The forge has no
 answer that means a repository does not exist: GitHub answers a name it cannot resolve the
 same way for a repository that is gone, for one the token cannot see, and in some
