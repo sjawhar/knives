@@ -524,10 +524,13 @@ impl Context<'_, '_> {
     }
 
     /// The pull request `<repo>#<number>` names: by a registry name, the one
-    /// the forge finds; by this fork's own repository, that repository's,
-    /// even when a fork of this fork in the registry has it as its upstream;
-    /// by this fork's registered upstream, that upstream's, with no forge
-    /// call. Another fork's upstream may be this fork's own repository under
+    /// [`Self::asked_which`] gives; by this fork's own repository, that
+    /// repository's, even when a fork of this fork in the registry has it as
+    /// its upstream; by this fork's registered upstream, that upstream's,
+    /// with no forge call, unless a spelling of this fork's own repository
+    /// (its checkout's or registry's `origin`) is that upstream too, which
+    /// names this fork's own repository first ([`Self::own_origin_named`]).
+    /// Another fork's upstream may be this fork's own repository under
     /// another name (a fork of this fork registered after a rename or a
     /// transfer), and nothing here tells the two apart: the forge is asked
     /// ([`Self::own_under`]), and the pull request is this fork's when it
@@ -652,15 +655,19 @@ impl Context<'_, '_> {
         asked(&typed, repo).map(|named| named.eq_ignore_ascii_case(&own))
     }
 
-    /// Pull request `number` of the fork `key` names: on its upstream or on
-    /// its own repository, whichever the forge says has it. Another fork's
-    /// upstream may be this fork's own repository under another name (a fork
-    /// of this fork): the forge is asked first, as for the `<owner>/<name>`
-    /// spelling ([`Self::own_under`]), and the pull request is this fork's
-    /// when it says so. A review pull request on the own repository of a
-    /// fork other than this one is refused: its head is no member of this
-    /// fork, so nothing here can say when it has landed
-    /// ([`Self::another_forks_review`]).
+    /// Pull request `number` of the fork `key` names. Another fork's upstream
+    /// may be this fork's own repository under another name (a fork of this
+    /// fork): the forge is asked first, as for the `<owner>/<name>` spelling
+    /// ([`Self::own_under`]), whatever forge repositories that fork has, and
+    /// the pull request is this fork's when it says so. Otherwise, when that
+    /// fork's upstream and own repository are both forge repositories: the
+    /// one the forge says has it, refused when both or neither do, or the
+    /// upstream's, with no lookup of the number, when the forge names that
+    /// own repository as the upstream; when either is no forge repository,
+    /// the upstream's, with no lookup of the number. A review pull request
+    /// on the own repository of a fork other than this one is refused: its
+    /// head is no member of this fork, so nothing here can say when it has
+    /// landed ([`Self::another_forks_review`]).
     fn asked_which(
         &self,
         text: &str,

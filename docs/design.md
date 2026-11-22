@@ -433,9 +433,13 @@ requests apart: `<upstream>#<n>` is a pull request on the fork's upstream,
 `origin:<owner>/<name>#<n>` a review pull request on the fork's own repository, and
 `origin:<owner>/<name>:<branch>` a member branch of the fork. `knives depends --on
 <repo>#<n>`, the registry name, used to mean the upstream's pull request, and recorded an
-unrelated one where the fork's review pull request was meant; it now asks the forge which
-repository has #n when both are forge repositories, and refuses when both do, naming both
-(otherwise #n is the upstream's, with no forge call). A review pull request is
+unrelated one where the fork's review pull request was meant. Another fork's key is first
+read as below, and names this fork's own repository when that fork's upstream is it.
+Otherwise, when the fork's upstream and own repository are both forge repositories, it asks
+the forge which has #n, and refuses when both do, naming both, or when neither does; when
+the forge names the fork's own repository as its upstream, #n is the upstream's with no
+lookup of the number. When either is no forge repository, there is no such lookup, and #n
+is the upstream's. A review pull request is
 recorded only on the fork's own repository, and only when its head is a member branch of
 the fork: a branch of the fork's owner that is not the dependent itself, a base, a release
 or a fetched `pr-<n>` head. A review pull request on another fork's repository is refused:
@@ -528,7 +532,9 @@ its own beside one the forge names as another repository's, which is another req
 A text spells a record when it parses to the same kind, number or branch, and repository,
 the repository's letter case aside; a branch name's case always counts. A pull request
 named `<owner>/<name>#<n>` by this fork's registered upstream is recorded with no forge
-call. One named by another fork's upstream, by its `<owner>/<name>` or its registry key,
+call, unless a spelling of this fork's own repository (its checkout's or registry's
+`origin`) is that upstream too: the name then spells this fork's own repository first (see
+below). One named by another fork's upstream, by its `<owner>/<name>` or its registry key,
 may be this fork's own repository under another name, when a fork of this fork is
 registered after a rename or a transfer, and nothing here tells the two apart: the forge
 is asked, and it is this fork's review pull request when the forge names this fork's
@@ -559,8 +565,11 @@ fork whose upstream or own repository names no forge repository (such as `local#
 that fork is this one, its upstream is a path, or this fork's own repository names no forge
 repository. One exception: when this fork's checkout or registry `origin` spells its
 upstream, `<owner>/<name>#<n>` of that upstream names this fork's own repository first,
-which only the forge can place, so it is refused (exit 3) offline. Any other text that only
-the forge can read is refused (exit 3).
+which only the forge can place, so it is refused (exit 3) offline; with the forge up it is
+refused too (exit 2: the forge names that repository as the upstream, not this fork's own),
+and so is this fork's key, so no spelling records that upstream's pull requests. Such an
+`origin` is a configuration error: set it to this fork's own repository. Any other text that
+only the forge can read is refused (exit 3).
 An upstream's `<owner>/<name>#<n>` is taken back without the forge. The forge has no
 answer that means a repository does not exist: GitHub answers a name it cannot resolve the
 same way for a repository that is gone, for one the token cannot see, and in some
