@@ -654,37 +654,35 @@ target needed to decide whether unreleased work would be orphaned. A revision is
 live release or the trunk carries its content; a superseded release is consulted only after those
 targets miss and does not make the result safe. Against the upstream trunk, which knives does not
 compose, an ancestor tip is carried-exact. Against a release an ancestor tip is carried-exact only
-when the release holds its own change: a release merge names its members as parents, so every member
-is an ancestor whatever the merge's tree holds. Its own change starts at its fork point with the
-trunk, or, for a member stacked on another branch, at that branch (`carriage::MemberBase`): from
-the trunk a stacked member brings its base's whole line, whose lines siblings rewrote and a hand-cut
-release combined. A member is seen stacked when another maintained branch's tip is on its
-first-parent line since the trunk; a branch merged into its line is not. Its base is the head of the
-one branch or review pull request on the fork's own
-repository it records with `knives depends`, whether or not it is seen stacked (a member that landed
-into its base is not: the base's tip descends from it); the change starts at the member's fork point
-with that head, or, when the head already reaches the member, with the first parent of the merge on
-the head's first-parent line that brought the member in (`Repo::member_fork_point`). A stacked
-member that records none or several, a head the forge does not report or the checkout lacks, and a
-member its base took by a fast-forward are not answered when the replay conflicts: the check is an
-error naming what to record, so `--carries` exits `3`. The change replaying empty onto the release,
-a release-log block the release holds as a union counting as held, shows it is held. A replay that
-leaves a clean diff shows part of it gone, reverted by a later commit or dropped by a merge: not
-carried. A replay that conflicts is read file by file and hunk by hunk
-(`Repo::rewritten_replay_outcome`): a hunk the release holds as the fork point held it is missing
-(not carried); one both changed is held only when it is regular file text, the release side is not
-empty, no line the member deleted from the fork point's text is in the release side again, and,
-comparing the two sides line by line, each group the release holds in place of the member's lines
-replaced the member's lines alone (not base text beside them) and was written (by annotation) by
-one-parent commits whose parents hold no conflict at the file, which descend from each commit that
-wrote the lines they replaced (and from the member when its side deleted lines the fork point
-held), and which took those lines over: some of the member's lines stood in each one's parent, and
-each of the member's lines stood in one's parent (`Repo::took_over`). A line the release holds
-where the member's side holds none was written by such a commit that is no ancestor of the member.
-Anything else conflicts: a merge's own resolution, a later edit of what a resolution left in the
-member's place, a sibling's line kept over the member's, a line put back, a file deleted and
-written anew, moved or deleted, a mode, link or submodule changed both ways. A mode the member set
-that the release lacks is missing.
+when the release holds every line of its own change as the tip left it: a release merge names its
+members as parents, so every member is an ancestor whatever the merge's tree holds. A false
+carried-exact is the failure this guards against, so it is never answered where the release does
+not hold a line the member wrote, whoever rewrote it later. Its own change starts at its fork point
+with the trunk, or where it left its base (`carriage::MemberBase`): from the trunk a stacked member
+brings its base's whole line, whose lines siblings rewrote and a hand-cut release combined. A member
+is seen stacked when another maintained branch's tip is on its first-parent line since the trunk;
+the nearest such tip is where it left the branch it was built on, and a branch merged into its line
+is not one. Its base is the one branch or review pull request on the fork's own repository it
+records with `knives depends`, used only where the graph bears it out, so that a wrong record cannot
+move the member's own commits into its base: when the record's head reaches the member (it landed),
+the change starts at the member's fork point with the parent, apart from the member, of the merge
+nearest it on the head's line (`Repo::member_fork_point`); when it is stacked, the head must reach
+the tip it was built on and their fork point must be that tip; when it is not stacked, the fork
+point must be the trunk's. Otherwise, and for a stacked member that records none or several, a
+head the forge does not report or the checkout lacks, or a base that took it with no merge, the
+change is read from the trunk and answered only when that reading is empty or clean; one that
+conflicts is an error naming what to record, so `--carries` exits `3`. The change replaying empty
+onto the release, a release-log block the release holds as a union counting as held, shows it
+held. A replay that leaves a clean diff shows part of it gone, reverted by a later commit or
+dropped by a merge: not carried. A replay that conflicts is read file by file and hunk by hunk
+(`Repo::held_replay_outcome`), from content alone: a hunk the release holds as the fork point held
+it is missing (not carried); one both changed is held only when it is regular file text, no line
+the member deleted from the fork point's text is in the release side again, and, comparing the
+member's side with the release's line by line, every line the member wrote is in the release side
+in its order: only base text the member kept may differ. Anything else conflicts: a line rewritten
+by later work or by a resolution, a sibling's line kept over the member's, a line put back, a file
+deleted and written anew, moved or deleted, a mode, link or submodule changed both ways. A mode the
+member set that the release lacks is missing.
 
 `knives release members --census` turns that same check into a census. Its primary matrix contains
 every maintained branch against the live releases and upstream trunk. Superseded releases are

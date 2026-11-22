@@ -49,15 +49,15 @@ Use the replay probe, never a source-text search: a symbol's presence does not s
 - `knives release members <target> --carries <revision>` checks that one target. Exit `0` carried, `1` `NOT carried` or `conflicted`, `3` unresolved or uncheckable. A superseded target is a valid target.
 - With no target, it checks live releases and upstream trunk, then superseded cuts. Carriage only by a superseded cut does not make deletion safe.
 - `--census` asks this for every maintained branch. The `landed` column of `status` is the upstream-trunk probe.
-- Against a release, a member's own change starts at its fork point with the trunk, or, for a member stacked on another branch (that branch's tip is on its first-parent line; a branch merged into it is not), at that branch, as `knives depends <member> --on <branch or review PR>` records it. A stacked member that records no such base, or several, answers `3` when its replay from the trunk conflicts, and the answer names what to record.
+- Against a release, a member's own change starts at its fork point with the trunk, or where it left the branch it was built on, as `knives depends <member> --on <branch or review PR>` records it. A record is used only where the graph bears it out (the base's head reaches where the member was built, or the member landed into it by a merge). A stacked member (another branch's tip is on its first-parent line; a branch merged into it is not) that records no such base answers `3` when its reading from the trunk conflicts, and the answer names what to record.
 
 | Verdict | Evidence |
 |---|---|
-| `carried-exact` | The revision tip is an ancestor of the target. Against a release, also its own change replays empty onto the release, or conflicts only where one-parent commits that built on its lines, and had them in their parents, rewrote them. |
+| `carried-exact` | The revision tip is an ancestor of the target. Against a release, also every line of its own change is in the release as it left it; base text beside those lines may differ. A line later work rewrote is not carried-exact. |
 | `carried-rewritten` | Replaying its net change leaves the target unchanged: equivalent content arrived another way, or it has no net change. |
 | `carried-rebased` | Replay differs, but a commit with its change id is an ancestor. Weaker: divergent changes can name different trees. |
 | `NOT carried` (JSON `not-carried`) | Replay leaves a clean non-empty diff, and no rewrite is in the target. For a tip the target reaches: part of its own change is gone, reverted by a later commit or dropped by a merge. |
-| `conflicted` | Replay conflicts, and either no rewrite is in the target or, for a tip the target reaches, a part was replaced otherwise than by a commit that built on its lines and took them over: a merge's resolution, a later edit of what a resolution left, a sibling's line, a line put back, a file deleted and written anew. Some content can be present: judge it. |
+| `conflicted` | Replay conflicts, and either no rewrite is in the target or, for a tip the target reaches, a line of its own change is not there as it left it: rewritten by later work or a resolution, a sibling's line kept instead, a line put back, a file deleted and written anew. Some content can be present: judge it. |
 
 ## Output and exit codes
 

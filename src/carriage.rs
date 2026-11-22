@@ -2,8 +2,8 @@
 //!
 //! The audit's worst near-miss class was a branch deleted while its content
 //! was uncarried. The verdicts here are content-based first: sha ancestry for
-//! carried-exact (for a release, ancestry and no merge since that dropped
-//! its change), a three-way tree merge for carried-rewritten (jj
+//! carried-exact (for a release, ancestry and every line of its own change in
+//! the release as it left it), a three-way tree merge for carried-rewritten (jj
 //! divergent change-ids force tree comparison — the same change id can name
 //! two different trees). Only when the tree says otherwise does the change id
 //! speak, and it says something weaker on purpose: carried-rebased means a
@@ -52,11 +52,10 @@ pub enum TargetRole {
 #[serde(rename_all = "kebab-case")]
 pub enum CarryVerdict {
     /// The revision's tip is an ancestor of the target: carried as-is. For a
-    /// release target, the release also holds its change: a release merge
-    /// reaches every member it names as a parent whatever its tree holds, so
-    /// ancestry alone does not show a hand resolution kept it. Each hunk of
-    /// its change is in the release as it left it, or rewritten by a commit
-    /// that built on the lines it replaced ([`check`]).
+    /// release target, the release also holds every line of the tip's own
+    /// change as the tip left it: a release merge reaches every member it
+    /// names as a parent whatever its tree holds, so ancestry alone does not
+    /// show a hand resolution kept it ([`check`]).
     CarriedExact,
     /// Its net tree change leaves the target unchanged, whether the same content
     /// arrived through different commits or the revision itself has no net content.
@@ -70,9 +69,9 @@ pub enum CarryVerdict {
     CarriedRebased,
     NotCarried,
     /// The replay conflicted while the target itself is clean, and, for a
-    /// tip the target reaches, some hunk of its change was not rewritten by a
-    /// commit that built on its lines: some content is there or unrelated
-    /// work touched the same files; judge by eye.
+    /// tip the target reaches, some line of its own change is not in the
+    /// target as it left it: some content is there or unrelated work touched
+    /// the same files; judge by eye.
     Conflicted,
 }
 
@@ -678,7 +677,7 @@ fn render_check(check: &TargetCheck, indent: &str) -> String {
     let reason = match (check.verdict, check.role) {
         (CarryVerdict::CarriedExact, TargetRole::UpstreamTrunk) => "tip is an ancestor",
         (CarryVerdict::CarriedExact, TargetRole::LiveRelease | TargetRole::SupersededRelease) => {
-            "tip is an ancestor and the release holds its change or a rewrite built on it"
+            "tip is an ancestor and the release holds every line of its own change"
         }
         (CarryVerdict::CarriedRewritten, _) => "no net content remains",
         (CarryVerdict::CarriedRebased, _) => "a rewrite of the change is an ancestor",
@@ -839,15 +838,16 @@ pub fn own_repository_spellings(fork: &Fork<'_>) -> Vec<String> {
 /// names (`knives depends <member> --on <branch>`), never from the trunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemberBase {
-    /// It is seen stacked on no maintained branch and records no one branch
-    /// it needs: its change starts where it forked from the trunk.
+    /// It is seen stacked on no maintained branch and records no base the
+    /// graph bears out: its change starts where it forked from the trunk.
     Trunk,
     /// Its record names the one branch or review pull request on the fork's
-    /// own repository it needs, whose head is `head`.
-    Recorded { requirement: String, head: CommitId },
-    /// It is stacked, and which branch it is stacked on cannot be read: why.
-    /// Only a replay from the trunk that reads empty or clean answers it;
-    /// one that conflicts cannot be judged.
+    /// own repository it needs, and the graph bears it out: its own change
+    /// starts at `from`.
+    Recorded { requirement: String, from: CommitId },
+    /// Where its own change starts cannot be read: why. Only a replay from
+    /// the trunk that reads empty or clean answers it; one that conflicts
+    /// cannot be judged.
     Unknown(String),
 }
 
@@ -883,17 +883,26 @@ impl MemberBase {
     /// could not be read).
     ///
     /// It is stacked when the tip of another maintained branch is on its
-    /// first-parent line since the trunk: it was built on that branch. A
-    /// branch merged into its line (a review branch that landed into it by a
-    /// merge) is reached only through a merge's other parent, and stacks
-    /// nothing. When it records exactly one branch or review pull request on
-    /// the fork's own repository it needs, its base is that one's head,
-    /// stacked or not: a member that landed into its base is no longer seen
-    /// stacked, since the base's tip now descends from it, and for a member
-    /// that sits on none the base's fork point with it is the trunk's. A
-    /// head on another repository, from a forge that does not answer or not
-    /// in this checkout leaves it unknown. Recording none or several, it is
-    /// unknown when stacked and starts from the trunk otherwise.
+    /// first-parent line since the trunk: the nearest such tip is where it
+    /// left the branch it was built on. A branch merged into its line (a
+    /// review branch that landed into it by a merge) is reached only through
+    /// a merge's other parent, and stacks nothing.
+    ///
+    /// A record is used only where the graph bears it out, so that a wrong
+    /// one cannot move the member's own commits into its base:
+    /// - the record's head reaches the member (it landed into its base): its
+    ///   own change starts where it left the base, read from the merge that
+    ///   landed it ([`Repo::member_fork_point`]); a base that took it with no
+    ///   merge leaves it unknown;
+    /// - it is stacked: the record's head reaches the branch tip it was
+    ///   built on, and its fork point with the member is that tip;
+    /// - it is not stacked: the record's fork point with it is the trunk's,
+    ///   so it starts from the trunk.
+    ///
+    /// Otherwise, and for a head on another repository, from a forge that
+    /// does not answer or not in this checkout, it is unknown. Recording
+    /// none or several, it is unknown when stacked and starts from the trunk
+    /// otherwise.
     pub fn read(
         repo: &Repo,
         (branch, tip): (Option<&str>, &CommitId),
@@ -908,16 +917,22 @@ impl MemberBase {
                 .branches
                 .iter()
                 .find(|(other, other_tip)| other_tip == commit && Some(other.as_str()) != branch)
-                .map(|(other, _)| other)
         });
+        let stacked_name = stacked_on.map(|(other, _)| other);
         let name = branch.unwrap_or("this revision");
         let record = |on: &str| {
             branch.map_or_else(
                 || {
-                    "`knives depends <branch> --on <branch it is stacked on>` on its branch"
+                    "`knives depends <branch> --on <branch it is stacked on>` on its branch, if \
+                     it was built on that branch's commits"
                         .to_owned()
                 },
-                |branch| format!("`knives depends {branch} --on {on}`"),
+                |branch| {
+                    format!(
+                        "`knives depends {branch} --on {on}` if {branch} was built on {on}'s \
+                         commits, not on a copy of its own"
+                    )
+                },
             )
         };
         let on_fork: Vec<&Requirement> = match recorded {
@@ -926,7 +941,7 @@ impl MemberBase {
                 .filter(|requirement| !matches!(requirement, Requirement::Upstream { .. }))
                 .collect(),
             Err(reason) => {
-                return Ok(stacked_on.map_or(Self::Trunk, |stacked_on| {
+                return Ok(stacked_name.map_or(Self::Trunk, |stacked_on| {
                     Self::Unknown(format!(
                         "{name} is stacked on {stacked_on}, and what it records it needs could \
                          not be read: {reason}"
@@ -935,7 +950,7 @@ impl MemberBase {
             }
         };
         let [requirement] = on_fork.as_slice() else {
-            let Some(stacked_on) = stacked_on else {
+            let Some(stacked_on) = stacked_name else {
                 return Ok(Self::Trunk);
             };
             return Ok(Self::Unknown(if on_fork.is_empty() {
@@ -958,12 +973,71 @@ impl MemberBase {
                 )
             }));
         };
-        Ok(match Self::recorded_head(repo, requirement, context) {
-            Ok(head) => Self::Recorded {
-                requirement: requirement.to_string(),
-                head,
+        let head = match Self::recorded_head(repo, requirement, context) {
+            Ok(head) => head,
+            Err(why) => {
+                return Ok(Self::Unknown(format!(
+                    "{name} records {requirement}, {why}"
+                )));
+            }
+        };
+        Ok(
+            match Self::borne_out(repo, (tip, &head), stacked_on, context.trunk)? {
+                Ok(Some(from)) => Self::Recorded {
+                    requirement: requirement.to_string(),
+                    from,
+                },
+                Ok(None) => Self::Trunk,
+                Err(why) => Self::Unknown(format!("{name} records {requirement}, {why}")),
             },
-            Err(why) => Self::Unknown(format!("{name} records {requirement}, {why}")),
+        )
+    }
+
+    /// Where the own change of the member at `tip` starts, by its recorded
+    /// base's `head`, where the graph bears the record out ([`Self::read`]):
+    /// `Some` where it left the base, `None` for the trunk's fork point, or
+    /// why the record cannot be used.
+    fn borne_out(
+        repo: &Repo,
+        (tip, head): (&CommitId, &CommitId),
+        stacked_on: Option<&(BranchName, CommitId)>,
+        trunk: &CommitId,
+    ) -> anyhow::Result<Result<Option<CommitId>, String>> {
+        if repo.is_ancestor(tip, head)? {
+            return Ok(repo.member_fork_point(tip, head)?.map_or_else(
+                || {
+                    Err(
+                        "which took it with no merge, so its own change cannot be told from its \
+                         base's"
+                            .to_owned(),
+                    )
+                },
+                |from| Ok(Some(from)),
+            ));
+        }
+        let from = repo.fork_point(tip, head)?;
+        Ok(match stacked_on {
+            Some((on, on_tip)) => {
+                if repo.is_ancestor(on_tip, head)? && repo.is_ancestor(&from, on_tip)? {
+                    Ok(Some(from))
+                } else {
+                    Err(format!(
+                        "but it was built on {on}, and its fork point with the record is not \
+                         {on}'s tip"
+                    ))
+                }
+            }
+            None => {
+                if repo.is_ancestor(&from, trunk)? {
+                    Ok(None)
+                } else {
+                    Err(
+                        "but no maintained branch's tip is on its line, so its fork point with \
+                         the record is one of its own commits"
+                            .to_owned(),
+                    )
+                }
+            }
         })
     }
 
@@ -1050,23 +1124,23 @@ impl<'a> CheckInput<'a> {
 ///
 /// An ancestor tip is carried-exact against the upstream trunk, which knives
 /// does not compose. Against a release it is carried-exact only when the
-/// release holds its change: a release merge names its members as parents,
-/// so every member is an ancestor whatever the merge's tree holds, and a
-/// hand resolution can drop a member's change while keeping the member a
-/// parent. Its own change replaying empty onto the release shows the release
-/// holds it. Its own change starts where it forked from the trunk, or, for a
-/// member stacked on another branch, from that branch ([`MemberBase`]): from
-/// the trunk it would bring that branch's line, which the release can hold
-/// combined with the work of others by hand. A replay that leaves a clean
-/// diff shows part of it gone, reverted or dropped: not carried. A replay
-/// that conflicts can be later work rewriting its lines, a commit that built
-/// on them, so it is read file by file and hunk by hunk
-/// ([`Repo::rewritten_replay_outcome`]): carried-exact when every hunk is
-/// held or rewritten by a commit that built on the lines it replaced, not
-/// carried when the rest holds and a hunk of the tip's change is missing,
-/// and conflicted when any hunk was resolved otherwise. A stacked member
-/// whose base cannot be read is answered only by a replay from the trunk
-/// that reads empty or clean; one that conflicts is an error naming why.
+/// release holds every line of its own change as the tip left it: a release
+/// merge names its members as parents, so every member is an ancestor
+/// whatever the merge's tree holds, and a hand resolution can drop a
+/// member's change while keeping the member a parent. Its own change starts
+/// where it forked from the trunk, or, for a member whose record the graph
+/// bears out, where it left its base ([`MemberBase`]): from the trunk a
+/// stacked member would bring its base's line, which the release can hold
+/// combined with the work of others by hand. Its own change replaying empty
+/// onto the release shows it held. A replay that leaves a clean diff shows
+/// part of it gone, reverted or dropped: not carried. A replay that
+/// conflicts is read file by file and hunk by hunk
+/// ([`Repo::held_replay_outcome`]): carried-exact when every line the tip
+/// wrote is there as it left it, whatever changed beside it; not carried
+/// when the rest holds and a hunk is missing; conflicted otherwise, as when
+/// later work or a resolution rewrote a line of it. A member whose base
+/// cannot be read is answered from the trunk only when that reading is
+/// empty or clean; one that conflicts is an error naming why.
 pub fn check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryCheck> {
     if input.repo.is_ancestor(input.tip, &target.commit)? {
         let verdict = match target.role {
@@ -1074,36 +1148,27 @@ pub fn check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryChe
             TargetRole::LiveRelease | TargetRole::SupersededRelease => {
                 let from = match &input.base {
                     MemberBase::Trunk | MemberBase::Unknown(_) => input.fork_point()?.clone(),
-                    MemberBase::Recorded { requirement, head } => {
-                        match input.repo.member_fork_point(input.tip, head)? {
-                            Some(from) => from,
-                            None => anyhow::bail!(
-                                "its base {requirement} at {} reaches it with no merge that \
-                                 landed it, so its own change cannot be told from its base's",
-                                head.short()
-                            ),
+                    MemberBase::Recorded { from, .. } => from.clone(),
+                };
+                let outcome =
+                    match input
+                        .repo
+                        .fork_point_replay_outcome(input.tip, &from, &target.commit)?
+                    {
+                        RebaseOutcome::Conflicted => {
+                            input
+                                .repo
+                                .held_replay_outcome(input.tip, &from, &target.commit)?
                         }
-                    }
-                };
-                let outcome = match input.repo.fork_point_replay_outcome(
-                    input.tip,
-                    &from,
-                    &target.commit,
-                )? {
-                    RebaseOutcome::Conflicted => match &input.base {
-                        MemberBase::Unknown(reason) => anyhow::bail!(
-                            "its change since the trunk conflicts with the release, and {reason}"
-                        ),
-                        MemberBase::Trunk | MemberBase::Recorded { .. } => input
-                            .repo
-                            .rewritten_replay_outcome(input.tip, &from, &target.commit)?,
-                    },
-                    outcome => outcome,
-                };
-                match outcome {
-                    RebaseOutcome::Empty => CarryVerdict::CarriedExact,
-                    RebaseOutcome::CleanNonEmpty => CarryVerdict::NotCarried,
-                    RebaseOutcome::Conflicted => CarryVerdict::Conflicted,
+                        outcome => outcome,
+                    };
+                match (outcome, &input.base) {
+                    (RebaseOutcome::Conflicted, MemberBase::Unknown(reason)) => anyhow::bail!(
+                        "its change since the trunk conflicts with the release, and {reason}"
+                    ),
+                    (RebaseOutcome::Empty, _) => CarryVerdict::CarriedExact,
+                    (RebaseOutcome::CleanNonEmpty, _) => CarryVerdict::NotCarried,
+                    (RebaseOutcome::Conflicted, _) => CarryVerdict::Conflicted,
                 }
             }
         };
