@@ -675,14 +675,20 @@ conflicts is an error naming what to record, so `--carries` exits `3`. The chang
 onto the release, a release-log block the release holds as a union counting as held, shows it
 held. A replay that leaves a clean diff shows part of it gone, reverted by a later commit or
 dropped by a merge: not carried. A replay that conflicts is read file by file and hunk by hunk
-(`Repo::held_replay_outcome`), from content alone: a hunk the release holds as the fork point held
-it is missing (not carried); one both changed is held only when it is regular file text, no line
-the member deleted from the fork point's text is in the release side again, and, comparing the
-member's side with the release's line by line, every line the member wrote is in the release side
-in its order: only base text the member kept may differ. Anything else conflicts: a line rewritten
-by later work or by a resolution, a sibling's line kept over the member's, a line put back, a file
-deleted and written anew, moved or deleted, a mode, link or submodule changed both ways. A mode the
-member set that the release lacks is missing.
+only for a member whose recorded base the graph bears out and whose own line, from where it left
+that base to its tip, merges nothing in (`Repo::is_linear`): there the replay's base is the text
+the member started from, and a line it deleted can be seen. For any other member a line it
+deleted may lie between the trunk and its base, or come from what it merged in, unseen, so its
+conflicting replay reads conflicted, as on main, or, when its base cannot be read, is not
+answered. The reading (`Repo::held_replay_outcome`) is from content alone: a hunk the release
+holds as the fork point held it is missing (not carried); one both changed is held only when it
+is regular file text, no line the member deleted from the fork point's text is in the release
+side again, and, comparing the member's side with the release's line by line, every line the
+member wrote is in the release side in its order: only base text the member kept may differ.
+Anything else conflicts: a line rewritten by later work or by a resolution, a sibling's line
+kept over the member's, a line put back, a file deleted and written anew, moved or deleted, a
+mode, link or submodule changed both ways. A mode the member set that the release lacks is
+missing.
 
 `knives release members --census` turns that same check into a census. Its primary matrix contains
 every maintained branch against the live releases and upstream trunk. Superseded releases are

@@ -982,6 +982,66 @@ fn release_carries_answers_not_carried_for_a_member_whose_deleted_line_the_relea
     assert_carried_in(&lab, &home, "feat/del", false);
 }
 
+#[test]
+fn release_carries_cannot_answer_an_unrecorded_stacked_member_whose_deleted_line_was_put_back() {
+    // Given: the same shape, but `feat/del` records no base.
+    let lab = Lab::new();
+    lab.branch("feat/base", "f.txt", "a\nb\nc\n");
+    child_by_hand(&lab, "feat/del", "feat/base", &[("f.txt", Some("a\nc\n"))]);
+    lab.branch("feat/x", "x.txt", "x\n");
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        ("feat/del", "feat/x"),
+        &[("f.txt", Some("a\nb\nc\n"))],
+    );
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: from the trunk, `f.txt` is one file `feat/del` added, and
+    // the line it deleted cannot be seen; so it is not answered, and the
+    // answer names the record to write.
+    assert_unanswered(
+        &lab,
+        &home,
+        "feat/del",
+        "record it with `knives depends feat/del --on feat/base`",
+    );
+}
+
+#[test]
+fn release_carries_answers_not_carried_for_a_member_that_deleted_a_line_it_merged_in() {
+    // Given: `feat/del`, built on `feat/base` and recording it, merges in
+    // `feat/u`, which adds `u.txt`, then deletes a line of `u.txt`; the
+    // release merges `feat/del` with another branch and puts the line back.
+    let lab = Lab::new();
+    lab.branch("feat/base", "base.txt", "base\n");
+    child_by_hand(&lab, "feat/del", "feat/base", &[("del.txt", Some("del\n"))]);
+    lab.branch("feat/u", "u.txt", "x\ny\n");
+    merge_by_hand(&lab, "feat/del-merged", ("feat/del", "feat/u"), &[]);
+    child_by_hand(
+        &lab,
+        "feat/del-final",
+        "feat/del-merged",
+        &[("u.txt", Some("x\n"))],
+    );
+    lab.jj_work(["bookmark", "set", "feat/del", "-r", "feat/del-final"]);
+    lab.jj_work(["bookmark", "delete", "feat/del-merged", "feat/del-final"]);
+    lab.branch("feat/x", "x.txt", "x\n");
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        ("feat/del", "feat/x"),
+        &[("u.txt", Some("x\ny\n"))],
+    );
+    let (home, _consumer) = release_test_home(&lab);
+    depends(&lab, &home, "feat/del", "feat/base");
+
+    // When, then: `feat/del` is not carried exactly: its own change holds a
+    // merge, so a line it deleted from what it merged in cannot be told
+    // from a line the release added.
+    assert_carried_in(&lab, &home, "feat/del", false);
+}
+
 /// `feat/line` changes `README.md`; `feat/member`, stacked on it, writes a
 /// file of its own; the release merges `feat/member` with another branch
 /// and rewrites by hand the line `feat/line` wrote, as a release rewrites a
@@ -1202,8 +1262,8 @@ fn release_carries_reads_a_member_landed_into_its_base_from_before_it_landed() {
 
     // And: had `feat/line` taken the member by moving onto it, with no
     // merge, its own change cannot be told from the base's, so it is read
-    // from the trunk: carried exactly where every line since the trunk is
-    // there as it was left.
+    // from the trunk: carried exactly only where that reading replays
+    // empty, the release holding every line since the trunk as it was left.
     lab.jj_work([
         "bookmark",
         "set",
@@ -1220,15 +1280,7 @@ fn release_carries_reads_a_member_landed_into_its_base_from_before_it_landed() {
     );
     lab.jj_work(["bookmark", "set", "feat/line", "-r", "feat/line-after"]);
     lab.jj_work(["bookmark", "delete", "feat/line-after"]);
-    merge_by_hand(
-        &lab,
-        "release/2026-08-05",
-        ("feat/line", "feat/other"),
-        &[(
-            "README.md",
-            Some("seed, as feat/line left it\na dependency the release added\n"),
-        )],
-    );
+    merge_by_hand(&lab, "release/2026-08-05", ("feat/line", "feat/other"), &[]);
     let output = knives_release(
         &lab,
         &home,
@@ -1238,22 +1290,34 @@ fn release_carries_reads_a_member_landed_into_its_base_from_before_it_landed() {
     assert_eq!(output.status.code(), Some(0), "{stdout}");
     assert!(stdout.contains("carried-exact "), "{stdout}");
 
-    // And: where the release rewrote a line of `feat/line`'s, the reading
-    // from the trunk conflicts, and the member is not answered.
-    merge_by_hand(
-        &lab,
-        "release/2026-08-06",
-        ("feat/line", "feat/other"),
-        &[("README.md", Some("seed, rewritten by the release\n"))],
-    );
-    let output = knives_release(
-        &lab,
-        &home,
-        &["members", "release/2026-08-06", "--carries", "feat/member"],
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(output.status.code(), Some(3), "{stdout}");
-    assert!(stdout.contains("which took it with no merge"), "{stdout}");
+    // And: where the release changed a file `feat/line` wrote, the reading
+    // from the trunk conflicts, and the member is not answered: from the
+    // trunk, a line its base wrote and it deleted cannot be seen.
+    for (release, readme) in [
+        (
+            "release/2026-08-06",
+            "seed, as feat/line left it\na dependency the release added\n",
+        ),
+        ("release/2026-08-07", "seed, rewritten by the release\n"),
+    ] {
+        merge_by_hand(
+            &lab,
+            release,
+            ("feat/line", "feat/other"),
+            &[("README.md", Some(readme))],
+        );
+        let output = knives_release(
+            &lab,
+            &home,
+            &["members", release, "--carries", "feat/member"],
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(3), "{release}: {stdout}");
+        assert!(
+            stdout.contains("which took it with no merge"),
+            "{release}: {stdout}"
+        );
+    }
 }
 
 #[test]

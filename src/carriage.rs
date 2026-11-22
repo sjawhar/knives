@@ -1134,13 +1134,16 @@ impl<'a> CheckInput<'a> {
 /// combined with the work of others by hand. Its own change replaying empty
 /// onto the release shows it held. A replay that leaves a clean diff shows
 /// part of it gone, reverted or dropped: not carried. A replay that
-/// conflicts is read file by file and hunk by hunk
+/// conflicts, for a member whose recorded base the graph bears out and
+/// whose own line merges nothing in, is read file by file and hunk by hunk
 /// ([`Repo::held_replay_outcome`]): carried-exact when every line the tip
 /// wrote is there as it left it, whatever changed beside it; not carried
 /// when the rest holds and a hunk is missing; conflicted otherwise, as when
-/// later work or a resolution rewrote a line of it. A member whose base
-/// cannot be read is answered from the trunk only when that reading is
-/// empty or clean; one that conflicts is an error naming why.
+/// later work or a resolution rewrote a line of it. For any other member a
+/// conflicting replay is not read that way: from where it is read, a line
+/// it deleted may not be seen. It reads conflicted, as on the trunk's
+/// fork point a member that is not stacked does; a member whose base
+/// cannot be read is an error naming why.
 pub fn check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryCheck> {
     if input.repo.is_ancestor(input.tip, &target.commit)? {
         let verdict = match target.role {
@@ -1155,7 +1158,14 @@ pub fn check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryChe
                         .repo
                         .fork_point_replay_outcome(input.tip, &from, &target.commit)?
                     {
-                        RebaseOutcome::Conflicted => {
+                        // Read line by line only where `from..tip` is the
+                        // member's own change, a line it deleted being
+                        // visible: a recorded base the graph bears out, and
+                        // a line that merges nothing in.
+                        RebaseOutcome::Conflicted
+                            if matches!(input.base, MemberBase::Recorded { .. })
+                                && input.repo.is_linear(&from, input.tip)? =>
+                        {
                             input
                                 .repo
                                 .held_replay_outcome(input.tip, &from, &target.commit)?

@@ -850,6 +850,26 @@ impl Repo {
         self.fork_point_of(std::slice::from_ref(revision), trunk)
     }
 
+    /// Whether every commit of `from..tip` has one parent: the line from
+    /// `from` to `tip` merges nothing in.
+    pub fn is_linear(&self, from: &CommitId, tip: &CommitId) -> Result<bool, JjError> {
+        let from = self.commit(from.as_str())?;
+        let tip = self.commit(tip.as_str())?;
+        let line = self.revset_ids(
+            ResolvedRevsetExpression::commit(from.id().clone())
+                .range(&ResolvedRevsetExpression::commit(tip.id().clone())),
+            &tip.id().hex(),
+        )?;
+        let store = self.repo.store();
+        for id in &line {
+            let commit = store.get_commit(id).map_err(|error| store_error(&error))?;
+            if commit.parent_ids().len() > 1 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// The commits on `tip`'s first-parent line below it, newest first, down
     /// to the first one `trunk` reaches, which is left out.
     pub fn first_parent_line(
