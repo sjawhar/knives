@@ -2460,6 +2460,10 @@ fn refusal_says(row: &str) -> &'static str {
     match row {
         "F4" | "F7" => "demo#12 answers to maintainer/demo#12, origin:acme/demo#12; name the one",
         "F5" | "F6" | "F47" => "If it does, it names two requirements.",
+        "F37" | "F56" => {
+            "nothing recorded: demo#13 answers to origin:acme-old/demo#13, origin:acme/demo#13, and \
+             whether they are one requirement could not be asked of the forge"
+        }
         "F29" => "which is sibling's own repository, not demo's",
         "F34" => "does not require origin:acme/demo#99",
         "F43" => "does not require feat/base",
@@ -3074,6 +3078,18 @@ fn forgetting_where_only_the_forge_could_decide_follows_the_table() {
             texts: &["demo#13"],
             exit: 0,
             left: &[],
+        },
+        // N107: F37 with the forge unable to resolve this fork's own
+        // repository, so the refusal that the two may be one requirement
+        // gives the unresolved advice.
+        ForgetRow {
+            row: "F56",
+            config: CONFIG_X,
+            held: &[F13_OLD, F13],
+            now: ForgeNow::OwnUnseen,
+            texts: &["demo#13"],
+            exit: 3,
+            left: &[F13_OLD, F13],
         },
         // N51(b): a third record of the number, on a repository the forge
         // names apart; the former name's lookup fails.
