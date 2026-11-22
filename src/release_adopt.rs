@@ -637,8 +637,8 @@ fn measure<'a>(
         let change_base = held.opened.change_base(tip, &trunk)?;
         let base = HeldBase::read(&held.opened, (tip, change_base), &held.parents)?;
         bases.extend(base.line(member, &held.name));
-        if let Some(base) = base.commit() {
-            forked.push((member.as_str(), tip, base.clone()));
+        if let Some(base) = base.into_commit() {
+            forked.push((member.as_str(), tip, base));
         }
     }
     let lost = lost_lines(&held.opened, &forked, (&held.commit, &changes))?;
@@ -699,10 +699,13 @@ impl LostLines {
 /// the baseline held.
 ///
 /// `forked` holds each member read, by its label, with its tip and its base
-/// by spec R6 ([`HeldBase`]). The base is the member's own, so a trunk that
-/// moved on since is never charged to it. Counted as a multiset because a
-/// release log repeats lines (`### Added`) that one member adding and
-/// another keeping must not cancel.
+/// by spec R6 ([`HeldBase`]). So a trunk commit that the member's tip does
+/// not hold is never charged to it. A base on the trunk's first-parent line
+/// ([`HeldBase::Line`]) is a commit that another parent holds. It charges
+/// the member with each trunk commit between that base and where the member
+/// began. Counted as a multiset because a release log repeats lines
+/// (`### Added`) that one member adding and another keeping must not
+/// cancel.
 /// Every file the commit changes is counted, a file the baseline left without
 /// a conflict too: restoring such a file can drop a member's line as surely as
 /// resolving a conflict can.
@@ -725,12 +728,12 @@ fn lost_lines(
             .map(|sides| sides.iter().map(Vec::as_slice).collect())
             .unwrap_or_default();
         let lines = FileLines::new(&baseline, &resolved);
-        for &(member, tip, ref fork_point) in forked {
+        for &(member, tip, ref base) in forked {
             // A member that left the file as it found it added no line of it.
-            if opened.same_path_value(fork_point, tip, file)? {
+            if opened.same_path_value(base, tip, file)? {
                 continue;
             }
-            let before = opened.file_bytes(fork_point, file)?.unwrap_or_default();
+            let before = opened.file_bytes(base, file)?.unwrap_or_default();
             let after = opened.file_bytes(tip, file)?.unwrap_or_default();
             let (counted, absent) = lines.counted_and_lost((&before, &after));
             if counted > 0 {
@@ -1070,9 +1073,9 @@ fn adopted_text(replaced: &Replaced, adoption: &Adoption<'_>) -> String {
 /// resolved by hand; the files changed beyond the conflicts, with the
 /// reason; each member's lost lines, then the base of each member that the
 /// trunk holds on its first-parent line ([`HeldBase::line`]); each carrier,
-/// labelled; and each `### `
-/// heading that a release log's one `[Unreleased]` section holds more than
-/// once ([`release::report_repeated_headings`]).
+/// labelled; and each `### ` heading that a release log's one
+/// `[Unreleased]` section holds more than once
+/// ([`release::report_repeated_headings`]).
 fn report(adopting: &Adopting<'_, '_>, adoption: &Adoption<'_>) {
     let (repo, held, replaced) = (&adopting.fork.name, adopting.held, adopting.replaced);
     // Names, paths and labels are read from the repository, and the reason is

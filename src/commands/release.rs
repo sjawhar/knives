@@ -9,7 +9,7 @@
 //! as their union, and refuses while the release in hand carries a change
 //! knives did not write or adopt, printing the steps that record it. Every one
 //! of them writes the release locally only, and none of them pushes it.
-// allow: SIZE_OK: 5746 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
+// allow: SIZE_OK: 5774 lines - the release lifecycle's plan, members, cut, edit, adopt refusals and remedies, audit, reap, and rebase operations, and the pull every one of them plans from, are one domain seam.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -3497,8 +3497,8 @@ pub fn audit_cut(
             .iter()
             .map(|parent| (parent, context.trunk_parent_base)),
     );
-    for ((name, tip), base) in read {
-        let fork_point = match base {
+    for ((name, tip), trunk_parent_base) in read {
+        let base = match trunk_parent_base {
             Some(base) => base.clone(),
             None => opened.release_base(
                 tip,
@@ -3506,7 +3506,7 @@ pub fn audit_cut(
                 &parents,
             )?,
         };
-        let mut lines = subject.member_lines(&opened, name, (&fork_point, tip))?;
+        let mut lines = subject.member_lines(&opened, name, (&base, tip))?;
         // A line the release held against already lacked is that release's
         // resolution, carried forward, not a loss: refusing it would make
         // every release with a hand-resolved conflict fail its own re-cut
@@ -3517,7 +3517,7 @@ pub fn audit_cut(
         if lines.reading == Reading::Missing
             && let Some(previous) = context.previous
         {
-            lines.carry_forward(&opened.member_lines(name, (&fork_point, tip), previous)?);
+            lines.carry_forward(&opened.member_lines(name, (&base, tip), previous)?);
         }
         match lines.reading {
             Reading::Carried => {}
@@ -4329,11 +4329,11 @@ pub struct CompositionDelta<'a> {
 /// inconclusive. A member the trunk reaches but the cut subject does not is
 /// dropped without a reading, as at knives 5.1.0 (spec R6): the trunk
 /// carries it, and this subject does not. Every other member is read from
-/// its fork point with the trunk ([`Repo::change_base`]). A recorded commit this
-/// repository cannot resolve counts as dropped: unverifiable must not read as
-/// carried. So does the newest write itself: a subject held against a write
-/// this repository does not hold is refused ([`CompositionCheck::absent_write`]),
-/// never held to less.
+/// its fork point with the trunk ([`Repo::change_base`]). A recorded
+/// commit this repository cannot resolve counts as dropped: unverifiable
+/// must not read as carried. So does the newest write itself: a subject
+/// held against a write this repository does not hold is refused
+/// ([`CompositionCheck::absent_write`]), never held to less.
 ///
 /// Each fix by hand that the series holds ([`CompositionDelta::fixes`]) is
 /// held file by file, each file against its reference ([`fix_lacks`]),

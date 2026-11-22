@@ -947,9 +947,9 @@ fn report_uncarried_cut(
 /// only where one of `remotes` has a branch or tag at it ([`fix_remedy`]).
 /// Under each inconclusive member, and after a refusal or the `--allow-drop`
 /// lines for each member they name, the lines name what the member lacks
-/// ([`lacking_lines`]); last,
-/// whether or not the check refuses, each line of a member that the subject
-/// holds only by its words ([`release::labelled_words_lines`]).
+/// ([`lacking_lines`]); last, whether or not the check refuses, each line
+/// of a member that the subject holds only by its words
+/// ([`release::labelled_words_lines`]).
 ///
 /// The recorded release's name and its members are a ledger entry's subject
 /// and evidence, which a peer's pulled ledger can carry any text in; a member

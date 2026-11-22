@@ -632,12 +632,12 @@ pub enum ReleaseAction {
     /// trunk commit that contains every merged pull request, then drops the
     /// members whose landed branches carry nothing more. A flat release has
     /// no base parent, so the target reaches it only through a parent on the
-    /// target: a member, or a carrier (an earlier write of the release),
-    /// which the drop leaves out. Where no member that stays is on the
-    /// target, the drop keeps the landed members that are, and says why.
-    /// Where none is, it drops nothing and exits 3. With nothing merged there
-    /// is no default, and which commit to move onto is a decision — a cut
-    /// does not make it for you.
+    /// target: a member, or a carrier (an earlier write of the release). The
+    /// drop does not keep the carriers, so a carrier on the target does not
+    /// count. Where no member that stays is on the target, the drop keeps the
+    /// landed members that are, and says why. Where none is, it drops nothing
+    /// and exits 3. With nothing merged there is no default, and which commit
+    /// to move onto is a decision — a cut does not make it for you.
     ///
     /// When the move leaves the rebased tip of a member conflicted, the
     /// report names that member, by its branch or by its short commit id,
@@ -774,7 +774,12 @@ pub enum ReleaseAction {
     /// member's own lines in the release and names each line the release
     /// lacks, with its path. A member's own lines are the lines that its
     /// change adds and removes, from its fork point with the upstream trunk
-    /// to its tip. A member reads inconclusive only where the release, or the
+    /// to its tip. A revision that the upstream trunk contains is read from
+    /// where the trunk took it in. Where a merge commit took it in, that is
+    /// its fork point with the first parent of that merge. Where it is on
+    /// the trunk's first-parent line, that is the newest commit of that line
+    /// below it that the release holds. A release that reaches the revision
+    /// carries it. A member reads inconclusive only where the release, or the
     /// member's tip, holds an unresolved conflict in one of its paths and the
     /// release lacks nothing else of it. `--carries REV` asks the other
     /// direction: is REV's content carried — by REF when one is given,

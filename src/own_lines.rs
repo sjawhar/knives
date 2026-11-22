@@ -1,13 +1,16 @@
 //! A member's own lines, and whether a release holds them: the rule of spec
 //! R9 and its Design, with R8's clause for release logs.
 //!
-//! A member's own change is the diff from its fork point with the upstream
-//! trunk to its tip (spec R6). The rule follows each line of that change
-//! from the tip to the release, as `git blame --reverse` follows a line
-//! forward, instead of replaying the change as one commit. For each path
-//! that the change touches, it takes the member's hunks, the line diff of
-//! the fork point and the tip, in the tip's lines, and the survival diff,
-//! the line diff of the tip and the release.
+//! A member's own change is the diff from its base by spec R6 to its tip,
+//! and this module calls that base the member's fork point. The base is
+//! the member's fork point with the upstream trunk. For a member that the
+//! trunk contains, it depends on how the trunk took the member in
+//! ([`crate::jj::Repo::release_base`]). The rule follows each line of that
+//! change from the tip to the release, as `git blame --reverse` follows a
+//! line forward, instead of replaying the change as one commit. For each
+//! path that the change touches, it takes the member's hunks, the line diff
+//! of the fork point and the tip, in the tip's lines, and the survival
+//! diff, the line diff of the tip and the release.
 //!
 //! - A non-blank line that the member added is lost where the survival diff
 //!   deletes it, unless R8 holds it: the release's one `[Unreleased]`
@@ -113,7 +116,11 @@ pub struct MemberLines {
     pub label: String,
     /// The member's tip.
     pub commit: CommitId,
-    /// The member's fork point with the upstream trunk (spec R6).
+    /// Where the member's own change starts: its base by spec R6
+    /// ([`crate::jj::Repo::release_base`]). That is its fork point with the
+    /// upstream trunk. For a member that the trunk contains, it depends on
+    /// how the trunk took the member in, and it is the member itself where
+    /// the release reaches it.
     pub fork_point: CommitId,
     pub reading: Reading,
     /// Each of the member's own lines, or paths, that the release lacks, and

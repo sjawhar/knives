@@ -615,12 +615,7 @@ pub fn trunk_reaches(
     trunks: &[CommitId],
     commit: &CommitId,
 ) -> Result<bool, jj::JjError> {
-    for trunk in trunks {
-        if repo.is_ancestor(commit, trunk)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    repo.reached_by(commit, trunks)
 }
 
 /// A branch tip's own changes, computed once so every released parent can be

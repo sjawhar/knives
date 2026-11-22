@@ -39,34 +39,31 @@ use crate::changelog_union;
 use crate::ids::CommitId;
 use crate::own_lines::{self, Lost, SkippedRange};
 
-/// A member's own change: each path where its fork point's tree and its
-/// tip's differ, with the two values there.
+/// A member's own change: each path where the trees of its base by spec R6
+/// and its tip differ, with the two values there.
 type ChangeValues = BTreeMap<RepoPathBuf, (MergedTreeValue, MergedTreeValue)>;
 
 impl Repo {
-    /// Each path where the trees of `fork_point` and `tip` differ, read with
-    /// no copy records, with the values there: a member's own change, as
+    /// Each path where the trees of `base` and `tip` differ, read with no
+    /// copy records, with the values there: a member's own change, as
     /// [`Self::member_lines`] reads it.
-    fn change_values(
-        &self,
-        (fork_point, tip): (&CommitId, &CommitId),
-    ) -> Result<ChangeValues, JjError> {
-        let fork_tree = self.commit(fork_point.as_str())?.tree();
+    fn change_values(&self, (base, tip): (&CommitId, &CommitId)) -> Result<ChangeValues, JjError> {
+        let base_tree = self.commit(base.as_str())?.tree();
         let tip_tree = self.commit(tip.as_str())?.tree();
         let mut change = BTreeMap::new();
-        for entry in collect_stream(fork_tree.diff_stream(&tip_tree, &EverythingMatcher)) {
+        for entry in collect_stream(base_tree.diff_stream(&tip_tree, &EverythingMatcher)) {
             let values = entry.values.map_err(|error| store_error(&error))?;
             change.insert(entry.path, (values.before, values.after));
         }
         Ok(change)
     }
 
-    /// Each line of the change `tip` makes from `fork_point` at `path`
+    /// Each line of the change `tip` makes from `base` at `path`
     /// ([`own_lines::change_lines`]).
     fn change_lines_at(
         &self,
         path: &RepoPath,
-        (fork_point, tip): (&CommitId, &CommitId),
+        (base, tip): (&CommitId, &CommitId),
     ) -> Result<Vec<Lost>, JjError> {
         let store = self.repo.store();
         let value_at = |commit: &CommitId| -> Result<own_lines::Value, JjError> {
@@ -76,7 +73,7 @@ impl Repo {
         };
         Ok(own_lines::change_lines(
             path.as_internal_file_string(),
-            &value_at(fork_point)?,
+            &value_at(base)?,
             &value_at(tip)?,
         ))
     }
@@ -211,8 +208,8 @@ impl EditCandidate<'_> {
         }
         let mut changes = Vec::with_capacity(members.len());
         for member in members {
-            let (fork_point, tip) = &member.change;
-            let change = self.repo.change_values((fork_point, tip))?;
+            let (base, tip) = &member.change;
+            let change = self.repo.change_values((base, tip))?;
             if !matches!(member.brought, Brought::Nothing) {
                 paths.extend(change.keys().cloned());
             }
@@ -231,8 +228,8 @@ impl EditCandidate<'_> {
         Ok(losses)
     }
 
-    /// The lines of `member`'s change at `path`, from its fork point's value
-    /// to its tip's, that the edit loses ([`Self::lost_lines`]); `None`
+    /// The lines of `member`'s change at `path`, from its base's value to
+    /// its tip's, that the edit loses ([`Self::lost_lines`]); `None`
     /// where it loses none. `versions` keeps what this path holds in each
     /// version once a member at the path read it.
     fn lost_at(

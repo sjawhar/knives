@@ -307,8 +307,9 @@ fn a_rebase_keeps_a_landed_bookmark_held_member() {
 fn a_rebase_moves_the_whole_composition_onto_the_target() {
     // Given: two members forked from the old trunk, their merge conflict
     // resolved on the release, and an upstream that has advanced. `rebase` is
-    // `jj rebase -b <release> -d <target>`: the members move onto the target
-    // and the release moves with them — the trunk never becomes a parent.
+    // `jj rebase -b <release> -d <target>`: the members whose commits the
+    // target's history does not hold move onto the target, and the release
+    // moves with them — the trunk never becomes a parent.
     let lab = Lab::new();
     lab.branch("feat/alpha", "shared.txt", "alpha\n");
     lab.branch("feat/beta", "shared.txt", "beta\n");

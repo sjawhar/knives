@@ -812,10 +812,7 @@ impl Repo {
         let line = ResolvedRevsetExpression::commit(self.commit(trunk.as_str())?.id().clone())
             .first_ancestors()
             .intersection(&ResolvedRevsetExpression::commit(tip.clone()).descendants());
-        let revision_error = |error: RevsetEvaluationError| JjError::Revision {
-            revision: revision.as_str().to_owned(),
-            detail: error.to_string(),
-        };
+        let revision_error = revset_error(revision.as_str());
         let revset = line.evaluate(self.repo.as_ref()).map_err(revision_error)?;
         // The stream runs children before parents, so the oldest comes last.
         let oldest = collect_stream(revset.stream())
@@ -874,17 +871,17 @@ impl Repo {
             .first_ancestors()
             .intersection(&ResolvedRevsetExpression::commits(held).ancestors())
             .minus(&ResolvedRevsetExpression::root());
-        let revision_error = |error: RevsetEvaluationError| JjError::Revision {
-            revision: revision.as_str().to_owned(),
-            detail: error.to_string(),
-        };
+        let revision_error = revset_error(revision.as_str());
         let revset = line.evaluate(self.repo.as_ref()).map_err(revision_error)?;
         // The stream runs children before parents: the first is the newest,
         // and nothing past it is walked.
-        first_of_stream(revset.stream())
-            .transpose()
-            .map(|newest| newest.map(|id| commit_id(&id)))
-            .map_err(revision_error)
+        let mut stream = std::pin::pin!(revset.stream());
+        block_on(std::future::poll_fn(|context| {
+            stream.as_mut().poll_next(context)
+        }))
+        .transpose()
+        .map(|newest| newest.map(|id| commit_id(&id)))
+        .map_err(revision_error)
     }
 
     /// The base of `revision`'s own change in a release whose parents are
@@ -903,25 +900,21 @@ impl Repo {
         base: &ChangeBase,
         parents: &[CommitId],
     ) -> Result<CommitId, JjError> {
-        if let ChangeBase::Fork(fork) = base {
-            return Ok(fork.clone());
-        }
-        if self.reached_by(revision, parents)? {
-            return Ok(revision.clone());
-        }
         Ok(match base {
-            ChangeBase::Fork(fork) | ChangeBase::Merged(fork) => fork.clone(),
+            ChangeBase::Fork(fork) => fork.clone(),
+            _ if parents.contains(revision) || self.reached_by(revision, parents)? => {
+                revision.clone()
+            }
+            ChangeBase::Merged(fork) => fork.clone(),
             ChangeBase::OnTrunkLine => self
                 .line_base(revision, parents)?
                 .unwrap_or_else(|| commit_id(self.repo.store().root_commit_id())),
         })
     }
 
-    /// Whether one of `commits` is `revision` or descends from it.
-    fn reached_by(&self, revision: &CommitId, commits: &[CommitId]) -> Result<bool, JjError> {
-        if commits.contains(revision) {
-            return Ok(true);
-        }
+    /// Whether one of `commits` is `revision` or descends from it, asked of
+    /// each in order until one is.
+    pub fn reached_by(&self, revision: &CommitId, commits: &[CommitId]) -> Result<bool, JjError> {
         for commit in commits {
             if self.is_ancestor(revision, commit)? {
                 return Ok(true);
@@ -1028,10 +1021,7 @@ impl Repo {
         expression: Arc<ResolvedRevsetExpression>,
         revision: &str,
     ) -> Result<HashSet<JjCommitId>, JjError> {
-        let revision_error = |error: RevsetEvaluationError| JjError::Revision {
-            revision: revision.to_owned(),
-            detail: error.to_string(),
-        };
+        let revision_error = revset_error(revision);
         let revset = expression
             .evaluate(self.repo.as_ref())
             .map_err(revision_error)?;
@@ -2452,6 +2442,14 @@ fn store_error(error: &jj_lib::backend::BackendError) -> JjError {
     }
 }
 
+/// A failure to evaluate a revset that reads `revision`, named for it.
+fn revset_error(revision: &str) -> impl Fn(RevsetEvaluationError) -> JjError + Copy {
+    move |error| JjError::Revision {
+        revision: revision.to_owned(),
+        detail: error.to_string(),
+    }
+}
+
 /// What a directory is to a checkout, read from its `.jj/repo` pointer and the
 /// name its working-copy state records.
 ///
@@ -3208,7 +3206,7 @@ pub struct PlainMergedFile {
     /// Whether the written release leaves the file conflicted.
     pub conflicted: bool,
     /// Whether the release had also changed lines outside that conflict, a
-    /// hand change the plain merge does not carry ([`edit`]).
+    /// hand change the plain merge does not carry ([`edit::changed_outside`]).
     pub hand_change_left_out: bool,
 }
 
@@ -4382,20 +4380,6 @@ fn collect_stream<S: futures_core::Stream>(stream: S) -> Vec<S::Item> {
         match stream.as_mut().poll_next(&mut context) {
             Poll::Ready(Some(item)) => items.push(item),
             Poll::Ready(None) => return items,
-            Poll::Pending => std::thread::yield_now(),
-        }
-    }
-}
-
-/// The first item of a jj-lib stream, polled with [`collect_stream`]'s loop;
-/// the rest of the stream is never polled.
-fn first_of_stream<S: futures_core::Stream>(stream: S) -> Option<S::Item> {
-    let waker = Waker::noop();
-    let mut context = Context::from_waker(waker);
-    let mut stream = std::pin::pin!(stream);
-    loop {
-        match stream.as_mut().poll_next(&mut context) {
-            Poll::Ready(item) => return item,
             Poll::Pending => std::thread::yield_now(),
         }
     }

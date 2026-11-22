@@ -3,17 +3,17 @@
 //!
 //! An edit keeps the release's resolution of a conflict only where the plain
 //! merge of the new parents leaves the same conflict there. Everywhere else
-//! it writes that plain merge, names the file, and says whether the file
-//! holds a conflict. The conflict is read from the plain merge of the release
-//! in hand's own parents, so the rule holds whether or not an adopt recorded
-//! the resolution. A release log whose conflict the release-log union joins
-//! is left to the union. The shape is INFRA-4895's drop-after-adopt probe: M
-//! adds a file of its own, D sets lines 5 and 6 of `f`, and A, made after the
-//! first cut, sets line 5 as D does. Before anything is written, the edit
-//! checks what it would write: where it would lose a remaining member's
-//! line away from any conflict it leaves, it writes nothing and exits 3,
-//! unless `--allow-loss` gives a reason. These tests drive only the knives
-//! binary.
+//! it writes that plain merge, names the file where that changed it, and
+//! says whether the file holds a conflict. The conflict is read from the
+//! plain merge of the release in hand's own parents, so the rule holds
+//! whether or not an adopt recorded the resolution. A release log whose
+//! conflict the release-log union joins is left to the union. The shape is
+//! INFRA-4895's drop-after-adopt probe: M adds a file of its own, D sets
+//! lines 5 and 6 of `f`, and A, made after the first cut, sets line 5 as D
+//! does. Before anything is written, the edit checks what it would write:
+//! where it would lose a remaining member's line away from any conflict it
+//! leaves, it writes nothing and exits 3, unless `--allow-loss` gives a
+//! reason. These tests drive only the knives binary.
 
 #![allow(
     clippy::expect_used,

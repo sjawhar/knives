@@ -929,7 +929,7 @@ impl HeldBase {
 
     /// The commit that X's change is read from; `None` where no line of X
     /// is read.
-    pub(crate) const fn commit(&self) -> Option<&CommitId> {
+    pub(crate) fn into_commit(self) -> Option<CommitId> {
         match self {
             Self::Fork(base) | Self::Line(base) => Some(base),
             Self::Unread => None,
@@ -941,28 +941,22 @@ impl HeldBase {
     /// that it read no line of X. None for a fork point. The label and the
     /// release are read from the repository, so each is escaped.
     pub(crate) fn line(&self, member: &str, release: &str) -> Option<String> {
-        let base = match self {
-            Self::Fork(_) => return None,
-            Self::Line(base) => Some(base),
-            Self::Unread => None,
-        };
-        let (member, release) = (inline_human_text(member), inline_human_text(release));
-        Some(base.map_or_else(
-            || {
-                format!(
-                    "  {member}: its lines are not read: the trunk holds it on its first-parent \
-                     line, and every other parent of {release} holds it or no trunk commit below \
-                     it"
-                )
-            },
-            |base| {
-                format!(
-                    "  {member}: read from {}, the newest trunk commit below it that another \
-                     parent of {release} holds",
-                    base.short()
-                )
-            },
-        ))
+        match self {
+            Self::Fork(_) => None,
+            Self::Line(base) => Some(format!(
+                "  {}: read from {}, the newest trunk commit below it that another parent of {} \
+                 holds",
+                inline_human_text(member),
+                base.short(),
+                inline_human_text(release)
+            )),
+            Self::Unread => Some(format!(
+                "  {}: its lines are not read: the trunk holds it on its first-parent line, and \
+                 every other parent of {} holds it or no trunk commit below it",
+                inline_human_text(member),
+                inline_human_text(release)
+            )),
+        }
     }
 }
 
@@ -986,7 +980,7 @@ fn edit_losses(
     let (opened, release) = (context.opened, context.release);
     let trunk = opened.resolve_commit(&context.entry.trunk_ref())?;
     let mut members = Vec::with_capacity(provenance.len());
-    let mut lines = Vec::new();
+    let mut bases = Vec::new();
     for (label, tip) in provenance {
         let replaced = brought
             .iter()
@@ -1001,8 +995,8 @@ fn edit_losses(
                 .filter(move |parent| Some(*parent) != old)
         };
         let base = HeldBase::read(opened, (tip, opened.change_base(tip, &trunk)?), others())?;
-        lines.extend(base.line(label, &release.name));
-        let Some(base) = base.commit() else {
+        bases.extend(base.line(label, &release.name));
+        let Some(base) = base.into_commit() else {
             continue;
         };
         let brought = match replaced {
@@ -1012,19 +1006,19 @@ fn edit_losses(
                 let old_base =
                     HeldBase::read(opened, (old, opened.change_base(old, &trunk)?), others())?;
                 old_base
-                    .commit()
+                    .into_commit()
                     .map_or(knives::jj::Brought::Whole, |old_base| {
-                        knives::jj::Brought::Since(old_base.clone(), old.clone())
+                        knives::jj::Brought::Since(old_base, old.clone())
                     })
             }
         };
         members.push(knives::jj::EditMember {
             label: label.as_str(),
-            change: (base.clone(), tip.clone()),
+            change: (base, tip.clone()),
             brought,
         });
     }
-    Ok((candidate.lost_lines(&members)?, lines))
+    Ok((candidate.lost_lines(&members)?, bases))
 }
 
 /// The lines an edit prints when spec R11's check counts lines of a

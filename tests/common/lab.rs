@@ -301,9 +301,9 @@ impl Lab {
         );
     }
 
-    /// Fast-forward upstream's trunk to a published pull, as a rebase merge
-    /// or a direct push lands it: the branch's commits become the trunk's own
-    /// first-parent line, with no merge commit.
+    /// Fast-forward upstream's trunk to a published pull, as a fast-forward
+    /// merge or a direct push lands it: the branch's commits become the
+    /// trunk's own first-parent line, with no merge commit.
     pub(crate) fn fast_forward_pull(&self, number: u64) {
         let pull = format!("refs/pull/{number}/head:refs/remotes/origin/pull/{number}/head");
         git(&self.maintainer, &self.trunk, ["fetch", "origin", &pull]);

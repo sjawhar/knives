@@ -18,7 +18,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 
 use super::difflib::{Ratio, SequenceMatcher, Tag, real_quick_ratio};
 use super::{Added, WORD_LIMIT, bare, is_subsequence, meet};
@@ -26,6 +26,20 @@ use super::{Added, WORD_LIMIT, bare, is_subsequence, meet};
 /// The words of `line`, in order, each a slice of it.
 fn tokens(line: &[u8]) -> Vec<&[u8]> {
     let mut words = Vec::new();
+    let _ = scan(line, |word| {
+        words.push(word);
+        ControlFlow::Continue(())
+    });
+    words
+}
+
+/// Give each word of `line` to `on_word`, in order, each a slice of the
+/// line, until `on_word` breaks. [`tokens`] collects the words this way.
+fn scan<'l>(
+    line: &'l [u8],
+    mut on_word: impl FnMut(&'l [u8]) -> ControlFlow<()>,
+) -> ControlFlow<()> {
+    let mut give = |word: Option<&'l [u8]>| word.map_or(ControlFlow::Continue(()), &mut on_word);
     let mut offset = 0;
     for chunk in line.utf8_chunks() {
         let valid = chunk.valid();
@@ -41,23 +55,23 @@ fn tokens(line: &[u8]) -> Vec<&[u8]> {
                 continue;
             }
             if let Some(begin) = run.take() {
-                words.extend(line.get(begin..start));
+                give(line.get(begin..start))?;
             }
             if !is_space(character) {
-                words.extend(line.get(start..start + character.len_utf8()));
+                give(line.get(start..start + character.len_utf8()))?;
             }
         }
         offset += valid.len();
         if let Some(begin) = run.take() {
-            words.extend(line.get(begin..offset));
+            give(line.get(begin..offset))?;
         }
         let invalid = chunk.invalid().len();
         for at in offset..offset + invalid {
-            words.extend(line.get(at..=at));
+            give(line.get(at..=at))?;
         }
         offset += invalid;
     }
-    words
+    ControlFlow::Continue(())
 }
 
 /// The pairing of spec R9's Design for one member hunk: for each line that
@@ -136,9 +150,20 @@ pub(super) fn pair_hunk(removed: &[&[u8]], added: &[&[u8]]) -> Vec<Option<usize>
 
 /// Whether `line` holds more than [`WORD_LIMIT`] words, as [`tokens`] reads
 /// them. A word is one byte or more, so a line of no more bytes than the
-/// limit is not read for its words.
+/// limit is not read for its words. The count stops at the first word past
+/// the limit.
 fn over_the_limit(line: &[u8]) -> bool {
-    line.len() > WORD_LIMIT && tokens(line).len() > WORD_LIMIT
+    let mut words = 0;
+    line.len() > WORD_LIMIT
+        && scan(line, |_| {
+            words += 1;
+            if words > WORD_LIMIT {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .is_break()
 }
 
 /// A member's own words on a line that it changed ([`line_word_diff`]).

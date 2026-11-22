@@ -49,7 +49,7 @@ Use the carriage probe (`--carries`), never a source-text search: a symbol's pre
 - `knives release members <target> --carries <revision>` checks that one target. Exit `0` carried, `1` `NOT carried` or `conflicted`, `3` unresolved or uncheckable. A superseded target is a valid target.
 - With no target, it checks live releases and upstream trunk, then superseded cuts. Carriage only by a superseded cut does not make deletion safe.
 - `--census` asks this for every maintained branch. The `landed` column of `status` is the upstream-trunk probe.
-- Against a release, the probe reads the revision's own lines: the lines that its change adds and removes, from its fork point with upstream trunk to its tip. Under each verdict it names each line the release lacks, with its path. It also names each line the release holds only by its words, with the release lines that hold them. Under `carried-rebased` the named lines are the rewrite's own lines, not the lines of the revision's tip. Read those lines before you act on the verdict.
+- Against a release, the probe reads the revision's own lines: the lines that its change adds and removes, from its fork point with upstream trunk to its tip. A revision that upstream trunk contains is read from where the trunk took it in. A release that reaches such a revision carries it. Under each verdict it names each line the release lacks, with its path. It also names each line the release holds only by its words, with the release lines that hold them. Under `carried-rebased` the named lines are the rewrite's own lines, not the lines of the revision's tip. Read those lines before you act on the verdict.
 
 | Verdict | Against a release | Against upstream trunk |
 |---|---|---|
