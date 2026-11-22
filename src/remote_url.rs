@@ -140,7 +140,7 @@ pub fn remote_slug(url: &str) -> Option<&str> {
 ///
 /// Same host, same form; `None` for a non-URL. The path is the last place
 /// the remote's own slug appears, so a host or owner that spells part of it
-/// (`https://github.com/m/m`, whose `com/m` spells `m/m`) is left as it is.
+/// (`https://forge.com/m/m`, whose `com/m` spells `m/m`) is left as it is.
 pub fn with_slug(url: &str, slug: &str) -> Option<String> {
     let own = remote_slug(url)?;
     let at = url.rfind(own)?;
@@ -320,14 +320,14 @@ mod tests {
     fn another_slug_replaces_the_path_and_nothing_else() {
         for (url, slug, wanted) in [
             (
-                "https://github.com/m/m",
+                "https://forge.com/m/m",
                 "acme/demo",
-                "https://github.com/acme/demo",
+                "https://forge.com/acme/demo",
             ),
             (
-                "https://github.com/m/m.git/",
+                "https://forge.com/m/m.git/",
                 "acme/demo",
-                "https://github.com/acme/demo.git/",
+                "https://forge.com/acme/demo.git/",
             ),
             (
                 "git@forge.example:org/tool.git",
