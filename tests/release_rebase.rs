@@ -1,4 +1,5 @@
-//! `knives release rebase`: the whole composition moves onto a newer trunk.
+//! `knives release rebase`: the release moves onto a newer trunk, with each
+//! member whose commits the trunk does not hold.
 //!
 //! Refused when every pin is frozen, when a stale parent cannot be mapped, when
 //! every member landed, or when the release is held only as a remote ref; a

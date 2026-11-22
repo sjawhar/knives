@@ -1,4 +1,5 @@
-//! `knives release rebase`: move the whole composition onto an upstream commit.
+//! `knives release rebase`: move the release onto an upstream commit, with
+//! each member whose commits the target's history does not hold.
 //!
 //! One ordered gate sequence — frozen pins, a published release in hand, stale
 //! bases, the target's provenance, the landed members a bare rebase sheds —
@@ -24,7 +25,7 @@ use super::release_edit::{
     report_hidden, report_replaced,
 };
 
-/// Rebase the whole composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
+/// Rebase the composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
 ///
 /// Each member branch's commits that the target's history does not hold move
 /// onto the target, and the release merge moves with them, member bookmarks
