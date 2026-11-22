@@ -3899,16 +3899,12 @@ fn a_forget_the_forge_could_not_resolve_says_so_and_an_outage_is_retried() {
 /// Add to the fixture's registry `local`, a fork whose upstream is a
 /// filesystem path, so its upstream name is its registry key.
 fn register_local(fixture: &Fixture) {
-    let registry = fixture.home.path().join("repos.toml");
-    let text = std::fs::read_to_string(&registry).expect("read the registry");
-    std::fs::write(
-        &registry,
-        format!(
-            "{text}[repos.local]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/local\"\n",
-            fixture.home.path().display()
-        ),
-    )
-    .expect("rewrite the registry");
+    register_raw(
+        fixture,
+        "local",
+        &fixture.home.path().display().to_string(),
+        "https://forge.invalid/acme/local",
+    );
 }
 
 #[test]
@@ -4063,16 +4059,41 @@ fn offline_an_upstream_this_forks_registry_origin_spells_is_refused() {
     assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
     assert_ne!(fixture.forge_calls(), "");
 
-    // And: with the forge up, that spelling and this fork's key are both
-    // refused (exit 2): the forge names the repository as the upstream,
-    // which is not this fork's own, so no spelling records the upstream's
-    // #12 while the registry `origin` spells the upstream (N117).
+    // And: with the forge up, that spelling is refused as no repository of
+    // this fork's, since the checkout's `origin` names acme/demo (N117,
+    // N126) ...
     fixture.forge_now(ForgeNow::Up);
-    for text in ["maintainer/demo#12", "demo#12"] {
-        let output = on(&fixture, text);
-        assert_eq!(output.status.code(), Some(2), "{text}: {}", said(&output));
-    }
-    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
+    let output = on(&fixture, "maintainer/demo#13");
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("maintainer/demo is not demo's own repository"),
+        "{}",
+        said(&output)
+    );
+    // ... while this fork's key is read as usual against the checkout's
+    // repository: a number only the upstream has is the upstream's (N123).
+    let output = on(&fixture, "demo#7");
+    assert!(output.status.success(), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), ["maintainer/demo#7"]);
+
+    // And: a number both have is refused without offering the upstream's
+    // spelling, which would be refused too, and the spelling it offers
+    // records (N123).
+    let depends =
+        |args: &[&str]| fixture.knives(&[&["--text", "depends", "feat/base"], args].concat());
+    let output = depends(&["--on", "demo#12"]);
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("the review pull request is named `--on acme/demo#12`")
+            && stderr.contains("the upstream's #12 has no spelling here")
+            && !stderr.contains("`--on maintainer/demo#12`"),
+        "{stderr}"
+    );
+    let output = depends(&["--on", "acme/demo#12"]);
+    assert!(output.status.success(), "{}", said(&output));
+    assert_eq!(fixture.required("feat/base"), ["origin:acme/demo#12"]);
 
     // And: when the registry `origin` is this fork's own repository, the
     // same text records offline, with no forge call.
@@ -4125,6 +4146,21 @@ fn a_fork_of_this_fork_with_a_local_origin_names_this_forks_review_pull_request(
     // its upstream is this fork's repository (N116).
     assert!(output.status.success(), "{}", said(&output));
     assert_eq!(fixture.required("feat/alpha"), ["origin:acme/demo#13"]);
+
+    // And: with the forge down, only the forge can answer that question:
+    // nothing is recorded (exit 3), never the child's upstream pull request
+    // (N124).
+    let fixture = fixture_with(CONFIG_B.0, CONFIG_B.1);
+    register_raw(
+        &fixture,
+        "child",
+        ORIGIN,
+        &fixture.home.path().display().to_string(),
+    );
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+    let output = on(&fixture, "child#13");
+    assert_eq!(output.status.code(), Some(3), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
 }
 
 #[test]
@@ -4141,6 +4177,25 @@ fn a_fork_of_this_fork_is_this_forks_beside_a_local_checkout_origin() {
 
     // Then: the registry's `origin` is this fork's own repository, so the
     // child's upstream is this fork's: its review pull request (N119).
+    assert!(output.status.success(), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), ["origin:acme/demo#13"]);
+}
+
+#[test]
+fn a_fork_of_this_fork_is_this_forks_beside_a_local_registry_origin() {
+    // Given: this fork's checkout `origin` is acme/demo and its registry
+    // `origin` a local path, so its own repository is acme/demo; `child`, a
+    // fork of this fork (upstream acme/demo, own repository acme/child);
+    // the forge answers.
+    let fixture = fixture_with(ORIGIN, "");
+    register(&fixture, "child", "acme/demo", "acme/child");
+
+    // When: #13 is named by the child's registry key.
+    let output = on(&fixture, "child#13");
+
+    // Then: the checkout's `origin` is this fork's own repository, so the
+    // child's upstream is this fork's: its review pull request, whatever
+    // the registry's `origin` names (N125, N119's mirror).
     assert!(output.status.success(), "{}", said(&output));
     assert_eq!(fixture.required("feat/alpha"), ["origin:acme/demo#13"]);
 }
