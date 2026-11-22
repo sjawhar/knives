@@ -1336,8 +1336,16 @@ fn every_write_on_a_shared_fork_is_on_the_ledger_when_it_exits() {
             "demo",
         ],
         &["--text", "track", BRANCH, "--pr", "7", "--repo", "demo"],
+        // The upstream's own `<owner>/<name>`: a registry name with a number
+        // asks the forge, which this test has none of.
         &[
-            "--text", "depends", BRANCH, "--on", "demo#3", "--repo", "demo",
+            "--text",
+            "depends",
+            BRANCH,
+            "--on",
+            "acme/demo#3",
+            "--repo",
+            "demo",
         ],
         &["--text", "finish", BRANCH, "--repo", "demo"],
     ];

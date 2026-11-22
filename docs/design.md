@@ -337,7 +337,9 @@ knives finish BRANCH           hand back claim and remove workspace; the branch,
                                names each one that something other than the release holds, with
                                what holds it; while the release holds conflicts, it abandons none
 knives track BRANCH --pr N     state which PR a branch belongs to, overriding inference
-knives depends BRANCH --on R#N  record that a branch cannot land before something else
+knives depends BRANCH --on R#N  record that a branch cannot land before a pull request (upstream's or
+                               the fork's own, the forge says which) or a member branch; --forget R
+                               takes one back, and with --on corrects it
 knives notch [SUBJECT]         read what happened here (bare: newest 20 human notes plus a
                                folded machine-event count; a subject: its whole chronology);
                                -m writes a note, --disposition requires --evidence
@@ -426,7 +428,191 @@ carry because ours was superseded.
 A branch can require a pull request in another managed repo. Dropping the required one
 from a release without dropping the branch that needs it ships a release that cannot
 work, which is exactly what happened when one repo's #4545 was dropped while a sibling's
-#49 still needed it. Satisfied means merged; an open PR may still change or be rejected.
+#49 still needed it. An upstream pull request is satisfied when it has merged; an open PR
+may still change or be rejected.
+
+A requirement says what it names, because a fork and its upstream number their pull
+requests apart: `<upstream>#<n>` is a pull request on the fork's upstream,
+`origin:<owner>/<name>#<n>` a review pull request on the fork's own repository, and
+`origin:<owner>/<name>:<branch>` a member branch of the fork. `knives depends --on
+<repo>#<n>`, the registry name, used to mean the upstream's pull request, and recorded an
+unrelated one where the fork's review pull request was meant. Another fork's key is first
+read as below, and names this fork's own repository when that fork's upstream is it.
+Otherwise, when the fork's upstream and own repository are both forge repositories, it asks
+the forge which has #n, and refuses when both do, naming both, or when neither does; when
+the forge names the fork's own repository as its upstream, #n is the upstream's with no
+lookup of the number. When either is no forge repository, there is no such lookup, and #n
+is the upstream's. A review pull request is
+recorded only on the fork's own repository, and only when its head is a member branch of
+the fork: a branch of the fork's owner that is not the dependent itself, a base, a release
+or a fetched `pr-<n>` head. A review pull request on another fork's repository is refused:
+its head is that fork's branch, which nothing here can judge, so the dependent names the
+upstream pull request it becomes. The same branches are refused as member branches.
+
+A member branch is satisfied once its current tip's work is in the upstream trunk: its row
+is landed, or its landed verdict is in the trunk (set by the probe, or by its merged
+upstream pull request when the trunk holds that merge and the tip holds nothing past what
+it merged); or, for a member this checkout knows only as `<branch>@origin` (another
+machine's, fetched), the same two tests on that copy: its merged upstream pull request
+with a landing the trunk holds and nothing past what it merged, or an empty replay onto
+the upstream trunk. A row judges the local tip only, so when `<branch>@origin` holds work
+the local tip lacks (a local bookmark that did not follow a fetch), or the row has no single
+local tip (a conflicted bookmark), that origin tip must pass too, as it would for a machine
+holding only it. A merge alone is not enough: a pull
+request merged into anything but the trunk, or a branch advanced past what merged, leaves
+work the upstream lacks. A review pull request is satisfied once its head, the member it
+carries, has landed upstream, judged at the head commit the forge reports for it, not at
+whatever a branch of that name points at here: by that branch's row only when the local
+tip is that commit, else by the commit itself. A head commit this checkout lacks (the
+branch moved since the last fetch) is a problem until it is fetched; if its branch was
+deleted, the problem says to fetch a ref that still holds the commit: the base it merged
+into, or the pull request's own `refs/pull/<n>/head`. The report names the head. Its
+own state is not the rule: a review pull request merges into a review base or into
+another member, which says nothing about the upstream, and while the member is in the
+fork's release only, dropping it from the release breaks the dependent. A review pull
+request is judged by its head only on the fork's own repository, the one the forge names
+for this fork's `origin` (a record under any other name counts when the forge resolves
+that name to it, so a record from before a rename still counts, and a registry and a
+checkout naming two live repositories are not merged), and when its head is a branch of
+that repository's owner and a member branch; any other is a problem that says why, never
+met. A member no copy here holds cannot be judged, and is a problem until it is fetched;
+the problem says its work may still be in a review base it merged into before it was
+deleted. Without the landed probe (`status --no-landed`), a member not shown landed stays
+an unmet finding: what is not shown to have landed is still needed. So does one under
+`--no-github`, or on a fork whose upstream is no forge repository: only the forge shows a
+squash merge, and it was not asked, so the finding says the member is not known to have
+landed. When the forge was asked and did not answer, a member not shown landed cannot be
+judged: a problem, not an unmet finding. A member recorded under two spellings of the
+fork's own repository, by machines whose `origin` remotes differ, is one requirement. A
+member record on a repository no spelling here gives is judged as a member only when the
+forge names that repository as the fork's own (a former name); a branch of another fork's
+own repository, or of one the forge names otherwise, is no member of this one, whatever a
+branch of its name here says: a problem.
+
+A report checks the requirements of every row; of a dependent this checkout holds only as
+`<branch>@origin`, another machine's branch nobody here claims; and of a dependent held
+nowhere, deleted. The forge is asked about every pull request on this fork's upstream that
+any of them requires, row or not. A deleted dependent is judged by the newest commit any
+ledger entry records for it: an entry about the branch records its tip when written, and a
+release write records each parent's commit and the bookmarks there; that record is kept across
+forgets and after the branch is deleted. It is a lower bound on the dependent's work, not
+its final head: the branch can move on with nothing written. So when that commit is here
+and has not landed, the dependent's requirements are checked (a branch merged into a review
+base and then deleted still carries its work there), and a note says so. When it has
+landed, is not here, or was never recorded, the dependent is not taken as done, and its
+requirements are judged too: one that is met says nothing, since nothing the dependent
+carried later can change it; each one that is unmet or cannot be judged is a problem that
+names the dependent, what could not be read, what was seen of the requirement, and the
+`knives depends <dependent> --forget …` command that takes those back, with a fetch
+suggested only when the recorded commit is not here. The command takes each requirement's
+records in one run while the forge answers as it did for `status`: every record of its pull
+request number or member on a repository that is not another fork's and that the forge did
+not name as another, each as spelled (a member by its branch name when every such record
+spells a spelling here and the name holds no `#`); a record on another fork's repository,
+or one the forge named as another, alone. If the forge stops answering between `status`
+and the forget, a record `status` left out because the forge named it apart may be meant
+again: the forget is refused (exit 3) and prints a command that takes it too. The problem
+says when the command takes a record it does not list. Under
+`--no-landed` a recorded commit can still be shown landed by its merged pull request's
+landing, not by a replay: one shown landed is judged as above, like a missing or
+unrecorded one, and one not shown landed has its requirements checked as a row's, with a
+note that says it could not be shown landed.
+
+A requirement is taken back by a `depends` forget followed by the list without it, two
+entries stamped in that order and written newest first: a run cut short between them
+leaves the list as it was, never empty. `--forget` takes a requirement by any spelling
+`--on` takes or the record's own; an `origin:` prefix always names this fork's own
+repository. A review pull request recorded under two names of the fork's repository, as
+before and after a rename, is one requirement: the forge ties the names, any spelling
+takes back every record of it, and `--on` names it as the list already holds it. A
+member recorded under two spellings here is one requirement too. A member record on a
+repository that is neither a spelling here nor another fork's is a record of this fork's
+member only when the forge names that repository as the fork's own, as for a review pull
+request: with the forge down, a forget whose outcome depends on it is refused (exit 3),
+and `--on` writes this fork's spelling beside it and says the two may be one requirement.
+With the forge up, `--on` reuses a record the forge places as the fork's own, and writes
+its own beside one the forge names as another repository's, which is another requirement.
+A text spells a record when it parses to the same kind, number or branch, and repository,
+the repository's letter case aside; a branch name's case always counts. A pull request
+named `<owner>/<name>#<n>` by this fork's registered upstream is recorded with no forge
+call, unless a spelling of this fork's own repository (its checkout's or registry's
+`origin`) is that upstream too: the name then spells this fork's own repository first (see
+below). One named by another fork's upstream, by its `<owner>/<name>` or its registry key,
+may be this fork's own repository under another name, when a fork of this fork is
+registered after a rename or a transfer, and nothing here tells the two apart: the forge
+is asked, and it is this fork's review pull request when the forge names this fork's
+repository so, or redirects the name to it; the other fork's upstream pull request
+otherwise. `--forget` reads either spelling the same way. When the forge cannot be asked,
+nothing is recorded (exit 3), and the refusal names that fork: a review pull request
+recorded as an upstream one reads met once it merges anywhere, so refusing is the safe
+failure. The refusal says to run it again when the forge answers, or, when the forge said it
+cannot resolve a repository, names the repository it could not resolve (that upstream, or
+this fork's own): it is gone, the token cannot see it, or the forge is failing, so run it
+again later or check the repository. The cost is that an offline `--on` to another project's
+pull request waits for the forge; and, with the forge up, one named by another fork's
+upstream is refused when the forge cannot resolve that upstream or this fork's own
+repository, since only those answers say whether the two are one. When this fork's own
+repository names no forge repository (neither its checkout's `origin` nor its registry's is
+a forge URL), it cannot be another fork's upstream under another name on the forge, and that
+question is not asked: a pull request named by that upstream's `<owner>/<name>` is then
+recorded with no forge call, while one named by the fork's registry key still asks the forge
+which of that fork's two repositories has the number when both are forge repositories.
+Another fork whose upstream is no forge repository, such as a path, has no `<owner>/<name>`:
+its pull requests are named by its registry key exactly and recorded with no forge call, and
+the key in another letter case is refused (exit 2), naming the key. This fork's own path
+upstream is its registry key too, taken in any letter case: `DEMO#12` records `demo#12`,
+with no forge call. With the forge down, then, a pull request is recorded only when naming it
+needs no forge question: by `<owner>/<name>`, one of this fork's upstream, or of another
+fork's when this fork's own repository names no forge repository; by a registry key, one of a
+fork whose upstream or own repository names no forge repository (such as `local#12`), when
+that fork is this one, its upstream is a path, or this fork's own repository names no forge
+repository. One exception: when this fork's checkout or registry `origin` spells its
+upstream, `<owner>/<name>#<n>` of that upstream names this fork's own repository first,
+which only the forge can place, so it is refused (exit 3) offline. Such an `origin` is a
+configuration error: set it to this fork's own repository. With the forge up, what each
+spelling does depends on which `origin` spells the upstream. When only the registry's does,
+and the checkout's names this fork's repository, that upstream's `<owner>/<name>` is refused
+(exit 2: not this fork's own repository), while this fork's key is read as usual against the
+checkout's repository: a number only the upstream has is the upstream's, one only the fork
+has is its review pull request, and one both have is refused without offering the upstream
+spelling, which has none while the registry `origin` spells the upstream. When this fork's
+own repository spells the upstream, its key takes the upstream's number with no lookup, and
+`<owner>/<name>` names a review pull request there. Any other text that only the forge can
+read is refused (exit 3).
+An upstream's `<owner>/<name>#<n>` is taken back without the forge. The forge has no
+answer that means a repository does not exist: GitHub answers a name it cannot resolve the
+same way for a repository that is gone, for one the token cannot see, and in some
+outages. So a record whose repository the forge does not name, by that answer or by a
+failure, is one the forge could not be asked about. The texts of one command are weighed
+together: when counting each such record as named would take back more than the forge's
+answers take, make a text ambiguous, or join two records a text names into one
+requirement, nothing is taken back (exit 3), so neither an outage nor a repository the
+token cannot see decides what a forget takes. Each such refusal prints a command that names
+every record of that pull request number or member on a repository that is not another
+fork's, each as it is spelled (a member by its branch name when every such record spells a
+spelling here, and the name holds no `#`): every candidate is then named directly, so no
+forge answer changes what it takes. It can take a record the forge showed is another
+repository's: with the forge unable to say which repository one text names, any of them
+may be meant; to keep one, run the forget again when the forge answers. When the text may
+name two requirements, the refusal prints one such command for each, never one that takes
+both. A text spelled exactly as a held upstream record names that record alone, whether or
+not the registry knows its repository, and a `<repo>#<n>` text the registry reads as a pull
+request names that pull request, as `--on` reads it, even when a member branch is named
+so. A record on another fork's own repository is never a record of this fork's: a bare
+branch name never names it, and a member token on that repository is refused unless a
+record is spelled exactly so; then that record alone is taken back. Every machine
+running this knives folds the two into the same list. A knives from before fork requirements
+reads the same list only while it holds no member branch: it cannot read a list that
+holds one, so the forget is the newest statement it reads there, and the branch requires
+nothing. The forget restates the list the writing machine holds after its pull, and the
+machines still agree on one list, but it can differ from what was meant, both ways. A
+requirement another machine stated that had not reached the forgetting machine (unsent, or
+sent after its pull) is not in
+that list, and is lost on every machine. A list another machine writes after the forget
+from a ledger that has not received it (the forget unsent, or sent after that machine's
+pull) still holds the forgotten requirement, and brings it back; two forgets made that
+way can undo each other. A fold that guarded against either would read the forget
+differently from the knives before it.
 
 ### `knives preflight`
 

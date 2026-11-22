@@ -193,7 +193,14 @@ fn track_depends_and_finish_name_the_fork_by_its_registry_key() {
     // When: its pull request is stated, a dependency recorded, and the
     // branch finished.
     let tracked = said(&["--text", "track", "feat/gamma", "--pr", "9"]);
-    let depends = said(&["--text", "depends", "feat/gamma", "--on", "demo#3"]);
+    // Named by the upstream's own `<owner>/<name>`, which needs no forge.
+    let depends = said(&[
+        "--text",
+        "depends",
+        "feat/gamma",
+        "--on",
+        "maintainer/demo#3",
+    ]);
     let finished = said(&["--text", "finish", "feat/gamma", "--repo", "demo"]);
 
     // Then: each line a person reads names the fork as the registry does,

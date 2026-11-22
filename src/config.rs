@@ -428,6 +428,23 @@ impl RepoEntry {
             .collect()
     }
 
+    /// What `branch` is when it is no member branch of this fork: a base its
+    /// members fork from, a release, or a fetched pull request head. `None`
+    /// for a branch that can be a member: what `knives status` gives a row.
+    pub fn non_member(&self, branch: &crate::ids::BranchName) -> Option<NonMember> {
+        if self.bases().contains(&branch.as_str()) {
+            Some(NonMember::Base)
+        } else if crate::ids::is_release_name(branch, &self.release_scheme())
+            || crate::ids::is_release_name(branch, &self.dated_scheme())
+        {
+            Some(NonMember::Release)
+        } else if crate::ids::pull_number_from_bookmark(branch.as_str()).is_some() {
+            Some(NonMember::PullHead)
+        } else {
+            None
+        }
+    }
+
     /// The `immutable_heads()` this fork runs under: jj's `trunk()`, the trunk by
     /// name on every remote knives knows — upstream, origin, and the release
     /// remote when one is configured — and every tag fetched from upstream.
@@ -519,6 +536,27 @@ impl RepoEntry {
     /// `false` for a fork whose ledger is not shared.
     pub fn shares_ledger_with(&self, slug: &str) -> bool {
         self.ledger.as_deref() == Some(slug)
+    }
+}
+
+/// A branch of a fork that is no member branch ([`RepoEntry::non_member`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonMember {
+    /// A base the fork's members fork from: the trunk or a series' base.
+    Base,
+    /// A release of the fork.
+    Release,
+    /// A fetched pull request head, `pr-<n>`.
+    PullHead,
+}
+
+impl fmt::Display for NonMember {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Base => "a base",
+            Self::Release => "a release",
+            Self::PullHead => "a fetched pull request head",
+        })
     }
 }
 

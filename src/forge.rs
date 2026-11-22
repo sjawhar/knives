@@ -180,6 +180,15 @@ impl PullRequest {
         self.state.eq_ignore_ascii_case("MERGED")
     }
 
+    /// Whether its head is a branch of `owner`'s repository. A head branch
+    /// name alone says nothing: an outside contributor's `main` is named as
+    /// ours is.
+    pub fn is_from(&self, owner: &str) -> bool {
+        self.head_repository_owner
+            .as_ref()
+            .is_some_and(|account| account.login.eq_ignore_ascii_case(owner))
+    }
+
     /// Whether the forge says this cannot be merged as it stands.
     ///
     /// `UNKNOWN` is not a conflict: the forge computes mergeability asynchronously, and

@@ -3,11 +3,11 @@
 //! Dispatch, the repository selection every command shares, and the report
 //! verbs whose work is gather, exit code, render: `status`, `sync`, `audit`,
 //! `consumers`, `pushed`, `pr`, `preflight`. The verbs that write — a cut, a
-//! rebase, a membership edit, a hand resolution adopted, a branch handed back
-//! — each own a module here: [`release_cut`], [`release_rebase`],
-//! [`release_edit`], [`release_adopt`], [`branch_verbs`]; the release's
-//! content reports are [`release_carries`]. Every command returns an
-//! [`Exit`], so the match stays a table.
+//! rebase, a membership edit, a hand resolution adopted, a branch handed back,
+//! a dependency stated — each own a module here: [`release_cut`],
+//! [`release_rebase`], [`release_edit`], [`release_adopt`], [`branch_verbs`],
+//! [`depends`]; the release's content reports are [`release_carries`]. Every
+//! command returns an [`Exit`], so the match stays a table.
 
 #![allow(
     clippy::redundant_pub_crate,
@@ -15,6 +15,7 @@
 )]
 
 mod branch_verbs;
+mod depends;
 mod ground;
 mod release_adopt;
 mod release_carries;
@@ -24,7 +25,7 @@ mod release_rebase;
 
 use std::process::ExitCode;
 
-use branch_verbs::{FinishOptions, run_depends, run_finish, run_track};
+use branch_verbs::{FinishOptions, run_finish, run_track};
 use clap::Parser as _;
 use ground::{Ground, Scope, Selected, grounded, placed, scan_home};
 use knives::bind::Fork;
@@ -284,14 +285,27 @@ fn dispatch() -> anyhow::Result<Exit> {
             };
             run_track(&fork, &branch, pr, fork_only, forget, ground.bound())
         }
-        Command::Depends { branch, on, repo } => {
+        Command::Depends {
+            branch,
+            on,
+            forget,
+            repo,
+        } => {
             let ground = grounded(&loaded)?;
             let (Some(fork), Some(branch)) =
                 (ground.one_fork(repo.as_deref())?, branch_name(&branch))
             else {
                 return Ok(Exit::Usage);
             };
-            run_depends(&fork, &branch, &on, ground.bound())
+            depends::run(
+                &fork,
+                &branch,
+                &depends::Change {
+                    on: &on,
+                    forget: &forget,
+                },
+                ground.bound(),
+            )
         }
         Command::Notch {
             subject,
