@@ -534,9 +534,11 @@ impl Context<'_, '_> {
     /// names this fork's repository so, that upstream's otherwise. When the
     /// forge cannot be asked, nothing is recorded (exit 3): a review pull
     /// request recorded as an upstream one reads met once it merges anywhere.
-    /// A fork whose upstream is no forge repository, such as a path, is named
-    /// by its registry key exactly ([`Self::asked_which`]): its key in another
-    /// letter case is refused (exit 2), naming the key.
+    /// Another fork whose upstream is no forge repository, such as a path, is
+    /// named by its registry key exactly ([`Self::asked_which`]): its key in
+    /// another letter case is refused (exit 2), naming the key. This fork's
+    /// own such upstream is its key in any letter case ([`Registry::resolve`]),
+    /// recorded with no forge call.
     fn pull_request(&self, text: &str, repo: &str, number: u64) -> Result<Requirement, Exit> {
         if let Some(fork) = self.registry.repos.get_key_value(repo) {
             return self.asked_which(text, fork, number);

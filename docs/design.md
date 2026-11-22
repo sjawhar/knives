@@ -545,10 +545,17 @@ repository, since only those answers say whether the two are one. When this fork
 names no forge repository, it cannot be another fork's upstream under another name on the
 forge, and that question is not asked: a pull request named by that upstream's
 `<owner>/<name>` is then recorded with no forge call, while one named by the fork's registry
-key still asks the forge which of that fork's two repositories has the number. A fork whose
-upstream is no forge repository, such as a path, has no `<owner>/<name>`: its pull requests
-are named by its registry key exactly and recorded with no forge call, and the key in another
-letter case is refused (exit 2), naming the key.
+key still asks the forge which of that fork's two repositories has the number. Another fork
+whose upstream is no forge repository, such as a path, has no `<owner>/<name>`: its pull
+requests are named by its registry key exactly and recorded with no forge call, and the key
+in another letter case is refused (exit 2), naming the key. This fork's own path upstream is
+its registry key too, taken in any letter case: `DEMO#12` records `demo#12`, with no forge
+call. With the forge down, then, a pull request is recorded only when naming it needs no
+forge question: by `<owner>/<name>`, one of this fork's upstream, or of another fork's when
+this fork's `origin` names no forge repository; by a registry key, one of a fork whose
+upstream or own repository names no forge repository (such as `local#12`), when that fork is
+this one, its upstream is a path, or this fork's `origin` names no forge repository. Any
+other text that only the forge can read is refused (exit 3).
 An upstream's `<owner>/<name>#<n>` is taken back without the forge. The forge has no
 answer that means a repository does not exist: GitHub answers a name it cannot resolve the
 same way for a repository that is gone, for one the token cannot see, and in some
