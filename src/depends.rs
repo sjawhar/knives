@@ -261,6 +261,23 @@ fn reasons(unasked: &[(Requirement, String)], records: &[&Requirement]) -> Strin
     why.join("; ")
 }
 
+/// What a refusal for an unanswered forge advises, from `why`, the forge's
+/// reasons: run it again when the forge answers; or, when the forge said it
+/// could not resolve a repository ([`UNRESOLVED`]), that the repository
+/// (`repository`, when the refusal knows which) is gone, the token cannot
+/// see it, or the forge is failing, which nothing here tells apart
+/// ([`Context::named`]).
+fn rerun(why: &str, repository: Option<&str>) -> String {
+    if !why.contains(UNRESOLVED) {
+        return "Run it again when the forge answers".to_owned();
+    }
+    format!(
+        "The forge could not resolve {}: it is gone, the token cannot see it, or the forge is \
+         failing. Run it again later, or check the repository",
+        repository.unwrap_or("a repository it was asked about")
+    )
+}
+
 /// What the forge says, before the fork's lock, about the list the pulled
 /// ledger states: per `--forget` text, its [`Tie`]; per requirement to add,
 /// the record already held under another name of its repository
@@ -562,11 +579,9 @@ impl Context<'_, '_> {
 
     /// Whether `repo`, the upstream `upstream` of another registered fork,
     /// is this fork's own repository under another name, as the forge says
-    /// ([`Self::is_own_under`]). Refused (exit 3) when the forge cannot say:
-    /// the refusal says to run it again when the forge answers, or, when the
-    /// forge answered that it cannot resolve a repository (it is gone, or the
-    /// token cannot see it), names that repository, since a rerun alone does
-    /// not change that answer.
+    /// ([`Self::is_own_under`]). Refused (exit 3) when the forge cannot say,
+    /// with the advice [`rerun`] gives, naming the repository the forge
+    /// could not resolve: `repo`, or this fork's own.
     fn own_under(&self, text: &str, repo: &str, upstream: &UpstreamName) -> Result<bool, Exit> {
         self.is_own_under(repo).or_else(|unasked| {
             let key = self
@@ -575,22 +590,15 @@ impl Context<'_, '_> {
                 .iter()
                 .find(|(key, entry)| entry.upstream_name(key) == *upstream)
                 .map_or(repo, |(key, _)| key.as_str());
-            let next = if unasked.error.contains(UNRESOLVED) {
-                format!(
-                    "The forge could not resolve {}: it is gone, or the token cannot see it, \
-                     and a rerun gives the same answer until that changes",
-                    unasked.repository
-                )
-            } else {
-                "Run it again when the forge answers".to_owned()
-            };
             refused(
                 Exit::Incomplete,
                 format_args!(
                     "nothing recorded: {repo} in {text} is the upstream of {key}, and only the \
                      forge can tell whether it is also {}'s own repository under another name: \
-                     {}. {next}",
-                    self.fork.name, unasked.error
+                     {}. {}",
+                    self.fork.name,
+                    unasked.error,
+                    rerun(&unasked.error, Some(&unasked.repository))
                 ),
             )
         })
@@ -915,54 +923,54 @@ impl Context<'_, '_> {
         if also.is_empty() {
             return Ok(known);
         }
+        let why = reasons(&unasked, &also);
         refused(
             Exit::Incomplete,
             format_args!(
-                "nothing recorded: whether {} also {} {} could not be asked of the forge: {}. {}",
+                "nothing recorded: whether {} also {} {} could not be asked of the forge: {why}. {}",
                 texts.join(" or "),
                 if texts.len() == 1 { "names" } else { "name" },
                 listed(also.iter().copied()),
-                reasons(&unasked, &also),
-                self.recovery(required, &at_most)
+                self.recovery(required, &at_most, &why)
             ),
         )
     }
 
-    /// What to do when the forge could not say what a forget takes: run it
-    /// again when it answers, or run the printed command, which takes back
-    /// every record of every requirement among `records` ([`Self::token_sets`])
-    /// whatever the forge answers. It can take a record the forge named as
-    /// another repository's: with the forge unable to say what one text
-    /// names, any record of the number on a repository that is no other
-    /// fork's may be meant. To keep one, wait for the forge.
-    fn recovery(&self, required: &[Requirement], records: &[Requirement]) -> String {
+    /// What to do when the forge could not say what a forget takes, `why`
+    /// being its reasons: what [`rerun`] advises, or run the printed command,
+    /// which takes back every record of every requirement among `records`
+    /// ([`Self::token_sets`]) whatever the forge answers. It can take a
+    /// record the forge named as another repository's: with the forge unable
+    /// to say what one text names, any record of the number on a repository
+    /// that is no other fork's may be meant. To keep one, wait for the forge.
+    fn recovery(&self, required: &[Requirement], records: &[Requirement], why: &str) -> String {
         let mut tokens: Vec<String> = Vec::new();
         joined(
             &mut tokens,
             self.token_sets(required, records).into_iter().flatten(),
         );
         format!(
-            "Run it again when the forge answers, or take back every record it might name and \
-             every other record of the same number or member, each as it is spelled, which no \
-             forge answer changes: {}",
+            "{}, or take back every record it might name and every other record of the same \
+             number or member, each as it is spelled, which no forge answer changes: {}",
+            rerun(why, None),
             self.command(&tokens)
         )
     }
 
     /// What to do when a text may name two requirements and the forge could
-    /// not say: run it again when it answers, or take back the one meant
-    /// with every other record of it, by a command per requirement among
-    /// `records` that no forge answer changes.
-    fn choices(&self, required: &[Requirement], records: &[Requirement]) -> String {
+    /// not say, `why` being its reasons: what [`rerun`] advises, or take back
+    /// the one meant with every other record of it, by a command per
+    /// requirement among `records` that no forge answer changes.
+    fn choices(&self, required: &[Requirement], records: &[Requirement], why: &str) -> String {
         let commands: Vec<String> = self
             .token_sets(required, records)
             .iter()
             .map(|tokens| self.command(tokens))
             .collect();
         format!(
-            "If it does, it names two requirements. Run it again when the forge answers, or take \
-             back the one meant, with every other record of it, by a command no forge answer \
-             changes: {}",
+            "If it does, it names two requirements. {}, or take back the one meant, with every \
+             other record of it, by a command no forge answer changes: {}",
+            rerun(why, None),
             commands.join(" or ")
         )
     }
@@ -1056,16 +1064,18 @@ impl Context<'_, '_> {
         let at_most = self.outcome(required, text, &tied);
         let two = matches!(at_most, Outcome::Ambiguous(_));
         match (self.outcome(required, text, &tie.same), at_most) {
-            (Outcome::Ambiguous(records), Outcome::One(_)) => refused(
-                Exit::Incomplete,
-                format_args!(
-                    "nothing recorded: {text} answers to {}, and whether they are one requirement \
-                     could not be asked of the forge: {}. {}",
-                    listed(&records),
-                    reasons(&tie.unasked, &records.iter().collect::<Vec<_>>()),
-                    self.recovery(required, &records)
-                ),
-            ),
+            (Outcome::Ambiguous(records), Outcome::One(_)) => {
+                let why = reasons(&tie.unasked, &records.iter().collect::<Vec<_>>());
+                refused(
+                    Exit::Incomplete,
+                    format_args!(
+                        "nothing recorded: {text} answers to {}, and whether they are one \
+                         requirement could not be asked of the forge: {why}. {}",
+                        listed(&records),
+                        self.recovery(required, &records, &why)
+                    ),
+                )
+            }
             (Outcome::Ambiguous(records), _) => refused(
                 Exit::Usage,
                 format_args!(
@@ -1101,24 +1111,23 @@ impl Context<'_, '_> {
                     .iter()
                     .filter(|record| !known.contains(record))
                     .collect();
+                let why = reasons(&tie.unasked, &also);
                 refused(
                     Exit::Incomplete,
                     format_args!(
                         "nothing recorded: whether {text} {} {} could not be asked of the \
-                         forge: {}. {}{}",
+                         forge: {why}. {}",
                         if known.is_empty() {
                             "names"
                         } else {
                             "also names"
                         },
                         listed(also.iter().copied()),
-                        reasons(&tie.unasked, &also),
                         if two {
-                            self.choices(required, &at_most)
+                            self.choices(required, &at_most, &why)
                         } else {
-                            self.recovery(required, &at_most)
-                        },
-                        ""
+                            self.recovery(required, &at_most, &why)
+                        }
                     ),
                 )
             }
@@ -1190,14 +1199,14 @@ impl Context<'_, '_> {
         }
         if known.is_empty() {
             let also: Vec<&Requirement> = at_most.iter().collect();
+            let why = reasons(&unasked, &also);
             return Some(refused(
                 Exit::Incomplete,
                 format_args!(
                     "nothing recorded: whether {text} names {} could not be asked of the forge: \
-                     {}. {}",
+                     {why}. {}",
                     listed(also.iter().copied()),
-                    reasons(&unasked, &also),
-                    self.recovery(required, &at_most)
+                    self.recovery(required, &at_most, &why)
                 ),
             ));
         }
@@ -1514,16 +1523,17 @@ impl Context<'_, '_> {
 
     /// The `<owner>/<name>` of another registered fork's upstream that
     /// `repo` names, by that fork's registry key or by the upstream's own
-    /// name; `None` for this fork's upstream, or a repository no fork has as
-    /// its upstream.
+    /// name in any letter case ([`Registry::resolve`]); `None` for this
+    /// fork's upstream, for a repository no fork has as its upstream, and for
+    /// an upstream that names no forge repository, such as a path: the forge
+    /// is never asked about it.
     fn others_upstream(&self, repo: &str) -> Option<String> {
-        if let Some((key, entry)) = self.registry.repos.get_key_value(repo) {
-            return (entry.upstream_name(key) != self.fork.upstream)
-                .then(|| remote_slug(&entry.upstream).map(str::to_owned))
-                .flatten();
-        }
         let upstream = self.registry.resolve(repo)?;
-        (upstream != self.fork.upstream).then(|| repo.to_owned())
+        if upstream == self.fork.upstream {
+            return None;
+        }
+        let entry = self.registry.kept_under(&upstream)?;
+        remote_slug(&entry.upstream).map(str::to_owned)
     }
 
     /// What the forge says of a member text's records ([`Tie`]), asked only
