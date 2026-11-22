@@ -3315,16 +3315,7 @@ fn a_review_pull_request_under_the_forks_new_name_is_its_own_beside_a_fork_of_th
     // current name; the registry holds a fork of this fork whose upstream is
     // acme/demo.
     let fixture = fixture_with(CONFIG_A.0, CONFIG_A.1);
-    let registry = fixture.home.path().join("repos.toml");
-    let text = std::fs::read_to_string(&registry).expect("read the registry");
-    std::fs::write(
-        &registry,
-        format!(
-            "{text}[repos.child]\nupstream = \"{ORIGIN}\"\n\
-             origin = \"https://forge.invalid/acme/child\"\n"
-        ),
-    )
-    .expect("rewrite the registry");
+    register_a_fork_of_this_fork(&fixture);
 
     // When: #13 is named by the fork's current name.
     let output = fixture.depends(&["--on", "acme/demo#13"]);
@@ -3338,6 +3329,93 @@ fn a_review_pull_request_under_the_forks_new_name_is_its_own_beside_a_fork_of_th
         held[0].starts_with("origin:") && held[0].ends_with("/demo#13"),
         "{held:?}\n{output}"
     );
+}
+
+/// Add to the fixture's registry `child`, a fork whose upstream is
+/// acme/demo, the fork's current name, and whose own repository is
+/// acme/child.
+fn register_a_fork_of_this_fork(fixture: &Fixture) {
+    let registry = fixture.home.path().join("repos.toml");
+    let text = std::fs::read_to_string(&registry).expect("read the registry");
+    std::fs::write(
+        &registry,
+        format!(
+            "{text}[repos.child]\nupstream = \"{ORIGIN}\"\n\
+             origin = \"https://forge.invalid/acme/child\"\n"
+        ),
+    )
+    .expect("rewrite the registry");
+}
+
+#[test]
+fn offline_a_pull_request_of_a_fork_of_this_forks_upstream_is_refused() {
+    // Given: config A, the child fork registered, and the forge down.
+    let fixture = fixture_with(CONFIG_A.0, CONFIG_A.1);
+    register_a_fork_of_this_fork(&fixture);
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+
+    // When: #13 is named by acme/demo, the child's upstream, which may be
+    // this fork's own repository under its current name.
+    let output = fixture.knives(&["--text", "depends", "feat/alpha", "--on", "acme/demo#13"]);
+
+    // Then: nothing is recorded (exit 3), and the refusal names the child
+    // and says to run it again (N83).
+    assert_eq!(output.status.code(), Some(3), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with(
+            "nothing recorded: acme/demo in acme/demo#13 is the upstream of child, which may be \
+             a fork of demo"
+        ) && stderr.contains("Run it again when the forge answers"),
+        "{stderr}"
+    );
+    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
+}
+
+#[test]
+fn offline_a_pull_request_of_another_projects_upstream_is_recorded_as_before() {
+    // Given: the child fork registered, and the forge down.
+    let fixture = fixture_with(CONFIG_A.0, CONFIG_A.1);
+    register_a_fork_of_this_fork(&fixture);
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+
+    // When: the sibling's upstream pull request is named: an upstream owned
+    // by no owner the registry keeps forks under.
+    let output = fixture.knives(&[
+        "--text",
+        "depends",
+        "feat/alpha",
+        "--on",
+        "maintainer/sibling#51",
+    ]);
+
+    // Then: it is recorded as the sibling's upstream pull request, as it
+    // was before N83's check.
+    assert!(output.status.success(), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), ["maintainer/sibling#51"]);
+}
+
+#[test]
+fn offline_the_forks_new_name_with_no_fork_of_it_registered_is_refused_as_before() {
+    // Given: config A, no fork of this fork registered, and the forge down.
+    let fixture = fixture_with(CONFIG_A.0, CONFIG_A.1);
+    install_failing_gh(fixture.shim.path(), &fixture.log);
+
+    // When: #13 is named by acme/demo, which nothing here spells.
+    let output = fixture.knives(&["--text", "depends", "feat/alpha", "--on", "acme/demo#13"]);
+
+    // Then: as before N83's check: whether this fork's repository was
+    // renamed to acme/demo could not be asked, so nothing is recorded.
+    assert_eq!(output.status.code(), Some(3), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with(
+            "nothing recorded: acme/demo in acme/demo#13 is no repository the registry or this \
+             checkout names"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
 }
 
 #[test]
