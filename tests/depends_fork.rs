@@ -3176,16 +3176,45 @@ fn a_review_pull_request_under_the_forks_new_name_is_its_own_beside_a_fork_of_th
 /// acme/demo, the fork's current name, and whose own repository is
 /// acme/child.
 fn register_a_fork_of_this_fork(fixture: &Fixture) {
+    register(fixture, "child", "acme/demo", "acme/child");
+}
+
+/// Add to the fixture's registry the fork `key`, whose upstream is the
+/// repository `upstream` and whose own repository is `origin`.
+fn register(fixture: &Fixture, key: &str, upstream: &str, origin: &str) {
     let registry = fixture.home.path().join("repos.toml");
     let text = std::fs::read_to_string(&registry).expect("read the registry");
     std::fs::write(
         &registry,
         format!(
-            "{text}[repos.child]\nupstream = \"{ORIGIN}\"\n\
-             origin = \"https://forge.invalid/acme/child\"\n"
+            "{text}[repos.{key}]\nupstream = \"https://forge.invalid/{upstream}\"\n\
+             origin = \"https://forge.invalid/{origin}\"\n"
         ),
     )
     .expect("rewrite the registry");
+}
+
+/// `--on <text>` for feat/alpha, with what it says.
+fn on(fixture: &Fixture, text: &str) -> std::process::Output {
+    fixture.knives(&["--text", "depends", "feat/alpha", "--on", text])
+}
+
+/// Assert `output` refused (exit 3) because only the forge can tell whether
+/// `repo`, the upstream of `key`, is this fork's own repository, and that
+/// nothing was recorded.
+fn refused_for_the_forge(fixture: &Fixture, output: &std::process::Output, repo: &str, key: &str) {
+    assert_eq!(output.status.code(), Some(3), "{}", said(output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "nothing recorded: {repo} in {repo}#"
+        )) && stderr.contains(&format!(
+            "is the upstream of {key}, and only the forge can tell whether it is also demo's own \
+             repository under another name"
+        )) && stderr.contains("Run it again when the forge answers"),
+        "{stderr}"
+    );
+    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
 }
 
 #[test]
@@ -3197,43 +3226,176 @@ fn offline_a_pull_request_of_a_fork_of_this_forks_upstream_is_refused() {
 
     // When: #13 is named by acme/demo, the child's upstream, which may be
     // this fork's own repository under its current name.
-    let output = fixture.knives(&["--text", "depends", "feat/alpha", "--on", "acme/demo#13"]);
+    let output = on(&fixture, "acme/demo#13");
 
-    // Then: nothing is recorded (exit 3), and the refusal names the child
-    // and says to run it again (N83).
-    assert_eq!(output.status.code(), Some(3), "{}", said(&output));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.starts_with(
-            "nothing recorded: acme/demo in acme/demo#13 is the upstream of child, which may be \
-             a fork of demo"
-        ) && stderr.contains("Run it again when the forge answers"),
-        "{stderr}"
-    );
-    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
+    // Then: nothing is recorded (exit 3), naming the child (N83).
+    refused_for_the_forge(&fixture, &output, "acme/demo", "child");
 }
 
 #[test]
-fn offline_a_pull_request_of_another_projects_upstream_is_recorded_as_before() {
-    // Given: the child fork registered, and the forge down.
+fn offline_a_third_partys_fork_of_this_fork_is_refused() {
+    // Given: config A; the registry holds this fork and the child, a fork of
+    // acme/demo owned by bob, and no fork owned by acme; the forge is down.
     let fixture = fixture_with(CONFIG_A.0, CONFIG_A.1);
-    register_a_fork_of_this_fork(&fixture);
+    let registry = fixture.home.path().join("repos.toml");
+    let text = std::fs::read_to_string(&registry).expect("read the registry");
+    let demo = text
+        .split("[repos.")
+        .find(|section| section.starts_with("demo]"))
+        .unwrap_or_else(|| panic!("no demo section in {text}"));
+    std::fs::write(&registry, format!("[repos.{demo}")).expect("rewrite the registry");
+    register(&fixture, "child", "acme/demo", "bob/child");
     install_failing_gh(fixture.shim.path(), &fixture.log);
 
-    // When: the sibling's upstream pull request is named: an upstream owned
-    // by no owner the registry keeps forks under.
-    let output = fixture.knives(&[
-        "--text",
-        "depends",
-        "feat/alpha",
-        "--on",
-        "maintainer/sibling#51",
-    ]);
+    // When / Then: as for any other fork's upstream, nothing is recorded
+    // (N87).
+    let output = on(&fixture, "acme/demo#13");
+    refused_for_the_forge(&fixture, &output, "acme/demo", "child");
+}
 
-    // Then: it is recorded as the sibling's upstream pull request, as it
-    // was before N83's check.
+/// The fixture's forge after this fork's repository moved from acme-old to
+/// newco, an owner no registered fork has: its review pull request #15,
+/// whose head is this fork's feat/base, merged into a review base.
+fn moved_to_newco(fixture: &Fixture) {
+    let head = lab::commit_at(&fixture.lab, "feat/base")
+        .as_str()
+        .to_owned();
+    let pulls = format!(
+        "[{}]",
+        pull_record_with_fields(
+            15,
+            "MERGED",
+            "feat/base",
+            &format!(
+                ",\"headRefOid\":\"{head}\",\"headRepositoryOwner\":{{\"login\":\"newco\"}},\
+                 \"baseRefName\":\"review/base\""
+            ),
+        )
+    );
+    install_repository_gh_failing(
+        fixture.shim.path(),
+        &[
+            Repository {
+                named: KEPT_UNDER,
+                canonical: KEPT_UNDER,
+                pulls: "[]",
+            },
+            Repository {
+                named: "acme-old/demo",
+                canonical: "newco/demo",
+                pulls: "[]",
+            },
+            Repository {
+                named: "newco/demo",
+                canonical: "newco/demo",
+                pulls: &pulls,
+            },
+            Repository {
+                named: "maintainer/sibling",
+                canonical: "maintainer/sibling",
+                pulls: "[]",
+            },
+            Repository {
+                named: "acme/sibling",
+                canonical: "acme/sibling",
+                pulls: "[]",
+            },
+        ],
+        &[],
+        &fixture.log,
+    );
+}
+
+#[test]
+fn a_pull_request_of_this_fork_after_a_transfer_is_never_another_forks_upstream_one() {
+    // Given: config A; this fork's repository moved to newco/demo, and a
+    // third party's fork of it, child, is registered with newco/demo as its
+    // upstream.
+    for forge_up in [true, false] {
+        let fixture = fixture_with(CONFIG_A.0, CONFIG_A.1);
+        register(&fixture, "child", "newco/demo", "childco/demo");
+        if forge_up {
+            moved_to_newco(&fixture);
+        } else {
+            install_failing_gh(fixture.shim.path(), &fixture.log);
+        }
+
+        // When: #15 is named by the new name.
+        let output = on(&fixture, "newco/demo#15");
+
+        // Then: with the forge up, it is this fork's review pull request;
+        // with the forge down, nothing is recorded, so no merge into a
+        // review base can read as met (Sol's R13-B1).
+        if forge_up {
+            assert!(output.status.success(), "{}", said(&output));
+            assert_eq!(fixture.required("feat/alpha"), ["origin:newco/demo#15"]);
+        } else {
+            refused_for_the_forge(&fixture, &output, "newco/demo", "child");
+        }
+    }
+}
+
+#[test]
+fn offline_only_this_forks_registered_upstream_records_whatever_else_is_registered() {
+    // Given: the forge down; with and without `tool`, an unrelated fork of
+    // outsider/tool kept under maintainer, who also owns the sibling's
+    // upstream.
+    for with_tool in [false, true] {
+        let fixture = fixture_with(CONFIG_A.0, CONFIG_A.1);
+        if with_tool {
+            register(&fixture, "tool", "outsider/tool", "maintainer/tool");
+        }
+        install_failing_gh(fixture.shim.path(), &fixture.log);
+
+        // When / Then: this fork's registered upstream's pull request is
+        // recorded with no forge call.
+        let output = on(&fixture, "maintainer/demo#7");
+        assert!(output.status.success(), "{}", said(&output));
+        assert_eq!(fixture.required("feat/alpha"), ["maintainer/demo#7"]);
+
+        // And: another fork's upstream is refused, whatever else is
+        // registered: only the forge can tell it from this fork's own
+        // repository under another name (Sol's R13-B2).
+        let fresh = fixture_with(CONFIG_A.0, CONFIG_A.1);
+        if with_tool {
+            register(&fresh, "tool", "outsider/tool", "maintainer/tool");
+        }
+        install_failing_gh(fresh.shim.path(), &fresh.log);
+        let output = on(&fresh, "maintainer/sibling#51");
+        refused_for_the_forge(&fresh, &output, "maintainer/sibling", "sibling");
+    }
+}
+
+#[test]
+fn online_another_forks_upstream_pull_request_is_recorded() {
+    // Given: the forge answers.
+    let fixture = fixture_with(CONFIG_A.0, CONFIG_A.1);
+
+    // When / Then: the sibling's upstream pull request is recorded as one.
+    let output = on(&fixture, "maintainer/sibling#51");
     assert!(output.status.success(), "{}", said(&output));
     assert_eq!(fixture.required("feat/alpha"), ["maintainer/sibling#51"]);
+}
+
+#[test]
+fn online_a_fork_of_this_fork_under_its_former_name_is_its_own() {
+    // Given: config B; the registry holds a fork of this fork whose upstream
+    // spells this fork's former name, acme-old/demo; the forge answers.
+    let fixture = fixture_with(CONFIG_B.0, CONFIG_B.1);
+    register(&fixture, "child", "acme-old/demo", "acme/child");
+
+    // When: #13 is named by the former name.
+    let output = on(&fixture, "acme-old/demo#13");
+
+    // Then: the forge redirects acme-old/demo to this fork's repository, so
+    // it is this fork's review pull request (N88).
+    let held = fixture.required("feat/alpha");
+    assert_eq!(held.len(), 1, "{}", said(&output));
+    assert!(
+        held[0].starts_with("origin:") && held[0].ends_with("/demo#13"),
+        "{held:?}\n{}",
+        said(&output)
+    );
 }
 
 #[test]
@@ -3243,7 +3405,7 @@ fn offline_the_forks_new_name_with_no_fork_of_it_registered_is_refused_as_before
     install_failing_gh(fixture.shim.path(), &fixture.log);
 
     // When: #13 is named by acme/demo, which nothing here spells.
-    let output = fixture.knives(&["--text", "depends", "feat/alpha", "--on", "acme/demo#13"]);
+    let output = on(&fixture, "acme/demo#13");
 
     // Then: as before N83's check: whether this fork's repository was
     // renamed to acme/demo could not be asked, so nothing is recorded.
