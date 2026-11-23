@@ -1,10 +1,10 @@
-//! The branch verbs after `start`: `finish`, `track` and `depends`.
+//! The branch verbs after `start`: `finish` and `track`.
 //!
 //! `finish` hands a claimed branch back and removes its workspace; `track`
-//! states which pull request a branch belongs to, overriding inference;
-//! `depends` records that a branch cannot land before something else does.
+//! states which pull request a branch belongs to, overriding inference.
 //! Each records one ledger event, and a statement rides on that event;
-//! `finish` also writes the released claim to the state file.
+//! `finish` also writes the released claim to the state file. `depends`, the
+//! third statement verb, is [`crate::depends`].
 //!
 //! On a fork that shares its ledger, the ledger's claim ref says who holds
 //! the branch, on every machine that shares it. `finish` reads it under the
@@ -26,9 +26,7 @@ use knives::commands::claim::{
 };
 use knives::commands::start::{collides_with_checkout, possesses, workspace_path};
 use knives::config::Registry;
-use knives::ids::{
-    BranchName, BranchTarget, CommitId, RepoName, Requirement, UpstreamName, is_release_name,
-};
+use knives::ids::{BranchName, BranchTarget, CommitId, RepoName, UpstreamName, is_release_name};
 use knives::jj::{
     JjError, Repo, StaleRegistration, WorkspaceIdentity, path_occupant, remove_finished_worktree,
 };
@@ -1628,14 +1626,16 @@ fn place_gate(
 /// A forget erases the statement before it, and the newest statement wins on
 /// every machine, so built from a ledger missing another machine's newer
 /// statement it would erase that statement everywhere, as a release write
-/// would check its drop guard against the wrong cut. A `depends` statement
-/// erases nothing, since the live list is every requirement stated since the
-/// last forget, but it records that the branch must wait from what this
-/// machine last pulled, and says "now requires …" from it: from a ledger it
-/// knows is stale, that would tell the caller a list other machines may
-/// already have changed. So each refuses, like a release write, rather than
-/// write from what this machine happens to have.
-fn pulled_before_replacing(fork: &Fork<'_>, bound: Bound<'_>, what: &str) -> bool {
+/// would check its drop guard against the wrong cut; a `depends --forget`
+/// restates the list it leaves, which would drop another machine's newer
+/// requirement. A `depends` that only adds erases nothing, since the live list
+/// is every requirement stated since the last forget, but it records that the
+/// branch must wait from what this machine last pulled, and says "now
+/// requires …" from it: from a ledger it knows is stale, that would tell the
+/// caller a list other machines may already have changed. So each refuses,
+/// like a release write, rather than write from what this machine happens to
+/// have.
+pub(crate) fn pulled_before_replacing(fork: &Fork<'_>, bound: Bound<'_>, what: &str) -> bool {
     let problems =
         knives::ledger_sweep::pull(bound.registry, &[&fork.upstream]).problems_for(&fork.upstream);
     for problem in &problems {
@@ -1654,7 +1654,10 @@ fn pulled_before_replacing(fork: &Fork<'_>, bound: Bound<'_>, what: &str) -> boo
 ///
 /// A forget pulls first ([`pulled_before_replacing`]) and writes a statement
 /// only when one is stated: a forget of nothing would erase, everywhere, a
-/// statement another machine made that this one has not seen.
+/// statement another machine made that this one has not seen. A stated
+/// number must be a pull request on the fork's upstream
+/// ([`crate::depends::upstream_pull`]), asked before the fork's lock is
+/// taken.
 #[allow(
     clippy::too_many_arguments,
     reason = "the fork, the branch, the three ways to state its pull request and the cwd binding are independent inputs"
@@ -1668,6 +1671,11 @@ pub(crate) fn run_track(
     bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
     let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
+    if let Some(number) = pr
+        && let Err(exit) = crate::depends::upstream_pull(fork, bound.registry, branch, number)
+    {
+        return Ok(exit);
+    }
     if forget && !pulled_before_replacing(fork, bound, "the forget") {
         return Ok(Exit::Incomplete);
     }
@@ -1749,102 +1757,15 @@ fn spoken(text: &str) -> String {
     }
 }
 
-/// Record what a branch cannot land before.
-///
-/// Requirements are validated against the registry, because a dependency on a repo
-/// knives does not manage is a typo, and a typo that records silently is worse than
-/// no dependency at all: it reads as satisfied forever.
-pub(crate) fn run_depends(
-    fork: &Fork<'_>,
-    branch: &BranchName,
-    on: &[String],
-    bound: Bound<'_>,
-) -> anyhow::Result<Exit> {
-    let registry = bound.registry;
-    let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
-    let mut requirements = Vec::new();
-    for text in on {
-        let Some(written) = Requirement::parse(text) else {
-            eprintln!("cannot read {text} as a requirement; write it as `<repo>#<number>`");
-            return Ok(Exit::Usage);
-        };
-        // Recorded under the required fork's repository name, whichever way it
-        // was typed, so the statement means the same fork on every machine.
-        let Some(upstream) = registry.resolve(written.repo.as_str()) else {
-            let known: Vec<String> = registry.names().map(|n| n.to_string()).collect();
-            eprintln!(
-                "unknown repo {} in {text}; known: {}",
-                written.repo,
-                known.join(", ")
-            );
-            return Ok(Exit::Usage);
-        };
-        requirements.push(Requirement {
-            repo: upstream,
-            number: written.number,
-        });
-    }
-    if !pulled_before_replacing(fork, bound, "the dependency") {
-        return Ok(Exit::Incomplete);
-    }
-    // The fork's lock is held while the list is read and the next statement
-    // appended, so two concurrent `depends` on this machine each add to the
-    // other's list rather than racing; the pull above brought in what other
-    // machines stated. Nothing here writes the state file.
-    let store = Store::open_for_update(
-        default_state_path(),
-        &registry.former_names(),
-        &[&fork.upstream],
-    )?;
-    let required = with_requirements(&store.dependencies(target), &requirements);
-    let pr = store.tracked_pull(target);
-    let listed: Vec<String> = requirements.iter().map(ToString::to_string).collect();
-    scribe_for(fork, bound)?.record(&Draft {
-        statement: Some(Stated {
-            statement: Statement {
-                kind: StatementKind::Depends,
-                value: Some(required.join(",")),
-            },
-            replaces: store.statement_stamp(target, StatementKind::Depends),
-        }),
-        ..Draft::event(
-            Some(branch.as_str()),
-            format!("requires {}", listed.join(", ")),
-            pr,
-        )
-    })?;
-    drop(store);
-    println!("{}/{branch} now requires {}", fork.name, listed.join(", "));
-    Ok(Exit::Ok)
-}
-
-/// Everything a branch requires once `added` joins what it already `required`.
-///
-/// Additive and deduplicated, so declaring the same requirement twice is not an
-/// error and re-running a script does not accumulate duplicates. The result is
-/// the whole list, so each entry reads on its own as everything the branch
-/// needed when it was written.
-fn with_requirements(required: &[Requirement], added: &[Requirement]) -> Vec<String> {
-    let mut texts: Vec<String> = required.iter().map(ToString::to_string).collect();
-    for requirement in added {
-        let text = requirement.to_string();
-        if !texts.contains(&text) {
-            texts.push(text);
-        }
-    }
-    texts.sort();
-    texts
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::{
         Place, Registration, copy_superseded, finish_provenance, kept_lines, left_to_its_owner,
-        naming_failure, no_claim_now, removal_note, shared_holder, spoken, with_requirements,
+        naming_failure, no_claim_now, removal_note, shared_holder, spoken,
     };
-    use knives::ids::{BranchName, Requirement};
+    use knives::ids::BranchName;
     use knives::jj::WorkspaceIdentity;
     use knives::store::{Claim, OwnerKind};
 
@@ -1867,18 +1788,6 @@ mod tests {
         ] {
             assert_eq!(spoken(event), expected);
         }
-    }
-
-    #[test]
-    fn requirements_join_what_was_already_required_without_duplicates() {
-        let parse = |text: &str| Requirement::parse(text).expect("a requirement");
-        assert_eq!(
-            with_requirements(
-                &[parse("sibling#49"), parse("other#7")],
-                &[parse("sibling#49"), parse("another#3")],
-            ),
-            ["another#3", "other#7", "sibling#49"]
-        );
     }
 
     /// The disposal line `finish` prints names the path jj recorded for the

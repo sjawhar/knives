@@ -57,11 +57,15 @@ Reports upstream contribution facts: convention files and their changes since la
 Inference matches branches to PR heads from our copies and reads a `pr-<n>` bookmark as that PR's head. It can miss older or closed PRs and a superseding PR by someone else. State them:
 
 ```text
-knives track <branch> --pr 4545     # any number, state or author
-knives track <branch> --forget      # back to inference
-knives depends <branch> --on <repo>#<number>
+knives track <branch> --pr 4545                 # an upstream PR, any state or author
+knives track <branch> --forget                  # back to inference
+knives depends <branch> --on <repo>#<number>    # an upstream PR, or a review PR on the fork's own repository
+knives depends <branch> --on <member-branch>    # a member branch of this fork
+knives depends <branch> --forget <requirement>  # take it back; with --on, correct it
 ```
 
 - `depends` is never inferred and can cross forks. `status` reports requirements that have not merged.
+- A knives older than v6.1.0 cannot read a member-branch or review-PR requirement: record one only when every machine that shares the fork's ledger runs v6.1.0 or later.
+- `track --pr` refuses a number that is the fork's review PR, not an upstream one.
 - `depends` and `track --forget` pull the shared ledger first and refuse (exit `3`) when the pull fails.
 - `track --fork-only` is a legacy statement; placement never records fork-only (fork-work §3).

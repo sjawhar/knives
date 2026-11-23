@@ -824,10 +824,8 @@ fn fold_phase_outcome(
     add_dependency_findings(DependencyInput {
         report,
         findings,
-        name,
-        path: &input.fork.checkout.path,
-        store: input.store,
-        options: input.options,
+        post: input,
+        index,
         snapshot,
         timings,
     });

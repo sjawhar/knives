@@ -254,7 +254,9 @@ pub enum Command {
         /// One line per finding rather than one line per kind.
         #[arg(long)]
         verbose: bool,
-        /// Skip the landed probe, which replays every branch onto the trunk.
+        /// Skip the landed probe, which replays every branch onto the trunk. A
+        /// required member branch not shown to have landed then stays an unmet
+        /// dependency: a merge alone does not show it.
         #[arg(long)]
         no_landed: bool,
         /// Skip pull request lookups. Branch pull request state reads as unknown.
@@ -377,13 +379,17 @@ pub enum Command {
     /// State which pull request a branch belongs to, overriding inference.
     ///
     /// Inference finds an open pull request from our own copy of the repository, which
-    /// is a sensible default and a bad rule. This accepts any number in any state from
-    /// any author: one opened before this tool existed, one the maintainer closed
-    /// because they wanted a different approach, or somebody else's that we are
-    /// carrying because ours was superseded.
+    /// is a sensible default and a bad rule. This accepts any upstream pull request in
+    /// any state from any author: one opened before this tool existed, one the
+    /// maintainer closed because they wanted a different approach, or somebody else's
+    /// that we are carrying because ours was superseded. The number is asked of the
+    /// forge, because the fork's own repository numbers its review pull requests
+    /// apart: refused when the fork's pull request of that number has this branch
+    /// as its head and the upstream's does not, when only the fork has the number,
+    /// and when neither has it.
     Track {
         branch: String,
-        /// The pull request number.
+        /// The upstream pull request's number.
         #[arg(long = "pr")]
         pr: Option<u64>,
         /// This branch deliberately has no upstream pull request. Recorded so it does
@@ -397,16 +403,76 @@ pub enum Command {
         #[arg(long)]
         repo: Option<String>,
     },
-    /// Record that a branch cannot land before something else does.
+    /// Record that a branch cannot land before something else does, or take a
+    /// requirement back.
     ///
     /// Dependencies cross forks: a branch here can require a pull request in another
     /// managed repo. Dropping the thing it needs from a release, without dropping
     /// this too, ships something that cannot work.
+    ///
+    /// A requirement is a pull request or a member branch, and the record says
+    /// which: `<upstream>#<n>` is a pull request on the fork's upstream,
+    /// `origin:<owner>/<name>#<n>` a review pull request on the fork's own
+    /// repository, `origin:<owner>/<name>:<branch>` a member branch of this fork.
+    ///
+    /// `--forget` takes a requirement back; with `--on` it corrects one. The
+    /// removal is a ledger entry, so every machine running this knives that
+    /// shares the ledger reads the same list. A knives from before fork
+    /// requirements cannot read a list holding a member branch, and reads a
+    /// forget whose list holds one as requiring nothing.
     Depends {
         branch: String,
-        /// What it needs, as `<repo>#<number>`, repeatable.
-        #[arg(long = "on", required = true)]
+        /// What it needs, repeatable. `<repo>#<number>`, `<repo>` the registry
+        /// name: another fork's key is first asked about as below, and names
+        /// this fork's own repository when its upstream is that. Otherwise,
+        /// when that fork's upstream and own repository are both forge
+        /// repositories, knives asks the forge which has that pull request, and
+        /// refuses when both or neither do (when the forge names that fork's
+        /// own repository as its upstream, the upstream's, with no lookup of
+        /// the number); when either is no forge repository, there is no such
+        /// lookup, and it is the upstream's. `<owner>/<name>#<number>`: the
+        /// upstream's pull request, or the fork's when `<owner>/<name>` is its
+        /// own repository. Another fork's upstream, by either spelling, may be
+        /// this fork's repository under another name, so the forge is asked,
+        /// and nothing is recorded (exit 3) when it cannot say. The question is
+        /// skipped when this fork's own repository names no forge repository
+        /// (neither its checkout's nor its registry's `origin` is a forge URL).
+        /// Another fork whose upstream is a path is named by its registry key
+        /// exactly, with no forge call, and its key in another letter case is
+        /// refused (exit 2); this fork's own path upstream is taken in any
+        /// letter case. With the forge down, a pull request is recorded only
+        /// when naming it needs no forge question: this fork's upstream's, by
+        /// `<owner>/<name>`, unless this fork's checkout or registry `origin`
+        /// spells that upstream; another fork's upstream's, by `<owner>/<name>`,
+        /// when this fork's own repository names no forge repository; and, by a
+        /// registry key, one of a fork whose upstream or own repository names no
+        /// forge repository, when that fork is this one, its upstream is a
+        /// path, or this fork's own repository names no forge repository. An
+        /// `origin` that spells this fork's upstream is a configuration error.
+        /// With the forge up, when only the registry's `origin` spells it,
+        /// that upstream's `<owner>/<name>` is refused (exit 2: not this fork's
+        /// own repository), while this fork's key is read as usual against the
+        /// checkout's repository, and a number both have is refused without
+        /// offering the upstream spelling; when this fork's own repository
+        /// spells it, this fork's key takes the upstream's number with no
+        /// lookup. A review pull request on another fork's repository is
+        /// refused, and so is one whose head is not a member branch of the
+        /// fork's owner. A branch name: a member branch of this fork.
+        #[arg(long = "on", required_unless_present = "forget")]
         on: Vec<String>,
+        /// A requirement to take back, repeatable: as its record spells it, or
+        /// as `--on` would. Every record of it is taken back, whatever spelling
+        /// of the fork's repository each carries; a record on another fork's
+        /// repository is never one of this fork's. The texts are weighed
+        /// together: when the forge cannot say whether a record is named (it
+        /// is down, or cannot see a repository), and counting it would take
+        /// back more, or tell two requirements from one, nothing is taken
+        /// back (exit 3), and the refusal prints a command no forge answer
+        /// changes: one that names every record of that number or member on a
+        /// repository that is not another fork's, or, when the text may name
+        /// two requirements, one such command for each.
+        #[arg(long)]
+        forget: Vec<String>,
         /// Registry name. Defaults to the repo you are standing in.
         #[arg(long)]
         repo: Option<String>,
@@ -959,6 +1025,10 @@ mod tests {
             vec!["knives", "release", "members", "r", "--carries", "x"],
             vec!["knives", "release", "members", "--census"],
             vec!["knives", "depends", "a-branch", "--on", "other#1"],
+            vec!["knives", "depends", "a-branch", "--forget", "other#1"],
+            vec![
+                "knives", "depends", "a-branch", "--forget", "other#1", "--on", "o/r#1",
+            ],
             vec!["knives", "track", "a-branch", "--pr", "7"],
             vec!["knives", "notch"],
             vec!["knives", "notch", "feat/alpha"],

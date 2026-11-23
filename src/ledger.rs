@@ -1331,7 +1331,29 @@ impl Scribe {
 
     /// [`Scribe::record`], with the path of the file the entry was written to.
     pub fn record_to(&self, draft: &Draft<'_>) -> Result<(Entry, PathBuf), LedgerError> {
-        let entry = Entry {
+        let entry = self.stamped(draft);
+        let path = self.write(&entry)?;
+        Ok((entry, path))
+    }
+
+    /// Append `drafts` as entries stamped in the order given, each after the
+    /// one before it, and write the newest first.
+    ///
+    /// A run cut short between two writes, or a write that fails, leaves the
+    /// later entries without the earlier ones, never the reverse: a `depends`
+    /// forget followed by the list it leaves never lands as the forget alone,
+    /// which would erase every requirement.
+    pub fn record_in_order(&self, drafts: &[Draft<'_>]) -> Result<Vec<Entry>, LedgerError> {
+        let entries: Vec<Entry> = drafts.iter().map(|draft| self.stamped(draft)).collect();
+        for entry in entries.iter().rev() {
+            let _ = self.write(entry)?;
+        }
+        Ok(entries)
+    }
+
+    /// `draft` as an entry, its automatic fields stamped.
+    fn stamped(&self, draft: &Draft<'_>) -> Entry {
+        Entry {
             ts: monotonic_after(draft.statement.as_ref().and_then(|stated| stated.replaces))
                 .to_string(),
             owner: self.owner.clone(),
@@ -1359,13 +1381,18 @@ impl Scribe {
             previous_started: draft.previous_started.clone(),
             previous_last_seen: draft.previous_last_seen.clone(),
             previous_why: draft.previous_why.clone(),
-        };
-        let path = self.ledger.append(&entry)?;
+        }
+    }
+
+    /// Write `entry` as one file and list it among what this process
+    /// appended ([`appended`]).
+    fn write(&self, entry: &Entry) -> Result<PathBuf, LedgerError> {
+        let path = self.ledger.append(entry)?;
         appended_list().push(Appended {
             fork: self.repo.clone(),
             path: path.clone(),
         });
-        Ok((entry, path))
+        Ok(path)
     }
 
     /// Record that this tool did something, as part of doing it.
@@ -2706,6 +2733,77 @@ mod tests {
         );
         // And: it is on disk, not just returned.
         assert_eq!(scribe.ledger.read().unwrap().entries, vec![written]);
+    }
+
+    /// A `depends` statement of `value` about `feat/alpha`, as a draft.
+    fn depends_draft(value: Option<&str>) -> Draft<'static> {
+        Draft {
+            statement: Some(Stated {
+                statement: Statement {
+                    kind: crate::statement::StatementKind::Depends,
+                    value: value.map(str::to_owned),
+                },
+                replaces: None,
+            }),
+            ..Draft::event(Some("feat/alpha"), "depends".to_owned(), None)
+        }
+    }
+
+    #[test]
+    fn entries_recorded_in_order_are_stamped_in_that_order() {
+        let _lock = crate::config::test_support::environment_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let scribe = scribe(dir.path());
+
+        let written = scribe
+            .record_in_order(&[depends_draft(None), depends_draft(Some("a-repo#2"))])
+            .unwrap();
+
+        let stamps: Vec<jiff::Timestamp> = written
+            .iter()
+            .map(|entry| entry.ts.parse().unwrap())
+            .collect();
+        assert!(stamps[0] < stamps[1], "{stamps:?}");
+        assert_eq!(scribe.ledger.read().unwrap().entries, written);
+        assert_eq!(
+            crate::statement::Statements::from_entries(&written).depends("feat/alpha"),
+            ["a-repo#2"]
+        );
+    }
+
+    #[test]
+    fn a_write_that_fails_in_an_ordered_record_leaves_the_later_entries_alone() {
+        let _lock = crate::config::test_support::environment_lock();
+        // Given: a forget the ledger refuses to write, as a full disk or a
+        // killed run would leave it unwritten, followed by the list it leaves.
+        let dir = tempfile::tempdir().unwrap();
+        let scribe = scribe(dir.path());
+        let refused = Draft {
+            statement: Some(Stated {
+                statement: Statement {
+                    kind: crate::statement::StatementKind::Unknown,
+                    value: None,
+                },
+                replaces: None,
+            }),
+            ..Draft::event(Some("feat/alpha"), "refused".to_owned(), None)
+        };
+
+        // When: both are recorded in order.
+        let recorded = scribe.record_in_order(&[refused, depends_draft(Some("a-repo#2"))]);
+
+        // Then: the record fails, and only the later entry is on disk: never
+        // a forget without the list after it.
+        assert!(recorded.is_err());
+        let texts: Vec<String> = scribe
+            .ledger
+            .read()
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.text)
+            .collect();
+        assert_eq!(texts, ["depends"]);
     }
 
     #[test]

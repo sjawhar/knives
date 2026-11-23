@@ -18,7 +18,9 @@ mod forge_shim;
 #[path = "common/lab.rs"]
 mod lab;
 
-use forge_shim::{install_failing_gh, path_with_gh_shim};
+use forge_shim::{
+    Repository, install_failing_gh, install_repository_gh, path_with_gh_shim, pull_record,
+};
 use knives::ids::BranchName;
 use knives::jj::Repo;
 use knives::statement::{Statement, StatementKind};
@@ -699,9 +701,47 @@ fn finishing_an_unheld_branch_with_a_reason_records_it_on_an_entry_that_changes_
     assert_eq!(entries[0].claim_change_why, None, "was: {entries:?}");
 }
 
+/// A fake gh in a new directory on which the sibling's upstream,
+/// `maintainer/other`, has pull requests #49 and #12, and its own repository,
+/// `acme/other`, has none. It also knows this fork's own repository,
+/// `acme/work`: `depends --on sibling#<n>` asks whether the sibling's upstream
+/// is this fork's repository under another name.
+fn sibling_forge() -> tempfile::TempDir {
+    let shim = tempfile::tempdir().expect("gh shim directory");
+    let sibling_pulls = format!(
+        "[{},{}]",
+        pull_record(49, "OPEN", "their-49", None),
+        pull_record(12, "OPEN", "their-12", None)
+    );
+    install_repository_gh(
+        shim.path(),
+        &[
+            Repository {
+                named: "maintainer/other",
+                canonical: "maintainer/other",
+                pulls: &sibling_pulls,
+            },
+            Repository {
+                named: "acme/other",
+                canonical: "acme/other",
+                pulls: "[]",
+            },
+            Repository {
+                named: "acme/work",
+                canonical: "acme/work",
+                pulls: "[]",
+            },
+        ],
+        &shim.path().join("calls.log"),
+    );
+    shim
+}
+
 #[test]
 fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger() {
-    // Given: a managed fork with a branch, and a sibling repo to depend on
+    // Given: a managed fork with a branch, and a sibling repo to depend on,
+    // whose upstream has pull requests #49 and #12 and whose own repository
+    // has neither
     let lab = lab::Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let home = tempfile::tempdir().expect("create config home");
@@ -715,6 +755,7 @@ fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger(
         ),
     )
     .expect("write registry");
+    let shim = sibling_forge();
     let knives = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_knives"))
             .args(args)
@@ -722,6 +763,7 @@ fn stating_a_pull_request_and_a_dependency_leaves_both_statements_in_the_ledger(
             .env("KNIVES_CONFIG_HOME", home.path())
             .env("HOME", lab.temp_path())
             .env("KNIVES_OWNER", "ses_fff688")
+            .env("PATH", path_with_gh_shim(shim.path()))
             .output()
             .expect("run knives")
     };
