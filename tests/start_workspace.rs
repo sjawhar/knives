@@ -374,7 +374,7 @@ fn start_makes_a_branch_pinned_only_by_an_untracked_remote_ref_rebasable() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(
-            "jj immutable_heads() written to demo's repository config: trunk() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\") | remote_tags(remote=exact:\"upstream\")"
+            "jj immutable_heads() written to demo's repository config: trunk() | tags() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\") | remote_tags(remote=exact:\"upstream\")"
         ),
         "the rule write must be disclosed: {stdout}"
     );
@@ -510,7 +510,7 @@ fn start_refreshes_the_rule_it_wrote_when_the_entry_moves_on() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(
-            "jj immutable_heads() refreshed in demo's repository config: trunk() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\") | remote_tags(remote=exact:\"upstream\")"
+            "jj immutable_heads() refreshed in demo's repository config: trunk() | tags() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\") | remote_tags(remote=exact:\"upstream\")"
         ),
         "was: {stdout}"
     );

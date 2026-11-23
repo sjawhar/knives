@@ -266,7 +266,12 @@ pub(crate) fn run_rebase(
             }
         }
         let tagged = knives::jj::tagged_commits_a_rebase_copies(path, &release_name, &onto)?;
-        knives::jj::rebase_branch_onto(path, &release_name, &onto)?;
+        knives::jj::rebase_branch_onto(
+            path,
+            &release_name,
+            &onto,
+            &entry.rebase_immutable_heads(),
+        )?;
         // The move rewrote the release under its change: the release it left
         // is the last write until the re-describe, so a step before that which
         // fails names its headings. It is read by that change, not by its

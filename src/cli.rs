@@ -299,13 +299,14 @@ pub enum Command {
     /// workspace. When it cannot read the claim or push it, it records no claim,
     /// opens no workspace and exits 3.
     ///
-    /// Also states the fork's `immutable_heads()` — jj's trunk, the trunk by name
-    /// on every knives remote, and every tag fetched from upstream — in the
-    /// repository's jj config when that config states none, and says so on
-    /// stdout. jj's default pins every commit beneath an untracked remote ref or
-    /// any tag, which in a fork is a superseded release cut, another fork's pull
-    /// request head, or the fork's own tagged release walling `jj rebase`; a
-    /// stated rule is left alone.
+    /// Also states the fork's `immutable_heads()` — jj's trunk and tags, the
+    /// trunk by name on every knives remote, the release branch where it is
+    /// published, and every tag fetched from upstream — in the repository's jj
+    /// config when that config states none or an earlier `start` wrote another,
+    /// and says so on stdout. So a hand command cannot rewrite a published
+    /// release. Untracked remote refs, which jj's default pins, are left out: in
+    /// a fork they are a superseded release cut or another fork's pull request
+    /// head walling `jj rebase`. A rule a person stated is left alone.
     Start {
         branch: String,
         /// Registry name. Defaults to the repo you are standing in.
@@ -885,9 +886,8 @@ pub enum ReleaseAction {
     ///
     /// Runs automatically after every cut; exists standalone for pre-knives repos carrying
     /// years of historical refs. A later fetch re-materializes forgotten refs as untracked;
-    /// re-run to clear them. Under the fork's `immutable_heads()` (the trunk, named on every
-    /// knives remote, and upstream's tags, which `knives start` writes) those refs pin nothing
-    /// for `jj rebase`, so reaping is tidiness, never an unlock.
+    /// re-run to clear them. Under the fork's `immutable_heads()` (which `knives start` writes)
+    /// untracked refs pin nothing for `jj rebase`, so reaping is tidiness, never an unlock.
     ///
     /// Keeps every superseded cut while the live one still carries conflicts: the previous
     /// cut is the only record of how they were last resolved.

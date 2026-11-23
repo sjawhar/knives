@@ -1743,10 +1743,11 @@ fn a_rebase_keeps_a_stray_copy_a_bookmark_points_at() {
 
 #[test]
 fn a_rebase_keeps_a_stray_copy_that_is_a_working_copy() {
-    // Given: the checkout editing the old tagged release itself
+    // Given: the checkout editing the old tagged release itself, as a working
+    // copy left there before the fork's rule pinned its tags is
     let lab = Lab::new();
     let (home, tagged) = fork_with_an_old_tagged_release(&lab);
-    lab.jj_work(["edit", OLD_RELEASE_TAG]);
+    lab.jj_work(["edit", "--ignore-immutable", OLD_RELEASE_TAG]);
 
     // When
     let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
@@ -1768,9 +1769,37 @@ fn a_rebase_keeps_a_stray_copy_that_is_a_working_copy() {
 }
 
 #[test]
+fn after_start_a_hand_restore_into_a_published_release_is_refused() {
+    // Given: a fork whose earlier publication is tagged, under the rule
+    // `knives start` writes.
+    let lab = Lab::new();
+    let (_home, tagged) = fork_with_an_old_tagged_release(&lab);
+
+    // When: a hand `jj restore --into` the published release, as a script ran
+    // one on a published release and five owners then built on the rewrite.
+    let output = std::process::Command::new("jj")
+        .args(["restore", "--from", "feat/alpha", "--into", OLD_RELEASE_TAG])
+        .current_dir(&lab.work)
+        .env("JJ_USER", "Knives Lab")
+        .env("JJ_EMAIL", "knives-lab@example.test")
+        .output()
+        .expect("run jj");
+
+    // Then: jj refuses it as immutable, and the tag still names the published
+    // commit with no rewritten copy beside it.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("immutable"),
+        "the restore must be refused as immutable: {stderr}"
+    );
+    assert_eq!(commit_at(&lab, OLD_RELEASE_TAG), tagged, "the tag moved");
+    assert_eq!(copies_of(&lab, &tagged), Vec::<String>::new());
+}
+
+#[test]
 fn a_rebase_refuses_under_the_tag_pinning_rule_an_earlier_knives_start_wrote() {
-    // Given: the fork's config still states the rule knives wrote before its own
-    // release tags were exempt, which pins every member beneath the tagged release
+    // Given: the fork's config still states a rule an earlier knives start
+    // wrote, which pins every member beneath the tagged release
     let lab = Lab::new();
     let (home, tagged) = fork_with_an_old_tagged_release(&lab);
     let stale = "trunk() | tags() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\")";
