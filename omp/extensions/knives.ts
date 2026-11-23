@@ -26,6 +26,11 @@ const blockEnvelope =
  * was lost: lost guidance is injected again, and a lost notice makes the next notice of its fork
  * the whole roster again.
  *
+ * `guidance` lists every block's nonce, as the binaries of 6.1.5 and 6.1.6 read it. `notices` lists
+ * the claims notices' again, and its presence tells a later binary that this report covers
+ * notices: the extension of 5.1.0 to 6.1.4 reported guidance blocks alone, so a binary never takes
+ * a notice missing from a report without `notices` as lost.
+ *
  * Only entries after the latest compaction or `/clear` boundary count. A compaction's kept tail
  * may hold a block too; counting it as lost costs one more copy, where counting a lost block as
  * held would leave the session without that guidance or that roster.
@@ -52,16 +57,19 @@ function modelContext(branch: readonly SessionEntry[], toolCallId: string): Mode
     }
   }
   const guidance = new Set<string>();
+  const notices = new Set<string>();
   for (const entry of branch.slice(start)) {
     if (entry.type !== "message" || entry.message.role !== "toolResult") continue;
     for (const part of entry.message.content) {
       if (part.type !== "text") continue;
-      for (const match of part.text.matchAll(blockEnvelope)) {
-        if (match[2] !== undefined) guidance.add(match[2]);
+      for (const [, kind, nonce] of part.text.matchAll(blockEnvelope)) {
+        if (nonce === undefined) continue;
+        guidance.add(nonce);
+        if (kind === "notice") notices.add(nonce);
       }
     }
   }
-  return { turn, guidance: [...guidance] };
+  return { turn, guidance: [...guidance], notices: [...notices] };
 }
 
 export default function knivesExtension(pi: ExtensionAPI): void {

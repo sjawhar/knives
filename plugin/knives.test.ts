@@ -864,6 +864,106 @@ test.serial.skipIf(realBinary.length === 0)(
 );
 
 test.serial.skipIf(realBinary.length === 0)(
+  "the OMP adapter tells a roster change once, and the roster again once its notice leaves the context",
+  async () => {
+    type Handler = (event: unknown, ctx: unknown) => Promise<unknown>;
+    type Part = { readonly type: string; readonly text?: string; readonly id?: string };
+    type Entry = {
+      readonly type: string;
+      readonly id: string;
+      readonly message: { readonly role: string; content: Part[] };
+    };
+    // Two claims on the managed fork, the second's reason `why`.
+    const claims = (why: string): string =>
+      JSON.stringify({
+        claims: Object.fromEntries(
+          [
+            ["feat/one", "porting"],
+            ["feat/two", why],
+          ].map(([branch, reason]) => [
+            `maintainer/managed/${branch}`,
+            {
+              repo: "maintainer/managed",
+              branch,
+              owner: "agent-one",
+              why: reason,
+              started: "2026-01-01T00:00:00Z",
+              files: [],
+            },
+          ])
+        ),
+      });
+    try {
+      await withRepository(async ({ home, root, file }) => {
+        process.env["KNIVES_CONFIG_HOME"] = home;
+        await write(join(home, "state.json"), claims("porting"));
+        const handlers = new Map<string, Handler>();
+        // Loaded by path for the reason the chat-turn test above gives: omp's types stay out of
+        // the plugin's typecheck.
+        const adapter = join(import.meta.dir, "..", "omp", "extensions", "knives.ts");
+        const knivesExtension = (await import(adapter)).default as (api: unknown) => void;
+        knivesExtension({ on: (name: string, handler: Handler) => handlers.set(name, handler) });
+        await handlers.get("session_start")?.(
+          {},
+          { cwd: root, sessionManager: { getSessionId: () => "roster" } }
+        );
+        // The session's branch as omp keeps it: each turn's assistant message, then its result.
+        const branch: Entry[] = [];
+        const ctx = {
+          getSystemPrompt: () => ["base"],
+          sessionManager: { getBranch: () => [...branch] },
+        };
+        const read = async (turn: string): Promise<string> => {
+          const call = `${turn}-call`;
+          branch.push({
+            type: "message",
+            id: turn,
+            message: { role: "assistant", content: [{ type: "toolCall", id: call }] },
+          });
+          const result = (await handlers.get("tool_result")?.(
+            {
+              toolName: "read",
+              toolCallId: call,
+              input: { path: file },
+              content: [{ type: "text", text: "tool output" }],
+            },
+            ctx
+          )) as { content?: Part[] } | undefined;
+          const content = result?.content ?? [{ type: "text", text: "tool output" }];
+          branch.push({
+            type: "message",
+            id: `${turn}-result`,
+            message: { role: "toolResult", content },
+          });
+          return content.map((part) => part.text ?? "").join("");
+        };
+
+        const first = await read("one");
+        await write(join(home, "state.json"), claims("review fixes"));
+        const change = await read("two");
+        const quiet = [await read("three"), await read("four")];
+        // omp's shake swaps the change's result for a recovery placeholder in place.
+        const shaken = branch.find((entry) => entry.id === "two-result");
+        if (shaken === undefined) throw new Error("the change's result is missing from the branch");
+        shaken.message.content = [{ type: "text", text: "[shaken ~2000 tokens]" }];
+        const lost = await read("five");
+        const after = await read("six");
+
+        const counts = [first, change, ...quiet, lost, after].map(
+          (text) => text.split("<knives-notice-").length - 1
+        );
+        expect(counts).toEqual([1, 1, 0, 0, 1, 0]);
+        expect(change).toContain("- claim changed: feat/two");
+        expect(lost).toContain("Branches claimed here (2)");
+        expect(lost).toContain("review fixes");
+      });
+    } finally {
+      restoreEnvironment();
+    }
+  }
+);
+
+test.serial.skipIf(realBinary.length === 0)(
   "preserves the binary budget after pathless bash",
   async () => {
     try {

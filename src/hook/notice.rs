@@ -9,8 +9,9 @@
 //! last shown it whole as it is now. A roster the session already holds is
 //! said again only as one line, the first time a call touches another
 //! workspace of the fork. What the session was told rests on the block that
-//! told it, where the harness shows the context: once that block is gone,
-//! the roster is told whole again ([`crate::hook::state::SessionState::reconcile`]).
+//! told it, where the harness reports the claims notices in the context: once
+//! that block is gone, the roster is told whole again
+//! ([`crate::hook::state::SessionState::reconcile`]).
 
 use std::collections::BTreeMap;
 

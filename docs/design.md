@@ -894,8 +894,12 @@ trusted repository, or both — the adapters can produce these two parts:
   limit, the rest counted), then only what changed, and the claim on the touched workspace's
   branch whole whenever it was not last shown whole as it is now. The session forgets what it
   was told when its context loses the block that told it: at compaction and `/clear`, and in
-  oh-my-pi when a shake drops the block. A Claude Code subagent keeps its own record. Claude
-  Code plans a notice without the session lock, so two parallel calls can both deliver it.
+  oh-my-pi when a shake drops the block. oh-my-pi's extension before 6.1.5 reports guidance
+  blocks alone, and a binary that took a notice missing from its report as lost told the whole
+  roster again on every turn after a change; a report without `notices` now leaves the roster
+  as told, and the first report with them tells again each roster it cannot check. A Claude
+  Code subagent keeps its own record. Claude Code plans a notice without the session lock, so
+  two parallel calls can both deliver it.
   Claude Code's limit holds for the notice and the guidance together: the notice gets the
   room the guidance leaves, and when that is too little, the guidance waits for the next
   call. A registry key longer than 100 characters is cut where a notice or the guidance
