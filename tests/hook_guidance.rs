@@ -80,6 +80,10 @@ fn notice_claim(repo: &str, branch: &str, owner: &str, why: &str) -> Claim {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one table pins every notice form byte for byte, each beside the plan that makes it"
+)]
 fn each_notice_form_reads_exactly_so() {
     // Given: two claims of one fork, one on feat/x, checked out in the
     // workspace `my-x`; a later roster where feat/y changed and feat/z is

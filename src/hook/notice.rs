@@ -971,14 +971,21 @@ mod tests {
     #[test]
     fn a_notice_at_its_cap_keeps_every_row_and_one_character_more_leaves_rows_out() {
         // Given: the claim here, with a whole reason longer than a row, and
-        // as many other claims as fit under the cap.
+        // as many other claims as fit under the cap: one more is the first
+        // the cap leaves out. Bounded, so a cap that never leaves a row out
+        // fails here instead of looping.
         let long = "z".repeat(300);
         let mut claims = vec![claim("feat/here", "agent-a", &long)];
-        let mut index = 0;
-        while first_notice(&claims).chars().count() <= NOTICE_CHARS {
-            index += 1;
+        for index in 1..=500 {
             claims.push(claim(&format!("feat/x{index:03}"), "agent-b", "review"));
+            if first_notice(&claims).contains("more not shown here") {
+                break;
+            }
         }
+        assert!(
+            first_notice(&claims).contains("more not shown here"),
+            "500 claims never reached the cap"
+        );
         claims.pop();
         let below = first_notice(&claims).chars().count();
         // Padded to exactly the cap by the last claim's branch, which a row

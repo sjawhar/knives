@@ -541,7 +541,7 @@ fn a_subagent_is_told_the_roster_its_parent_was_told() {
 
     // When: a subagent of that session reads the same file. Its events carry
     // the parent's session id and its own agent id.
-    let mut subagent = read.clone();
+    let mut subagent = read;
     subagent["agent_id"] = json!("agent-def456");
     subagent["agent_type"] = json!("Explore");
     let told = run_hook(repos.home.path(), &subagent);
