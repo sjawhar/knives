@@ -55,12 +55,22 @@ pub struct HeldRoster {
     pub claims: BTreeMap<String, String>,
 }
 
-/// How a claim was last shown to the session: its fingerprint then, and
-/// whether with its whole reason.
+/// How much of a claim a notice gave: its reason cut to one line (a roster
+/// row), as much as the notice's cap allows, or whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Given {
+    Line,
+    Fitted,
+    Whole,
+}
+
+/// How a claim was last shown to the session: its fingerprint then, and how
+/// much of it was given.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Shown {
     fingerprint: String,
-    whole: bool,
+    given: Given,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -164,20 +174,26 @@ impl SessionState {
         self.rosters.insert(fork, roster);
     }
 
-    /// Whether the claim on the branch `key` names was last shown to the
-    /// session whole, as it is now (its `fingerprint`).
-    pub fn shown_whole(&self, key: &str, fingerprint: &str) -> bool {
+    /// Whether the claim on the branch `key` names was last told to the
+    /// session as fully as a notice can, as it is now (its `fingerprint`):
+    /// whole, or cut only to fit the cap. Either is not told again until the
+    /// claim changes or the context loses it.
+    pub fn told(&self, key: &str, fingerprint: &str) -> bool {
         self.shown_claims
             .get(key)
-            .is_some_and(|shown| shown.whole && shown.fingerprint == fingerprint)
+            .is_some_and(|shown| shown.given >= Given::Fitted && shown.fingerprint == fingerprint)
     }
 
     /// Records that the claim on the branch `key` names was shown with
-    /// `fingerprint`, `whole` or cut to a line. A claim shown whole and then
-    /// in a line, unchanged, is still one the session had whole.
-    pub fn record_shown(&mut self, key: String, fingerprint: String, whole: bool) {
-        let whole = whole || self.shown_whole(&key, &fingerprint);
-        self.shown_claims.insert(key, Shown { fingerprint, whole });
+    /// `fingerprint`, and how much of it was `given`. A claim given more and
+    /// then a line of it, unchanged, keeps the more it was given.
+    pub fn record_shown(&mut self, key: String, fingerprint: String, given: Given) {
+        let given = self
+            .shown_claims
+            .get(&key)
+            .filter(|shown| shown.fingerprint == fingerprint)
+            .map_or(given, |shown| shown.given.max(given));
+        self.shown_claims.insert(key, Shown { fingerprint, given });
     }
 
     /// Forgets what the session was told of `fork`'s claims: its roster and

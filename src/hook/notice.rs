@@ -18,7 +18,7 @@ use crate::commands::claim::{owner_kind_label, render_claim_line};
 use crate::commands::wip::workspace_for;
 use crate::config::GuidanceRoot;
 use crate::hook::guidance::{FNV_OFFSET_BASIS, envelope_nonce, fnv1a, safe_attribute};
-use crate::hook::state::HeldRoster;
+use crate::hook::state::{Given, HeldRoster};
 use crate::ids::UpstreamName;
 use crate::jj::WorkspaceActivity;
 use crate::seen::{self, Seen};
@@ -103,7 +103,7 @@ pub struct NoticePlan<'a> {
     pub form: Form<'a>,
     /// The claims on the branch of the workspace the call touched
     /// ([`Workspace`]), each with whether to give it whole: it was not last
-    /// shown to the session whole as it is now.
+    /// told to the session as fully as a notice can, as it is now.
     pub here: Vec<(&'a Claim, bool)>,
     /// The branches read checked out in that workspace that hold no claim.
     pub unclaimed: Vec<String>,
@@ -118,20 +118,19 @@ pub struct Workspace<'a> {
 }
 
 impl Workspace<'_> {
-    /// Whether `claim` is on this workspace's branch: the branch checked out
-    /// here, else, when none was read, the branch the directory is named for,
-    /// as `knives start` names a workspace ([`workspace_for`]). The name is
-    /// only the fallback: a checkout made by hand is named as anyone liked,
-    /// and `workspace_for` flattens `/` to `-`, so `feat/a-b` and `feat-a/b`
-    /// share a name. A jj workspace whose bookmark has not caught up with its
-    /// working copy has no branch checked out, and has the name.
+    /// Whether `claim` is on this workspace's branch: a branch read checked
+    /// out here, or the branch the directory is named for, as `knives start`
+    /// names a workspace ([`workspace_for`]). Either counts: a checkout made
+    /// by hand is named as anyone liked, and the branch at a jj checkout's
+    /// detached HEAD is its working copy's parent, which for a workspace
+    /// `knives start` made for a new branch is the base, where `main` is.
+    /// A claim told too often is the safe side: `workspace_for` flattens `/`
+    /// to `-`, so `feat/a-b` and `feat-a/b` share a name and are both here.
     fn holds(&self, claim: &Claim) -> bool {
-        if self.branches.is_empty() {
-            self.name
+        self.branches.contains(&claim.branch)
+            || self
+                .name
                 .is_some_and(|name| workspace_for(&claim.branch) == name)
-        } else {
-            self.branches.contains(&claim.branch)
-        }
     }
 }
 
@@ -164,7 +163,8 @@ pub struct Holding<'a, F: Fn(&Claim) -> bool> {
     pub roster: Option<&'a HeldRoster>,
     /// Whether a notice of this digest reached the session for this workspace.
     pub noticed: bool,
-    /// Whether the claim was last shown to the session whole, as it is now.
+    /// Whether the claim was last told to the session as fully as a notice
+    /// can (whole, or cut only to fit the cap), as it is now.
     pub had_whole: F,
 }
 
@@ -260,20 +260,24 @@ pub fn plan<'a, F: Fn(&Claim) -> bool>(
     })
 }
 
-/// Each claim the notice `plan` shows, with whether whole: what the session
-/// was last shown of it once the notice is delivered.
-pub fn shown<'a>(plan: &NoticePlan<'a>) -> Vec<(&'a Claim, bool)> {
-    let cut = |claims: &[&'a Claim]| {
+/// Each claim the notice `plan` shows, and how much of it was given.
+///
+/// That is what the session was last shown of it once the notice is
+/// delivered. `cut` says, per claim here, whether the notice cut its reason
+/// or folded it into the summary to fit the cap ([`Rendered::cut`]): such a
+/// claim was given as fully as the cap allows, never whole.
+pub fn shown<'a>(plan: &NoticePlan<'a>, cut: &[bool]) -> Vec<(&'a Claim, Given)> {
+    let rows = |claims: &[&'a Claim]| {
         claims
             .iter()
-            .map(|claim| (*claim, false))
+            .map(|claim| (*claim, Given::Line))
             .collect::<Vec<_>>()
     };
     let mut shown = match &plan.form {
-        Form::Roster(others) => cut(others),
+        Form::Roster(others) => rows(others),
         Form::Changes {
             claimed, changed, ..
-        } => cut(claimed).into_iter().chain(cut(changed)).collect(),
+        } => rows(claimed).into_iter().chain(rows(changed)).collect(),
         Form::Unchanged => Vec::new(),
     };
     // A Changes notice gives only the claims here it gives whole
@@ -282,19 +286,80 @@ pub fn shown<'a>(plan: &NoticePlan<'a>) -> Vec<(&'a Claim, bool)> {
     shown.extend(
         plan.here
             .iter()
-            .filter(|(_, whole)| !changes || *whole)
-            .copied(),
+            .enumerate()
+            .filter(|(_, (_, whole))| !changes || *whole)
+            .map(|(index, (claim, whole))| {
+                let given = match (*whole, cut.get(index).copied().unwrap_or(false)) {
+                    (false, _) => Given::Line,
+                    (true, true) => Given::Fitted,
+                    (true, false) => Given::Whole,
+                };
+                (*claim, given)
+            }),
     );
     shown
+}
+
+/// One line of a notice's always-given part.
+enum Line {
+    Text(String),
+    /// The claim `plan.here[index]`: the line up to its reason, and the
+    /// reason, which the cap may cut ([`format_notice`]).
+    Here {
+        index: usize,
+        lead: String,
+        reason: String,
+    },
+}
+
+impl Line {
+    fn chars(&self) -> usize {
+        match self {
+            Self::Text(text) => text.chars().count(),
+            Self::Here { lead, reason, .. } => lead.chars().count() + reason.chars().count(),
+        }
+    }
+
+    fn into_text(self) -> String {
+        match self {
+            Self::Text(text) => text,
+            Self::Here { lead, reason, .. } => lead + &reason,
+        }
+    }
 }
 
 /// The lines of a notice: those always given (the header, then the claim on
 /// the touched workspace's branch), the claim rows the cap may leave out,
 /// and the usage lines that close a roster.
 struct Lines {
-    head: Vec<String>,
+    head: Vec<Line>,
     rows: Vec<String>,
     tail: Vec<String>,
+}
+
+/// The line of the claim `plan.here[index]`, given whole or cut to a line:
+/// the line up to its reason, and the reason, apart.
+fn here_line(index: usize, claim: &Claim, whole: bool, sightings: &Sightings<'_>) -> Line {
+    // The row with no reason is the row up to its reason: a row ends with
+    // its reason.
+    let full = claim_line(claim, whole, sightings);
+    let bare = claim_line(
+        &Claim {
+            why: String::new(),
+            ..claim.clone()
+        },
+        whole,
+        sightings,
+    );
+    let (lead, reason) = full.strip_prefix(&bare).map_or_else(
+        || (full.clone(), String::new()),
+        |reason| (bare.clone(), reason.to_owned()),
+    );
+    Line::Here {
+        index,
+        lead: format!("This workspace's branch is claimed: {lead}"),
+        reason,
+    }
 }
 
 /// The lines of the notice `plan` describes, for the workspace `root`.
@@ -304,26 +369,23 @@ fn notice_lines(root: &std::path::Path, plan: &NoticePlan<'_>, sightings: &Sight
     let here = |filter: &dyn Fn(bool) -> bool| {
         plan.here
             .iter()
-            .filter(|(_, whole)| filter(*whole))
-            .map(|(claim, whole)| {
-                format!(
-                    "This workspace's branch is claimed: {}",
-                    line(claim, *whole)
-                )
-            })
+            .enumerate()
+            .filter(|(_, (_, whole))| filter(*whole))
+            .map(|(index, (claim, whole))| here_line(index, claim, *whole, sightings))
             .collect::<Vec<_>>()
     };
+    let text = |text: String| Line::Text(text);
     let mut head = Vec::new();
     let mut rows = Vec::new();
     let mut tail = Vec::new();
     match &plan.form {
         Form::Roster(others) => {
-            head.push(format!(
+            head.push(text(format!(
                 "{} is a fork managed by knives, and another agent may be working in it.",
                 root.display()
-            ));
+            )));
             head.extend(here(&|_| true));
-            head.push(match (others.len(), plan.here.is_empty()) {
+            head.push(text(match (others.len(), plan.here.is_empty()) {
                 (0, true) => "No branch is claimed here right now.".to_owned(),
                 (0, false) => "No other branch is claimed here right now.".to_owned(),
                 (count, true) => {
@@ -332,7 +394,7 @@ fn notice_lines(root: &std::path::Path, plan: &NoticePlan<'_>, sightings: &Sight
                 (count, false) => {
                     format!("Other branches claimed here ({count}), each reason cut to one line:")
                 }
-            });
+            }));
             rows.extend(
                 others
                     .iter()
@@ -346,10 +408,10 @@ fn notice_lines(root: &std::path::Path, plan: &NoticePlan<'_>, sightings: &Sight
             changed,
             released,
         } => {
-            head.push(format!(
+            head.push(text(format!(
                 "The claims on this fork changed since the notice with digest {since}; only the \
                  changes follow."
-            ));
+            )));
             // A claim here the session had whole and that did not change is
             // no change.
             head.extend(here(&|whole| whole));
@@ -373,19 +435,19 @@ fn notice_lines(root: &std::path::Path, plan: &NoticePlan<'_>, sightings: &Sight
             // That no claim is here is said only of a branch read checked
             // out here: one neither checked out nor its directory's name may
             // be claimed all the same, and the roster above names every claim.
-            head.push(format!(
+            head.push(text(format!(
                 "{}: the claims on this fork are unchanged since the notice with digest {digest}.",
                 root.display()
-            ));
+            )));
             if plan.here.is_empty() && !plan.unclaimed.is_empty() {
-                head.push(format!(
+                head.push(text(format!(
                     "No claim is on the branch checked out here: {}.",
                     plan.unclaimed
                         .iter()
                         .map(|branch| crate::ledger::inline_human_text(branch))
                         .collect::<Vec<_>>()
                         .join(", ")
-                ));
+                )));
             }
             head.extend(here(&|_| true));
         }
@@ -409,18 +471,37 @@ const USAGE: [&str; 4] = [
     "its bookmark, and any open pull request all survive the release.",
 ];
 
+/// A notice as written, and, per claim here (`plan.here`), whether its reason
+/// was cut to fit the cap: such a claim was not given whole ([`shown`]).
+#[derive(Debug)]
+pub struct Rendered {
+    pub text: String,
+    pub cut: Vec<bool>,
+}
+
 /// The notice `plan` describes for the workspace `repo`.
 ///
 /// `repo` is the workspace's root and the name the registry gives its fork;
 /// `nonce` names the envelope: the call's, which its guidance shares
-/// ([`crate::hook::state::Envelope`]).
+/// ([`crate::hook::state::Envelope`]). The notice runs to at most
+/// [`NOTICE_CHARS`]: rows that do not fit are left out and counted, and when
+/// the lines always given are too long alone, the reason of a claim here is
+/// cut, the last one first, and says how much of it is shown.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the cap is met by four ordered steps that share one measure of the notice"
+)]
 pub fn format_notice(
     repo: &GuidanceRoot,
     plan: &NoticePlan<'_>,
     sightings: &Sightings<'_>,
     nonce: &str,
-) -> String {
-    let Lines { head, rows, tail } = notice_lines(&repo.root, plan, sightings);
+) -> Rendered {
+    let Lines {
+        mut head,
+        rows,
+        tail,
+    } = notice_lines(&repo.root, plan, sightings);
     let open = format!(
         "\n\n<knives-notice-{nonce} repo=\"{}\" digest=\"{}\">",
         safe_attribute(&repo.name),
@@ -436,27 +517,116 @@ pub fn format_notice(
     };
     // Each line costs its characters and the newline before it.
     let cost = |line: &String| line.chars().count() + 1;
-    let fixed = open.chars().count()
-        + head.iter().chain(&tail).map(cost).sum::<usize>()
-        + close.chars().count()
-        + 1;
-    let mut kept = rows.len();
-    let mut used = fixed + rows.iter().map(cost).sum::<usize>();
-    while used > NOTICE_CHARS && kept > 0 {
-        kept -= 1;
-        used = fixed
+    let total = |head: &[Line], kept: usize| {
+        open.chars().count()
+            + head.iter().map(|line| line.chars() + 1).sum::<usize>()
             + rows.iter().take(kept).map(cost).sum::<usize>()
-            + cost(&more(rows.len() - kept));
+            + if kept < rows.len() {
+                cost(&more(rows.len() - kept))
+            } else {
+                0
+            }
+            + tail.iter().map(cost).sum::<usize>()
+            + close.chars().count()
+            + 1
+    };
+    // 1. Leave rows out, the last first.
+    let mut kept = rows.len();
+    while total(&head, kept) > NOTICE_CHARS && kept > 0 {
+        kept -= 1;
+    }
+    // 2. Cut the reasons of the claims here, the last first.
+    let mut cut = vec![false; plan.here.len()];
+    for position in (0..head.len()).rev() {
+        let over = total(&head, kept).saturating_sub(NOTICE_CHARS);
+        if over == 0 {
+            break;
+        }
+        let Some(Line::Here { index, reason, .. }) = head.get_mut(position) else {
+            continue;
+        };
+        let length = reason.chars().count();
+        // The marker as long as it can be, so the reason fits with it.
+        let marker = |shown: usize| format!("… (reason cut: {shown} of {length} characters)");
+        let room = length
+            .saturating_sub(over)
+            .saturating_sub(marker(length).chars().count());
+        let shortened = reason.chars().take(room).collect::<String>() + &marker(room);
+        if shortened.chars().count() < length {
+            *reason = shortened;
+            if let Some(flag) = cut.get_mut(*index) {
+                *flag = true;
+            }
+        }
+    }
+    // 3. Fold the claims here that still do not fit, the last first, into one
+    //    line naming their branches as far as it fits.
+    let mut folded = Vec::new();
+    while total(&head, kept) > NOTICE_CHARS {
+        let Some(position) = head
+            .iter()
+            .rposition(|line| matches!(line, Line::Here { .. }))
+        else {
+            break;
+        };
+        if let Some(Line::Text(_)) = head.get(position + 1).filter(|_| !folded.is_empty()) {
+            head.remove(position + 1);
+        }
+        if let Line::Here { index, .. } = head.remove(position) {
+            if let Some(flag) = cut.get_mut(index) {
+                *flag = true;
+            }
+            if let Some((claim, _)) = plan.here.get(index) {
+                folded.insert(0, crate::ledger::inline_human_text(&claim.branch));
+            }
+        }
+        let lead = format!("… and {} more claims here, cut to fit: ", folded.len());
+        head.insert(position, Line::Text(lead.clone()));
+        let room = NOTICE_CHARS.saturating_sub(total(&head, kept));
+        let list = folded.join(", ");
+        let named = if list.chars().count() <= room {
+            list
+        } else {
+            list.chars()
+                .take(room.saturating_sub(1))
+                .collect::<String>()
+                + "…"
+        };
+        if let Some(Line::Text(summary)) = head.get_mut(position) {
+            *summary = lead + &named;
+        }
+    }
+    // 4. Cut the longest line always given, as a last resort: a header that
+    //    names a long path or many branches.
+    while total(&head, kept) > NOTICE_CHARS {
+        let over = total(&head, kept) - NOTICE_CHARS;
+        let Some(Line::Text(longest)) = head
+            .iter_mut()
+            .filter(|line| matches!(line, Line::Text(_)))
+            .max_by_key(|line| line.chars())
+        else {
+            break;
+        };
+        let length = longest.chars().count();
+        if length <= 1 {
+            break;
+        }
+        *longest = longest
+            .chars()
+            .take(length.saturating_sub(over + 1))
+            .collect::<String>()
+            + "…";
     }
     let left = (kept < rows.len()).then(|| more(rows.len() - kept));
-    std::iter::once(open)
-        .chain(head)
+    let text = std::iter::once(open)
+        .chain(head.into_iter().map(Line::into_text))
         .chain(rows.into_iter().take(kept))
         .chain(left)
         .chain(tail)
         .chain([close])
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    Rendered { text, cut }
 }
 
 /// The notice in place of the claim roster when knives cannot read the claims:
@@ -524,13 +694,14 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
+    use super::Rendered;
     use super::{
         Form, Holding, NOTICE_CHARS, NoticePlan, REASON_CHARS, Sightings, Workspace,
         claim_fingerprint, claim_line, format_notice, held, one_line, plan, roster, roster_digest,
         shown,
     };
     use crate::config::GuidanceRoot;
-    use crate::hook::state::HeldRoster;
+    use crate::hook::state::{Given, HeldRoster};
     use crate::ids::UpstreamName;
     use crate::seen::Seen;
     use crate::store::{Claim, OwnerKind};
@@ -576,6 +747,10 @@ mod tests {
     }
 
     fn text(root: &str, planned: &NoticePlan<'_>) -> String {
+        rendered(root, planned).text
+    }
+
+    fn rendered(root: &str, planned: &NoticePlan<'_>) -> Rendered {
         format_notice(
             &GuidanceRoot {
                 name: "beta".to_owned(),
@@ -943,7 +1118,16 @@ mod tests {
         ];
         let roster = roster(&claims, &beta);
         let first = plan(&roster, "d", &named("feat-a"), &holding(None, false)).expect("roster");
-        assert_eq!(shown(&first), vec![(&claims[1], false), (&claims[0], true)]);
+        assert_eq!(
+            shown(&first, &[false]),
+            vec![(&claims[1], Given::Line), (&claims[0], Given::Whole)]
+        );
+        // The claim here cut to fit is given as fully as the cap allows,
+        // never whole.
+        assert_eq!(
+            shown(&first, &[true]),
+            vec![(&claims[1], Given::Line), (&claims[0], Given::Fitted)]
+        );
 
         // A Changes notice that leaves the claim here out shows only the delta.
         let before = [claim("feat/a", "agent-a", "porting")];
@@ -955,7 +1139,7 @@ mod tests {
             had_whole: |claim: &Claim| claim_fingerprint(claim) == key_a,
         };
         let changes = plan(&roster, "new", &named("feat-a"), &holding_a).expect("changes");
-        assert_eq!(shown(&changes), vec![(&claims[1], false)]);
+        assert_eq!(shown(&changes, &[false]), vec![(&claims[1], Given::Line)]);
     }
 
     /// The first notice of `claims` for the workspace `feat-here`, whose
@@ -1119,29 +1303,167 @@ mod tests {
     }
 
     #[test]
-    fn a_branch_read_checked_out_decides_and_the_name_is_only_a_fallback() {
+    fn a_branch_read_or_the_directory_name_each_count() {
         // Given: claims on feat/a-b and feat-a/b, which both flatten to
-        // `feat-a-b`.
+        // `feat-a-b`, and on feat/c.
         let beta = UpstreamName::new("beta");
         let claims = [
             claim("feat-a/b", "agent-x", "one"),
             claim("feat/a-b", "agent-y", "two"),
+            claim("feat/c", "agent-z", "three"),
         ];
         let roster = roster(&claims, &beta);
-        let branches = ["feat/a-b".to_owned()];
-        let read = Workspace {
-            name: Some("feat-a-b"),
-            branches: &branches,
-        };
 
-        // When / Then: with feat/a-b read checked out, only its claim is here
-        // (N29).
-        let planned = plan(&roster, "d", &read, &holding(None, false)).expect("a notice");
-        assert_eq!(planned.here, vec![(&claims[1], true)]);
+        // When / Then: a branch read counts whatever the directory's name,
+        // and the name counts whatever branch is read: at a jj checkout's
+        // detached HEAD the branch read can be the base, `main` (F1).
+        let c = ["feat/c".to_owned()];
+        let planned = plan(
+            &roster,
+            "d",
+            &Workspace {
+                name: Some("my-fix"),
+                branches: &c,
+            },
+            &holding(None, false),
+        )
+        .expect("a notice");
+        assert_eq!(planned.here, vec![(&claims[2], true)]);
+        let main = ["main".to_owned()];
+        let planned = plan(
+            &roster,
+            "d",
+            &Workspace {
+                name: Some("feat-c"),
+                branches: &main,
+            },
+            &holding(None, false),
+        )
+        .expect("a notice");
+        assert_eq!(planned.here, vec![(&claims[2], true)]);
 
-        // And: with no branch read, the name holds both: the safe side.
+        // And: a name two branches flatten to holds both: a claim told too
+        // often is the safe side (N29).
         let planned =
             plan(&roster, "d", &named("feat-a-b"), &holding(None, false)).expect("a notice");
         assert_eq!(planned.here.len(), 2);
+    }
+
+    /// The cap probe's case: the first notice of `claims`, at the workspace
+    /// `feat-here`, with every claim's branch checked out there when
+    /// `current` (a detached `HEAD` at several branch tips).
+    fn sol_case(claims: &[Claim], current: bool) -> (NoticePlan<'_>, Rendered) {
+        let beta = UpstreamName::new("beta");
+        let branches = if current {
+            claims.iter().map(|claim| claim.branch.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        let workspace = Workspace {
+            name: Some("feat-here"),
+            branches: &branches,
+        };
+        let roster = roster(claims, &beta);
+        let planned = plan(&roster, "d1", &workspace, &holding(None, false)).expect("a notice");
+        let rendered = rendered("/w/feat-here", &planned);
+        (planned, rendered)
+    }
+
+    #[test]
+    fn the_cap_controls_a_short_notice_and_crowded_rows() {
+        let short = [claim("feat/here", "agent-a", "short")];
+        let (_, rendered) = sol_case(&short, true);
+        assert!(rendered.text.chars().count() <= NOTICE_CHARS);
+        assert!(rendered.text.contains("): short\n"), "{}", rendered.text);
+        assert_eq!(rendered.cut, [false]);
+
+        let crowded = (0..500)
+            .map(|n| claim(&format!("feat/other-{n}"), "agent-a", "review"))
+            .collect::<Vec<_>>();
+        let (_, rendered) = sol_case(&crowded, false);
+        assert!(rendered.text.chars().count() <= NOTICE_CHARS);
+        assert!(
+            rendered.text.contains("more not shown here"),
+            "{}",
+            rendered.text
+        );
+    }
+
+    #[test]
+    fn a_current_claim_with_a_10000_character_reason_is_cut_to_the_cap() {
+        // Given: one claim here whose reason is 10,000 characters, most of
+        // them more than one byte (the review's first case rendered 10,634).
+        let reason = "é—x".repeat(3_333) + "é";
+        assert_eq!(reason.chars().count(), 10_000);
+        assert!(reason.len() > 10_000);
+        let claims = [claim("feat/here", "agent-a", &reason)];
+
+        // When: its first notice is written.
+        let (planned, rendered) = sol_case(&claims, true);
+
+        // Then: within the cap, the branch and holder kept, the reason cut
+        // with how much of it is shown, and the claim recorded as fitted,
+        // not whole.
+        let text = &rendered.text;
+        assert!(
+            text.chars().count() <= NOTICE_CHARS,
+            "{}",
+            text.chars().count()
+        );
+        assert!(
+            text.contains("This workspace's branch is claimed: feat/here (agent-a,"),
+            "{text}"
+        );
+        assert!(text.contains("… (reason cut: "), "{text}");
+        assert!(text.contains(" of 10000 characters)\n"), "{text}");
+        assert!(text.contains("é—xé—x"), "{text}");
+        assert_eq!(rendered.cut, [true]);
+        assert_eq!(
+            shown(&planned, &rendered.cut),
+            vec![(&claims[0], Given::Fitted)]
+        );
+    }
+
+    #[test]
+    fn many_current_claims_whose_metadata_alone_is_over_the_cap_are_summarised() {
+        // Given: 120 claims here with empty reasons (the review's second case
+        // rendered 24,151), their branch names more than one byte a letter.
+        let claims = (0..120)
+            .map(|n| claim(&format!("feat/hére-{n}-{}", "b".repeat(60)), "agent-a", ""))
+            .collect::<Vec<_>>();
+
+        // When: their first notice is written.
+        let (planned, rendered) = sol_case(&claims, true);
+
+        // Then: within the cap; the claims that fit each on their line, the
+        // rest counted on one bounded line; those recorded as fitted, the
+        // others whole.
+        let text = &rendered.text;
+        assert!(
+            text.chars().count() <= NOTICE_CHARS,
+            "{}",
+            text.chars().count()
+        );
+        let given = text
+            .lines()
+            .filter(|line| line.starts_with("This workspace's branch is claimed: "))
+            .count();
+        assert!(given > 0 && given < 120, "{given}");
+        let folded = 120 - given;
+        assert!(
+            text.contains(&format!("… and {folded} more claims here, cut to fit: ")),
+            "{text}"
+        );
+        assert!(text.contains("`knives start <branch>`"), "{text}");
+        let records = shown(&planned, &rendered.cut);
+        let fitted = records
+            .iter()
+            .filter(|(_, given)| *given == Given::Fitted)
+            .count();
+        let whole = records
+            .iter()
+            .filter(|(_, given)| *given == Given::Whole)
+            .count();
+        assert_eq!((whole, fitted), (given, folded));
     }
 }

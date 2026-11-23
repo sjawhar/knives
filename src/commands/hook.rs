@@ -16,7 +16,7 @@ use crate::hook::guidance::{
 use crate::hook::notice::{self, Holding, format_notice, format_refusal};
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
 use crate::hook::resolve::{Match, argument_paths, match_checkout};
-use crate::hook::state::{Envelope, HeldRoster, SessionState};
+use crate::hook::state::{Envelope, Given, HeldRoster, SessionState};
 use crate::ids::UpstreamName;
 use crate::ledger::problem_human_text;
 use crate::lock::LockError;
@@ -765,8 +765,8 @@ struct ClaimsUpdate {
     /// The roster the session holds once the notice is delivered.
     roster: HeldRoster,
     /// Each claim the notice shows, by [`notice::branch_key`], with its
-    /// fingerprint and whether whole ([`notice::shown`]).
-    shown: Vec<(String, String, bool)>,
+    /// fingerprint and how much of it the notice gives ([`notice::shown`]).
+    shown: Vec<(String, String, Given)>,
     /// What the session held when the notice was planned.
     basis: Basis,
 }
@@ -783,12 +783,12 @@ struct Target {
 /// What a claims notice is planned against, in the session: the digest of
 /// its roster of the fork, whether the root had a notice of the roster's
 /// digest, and which claims on the touched workspace's branch it was last
-/// shown whole as they are.
+/// told as fully as a notice can, as they are.
 #[derive(Debug, PartialEq, Eq)]
 struct Basis {
     held: Option<String>,
     noticed: bool,
-    whole: Vec<bool>,
+    told: Vec<bool>,
 }
 
 impl Basis {
@@ -796,10 +796,10 @@ impl Basis {
         Self {
             held: state.roster(&target.fork).map(|held| held.digest.clone()),
             noticed: state.notice_seen(root, digest),
-            whole: target
+            told: target
                 .here
                 .iter()
-                .map(|(key, fingerprint)| state.shown_whole(key, fingerprint))
+                .map(|(key, fingerprint)| state.told(key, fingerprint))
                 .collect(),
         }
     }
@@ -823,8 +823,8 @@ impl NoticeStateUpdate {
             return;
         };
         state.hold_roster(claims.target.fork.clone(), claims.roster.clone());
-        for (key, fingerprint, whole) in &claims.shown {
-            state.record_shown(key.clone(), fingerprint.clone(), *whole);
+        for (key, fingerprint, given) in &claims.shown {
+            state.record_shown(key.clone(), fingerprint.clone(), *given);
         }
     }
 }
@@ -901,7 +901,7 @@ fn notice_if_requested(
         roster: state.roster(&fork),
         noticed: state.notice_seen(&repo.root, &digest),
         had_whole: |claim: &crate::store::Claim| {
-            state.shown_whole(
+            state.told(
                 &notice::branch_key(claim),
                 &notice::claim_fingerprint(claim),
             )
@@ -910,7 +910,7 @@ fn notice_if_requested(
     let Some(plan) = notice::plan(&roster, &digest, &workspace, &holding) else {
         return Ok(None);
     };
-    let text = format_notice(
+    let rendered = format_notice(
         repo,
         &plan,
         &notice::Sightings {
@@ -928,17 +928,17 @@ fn notice_if_requested(
     let update = ClaimsUpdate {
         basis: Basis::of(state, &repo.root, &digest, &target),
         roster: notice::held(&roster, &digest),
-        shown: notice::shown(&plan)
+        shown: notice::shown(&plan, &rendered.cut)
             .into_iter()
-            .map(|(claim, whole)| {
+            .map(|(claim, given)| {
                 let (key, fingerprint) = keyed(claim);
-                (key, fingerprint, whole)
+                (key, fingerprint, given)
             })
             .collect(),
         target,
     };
     Ok(Some(PreparedNotice {
-        text,
+        text: rendered.text,
         update: NoticeStateUpdate {
             digest,
             claims: Some(update),

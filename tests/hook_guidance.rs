@@ -136,6 +136,7 @@ fn each_notice_form_reads_exactly_so() {
             &sightings,
             "NONCE",
         )
+        .text
     };
 
     // When: each form is planned.
