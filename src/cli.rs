@@ -449,15 +449,17 @@ pub enum Command {
         /// forge repository, when that fork is this one, its upstream is a
         /// path, or this fork's own repository names no forge repository. An
         /// `origin` that spells this fork's upstream is a configuration error.
-        /// With the forge up, when only the registry's `origin` spells it,
-        /// that upstream's `<owner>/<name>` is refused (exit 2: not this fork's
-        /// own repository), while this fork's key is read as usual against the
+        /// With the forge up, when only the registry's `origin` spells it and
+        /// the checkout's names this fork's repository, that upstream's
+        /// `<owner>/<name>` is refused (exit 2: not this fork's own
+        /// repository), while this fork's key is read as usual against the
         /// checkout's repository, and a number both have is refused without
         /// offering the upstream spelling; when this fork's own repository
-        /// spells it, this fork's key takes the upstream's number with no
-        /// lookup. A review pull request on another fork's repository is
-        /// refused, and so is one whose head is not a member branch of the
-        /// fork's owner. A branch name: a member branch of this fork.
+        /// spells it (as when the checkout's `origin` is a path), this fork's
+        /// key takes the upstream's number with no lookup. A review pull
+        /// request on another fork's repository is refused, and so is one whose
+        /// head is not a member branch of the fork's owner. A branch name: a
+        /// member branch of this fork.
         #[arg(long = "on", required_unless_present = "forget")]
         on: Vec<String>,
         /// A requirement to take back, repeatable: as its record spells it, or
