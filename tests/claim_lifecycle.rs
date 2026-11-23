@@ -771,10 +771,10 @@ fn start_refusing_a_claim_names_the_processes_working_in_its_workspace() {
     let (home, _consumer) = release_test_home(&lab);
     let workspace = claimed_by_agent_one(&lab, home.path());
     // knives never counts the processes of the session calling it, so this
-    // stand-in for the holder's shell carries none of this test's variables.
+    // stand-in for the holder's shell names no session, as the test process
+    // names none (tests/common/isolation.rs).
     let mut working = Command::new("sleep");
     working.arg("3600").current_dir(&workspace);
-    lab::without_harness_session(&mut working);
     let mut holder = working.spawn().expect("spawn a process in the workspace");
 
     let refused = tried(
@@ -852,13 +852,13 @@ fn start_refusing_a_claim_escapes_the_control_characters_of_a_live_process() {
     let (home, _consumer) = release_test_home(&lab);
     let workspace = claimed_by_agent_one(&lab, home.path());
     // knives never counts the processes of the session calling it, so this
-    // stand-in for the holder's shell carries none of this test's variables.
+    // stand-in for the holder's shell names no session, as the test process
+    // names none (tests/common/isolation.rs).
     let mut working = Command::new("sleep");
     working
         .arg0("sleep\u{1b}]0;held\u{7}\u{9b}31m")
         .arg("3600")
         .current_dir(&workspace);
-    lab::without_harness_session(&mut working);
     let mut holder = working.spawn().expect("spawn a process in the workspace");
 
     // When: another identity tries to start the claimed branch

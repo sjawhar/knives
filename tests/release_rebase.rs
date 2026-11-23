@@ -1873,13 +1873,12 @@ fn a_rebase_whose_record_fails_still_abandons_the_rebased_copy_of_a_pushed_relea
     std::fs::write(home.path().join("state.json"), "{not json").expect("corrupt state");
 
     // When: an anonymous terminal user rebases the release in hand.
-    let output = lab::without_harness_session(&mut release_command(
+    let output = release_command(
         &lab,
         &home,
         ReleaseOutput::Text,
         &["rebase", "main@upstream"],
-    ))
-    .env_remove("KNIVES_OWNER")
+    )
     .output()
     .expect("run knives release rebase");
 

@@ -1,7 +1,16 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 
 import * as knivesEntry from "./knives.ts";
 import {
@@ -11,6 +20,7 @@ import {
   relevantTools,
   resolveBinary,
 } from "./lib/internals.ts";
+import { testHome } from "./test-environment.ts";
 
 // allow: SIZE_OK — Task 8 constrains both fake and real integration layers to this test file.
 const realBinary = process.env["KNIVES_BIN"] ?? "";
@@ -32,10 +42,12 @@ async function write(path: string, contents: string): Promise<void> {
 }
 
 function gitRepository(root: string, remotes: ReadonlyArray<readonly [string, string]>): void {
-  const init = Bun.spawnSync(["git", "-C", root, "init", "--quiet"]);
+  const init = Bun.spawnSync(["git", "-C", root, "init", "--quiet"], { env: process.env });
   if (init.exitCode !== 0) throw new Error(`git init failed: ${init.stderr.toString()}`);
   for (const [name, url] of remotes) {
-    const added = Bun.spawnSync(["git", "-C", root, "remote", "add", name, url]);
+    const added = Bun.spawnSync(["git", "-C", root, "remote", "add", name, url], {
+      env: process.env,
+    });
     if (added.exitCode !== 0) throw new Error(`git remote add failed: ${added.stderr.toString()}`);
   }
 }
@@ -1002,3 +1014,207 @@ test.serial("in-flight invocations are capped so slow children cannot pile up", 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+const environmentTest = "a process this file starts sees an environment of its own";
+
+test(environmentTest, () => {
+  const spawned = Bun.spawnSync(["env"], { env: process.env });
+  expect(spawned.exitCode).toBe(0);
+  const environment = new Map(
+    spawned.stdout
+      .toString()
+      .split("\n")
+      .filter((line) => line.includes("="))
+      .map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)] as const)
+  );
+  expect(environment.get("HOME")).toBe(testHome);
+  expect(environment.get("GIT_CONFIG_GLOBAL")).toBe(join(testHome, ".gitconfig"));
+  expect(environment.get("JJ_CONFIG")).toBe(join(testHome, ".config", "jj", "config.toml"));
+  expect(environment.get("GIT_CONFIG_NOSYSTEM")).toBe("1");
+  const session =
+    /^(OMP_|PI_|GH_|CLAUDE|SSH_AUTH_SOCK$|KNIVES_OWNER$|KNIVES_CONFIG_HOME$|GIT_CONFIG_COUNT$|JJ_USER$|JJ_EMAIL$)/;
+  expect([...environment.keys()].filter((name) => session.test(name))).toEqual([]);
+  const signing = Bun.spawnSync(["git", "config", "--show-origin", "--get", "commit.gpgsign"], {
+    env: process.env,
+  });
+  expect(signing.exitCode).toBe(0);
+  expect(signing.stdout.toString().trim()).toBe(`file:${join(testHome, ".gitconfig")}\tfalse`);
+});
+
+// The test above, started again in an environment that plants what a developer's or an agent
+// session's carries: a ~/.gitconfig that signs every commit with a key that does not exist and
+// runs hooks from elsewhere, a git and a jj first on PATH that record each run and fail, and the
+// session's variables. It starts a whole `bun test`, so it is given more than the default 5 s.
+test("a developer's or a session's environment reaches nothing this file starts", async () => {
+  const plant = await mkdtemp(join(tmpdir(), "knives-plugin-plant-"));
+  try {
+    const home = join(plant, "home");
+    const bin = join(plant, "bin");
+    const log = join(plant, "wrappers.log");
+    await write(
+      join(home, ".gitconfig"),
+      `[commit]\n\tgpgsign = true\n[gpg]\n\tformat = ssh\n[user]\n\tsigningkey = ${join(plant, "no-such-key.pub")}\n[core]\n\thooksPath = ${join(plant, "hooks")}\n`
+    );
+    for (const program of ["git", "jj"]) {
+      await write(join(bin, program), `#!/bin/sh\necho "$0 $*" >> '${log}'\nexit 1\n`);
+      await chmod(join(bin, program), 0o755);
+    }
+    const child = Bun.spawn(
+      [process.execPath, "test", import.meta.path, "--test-name-pattern", `^${environmentTest}$`],
+      {
+        cwd: join(import.meta.dir, ".."),
+        env: {
+          PATH: `${bin}${delimiter}${process.env["PATH"] ?? ""}`,
+          HOME: home,
+          TMPDIR: tmpdir(),
+          OMP_SESSION_ID: "01planted-session",
+          PI_SESSION_ID: "01planted-session",
+          CLAUDE_CODE_SESSION_ID: "planted-session",
+          KNIVES_OWNER: "planted-owner",
+          KNIVES_CONFIG_HOME: join(plant, "knives"),
+          GH_TOKEN: "planted-token",
+          SSH_AUTH_SOCK: join(plant, "agent.sock"),
+          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_KEY_0: "commit.gpgsign",
+          GIT_CONFIG_VALUE_0: "true",
+          JJ_USER: "Planted Session",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      }
+    );
+    const [status, stdout, stderr] = await Promise.all([
+      child.exited,
+      child.stdout.text(),
+      child.stderr.text(),
+    ]);
+    const report = `${stdout}${stderr}`;
+    expect({ status, wrappersRan: await Bun.file(log).exists() }, report).toEqual({
+      status: 0,
+      wrappersRan: false,
+    });
+    // A pattern that matched no test would pass as well.
+    expect(report).toContain("Ran 1 test");
+  } finally {
+    await rm(plant, { recursive: true, force: true });
+  }
+}, 60_000);
+
+// The setup stops a run whose PATH holds no git but wrappers, naming them, instead of letting each
+// test fail on a spawn error that does not say why; a jj wrapper is dropped without stopping, since
+// these tests never start jj. It starts a whole `bun test`, so it is given more than the default 5 s.
+test("a PATH whose only git is a wrapper stops the tests, naming it", async () => {
+  const plant = await mkdtemp(join(tmpdir(), "knives-plugin-wrappers-"));
+  try {
+    const bin = join(plant, "bin");
+    await write(join(bin, "git"), "#!/bin/sh\nexit 1\n");
+    await chmod(join(bin, "git"), 0o755);
+    await symlink(process.execPath, join(bin, "jj"));
+    const child = Bun.spawn(
+      [process.execPath, "test", import.meta.path, "--test-name-pattern", `^${environmentTest}$`],
+      {
+        cwd: join(import.meta.dir, ".."),
+        env: { PATH: bin, HOME: join(plant, "home"), TMPDIR: tmpdir() },
+        stdout: "pipe",
+        stderr: "pipe",
+      }
+    );
+    const [status, stdout, stderr] = await Promise.all([
+      child.exited,
+      child.stdout.text(),
+      child.stderr.text(),
+    ]);
+    const report = `${stdout}${stderr}`;
+    expect(status, report).not.toBe(0);
+    expect(report).toContain(
+      `knives tests: PATH has no real git: skipped ${join(bin, "git")}, a script`
+    );
+    expect(report).not.toContain("knives tests: PATH has no real jj");
+    expect(report).toContain(`knives tests: searched PATH=${bin}`);
+  } finally {
+    await rm(plant, { recursive: true, force: true });
+  }
+}, 60_000);
+
+// A PATH entry the setup cannot stat holds no program for it, as for exec, and must not stop the
+// tests: a directory this uid may not search (mode 0400: its names cannot be looked up, though it
+// can still be listed and removed), a regular file (ENOTDIR), and a symlink loop. The file and the
+// loop fail a stat for any uid; the directory for every uid but root, as in CI. A git wrapper
+// first on PATH makes the setup look for a real git past the unsearchable entry too.
+test("a PATH entry the setup cannot stat is passed over, not fatal", async () => {
+  const plant = await mkdtemp(join(tmpdir(), "knives-plugin-unreachable-"));
+  try {
+    const bin = join(plant, "bin");
+    const log = join(plant, "wrappers.log");
+    await write(join(bin, "git"), `#!/bin/sh\necho "$0 $*" >> '${log}'\nexit 1\n`);
+    await chmod(join(bin, "git"), 0o755);
+    const unsearchable = join(plant, "unsearchable");
+    await mkdir(unsearchable);
+    await chmod(unsearchable, 0o400);
+    const file = join(plant, "file");
+    await writeFile(file, "not a directory\n");
+    const loop = join(plant, "loop");
+    await symlink("loop", loop);
+    // The loop goes last: glibc's execvp gives up at the first entry that fails with ELOOP.
+    const path = [bin, unsearchable, file, process.env["PATH"] ?? "", loop].join(delimiter);
+    const child = Bun.spawn(
+      [process.execPath, "test", import.meta.path, "--test-name-pattern", `^${environmentTest}$`],
+      {
+        cwd: join(import.meta.dir, ".."),
+        env: { PATH: path, HOME: join(plant, "home"), TMPDIR: tmpdir() },
+        stdout: "pipe",
+        stderr: "pipe",
+      }
+    );
+    const [status, stdout, stderr] = await Promise.all([
+      child.exited,
+      child.stdout.text(),
+      child.stderr.text(),
+    ]);
+    const report = `${stdout}${stderr}`;
+    expect({ status, wrappersRan: await Bun.file(log).exists() }, report).toEqual({
+      status: 0,
+      wrappersRan: false,
+    });
+    // A pattern that matched no test would pass as well.
+    expect(report).toContain("Ran 1 test");
+  } finally {
+    await rm(plant, { recursive: true, force: true });
+  }
+}, 60_000);
+
+// A directory goes whole when its jj is a wrapper, so a real git beside it goes too; when that was
+// the only git, the setup stops and names it, as for a git wrapper.
+test("a real git in a directory dropped for its jj wrapper stops the tests, naming it", async () => {
+  const plant = await mkdtemp(join(tmpdir(), "knives-plugin-mixed-"));
+  try {
+    const mixed = join(plant, "mixed");
+    await write(join(mixed, "jj"), "#!/bin/sh\nexit 1\n");
+    await chmod(join(mixed, "jj"), 0o755);
+    const git = Bun.which("git", { PATH: process.env["PATH"] ?? "" });
+    expect(git).not.toBeNull();
+    await symlink(await realpath(git ?? ""), join(mixed, "git"));
+    const child = Bun.spawn(
+      [process.execPath, "test", import.meta.path, "--test-name-pattern", `^${environmentTest}$`],
+      {
+        cwd: join(import.meta.dir, ".."),
+        env: { PATH: mixed, HOME: join(plant, "home"), TMPDIR: tmpdir() },
+        stdout: "pipe",
+        stderr: "pipe",
+      }
+    );
+    const [status, stdout, stderr] = await Promise.all([
+      child.exited,
+      child.stdout.text(),
+      child.stderr.text(),
+    ]);
+    const report = `${stdout}${stderr}`;
+    expect(status, report).not.toBe(0);
+    expect(report).toContain(
+      `knives tests: PATH has no real git: skipped ${join(mixed, "git")}, the program, in a directory dropped for its wrapper`
+    );
+    expect(report).toContain(`knives tests: searched PATH=${mixed}`);
+  } finally {
+    await rm(plant, { recursive: true, force: true });
+  }
+}, 60_000);

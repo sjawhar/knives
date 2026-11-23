@@ -365,6 +365,9 @@ mod tests {
                 "lock::tests::helper_holds_the_lock_until_killed",
             ])
             .env(HELPER_LOCK_TARGET, &path)
+            // SIGKILL leaves the child no exit to remove its own HOME
+            // (tests/common/isolation.rs) in: make it here, where `dir` goes.
+            .env("TMPDIR", dir.path())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()

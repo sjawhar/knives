@@ -512,10 +512,9 @@ fn a_release_plan_reads_nothing_about_who_is_asking() {
     std::fs::write(home.path().join("state.json"), "{not json").expect("corrupt state");
 
     // When: the plan is asked for by an anonymous terminal user.
-    let output =
-        lab::without_harness_session(&mut release_command(&lab, &home, ReleaseOutput::Text, &[]))
-            .output()
-            .expect("run knives release");
+    let output = release_command(&lab, &home, ReleaseOutput::Text, &[])
+        .output()
+        .expect("run knives release");
     let text = String::from_utf8_lossy(&output.stdout);
     let errors = String::from_utf8_lossy(&output.stderr);
 
@@ -533,12 +532,12 @@ fn a_release_plan_reads_nothing_about_who_is_asking() {
     );
 
     // And: a cut, which writes the ledger in the asker's name, is stopped by it.
-    let cut = lab::without_harness_session(&mut release_command(
+    let cut = release_command(
         &lab,
         &home,
         ReleaseOutput::Text,
         &["cut", "release/2026-08-05"],
-    ))
+    )
     .output()
     .expect("run knives release cut");
     let errors = String::from_utf8_lossy(&cut.stderr);
@@ -564,15 +563,9 @@ fn a_cut_whose_record_fails_after_its_write_names_a_heading_held_twice_once() {
     std::fs::write(home.path().join("state.json"), "{not json").expect("corrupt state");
 
     // When: an anonymous terminal user cuts the release.
-    let output = lab::without_harness_session(&mut release_command(
-        &lab,
-        &home,
-        ReleaseOutput::Text,
-        &["cut", release],
-    ))
-    .env_remove("KNIVES_OWNER")
-    .output()
-    .expect("run knives release cut");
+    let output = release_command(&lab, &home, ReleaseOutput::Text, &["cut", release])
+        .output()
+        .expect("run knives release cut");
 
     // Then: the command exits with the record's failure, the release is the
     // cut's write, and one line names the file and the heading, for it.

@@ -196,13 +196,12 @@ fn an_include_whose_record_fails_after_its_write_names_a_heading_held_twice_once
     std::fs::write(home.path().join("state.json"), "{not json").expect("corrupt state");
 
     // When: an anonymous terminal user includes gamma.
-    let output = lab::without_harness_session(&mut lab::release_command(
+    let output = lab::release_command(
         &lab,
         &home,
         lab::ReleaseOutput::Text,
         &["include", "feat/gamma"],
-    ))
-    .env_remove("KNIVES_OWNER")
+    )
     .output()
     .expect("run knives release include");
 

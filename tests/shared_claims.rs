@@ -130,17 +130,7 @@ fn stderr_of(output: &Output) -> String {
 /// Commit everything in the git repository `root`, quietly.
 fn commit_all(root: &Path, message: &str) {
     lab::git_output(root, ["add", "--all"]);
-    lab::git_output(
-        root,
-        [
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--quiet",
-            "-m",
-            message,
-        ],
-    );
+    lab::git_output(root, ["commit", "--quiet", "-m", message]);
 }
 
 /// Push a commit with no parent whose tree holds `contents` at `path` to

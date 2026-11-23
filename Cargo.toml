@@ -63,10 +63,12 @@ toml = "0.9"
 toon-format = { version = "=0.5.0", git = "https://github.com/sjawhar/toon-rust", rev = "9f0a88fab65727a0384db1794b6a26e6fa5b2002", default-features = false }
 
 [dev-dependencies]
-# Runs the lab fixture's `XDG_CONFIG_HOME` isolation before `main` (see
-# tests/common/lab.rs). Cargo's `[env]` cannot replace it: that would also
-# redirect `cargo run`, and knives resolves its own registry through that variable.
+# Build each test process's own environment before `main`, and remove the HOME
+# it made there when the process exits (tests/common/isolation.rs). Cargo's
+# `[env]` cannot replace it: that would also redirect `cargo run`, and knives
+# resolves its own registry through `XDG_CONFIG_HOME`.
 ctor = "1"
+dtor = "1"
 insta = "1"
 
 [profile.release]

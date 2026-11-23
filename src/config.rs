@@ -48,7 +48,6 @@ pub(crate) mod test_support {
         let output = std::process::Command::new("jj")
             .current_dir(path)
             .args(args)
-            .env("JJ_CONFIG", "/dev/null")
             .env("JJ_USER", "knives tests")
             .env("JJ_EMAIL", "tests@example.invalid")
             .output()

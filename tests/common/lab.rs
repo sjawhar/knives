@@ -16,46 +16,10 @@ use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
-/// Give every jj in this test process a hermetic configuration, before `main`
-/// runs: a config home under cargo's target directory, and no user config file.
-///
-/// jj resolves a repository's config to `$XDG_CONFIG_HOME/jj/repos/<config-id>/`
-/// and creates that directory on first contact; left unset, every lab repository
-/// leaves one in the developer's real `~/.config`. `JJ_CONFIG` names the user
-/// config files and replaces the rest; inherited from an agent session, its
-/// overlays (an `immutable_heads()` that walls the session's own commits, say)
-/// change what the lab's jj may rewrite, so it is pointed at `/dev/null`.
-/// Per-spawn `.env()` is not enough: tests also call knives in-process, and the
-/// jj it spawns inherits the test process's own environment. One setting for
-/// the whole process keeps the lab's jj, the knives binary, and in-process
-/// knives agreeing on where a repository's config (identity,
-/// `immutable_heads()`) lives; a test that wants a user config still sets
-/// `JJ_CONFIG` on its own command.
-///
-/// `JJ_USER` and `JJ_EMAIL` are removed for the same reason, and they need
-/// their own removal because jj-lib reads them from the environment and lets
-/// them outrank the repository config the lab writes: a test that asserts the
-/// identity on what it commits must get the identity it stated, whoever runs
-/// it — a developer, CI, or an agent session whose harness exports its bot
-/// account.
-///
-/// `JJ_EDITOR` is set to `false` because jj reads it before `$VISUAL` and
-/// `$EDITOR`, so a lab jj that would open an editor fails the same way in
-/// every environment instead of passing where the caller happens to export a
-/// no-op editor.
-#[ctor::ctor(unsafe)]
-fn isolate_jj_config() {
-    let xdg = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("xdg");
-    // SAFETY: a constructor runs before `main`, hence before libtest spawns its
-    // first thread; nothing can read or write the environment concurrently.
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", xdg);
-        std::env::set_var("JJ_CONFIG", "/dev/null");
-        std::env::remove_var("JJ_USER");
-        std::env::remove_var("JJ_EMAIL");
-        std::env::set_var("JJ_EDITOR", "false");
-    }
-}
+/// The environment every git, jj and knives a test starts runs in, set once for
+/// the whole process before `main`.
+#[path = "isolation.rs"]
+mod isolation;
 
 pub struct Lab {
     temp: TempDir,
@@ -894,17 +858,7 @@ pub fn push_as_peer(remote: &Path, machine: &str, path: &str, contents: &str) {
     std::fs::create_dir_all(file.parent().expect("an entry's directory")).expect("mkdir");
     std::fs::write(&file, contents).expect("write the peer's entry");
     git_output(&root, ["add", "--all"]);
-    git_output(
-        &root,
-        [
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--quiet",
-            "-m",
-            "peer",
-        ],
-    );
+    git_output(&root, ["commit", "--quiet", "-m", "peer"]);
     git_output(
         &root,
         [
@@ -1021,17 +975,6 @@ pub fn jj_workspace_add(checkout: &Path, name: &str, path: &Path) {
     );
 }
 
-/// `command` with every variable a harness names its session by removed
-/// (`HARNESS_SESSION_VARIABLES`). The harness running the suite names its
-/// own session in the environment; without this, a test's identity would be
-/// that session rather than the one the test states.
-pub fn without_harness_session(command: &mut Command) -> &mut Command {
-    for name in knives::commands::claim::HARNESS_SESSION_VARIABLES {
-        command.env_remove(name);
-    }
-    command
-}
-
 /// `command` with one rule handed to git as `GIT_CONFIG_COUNT` and its
 /// numbered pair, as a session hands git configuration of its own.
 pub fn with_git_rule<'c>(command: &'c mut Command, key: &str, value: &str) -> &'c mut Command {
@@ -1042,9 +985,10 @@ pub fn with_git_rule<'c>(command: &'c mut Command, key: &str, value: &str) -> &'
 }
 
 /// The knives binary, run from `cwd` against the registry in `config_home` and
-/// scanning `scan_home` for checkouts, with no harness session in its
-/// environment ([`without_harness_session`]). Returned unrun so a caller can
-/// add an environment variable (`KNIVES_OWNER`, say) before `.output()`.
+/// scanning `scan_home` for checkouts. Like everything a test starts, it sees
+/// no harness session: the test process has none ([`isolation`]). Returned
+/// unrun so a caller can add an environment variable (`KNIVES_OWNER`, say)
+/// before `.output()`.
 pub fn knives_command(cwd: &Path, config_home: &Path, scan_home: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_knives"));
     command
@@ -1052,7 +996,6 @@ pub fn knives_command(cwd: &Path, config_home: &Path, scan_home: &Path, args: &[
         .current_dir(cwd)
         .env("KNIVES_CONFIG_HOME", config_home)
         .env("HOME", scan_home);
-    without_harness_session(&mut command);
     command
 }
 

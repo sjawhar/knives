@@ -443,16 +443,7 @@ mod tests {
             git(&peer, &["--work-tree", work_tree, "add", "--all"]);
             git(
                 &peer,
-                &[
-                    "-c",
-                    "commit.gpgsign=false",
-                    "--work-tree",
-                    work_tree,
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    "peer",
-                ],
+                &["--work-tree", work_tree, "commit", "--quiet", "-m", "peer"],
             );
             git(
                 &peer,
