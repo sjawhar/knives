@@ -393,10 +393,12 @@ fn notice_lines(root: &std::path::Path, plan: &NoticePlan<'_>, sightings: &Sight
     Lines { head, rows, tail }
 }
 
-/// The most characters a notice runs to. Claude Code takes a hook's
-/// `additionalContext` whole only up to 10,000 characters, and above that
-/// shows the model a file path and the first 2,000; this leaves room for the
-/// envelope's JSON. Every harness gets the same notice.
+/// The most characters a notice runs to.
+///
+/// Claude Code takes a hook's `additionalContext` whole only up to 10,000
+/// characters, and above that shows the model a file path and the first
+/// 2,000; this leaves room for the envelope's JSON. Every harness gets the
+/// same notice.
 pub const NOTICE_CHARS: usize = 9_500;
 
 /// How to work in a managed fork, said with the full roster.
