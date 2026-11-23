@@ -36,7 +36,7 @@ Reports upstream contribution facts: convention files and their changes since la
 
 ### Locks
 
-- `start`, `finish`, `track`, `depends` and `sync` hold the fork's lock (`fork-locks/<owner>/<name>.lock` beside `state.json`) while they work. Another of them on the same fork waits up to one minute, with pauses from 20 ms doubling to 2 s, with jitter. A command on another fork does not wait. The `state.json` write takes `state.lock`, also with a one-minute wait. Sighting and hook-session locks wait one second, with pauses from 20 ms to 200 ms.
+- `start` and `finish` hold their branch's lock (`fork-locks/<owner>/<name>.branches/<workspace>.lock` beside `state.json`); `track`, `depends`, `sync` and release writes hold the fork's lock (`fork-locks/<owner>/<name>.lock`). A command waits up to one minute, with pauses from 20 ms doubling to 2 s, with jitter, only for another that holds the same lock. The `state.json` write takes `state.lock`, also with a one-minute wait. Sighting and hook-session locks wait one second, with pauses from 20 ms to 200 ms.
 - Each lock is the OS advisory lock on its file and ends with its process, also on SIGKILL. Never remove a lock file: a held lock belongs to a running process.
 - When the wait runs out, the command exits `3`:
 
