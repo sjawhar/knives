@@ -4903,43 +4903,39 @@ fn toml_string(value: &str) -> String {
 /// descendants. Bookmarks and working copies follow their rewritten commits;
 /// conflicts are recorded in the commits rather than blocking.
 ///
-/// `immutable_heads` is the rule this one command runs under, in place of
-/// the checkout's: the fork's own rule pins every tagged and published
-/// release with its members, which a release rebase must move. The caller
-/// passes `RepoEntry::rebase_immutable_heads`, which still pins the trunks,
-/// the series bases and upstream's tags; it checks the release it moves
-/// first (`refuse_edit_in_hand`) and puts back every pushed or published
-/// name the rebase moved, and tags never move.
+/// `immutable_heads`, when given, is the rule this one command runs under,
+/// in place of the checkout's: the rule `knives start` writes pins every
+/// tagged and published release with its members, which a release rebase
+/// must move. The caller passes `RepoEntry::rebase_immutable_heads`, which
+/// still pins the trunks, the series bases and upstream's tags, and only
+/// where the checkout states knives' own rule; with `None` the rebase runs
+/// under whatever rule the checkout states. The caller checks the release
+/// it moves first (`refuse_edit_in_hand`) and puts back every pushed or
+/// published name the rebase moved, and tags never move.
 pub fn rebase_branch_onto(
     repo: &Path,
     rev: &str,
     dest: &CommitId,
-    immutable_heads: &str,
+    immutable_heads: Option<&str>,
 ) -> Result<(), JjError> {
     // No --ignore-working-copy: this rewrites checked-out ancestry, and the
     // invoking workspace must move with the operation rather than go stale.
     let repo_path = path(repo);
     // The table form, as `knives start` writes it: a table at the command
     // layer replaces the repository's `definition` key for key.
-    let rule = format!(
-        "{IMMUTABLE_HEADS_KEY}={{ definition = {}, doc = {} }}",
-        toml_string(immutable_heads),
-        toml_string("knives release rebase's rule for its own jj rebase")
-    );
-    let _ = command_output(
-        "jj",
-        &[
-            "--repository",
-            &repo_path,
-            "--config",
-            &rule,
-            "rebase",
-            "-b",
-            rev,
-            "-d",
-            dest.as_str(),
-        ],
-    )?;
+    let rule = immutable_heads.map(|rule| {
+        format!(
+            "{IMMUTABLE_HEADS_KEY}={{ definition = {}, doc = {} }}",
+            toml_string(rule),
+            toml_string("knives release rebase's rule for its own jj rebase")
+        )
+    });
+    let mut args = vec!["--repository", repo_path.as_str()];
+    if let Some(rule) = &rule {
+        args.extend(["--config", rule.as_str()]);
+    }
+    args.extend(["rebase", "-b", rev, "-d", dest.as_str()]);
+    let _ = command_output("jj", &args)?;
     Ok(())
 }
 

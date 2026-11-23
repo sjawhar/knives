@@ -458,7 +458,14 @@ impl RepoEntry {
     /// published. `knives release rebase`, which must move members beneath an
     /// old tagged release and the release itself, runs its one `jj rebase`
     /// under [`Self::rebase_immutable_heads`] instead, behind its own checks,
-    /// and restores every pushed or published name it moved.
+    /// and restores every pushed or published name it moved; it does so only
+    /// where the checkout states this rule as `knives start` wrote it.
+    ///
+    /// A dated or series cut (`release/<date>`) is pinned once it is tagged,
+    /// and knives does not tag a cut: the fork's publishing step does. Its
+    /// pushed name is not pinned, because a reap leaves superseded cuts that a
+    /// fetch brings back, and pinning them would wall every hand rebase of a
+    /// member beneath one.
     ///
     /// jj's default also adds `untracked_remote_bookmarks()`. In a fork, such a
     /// ref is a superseded release cut a fetch re-materialized or another
@@ -490,44 +497,49 @@ impl RepoEntry {
 
     /// The rule, with the fork's published releases pinned when `published`.
     fn rule(&self, published: bool) -> String {
-        let trunk = self.default_trunk();
+        let trunk = revset_literal(self.default_trunk());
         let mut remotes = vec![Role::Upstream, Role::Origin];
         if self.has_split_release() {
             remotes.push(Role::Release);
         }
+        let bookmarks = |name: &str, remote: &str| {
+            format!(
+                "remote_bookmarks(exact:{name}, exact:{})",
+                revset_literal(remote)
+            )
+        };
         // The release branch is pinned on each remote a release is published to.
-        let releases = self
+        let releases: Vec<String> = self
             .release_branch
             .iter()
             .filter(|_| published)
             .flat_map(|branch| {
+                let branch = revset_literal(branch);
                 remotes
                     .iter()
                     .filter(|remote| **remote != Role::Upstream)
-                    .map(move |remote| {
-                        format!("remote_bookmarks(exact:\"{branch}\", exact:\"{remote}\")")
-                    })
-            });
+                    .map(move |remote| bookmarks(&branch, &remote.to_string()))
+            })
+            .collect();
         // A named series' base is pinned on the remote that holds it, for the
         // same reason as the trunk: a release rebase of that series rebuilds
         // its members, never the base they stand on.
         let pinned: Vec<String> = remotes
             .iter()
-            .map(|remote| format!("remote_bookmarks(exact:\"{trunk}\", exact:\"{remote}\")"))
+            .map(|remote| bookmarks(&trunk, &remote.to_string()))
             .chain(self.series.values().map(|series| {
-                format!(
-                    "remote_bookmarks(exact:\"{}\", exact:\"{}\")",
-                    series.base,
-                    series.base_remote.role()
+                bookmarks(
+                    &revset_literal(&series.base),
+                    &series.base_remote.role().to_string(),
                 )
             }))
             .chain(releases)
             .collect();
         format!(
-            "trunk() | {}{} | remote_tags(remote=exact:\"{}\")",
+            "trunk() | {}{} | remote_tags(remote=exact:{})",
             if published { "tags() | " } else { "" },
             pinned.join(" | "),
-            Role::Upstream
+            revset_literal(&Role::Upstream.to_string())
         )
     }
 
@@ -1509,6 +1521,14 @@ pub(crate) fn is_forge_slug(value: &str) -> bool {
             || segment.contains(['/', '\\'])
     };
     !has_path_syntax(owner) && !owner.starts_with('.') && !has_path_syntax(repository)
+}
+
+/// `value` as a jj revset string literal: in double quotes, with `\` and `"`
+/// escaped as jj's string-literal grammar reads them. A Git branch name may
+/// hold a `"`, and one quoted bare would end the literal early and make the
+/// whole alias invalid.
+fn revset_literal(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 #[cfg(test)]
