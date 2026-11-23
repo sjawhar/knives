@@ -903,16 +903,18 @@ pub fn check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryChe
             evidence: input.tip.clone(),
         });
     }
+    // Against a release, a tip that holds an unresolved conflict has no
+    // change a release can be said to hold, however its replay reads, and no
+    // rewrite of it stands for it: a clean resolution is another change.
+    let tip_conflicted = release && !input.repo.conflicted_files(input.tip.as_str())?.is_empty();
     let outcome = if !release {
         input.repo.tree_replay_outcome(input.tip, &target.commit)?
-    } else if input.repo.conflicted_files(input.tip.as_str())?.is_empty() {
+    } else if tip_conflicted {
+        RebaseOutcome::Conflicted
+    } else {
         input
             .repo
             .base_replay_outcome(input.tip, &release_base(input, target)?, &target.commit)?
-    } else {
-        // A tip that holds an unresolved conflict has no change a release
-        // can be said to hold, however its replay reads.
-        RebaseOutcome::Conflicted
     };
     if reaches {
         return Ok(if outcome == RebaseOutcome::Empty {
@@ -932,7 +934,7 @@ pub fn check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryChe
         RebaseOutcome::CleanNonEmpty => CarryVerdict::NotCarried,
         RebaseOutcome::Conflicted => CarryVerdict::Conflicted,
     };
-    if verdict != CarryVerdict::CarriedRewritten {
+    if verdict != CarryVerdict::CarriedRewritten && !tip_conflicted {
         for rewrite in input.repo.standing_rewrites_of(input.tip)? {
             if input.repo.is_ancestor(&rewrite, &target.commit)?
                 && (!release || rewrite_replays_empty(input, &rewrite, target)?)

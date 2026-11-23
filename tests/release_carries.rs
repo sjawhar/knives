@@ -29,7 +29,7 @@ use forge_shim::{install_failing_gh, path_with_gh_shim, pull_record};
 use knives::jj::Repo;
 use lab::{
     Lab, ReleaseOutput, commit_at, extend_branch, home_after_first_cut, knives_release,
-    release_command, release_parents, release_test_home,
+    release_command, release_parents, release_test_home, text,
 };
 use release_forge::{ReleaseWithSnapshotForgeInput, release_with_snapshot_forge};
 use std::process::Command;
@@ -1377,6 +1377,106 @@ fn release_carries_answers_merged_then_edited_for_a_member_a_later_release_commi
     // When, then: the member is not carried: the release reaches it, but
     // its change is gone.
     assert_member_carried(&lab, false);
+}
+
+#[test]
+fn release_carries_answers_conflicted_for_a_conflicted_tip_whose_clean_resolution_the_release_holds()
+ {
+    // Given: a merge of two branches that conflict on `shared.txt`, kept
+    // unresolved under `feat/conflicted`; its resolution, a jj rewrite of the
+    // same change, under `feat/resolved`; and a release that merges the
+    // resolution with another branch.
+    let lab = Lab::new();
+    lab.branch("feat/left", "shared.txt", "left\n");
+    lab.branch("feat/right", "shared.txt", "right\n");
+    lab.jj_work([
+        "new",
+        "-r",
+        "feat/left",
+        "-r",
+        "feat/right",
+        "-m",
+        "unresolved member",
+    ]);
+    lab.jj_work(["bookmark", "create", "feat/conflicted", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let conflicted = commit_at(&lab, "feat/conflicted");
+    lab.jj_work(["edit", "feat/conflicted"]);
+    std::fs::write(lab.work.join("shared.txt"), "resolved\n").expect("resolve the conflict");
+    lab.jj_work(["new"]);
+    let clean = commit_at(&lab, "feat/conflicted");
+    lab.jj_work(["bookmark", "create", "feat/resolved", "-r", clean.as_str()]);
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "feat/conflicted",
+        "-r",
+        conflicted.as_str(),
+        "--allow-backwards",
+    ]);
+    lab.branch("feat/other", "other.txt", "other\n");
+    merge_by_hand(
+        &lab,
+        "release/2026-08-04",
+        ("feat/resolved", "feat/other"),
+        &[],
+    );
+    let release = commit_at(&lab, "release/2026-08-04");
+    let repo = Repo::open(&lab.work).expect("open the lab");
+    assert_eq!(
+        repo.conflicted_files(conflicted.as_str())
+            .expect("read the tip's conflicts"),
+        ["shared.txt"],
+        "the tip holds the conflict"
+    );
+    assert!(
+        !repo
+            .is_ancestor(&conflicted, &release)
+            .expect("read ancestry")
+    );
+    assert!(repo.is_ancestor(&clean, &release).expect("read ancestry"));
+    assert!(
+        repo.standing_rewrites_of(&conflicted)
+            .expect("read the rewrites")
+            .contains(&clean)
+    );
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: the resolution is carried exactly.
+    let control = knives_release(
+        &lab,
+        &home,
+        &[
+            "members",
+            "release/2026-08-04",
+            "--carries",
+            "feat/resolved",
+        ],
+    );
+    assert_eq!(control.status.code(), Some(0), "{}", text(&control));
+
+    // And: the conflicted tip is not carried, though the release holds a
+    // rewrite of it: a tip with an unresolved conflict is never carried.
+    let query = knives_release(
+        &lab,
+        &home,
+        &[
+            "members",
+            "release/2026-08-04",
+            "--carries",
+            "feat/conflicted",
+        ],
+    );
+    let out = String::from_utf8_lossy(&query.stdout);
+    assert_eq!(query.status.code(), Some(1), "{}", text(&query));
+    assert!(
+        out.contains(&format!(
+            "conflicted         release/2026-08-04 @ {}",
+            release.short()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("carried-"), "{out}");
 }
 
 /// [`MEMBER`] on the trunk, one commit that writes each of `files`, with

@@ -48,16 +48,16 @@ Use the carriage probe (`--carries`), never a source-text search: a symbol's pre
 
 - `knives release members <target> --carries <revision>` checks that one target. Exit `0` carried, `1` `NOT carried` or `conflicted`, `3` `merged-then-edited`, unresolved or uncheckable. A superseded target is a valid target.
 - With no target, it checks live releases and upstream trunk, then superseded cuts. Carriage only by a superseded cut does not make deletion safe.
-- `--census` asks this for every maintained branch. The `landed` column of `status` is the upstream-trunk probe.
+- `--census` asks this for every maintained branch; a `merged-then-edited` row there changes no exit. The `landed` column of `status` is the upstream-trunk probe.
 
 | Verdict | Evidence |
 |---|---|
-| `carried-exact` | The revision tip is an ancestor of the target. Against a release, its change also replays empty onto the release's tree. |
-| `merged-then-edited` | An ancestor of the release whose replay is not empty: later work changed what it brought. No record makes it carried; judge it. |
+| `carried-exact` | The revision tip is an ancestor of the target. Against a release, its change also replays empty onto the release's tree, and the tip holds no unresolved conflict. |
+| `merged-then-edited` | An ancestor of the release whose replay is not empty, or whose tip holds a conflict: later work changed what it brought. No record makes it carried; judge it. |
 | `carried-rewritten` | Replaying its net change leaves the target unchanged: equivalent content arrived another way, or it has no net change. |
-| `carried-rebased` | Replay differs, but a commit with its change id is an ancestor. Weaker: divergent changes can name different trees. |
+| `carried-rebased` | Replay differs, but a commit with its change id is an ancestor. Against a release, that rewrite's own change also replays empty, and the tip holds no conflict. Weaker: divergent changes can name different trees. |
 | `NOT carried` (JSON `not-carried`) | Replay leaves a clean non-empty diff, and no rewrite is in the target. |
-| `conflicted` | Replay conflicts, and no rewrite is in the target. Some content can be present: judge it. |
+| `conflicted` | Replay conflicts, or the tip holds a conflict against a release, and no rewrite counts. Some content can be present: judge it. |
 
 ## Output and exit codes
 
