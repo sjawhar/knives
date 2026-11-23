@@ -1146,9 +1146,14 @@ impl Holding {
         panic!("the held command neither reached its gate nor exited in four minutes");
     }
 
+    /// Open the gate: the held call, and every later one, goes on.
+    pub fn open(&self) {
+        std::fs::write(self.gate(), "").expect("open the gate");
+    }
+
     /// Open the gate, and collect `child`.
     pub fn release(&self, child: std::process::Child) -> Output {
-        std::fs::write(self.gate(), "").expect("open the gate");
+        self.open();
         child.wait_with_output().expect("collect the held command")
     }
 }
