@@ -50,7 +50,7 @@ Reports upstream contribution facts: convention files and their changes since la
 
 ### The immutability rule
 
-`start` writes the fork's `immutable_heads()` into the repository's jj config only when that config states none: trunk on every knives remote, tags, the published release branch, and tags fetched from upstream. It refreshes a rule it wrote and never overwrites a human one. jj's default would pin superseded releases and other forks' PR heads. A published release and its members are immutable to hand commands; `knives release rebase` still moves them.
+`start` writes the fork's `immutable_heads()` into the repository's jj config only when that config states none: trunk on every knives remote, plus tags fetched from upstream. It refreshes a rule it wrote and never overwrites a human one. jj's default would pin superseded releases and other forks' PR heads. Fork release and `keep/*` tags do not make commits immutable.
 
 ## State a PR link or dependency
 
