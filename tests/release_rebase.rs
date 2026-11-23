@@ -1943,6 +1943,54 @@ fn the_rebase_rule_keeps_upstreams_tags_and_the_trunks_pinned() {
 }
 
 #[test]
+fn the_rebase_rule_pins_origins_trunk_by_name() {
+    // Given: `trunk()` names upstream's trunk, as a checkout cloned from
+    // upstream has it, and origin's trunk advanced past it with a commit no
+    // tag reaches: only the pin on origin's trunk by name covers that commit.
+    let lab = Lab::new();
+    lab.jj_work(["new", "main@origin", "-m", "on origin's trunk"]);
+    lab.jj_work(["bookmark", "create", "on-origin-trunk", "-r", "@"]);
+    lab.advance_origin_branch("main", "origin advance\n");
+    lab.jj_work(["git", "fetch", "--remote", "origin"]);
+    lab.jj_work([
+        "config",
+        "set",
+        "--repo",
+        "revset-aliases.\"trunk()\"",
+        "main@upstream",
+    ]);
+    assert_eq!(
+        lab.revision(&lab.work, "trunk()", "commit_id"),
+        commit_at(&lab, "main@upstream").as_str(),
+        "trunk() must name upstream's trunk, or it pins origin's instead"
+    );
+    assert_eq!(
+        lab.revision(
+            &lab.work,
+            "main@origin & ::(trunk() | tags() | remote_tags())",
+            "commit_id"
+        ),
+        "",
+        "origin's new trunk commit must sit outside every other pin"
+    );
+    let rule = knives::config::RepoEntry::new("u", "o").rebase_immutable_heads();
+    let before = commit_at(&lab, "main@origin");
+
+    // When: the release rebase's one `jj rebase` is pointed at it.
+    let refused = knives::jj::rebase_branch_onto(
+        &lab.work,
+        "main@origin",
+        &commit_at(&lab, "on-origin-trunk"),
+        Some(&rule),
+    );
+
+    // Then: the rule the rebase runs under refuses it.
+    let error = refused.expect_err("main@origin");
+    assert!(error.to_string().contains("immutable"), "{error}");
+    assert_eq!(commit_at(&lab, "main@origin"), before, "main@origin moved");
+}
+
+#[test]
 fn a_pushed_release_cut_is_pinned_once_it_is_tagged() {
     // Given: a dated fork whose cut is pushed to origin and not tagged, under
     // the rule `knives start` writes.
