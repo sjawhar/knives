@@ -22,10 +22,10 @@ pub(crate) struct LockWait {
 }
 
 impl LockWait {
-    /// One minute, for a fork's lock and the state file's: `start` holds its
-    /// fork's lock for the whole fetch and workspace creation, so a waiter on
-    /// the same fork must outlast several holds; the state file's lock is
-    /// held only for one read and write of the file.
+    /// One minute, for a fork's lock, a branch's and the state file's:
+    /// `start` holds its branch's lock for the whole fetch and workspace
+    /// creation, so a waiter on the same branch must outlast several holds;
+    /// the state file's lock is held only for one read and write of the file.
     pub(crate) const CLAIM: Self = Self {
         deadline: Duration::from_secs(60),
         floor: Duration::from_millis(20),

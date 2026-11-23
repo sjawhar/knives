@@ -41,7 +41,7 @@ fn sync_fails_closed_when_the_facts_batch_fails() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(
+    let mut store = Store::open(
         state.path().join("state.json"),
         &knives::config::FormerNames::new(),
         &[&name],
@@ -92,7 +92,7 @@ fn a_listed_state_wins_and_a_vanished_number_is_answered_by_the_batch() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(
+    let mut store = Store::open(
         state.path().join("state.json"),
         &knives::config::FormerNames::new(),
         &[&name],
@@ -168,7 +168,7 @@ fn sync_records_one_event_for_each_pull_request_that_moved() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(
+    let mut store = Store::open(
         state.path().join("state.json"),
         &knives::config::FormerNames::new(),
         &[&name],
@@ -239,7 +239,7 @@ fn sync_records_a_settled_pull_request_once_across_repeated_runs() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(
+    let mut store = Store::open(
         state.path().join("state.json"),
         &knives::config::FormerNames::new(),
         &[&name],
@@ -304,7 +304,7 @@ fn sync_records_an_advanced_pull_request_then_its_merge() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(
+    let mut store = Store::open(
         state.path().join("state.json"),
         &knives::config::FormerNames::new(),
         &[&name],
@@ -368,7 +368,7 @@ fn sync_records_each_consecutive_advance() {
         ..knives::forge::fake::FakeForge::default()
     };
     let state = tempfile::tempdir().expect("state directory");
-    let mut store = Store::open_for_update(
+    let mut store = Store::open(
         state.path().join("state.json"),
         &knives::config::FormerNames::new(),
         &[&name],

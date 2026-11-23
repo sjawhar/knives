@@ -1,14 +1,18 @@
-//! Concurrent `knives start`s: what waits for what.
+//! Concurrent `knives start`s, and a `sync` beside another writer of its
+//! fork: what waits for what.
 //!
-//! A `start` holds its fork's lock for the whole claim, fetch and workspace
+//! A `start` holds its branch's lock for the whole claim, fetch and workspace
 //! creation, and the state file's lock only for the write that records the
-//! claim. So a `start` on another fork does not wait for it, while a `start`
-//! on the same fork waits its turn and then decides from what the first one
-//! wrote.
+//! claim. So a `start` of another branch, of this fork or another, does not
+//! wait for it, while a `start` of the same branch waits its turn and then
+//! decides from what the first one wrote. A `sync` takes its fork's lock only
+//! once it has fetched, so a writer of the fork does not wait for its fetch.
 //!
-//! The first `start` is held inside its fetch by a `git` on its `PATH` that
-//! waits for a gate file, so each test sees the first `start` mid-claim for
-//! as long as it needs, whatever the machine's speed.
+//! The first command is held inside its fetch by a `git` on its `PATH` that
+//! waits for a gate file, so each test sees it mid-fetch for as long as it
+//! needs, whatever the machine's speed. Where a test needs to know a command
+//! waits for a lock, it reads that the command holds a lock file open
+//! ([`lab::waits_for_a_lock`]), not how long it took.
 
 #![allow(
     clippy::expect_used,
@@ -20,12 +24,15 @@
 #[path = "common/lab.rs"]
 mod lab;
 
+#[path = "common/forge_shim.rs"]
+mod forge_shim;
+
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use lab::Lab;
+use lab::{Holding, Lab};
 use serde_json::Value;
 
 /// Two forks, `demo` and `other`, whose checkouts one scan root holds, and the
@@ -141,9 +148,11 @@ impl Estate {
 }
 
 /// A directory holding a `git` that, when `LAB_FETCH_GATE` is set, writes
-/// `$LAB_FETCH_GATE.waiting` and waits (up to a minute) for `$LAB_FETCH_GATE`
-/// to exist before a fetch, then runs the real `git`; and the `PATH` with it
-/// first. jj fetches through the `git` on its `PATH`.
+/// `$LAB_FETCH_GATE.waiting` and waits (up to four minutes) for
+/// `$LAB_FETCH_GATE` to exist before a fetch, then runs the real `git`; and
+/// the `PATH` with it first. jj fetches through the `git` on its `PATH`. Four
+/// minutes is past the minute a waiter gives a lock, so a command that waits
+/// for the held one's lock gives up while the held one is still held.
 fn gated_git(root: &Path) -> std::ffi::OsString {
     let path = std::env::var_os("PATH").expect("PATH");
     let real = std::env::split_paths(&path)
@@ -162,7 +171,7 @@ fn gated_git(root: &Path) -> std::ffi::OsString {
              \x20 if [ -n \"$LAB_FETCH_GATE\" ]; then\n\
              \x20   : > \"$LAB_FETCH_GATE.waiting\"\n\
              \x20   i=0\n\
-             \x20   while [ ! -e \"$LAB_FETCH_GATE\" ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
+             \x20   while [ ! -e \"$LAB_FETCH_GATE\" ] && [ $i -lt 4800 ]; do sleep 0.05; i=$((i+1)); done\n\
              \x20 fi;;\n\
              esac\n\
              exec '{}' \"$@\"\n",
@@ -174,20 +183,6 @@ fn gated_git(root: &Path) -> std::ffi::OsString {
         .expect("chmod gated git");
     std::env::join_paths(std::iter::once(directory).chain(std::env::split_paths(&path)))
         .expect("join PATH")
-}
-
-/// Whether `child` exits within `limit`.
-fn exits_within(child: &mut Child, limit: Duration) -> bool {
-    let deadline = Instant::now() + limit;
-    loop {
-        if child.try_wait().expect("poll child").is_some() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }
 
 fn finished(child: Child, what: &str) -> std::process::Output {
@@ -205,22 +200,21 @@ fn a_start_on_another_fork_does_not_wait_for_one_mid_claim() {
     let estate = Estate::new();
     let mut held = estate.start_held("demo", "feat/alpha", "agent-one");
 
-    // When: a start on `other` runs.
-    let mut other = estate
+    // When: a start on `other` runs to its end. Had it waited for the held
+    // start, it would have given up the wait after a minute, while the held
+    // start is still held, and exited 3.
+    let other = estate
         .start("other", "feat/beta", "agent-two")
-        .spawn()
-        .expect("spawn the other start");
-
-    // Then: it finishes while the first is still held; one minute is the
-    // claim-lock budget, so a start that waited for the first would not.
-    let done = exits_within(&mut other, Duration::from_secs(30));
+        .output()
+        .expect("run the other start");
     let still_held = held.try_wait().expect("poll held").is_none();
     estate.open_gate();
     let held = finished(held, "the held start");
-    assert!(done, "the start on another fork waited for the held one");
-    assert!(still_held, "the held start was not held: {held:?}");
-    let other = finished(other, "the other start");
+
+    // Then: it took its claim while the first was held, and both claims are
+    // kept.
     assert!(other.status.success(), "{other:?}");
+    assert!(still_held, "the held start was not held: {held:?}");
     assert!(held.status.success(), "{held:?}");
     let mut claims = estate.claims();
     claims.sort();
@@ -235,27 +229,38 @@ fn a_start_on_another_fork_does_not_wait_for_one_mid_claim() {
 }
 
 #[test]
-fn a_start_on_the_same_fork_waits_for_one_mid_claim() {
-    // Given: a start on `demo` held inside its fetch, mid-claim.
+fn a_start_of_another_branch_of_the_same_fork_does_not_wait_for_one_mid_claim() {
+    // Given: a start of `feat/alpha` on `demo` held inside its fetch,
+    // mid-claim.
     let estate = Estate::new();
-    let held = estate.start_held("demo", "feat/alpha", "agent-one");
+    let mut held = estate.start_held("demo", "feat/alpha", "agent-one");
 
-    // When: a start of another branch on `demo` runs.
-    let mut second = estate
+    // When: a start of another branch on `demo` runs to its end. Had it
+    // waited for the held start, it would have given up the wait after a
+    // minute, while the held start is still held, and exited 3.
+    let second = estate
         .start("demo", "feat/beta", "agent-two")
-        .spawn()
-        .expect("spawn the second start");
-
-    // Then: it does not finish while the first holds the fork, and does once
-    // the first is done, with both claims kept.
-    let early = exits_within(&mut second, Duration::from_secs(3));
+        .output()
+        .expect("run the second start");
+    let still_held = held.try_wait().expect("poll held").is_none();
     estate.open_gate();
     let held = finished(held, "the held start");
-    assert!(!early, "the second start on one fork did not wait");
-    assert!(held.status.success(), "{held:?}");
-    let second = finished(second, "the second start");
+
+    // Then: it took its claim while the first was held, and both claims are
+    // kept.
     assert!(second.status.success(), "{second:?}");
-    assert_eq!(estate.claims().len(), 2, "{:?}", estate.claims());
+    assert!(still_held, "the held start was not held: {held:?}");
+    assert!(held.status.success(), "{held:?}");
+    let mut claims = estate.claims();
+    claims.sort();
+    assert_eq!(
+        claims,
+        [
+            ("demo/feat/alpha".to_owned(), "agent-one".to_owned()),
+            ("demo/feat/beta".to_owned(), "agent-two".to_owned()),
+        ],
+        "a claim was lost"
+    );
 }
 
 #[test]
@@ -269,13 +274,17 @@ fn two_starts_of_one_branch_leave_one_claim() {
         .start("demo", "feat/alpha", "agent-two")
         .spawn()
         .expect("spawn the second start");
-    let early = exits_within(&mut second, Duration::from_secs(3));
+    let lock = estate.home.path().join("branch-locks/demo/feat-alpha.lock");
+    let waited = lab::waits_for_a_lock(&mut second, &lock);
     estate.open_gate();
     let held = finished(held, "the held start");
     let second = finished(second, "the second start");
 
     // Then: it waited for the first, then refused on agent-one's claim.
-    assert!(!early, "the second start of one branch did not wait");
+    assert!(
+        waited,
+        "the second start of one branch did not wait: {second:?}"
+    );
     assert!(held.status.success(), "{held:?}");
     assert_eq!(second.status.code(), Some(2), "{second:?}");
     let stderr = String::from_utf8_lossy(&second.stderr);
@@ -284,4 +293,125 @@ fn two_starts_of_one_branch_leave_one_claim() {
         estate.claims(),
         [("demo/feat/alpha".to_owned(), "agent-one".to_owned())]
     );
+}
+
+/// The forge URL `demo`'s upstream is at in the sync test.
+const UPSTREAM: &str = "https://forge.invalid/acme/demo";
+
+#[test]
+fn a_sync_held_at_any_network_call_keeps_no_writer_of_its_fork_waiting() {
+    // Each network call `sync` makes, by the program it runs and the
+    // arguments that name it: the fetch of every remote, the forge's first
+    // answer, and the read of the upstream's pull request heads.
+    let forge = tempfile::tempdir().expect("forge directory");
+    forge_shim::install_snapshot_gh(forge.path(), "[]", &[]);
+    let phases = [
+        ("the fetch", Holding::git("*\" fetch \"*"), true),
+        (
+            "the forge",
+            Holding::new(&forge.path().join("gh"), "*"),
+            false,
+        ),
+        (
+            "the read of the pull request heads",
+            Holding::git("*\" ls-remote \"*refs/pull/*"),
+            true,
+        ),
+    ];
+    for (phase, holding, no_github) in phases {
+        // Given: a sync of `demo` held at that call, its upstream at a forge
+        // URL, as a real fork's is, so that the forge names its repository.
+        let estate = Estate::new();
+        estate.demo.upstream_at_forge_url(UPSTREAM);
+        let registry = estate.home.path().join("repos.toml");
+        let text = std::fs::read_to_string(&registry).expect("read the registry");
+        std::fs::write(
+            &registry,
+            text.replace(&estate.demo.upstream.display().to_string(), UPSTREAM),
+        )
+        .expect("write the registry");
+        let mut args = vec!["--text", "sync", "demo"];
+        if no_github {
+            args.push("--no-github");
+        }
+        let mut sync = lab::knives_command(
+            &estate.demo.work,
+            estate.home.path(),
+            estate.root.path(),
+            &args,
+        );
+        sync.env("XDG_CACHE_HOME", forge.path().join("cache"));
+        let mut held = holding
+            .hold(&mut sync)
+            .unwrap_or_else(|output| panic!("the sync never reached {phase}: {output:?}"));
+
+        // When: a statement about a branch of `demo` is written, which holds
+        // the fork's lock while it reads and writes. Had it waited for the
+        // sync, it would have given up the wait after a minute, while the
+        // sync is still held, and exited 3.
+        let track = lab::knives_command(
+            &estate.demo.work,
+            estate.home.path(),
+            estate.root.path(),
+            &[
+                "--text",
+                "track",
+                "feat/alpha",
+                "--pr",
+                "5",
+                "--repo",
+                "demo",
+            ],
+        )
+        .output()
+        .expect("run the track");
+        let still_held = held.try_wait().expect("poll the held sync").is_none();
+        let held = holding.release(held);
+
+        // Then: it wrote its statement while the sync was held, and the sync
+        // then ended as one with nothing to record ends.
+        assert!(track.status.success(), "{phase}: {track:?}");
+        assert!(still_held, "{phase}: the held sync was not held: {held:?}");
+        assert!(held.status.success(), "{phase}: {held:?}");
+    }
+}
+
+#[test]
+fn two_syncs_of_one_fork_take_turns() {
+    // Given: a sync of `demo` held inside its fetch.
+    let estate = Estate::new();
+    let holding = Holding::git("*\" fetch \"*");
+    let mut first = lab::knives_command(
+        &estate.demo.work,
+        estate.home.path(),
+        estate.root.path(),
+        &["--text", "sync", "demo", "--no-github"],
+    );
+    let held = holding
+        .hold(&mut first)
+        .unwrap_or_else(|output| panic!("the first sync never fetched: {output:?}"));
+
+    // When: a second sync of `demo` runs.
+    let mut second = lab::knives_command(
+        &estate.demo.work,
+        estate.home.path(),
+        estate.root.path(),
+        &["--text", "sync", "demo", "--no-github"],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("spawn the second sync");
+    let waited = lab::waits_for_a_lock(
+        &mut second,
+        &estate.home.path().join("sync-locks/demo.lock"),
+    );
+    let first = holding.release(held);
+    let second = finished(second, "the second sync");
+
+    // Then: it waited for the first, so it read what the first recorded,
+    // and both synced.
+    assert!(waited, "the second sync did not wait: {second:?}");
+    assert!(first.status.success(), "{first:?}");
+    assert!(second.status.success(), "{second:?}");
 }

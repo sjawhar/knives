@@ -43,7 +43,7 @@ use crate::ledger_git::{ClaimError, ClaimRecord, ClaimRef, HeldClaim};
 use crate::ledger_sweep::{self, ClaimOutcome, LedgerFailure, NotApplied, SharedFork};
 use crate::release_model::newest_release;
 use crate::seen;
-use crate::store::{Claim, Store, default_state_path};
+use crate::store::{BranchLock, Claim, ForkLock, Store, default_state_path};
 
 /// Where `start` creates a new workspace for a branch: under the entry's
 /// workspace root, named for the branch with slashes flattened.
@@ -207,15 +207,25 @@ pub fn run(
         eprintln!("{repo_name}: {line}");
         return Ok(Exit::Usage);
     }
-    // Holds this fork's lock, and only this fork's, until the command ends:
-    // another `start` on the fork waits and then decides from this
-    // one's claim, while a `start` on any other fork runs alongside. The state
-    // file's lock is taken only by the save that records the claim.
-    let mut store = Store::open_for_update(
-        default_state_path(),
-        &bound.registry.former_names(),
-        &[&fork.upstream],
-    )?;
+    // Holds this branch's lock, and only this branch's, until the command
+    // ends: another `start` or a `finish` of the branch waits and then
+    // decides from this one's claim, while a `start` of any other branch runs
+    // alongside, its network waits and its workspace's creation included
+    // ([`BranchLock`]). The state file's lock is taken only by the save that
+    // records the claim, which refuses if the claim it read moved meanwhile.
+    // The fork's lock is held for the store's open alone, which reads the
+    // fork's ledger and checks that nothing is left to migrate: `knives
+    // ledger migrate` moves the ledger under every fork's lock, so the open
+    // reads it whole, before or after the move ([`Store::migrated`]).
+    let _branch = BranchLock::acquire(&fork.upstream, branch)?;
+    let mut store = {
+        let _fork = ForkLock::acquire(&fork.upstream)?;
+        Store::open(
+            default_state_path(),
+            &bound.registry.former_names(),
+            &[&fork.upstream],
+        )?
+    };
     // A fork that shares its ledger is decided from the ledger's claim, on
     // every machine that shares it.
     let request = Request {
@@ -1253,7 +1263,7 @@ fn start_on_ledger(request: &Request<'_>, store: &mut Store) -> anyhow::Result<O
 /// `claim`.
 ///
 /// The ledger's claim ref decides who holds the branch, on every machine
-/// that shares the ledger. It is read under the fork's lock and weighed
+/// that shares the ledger. It is read under the branch's lock and weighed
 /// with a local claim an older knives left in this machine's state file
 /// ([`decide`]), and every refusal comes before anything is written to the
 /// ledger. A take, a seize or a restate is then one push, leased on the

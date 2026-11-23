@@ -32,11 +32,11 @@ use crate::ledger::{Entry, Kind, Ledger, RecordedParent};
 use crate::own_lines::{Lost, LostKind, MemberLines, Reading, SkippedRange};
 use crate::pins::{Pin, PinKind};
 use crate::release_model::{
-    BranchSuccessions, CompositionBaseline, EarlierWrites, MemberEvidence, MemberHistory,
-    MemberSuccession, RecordedWrite, SeriesWrite, StackedHistoryContext, carried_from_tips,
-    double_cut_findings, last_recorded_parents, matched_write, member_history, member_parents,
-    newest_release, read_release, recorded_release_changes, release_refs_by_commit, repo_slug,
-    trunk_positions,
+    BranchSuccessions, CompositionBaseline, ConsumerScan, EarlierWrites, MemberEvidence,
+    MemberHistory, MemberSuccession, RecordedWrite, SeriesWrite, StackedHistoryContext,
+    carried_from_tips, double_cut_findings, last_recorded_parents, matched_write, member_history,
+    member_parents, newest_release, read_release, recorded_release_changes, release_refs_by_commit,
+    repo_slug, trunk_positions,
 };
 
 /// Registered forge consumers and explicitly requested local checkout scans.
@@ -78,23 +78,78 @@ pub fn pulled_ledger(
     Ok((read.entries, problems))
 }
 
-/// The release plan for `fork`, from a ledger pulled first: what a release
-/// command decides from.
+/// What a release command asks the network for: the fork's ledger, pulled,
+/// and each registered consumer's pins, read from the forge ([`fetch`]).
 ///
-/// A pull that fails is one of the plan's problems. The plan still answers
-/// from the entries this machine has, and a command that would write from it
-/// refuses, exactly as it does when a consumer could not be consulted: the
-/// drop guard checks a member against the newest recorded cut, and a stale
-/// ledger would check it against the wrong one.
-pub fn pulled_plan(
-    fork: &Fork<'_>,
-    registry: &Registry,
-    consumers: &ConsumerInputs<'_>,
-) -> anyhow::Result<Plan> {
-    let (entries, problems) = pulled_ledger(fork, registry)?;
-    let mut plan = plan(fork, consumers, &entries)?;
-    plan.problems.extend(problems);
-    Ok(plan)
+/// A release write asks for these before it takes its fork's lock, and reads
+/// the rest under it ([`Fetched::plan`]), so a pull or a forge call that
+/// stalls keeps no other writer of the fork waiting. Neither answer is the
+/// fork's lock's to guard: another machine's entries come in by a pull
+/// whichever lock is held here, and a consumer's pins are the consumer's.
+#[derive(Debug)]
+pub struct Fetched {
+    /// What the pull could not bring.
+    pulled: Vec<String>,
+    /// Each registered consumer's scan, in the registry's order.
+    scans: Vec<ConsumerScan>,
+}
+
+/// Every network call a release plan makes ([`Fetched`]).
+///
+/// It pulls `fork`'s ledger from every destination `registry` gives it, and
+/// scans each consumer `consumers` registers on the forge. A pull that fails,
+/// and a consumer that could not be read, are problems of the plan.
+pub fn fetch(fork: &Fork<'_>, registry: &Registry, consumers: &ConsumerInputs<'_>) -> Fetched {
+    let pulled =
+        crate::ledger_sweep::pull(registry, &[&fork.upstream]).problems_for(&fork.upstream);
+    Fetched {
+        pulled,
+        scans: scan_consumers(fork, consumers),
+    }
+}
+
+impl Fetched {
+    /// The release plan for `fork`, from its ledger and repository as they
+    /// are now, with the consumer pins [`fetch`] read.
+    ///
+    /// It is what a release command decides from; a writer reads it under its
+    /// fork's lock, after the network.
+    ///
+    /// A pull that failed is one of the plan's problems, and so is each entry
+    /// or statement the ledger read could not fully read. The plan still
+    /// answers from the entries this machine has, and a command that would
+    /// write from it refuses, exactly as it does when a consumer could not be
+    /// consulted: the drop guard checks a member against the newest recorded
+    /// cut, and a stale ledger would check it against the wrong one.
+    pub fn plan(self, fork: &Fork<'_>, consumers: &ConsumerInputs<'_>) -> anyhow::Result<Plan> {
+        let read = Ledger::for_fork(fork).read()?;
+        let mut plan = plan_scanned(fork, consumers, &read.entries, Some(self.scans))?;
+        plan.problems.extend(self.pulled);
+        plan.problems.extend(read.problems);
+        Ok(plan)
+    }
+}
+
+/// Each consumer `consumers` registers on the forge, scanned for `fork`'s
+/// release pins, in the registry's order.
+fn scan_consumers(fork: &Fork<'_>, consumers: &ConsumerInputs<'_>) -> Vec<ConsumerScan> {
+    let scheme = fork.entry.release_scheme();
+    let slug = repo_slug(fork.entry);
+    consumers
+        .slugs
+        .iter()
+        .map(|consumer| {
+            scan_consumer_slug_with_heads(
+                consumers.forge,
+                consumers.cache_root,
+                &fork.checkout.path,
+                consumer,
+                slug.as_deref(),
+                &scheme,
+                consumers.heads,
+            )
+        })
+        .collect()
 }
 
 /// What repairing this release would actually reach.
@@ -803,14 +858,17 @@ pub struct ReapReport {
     pub hidden: Vec<crate::jj::HiddenHead>,
 }
 
-/// A claim of a release name in this machine's state file: the release
-/// claim, which `knives start <name>` takes and `knives finish <name>`
-/// releases.
+/// A release name the reap must keep for its claim.
+///
+/// It is one a claim in this machine's state file holds, which `knives start
+/// <name>` takes and `knives finish <name>` releases, or one whose lock a
+/// `start` or `finish` of it holds now ([`crate::store::BranchLock`]), which
+/// may be about to take or release that claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldRelease {
     pub name: String,
-    /// The claim's owner.
-    pub holder: String,
+    /// The claim's owner; `None` for a name a `start` or `finish` holds now.
+    pub holder: Option<String>,
 }
 
 /// The live release claims of a fork, as the reap reads them from the state
@@ -833,10 +891,19 @@ impl ReleaseClaims {
                 "the claims could not be read, so a release claim may hold it: {error}"
             )),
             Self::Read(held) => held.iter().find(|claim| claim.name == name).map(|claim| {
-                format!(
-                    "held by the release claim of {}; `knives finish {}` releases it",
-                    claim.holder,
-                    crate::ledger::shell_word(name)
+                claim.holder.as_ref().map_or_else(
+                    || {
+                        "a `knives start` or `finish` of it runs now; a later reap \
+                                 retires it"
+                            .to_owned()
+                    },
+                    |holder| {
+                        format!(
+                            "held by the release claim of {holder}; `knives finish {}` \
+                                     releases it",
+                            crate::ledger::shell_word(name)
+                        )
+                    },
                 )
             }),
         }
@@ -1864,11 +1931,24 @@ fn unlanded_members(
 ///
 /// `ledger` is this repository's ledger, read by the caller: the last recorded
 /// parent set is what names a member whose branch was rebased outside jj or
-/// landed upstream, where the repository no longer can.
+/// landed upstream, where the repository no longer can. Each consumer the
+/// registry names is scanned on the forge here; a writer scans them first,
+/// before its fork's lock, and plans from those ([`Fetched::plan`]).
 pub fn plan(
     fork: &Fork<'_>,
     consumers: &ConsumerInputs<'_>,
     ledger: &[Entry],
+) -> anyhow::Result<Plan> {
+    plan_scanned(fork, consumers, ledger, None)
+}
+
+/// [`plan`], with each registered consumer's scan already made where `scans`
+/// holds them, in the registry's order.
+fn plan_scanned(
+    fork: &Fork<'_>,
+    consumers: &ConsumerInputs<'_>,
+    ledger: &[Entry],
+    scans: Option<Vec<ConsumerScan>>,
 ) -> anyhow::Result<Plan> {
     let entry = fork.entry;
     let path = &fork.checkout.path;
@@ -1939,15 +2019,17 @@ pub fn plan(
     })?);
     plan.list_parents(parents);
 
-    add_consumer_pins(&mut plan, fork, consumers, &scheme);
+    add_consumer_pins(&mut plan, fork, consumers, scans);
     Ok(plan)
 }
 
+/// Every consumer's pins: each registered one's scan, `scans` where the
+/// caller made them, and each local checkout's.
 fn add_consumer_pins(
     plan: &mut Plan,
     fork: &Fork<'_>,
     consumers: &ConsumerInputs<'_>,
-    scheme: &ReleaseScheme,
+    scans: Option<Vec<ConsumerScan>>,
 ) {
     if consumers.slugs.is_empty() && consumers.locals.is_empty() {
         // An answer, not a gap: `consumers` is optional, and a fork consumed by an
@@ -1963,24 +2045,16 @@ fn add_consumer_pins(
     }
     // Every consumer, not one: they can sit on different releases, so a plan that saw only
     // the first would call a release unpinned while something else was frozen on it.
+    let scheme = fork.entry.release_scheme();
     let slug = repo_slug(fork.entry);
     let consulted = plan.problems.len();
-    for consumer in consumers.slugs {
-        let scan = scan_consumer_slug_with_heads(
-            consumers.forge,
-            consumers.cache_root,
-            &fork.checkout.path,
-            consumer,
-            slug.as_deref(),
-            scheme,
-            consumers.heads,
-        );
+    for scan in scans.unwrap_or_else(|| scan_consumers(fork, consumers)) {
         plan.pins.extend(scan.pins);
         plan.notes.extend(scan.notes);
         plan.problems.extend(scan.problems);
     }
     for consumer in consumers.locals {
-        let scan = scan_consumer_for(consumer, slug.as_deref(), scheme);
+        let scan = scan_consumer_for(consumer, slug.as_deref(), &scheme);
         plan.pins.extend(scan.pins);
         plan.notes.extend(scan.notes);
         // The scan speaks of one checkout; the plan may hold several, so the

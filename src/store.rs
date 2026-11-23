@@ -207,16 +207,18 @@ pub struct Store {
     path: PathBuf,
     state: State,
     /// The ledger of each repository the store was opened for, read once
-    /// when the store opens, or why it could not be read at all: only a
-    /// store opened with [`Store::open_each`] or
-    /// [`Store::open_each_for_update`] keeps one it could not read; every
-    /// other open fails on it.
+    /// when the store opens, and again by [`Store::reread_locked`], or why
+    /// it could not be read at all: only a store opened with
+    /// [`Store::open_each`] keeps one it could not read; every other open
+    /// fails on it.
     ledgers: BTreeMap<UpstreamName, Result<ForkLedger, LedgerError>>,
     writes: Writes,
     /// The lock on each fork a store opened for update was opened for
-    /// ([`Store::open_for_update`]). Held, not read: its whole job is to exist
-    /// until this value is dropped.
-    _forks: Vec<FileLock>,
+    /// ([`Store::open_for_update`]). Held, and read only for whether there
+    /// are any: its whole job is to exist until this value is dropped. A
+    /// store that holds them has nothing to take again in
+    /// [`Store::reread_locked`].
+    forks: Vec<FileLock>,
 }
 
 /// What one read of a fork's ledger gave the store ([`Ledger::read`]).
@@ -236,7 +238,10 @@ impl Store {
     /// made on it is replayed at [`Store::save`] onto the file as it is then,
     /// so it loses no other writer's change; a writer whose change follows
     /// from what it read must not race another such writer, and opens
-    /// [`Store::open_for_update`] instead.
+    /// [`Store::open_for_update`] instead, holds the one branch's lock its
+    /// change is about ([`BranchLock`]: a claim it changes is compared on
+    /// save with the one it read), or takes the fork's lock once it has done
+    /// its waiting on the network and reads again ([`Store::reread_locked`]).
     ///
     /// `former` is what the caller's registry says each fork was once kept
     /// under ([`crate::config::Registry::former_names`]), for the refusal of
@@ -291,37 +296,81 @@ impl Store {
         Self::read(path, repos, Writes::Replayed(Vec::new()), Vec::new())?.migrated(former)
     }
 
-    /// [`Store::open_for_update`] as [`Store::open_each`] opens a store: for
-    /// a writer that may still answer a caller without a ledger it could not
-    /// read, and fails on that ledger ([`Store::all_read`]) before anything
-    /// that needs it.
-    pub fn open_each_for_update(
-        path: PathBuf,
-        former: &FormerNames,
-        repos: &[&UpstreamName],
-    ) -> Result<Self, StoreError> {
-        let forks = lock_forks(&path, repos)?;
-        Self::read(path, repos, Writes::Replayed(Vec::new()), forks)?.migrated(former)
+    /// Take the lock of each fork this store was opened for, unless it holds
+    /// them already, and read the state file and those forks' ledgers again
+    /// under it; the locks are held until the returned value is dropped.
+    ///
+    /// For a writer that asks the network before it decides, and must not
+    /// keep every other writer of the fork waiting on that: it opens the
+    /// store with no lock ([`Store::open`], [`Store::open_each`]), asks, and
+    /// then takes the lock here for its decision and its write. What the
+    /// store answers from then on is what the fork's other writers left, so
+    /// the writer can check that what it read before its wait has not moved.
+    /// A change made on the store before is kept: it applies to what is read
+    /// here, as the save replays it.
+    ///
+    /// The refusal of a state file an older knives left is not made again:
+    /// the open made it ([`Store::migrated`]), and `knives ledger migrate`,
+    /// the only writer that rewrites one, holds the state file's lock for its
+    /// whole run, which [`Store::save`] waits for as well.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Lock`] when another writer of one of the forks still
+    /// holds its lock after the wait ([`LockWait::CLAIM`]); a state file that
+    /// cannot be read; and [`StoreError::Ledger`] with why the first of the
+    /// ledgers that can no longer be read could not be.
+    pub fn reread_locked(&mut self) -> Result<ForkLock, StoreError> {
+        let changes = match &self.writes {
+            Writes::Replayed(changes) => changes,
+            // `knives ledger migrate` writes the whole file, holding the
+            // state file's lock from its open while its caller holds every
+            // fork's lock, so nothing it read can have moved.
+            Writes::Whole(_) => return Ok(ForkLock { _held: Vec::new() }),
+        };
+        let owned: Vec<UpstreamName> = self.ledgers.keys().cloned().collect();
+        let repos: Vec<&UpstreamName> = owned.iter().collect();
+        let held = if self.forks.is_empty() {
+            lock_forks(&self.path, &repos)?
+        } else {
+            Vec::new()
+        };
+        let mut state = read_state(&self.path)?;
+        for change in changes {
+            // As at [`Store::change`]: only a save can find the file moved
+            // under a change, and the save replays it then.
+            let _ = change(&mut state, &self.path);
+        }
+        self.state = state;
+        self.ledgers = read_ledgers(&self.path.with_file_name("ledger"), &repos);
+        self.take_unreadable()?;
+        Ok(ForkLock { _held: held })
     }
 
     /// Refuse a store that could not read one of the ledgers it was opened
     /// for, naming the first: what [`Store::open`] and
     /// [`Store::open_for_update`] do on opening, for a store opened with
-    /// [`Store::open_each_for_update`] once it needs every ledger. The lock a
-    /// store opened for update holds stays held.
+    /// [`Store::open_each`] once it needs every ledger.
     ///
     /// # Errors
     ///
     /// [`StoreError::Ledger`] with why the first unreadable ledger could not
     /// be read.
     pub fn all_read(mut self) -> Result<Self, StoreError> {
+        self.take_unreadable()?;
+        Ok(self)
+    }
+
+    /// [`Store::all_read`] in place: the first ledger the store could not
+    /// read leaves it, as its error.
+    fn take_unreadable(&mut self) -> Result<(), StoreError> {
         let unreadable = self
             .ledgers
             .iter()
             .find_map(|(repo, read)| read.is_err().then(|| repo.clone()));
         match unreadable.and_then(|repo| self.ledgers.remove(&repo)) {
             Some(Err(error)) => Err(error.into()),
-            _ => Ok(self),
+            _ => Ok(()),
         }
     }
 
@@ -389,7 +438,7 @@ impl Store {
             state,
             ledgers,
             writes,
-            _forks: forks,
+            forks,
         })
     }
 
@@ -489,7 +538,7 @@ impl Store {
     /// Put `next` in place of the claim at `key` that this store holds now.
     /// The decision to take or release a claim was made from that one, so
     /// the save refuses when the file holds another: a writer that bypassed
-    /// the fork's lock (an older knives, a hand edit) moved it meanwhile.
+    /// the branch's lock (an older knives, a hand edit) moved it meanwhile.
     ///
     /// The owner that moved it is that writer's own text, and the refusal is
     /// printed to a terminal, so it goes out escaped
@@ -627,9 +676,10 @@ impl Store {
 
     /// The stamp of the live statement of `kind` about `target`, which a
     /// statement replacing it is stamped after ([`crate::ledger::Stated::replaces`]).
-    /// Read from a store opened for update of `target`'s fork, it is the
-    /// newest this machine has while it holds the fork's lock its writers
-    /// take ([`Store::open_for_update`]).
+    /// It is the newest this machine has while the reader holds the lock
+    /// every writer of that statement on this machine takes: the fork's
+    /// ([`Store::open_for_update`]) for `track` and `depends`, and for
+    /// `superseded`, which only `finish` writes, the branch's ([`BranchLock`]).
     pub fn statement_stamp(
         &self,
         target: &BranchTarget,
@@ -656,9 +706,8 @@ impl Store {
         }
     }
     /// Why `repo`'s ledger could not be read at all, for a store opened with
-    /// [`Store::open_each`] or [`Store::open_each_for_update`]: that fork's
-    /// answer is this, and nothing else about its ledger may be asked of the
-    /// store.
+    /// [`Store::open_each`]: that fork's answer is this, and nothing else
+    /// about its ledger may be asked of the store.
     pub fn unreadable(&self, repo: &UpstreamName) -> Option<&LedgerError> {
         self.ledgers.get(repo)?.as_ref().err()
     }
@@ -776,8 +825,10 @@ impl Store {
 /// The lock of each fork in `repos`, taken in name order so that two writers
 /// about the same forks cannot each hold one the other waits for. A fork's
 /// lock is `fork-locks/<upstream>.lock` beside the state file: it guards the
-/// fork's records in the state file, its ledger statements and the release
-/// verbs' ledger events ([`ForkLock`]), and nothing else.
+/// fork's statements of `track` and `depends`, the pull request records
+/// `sync` keeps in the state file, and the release verbs' ledger events
+/// ([`ForkLock`]), and nothing else. A claim is guarded by its branch's lock
+/// ([`BranchLock`]).
 pub(crate) fn lock_forks(path: &Path, repos: &[&UpstreamName]) -> Result<Vec<FileLock>, LockError> {
     let ordered: BTreeSet<&UpstreamName> = repos.iter().copied().collect();
     ordered
@@ -793,16 +844,19 @@ pub(crate) fn lock_forks(path: &Path, repos: &[&UpstreamName]) -> Result<Vec<Fil
         .collect()
 }
 
-/// One fork's lock ([`lock_forks`]), held by a writer that opens no store for
-/// update: a release verb, from before its first read of the fork's ledger
-/// until its last write.
+/// One fork's lock ([`lock_forks`]), held by a writer that opens no store
+/// for update.
+///
+/// A release verb holds it from the first read it decides from, once it has
+/// asked the network, until its last write; `finish`'s sweep of a release's
+/// earlier writes holds it for that sweep alone.
 ///
 /// The lock is the kernel's lock on one open file, so a second acquire in
 /// the same process waits for the first one like any other waiter, and then
-/// gives up. So a release verb takes it once, before it reads anything, and
-/// nothing it runs takes it again: it opens the store only to read
-/// ([`Store::open`], which takes no lock), and an append to the ledger takes
-/// none ([`Ledger::append`]).
+/// gives up. So a release verb takes it once, and nothing it runs under it
+/// takes it again: it opens the store only to read ([`Store::open`], which
+/// takes no lock), and an append to the ledger takes none
+/// ([`Ledger::append`]).
 #[derive(Debug)]
 pub struct ForkLock {
     /// Dropping it releases the lock.
@@ -820,9 +874,215 @@ impl ForkLock {
     /// how long ago the lock was written; [`LockError::Io`] when its file
     /// cannot be opened.
     pub fn acquire(repo: &UpstreamName) -> Result<Self, LockError> {
+        Self::acquire_beside(&default_state_path(), repo)
+    }
+
+    /// The lock of `repo` beside the state file at `state`
+    /// ([`ForkLock::acquire`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`ForkLock::acquire`].
+    pub fn acquire_beside(state: &Path, repo: &UpstreamName) -> Result<Self, LockError> {
         Ok(Self {
-            _held: lock_forks(&default_state_path(), &[repo])?,
+            _held: lock_forks(state, &[repo])?,
         })
+    }
+}
+
+/// `repo` as one file name: each `%` as `%25`, each `/` as `%2F` and a
+/// leading `.` as `%2E`, or its digest where that is too long ([`fitted`]).
+///
+/// So two upstreams never name one lock file, and no lock of one upstream is
+/// a directory of another's. The sync and branch locks each live under a
+/// root of their own beside the state file, apart from the fork locks, so
+/// none of them is a fork's lock either.
+fn lock_component(repo: &UpstreamName) -> String {
+    let mut encoded = repo.as_str().replace('%', "%25").replace('/', "%2F");
+    if encoded.starts_with('.') {
+        encoded.replace_range(..1, "%2E");
+    }
+    fitted(encoded)
+}
+
+/// `name`, which starts with no `.`, where it leaves room for `.lock` in a
+/// file name, which is at most 255 bytes where knives runs; else
+/// `.sha256-<its SHA-256 in hex>`, which no such name is.
+fn fitted(name: String) -> String {
+    use sha2::Digest as _;
+    use std::fmt::Write as _;
+    const NAME_MAX: usize = 255;
+    if name.len() + ".lock".len() <= NAME_MAX {
+        return name;
+    }
+    let digest: [u8; 32] = sha2::Sha256::digest(name.as_bytes()).into();
+    let mut fitted = String::with_capacity(".sha256-".len() + 64);
+    fitted.push_str(".sha256-");
+    for byte in digest {
+        let _ = write!(fitted, "{byte:02x}");
+    }
+    fitted
+}
+
+/// One fork's sync lock, held by `sync` of that fork for its whole run.
+///
+/// It covers the network too, so two syncs of one fork take turns: `sync` is
+/// the only writer of the pull request records, so no record can change
+/// while a sync asks the forge, and none can change and change back. Nothing
+/// else takes it, so no other writer of the fork waits on a sync's network;
+/// `sync` takes it before the fork's lock, which it holds for its writes
+/// alone ([`Store::reread_locked`]).
+///
+/// The file is `sync-locks/<upstream>.lock` beside the state file, its
+/// upstream one file name ([`lock_component`]).
+#[derive(Debug)]
+pub struct SyncLock {
+    /// Dropping it releases the lock.
+    _held: FileLock,
+}
+
+impl SyncLock {
+    /// The sync lock of `repo` beside the state file at its default path
+    /// ([`SyncLock::acquire_beside`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`ForkLock::acquire`].
+    pub fn acquire(repo: &UpstreamName) -> Result<Self, LockError> {
+        Self::acquire_beside(&default_state_path(), repo)
+    }
+
+    /// The sync lock of `repo` beside the state file at `state`, waited for
+    /// as a claim writer waits ([`LockWait::CLAIM`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`ForkLock::acquire`].
+    pub fn acquire_beside(state: &Path, repo: &UpstreamName) -> Result<Self, LockError> {
+        // Named `<upstream>.sync` for `FileLock` to put `.lock` in place of:
+        // an upstream name's own dots are not an extension.
+        let target = state
+            .with_file_name("sync-locks")
+            .join(format!("{}.sync", lock_component(repo)));
+        Ok(Self {
+            _held: FileLock::acquire(&target, LockWait::CLAIM)?,
+        })
+    }
+}
+
+/// One branch's lock, held by `start` and `finish` of that branch.
+///
+/// They hold it from before their first read until their last write: a
+/// `start` and a `finish` of one branch take turns, and the later one
+/// decides from what the earlier one wrote, while those of two branches of
+/// one fork run side by side.
+///
+/// Neither holds its fork's lock ([`lock_forks`]) across its run: both wait
+/// on the network (the ledger's claim ref and its push, `jj git fetch`) and
+/// on slow local work (a snapshot, a workspace's removal), and a fork's lock
+/// held across that keeps every other writer of the fork waiting as long.
+/// What the fork's lock kept for them is kept another way:
+///
+/// - a branch's claim is written only by a `start` or a `finish` of that
+///   branch, which take this lock, and the save compares the claim it writes
+///   over with the one the command read ([`StoreError::ClaimMoved`]);
+/// - `superseded`, the one statement `finish` writes, only `knives ledger
+///   migrate` also writes, and a store refuses to open while the state file
+///   holds what that migrates ([`StoreError::Unmigrated`]); `start` writes
+///   no statement;
+/// - the ledger's claim ref changes only by a push leased on the claim
+///   commit the command read; that push also moves this machine's own ref,
+///   leased on its last commit, under the ledger's lock and its git
+///   directory's transport lock, so the claim pushes of one machine still
+///   take turns there;
+/// - `finish`'s sweep of a release's earlier writes, which a release write
+///   must not meet, takes the fork's lock for the sweep alone ([`ForkLock`]);
+/// - a reap, which keeps a release a claim holds, tries the lock of each
+///   release name under the fork's lock, and keeps the release whose lock a
+///   `start` or `finish` holds ([`BranchLock::try_acquire`]).
+///
+/// It is taken before any other lock the command takes: the fork's, the
+/// ledger's and the transport lock, in that order, as every other command
+/// takes those it takes, so no two commands each hold one the other waits
+/// for; the reap's tries under the fork's lock wait for nothing.
+///
+/// The lock is the workspace's the branch's work lives in, named with the
+/// branch's slashes flattened ([`crate::commands::wip::workspace_for`]), so
+/// two branch names that share one workspace, `feat/a` and `feat-a`, share
+/// one lock too: `branch-locks/<upstream>/<workspace>.lock` beside the state
+/// file, its upstream one directory name ([`lock_component`]), one file each.
+#[derive(Debug)]
+pub struct BranchLock {
+    /// Dropping it releases the lock.
+    _held: FileLock,
+}
+
+impl BranchLock {
+    /// The lock of `branch` of `repo` beside the state file at its default
+    /// path ([`BranchLock::acquire_beside`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`ForkLock::acquire`].
+    pub fn acquire(repo: &UpstreamName, branch: &BranchName) -> Result<Self, LockError> {
+        Self::acquire_beside(&default_state_path(), repo, branch)
+    }
+
+    /// The lock of `branch` of `repo` beside the state file at `state`,
+    /// waited for as a claim writer waits ([`LockWait::CLAIM`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`ForkLock::acquire`].
+    pub fn acquire_beside(
+        state: &Path,
+        repo: &UpstreamName,
+        branch: &BranchName,
+    ) -> Result<Self, LockError> {
+        Self::acquire_at(state, repo, branch, LockWait::CLAIM)
+    }
+
+    /// The lock of `branch` of `repo` beside the state file at its default
+    /// path, without waiting: `None` while a `start` or `finish` of the
+    /// branch holds it.
+    ///
+    /// # Errors
+    ///
+    /// [`LockError::Io`] when its file cannot be opened.
+    pub fn try_acquire(
+        repo: &UpstreamName,
+        branch: &BranchName,
+    ) -> Result<Option<Self>, LockError> {
+        Ok(
+            FileLock::try_acquire(&Self::target(&default_state_path(), repo, branch))?
+                .map(|held| Self { _held: held }),
+        )
+    }
+
+    fn acquire_at(
+        state: &Path,
+        repo: &UpstreamName,
+        branch: &BranchName,
+        wait: LockWait,
+    ) -> Result<Self, LockError> {
+        Ok(Self {
+            _held: FileLock::acquire(&Self::target(state, repo, branch), wait)?,
+        })
+    }
+
+    /// What [`FileLock`] locks for `branch` of `repo` beside the state file
+    /// at `state`.
+    fn target(state: &Path, repo: &UpstreamName, branch: &BranchName) -> PathBuf {
+        // A workspace name starts with no `.` ([`BranchName::parse`]), so its
+        // digest, where it is too long for a file name, is no workspace's.
+        let stem = fitted(crate::commands::wip::workspace_for(branch.as_str()));
+        // Named `<stem>.branch` for `FileLock` to put `.lock` in place of: a
+        // workspace name's own dots are not an extension, so `fix-v1.2` and
+        // `fix-v1` are two locks.
+        state
+            .with_file_name("branch-locks")
+            .join(lock_component(repo))
+            .join(format!("{stem}.branch"))
     }
 }
 
@@ -1504,6 +1764,172 @@ mod tests {
         // Then: it opened only once the first was done, and reads its claim.
         assert!(started.elapsed() >= std::time::Duration::from_millis(150));
         assert_eq!(second.claims(None)[0].owner, "first");
+    }
+
+    #[test]
+    fn branch_locks_of_two_branches_are_apart_and_one_branch_has_one_holder() {
+        // Given: feat/alpha's and fix/v1's locks held, and a wait that gives
+        // up at its first try, so a lock someone holds reads as held at once.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let once = LockWait {
+            deadline: std::time::Duration::ZERO,
+            ..LockWait::CLAIM
+        };
+        let alpha = BranchName::new("feat/alpha");
+        let held = BranchLock::acquire_at(&path, &repo(), &alpha, once).unwrap();
+        let _v1 = BranchLock::acquire_at(&path, &repo(), &BranchName::new("fix/v1"), once).unwrap();
+
+        // When / Then: another branch's lock is free, one whose name is
+        // fix/v1's with a dot and more after it included, and so is the
+        // fork's lock.
+        let _beta = BranchLock::acquire_at(&path, &repo(), &BranchName::new("feat/beta"), once)
+            .expect("feat/beta's lock is free while feat/alpha's is held");
+        let _v12 = BranchLock::acquire_at(&path, &repo(), &BranchName::new("fix/v1.2"), once)
+            .expect("fix/v1.2's lock is free while fix/v1's is held");
+        assert!(
+            FileLock::try_acquire(&dir.path().join("fork-locks/a-repo.fork"))
+                .unwrap()
+                .is_some(),
+            "a branch's lock took the fork's"
+        );
+        assert!(
+            dir.path()
+                .join("branch-locks/a-repo/feat-beta.lock")
+                .is_file()
+        );
+
+        // And: feat/alpha's lock is held until its holder lets it go, and it
+        // is feat-alpha's too, whose workspace is feat/alpha's.
+        let refused = BranchLock::acquire_at(&path, &repo(), &alpha, once)
+            .expect_err("one branch's lock has one holder");
+        assert!(matches!(refused, LockError::Held { .. }), "{refused:?}");
+        let shared = BranchLock::acquire_at(&path, &repo(), &BranchName::new("feat-alpha"), once)
+            .expect_err("feat-alpha shares feat/alpha's workspace, and so its lock");
+        assert!(matches!(shared, LockError::Held { .. }), "{shared:?}");
+        // A name with `.lock` in a segment is a file of its own beside the
+        // others, not a directory under one.
+        let _dotted =
+            BranchLock::acquire_at(&path, &repo(), &BranchName::new("feat/alpha.lock/b"), once)
+                .expect("feat/alpha.lock/b's lock is its own");
+        // A workspace name with no room left for `.lock` in a file name has
+        // a lock of its own too, named by its digest.
+        let long = BranchName::new(format!("feat/{}", "a".repeat(249)).as_str());
+        let _long = BranchLock::acquire_at(&path, &repo(), &long, once)
+            .expect("a 254-byte workspace name's lock");
+        assert!(
+            BranchLock::acquire_at(&path, &repo(), &long, once).is_err(),
+            "the long name's lock has one holder"
+        );
+        // And: a branch spelled as that digest's name is a lock of its own.
+        let digest: [u8; 32] = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(format!("feat-{}", "a".repeat(249)).as_bytes()).into()
+        };
+        let spelled: String = std::iter::once("sha256-".to_owned())
+            .chain(digest.iter().map(|byte| format!("{byte:02x}")))
+            .collect();
+        BranchLock::acquire_at(&path, &repo(), &BranchName::new(spelled.as_str()), once)
+            .expect("a branch spelled as a digest's lock name has a lock of its own");
+        drop(held);
+        BranchLock::acquire_at(&path, &repo(), &alpha, once).expect("taken once let go");
+    }
+
+    #[test]
+    fn no_sync_or_branch_lock_is_another_forks_lock() {
+        // Given: `demo`'s sync lock and the lock of its branch `x` held, and
+        // a wait that gives up at its first try.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let once = LockWait {
+            deadline: std::time::Duration::ZERO,
+            ..LockWait::CLAIM
+        };
+        let demo = UpstreamName::new("demo");
+        let _sync = SyncLock::acquire_beside(&path, &demo).unwrap();
+        let _branch = BranchLock::acquire_at(&path, &demo, &BranchName::new("x"), once).unwrap();
+
+        // When / Then: the forks whose names spell those locks' paths under
+        // the fork locks' root take their own locks, and so does the
+        // upstream whose name spells `demo`'s with its `/` encoded.
+        for other in ["demo.sync/sync", "demo.branches/x", "demo/x", "demo%2Fx"] {
+            let _fork = ForkLock::acquire_beside(&path, &UpstreamName::new(other))
+                .unwrap_or_else(|error| panic!("{other}'s fork lock: {error:?}"));
+            let _its_sync = SyncLock::acquire_beside(&path, &UpstreamName::new(other))
+                .unwrap_or_else(|error| panic!("{other}'s sync lock: {error:?}"));
+        }
+        BranchLock::acquire_at(
+            &path,
+            &UpstreamName::new("demo%2F"),
+            &BranchName::new("x"),
+            once,
+        )
+        .expect("another upstream's branch x");
+    }
+
+    #[test]
+    fn an_upstream_too_long_for_a_file_name_has_locks_of_its_own() {
+        // Given: two upstreams whose names, `/` encoded, pass 255 bytes, and
+        // one whose name starts with `.`, and a wait that gives up at its
+        // first try.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let once = LockWait {
+            deadline: std::time::Duration::ZERO,
+            ..LockWait::CLAIM
+        };
+        let first = UpstreamName::new(format!("acme/{}", "r".repeat(250)).as_str());
+        let second = UpstreamName::new(format!("acme/{}", "s".repeat(250)).as_str());
+        let dotted = UpstreamName::new(".dotted");
+
+        // When / Then: each takes its sync lock and a branch's lock, the
+        // first's held while the second's are taken.
+        let _first_sync = SyncLock::acquire_beside(&path, &first).expect("the first's sync lock");
+        let _first_branch = BranchLock::acquire_at(&path, &first, &BranchName::new("x"), once)
+            .expect("the first's branch lock");
+        let _second_sync =
+            SyncLock::acquire_beside(&path, &second).expect("the second's sync lock");
+        BranchLock::acquire_at(&path, &second, &BranchName::new("x"), once)
+            .expect("the second's branch lock");
+        let _dotted_sync = SyncLock::acquire_beside(&path, &dotted).expect("the dotted sync lock");
+        assert!(dir.path().join("sync-locks/%2Edotted.lock").is_file());
+    }
+
+    #[test]
+    fn a_locked_reread_reads_what_another_writer_saved_and_holds_the_forks_lock() {
+        // Given: a writer that opened the store with no lock and made a
+        // change, and another writer's claim saved after that open.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut subject = Store::open(path.clone(), &FormerNames::new(), &[&repo()]).unwrap();
+        subject.record_pull_head(&repo(), 42, "aaaa");
+        let mut other = Store::open(path.clone(), &FormerNames::new(), &[&repo()]).unwrap();
+        let _ = other.claim(&target(), &os_user("other"), "w");
+        other.save().unwrap();
+        assert!(subject.claim_of(&target()).is_none());
+
+        // When: the writer takes the fork's lock and reads again.
+        let lock = subject.reread_locked().unwrap();
+
+        // Then: it answers with the other writer's claim and its own change,
+        // and the fork's lock is held until the lock it got goes.
+        assert_eq!(subject.claim_of(&target()).unwrap().owner, "other");
+        assert_eq!(subject.pull_heads(&repo()).get("42").unwrap(), "aaaa");
+        let fork = dir.path().join("fork-locks/a-repo.fork");
+        assert!(FileLock::try_acquire(&fork).unwrap().is_none());
+        drop(lock);
+        assert!(FileLock::try_acquire(&fork).unwrap().is_some());
+
+        // And: a store that holds the fork's lock since its open reads again
+        // without taking it a second time, which would wait on itself.
+        let mut holder = Store::open_for_update(path, &FormerNames::new(), &[&repo()]).unwrap();
+        let _again = holder.reread_locked().unwrap();
+        assert!(FileLock::try_acquire(&fork).unwrap().is_none());
+        subject.save().unwrap();
+        assert_eq!(
+            store(dir.path()).pull_heads(&repo()).get("42").unwrap(),
+            "aaaa"
+        );
     }
 
     #[test]

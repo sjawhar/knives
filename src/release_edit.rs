@@ -18,6 +18,7 @@ use knives::release_model::{
     member_history, member_parents, members_event_text, read_release, series_fit,
     trunk_positions_in,
 };
+use knives::store::ForkLock;
 
 use super::scribe_for;
 
@@ -670,7 +671,6 @@ fn edit_release(
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
     let entry = fork.entry;
-    let opened = knives::jj::Repo::open(&fork.checkout.path)?;
     let consumers = release::ConsumerInputs {
         slugs: &entry.consumers,
         locals,
@@ -678,7 +678,14 @@ fn edit_release(
         cache_root,
         heads,
     };
-    let plan = release::pulled_plan(fork, bound.registry, &consumers)?;
+    let fetched = release::fetch(fork, bound.registry, &consumers);
+    // The fork's lock is taken once the network has answered, and the
+    // repository and the ledger the edit decides from are read under it: a
+    // write of this fork that landed while this one asked is in what it reads
+    // ([`release::Fetched::plan`]).
+    let _fork = ForkLock::acquire(&fork.upstream)?;
+    let opened = knives::jj::Repo::open(&fork.checkout.path)?;
+    let plan = fetched.plan(fork, &consumers)?;
     if refuse_plan_problems(repo, &plan, change.verb()) {
         return Ok(Exit::Incomplete);
     }
