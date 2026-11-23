@@ -7,9 +7,10 @@
 //! removed. Where another change edited a line of the member, the line is
 //! held by its words. A release-log entry is held wherever the release's one
 //! `## [Unreleased]` section holds it. `members --verify`, both audits of
-//! `release cut`, the composition gate, `--carries` and `--census` read a
-//! member this way, and each names the lines that a member lacks. These tests
-//! drive only the knives binary.
+//! `release cut` and the composition gate read a member this way, and each
+//! names the lines that a member lacks. `--carries` and `--census` read the
+//! same base by replay; their tests here pin what they answer for these
+//! shapes. These tests drive only the knives binary.
 
 #![allow(
     clippy::expect_used,
@@ -527,7 +528,7 @@ fn carries_reads_carried_rewritten_for_a_cherry_pick_on_an_older_trunk() {
     let out = stdout(&output);
     assert!(
         out.contains(&format!(
-            "carried-rewritten  {RELEASE} @ {}  (evidence {}: the release holds its own lines)",
+            "carried-rewritten  {RELEASE} @ {}  (evidence {}: no net content remains)",
             release.short(),
             release.short()
         )),
@@ -614,15 +615,6 @@ const X: &str = "feat/x";
 const Y: &str = "feat/y";
 /// X's two lines, in `x.txt`.
 const X_LINES: &str = "x one\nx two\n";
-/// How `--carries` and `--census` name X's two lines where a release lacks
-/// them.
-const X_LINES_LOST: [&str; 2] = [
-    "x.txt:1: added line lost ‹x one›",
-    "x.txt:2: added line lost ‹x two›",
-];
-/// How `--carries` and `--census` name the line that c1, X's first commit,
-/// adds to `a.txt`, where a release lacks it.
-const C1_LINE_LOST: &str = "a.txt:1: added line lost ‹c1 line›";
 
 /// The start of a check that reads the revision as not carried by
 /// `release` at `commit`, up to its evidence; f6a1ef95 prints it too.
@@ -678,8 +670,8 @@ fn carries_reads_a_trunk_merged_revision_from_before_its_merge() {
     let output = carries_against(&lab, &home, RELEASE, X);
 
     // Then: X's change is read from its fork point with the merge's first
-    // parent, T0: the release does not carry it, with the findings exit,
-    // and both its lines are named.
+    // parent, T0: the release does not carry it, with the findings exit.
+    // `--carries` names no line: `members --verify` does.
     let out = stdout(&output);
     assert!(
         out.contains(&not_carried(RELEASE, &lacking)),
@@ -687,9 +679,6 @@ fn carries_reads_a_trunk_merged_revision_from_before_its_merge() {
         text(&output)
     );
     assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
-    for line in X_LINES_LOST {
-        assert!(out.contains(line), "{out}");
-    }
 
     // And: the census, whose live release that is, reads it the same way.
     let census_out = census(&lab, &home);
@@ -698,9 +687,6 @@ fn carries_reads_a_trunk_merged_revision_from_before_its_merge() {
         block.contains(&not_carried(RELEASE, &lacking)),
         "{census_out}"
     );
-    for line in X_LINES_LOST {
-        assert!(block.contains(line), "{census_out}");
-    }
 
     // Given: a later release on T1 of N and a cherry-pick of X's change.
     member_on(
@@ -746,8 +732,8 @@ fn carries_reads_a_fast_forwarded_revision_from_the_trunk_commit_its_release_sta
     let output = carries_against(&lab, &home, RELEASE, X);
 
     // Then: X's change is read from c0, the newest commit of the trunk's
-    // line that the release holds: X reads missing, and c1's line is named,
-    // not c2's, which the release holds.
+    // line that the release holds: c1's line is not in it, so X reads
+    // missing.
     let out = stdout(&output);
     assert!(
         out.contains(&not_carried(RELEASE, &lacking)),
@@ -755,8 +741,6 @@ fn carries_reads_a_fast_forwarded_revision_from_the_trunk_commit_its_release_sta
         text(&output)
     );
     assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
-    assert!(out.contains(C1_LINE_LOST), "{out}");
-    assert!(!out.contains("b.txt:"), "{out}");
 
     // Given: a release on c0 of a member that holds both commits' changes.
     member_on(
@@ -797,9 +781,8 @@ fn carries_reads_a_fast_forwarded_revision_whole_against_a_release_of_unrelated_
 
     // Then: the release's parents hold no commit of X's first-parent line
     // but the root commit, so X's base is the root commit and X's whole tree
-    // is its change: the release does not carry X, with the findings exit.
-    // The lines of the trunk's files that the release lacks are named, and
-    // X's own lines, which it holds, are not.
+    // is its change: the release, which lacks the trunk's files, does not
+    // carry X, with the findings exit.
     let out = stdout(&output);
     assert!(
         out.contains(&not_carried(RELEASE, &lacking)),
@@ -807,15 +790,6 @@ fn carries_reads_a_fast_forwarded_revision_whole_against_a_release_of_unrelated_
         text(&output)
     );
     assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
-    for line in [
-        "README.md:1: added line lost ‹seed›",
-        "l.txt:1: added line lost ‹first›",
-        "l.txt:2: added line lost ‹L = 0›",
-        "l.txt:3: added line lost ‹last›",
-    ] {
-        assert!(out.contains(line), "{out}");
-    }
-    assert!(!out.contains("x.txt:"), "{out}");
 
     // Given: a release of a member of an unrelated history that holds X's
     // whole tree.
@@ -895,7 +869,7 @@ fn carries_reads_a_revision_merged_through_another_branch_missing_where_the_rele
     // When: X's carriage is asked against that release.
     let output = carries_against(&lab, &home, RELEASE, X);
 
-    // Then: X reads missing, and its two lines are named.
+    // Then: X reads missing.
     let out = stdout(&output);
     assert!(
         out.contains(&not_carried(RELEASE, &release)),
@@ -903,9 +877,6 @@ fn carries_reads_a_revision_merged_through_another_branch_missing_where_the_rele
         text(&output)
     );
     assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
-    for line in X_LINES_LOST {
-        assert!(out.contains(line), "{out}");
-    }
 }
 
 /// K11 (20c): Y forks at T0's parent and writes `y.txt`; the trunk moves
@@ -967,8 +938,7 @@ fn carries_reads_a_fast_forward_after_a_merged_member_missing_where_the_release_
     // When: X's carriage is asked against that release.
     let output = carries_against(&lab, &home, RELEASE, X);
 
-    // Then: X reads missing, and only c1's line is named: not c2's or Y's,
-    // which the release holds, nor N's file.
+    // Then: X reads missing: c1's line is not in the release.
     let out = stdout(&output);
     assert!(
         out.contains(&not_carried(RELEASE, &release)),
@@ -976,10 +946,6 @@ fn carries_reads_a_fast_forward_after_a_merged_member_missing_where_the_release_
         text(&output)
     );
     assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
-    assert!(out.contains(C1_LINE_LOST), "{out}");
-    for other in ["b.txt", "y.txt", "n.txt"] {
-        assert!(!out.contains(other), "{out}");
-    }
 }
 
 #[test]
@@ -1322,11 +1288,10 @@ fn neighbour_edit_release() -> (Lab, TempDir, CommitId) {
 }
 
 #[test]
-fn a_neighbour_edit_leaves_a_member_carried_in_every_command() {
+fn a_neighbour_edit_leaves_a_member_carried_in_every_gate() {
     // Given: M adds a function; N changes the line right after it; the
     // release merges both and holds both changes.
     let (lab, home, release) = neighbour_edit_release();
-    let member = commit_at(&lab, M);
 
     // When/Then: `members --verify` exits 0 and reads M and N as carried.
     let verified = verify(&lab, &home, RELEASE);
@@ -1336,27 +1301,27 @@ fn a_neighbour_edit_leaves_a_member_carried_in_every_command() {
         assert!(out.contains(&carried_row(&label(&lab, branch))), "{out}");
     }
 
-    // And: `--carries` of M reads carried-exact, not `conflicted`.
+    // And: `--carries` and `--census` of M read merged-then-edited, exit 3:
+    // they read the release by replay, and N's edit next to M's line makes
+    // M's replay conflict; a person judges it.
     let carried = carries(&lab, &home, M);
     let carried_out = stdout(&carried);
     assert!(
         carried_out.contains(&format!(
-            "carried-exact      {RELEASE} @ {}  (evidence {}: tip is an ancestor and the release \
-             holds its own lines)",
+            "merged-then-edited {RELEASE} @ {}  (evidence {}: tip is an ancestor, but work \
+             since changed what it brought; judge by eye)",
             release.short(),
-            member.short()
+            release.short()
         )),
         "{}",
         text(&carried)
     );
-    assert!(!carried_out.contains("conflicted"), "{carried_out}");
-    assert_eq!(carried.status.code(), Some(0), "{}", text(&carried));
-
-    // And: `--census` reads M as carried by the release.
+    assert!(!carried_out.contains("carried-"), "{carried_out}");
+    assert_eq!(carried.status.code(), Some(3), "{}", text(&carried));
     let census_out = census(&lab, &home);
     assert!(
         census_block(&census_out, M).contains(&format!(
-            "carried-exact      {RELEASE} @ {}",
+            "merged-then-edited {RELEASE} @ {}",
             release.short()
         )),
         "{census_out}"
@@ -1448,35 +1413,20 @@ fn wrapped_call_release() -> (Lab, TempDir, CommitId) {
     )
 }
 
-/// `--carries` and `--census` of [`M`] name [`CALL`] as held only by its
-/// words, in their text, and `--carries` in its JSON report too.
-fn assert_word_held_by_carries_and_census(lab: &Lab, home: &TempDir) {
+/// `--carries` and `--census` of [`M`], which read the release by replay,
+/// read merged-then-edited: N's wrap of [`CALL`] changed what M brought.
+fn assert_carries_and_census_read_merged_then_edited(lab: &Lab, home: &TempDir) {
     let carried = carries(lab, home, M);
     let out = stdout(&carried);
     assert!(
-        out.contains(&format!("carried-exact      {RELEASE} @ ")),
+        out.contains(&format!("merged-then-edited {RELEASE} @ ")),
         "{}",
         text(&carried)
     );
-    assert!(out.contains(WORD_HELD), "{out}");
-    let report = json_report(lab, home, &["members", "--carries", M]);
-    let check = report["checks"]
-        .as_array()
-        .and_then(|checks| checks.iter().find(|check| check["target"] == RELEASE))
-        .unwrap_or_else(|| panic!("no check against {RELEASE}: {report}"));
-    assert_eq!(
-        check["lines"]["held_by_words"],
-        json!([{
-            "path": JS,
-            "line": 3,
-            "text": CALL,
-            "release_lines": [{ "line": 3, "text": WRAPPED }],
-        }]),
-        "{report}"
-    );
+    assert_eq!(carried.status.code(), Some(3), "{}", text(&carried));
     let census_out = census(lab, home);
     assert!(
-        census_block(&census_out, M).contains(WORD_HELD),
+        census_block(&census_out, M).contains(&format!("merged-then-edited {RELEASE} @ ")),
         "{census_out}"
     );
 }
@@ -1512,10 +1462,12 @@ fn a_wrapped_call_is_held_by_its_words_and_named() {
         "{report}"
     );
 
-    // And: `--carries` and `--census` name it the same way.
-    assert_word_held_by_carries_and_census(&lab, &home);
+    // And: `--carries` and `--census`, which read by replay, leave it to a
+    // person.
+    assert_carries_and_census_read_merged_then_edited(&lab, &home);
 
-    // And: so does the audit of a next knives cut over the recorded release.
+    // And: the audit of a next knives cut over the recorded release names
+    // the line as `--verify` does.
     let recorded = record(&lab, &home, RELEASE, &release);
     assert_eq!(recorded.status.code(), Some(0), "{}", text(&recorded));
     // The working copy steps off the release, or the reap keeps it for that.
@@ -2381,16 +2333,15 @@ fn a_conflict_in_the_members_path_is_inconclusive_and_one_elsewhere_is_not() {
     assert!(out.contains(&carried_row(&label(&lab, O))), "{out}");
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
 
-    // And: `--carries` reads M `conflicted` there, and O carried-exact.
-    let conflicted = stdout(&carries(&lab, &home, M));
+    // And: `--carries` reads M, which the release reaches and whose replay
+    // conflicts there, merged-then-edited, and O carried-exact.
+    let conflicted = carries(&lab, &home, M);
     assert!(
-        conflicted.contains(&format!("conflicted         {RELEASE} @ ")),
-        "{conflicted}"
+        stdout(&conflicted).contains(&format!("merged-then-edited {RELEASE} @ ")),
+        "{}",
+        text(&conflicted)
     );
-    assert!(
-        conflicted.contains(": the release holds an unresolved conflict in its path)"),
-        "{conflicted}"
-    );
+    assert_eq!(conflicted.status.code(), Some(3), "{}", text(&conflicted));
     let other = stdout(&carries(&lab, &home, O));
     assert!(
         other.contains(&format!("carried-exact      {RELEASE} @ ")),
@@ -2399,7 +2350,7 @@ fn a_conflict_in_the_members_path_is_inconclusive_and_one_elsewhere_is_not() {
 }
 
 #[test]
-fn a_member_whose_tip_holds_a_conflict_reads_inconclusive_and_conflicted() {
+fn a_member_whose_tip_holds_a_conflict_reads_inconclusive_and_not_carried() {
     // Given: M forks at T0 and changes the line of `f.txt`; the trunk moves
     // to T1, which changes that line too, and N forks there; M is rebased
     // onto T1, which leaves its tip conflicted in `f.txt`; a release made
@@ -2430,17 +2381,17 @@ fn a_member_whose_tip_holds_a_conflict_reads_inconclusive_and_conflicted() {
     assert!(!out.contains(&missing_row(&member)), "{out}");
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
 
-    // And: `--carries` reads it `conflicted`, and says the conflict is at
-    // the member's tip, not in the release.
-    let carried = stdout(&carries(&lab, &home, M));
+    // And: `--carries` does not read it carried: the release reaches it, and
+    // a tip that holds an unresolved conflict is merged-then-edited, exit 3.
+    let carried = carries(&lab, &home, M);
+    let out = stdout(&carried);
     assert!(
-        carried.contains(&format!("conflicted         {RELEASE} @ ")),
-        "{carried}"
+        out.contains(&format!("merged-then-edited {RELEASE} @ ")),
+        "{}",
+        text(&carried)
     );
-    assert!(
-        carried.contains(": the member's tip holds an unresolved conflict in its path)"),
-        "{carried}"
-    );
+    assert!(!out.contains("carried-"), "{out}");
+    assert_eq!(carried.status.code(), Some(3), "{}", text(&carried));
 }
 
 /// A knives cut of [`M`], which writes `m.txt` as `line`; the trunk then
@@ -2475,7 +2426,7 @@ fn carries_reads_carried_rebased_where_the_release_holds_the_rewrites_lines() {
     assert!(
         out.contains(&format!(
             "carried-rebased    {RELEASE} @ {}  (evidence {}: a rewrite of the change is an \
-             ancestor and the release holds the rewrite's own lines)",
+             ancestor)",
             release.short(),
             rewrite.short()
         )),
@@ -2499,21 +2450,16 @@ fn carries_reads_not_carried_where_the_release_reverts_a_rewrites_lines() {
     // When: M's first commit is checked against the release.
     let output = carries(&lab, &home, first.as_str());
 
-    // Then: not carried, as its ancestry alone does not carry it, and the
-    // line it lacks is named.
+    // Then: not carried, as its ancestry alone does not carry it: its replay
+    // onto a release whose line was emptied conflicts, a finding.
     let out = stdout(&output);
-    assert!(!out.contains("carried-rebased"), "{}", text(&output));
+    assert!(!out.contains("carried-"), "{}", text(&output));
     assert!(
         out.contains(&format!(
-            "NOT carried        {RELEASE} @ {}  (evidence {}: the release lacks 1 of its own \
-             lines)",
+            "conflicted         {RELEASE} @ {}  (evidence {}: judge by eye)",
             release.short(),
             release.short()
         )),
-        "{out}"
-    );
-    assert!(
-        out.contains("m.txt:1: added line lost ‹the member's line›"),
         "{out}"
     );
     assert_eq!(output.status.code(), Some(FINDINGS), "{out}");

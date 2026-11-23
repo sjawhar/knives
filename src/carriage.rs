@@ -2,20 +2,21 @@
 //! commit's description.
 //!
 //! The audit's worst near-miss class was a branch deleted while its content
-//! was uncarried. The verdicts here are content-based first. Against the
-//! upstream trunk, which knives does not compose: sha ancestry for
-//! carried-exact, and a three-way tree merge for carried-rewritten (jj
-//! divergent change-ids force tree comparison — the same change id can name
-//! two different trees). Against a release: the revision's own lines, the
-//! change from its base by spec R6 to its tip, which the release must hold
-//! ([`crate::own_lines`], spec R6 and R9). Only when the content
+//! was uncarried. The verdicts here are content-based first: sha ancestry for
+//! carried-exact (against a release, ancestry and a replay of its change from
+//! its base by spec R6 that finds that change in the release's tree), a
+//! three-way tree merge for carried-rewritten (jj divergent change-ids force
+//! tree comparison — the same change id can name two different trees). An
+//! ancestor of a release whose change does not replay empty onto it is
+//! merged-then-edited: its commits are in the release, but what it brought
+//! was changed since, and a person judges it. Only when the content
 //! says otherwise does the change id speak, and it says something weaker on
 //! purpose: carried-rebased means a rewrite of the change (`jj rebase` keeps
 //! the change id) is in the target's ancestry, so the change lives on there
 //! in the form its author gave it on the new base — not that this exact tree
-//! does. A release must also hold the rewrite's own lines. Merge conflicts
-//! with no such rewrite stay a matter for human judgment. A net-zero revision
-//! is vacuously carried: it contributes no content for the target to lack.
+//! does. Merge conflicts with no such rewrite stay a matter for human
+//! judgment. A net-zero revision is vacuously carried: it contributes no
+//! content for the target to lack.
 //! Every verdict names an evidence commit a notch can cite and a later reader
 //! can re-resolve.
 
@@ -28,7 +29,6 @@ use crate::detect::{BookmarkTips, RebaseOutcome};
 use crate::forge::{Forge, index_pulls};
 use crate::ids::{BookmarkRef, BranchName, CommitId, CutKey, ReleaseScheme, is_our_release};
 use crate::jj::{ChangeBase, Repo, TakenIn};
-use crate::own_lines::{LostKind, MemberLines, Reading};
 use crate::release_model;
 use crate::snapshot::{self, SnapshotConfig};
 
@@ -57,29 +57,35 @@ pub enum TargetRole {
 #[serde(rename_all = "kebab-case")]
 pub enum CarryVerdict {
     /// The revision's tip is an ancestor of the target: carried as-is. For a
-    /// release target, the release also holds the tip's own lines: a release
-    /// merge reaches every member it names as a parent whatever its tree
-    /// holds, so ancestry alone does not show a hand resolution kept it.
+    /// release target, its change from its base by spec R6 also replays
+    /// empty, with no conflict, onto the release: a release merge reaches
+    /// every member it names as a parent whatever its tree holds, so ancestry
+    /// alone does not show a hand resolution kept it.
     CarriedExact,
-    /// Against the upstream trunk, its net tree change leaves the trunk
-    /// unchanged, whether the same content arrived through different commits
-    /// or the revision itself has no net content. Against a release, the
-    /// release does not reach the tip and holds its own lines.
+    /// Its net tree change leaves the target unchanged, whether the same
+    /// content arrived through different commits or the revision itself has
+    /// no net content.
     CarriedRewritten,
     /// Its content does not read as carried, but a rewrite of its change that
     /// stands for it — a successor of it, or a commit with its tree
     /// ([`crate::jj::Repo::standing_rewrites_of`]) — is an ancestor of the
     /// target: the change is carried as its author rebased it, and that
-    /// rewrite is the evidence. A release must also hold the rewrite's own
-    /// lines. An older version of the change, which only shares its change
-    /// id, carries nothing of what the newer one added.
+    /// rewrite is the evidence. An older version of the change, which only
+    /// shares its change id, carries nothing of what the newer one added.
     CarriedRebased,
+    /// The tip is an ancestor of the release, but its change from its base
+    /// does not replay empty onto it: work merged with it or after it, or a
+    /// resolution, changed what it brought. Its commits are in the release;
+    /// whether its change is, a person judges, with the commits since that
+    /// changed its files ([`crate::jj::Repo::edited_since`]). A record of the
+    /// branch it was built on is not read: no input decides it carried.
+    MergedThenEdited,
+    /// The tip is not in the target, and its change replays onto the target
+    /// with something left over.
     NotCarried,
-    /// Against the upstream trunk, the replay conflicted while the trunk
-    /// itself is clean: some content is there or unrelated work touched the
-    /// same files; judge by eye. Against a release, a path of its change
-    /// holds an unresolved conflict, in the release or at the tip, so its own
-    /// lines cannot be read there, and the release lacks nothing else.
+    /// The tip is not in the target, and the replay conflicted while the
+    /// target itself is clean: some content is there or unrelated work
+    /// touched the same files; judge by eye.
     Conflicted,
 }
 
@@ -94,19 +100,13 @@ impl CarryVerdict {
 
 /// One verdict with the commit that proves it.
 ///
-/// The revision tip for carried-exact (it IS in the target's ancestry, and a
-/// release holds its own lines), the rewrite for carried-rebased (the same
-/// change, in the target's ancestry), the target commit otherwise (the tree
-/// the verdict was read from).
+/// The revision tip for carried-exact (it IS in the target's ancestry), the
+/// rewrite for carried-rebased (the same change, in the target's ancestry),
+/// the target commit otherwise (the tree the verdict was read from).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CarryCheck {
     pub verdict: CarryVerdict,
     pub evidence: CommitId,
-    /// Against a release, the own lines that decided the verdict: the
-    /// rewrite's for carried-rebased, the tip's for every other verdict.
-    /// `None` against the upstream trunk.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lines: Option<MemberLines>,
 }
 /// One target's carriage verdict, including how it was classified for exit
 /// semantics and the commit that establishes the verdict.
@@ -118,10 +118,11 @@ pub struct TargetCheck {
     pub role: TargetRole,
     pub verdict: CarryVerdict,
     pub evidence: CommitId,
-    /// What the release holds of the revision's own lines
-    /// ([`CarryCheck::lines`]); `None` against the upstream trunk.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lines: Option<MemberLines>,
+    /// For a merged-then-edited verdict asked about one revision, the
+    /// target's commits that changed a file of the revision's change since
+    /// it was merged, newest first ([`edited_since`]); empty otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub edited_since: Vec<CommitId>,
 }
 
 /// The complete answer to a `release members --carries` query.
@@ -389,12 +390,7 @@ fn census_rows(
                         let members = slice
                             .iter()
                             .map(|input| {
-                                let check_input = CheckInput::new(
-                                    &repo,
-                                    &input.branch,
-                                    &input.tip,
-                                    targets.trunk,
-                                );
+                                let check_input = CheckInput::new(&repo, &input.tip, targets.trunk);
                                 census_member(input, targets, &mut problems, |target| {
                                     check(&check_input, target)
                                 })
@@ -510,7 +506,7 @@ impl<'a> CensusChecks<'a> {
                     role: target.role,
                     verdict: check.verdict,
                     evidence: check.evidence,
-                    lines: check.lines,
+                    edited_since: Vec::new(),
                 }),
                 Err(error) => {
                     complete = false;
@@ -676,54 +672,32 @@ pub fn render_carries(report: &CarriesReport) -> String {
     lines.join("\n")
 }
 
-/// One check's line, then, against a release, the lines that name what the
-/// release lacks of the revision's own lines and each line that it holds
-/// only by its words, indented 2 more than the check
-/// ([`crate::commands::release::lost_lines`],
-/// [`crate::commands::release::held_by_words_lines`]).
+/// One check's line, then, for a merged-then-edited verdict, the commits
+/// that changed the revision's files since, indented 2 more than the check.
 fn render_check(check: &TargetCheck, indent: &str) -> Vec<String> {
-    use std::borrow::Cow;
+    /// How many of the commits that changed a merged-then-edited tip's files
+    /// one row names.
+    const SHOWN: usize = 12;
     let verdict = match check.verdict {
         CarryVerdict::CarriedExact => "carried-exact",
         CarryVerdict::CarriedRewritten => "carried-rewritten",
         CarryVerdict::CarriedRebased => "carried-rebased",
+        CarryVerdict::MergedThenEdited => "merged-then-edited",
         CarryVerdict::NotCarried => "NOT carried",
         CarryVerdict::Conflicted => "conflicted",
     };
-    let reason: Cow<'_, str> = match check.role {
-        TargetRole::UpstreamTrunk => match check.verdict {
-            CarryVerdict::CarriedExact => "tip is an ancestor",
-            CarryVerdict::CarriedRewritten => "no net content remains",
-            CarryVerdict::CarriedRebased => "a rewrite of the change is an ancestor",
-            CarryVerdict::NotCarried => "replay leaves real diffs",
-            CarryVerdict::Conflicted => "judge by eye",
+    let reason = match (check.verdict, check.role) {
+        (CarryVerdict::CarriedExact, TargetRole::UpstreamTrunk) => "tip is an ancestor",
+        (CarryVerdict::CarriedExact, TargetRole::LiveRelease | TargetRole::SupersededRelease) => {
+            "tip is an ancestor and its change replays empty onto the release"
         }
-        .into(),
-        TargetRole::LiveRelease | TargetRole::SupersededRelease => match check.verdict {
-            CarryVerdict::CarriedExact => {
-                "tip is an ancestor and the release holds its own lines".into()
-            }
-            CarryVerdict::CarriedRewritten => "the release holds its own lines".into(),
-            CarryVerdict::CarriedRebased => "a rewrite of the change is an ancestor and the \
-                                             release holds the rewrite's own lines"
-                .into(),
-            CarryVerdict::NotCarried => format!(
-                "the release lacks {} of its own lines",
-                check.lines.as_ref().map_or(0, lacking)
-            )
-            .into(),
-            CarryVerdict::Conflicted
-                if check
-                    .lines
-                    .as_ref()
-                    .is_some_and(MemberLines::conflicted_only_at_tip) =>
-            {
-                "the member's tip holds an unresolved conflict in its path".into()
-            }
-            CarryVerdict::Conflicted => {
-                "the release holds an unresolved conflict in its path".into()
-            }
-        },
+        (CarryVerdict::CarriedRewritten, _) => "no net content remains",
+        (CarryVerdict::CarriedRebased, _) => "a rewrite of the change is an ancestor",
+        (CarryVerdict::MergedThenEdited, _) => {
+            "tip is an ancestor, but work since changed what it brought; judge by eye"
+        }
+        (CarryVerdict::NotCarried, _) => "replay leaves real diffs",
+        (CarryVerdict::Conflicted, _) => "judge by eye",
     };
     let target = if check.target.is_empty() {
         match check.role {
@@ -738,25 +712,24 @@ fn render_check(check: &TargetCheck, indent: &str) -> Vec<String> {
         check.commit.short(),
         check.evidence.short(),
     )];
-    if let Some(lines) = &check.lines {
-        let under = format!("{indent}  ");
-        out.extend(crate::commands::release::lost_lines(
-            (&lines.lost, &lines.word_step_skipped),
-            &under,
+    if !check.edited_since.is_empty() {
+        let shown: Vec<&str> = check
+            .edited_since
+            .iter()
+            .take(SHOWN)
+            .map(CommitId::short)
+            .collect();
+        let more = match check.edited_since.len().saturating_sub(SHOWN) {
+            0 => String::new(),
+            more => format!(" and {more} more"),
+        };
+        out.push(format!(
+            "{indent}  changed its files since ({}): {}{more}",
+            check.edited_since.len(),
+            shown.join(" "),
         ));
-        out.extend(crate::commands::release::held_by_words_lines(lines, &under));
     }
     out
-}
-
-/// How many of the revision's own lines, or paths, a release lacks: each
-/// lost entry, but a path that cannot be read for its unresolved conflict.
-fn lacking(lines: &MemberLines) -> usize {
-    lines
-        .lost
-        .iter()
-        .filter(|lost| lost.kind != LostKind::Conflict)
-        .count()
 }
 
 /// Every check target for this repository: each distinct commit named by our
@@ -859,9 +832,8 @@ pub fn targets(
 #[derive(Debug)]
 pub struct CheckInput<'a> {
     pub repo: &'a Repo,
-    pub revision: &'a str,
     pub tip: &'a CommitId,
-    /// The upstream trunk: a release target reads the tip's own lines from
+    /// The upstream trunk: a release target replays the tip's change from
     /// its base against it (spec R6).
     pub trunk: &'a CommitId,
     /// Where the tip's own change starts against the trunk, read once, by
@@ -873,15 +845,9 @@ pub struct CheckInput<'a> {
 }
 
 impl<'a> CheckInput<'a> {
-    pub const fn new(
-        repo: &'a Repo,
-        revision: &'a str,
-        tip: &'a CommitId,
-        trunk: &'a CommitId,
-    ) -> Self {
+    pub const fn new(repo: &'a Repo, tip: &'a CommitId, trunk: &'a CommitId) -> Self {
         Self {
             repo,
-            revision,
             tip,
             trunk,
             change_base: std::cell::OnceCell::new(),
@@ -911,41 +877,71 @@ impl<'a> CheckInput<'a> {
 
 /// The verdict of one revision against one target.
 ///
-/// Against the upstream trunk, which knives does not compose, ancestry and a
-/// tree replay decide ([`trunk_check`]). Against a release, the revision's
-/// own lines decide ([`release_check`]).
+/// A tip the target reaches is carried-exact against the upstream trunk,
+/// which knives does not compose. Against a release it is carried-exact
+/// only when its change from its base by spec R6 replays empty, with no
+/// conflict, onto the release ([`Repo::release_base`],
+/// [`Repo::base_replay_outcome`]), and merged-then-edited otherwise: a
+/// release merge names its members as parents, so every member is an
+/// ancestor whatever the merge's tree holds, and a hand resolution can drop
+/// a member's change while keeping the member a parent. No other input (a
+/// record of the branch it was built on, a reading of its lines) makes it
+/// carried. A tip the target does not reach is replayed onto it, from their
+/// common ancestor against the trunk ([`Repo::tree_replay_outcome`]) and
+/// from its base against a release: an empty replay is carried-rewritten.
+/// Otherwise a standing rewrite of the tip that the target reaches makes it
+/// carried-rebased, where, against a release, the rewrite's own change from
+/// its own base replays empty too. Against a release, a tip that holds an
+/// unresolved conflict reads as a conflicting replay: merged-then-edited
+/// where the release reaches it, conflicted where it does not.
 pub fn check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryCheck> {
-    match target.role {
-        TargetRole::UpstreamTrunk => trunk_check(input, target),
-        TargetRole::LiveRelease | TargetRole::SupersededRelease => release_check(input, target),
-    }
-}
-
-/// The verdict of one revision against the upstream trunk: an ancestor tip
-/// is carried-exact; any other tip's net change is replayed onto the trunk
-/// from their common ancestor ([`Repo::tree_replay_outcome`]), and where
-/// that replay leaves the trunk changed, a standing rewrite of the tip that
-/// the trunk reaches makes it carried-rebased.
-fn trunk_check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryCheck> {
-    if input.repo.is_ancestor(input.tip, &target.commit)? {
+    let release = target.role != TargetRole::UpstreamTrunk;
+    let reaches = input.repo.is_ancestor(input.tip, &target.commit)?;
+    if reaches && !release {
         return Ok(CarryCheck {
             verdict: CarryVerdict::CarriedExact,
             evidence: input.tip.clone(),
-            lines: None,
         });
     }
-    let verdict = match input.repo.tree_replay_outcome(input.tip, &target.commit)? {
+    // Against a release, a tip that holds an unresolved conflict has no
+    // change a release can be said to hold, however its replay reads, and no
+    // rewrite of it stands for it: a clean resolution is another change.
+    let tip_conflicted = release && !input.repo.conflicted_files(input.tip.as_str())?.is_empty();
+    let outcome = if !release {
+        input.repo.tree_replay_outcome(input.tip, &target.commit)?
+    } else if tip_conflicted {
+        RebaseOutcome::Conflicted
+    } else {
+        input
+            .repo
+            .base_replay_outcome(input.tip, &release_base(input, target)?, &target.commit)?
+    };
+    if reaches {
+        return Ok(if outcome == RebaseOutcome::Empty {
+            CarryCheck {
+                verdict: CarryVerdict::CarriedExact,
+                evidence: input.tip.clone(),
+            }
+        } else {
+            CarryCheck {
+                verdict: CarryVerdict::MergedThenEdited,
+                evidence: target.commit.clone(),
+            }
+        });
+    }
+    let verdict = match outcome {
         RebaseOutcome::Empty => CarryVerdict::CarriedRewritten,
         RebaseOutcome::CleanNonEmpty => CarryVerdict::NotCarried,
         RebaseOutcome::Conflicted => CarryVerdict::Conflicted,
     };
-    if verdict != CarryVerdict::CarriedRewritten {
+    if verdict != CarryVerdict::CarriedRewritten && !tip_conflicted {
         for rewrite in input.repo.standing_rewrites_of(input.tip)? {
-            if input.repo.is_ancestor(&rewrite, &target.commit)? {
+            if input.repo.is_ancestor(&rewrite, &target.commit)?
+                && (!release || rewrite_replays_empty(input, &rewrite, target)?)
+            {
                 return Ok(CarryCheck {
                     verdict: CarryVerdict::CarriedRebased,
                     evidence: rewrite,
-                    lines: None,
                 });
             }
         }
@@ -953,88 +949,49 @@ fn trunk_check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryC
     Ok(CarryCheck {
         verdict,
         evidence: target.commit.clone(),
-        lines: None,
     })
 }
 
-/// The verdict of one revision against a release, from the revision's own
-/// lines (spec R6, R9): the change from its base to its tip, whether or not
-/// the release reaches the tip ([`Repo::member_lines`]). The base is its
-/// fork point with the upstream trunk, or, for a revision the trunk
-/// contains, the base that the release's parents and the way the trunk took
-/// it in give ([`Repo::release_base`]); a revision the trunk contains and
-/// the release reaches is carried by ancestry. A release merge names its
-/// members as parents, so every member is an ancestor whatever the merge's
-/// tree holds, and a hand resolution can drop a member's change while
-/// keeping the member a parent. The verdicts, in this order:
-///
-/// - carried-exact: the release reaches the tip and holds its own lines;
-/// - carried-rewritten: the release does not reach the tip and holds its
-///   own lines;
-/// - carried-rebased: the release does not reach the tip, and it reaches a
-///   standing rewrite of it and holds that rewrite's own lines, read from
-///   the rewrite's own base by the same rule. A release that reaches the
-///   tip is never read for a rewrite;
-/// - conflicted: a path of the tip's change holds an unresolved conflict,
-///   in the release or at the tip, and the release lacks nothing else;
-/// - not carried: anything else.
-fn release_check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryCheck> {
-    let reaches = input.repo.is_ancestor(input.tip, &target.commit)?;
+/// Where the tip's own change starts in the release `target` (spec R6,
+/// [`Repo::release_base`]).
+fn release_base(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CommitId> {
     let parents = input.repo.parent_commits(target.commit.as_str())?;
-    let base = input
+    Ok(input
         .repo
         .release_base((input.tip, input.change_base()?), &parents, || {
             input.taken_in().cloned()
-        })?;
-    let lines = input
+        })?)
+}
+
+/// Whether `rewrite`'s own change, from its own base by spec R6, replays
+/// empty onto the release `target`.
+fn rewrite_replays_empty(
+    input: &CheckInput<'_>,
+    rewrite: &CommitId,
+    target: &Target,
+) -> anyhow::Result<bool> {
+    let parents = input.repo.parent_commits(target.commit.as_str())?;
+    let change_base = input.repo.change_base(rewrite, input.trunk)?;
+    let base = input
         .repo
-        .member_lines(input.revision, (&base, input.tip), &target.commit)?;
-    if lines.reading == Reading::Carried {
-        let (verdict, evidence) = if reaches {
-            (CarryVerdict::CarriedExact, input.tip.clone())
-        } else {
-            (CarryVerdict::CarriedRewritten, target.commit.clone())
-        };
-        return Ok(CarryCheck {
-            verdict,
-            evidence,
-            lines: Some(lines),
-        });
-    }
-    if !reaches {
-        for rewrite in input.repo.standing_rewrites_of(input.tip)? {
-            if !input.repo.is_ancestor(&rewrite, &target.commit)? {
-                continue;
-            }
-            let change_base = input.repo.change_base(&rewrite, input.trunk)?;
-            let base = input
-                .repo
-                .release_base((&rewrite, &change_base), &parents, || {
-                    input.repo.taken_in(&rewrite, input.trunk)
-                })?;
-            let held =
-                input
-                    .repo
-                    .member_lines(input.revision, (&base, &rewrite), &target.commit)?;
-            if held.reading == Reading::Carried {
-                return Ok(CarryCheck {
-                    verdict: CarryVerdict::CarriedRebased,
-                    evidence: rewrite,
-                    lines: Some(held),
-                });
-            }
-        }
-    }
-    let verdict = if lines.reading == Reading::Inconclusive {
-        CarryVerdict::Conflicted
-    } else {
-        CarryVerdict::NotCarried
-    };
-    Ok(CarryCheck {
-        verdict,
-        evidence: target.commit.clone(),
-        lines: Some(lines),
-    })
+        .release_base((rewrite, &change_base), &parents, || {
+            input.repo.taken_in(rewrite, input.trunk)
+        })?;
+    Ok(input
+        .repo
+        .base_replay_outcome(rewrite, &base, &target.commit)?
+        == RebaseOutcome::Empty)
+}
+
+/// The evidence of a merged-then-edited verdict of `input` against `target`
+/// ([`Repo::edited_since`]).
+///
+/// The target's commits that the tip does not reach and that changed a file
+/// of its change from its base by spec R6, newest first.
+pub fn edited_since(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<Vec<CommitId>> {
+    Ok(input
+        .repo
+        .edited_since(input.tip, &release_base(input, target)?, &target.commit)?)
 }
 
 #[cfg(test)]
@@ -1298,7 +1255,6 @@ mod tests {
                 TargetRole::LiveRelease => Ok(CarryCheck {
                     verdict: CarryVerdict::NotCarried,
                     evidence: target.commit.clone(),
-                    lines: None,
                 }),
                 TargetRole::UpstreamTrunk => {
                     Err(anyhow::anyhow!("no unique common ancestor with trunk"))
@@ -1371,7 +1327,7 @@ mod tests {
             role: TargetRole::LiveRelease,
             verdict: CarryVerdict::CarriedExact,
             evidence: CommitId::new("bbbb"),
-            lines: None,
+            edited_since: Vec::new(),
         };
         let census = CensusReport {
             repo: "demo".to_owned(),
