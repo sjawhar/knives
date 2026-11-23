@@ -762,8 +762,8 @@ impl Repo {
     /// merge. Unlike a per-commit rebase, this correctly recognizes a squashed
     /// series and a branch whose additions are later reverted.
     ///
-    /// `--carries` and `--census` read the upstream trunk this way. A release
-    /// is read by a member's own lines instead ([`Self::member_lines`]).
+    /// `--carries` and `--census` read a revision the target does not reach
+    /// this way ([`crate::carriage::check`]).
     pub fn tree_replay_outcome(
         &self,
         revision: &CommitId,
@@ -792,6 +792,102 @@ impl Repo {
         } else {
             RebaseOutcome::CleanNonEmpty
         })
+    }
+
+    /// The net change `revision` makes from `base`, where its own change
+    /// starts (spec R6, [`Self::release_base`]), replayed onto `target`, with
+    /// a release log the target holds as a union left out ([`replayed_tree`]).
+    ///
+    /// This answers whether `target`'s tree holds a revision it already
+    /// reaches. [`Self::tree_replay_outcome`] cannot: its base is the common
+    /// ancestor of the two, which for such a revision is the revision itself,
+    /// so it always reads empty. A conflict counts only at a path of the
+    /// revision's change: one the target holds elsewhere is not the
+    /// revision's, and the replay carries it along unchanged.
+    pub fn base_replay_outcome(
+        &self,
+        revision: &CommitId,
+        base: &CommitId,
+        target: &CommitId,
+    ) -> Result<RebaseOutcome, JjError> {
+        let base = self.commit(base.as_str())?;
+        let revision = self.commit(revision.as_str())?;
+        let target = self.commit(target.as_str())?;
+        // `base..revision` is empty exactly when the base already reaches the tip.
+        if self.backend_is_ancestor(revision.id(), base.id())? {
+            return Ok(RebaseOutcome::Empty);
+        }
+        let mut changed = Vec::new();
+        for entry in collect_stream(
+            base.tree()
+                .diff_stream(&revision.tree(), &EverythingMatcher),
+        ) {
+            entry.values.map_err(|error| store_error(&error))?;
+            changed.push(entry.path.as_internal_file_string().to_owned());
+        }
+        let mut tx = self.repo.start_transaction();
+        let tree = replayed_tree(&base.tree(), revision.tree(), &target.tree())?;
+        let replayed = replayed_commit(&mut tx, (base.id(), tree), target.id())?;
+        let conflicted = conflicted_paths(&replayed.tree())?
+            .iter()
+            .any(|path| changed.contains(path));
+        let outcome = if conflicted {
+            RebaseOutcome::Conflicted
+        } else if block_on(replayed.is_empty(tx.repo())).map_err(|error| store_error(&error))? {
+            RebaseOutcome::Empty
+        } else {
+            RebaseOutcome::CleanNonEmpty
+        };
+        // Dropped, never committed: the probe leaves no trace in the op log.
+        drop(tx);
+        Ok(outcome)
+    }
+
+    /// The commits of `target` that `revision` does not reach and that
+    /// change a file of `revision`'s change from `base`, newest first: what
+    /// changed what `revision` brought after it was merged, the evidence of
+    /// a merged-then-edited verdict. A commit's change is its tree against
+    /// the automatic merge of its parents, so a merge is read by its own
+    /// resolution, as `jj diff` shows it.
+    pub fn edited_since(
+        &self,
+        revision: &CommitId,
+        base: &CommitId,
+        target: &CommitId,
+    ) -> Result<Vec<CommitId>, JjError> {
+        let tip = self.commit(revision.as_str())?;
+        let base = self.commit(base.as_str())?;
+        let mut paths = Vec::new();
+        for entry in collect_stream(base.tree().diff_stream(&tip.tree(), &EverythingMatcher)) {
+            entry.values.map_err(|error| store_error(&error))?;
+            paths.push(entry.path);
+        }
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let matcher = jj_lib::matchers::FilesMatcher::new(&paths);
+        let target = self.commit(target.as_str())?;
+        let since = self.range_newest_first(std::slice::from_ref(tip.id()), target.id())?;
+        let store = self.repo.store();
+        let mut edited = Vec::new();
+        for id in &since {
+            let commit = store.get_commit(id).map_err(|error| store_error(&error))?;
+            let parents: Vec<jj_lib::commit::Commit> = commit
+                .parent_ids()
+                .iter()
+                .map(|parent| {
+                    store
+                        .get_commit(parent)
+                        .map_err(|error| store_error(&error))
+                })
+                .collect::<Result<_, _>>()?;
+            let merged = block_on(merge_commit_trees(self.repo.as_ref(), &parents))
+                .map_err(|error| store_error(&error))?;
+            if !collect_stream(merged.diff_stream(&commit.tree(), &matcher)).is_empty() {
+                edited.push(CommitId::new(id.hex()));
+            }
+        }
+        Ok(edited)
     }
 
     /// Where `revision` forked from `trunk`: their one common ancestor, or the

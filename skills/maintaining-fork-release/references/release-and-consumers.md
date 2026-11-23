@@ -4,7 +4,7 @@ Read this whenever you do step 5. Do the five stages in order.
 
 1. **Reconcile intended content.** Read the release and member notches again. Run `knives release --repo <repo>`, `knives release --repo <repo> members --census` and `knives consumers <repo>`.
    - For each maintained delta, record whether the release must carry it, inherits it upstream, excludes it deliberately, or needs repair.
-   - Prove carriage with `knives release members <target> --carries <revision>`. A merged upstream PR or a source-text match is not proof. Investigate a `conflicted` probe; do not drop it automatically.
+   - Prove carriage with `knives release members <target> --carries <revision>`. A merged upstream PR or a source-text match is not proof. Investigate a `conflicted` or `merged-then-edited` probe; do not drop it automatically.
 2. **Compose the intended release** with `include`, `advance`, `drop --why`, `rebase` and `cut`, behind the barrier in [release-wide-writes.md](release-wide-writes.md).
    - Advance repaired members to verified heads. Include an unreleased PR only when it is intended and ready to ship.
    - Read the real consumer pins before you choose an in-place edit or a new cut. When an edit is refused (frozen pins, a published release), follow the remedy the refusal names. Make no parallel lineage and no forced ref move, and keep required old refs reachable.

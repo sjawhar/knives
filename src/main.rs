@@ -543,6 +543,10 @@ fn run_audit(
     clippy::too_many_arguments,
     reason = "the fork, the action, the extra consumers, the output format and the cwd binding are independent inputs"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one match arm per release action, each only a call"
+)]
 fn dispatch_release(
     fork: &Fork<'_>,
     action: Option<ReleaseAction>,
@@ -603,9 +607,12 @@ fn dispatch_release(
             // `--verify`, so a census request never has a target to lose here.
             match (census, carries.as_deref()) {
                 (true, _) => run_release_census(fork, no_github, output),
-                (false, Some(revision)) => {
-                    run_revision_carries(fork, revision, reference.as_deref(), output)
-                }
+                (false, Some(revision)) => run_revision_carries(
+                    fork,
+                    bound.registry,
+                    (revision, reference.as_deref()),
+                    output,
+                ),
                 (false, None) => {
                     run_release_members(fork, bound.registry, reference.as_deref(), verify, output)
                 }

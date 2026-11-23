@@ -11,7 +11,8 @@
 
 use knives::bind::Fork;
 use knives::carriage::{
-    self, CarriesReport, CensusOptions, CensusReport, CheckInput, Target, TargetCheck, TargetRole,
+    self, CarriesReport, CarryVerdict, CensusOptions, CensusReport, CheckInput, Target,
+    TargetCheck, TargetRole,
 };
 use knives::cli::{Exit, Output};
 use knives::commands::release;
@@ -128,8 +129,8 @@ pub(crate) fn run_release_census(
 /// otherwise against every live release and the upstream trunk.
 pub(crate) fn run_revision_carries(
     fork: &Fork<'_>,
-    revision: &str,
-    target: Option<&str>,
+    registry: &knives::config::Registry,
+    (revision, target): (&str, Option<&str>),
     output: Output,
 ) -> anyhow::Result<Exit> {
     let repo = &fork.name;
@@ -190,7 +191,7 @@ pub(crate) fn run_revision_carries(
         selected_target.role = TargetRole::UpstreamTrunk;
     }
     let checks = CarriesChecks {
-        input: CheckInput::new(&opened, revision, &tip, &trunk),
+        input: CheckInput::new(&opened, &tip, &trunk),
         fallback: target.unwrap_or(trunk_name.as_str()),
     };
     let mut report = CarriesReport {
@@ -202,13 +203,57 @@ pub(crate) fn run_revision_carries(
     };
     checks.append(&mut report, selected);
     let exit = carries_exit(&mut report, &checks, superseded, target);
+    if report
+        .checks
+        .iter()
+        .any(|check| check.verdict == CarryVerdict::MergedThenEdited)
+    {
+        report
+            .notes
+            .extend(recorded_base_note(fork, registry, revision));
+    }
     print_carries(&report, output)?;
     Ok(exit)
 }
 
+/// For a merged-then-edited answer about the branch `revision` names, what
+/// that branch records it needs (`knives depends`), so a person judging it
+/// sees the branch it was built on. A record never decides carriage.
+fn recorded_base_note(
+    fork: &Fork<'_>,
+    registry: &knives::config::Registry,
+    revision: &str,
+) -> Option<String> {
+    let store = knives::store::Store::open(
+        knives::store::default_state_path(),
+        &registry.former_names(),
+        &[&fork.upstream],
+    )
+    .ok()?;
+    let recorded = store.dependencies(&knives::ids::BranchTarget::new(
+        fork.upstream.clone(),
+        knives::ids::BranchName::new(revision),
+    ));
+    let on_fork: Vec<String> = recorded
+        .iter()
+        .filter(|requirement| !matches!(requirement, knives::ids::Requirement::Upstream { .. }))
+        .map(ToString::to_string)
+        .collect();
+    (!on_fork.is_empty()).then(|| {
+        format!(
+            "{revision} records it needs {}; work there may account for some of what changed, \
+             but a record is not read as carriage",
+            on_fork.join(", ")
+        )
+    })
+}
+
 /// The outcome: unanswered checks outrank everything; against an explicit
 /// `target` every check must carry; bare, a live release or the trunk must,
-/// with the superseded releases consulted only after those miss.
+/// with the superseded releases consulted only after those miss. A miss
+/// where a release reaches the revision but work since changed what it
+/// brought (merged-then-edited) is no finding to act on blind: it exits
+/// incomplete, for a person to judge.
 fn carries_exit(
     report: &mut CarriesReport,
     checks: &CarriesChecks<'_>,
@@ -226,7 +271,17 @@ fn carries_exit(
         }
         carries_safe(report)
     };
-    if carried { Exit::Ok } else { Exit::Findings }
+    if carried {
+        Exit::Ok
+    } else if report
+        .checks
+        .iter()
+        .any(|check| check.verdict == CarryVerdict::MergedThenEdited)
+    {
+        Exit::Incomplete
+    } else {
+        Exit::Findings
+    }
 }
 
 struct CarriesChecks<'a> {
@@ -239,14 +294,27 @@ impl CarriesChecks<'_> {
         for target in targets {
             let target_name = carriage::target_name(&target, self.fallback);
             match carriage::check(&self.input, &target) {
-                Ok(check) => report.checks.push(TargetCheck {
-                    target: target_name,
-                    commit: target.commit,
-                    role: target.role,
-                    verdict: check.verdict,
-                    evidence: check.evidence,
-                    lines: check.lines,
-                }),
+                Ok(check) => {
+                    let edited_since = if check.verdict == CarryVerdict::MergedThenEdited {
+                        carriage::edited_since(&self.input, &target).unwrap_or_else(|error| {
+                            report.notes.push(format!(
+                                "cannot list what changed its files in {target_name} since: \
+                                 {error}"
+                            ));
+                            Vec::new()
+                        })
+                    } else {
+                        Vec::new()
+                    };
+                    report.checks.push(TargetCheck {
+                        target: target_name,
+                        commit: target.commit,
+                        role: target.role,
+                        verdict: check.verdict,
+                        evidence: check.evidence,
+                        edited_since,
+                    });
+                }
                 Err(error) => report
                     .problems
                     .push(format!("cannot check {target_name}: {error}")),

@@ -672,11 +672,11 @@ A release write refuses over an unrecorded release. The release in hand is unrec
 
 A fast-forward carrier is a parent that is an earlier write of the same release name, which a push adds when it rebases the release onto its published position to make the push a fast-forward. The ledger's cut and edit events of the name, the publish remote's commit of it, the visible rewrites of either, the change ids those events name (a pushed copy keeps its write's change id), and the parents a recorded event of the name lists under the carrier label define the set (`release_model::EarlierWrites::carriers`). Only `adopt`'s record of the fast-forward parent it took writes that label (`release_model::carrier_label`), never for a member of the write it replaces. Once the publish ref has moved past it, the label is the only record of a carrier that no event records as a write, such as a published resolution squashed into the release. A recorded write is a release merge and a member is a feature branch, so the two never share a change id, and the test cannot take a member for a carrier. The plan and `members` label a carrier `<name> earlier write (carrier, not a member)` and do not count it as stacked. Every write that composes from a release's parents leaves the carriers out: it writes an in-between commit on the other parents with the release's own tree, duplicates that, and records the in-between commit abandoned, in the same transaction (`rebase`, whose jj CLI rebase cannot share one, does this in a write of its own first). So a resolution made over a carrier becomes the release's own change, and no working copy moves. Kept as a member, a carrier would pile up, one more with every push. After a write records its abandons, it also abandons, until none is left, each new visible head that nothing holds (a bookmark, a working copy, a tag, or a remote ref other than the name's own tracked ref on its publish remote) when that head is an earlier write of the name or a commit whose newer version is still visible, and names each one. So a carrier a write leaves out stays hidden behind its publish ref, and anything else the write exposes, such as a member with no bookmark, stays visible for the audit to report. While the written release carries conflicts, nothing is hidden.
 
-Every check of whether a release carries a member reads the member by its own lines (`own_lines`,
-through `jj::Repo::member_lines`, or `jj::Candidate::member_lines` for a cut's candidate):
-`members --verify`, the audits of a knives cut and of `cut NAME --at` (`release::audit_cut`), the
-composition gate (`release::uncarried_recorded_members`), and `--carries` and `--census` against a
-live or superseded release (`carriage::check`). A release merge names its members as parents, so
+Every gate's check of whether a release carries a member reads the member by its own lines
+(`own_lines`, through `jj::Repo::member_lines`, or `jj::Candidate::member_lines` for a cut's
+candidate): `members --verify`, the audits of a knives cut and of `cut NAME --at`
+(`release::audit_cut`), and the composition gate (`release::uncarried_recorded_members`).
+`--carries` and `--census` do not (below). A release merge names its members as parents, so
 every member is an ancestor whatever the merge's tree holds, and only the content shows whether a
 hand resolution kept a member's change. The member's own change is the diff from its fork point
 with the upstream trunk (`Repo::fork_point`) to its tip, read with no rename detection. So the
@@ -721,35 +721,36 @@ there, and a changed executable bit where the release's file has the tip's bit. 
 change next to the member's lines, in the same merge hunk or on the same line, that keeps the
 member's own words makes no member read missing, unless it puts back what the member removed. A
 path where the release, or the member's tip, holds an unresolved conflict cannot be read. There
-the member reads inconclusive (`own_lines::Reading::Inconclusive`), and `--carries` reads
-`conflicted`, where it lacks nothing else (in a cut's audit, nothing else that the release in hand
-does not lack too), and missing where it also lacks a line elsewhere. A conflict in any other path
-changes nothing. Each command names in its text each line that a member lacks, with its path, and
-each line that the release holds only by its words, with the release's lines that hold them
-(`release::lost_lines` and `release::held_by_words_lines`, the one renderer of all four text
-reports). `members --verify`, `--carries` and `--census` also name them in their JSON report
+the member reads inconclusive (`own_lines::Reading::Inconclusive`), where it lacks nothing else
+(in a cut's audit, nothing else that the release in hand does not lack too), and missing where it
+also lacks a line elsewhere. A conflict in any other path changes nothing. Each command names in
+its text each line that a member lacks, with its path, and each line that the release holds only
+by its words, with the release's lines that hold them (`release::lost_lines` and
+`release::held_by_words_lines`). `members --verify` also names them in its JSON report
 (`own_lines::MemberLines`). A line held only by its words does not make the member read missing.
 
 `knives release members --carries REVISION` is the content answer rather than an ancestry guess.
 With no REF it compares the revision with every live release and the upstream trunk, reporting an
-exact, rewritten, rebased, conflicted, or not-carried verdict with the commit that is its evidence;
-`knives release members REF --carries REVISION` retains the explicit single-target query. It also
-answers when no release exists, against the upstream trunk alone, rather than refusing; that is the
-only target needed to decide whether unreleased work would be orphaned. A revision is safe only
-when a live release or the trunk carries its content; a superseded release is consulted only after
-those targets miss and does not make the result safe. Against the upstream trunk, which knives does
-not compose, an ancestor tip is carried-exact. Any other tip's net change is replayed onto the
-trunk from their common ancestor (`carriage::trunk_check`, `Repo::tree_replay_outcome`): an empty
-replay is carried-rewritten, and otherwise a standing rewrite that the trunk reaches makes it
-carried-rebased. Against a release, the revision's own lines decide, by the rule above
-(`carriage::release_check`). It is carried-exact where the release reaches the tip and holds its
-own lines, and carried-rewritten where the release does not reach the tip and holds them. Where the
-release does not reach the tip, it is carried-rebased where the release reaches a standing rewrite
-of it (`jj::Repo::standing_rewrites_of`) and holds that rewrite's own lines, read from the
-rewrite's own base by the rule above. It is conflicted where a path of its change holds an
-unresolved conflict, in the release or at the tip, and the release lacks nothing else, and
-not-carried otherwise. The text names the lines under the verdict, and each JSON check holds the
-reading (`TargetCheck::lines`).
+exact, rewritten, rebased, merged-then-edited, conflicted, or not-carried verdict with the commit
+that is its evidence; `knives release members REF --carries REVISION` retains the explicit
+single-target query. It also answers when no release exists, against the upstream trunk alone,
+rather than refusing; that is the only target needed to decide whether unreleased work would be
+orphaned. A revision is safe only when a live release or the trunk carries its content; a
+superseded release is consulted only after those targets miss and does not make the result safe.
+It reads by replay, not by own lines (`carriage::check`): fixtures where a release put back a line
+a member deleted, wrote it back edited, kept a sibling's edit over the deletion, or dropped a
+member's executable bit or blank lines read carried by own lines and are not. An ancestor tip of
+the upstream trunk, which knives does not compose, is carried-exact. An ancestor tip of a release
+is carried-exact only when its change from its base by the rule above (`Repo::release_base`)
+replays empty, with no conflict, onto the release (`Repo::base_replay_outcome`), and
+merged-then-edited otherwise: the answer exits 3 for a person to judge, and lists newest first the
+release's commits the tip does not reach that changed a file of its change, each read against the
+automatic merge of its parents (`Repo::edited_since`). A `knives depends` record of the branch it
+was built on is named in a note and never decides the verdict. A tip the target does not reach is
+replayed onto it from their common ancestor (`Repo::tree_replay_outcome`): an empty replay is
+carried-rewritten, and otherwise a standing rewrite that the target reaches makes it
+carried-rebased, else conflicted or not-carried. In the census a merged-then-edited row is no
+orphan and does not change the exit.
 
 `knives release members --census` turns that same check into a census. Its primary matrix contains
 every maintained branch against the live releases and upstream trunk. Superseded releases are

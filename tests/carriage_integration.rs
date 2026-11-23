@@ -24,7 +24,7 @@ fn check_against(repo: &Repo, revision: &str, target: &str) -> CarryVerdict {
     let tip = repo.resolve_commit(revision).expect("resolve revision");
     let trunk = repo.resolve_commit(target).expect("resolve target");
     let target = upstream_trunk_target(trunk.clone());
-    check(&CheckInput::new(repo, revision, &tip, &trunk), &target)
+    check(&CheckInput::new(repo, &tip, &trunk), &target)
         .expect("check carriage")
         .verdict
 }
