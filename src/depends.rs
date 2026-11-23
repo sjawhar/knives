@@ -46,10 +46,6 @@ use crate::branch_verbs::pulled_before_replacing;
 
 /// The remote, and the role, of a fork's own repository.
 const ORIGIN: &str = "origin";
-/// Which `origin` spells a repository ([`Context::own_origin_spelled`]): the
-/// checkout's remote, or the registry's entry.
-const CHECKOUT_ORIGIN: &str = "checkout's";
-const REGISTRY_ORIGIN: &str = "registry's";
 
 /// What one `depends` asks for: requirements to add, as typed, and
 /// requirements to take back, as typed.
@@ -905,7 +901,7 @@ impl Context<'_, '_> {
     /// its own repository have offers in its place ([`Both`]). A spelling is
     /// offered only where `--on` takes it: the review pull request when it
     /// can be required ([`Self::review_head_refusal`]), the upstream's while
-    /// no `origin` here spells the upstream ([`Self::own_origin_spelled`]).
+    /// no `origin` here spells the upstream ([`Self::own_origin_named`]).
     fn choice(&self, both: &Both<'_>) -> String {
         let Both {
             key,
@@ -924,17 +920,16 @@ impl Context<'_, '_> {
             },
             Err,
         );
-        let upstream = match self.own_origin_spelled(upstream_name.as_str()) {
-            Some((which, _)) => Err(format!(
-                "the upstream's #{number} has no spelling here while the {which} {ORIGIN} for \
-                 {key} spells its upstream: set it to {key}'s own repository{}",
-                if which == REGISTRY_ORIGIN {
-                    format!(", {own}")
-                } else {
-                    String::new()
-                }
-            )),
-            None => Ok(format!("`--on {upstream_name}#{number}`")),
+        // Only the registry's `origin` can spell the upstream here: when the
+        // checkout's does, this fork's own repository is the upstream, which
+        // takes the upstream's number before any lookup.
+        let upstream = if self.own_origin_named(upstream_name.as_str()).is_some() {
+            Err(format!(
+                "the upstream's #{number} has no spelling here while the registry's {ORIGIN} \
+                 for {key} spells its upstream: set it to {key}'s own repository, {own}"
+            ))
+        } else {
+            Ok(format!("`--on {upstream_name}#{number}`"))
         };
         match (upstream, review) {
             (Ok(upstream), Ok(review)) => format!("name the one meant: {upstream} or {review}"),
@@ -1955,12 +1950,6 @@ impl Context<'_, '_> {
     /// `repository`: its checkout's `origin` remote, or its registry
     /// `origin`.
     fn own_origin_named(&self, repository: &str) -> Option<&str> {
-        self.own_origin_spelled(repository).map(|(_, url)| url)
-    }
-
-    /// [`Self::own_origin_named`], with which `origin` spells it:
-    /// [`CHECKOUT_ORIGIN`] or [`REGISTRY_ORIGIN`].
-    fn own_origin_spelled(&self, repository: &str) -> Option<(&'static str, &str)> {
         let names =
             |url: &&str| remote_slug(url).is_some_and(|slug| slug.eq_ignore_ascii_case(repository));
         self.fork
@@ -1969,12 +1958,7 @@ impl Context<'_, '_> {
             .get(ORIGIN)
             .map(String::as_str)
             .filter(names)
-            .map(|url| (CHECKOUT_ORIGIN, url))
-            .or_else(|| {
-                Some(self.fork.entry.origin.as_str())
-                    .filter(names)
-                    .map(|url| (REGISTRY_ORIGIN, url))
-            })
+            .or_else(|| Some(self.fork.entry.origin.as_str()).filter(names))
     }
 
     /// The `origin` URL of this fork's own repository named `repository` by

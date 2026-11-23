@@ -4092,8 +4092,8 @@ fn offline_an_upstream_this_forks_registry_origin_spells_is_refused() {
     );
 
     // And: a number both have is refused without offering the upstream's
-    // spelling, which would be refused too, naming the `origin` that spells
-    // the upstream; the spelling it offers records (N123, N130).
+    // spelling, which would be refused too, saying which repository to set
+    // the registry's `origin` to; the spelling it offers records (N123).
     let depends =
         |args: &[&str]| fixture.knives(&[&["--text", "depends", "feat/base"], args].concat());
     let output = depends(&["--on", "demo#12"]);
@@ -4103,7 +4103,7 @@ fn offline_an_upstream_this_forks_registry_origin_spells_is_refused() {
         stderr.contains("the review pull request is named `--on acme/demo#12`")
             && stderr.contains(
                 "the upstream's #12 has no spelling here while the registry's origin for demo \
-                 spells its upstream"
+                 spells its upstream: set it to demo's own repository, acme/demo"
             )
             && !stderr.contains("`--on maintainer/demo#12`"),
         "{stderr}"
