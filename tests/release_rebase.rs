@@ -1883,6 +1883,61 @@ fn a_release_branch_with_a_quote_yields_a_rule_jj_accepts() {
 }
 
 #[test]
+fn the_rebase_rule_keeps_upstreams_tags_and_the_trunks_pinned() {
+    // Given: a tag upstream published off its trunk, and a destination with
+    // no relation to anything pinned.
+    let lab = Lab::new();
+    lab.upstream_branch("maintenance", "maintenance.txt", "maintenance\n");
+    lab.upstream_tag("upstream-maintenance-tag", "maintenance");
+    lab.jj_work(["new", "root()", "-m", "independent destination"]);
+    lab.jj_work(["bookmark", "create", "review-destination", "-r", "@"]);
+    let destination = commit_at(&lab, "review-destination");
+    let tag = commit_at(&lab, "upstream-maintenance-tag");
+    assert_eq!(
+        lab.revision(
+            &lab.work,
+            "remote_tags(remote=exact:\"upstream\") & upstream-maintenance-tag",
+            "commit_id"
+        ),
+        tag.as_str(),
+        "the tag must be one upstream's tags name, or the test proves nothing"
+    );
+    let rule = knives::config::RepoEntry::new("u", "o").rebase_immutable_heads();
+
+    for source in ["upstream-maintenance-tag", "main@upstream", "main@origin"] {
+        // When: the release rebase's one `jj rebase` is pointed at it.
+        let before = commit_at(&lab, source);
+        let refused = knives::jj::rebase_branch_onto(&lab.work, source, &destination, Some(&rule));
+
+        // Then: the rule the rebase runs under still refuses it.
+        let error = refused.expect_err(source);
+        assert!(error.to_string().contains("immutable"), "{source}: {error}");
+        assert_eq!(commit_at(&lab, source), before, "{source} moved");
+    }
+}
+
+#[test]
+fn a_pushed_release_cut_is_pinned_once_it_is_tagged() {
+    // Given: a dated fork whose cut is pushed to origin and not tagged, under
+    // the rule `knives start` writes.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-03", "feat/alpha", "feat/beta");
+    lab.push_branch("release/2026-08-03");
+    let (home, _consumer) = release_test_home(&lab);
+    let started = knives_start(&lab, &home, "feat/gamma");
+    assert!(started.status.success(), "{started:?}");
+
+    // Then: the rule does not pin a cut by its dated name, so the untagged
+    // pushed cut is mutable; the tag the fork publishes it under pins it.
+    let cut = "release/2026-08-03@origin";
+    assert_eq!(lab.revision(&lab.work, cut, "immutable"), "false");
+    lab.jj_work(["tag", "set", "v1.0.0-fork.20260803", "-r", cut]);
+    assert_eq!(lab.revision(&lab.work, cut, "immutable"), "true");
+}
+
+#[test]
 fn a_rebase_refuses_under_the_tag_pinning_rule_an_earlier_knives_start_wrote() {
     // Given: the fork's config still states a rule an earlier knives start
     // wrote, which pins every member beneath the tagged release

@@ -458,7 +458,14 @@ impl RepoEntry {
     /// published. `knives release rebase`, which must move members beneath an
     /// old tagged release and the release itself, runs its one `jj rebase`
     /// under [`Self::rebase_immutable_heads`] instead, behind its own checks,
-    /// and restores every pushed or published name it moved.
+    /// and restores every pushed or published name it moved; it does so only
+    /// where the checkout states this rule as `knives start` wrote it.
+    ///
+    /// A dated or series cut (`release/<date>`) is pinned once it is tagged,
+    /// and knives does not tag a cut: the fork's publishing step does. Its
+    /// pushed name is not pinned, because a reap leaves superseded cuts that a
+    /// fetch brings back, and pinning them would wall every hand rebase of a
+    /// member beneath one.
     ///
     /// jj's default also adds `untracked_remote_bookmarks()`. In a fork, such a
     /// ref is a superseded release cut a fetch re-materialized or another
