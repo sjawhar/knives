@@ -7,7 +7,7 @@ use crate::bind::Fork;
 use crate::cli::Exit;
 use crate::config::Role;
 use crate::forge::{Forge, PullFacts, PullSummary};
-use crate::ids::{BranchName, BranchTarget};
+use crate::ids::{BranchName, BranchTarget, UpstreamName};
 use crate::jj::{fetch_all, fetch_pull_ref, pull_heads};
 pub use crate::ledger::transitions::PullState;
 use crate::ledger::transitions::{transition_of, transition_text};
@@ -173,6 +173,8 @@ pub struct Report {
 
 pub struct SyncInput<'a> {
     pub fork: &'a Fork<'a>,
+    /// Opened with no lock: [`sync_repo`] takes the fork's lock itself, once
+    /// it has asked the network ([`Store::reread_locked`]).
     pub store: &'a mut Store,
     pub forge: Option<&'a dyn Forge>,
     pub scribe: &'a Scribe,
@@ -520,6 +522,77 @@ fn select_tracked_numbers(
         .collect()
 }
 
+/// What the state file recorded of one pull request in one read of it: the
+/// head, the forge state and the newest comment's time a sync recorded.
+#[derive(Debug, PartialEq, Eq)]
+struct PullRecord {
+    head: Option<String>,
+    state: Option<String>,
+    mark: Option<String>,
+}
+
+/// What `store` holds for each pull request of `repo` that `tracked` names.
+fn pull_records(
+    store: &Store,
+    repo: &UpstreamName,
+    tracked: &BTreeMap<u64, String>,
+) -> BTreeMap<u64, PullRecord> {
+    let heads = store.pull_heads(repo);
+    tracked
+        .keys()
+        .map(|&number| {
+            let record = PullRecord {
+                head: heads.get(&number.to_string()).cloned(),
+                state: store.pull_state(repo, number).map(str::to_owned),
+                mark: store.comment_mark(repo, number).map(str::to_owned),
+            };
+            (number, record)
+        })
+        .collect()
+}
+
+/// `tracked` without each pull request whose record another writer changed
+/// between `read`, what this run read before it asked the forge and the
+/// remotes, and `now`, the records under the fork's lock; a note names each.
+///
+/// Two syncs of one fork take turns under its sync lock
+/// ([`crate::store::SyncLock`]), so the other writer is one that takes none:
+/// a sync of an older knives. It asked the forge while this one did, so which
+/// of the two saw the newer state cannot be told. This run records nothing
+/// over it: it neither writes that sync's transition again nor writes an
+/// older state over its record, and the next sync compares with what that
+/// one recorded.
+fn unmoved(
+    tracked: BTreeMap<u64, String>,
+    read: &BTreeMap<u64, PullRecord>,
+    now: &BTreeMap<u64, PullRecord>,
+    report: &mut Report,
+) -> BTreeMap<u64, String> {
+    tracked
+        .into_iter()
+        .filter(|(number, _)| {
+            let moved = read.get(number) != now.get(number);
+            if moved {
+                report.notes.push(format!(
+                    "#{number} was recorded by another sync while this one asked the forge and \
+                     the remotes; this run records nothing over it"
+                ));
+            }
+            !moved
+        })
+        .collect()
+}
+
+/// Fetch, ask the forge, then record each tracked pull request's transition.
+///
+/// The caller holds the fork's sync lock ([`crate::store::SyncLock`]) and
+/// opens `store` with no other lock ([`Store::open`]): every wait on the
+/// network comes first, and the fork's lock is taken only after the last of
+/// them, for the decision and the write ([`Store::reread_locked`]), so a
+/// sync stalled on a fetch or on the forge keeps no other writer of the fork
+/// waiting. Under the lock, each pull request's record is read again and one
+/// another writer changed meanwhile is left as it was left ([`unmoved`]);
+/// every other one is decided from the record as it is then.
 pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
     let SyncInput {
         fork,
@@ -581,10 +654,19 @@ pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
     let summaries: &[PullSummary] = snapshot
         .as_ref()
         .map_or(&[], crate::snapshot::CompletedSnapshot::rows);
+    // The last call that waits on the network; what it says is said after
+    // the transitions, where it always was.
+    let mut fetched = Report::default();
+    fetch_foreign(path, entry.remote(Role::Upstream), &foreign, &mut fetched);
+
+    let read = pull_records(store, name, &tracked);
+    let _fork = store.reread_locked()?;
+    let now = pull_records(store, name, &tracked);
+    let tracked = unmoved(tracked, &read, &now, &mut report);
     record_tracked_pulls(
         TrackingInput {
             tracked,
-            seen: &seen,
+            seen: &store.pull_heads(name),
             heads: &heads,
             summaries,
             snapshot: snapshot.as_ref(),
@@ -595,8 +677,8 @@ pub fn sync_repo(input: SyncInput<'_>) -> anyhow::Result<Report> {
     )?;
 
     persist_snapshot(snapshot.as_ref(), &mut report);
-
-    fetch_foreign(path, entry.remote(Role::Upstream), &foreign, &mut report);
+    report.notes.extend(fetched.notes);
+    report.problems.extend(fetched.problems);
 
     report.rows.sort_by_key(|row| row.number);
     store.save()?;
@@ -1411,7 +1493,7 @@ mod comment_activity_tests {
         let temp = TempDir::new().unwrap();
         let entry = local_entry(&temp);
         let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
-        let mut store = Store::open_for_update(
+        let mut store = Store::open(
             temp.path().join("state.json"),
             &crate::config::FormerNames::new(),
             &[&fork.upstream],
@@ -1445,7 +1527,7 @@ mod comment_activity_tests {
         let mut entry = local_entry(&temp);
         entry.upstream = temp.path().join("missing-upstream").display().to_string();
         let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
-        let mut store = Store::open_for_update(
+        let mut store = Store::open(
             temp.path().join("state.json"),
             &crate::config::FormerNames::new(),
             &[&fork.upstream],
@@ -1483,7 +1565,7 @@ mod comment_activity_tests {
         let temp = TempDir::new().unwrap();
         let entry = local_entry(&temp);
         let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
-        let mut store = Store::open_for_update(
+        let mut store = Store::open(
             temp.path().join("state.json"),
             &crate::config::FormerNames::new(),
             &[&fork.upstream],
@@ -1527,7 +1609,7 @@ mod comment_activity_tests {
             error_on_comment: None,
         };
 
-        let mut store = Store::open_for_update(
+        let mut store = Store::open(
             store_path.clone(),
             &crate::config::FormerNames::new(),
             &[&fork.upstream],
@@ -1606,7 +1688,7 @@ mod comment_activity_tests {
             newest_comments: BTreeMap::new(),
             error_on_comment: Some(42),
         };
-        let mut store = Store::open_for_update(
+        let mut store = Store::open(
             temp.path().join("state.json"),
             &crate::config::FormerNames::new(),
             &[&fork.upstream],
@@ -1650,7 +1732,7 @@ mod comment_activity_tests {
             newest_comments: BTreeMap::from([(42, "2026-07-30T10:00:00Z".to_owned())]),
             error_on_comment: None,
         };
-        let mut store = Store::open_for_update(
+        let mut store = Store::open(
             store_path,
             &crate::config::FormerNames::new(),
             &[&fork.upstream],
@@ -1695,7 +1777,7 @@ mod comment_activity_tests {
             newest_comments: BTreeMap::from([(42, "2026-07-30T10:00:00Z".to_owned())]),
             error_on_comment: None,
         };
-        let mut store = Store::open_for_update(
+        let mut store = Store::open(
             store_path,
             &crate::config::FormerNames::new(),
             &[&fork.upstream],
@@ -1743,7 +1825,7 @@ mod comment_activity_tests {
             newest_comments: BTreeMap::new(),
             error_on_comment: None,
         };
-        let mut store = Store::open_for_update(
+        let mut store = Store::open(
             store_path,
             &crate::config::FormerNames::new(),
             &[&fork.upstream],
@@ -1793,7 +1875,7 @@ mod comment_activity_tests {
             newest_comments: BTreeMap::new(),
             error_on_comment: None,
         };
-        let mut store = Store::open_for_update(
+        let mut store = Store::open(
             store_path.clone(),
             &crate::config::FormerNames::new(),
             &[&fork.upstream],
@@ -1859,7 +1941,7 @@ mod comment_activity_tests {
             newest_comments: BTreeMap::new(),
             error_on_comment: None,
         };
-        let mut store = Store::open_for_update(
+        let mut store = Store::open(
             store_path.clone(),
             &crate::config::FormerNames::new(),
             &[&fork.upstream],
@@ -1912,6 +1994,95 @@ mod comment_activity_tests {
     }
 
     #[test]
+    fn a_record_another_sync_wrote_while_this_one_asked_the_forge_is_left_as_it_wrote_it() {
+        let _lock = crate::config::test_support::environment_lock();
+        let temp = TempDir::new().unwrap();
+        let store_path = temp.path().join("state.json");
+        let repo_name = UpstreamName::new("test-repo");
+        let entry = local_entry(&temp);
+        let fork = Fork::at("test-repo", &entry, &temp.path().join("work"));
+        let scribe = test_scribe(&temp, &repo_name);
+        let ledger = crate::ledger::Ledger::at(temp.path().join("ledger"));
+        let open = |path: &Path| {
+            Store::open(
+                path.to_owned(),
+                &crate::config::FormerNames::new(),
+                &[&fork.upstream],
+            )
+            .unwrap()
+        };
+        let forge = |pull_request: PullRequest| ErroringForge {
+            pull_requests: vec![pull_request],
+            newest_comments: BTreeMap::new(),
+            error_on_comment: None,
+        };
+
+        // Given: #42 recorded open at aaaa by a first sync.
+        let (_branch, first) = test_pull(42, "feat/alpha");
+        sync_repo(SyncInput {
+            fork: &fork,
+            store: &mut open(&store_path),
+            forge: Some(&forge(first)),
+            scribe: &scribe,
+            cache: None,
+        })
+        .unwrap();
+
+        // And: this sync's read of the state file, then another sync's record
+        // of #42 merged at cccc, and its event, before this one takes the
+        // fork's lock.
+        let mut this = open(&store_path);
+        let mut other = open(&store_path);
+        other.record_pull_head(&repo_name, 42, "cccc");
+        other.record_pull_state(&repo_name, 42, ForgeState::Merged);
+        other.save().unwrap();
+        let _ = scribe
+            .event(Some("feat/alpha"), "#42 merged".to_owned(), None)
+            .unwrap();
+
+        // When: this sync, whose forge said #42 was open at bbbb, records.
+        let (_branch, mut stale) = test_pull(42, "feat/alpha");
+        stale.head_ref_oid = "bbbb".to_owned();
+        let report = sync_repo(SyncInput {
+            fork: &fork,
+            store: &mut this,
+            forge: Some(&forge(stale)),
+            scribe: &scribe,
+            cache: None,
+        })
+        .unwrap();
+
+        // Then: it records nothing over the other sync's record, and writes no
+        // transition of its own (read against that record, a reopen), and
+        // says so.
+        assert!(
+            report.rows.iter().all(|row| row.number != 42),
+            "was: {report:?}"
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.starts_with("#42 was recorded by another sync")),
+            "was: {report:?}"
+        );
+        let texts: Vec<String> = ledger
+            .read()
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.text)
+            .collect();
+        assert_eq!(texts, ["#42 merged"]);
+        let after = open(&store_path);
+        assert_eq!(
+            after.pull_heads(&repo_name).get("42").map(String::as_str),
+            Some("cccc")
+        );
+        assert_eq!(after.pull_state(&repo_name, 42), Some("MERGED"));
+    }
+
+    #[test]
     fn an_open_pull_requests_moved_head_is_advanced() {
         let _lock = crate::config::test_support::environment_lock();
         let temp = TempDir::new().unwrap();
@@ -1928,7 +2099,7 @@ mod comment_activity_tests {
             newest_comments: BTreeMap::new(),
             error_on_comment: None,
         };
-        let mut store = Store::open_for_update(
+        let mut store = Store::open(
             store_path.clone(),
             &crate::config::FormerNames::new(),
             &[&fork.upstream],
@@ -2027,7 +2198,7 @@ mod comment_activity_tests {
             &[(42, "aaaa"), (43, "aaaa")],
             &[(42, "unchanged"), (43, "advanced")],
         );
-        let mut store = Store::open_for_update(
+        let mut store = Store::open(
             store_path,
             &crate::config::FormerNames::new(),
             &[&fork.upstream],
@@ -2102,7 +2273,7 @@ mod comment_activity_tests {
         // takes. With no head to fall back on, the record is the only evidence
         // that this pull request was seen before.
         write_state_left_by_an_earlier_knives(&store_path, &[], &[(42, "unchanged")]);
-        let mut store = Store::open_for_update(
+        let mut store = Store::open(
             store_path,
             &crate::config::FormerNames::new(),
             &[&fork.upstream],
@@ -2151,7 +2322,7 @@ mod comment_activity_tests {
         // Given: a record in a spelling no version of knives ever wrote, on a
         // pull request whose head has since moved.
         write_state_left_by_an_earlier_knives(&store_path, &[(42, "bbbb")], &[(42, "garbage")]);
-        let mut store = Store::open_for_update(
+        let mut store = Store::open(
             store_path,
             &crate::config::FormerNames::new(),
             &[&fork.upstream],
@@ -2202,7 +2373,7 @@ mod comment_activity_tests {
             &[(42, "aaaa"), (43, "aaaa")],
             &[(42, "unchanged"), (43, "garbage")],
         );
-        let mut store = Store::open_for_update(
+        let mut store = Store::open(
             store_path,
             &crate::config::FormerNames::new(),
             &[&repo_name],

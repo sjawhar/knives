@@ -30,8 +30,9 @@ use knives::jj::{Repo, ResolutionBaseline, ResolutionChanges};
 use knives::ledger::{Draft, Entry, FixChange, FixFile, Ledger, RecordedParent, inline_human_text};
 use knives::release_model::{
     ADOPTED_BEYOND, ADOPTED_RESOLVED, EarlierWrites, RecordedWrite, carrier_label, matched_write,
-    recorded_members, recorded_write_events,
+    newest_release, recorded_members, recorded_write_events,
 };
+use knives::store::ForkLock;
 
 use super::release_edit::{
     HeldBase, edit_event_text, recorded_parents, refuse_plan_problems, refuse_unresolved_trunk,
@@ -65,7 +66,13 @@ pub(crate) fn run_release_adopt(
         cache_root: cache_root.as_deref(),
         heads: &heads,
     };
-    let plan = release::pulled_plan(fork, bound.registry, &consumers)?;
+    let fetched_first = fetch_unheld(fork, reference)?;
+    let fetched = release::fetch(fork, bound.registry, &consumers);
+    // Every network call is behind this adopt, so the fork's lock is taken
+    // now, and the plan, the repository and the ledger it decides from are
+    // read under it ([`release::Fetched::plan`]).
+    let _fork = ForkLock::acquire(&fork.upstream)?;
+    let plan = fetched.plan(fork, &consumers)?;
     if refuse_plan_problems(repo, &plan, "adopt") {
         return Ok(Exit::Incomplete);
     }
@@ -86,10 +93,43 @@ pub(crate) fn run_release_adopt(
     if refuse_unresolved_trunk(&opened, repo, fork.entry) {
         return Ok(Exit::Incomplete);
     }
-    let Some(held) = Held::read(fork, opened, name)? else {
+    let Some(held) = Held::read(fork, opened, name, fetched_first)? else {
         return Ok(Exit::Incomplete);
     };
     adopt(fork, &held, why, bound)
+}
+
+/// Fetch every remote, before the fork's lock, when the release to adopt has
+/// no local bookmark here: `reference`'s, or else the newest release's. A
+/// release somebody else published is held here only as the publish remote's
+/// ref, which is as old as the last fetch. Whether it fetched: not where the
+/// release has a local bookmark, is divergent, or does not exist.
+fn fetch_unheld(fork: &Fork<'_>, reference: Option<&str>) -> anyhow::Result<bool> {
+    let path = &fork.checkout.path;
+    let opened = Repo::open(path)?;
+    let name = if let Some(reference) = reference {
+        BookmarkRef::parse(reference).branch().as_str().to_owned()
+    } else {
+        let tips = opened.bookmark_tips()?;
+        let entry = fork.entry;
+        let Some((newest, _)) =
+            newest_release(&tips, &entry.release_scheme(), entry.publish_remote())
+        else {
+            return Ok(false);
+        };
+        newest.branch().as_str().to_owned()
+    };
+    let local = BookmarkRef::Local(BranchName::new(name.as_str()));
+    if opened.local_bookmark_tip(&name).is_some()
+        || opened
+            .conflicted_bookmarks()?
+            .iter()
+            .any(|(conflicted, _)| *conflicted == local)
+    {
+        return Ok(false);
+    }
+    knives::jj::fetch_all(path)?;
+    Ok(true)
 }
 
 /// Refuse, naming the series that owns it, a name that is not a release of
@@ -143,11 +183,19 @@ impl Held {
     /// Read the commit `name` holds in `opened`, or `None` after saying why
     /// there is no one commit to adopt.
     ///
-    /// A name with no local bookmark is fetched first: a release somebody
-    /// else published is held here only as the publish remote's ref, and
-    /// that ref is as old as the last fetch.
-    fn read(fork: &Fork<'_>, mut opened: Repo, name: String) -> anyhow::Result<Option<Self>> {
-        let (repo, path) = (&fork.name, &fork.checkout.path);
+    /// A name with no local bookmark is read from the publish remote's ref
+    /// as the fetch before the fork's lock left it ([`fetch_unheld`]);
+    /// `fetched` is whether that fetch ran. Where it did not, the release it
+    /// read then needed none, and another command changed it while this adopt
+    /// asked the network: the ref is as old as an earlier fetch, and the
+    /// adopt refuses.
+    fn read(
+        fork: &Fork<'_>,
+        opened: Repo,
+        name: String,
+        fetched: bool,
+    ) -> anyhow::Result<Option<Self>> {
+        let repo = &fork.name;
         let shown = inline_human_text(&name);
         let local = opened.local_bookmark_tip(&name);
         if local.is_none() {
@@ -164,8 +212,15 @@ impl Held {
                 );
                 return Ok(None);
             }
-            knives::jj::fetch_all(path)?;
-            opened = Repo::open(path)?;
+            if !fetched {
+                println!(
+                    "{repo}: {shown} has no local bookmark, and this adopt fetched nothing \
+                     before it took the fork's lock: the release it read then needed no fetch, \
+                     and another command changed it meanwhile; nothing was adopted; run \
+                     `knives release adopt` again"
+                );
+                return Ok(None);
+            }
         }
         let remote = fork.entry.publish_remote();
         let published = opened.bookmark_tips()?.remove(&BookmarkRef::Remote {

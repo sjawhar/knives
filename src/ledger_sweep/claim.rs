@@ -40,20 +40,21 @@ pub struct LedgerFailure {
 /// record, or a claim whose record does not read, with why
 /// ([`HeldClaim::record`]).
 ///
-/// Under the destination's transport lock, so the read never meets a
-/// sweep's fetch into the same git directory; the caller holds the fork's
-/// lock, and this takes no ledger lock, since it commits nothing.
+/// Under no lock. The read writes no ref ([`ledger_git::read_claim`]: an
+/// `ls-remote`, then a fetch of the claim commit's objects with no name for
+/// them), so a sweep's fetch or a push through the same git directory can
+/// run beside it, and a read stalled on a slow remote keeps no other command
+/// waiting. The caller holds the branch's lock
+/// ([`crate::store::BranchLock`]).
 pub fn read_claim(
     shared: &SharedFork,
     claim: &ClaimRef,
 ) -> Result<Option<HeldClaim>, LedgerFailure> {
-    let failed = |error: &dyn std::fmt::Display| LedgerFailure {
-        cause: error.to_string(),
-    };
-    let _transport = FileLock::acquire(shared.destination.transport_lock(), LockWait::TRANSPORT)
-        .map_err(|error| failed(&error))?;
-    ledger_git::read_claim(&shared.destination.repository, REMOTE, claim)
-        .map_err(|error| failed(&error))
+    ledger_git::read_claim(&shared.destination.repository, REMOTE, claim).map_err(|error| {
+        LedgerFailure {
+            cause: error.to_string(),
+        }
+    })
 }
 
 /// One change of a claim on a shared fork: a take, a seize or a restate,

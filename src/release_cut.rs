@@ -23,6 +23,7 @@ use knives::release_model::{
     previous_release_for_record, read_release, series_members, trunk_positions, trunk_positions_in,
     trunk_reaches,
 };
+use knives::store::{BranchLock, ForkLock};
 
 use super::release_edit::{announce_unchecked, recorded_parents, report_hidden, union_event_text};
 use super::scribe_for;
@@ -59,21 +60,30 @@ pub(crate) fn run_release(
     let forge = CliForge;
     let cache_root = knives::forge_cache::cache_root();
     let heads = knives::consumer_pins::ConsumerHeadMemo::default();
-    let opened = knives::jj::Repo::open(path)?;
     let scheme = entry.release_scheme();
     let (cut_name, allow_drop, at) = match requested_cut(invocation, &scheme, entry) {
         Ok(request) => request,
         Err(exit) => return Ok(exit),
     };
-    let (mut worst, pins) = release_plan_exit(
-        fork,
-        bound.registry,
-        &locals,
-        &opened,
-        &forge,
-        cache_root.as_deref(),
-        &heads,
-    )?;
+    let consumers = release::ConsumerInputs {
+        slugs: &entry.consumers,
+        locals: &locals,
+        forge: &forge,
+        cache_root: cache_root.as_deref(),
+        heads: &heads,
+    };
+    let fetched = release::fetch(fork, bound.registry, &consumers);
+    // A cut writes, so it takes its fork's lock here, once the network has
+    // answered, and reads the repository and the ledger it decides from
+    // under it ([`release::Fetched::plan`]); a plan writes nothing.
+    let lock = CutLock::of(
+        cut_name
+            .is_some()
+            .then(|| ForkLock::acquire(&fork.upstream))
+            .transpose()?,
+    );
+    let opened = knives::jj::Repo::open(path)?;
+    let (mut worst, pins) = release_plan_exit(fork, fetched, &consumers, &opened)?;
     if worst == Exit::Incomplete {
         return Ok(worst);
     }
@@ -83,8 +93,7 @@ pub(crate) fn run_release(
         // gate, no candidate, no reap.
         if let Some(at) = at {
             return Ok(worst.worst(record_hand_cut(
-                fork,
-                &opened,
+                (fork, &opened, &lock),
                 (&name, at, allow_drop),
                 bound,
             )?));
@@ -262,6 +271,7 @@ pub(crate) fn run_release(
             record: None,
             opened: &opened,
             entry,
+            lock: &lock,
             path,
             parents: &request.parents,
             base: &audit_base,
@@ -497,28 +507,14 @@ fn requested_cut<'a>(
 /// itself, against the release it compares the candidate with: when every pin
 /// of that release is frozen, a new dated name is the only editable
 /// composition, so the identical-composition refusal must stand down for it.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the release plan needs explicit repository state and each independently owned consumer-scan collaborator"
-)]
 fn release_plan_exit(
     fork: &Fork<'_>,
-    registry: &knives::config::Registry,
-    locals: &[std::path::PathBuf],
+    fetched: release::Fetched,
+    consumers: &release::ConsumerInputs<'_>,
     opened: &knives::jj::Repo,
-    forge: &dyn knives::consumer_pins::ConsumerPinSource,
-    cache_root: Option<&std::path::Path>,
-    heads: &knives::consumer_pins::ConsumerHeadMemo,
 ) -> anyhow::Result<(Exit, Vec<knives::pins::Pin>)> {
     let entry = fork.entry;
-    let consumers = release::ConsumerInputs {
-        slugs: &entry.consumers,
-        locals,
-        forge,
-        cache_root,
-        heads,
-    };
-    let plan = release::pulled_plan(fork, registry, &consumers)?;
+    let plan = fetched.plan(fork, consumers)?;
     println!("{}", release::render(&plan));
     let mut exit = release::exit_for(&plan);
     if let Some(lag) = release::trunk_lag(opened, plan.release.as_deref(), &entry.trunk_ref()) {
@@ -628,6 +624,23 @@ fn report_cut_audit(
     Some(Exit::Incomplete)
 }
 
+/// The fork's lock a cut holds, which a refusal lets go of before it asks the
+/// remotes where a commit that this repository lacks can be fetched
+/// ([`Remotes`]): a refusal writes nothing after it, so no other writer of
+/// the fork waits on those remotes.
+struct CutLock(std::cell::RefCell<Option<ForkLock>>);
+
+impl CutLock {
+    const fn of(held: Option<ForkLock>) -> Self {
+        Self(std::cell::RefCell::new(held))
+    }
+
+    /// Let the lock go, where it is still held.
+    fn release(&self) {
+        drop(self.0.borrow_mut().take());
+    }
+}
+
 /// The composition gate's inputs: everything the recorded-member check reads
 /// beside the cut subject.
 struct CompositionGate<'a> {
@@ -642,6 +655,8 @@ struct CompositionGate<'a> {
     /// The fork's registry entry, whose remotes a refusal reads for the
     /// fetch of a commit this repository does not hold ([`Remotes`]).
     entry: &'a knives::config::RepoEntry,
+    /// The cut's lock, which such a refusal lets go of before it reads them.
+    lock: &'a CutLock,
     path: &'a std::path::Path,
     parents: &'a [knives::ids::CommitId],
     base: &'a knives::ids::CommitId,
@@ -894,8 +909,9 @@ fn recorded_composition_check(
         (false, release::CutSubject::Committed(_)) => DropDisposition::RefuseRecordingNothing,
     };
     // The fork's remotes are read only where the refusal names the fetch of
-    // a commit this repository does not hold, and then once ([`Remotes`]).
-    let remotes = Remotes::of(gate.entry);
+    // a commit this repository does not hold, and then once, after the cut
+    // lets its lock go ([`Remotes`]).
+    let remotes = Remotes::of(gate.entry, gate.lock);
     if let Some(exit) = report_uncarried_cut(repo, held, &check, (on_drop, &remotes)) {
         return Ok(Err(exit));
     }
@@ -1648,17 +1664,20 @@ fn unread_fetch(asks: &[FixRemedy<'_>]) -> String {
 /// ([`fix_remedy`]): origin, and the publish remote where it is another
 /// remote. Each is read with one `git ls-remote` of its branches and tags
 /// ([`knives::jj::remote_refs`]), so what a remedy names is what the remote
-/// has now, not what this repository last fetched.
+/// has now, not what this repository last fetched. The cut lets its lock go
+/// before the first read ([`CutLock`]): only a refusal reads them.
 struct Remotes<'a> {
     /// The remotes to read, each by name with its URL.
     urls: Vec<(&'a str, &'a str)>,
     /// What they have, once read.
     read: OnceCell<Advertised<'a>>,
+    /// The cut's lock, let go before the first read; `None` in a test.
+    lock: Option<&'a CutLock>,
 }
 
 impl<'a> Remotes<'a> {
-    /// The remotes of `entry`, not read yet.
-    fn of(entry: &'a knives::config::RepoEntry) -> Self {
+    /// The remotes of `entry`, not read yet, for a cut that holds `lock`.
+    fn of(entry: &'a knives::config::RepoEntry, lock: &'a CutLock) -> Self {
         let mut urls = vec![("origin", entry.remote(Role::Origin))];
         if entry.has_split_release() {
             urls.push((entry.publish_remote(), entry.remote(Role::Release)));
@@ -1666,6 +1685,7 @@ impl<'a> Remotes<'a> {
         Self {
             urls,
             read: OnceCell::new(),
+            lock: Some(lock),
         }
     }
 
@@ -1675,12 +1695,17 @@ impl<'a> Remotes<'a> {
         Self {
             urls: Vec::new(),
             read: OnceCell::from(advertised),
+            lock: None,
         }
     }
 
-    /// What the remotes have, read on the first call.
+    /// What the remotes have, read on the first call, once the cut has let
+    /// its lock go.
     fn advertised(&self) -> &Advertised<'a> {
         self.read.get_or_init(|| {
+            if let Some(lock) = self.lock {
+                lock.release();
+            }
             let mut advertised = Advertised::default();
             for &(name, url) in &self.urls {
                 match knives::jj::remote_refs(url, &["refs/heads/*", "refs/tags/*"]) {
@@ -2137,8 +2162,7 @@ fn checked_committed_cut(
 /// them, even where the record fails after the bookmark was made
 /// ([`write_hand_cut`]).
 fn record_hand_cut(
-    fork: &Fork<'_>,
-    opened: &knives::jj::Repo,
+    (fork, opened, lock): (&Fork<'_>, &knives::jj::Repo, &CutLock),
     (name, at, allow_drop): (&str, &str, bool),
     bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
@@ -2177,6 +2201,7 @@ fn record_hand_cut(
         record,
         opened,
         entry,
+        lock,
         path: &fork.checkout.path,
         parents: &parents,
         base: &composed.base,
@@ -2758,7 +2783,7 @@ fn report_completed_cut(
             }
         }
     }
-    let exit = post_cut_exit.worst(reap_after_cut(fork, &release_claims(fork, &claims))?);
+    let exit = post_cut_exit.worst(reap_after_cut(fork, bound)?);
     if let Some(orphaned) = cut.stated_drop {
         report_stated_drop(fork, orphaned)?;
     }
@@ -2925,14 +2950,14 @@ fn stacked_branches(
 }
 
 /// Reap superseded dated cuts now that a newer one exists, keeping each name
-/// a release claim of `claims` holds.
+/// a release claim holds ([`reap`]).
 ///
 /// Under `Fixed` the enumeration is empty by construction (no dated names), so
 /// this is a no-op there. Opens the repository again deliberately: the caller's
 /// handle predates the cut and reads stale tips, under which the superseded cut
 /// is still the newest dated name and nothing is reaped at all.
-fn reap_after_cut(fork: &Fork<'_>, claims: &release::ReleaseClaims) -> anyhow::Result<Exit> {
-    let reaped = reap(fork, claims)?;
+fn reap_after_cut(fork: &Fork<'_>, bound: Bound<'_>) -> anyhow::Result<Exit> {
+    let reaped = reap(fork, bound)?;
     print_reap(&fork.name, &reaped);
     Ok(reap_exit(&reaped.report))
 }
@@ -2948,11 +2973,13 @@ fn read_claims(bound: Bound<'_>) -> Result<knives::store::Store, knives::store::
 }
 
 /// The release claims of `fork` in the state file `read` holds: each claim
-/// of a name that is a release under the fork's scheme, with its owner, or
-/// why the file could not be read ([`release::reap_superseded_held`]).
+/// of a name that is a release under the fork's scheme, with its owner, and
+/// each name of `busy`, a `start` or `finish` of which holds its lock now;
+/// or why the file could not be read ([`release::reap_superseded_held`]).
 fn release_claims(
     fork: &Fork<'_>,
     read: &Result<knives::store::Store, knives::store::StoreError>,
+    busy: Vec<String>,
 ) -> release::ReleaseClaims {
     let store = match read {
         Ok(store) => store,
@@ -2968,10 +2995,44 @@ fn release_claims(
             })
             .map(|claim| release::HeldRelease {
                 name: claim.branch.clone(),
-                holder: claim.owner.clone(),
+                holder: Some(claim.owner.clone()),
             })
+            .chain(
+                busy.into_iter()
+                    .map(|name| release::HeldRelease { name, holder: None }),
+            )
             .collect(),
     )
+}
+
+/// The lock of each release name `opened` holds a ref of, tried under the
+/// fork's lock the reap holds, which waits for none of them: the locks it
+/// took, held until the reap is done, and the names a `start` or `finish`
+/// holds now, which the reap keeps.
+///
+/// A release claim is taken and released by a `start` or `finish` of its
+/// name under that name's lock, not the fork's ([`BranchLock`]), so this is
+/// what keeps a claim from being taken between the reap's read of the
+/// claims and its forget of the name.
+fn lock_release_names(
+    fork: &Fork<'_>,
+    opened: &knives::jj::Repo,
+) -> anyhow::Result<(Vec<BranchLock>, Vec<String>)> {
+    let scheme = fork.entry.dated_scheme();
+    let names: std::collections::BTreeSet<String> = opened
+        .bookmark_tips()?
+        .into_keys()
+        .map(|reference| reference.branch().as_str().to_owned())
+        .filter(|name| knives::ids::is_release_name(&BranchName::new(name.as_str()), &scheme))
+        .collect();
+    let (mut held, mut busy) = (Vec::new(), Vec::new());
+    for name in names {
+        match BranchLock::try_acquire(&fork.upstream, &BranchName::new(name.as_str()))? {
+            Some(lock) => held.push(lock),
+            None => busy.push(name),
+        }
+    }
+    Ok((held, busy))
 }
 
 /// Abandon the earlier writes of each name the reap just forgot — commits the
@@ -3062,7 +3123,7 @@ pub(crate) fn run_reap(
     output: knives::cli::Output,
     bound: Bound<'_>,
 ) -> anyhow::Result<Exit> {
-    let reaped = reap(fork, &release_claims(fork, &read_claims(bound)))?;
+    let reaped = reap(fork, bound)?;
     if let Some(payload) = knives::cli::machine_payload(output, &ReapPayload::of(fork, &reaped))? {
         println!("{payload}");
     } else {
@@ -3081,14 +3142,18 @@ struct Reaped {
 
 /// The reap both callers run, on the repository as it is now. The ledger's
 /// earlier writes of each name count for the keep rule and are cleaned up
-/// after it, and a name a release claim of `claims` holds is kept.
-fn reap(fork: &Fork<'_>, claims: &release::ReleaseClaims) -> anyhow::Result<Reaped> {
+/// after it, and a name a release claim holds is kept: the claims are read
+/// once the lock of each release name is taken, or kept as busy
+/// ([`lock_release_names`]).
+fn reap(fork: &Fork<'_>, bound: Bound<'_>) -> anyhow::Result<Reaped> {
     let path = &fork.checkout.path;
     let (scheme, publish_remote) = (fork.entry.dated_scheme(), fork.entry.publish_remote());
     let opened = knives::jj::Repo::open(path)?;
+    let (_names, busy) = lock_release_names(fork, &opened)?;
+    let claims = release_claims(fork, &read_claims(bound), busy);
     let ledger = Ledger::for_fork(fork).read()?.entries;
     let mut report =
-        release::reap_superseded_held(&opened, &scheme, publish_remote, &ledger, claims)?;
+        release::reap_superseded_held(&opened, &scheme, publish_remote, &ledger, &claims)?;
     let cleaned = abandon_reaped_writes(fork, &report, &ledger);
     report.notes.extend(cleaned.notes);
     // The reap's own abandons hid what they exposed in one operation over

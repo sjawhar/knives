@@ -4,7 +4,7 @@
     clippy::unreachable,
     reason = "fixture setup failures and JSON shape mismatches are test failures"
 )]
-// allow: SIZE_OK: 1367 lines - real-binary adapter scenarios share one fixture and process harness.
+// allow: SIZE_OK: 1725 lines - real-binary adapter scenarios share one fixture and process harness.
 
 #[path = "common/lab.rs"]
 mod lab;
@@ -490,6 +490,102 @@ fn compact_session_start_resets_the_notice_budget() {
     assert!(additional_context(&first).contains("fork managed by knives"));
     assert!(compact.is_empty(), "was: {compact}");
     assert!(additional_context(&restarted).contains("fork managed by knives"));
+}
+
+#[test]
+fn a_clear_session_start_tells_the_roster_again() {
+    // Given: a managed session has already received its notice.
+    let repos = Repositories::new();
+    repos.configure(false);
+    let start = event("session-start", &repos.beta, None);
+    let first = run_hook(repos.home.path(), &start);
+    assert!(additional_context(&first).contains("fork managed by knives"));
+    let again = run_hook(repos.home.path(), &start);
+    assert!(
+        again.is_empty(),
+        "the control: a held roster is not told again: {again}"
+    );
+
+    // When: SessionStart reports a `/clear`, which keeps the session id.
+    let mut clear = event("session-start", &repos.beta, None);
+    clear["source"] = json!("clear");
+    let cleared = run_hook(repos.home.path(), &clear);
+
+    // Then: the roster comes at once, as for a new session (N28).
+    assert!(
+        additional_context(&cleared).contains("fork managed by knives"),
+        "was: {cleared}"
+    );
+}
+
+#[test]
+fn a_subagent_is_told_the_roster_its_parent_was_told() {
+    // Given: a session that was told beta's roster on a read.
+    let repos = Repositories::new();
+    repos.configure(false);
+    let read = event(
+        "post-tool-read",
+        &repos.alpha,
+        Some(&repos.beta.join("file.txt")),
+    );
+    let parent = run_hook(repos.home.path(), &read);
+    assert!(
+        additional_context(&parent).contains("feat/claimed"),
+        "was: {parent}"
+    );
+    let again = run_hook(repos.home.path(), &read);
+    assert!(
+        !again.contains("feat/claimed"),
+        "the control: the parent is not told again: {again}"
+    );
+
+    // When: a subagent of that session reads the same file. Its events carry
+    // the parent's session id and its own agent id.
+    let mut subagent = read;
+    subagent["agent_id"] = json!("agent-def456");
+    subagent["agent_type"] = json!("Explore");
+    let told = run_hook(repos.home.path(), &subagent);
+
+    // Then: the subagent, whose context holds none of it, is told the roster
+    // (N22).
+    assert!(
+        additional_context(&told).contains("feat/claimed"),
+        "was: {told}"
+    );
+}
+
+#[test]
+fn a_notice_the_hook_could_not_write_is_not_recorded_as_told() {
+    // Given: a session start whose stdout nobody reads: the write fails.
+    let repos = Repositories::new();
+    repos.configure(false);
+    let start = event("session-start", &repos.beta, None);
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let mut command = hook_command(repos.home.path());
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .expect("hook stdin")
+        .write_all(start.to_string().as_bytes())
+        .expect("write hook input");
+    let lost = child.wait_with_output().expect("wait for hook");
+    assert!(lost.status.success(), "a hook must never fail the session");
+
+    // When: the session starts again with a stdout that is read.
+    let output = run_hook(repos.home.path(), &start);
+
+    // Then: the notice comes, since none was delivered (N24).
+    assert!(
+        additional_context(&output).contains("fork managed by knives"),
+        "was: {output}"
+    );
 }
 
 #[test]
@@ -1364,4 +1460,266 @@ fn a_forged_jj_pointer_inside_a_git_clone_is_judged_by_the_clones_own_remotes() 
     let context = additional_context(&output);
     assert!(context.contains("clone instructions"), "{context}");
     assert!(!context.contains("fork managed by knives"), "{context}");
+}
+
+/// The first `PostToolUse` of a session reading alpha, a trusted managed
+/// fork, with `claims` claims and `guidance` characters of `AGENTS.md`; the
+/// answer's `additionalContext`.
+fn first_read_of_alpha(repos: &Repositories, claims: usize, guidance: usize) -> String {
+    repos.configure(false);
+    std::fs::write(
+        repos.alpha.join("AGENTS.md"),
+        format!("alpha instructions {}", "g".repeat(guidance)),
+    )
+    .expect("write instructions");
+    let mut map = serde_json::Map::new();
+    for n in 0..claims {
+        map.insert(
+            format!("maintainer/alpha/feat/x{n:03}"),
+            json!({
+                "repo": "maintainer/alpha",
+                "branch": format!("feat/x{n:03}"),
+                "owner": format!("agent-{n}"),
+                "why": "porting the walker to the new layout, then the plant tests, then the review fixes",
+                "started": "2026-01-01T00:00:00Z",
+                "files": []
+            }),
+        );
+    }
+    repos.write_state(&json!({ "claims": map }));
+    let read = event(
+        "post-tool-read",
+        &repos.beta,
+        Some(&repos.alpha.join("file.txt")),
+    );
+    additional_context(&run_hook(repos.home.path(), &read))
+}
+
+#[test]
+fn a_small_roster_and_guidance_fit_together() {
+    // The control: one claim and a short guidance.
+    let repos = Repositories::new();
+    let context = first_read_of_alpha(&repos, 1, 100);
+    assert!(context.contains("fork managed by knives"), "{context}");
+    assert!(context.contains("alpha instructions"), "{context}");
+    assert!(context.chars().count() <= 10_000);
+}
+
+#[test]
+fn a_full_roster_beside_guidance_fits_claude_codes_limit() {
+    // Given: 100 claims, enough to fill the notice to its cap, and 3,000
+    // characters of guidance (the review's case was 12,725 characters).
+    let repos = Repositories::new();
+
+    // When / Then: the notice and the guidance in one `additionalContext`
+    // of at most 10,000 characters, the rows that do not fit counted (F3).
+    let context = first_read_of_alpha(&repos, 100, 3_000);
+    assert!(context.contains("fork managed by knives"), "{context}");
+    assert!(context.contains("alpha instructions"), "{context}");
+    assert!(context.contains("more not shown here"), "{context}");
+    assert!(
+        context.chars().count() <= 10_000,
+        "{}",
+        context.chars().count()
+    );
+}
+
+#[test]
+fn guidance_that_leaves_the_notice_too_little_room_waits_for_the_next_call() {
+    // Given: 100 claims and 9,000 characters of guidance.
+    let repos = Repositories::new();
+
+    // When: the first read.
+    let first = first_read_of_alpha(&repos, 100, 9_000);
+
+    // Then: the notice alone, within the limit; the guidance is not recorded
+    // as given, so the next read gives it.
+    assert!(first.contains("fork managed by knives"), "{first}");
+    assert!(!first.contains("alpha instructions"), "{first}");
+    assert!(first.chars().count() <= 10_000, "{}", first.chars().count());
+    let read = event(
+        "post-tool-read",
+        &repos.beta,
+        Some(&repos.alpha.join("file.txt")),
+    );
+    let second = additional_context(&run_hook(repos.home.path(), &read));
+    assert!(second.contains("alpha instructions"), "{second}");
+    assert!(!second.contains("fork managed by knives"), "{second}");
+}
+
+/// The `additionalContext` of a hook's answer, or nothing for no answer.
+fn context_of(output: &str) -> String {
+    if output.trim().is_empty() {
+        String::new()
+    } else {
+        additional_context(output)
+    }
+}
+
+/// alpha's entry in the session's record: `guided` once its guidance was
+/// given whole, `pointed` once the session was pointed at its files.
+fn alpha_flags(repos: &Repositories) -> Value {
+    let file = repos
+        .home
+        .path()
+        .join("hook-sessions")
+        .join(format!("claude-code-{SESSION_ID}.json"));
+    let Ok(text) = std::fs::read_to_string(&file) else {
+        return Value::Null;
+    };
+    let state: Value = serde_json::from_str(&text).expect("session JSON");
+    let alpha = std::fs::canonicalize(&repos.alpha).expect("alpha's path");
+    state["repos"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .find(|(root, _)| std::fs::canonicalize(root).is_ok_and(|root| root == alpha))
+        .map_or(Value::Null, |(_, flags)| flags.clone())
+}
+
+/// `count` reads of a file in alpha from beta: each answer's
+/// `additionalContext`, and alpha's entry in the session's record after it.
+fn reads_of_alpha(repos: &Repositories, count: usize) -> Vec<(String, Value)> {
+    let read = event(
+        "post-tool-read",
+        &repos.beta,
+        Some(&repos.alpha.join("file.txt")),
+    );
+    (0..count)
+        .map(|_| {
+            let context = context_of(&run_hook(repos.home.path(), &read));
+            (context, alpha_flags(repos))
+        })
+        .collect()
+}
+
+fn guided(flags: &Value) -> bool {
+    flags["guided"].as_bool().unwrap_or(false)
+}
+
+#[test]
+fn a_registry_key_of_10000_characters_gives_the_guidance_whole_once() {
+    // Given: alpha, a trusted managed fork, registered under a key of
+    // 10,000 characters, which the registry takes (the review's second call
+    // sent 10,343 characters and recorded alpha guided).
+    let repos = Repositories::new();
+    repos.configure(false);
+    let registry = repos.home.path().join("repos.toml");
+    let text = std::fs::read_to_string(&registry).expect("read the registry");
+    std::fs::write(
+        &registry,
+        text.replace("[repos.alpha]", &format!("[repos.{}]", "k".repeat(10_000))),
+    )
+    .expect("rewrite the registry");
+
+    // When: three reads of a file in alpha.
+    let calls = reads_of_alpha(&repos, 3);
+
+    // Then: every answer within Claude Code's 10,000 characters; one gives
+    // the guidance whole, under the key cut and marked; alpha is guided from
+    // that call on, never before.
+    for (context, _) in &calls {
+        assert!(
+            context.chars().count() <= 10_000,
+            "{}",
+            context.chars().count()
+        );
+    }
+    let giving = calls
+        .iter()
+        .filter(|(context, _)| context.contains("alpha instructions"))
+        .count();
+    assert_eq!(giving, 1, "{calls:?}");
+    let given = calls
+        .iter()
+        .position(|(context, _)| context.contains("alpha instructions"))
+        .expect("a call gives the guidance");
+    assert!(
+        calls[given]
+            .0
+            .contains(&format!(" repo=\"{}...\">", "k".repeat(100))),
+        "{}",
+        calls[given].0
+    );
+    for (call, (_, flags)) in calls.iter().enumerate() {
+        assert_eq!(guided(flags), call >= given, "call {call}: {flags}");
+    }
+}
+
+#[test]
+fn guidance_over_claude_codes_limit_is_pointed_at_and_again_when_it_changes() {
+    // Given: alpha's AGENTS.md runs 28,273 characters past its first words,
+    // as the fork's own does (the review's second call sent 28,633
+    // characters, shown as a preview, and recorded alpha guided).
+    let repos = Repositories::new();
+    repos.configure(false);
+    let agents = repos.alpha.join("AGENTS.md");
+    std::fs::write(
+        &agents,
+        format!("alpha instructions {}", "g".repeat(28_273)),
+    )
+    .expect("write instructions");
+
+    // When: three reads of a file in alpha.
+    let calls = reads_of_alpha(&repos, 3);
+
+    // Then: every answer within 10,000 characters. The first gives the
+    // notice and points at the file with its length, without its body;
+    // alpha is recorded pointed, never guided; the next two say nothing.
+    for (context, flags) in &calls {
+        assert!(
+            context.chars().count() <= 10_000,
+            "{}",
+            context.chars().count()
+        );
+        assert!(!guided(flags), "{flags}");
+    }
+    let (first, flags) = &calls[0];
+    assert!(first.contains("fork managed by knives"), "{first}");
+    assert!(first.contains("AGENTS.md (28292 characters)"), "{first}");
+    assert!(first.contains("read them before you work"), "{first}");
+    assert!(!first.contains("alpha instructions"), "{first}");
+    assert!(flags["pointed"].is_u64(), "{flags}");
+    assert_eq!(calls[1].0, "");
+    assert_eq!(calls[2].0, "");
+
+    // When: the file changes, and a file in alpha is read again.
+    std::fs::write(
+        &agents,
+        format!("alpha instructions {}", "g".repeat(30_000)),
+    )
+    .expect("change instructions");
+    let again = reads_of_alpha(&repos, 1);
+
+    // Then: the session is pointed at it again, with its new length.
+    let (context, changed) = &again[0];
+    assert!(
+        context.contains("AGENTS.md (30019 characters)"),
+        "{context}"
+    );
+    assert!(context.chars().count() <= 10_000);
+    assert!(!guided(changed), "{changed}");
+    assert_ne!(changed["pointed"], flags["pointed"]);
+}
+
+#[test]
+fn guidance_within_claude_codes_limit_is_given_whole_once() {
+    // The control: 1,000 characters of guidance (the review's control: one
+    // answer of 2,076 characters, then nothing twice).
+    let repos = Repositories::new();
+    repos.configure(false);
+    std::fs::write(
+        repos.alpha.join("AGENTS.md"),
+        format!("alpha instructions {}", "g".repeat(1_000)),
+    )
+    .expect("write instructions");
+
+    let calls = reads_of_alpha(&repos, 3);
+
+    let (first, flags) = &calls[0];
+    assert!(first.contains("alpha instructions"), "{first}");
+    assert!(!first.contains("a hook may show"), "{first}");
+    assert!(guided(flags), "{flags}");
+    assert_eq!(calls[1].0, "");
+    assert_eq!(calls[2].0, "");
 }

@@ -645,10 +645,10 @@ impl Shared {
 }
 
 /// A `git` first on `PATH` that, when `LAB_PUSH_GATE` names a file, writes
-/// `$LAB_PUSH_GATE.waiting` before a push it holds and waits (up to a
-/// minute) for that file to exist, then runs the real `git`: a command held
-/// there has read all it reads before that push, and pushes once the gate
-/// opens.
+/// `$LAB_PUSH_GATE.waiting` before a command it holds and waits (up to a
+/// minute, or as long as the gate says) for that file to exist, then runs the
+/// real `git`: a command held at a push has read all it reads before that
+/// push, and pushes once the gate opens.
 struct Gate {
     root: TempDir,
     path: OsString,
@@ -666,9 +666,22 @@ impl Gate {
         Self::holding("*\" push \"*\" :refs/knives-claims/\"*")
     }
 
+    /// A gate that holds only a read of a claim ref (`git ls-remote` naming
+    /// it), as `start` and `finish` read the claim they decide from, for up
+    /// to four minutes: past the minute a waiter gives a lock, so a command
+    /// that waits for the held one's lock gives up while it is still held.
+    fn on_claim_read() -> Self {
+        Self::holding_for("*\" ls-remote \"*\" refs/knives-claims/\"*", 4800)
+    }
+
     /// A gate that holds each git command whose arguments, spelled ` $* `,
     /// match the shell pattern `pattern`.
     fn holding(pattern: &str) -> Self {
+        Self::holding_for(pattern, 1200)
+    }
+
+    /// [`Gate::holding`], for up to `polls` polls of 50 ms each.
+    fn holding_for(pattern: &str, polls: u32) -> Self {
         let root = tempfile::tempdir().expect("gate directory");
         let path = std::env::var_os("PATH").expect("PATH");
         let bin = root.path().join("bin");
@@ -682,7 +695,7 @@ impl Gate {
                  \x20 if [ -n \"$LAB_PUSH_GATE\" ]; then\n\
                  \x20   : > \"$LAB_PUSH_GATE.waiting\"\n\
                  \x20   i=0\n\
-                 \x20   while [ ! -e \"$LAB_PUSH_GATE\" ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
+                 \x20   while [ ! -e \"$LAB_PUSH_GATE\" ] && [ $i -lt {polls} ]; do sleep 0.05; i=$((i+1)); done\n\
                  \x20 fi;;\n\
                  esac\n\
                  exec '{}' \"$@\"\n",
@@ -2786,6 +2799,118 @@ fn a_seize_that_loses_to_a_finish_takes_nothing() {
     assert!(!two.workspace(BRANCH).exists());
     assert_eq!(two.entries(), entries);
     assert_eq!(two.machine_ref(), machine_ref);
+}
+
+#[test]
+fn a_finish_held_at_its_read_of_the_ledger_keeps_no_finish_of_another_branch_waiting() {
+    // Given: owner one's claims of two branches, and owner one's finish of
+    // the first held at its read of the claim on the ledger, as behind a
+    // remote that does not answer.
+    let shared = Shared::new();
+    let one = &shared.one;
+    for branch in [BRANCH, "feat/delta"] {
+        one.ran(
+            "owner-one",
+            &[
+                "--text", "start", branch, "--repo", "demo", "--why", "port it",
+            ],
+        );
+    }
+    let gate = Gate::on_claim_read();
+    let (mut held, reached) =
+        gate.hold(&mut one.command("owner-one", &["--text", "finish", BRANCH, "--repo", "demo"]));
+
+    // When: owner one finishes the other branch, to its end. Had it waited
+    // for the held finish, it would have given up the wait after a minute,
+    // while the held finish is still held, and exited 3.
+    let other = one.tried(
+        "owner-one",
+        &["--text", "finish", "feat/delta", "--repo", "demo"],
+    );
+    let still_held = held.try_wait().expect("poll the held finish").is_none();
+    let fork_lock_free = lab::lock_is_free(&one.home.path().join("fork-locks/acme/demo.lock"));
+    let held = gate.release(held);
+
+    // Then: the other finish released its claim on the ledger while the
+    // first sat at its read, which held no lock of the fork's; the first then
+    // released its own.
+    assert!(
+        reached,
+        "the held finish never reached its read of the claim: {}",
+        stderr_of(&held)
+    );
+    assert!(
+        other.status.success(),
+        "the other finish: {}",
+        stderr_of(&other)
+    );
+    assert!(
+        still_held,
+        "the held finish was not held: {}",
+        stderr_of(&held)
+    );
+    assert!(shared.claim("feat/delta").is_none());
+    assert_eq!(one.claim("feat/delta"), Value::Null);
+    assert!(
+        fork_lock_free,
+        "the finish at its read held the fork's lock"
+    );
+    assert!(held.status.success(), "{}", stderr_of(&held));
+    assert!(shared.claim(BRANCH).is_none());
+    assert_eq!(one.claim(BRANCH), Value::Null);
+}
+
+#[test]
+fn a_start_and_a_finish_of_one_branch_take_turns() {
+    // Given: owner one's start of a branch nobody holds, held at its read of
+    // the claim on the ledger.
+    let shared = Shared::new();
+    let one = &shared.one;
+    let gate = Gate::on_claim_read();
+    let (held, reached) = gate.hold(&mut one.command(
+        "owner-one",
+        &[
+            "--text", "start", BRANCH, "--repo", "demo", "--why", "port it",
+        ],
+    ));
+
+    // When: owner one finishes that branch, and the start goes on once the
+    // finish waits for a lock.
+    let mut finish = one
+        .command("owner-one", &["--text", "finish", BRANCH, "--repo", "demo"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the finish");
+    let lock = one
+        .home
+        .path()
+        .join("branch-locks/acme%2Fdemo/feat-gamma.lock");
+    let waited = lab::waits_for_a_lock(&mut finish, &lock);
+    let started = gate.release(held);
+    let finished = finish.wait_with_output().expect("collect the finish");
+
+    // Then: the finish waited for the start, then decided from the claim the
+    // start took, and released it.
+    assert!(
+        reached,
+        "the start never reached its read of the claim: {}",
+        stderr_of(&started)
+    );
+    assert!(
+        waited,
+        "the finish did not wait for the start: {}",
+        stderr_of(&finished)
+    );
+    assert!(started.status.success(), "{}", stderr_of(&started));
+    assert!(finished.status.success(), "{}", stderr_of(&finished));
+    assert!(
+        stdout_of(&finished).contains("claim released"),
+        "{}",
+        stdout_of(&finished)
+    );
+    assert!(shared.claim(BRANCH).is_none());
+    assert_eq!(one.claim(BRANCH), Value::Null);
 }
 
 #[test]

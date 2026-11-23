@@ -313,6 +313,57 @@ fn finish_abandons_an_earlier_write_the_claims_working_copy_left_behind() {
 }
 
 #[test]
+fn finish_sweeps_only_once_no_release_write_holds_the_forks_lock() {
+    // Given: K17 2's shape, whose finish abandons the adopted commit, and
+    // that finish held at its `jj workspace forget`: after its store's open,
+    // the last thing before it that takes the fork's lock, and before its
+    // sweep.
+    let (lab, home, claim, adopted) = hand_resolved_release();
+    third_member(&lab, "gamma.txt");
+    release_ran_in(&lab, &home, &claim, &["include", "feat/gamma"]);
+    let holding = lab::Holding::new(&lab::on_path("jj"), "*\" workspace forget \"*");
+    let mut finish = lab::knives_command(
+        &lab.work,
+        home.path(),
+        lab.temp_path(),
+        &["--text", "finish", RELEASE, "--repo", "demo"],
+    );
+    finish.env("KNIVES_OWNER", OWNER);
+    let mut held = holding.hold(&mut finish).unwrap_or_else(|output| {
+        panic!("the finish never forgot its workspace: {}", text(&output))
+    });
+
+    // When: a release write of the fork holds the fork's lock, as one does
+    // from its first read of the release's writes until its last write, and
+    // the finish goes on.
+    let write = knives::store::ForkLock::acquire_beside(
+        &home.path().join("state.json"),
+        &knives::ids::UpstreamName::new("demo"),
+    )
+    .expect("hold the fork's lock");
+    holding.open();
+    let waited = lab::waits_for_a_lock(&mut held, &home.path().join("fork-locks/demo.lock"));
+    let kept_meanwhile = is_visible(&lab, &adopted);
+    drop(write);
+    let finished = held.wait_with_output().expect("collect the finish");
+
+    // Then: its sweep waited for the write and abandoned nothing meanwhile;
+    // once the write was done, it abandoned the adopted commit.
+    let out = text(&finished);
+    assert!(waited, "the finish swept without the fork's lock: {out}");
+    assert!(
+        kept_meanwhile,
+        "the finish abandoned the adopted commit while a release write held the fork's lock: {out}"
+    );
+    assert_eq!(finished.status.code(), Some(0), "{out}");
+    assert!(
+        stdout(&finished).contains(&abandoned_by_finish(&adopted)),
+        "{out}"
+    );
+    assert!(!is_visible(&lab, &adopted), "{out}");
+}
+
+#[test]
 fn finish_keeps_an_earlier_write_another_checkouts_working_copy_rests_on() {
     // Given (K17 3): as K17 2, but the claim's workspace moved off R and the
     // main checkout's working copy on the adopted commit when the include

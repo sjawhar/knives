@@ -614,20 +614,20 @@ fn finish_does_not_forget_a_workspace_it_cannot_look_into() {
 }
 
 #[test]
-fn finish_touches_nothing_before_it_holds_the_forks_lock() {
-    // Given: another writer on this fork holds its lock
+fn finish_touches_nothing_before_it_holds_the_branchs_lock() {
+    // Given: another command about this branch holds its lock
     let lab = Lab::new();
     let (home, _consumer) = release_test_home(&lab);
     let workspace = start(&lab, &home);
-    let held = knives::store::Store::open_for_update(
-        home.path().join("state.json"),
-        &knives::config::FormerNames::new(),
-        &[&knives::ids::UpstreamName::new("demo")],
+    let held = knives::store::BranchLock::acquire_beside(
+        &home.path().join("state.json"),
+        &knives::ids::UpstreamName::new("demo"),
+        &knives::ids::BranchName::new("feat/gamma"),
     )
-    .expect("hold the fork's lock");
+    .expect("hold the branch's lock");
 
-    // When: a finish runs while that writer holds it
-    let finishing = lab::knives_command(
+    // When: a finish runs while that command holds it, and is waiting for it
+    let mut finishing = lab::knives_command(
         &lab.work,
         home.path(),
         lab.temp_path(),
@@ -638,13 +638,62 @@ fn finish_touches_nothing_before_it_holds_the_forks_lock() {
     .stderr(std::process::Stdio::piped())
     .spawn()
     .expect("spawn finish");
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    let waiting = lab::waits_for_a_lock(
+        &mut finishing,
+        &home.path().join("branch-locks/demo/feat-gamma.lock"),
+    );
 
     // Then: it has taken nothing: no snapshot, no forget, no removal
+    assert!(waiting, "the finish did not wait for the branch's lock");
     assert!(workspace.is_dir(), "the workspace went before the lock");
     assert!(claim_held(&home), "the claim went before the lock");
     let names = jj(&lab.work, &["workspace", "list", "-T", r#"name ++ "\n""#]);
     assert!(names.contains("feat-gamma"), "{names}");
+
+    // When: the lock is free
+    drop(held);
+    let finished = finishing.wait_with_output().expect("wait for finish");
+
+    // Then: the finish goes through
+    assert!(finished.status.success(), "{}", shown(&finished));
+    assert!(!workspace.exists());
+}
+
+#[test]
+fn finish_reads_the_ledger_under_the_forks_lock() {
+    // Given: a writer of the whole fork, as `knives ledger migrate` is while
+    // it moves the fork's ledger, holds the fork's lock
+    let lab = Lab::new();
+    let (home, _consumer) = release_test_home(&lab);
+    let workspace = start(&lab, &home);
+    let held = knives::store::ForkLock::acquire_beside(
+        &home.path().join("state.json"),
+        &knives::ids::UpstreamName::new("demo"),
+    )
+    .expect("hold the fork's lock");
+
+    // When: a finish runs while that writer holds it
+    let mut finishing = lab::knives_command(
+        &lab.work,
+        home.path(),
+        lab.temp_path(),
+        &["--text", "finish", "feat/gamma", "--repo", "demo"],
+    )
+    .env("KNIVES_OWNER", OWNER)
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .expect("spawn finish");
+    let waiting = lab::waits_for_a_lock(&mut finishing, &home.path().join("fork-locks/demo.lock"));
+
+    // Then: it waits for the fork's lock to read the state file and the
+    // ledger, and has touched nothing
+    assert!(
+        waiting,
+        "the finish read the ledger without the fork's lock"
+    );
+    assert!(workspace.is_dir(), "the workspace went before the read");
+    assert!(claim_held(&home), "the claim went before the read");
 
     // When: the lock is free
     drop(held);

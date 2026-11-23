@@ -300,8 +300,11 @@ pub fn migrate(
     dry_run: bool,
 ) -> anyhow::Result<Migrated> {
     // Every registered fork's lock first, in the order writers take theirs: a
-    // writer holds its fork's lock from before it reads the fork's ledger
-    // until it is done, so none reads a ledger directory this run is moving.
+    // writer of a fork's statements, pull request records or release events
+    // reads the ledger it decides from under its fork's lock, so none decides
+    // from a ledger directory this run is moving. `start` and `finish` hold
+    // their branch's lock for their run and the fork's lock for their store's
+    // open, so that open reads the ledger before or after this run, whole.
     let upstreams: Vec<UpstreamName> = registry.as_ref().map_or_else(
         |_| Vec::new(),
         |registry| {

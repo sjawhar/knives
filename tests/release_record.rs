@@ -1475,6 +1475,61 @@ fn another_machine_reads_the_record_after_a_sweep() {
 }
 
 #[test]
+fn a_record_held_at_its_pull_of_the_shared_ledger_holds_no_lock_of_the_fork() {
+    // Given: a machine that shares its ledger, a release merged by hand and
+    // pushed to the publish remote, and its record held at the pull of the
+    // shared ledger, the first network call a release write makes.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus(RELEASE, "feat/alpha", "feat/beta");
+    lab.push_branch(RELEASE);
+    let commit = commit_at(&lab, RELEASE);
+    let home = shared_home(&lab);
+    with_lab_origin(&lab, home.path());
+    let (_remote_dir, remote) = lab::bare_remote();
+    share(home.path(), "alpha", &remote);
+    let holding = lab::Holding::git("*\" fetch \"*");
+    let mut record = lab::knives_command(
+        lab.work_path(),
+        home.path(),
+        lab.temp_path(),
+        &[
+            "--text",
+            "release",
+            "--repo",
+            "demo",
+            "cut",
+            RELEASE,
+            "--at",
+            commit.as_str(),
+        ],
+    );
+    record.env("KNIVES_OWNER", "ses_fff688");
+    let mut held = holding
+        .hold(&mut record)
+        .unwrap_or_else(|output| panic!("the record never pulled the ledger: {}", text(&output)));
+
+    // When: the fork's lock is tried while the record is held there.
+    let fork_lock_free = lab::lock_is_free(&home.path().join("fork-locks/acme/demo.lock"));
+    let still_held = held.try_wait().expect("poll the record").is_none();
+    let recorded = holding.release(held);
+
+    // Then: nobody held it, and the record then recorded the release.
+    assert!(still_held, "the record was not held: {}", text(&recorded));
+    assert!(
+        fork_lock_free,
+        "the record held the fork's lock while it pulled the ledger"
+    );
+    assert_eq!(recorded.status.code(), Some(0), "{}", text(&recorded));
+    assert!(
+        text(&recorded).contains(&recorded_line(RELEASE, &commit)),
+        "{}",
+        text(&recorded)
+    );
+}
+
+#[test]
 fn a_record_that_lacks_a_fix_the_newest_release_adopted_is_refused() {
     // Given: RELEASE, a knives cut of `feat/alpha` and `feat/beta`, fixed by
     // hand in place and adopted, which the ledger records as its newest
@@ -2511,6 +2566,71 @@ fn a_record_in_a_clone_without_the_newest_write_is_refused_naming_its_fetch() {
         "{out}"
     );
     assert_eq!(ledger_entries(&home), entries, "{out}");
+}
+
+#[test]
+fn a_record_refused_while_it_asks_the_remotes_keeps_no_writer_of_its_fork_waiting() {
+    // Given: [`adopt_at_origin_lab`], whose record's refusal reads the
+    // remotes to name origin's branch at the adopt it lacks, and that record
+    // held at that read.
+    let (lab, home, adopt, commit) = adopt_at_origin_lab();
+    let holding = lab::Holding::git("*\" ls-remote \"*");
+    let mut record = lab::knives_command(
+        &lab.second,
+        home.path(),
+        lab.temp_path(),
+        &[
+            "--text",
+            "release",
+            "--repo",
+            "demo",
+            "cut",
+            "release/2026-08-06",
+            "--at",
+            commit.as_str(),
+        ],
+    );
+    let mut held = holding
+        .hold(&mut record)
+        .unwrap_or_else(|output| panic!("the record never asked the remotes: {}", text(&output)));
+
+    // When: a statement about a branch of the fork is written, to its end.
+    // Had it waited for the record, it would have given up the wait after a
+    // minute, while the record is still held, and exited 3.
+    let track = lab::knives(
+        &lab,
+        &home,
+        &[
+            "--text",
+            "track",
+            "feat/alpha",
+            "--pr",
+            "5",
+            "--repo",
+            "demo",
+        ],
+    );
+    let still_held = held.try_wait().expect("poll the record").is_none();
+    let fork_lock_free = lab::lock_is_free(&home.path().join("fork-locks/demo.lock"));
+    let recorded = holding.release(held);
+
+    // Then: it was written while the record was held, which had let the
+    // fork's lock go; the record then refused as it does unheld.
+    assert!(track.status.success(), "{}", text(&track));
+    assert!(still_held, "the record was not held: {}", text(&recorded));
+    assert!(
+        fork_lock_free,
+        "the record held the fork's lock while it asked the remotes"
+    );
+    assert_eq!(recorded.status.code(), Some(3), "{}", text(&recorded));
+    assert!(
+        text(&recorded).contains(&format!(
+            "nothing was recorded; fetch origin's refs/heads/{RELEASE}, which holds {}",
+            adopt.short()
+        )),
+        "{}",
+        text(&recorded)
+    );
 }
 
 #[test]
@@ -4097,16 +4217,15 @@ fn an_older_adopt_of_two_thousand_files_is_refused_in_a_clone_without_its_commit
     );
 }
 
-#[test]
-fn an_older_adopt_past_the_piece_bound_is_refused_naming_the_branch_that_origin_holds_at_it() {
-    // Given: RELEASE fixed by hand with one new file whose path joins 17
-    // pieces with `, `, one more than an older event's text is read for, and
-    // adopted, its event as a knives from before the `fix_files` list writes
-    // it; the next release cut on it; a second clone that holds the next
-    // release and not the adopt's commit; RELEASE then pushed at the adopt,
-    // so the publish remote, origin, which the registry reaches, holds it;
-    // and the third release merged by hand in the second clone, without the
-    // fix.
+/// RELEASE fixed by hand with one new file whose path joins 17 pieces with
+/// `, `, one more than an older event's text is read for, and adopted, its
+/// event as a knives from before the `fix_files` list writes it; the next
+/// release cut on it; a second clone that holds the next release and not
+/// the adopt's commit; RELEASE then pushed at the adopt, so the publish
+/// remote, origin, which the registry reaches, holds it; and the third
+/// release merged by hand in the second clone, without the fix. Returns the
+/// adopt's commit and the hand merge's.
+fn adopt_at_origin_lab() -> (Lab, tempfile::TempDir, CommitId, CommitId) {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
@@ -4145,6 +4264,13 @@ fn an_older_adopt_past_the_piece_bound_is_refused_naming_the_branch_that_origin_
         "the second clone does not hold the adopt's commit"
     );
     let commit = hand_merge_in_second_clone(&lab, None);
+    (lab, home, adopt, commit)
+}
+
+#[test]
+fn an_older_adopt_past_the_piece_bound_is_refused_naming_the_branch_that_origin_holds_at_it() {
+    // Given: [`adopt_at_origin_lab`].
+    let (lab, home, adopt, commit) = adopt_at_origin_lab();
     let entries = ledger_entries(&home);
 
     // When: it is recorded in the second clone.

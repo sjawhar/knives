@@ -1884,17 +1884,21 @@ fn a_release_branch_with_a_quote_yields_a_rule_jj_accepts() {
 
 #[test]
 fn the_rebase_rule_keeps_upstreams_tags_and_the_trunks_pinned() {
-    // Given: a tag upstream published off its trunk; a destination on the
-    // trunk's tip, so a rebase of the tag moves its own off-trunk commit and
-    // nothing the trunk pins; and a destination with no relation to anything
-    // pinned, for the trunks.
+    // Given: a tag upstream published off its trunk, and destinations on each
+    // trunk's tip; then both trunks advance past every tag. A rebase of the
+    // tag onto its trunk's old tip moves only its own off-trunk commit, and a
+    // rebase of a trunk onto its old tip moves only the new commit, which no
+    // tag reaches: each can be refused by its own pin alone.
     let lab = Lab::new();
     lab.upstream_branch("maintenance", "maintenance.txt", "maintenance\n");
     lab.upstream_tag("upstream-maintenance-tag", "maintenance");
-    lab.jj_work(["new", "main@upstream", "-m", "destination on the trunk"]);
-    lab.jj_work(["bookmark", "create", "on-trunk", "-r", "@"]);
-    lab.jj_work(["new", "root()", "-m", "independent destination"]);
-    lab.jj_work(["bookmark", "create", "review-destination", "-r", "@"]);
+    lab.jj_work(["new", "main@upstream", "-m", "on upstream's trunk"]);
+    lab.jj_work(["bookmark", "create", "on-upstream-trunk", "-r", "@"]);
+    lab.jj_work(["new", "main@origin", "-m", "on origin's trunk"]);
+    lab.jj_work(["bookmark", "create", "on-origin-trunk", "-r", "@"]);
+    lab.advance_upstream("upstream advance\n");
+    lab.advance_origin_branch("main", "origin advance\n");
+    lab.jj_work(["git", "fetch", "--remote", "origin"]);
     let tag = commit_at(&lab, "upstream-maintenance-tag");
     assert_eq!(
         lab.revision(
@@ -1905,21 +1909,26 @@ fn the_rebase_rule_keeps_upstreams_tags_and_the_trunks_pinned() {
         tag.as_str(),
         "the tag must be one upstream's tags name, or the test proves nothing"
     );
-    assert_eq!(
-        lab.revision(
-            &lab.work,
-            "upstream-maintenance-tag & ::main@upstream",
-            "commit_id"
+    for (source, unrelated) in [
+        (
+            "upstream-maintenance-tag",
+            "::main@upstream | ::main@origin",
         ),
-        "",
-        "the tag must sit off the trunk, or the trunk's pin refuses it instead"
-    );
+        ("main@upstream", "::(tags() | remote_tags())"),
+        ("main@origin", "::(tags() | remote_tags())"),
+    ] {
+        assert_eq!(
+            lab.revision(&lab.work, &format!("{source} & ({unrelated})"), "commit_id"),
+            "",
+            "{source} must sit outside {unrelated}, or another pin refuses it instead"
+        );
+    }
     let rule = knives::config::RepoEntry::new("u", "o").rebase_immutable_heads();
 
     for (source, destination) in [
-        ("upstream-maintenance-tag", "on-trunk"),
-        ("main@upstream", "review-destination"),
-        ("main@origin", "review-destination"),
+        ("upstream-maintenance-tag", "on-upstream-trunk"),
+        ("main@upstream", "on-upstream-trunk"),
+        ("main@origin", "on-origin-trunk"),
     ] {
         // When: the release rebase's one `jj rebase` is pointed at it.
         let before = commit_at(&lab, source);
@@ -1931,6 +1940,54 @@ fn the_rebase_rule_keeps_upstreams_tags_and_the_trunks_pinned() {
         assert!(error.to_string().contains("immutable"), "{source}: {error}");
         assert_eq!(commit_at(&lab, source), before, "{source} moved");
     }
+}
+
+#[test]
+fn the_rebase_rule_pins_origins_trunk_by_name() {
+    // Given: `trunk()` names upstream's trunk, as a checkout cloned from
+    // upstream has it, and origin's trunk advanced past it with a commit no
+    // tag reaches: only the pin on origin's trunk by name covers that commit.
+    let lab = Lab::new();
+    lab.jj_work(["new", "main@origin", "-m", "on origin's trunk"]);
+    lab.jj_work(["bookmark", "create", "on-origin-trunk", "-r", "@"]);
+    lab.advance_origin_branch("main", "origin advance\n");
+    lab.jj_work(["git", "fetch", "--remote", "origin"]);
+    lab.jj_work([
+        "config",
+        "set",
+        "--repo",
+        "revset-aliases.\"trunk()\"",
+        "main@upstream",
+    ]);
+    assert_eq!(
+        lab.revision(&lab.work, "trunk()", "commit_id"),
+        commit_at(&lab, "main@upstream").as_str(),
+        "trunk() must name upstream's trunk, or it pins origin's instead"
+    );
+    assert_eq!(
+        lab.revision(
+            &lab.work,
+            "main@origin & ::(trunk() | tags() | remote_tags())",
+            "commit_id"
+        ),
+        "",
+        "origin's new trunk commit must sit outside every other pin"
+    );
+    let rule = knives::config::RepoEntry::new("u", "o").rebase_immutable_heads();
+    let before = commit_at(&lab, "main@origin");
+
+    // When: the release rebase's one `jj rebase` is pointed at it.
+    let refused = knives::jj::rebase_branch_onto(
+        &lab.work,
+        "main@origin",
+        &commit_at(&lab, "on-origin-trunk"),
+        Some(&rule),
+    );
+
+    // Then: the rule the rebase runs under refuses it.
+    let error = refused.expect_err("main@origin");
+    assert!(error.to_string().contains("immutable"), "{error}");
+    assert_eq!(commit_at(&lab, "main@origin"), before, "main@origin moved");
 }
 
 #[test]

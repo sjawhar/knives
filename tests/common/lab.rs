@@ -1006,6 +1006,219 @@ pub fn knives(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std::proces
         .expect("run knives")
 }
 
+/// Whether the process `pid` has the file at `path` open, as Linux's `/proc`
+/// shows it.
+pub fn has_open(pid: u32, path: &Path) -> bool {
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    std::fs::read_dir(format!("/proc/{pid}/fd")).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| std::fs::read_link(entry.path()).is_ok_and(|to| to == path))
+    })
+}
+
+/// Wait until `child` waits for the lock whose file is `lock`, or has
+/// exited; whether it waits. It waits while it holds the file open and
+/// another holds the lock: a knives command keeps a lock's file open for
+/// the whole wait, so a test sees the wait itself, with no clock. A knives
+/// command gives up a lock it has waited a minute for, and exits; the poll's
+/// own bound, four minutes, ends a child that hangs elsewhere as a failure,
+/// never a verdict.
+pub fn waits_for_a_lock(child: &mut std::process::Child, lock: &Path) -> bool {
+    for _ in 0..12_000 {
+        if has_open(child.id(), lock) && !lock_is_free(lock) {
+            return true;
+        }
+        if child.try_wait().expect("poll the command").is_some() {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    panic!("the command neither waited for a lock nor exited in four minutes");
+}
+
+/// Whether nobody holds the lock whose file is `path`: nobody ever made it,
+/// or a try of it from here takes it, and lets it go at once. A test whose
+/// path is wrong reads it as free, so each test that asks this has a control
+/// that holds the lock at that path.
+pub fn lock_is_free(path: &Path) -> bool {
+    if !path.exists() {
+        return true;
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("open the lock file")
+        .try_lock()
+        .is_ok()
+}
+
+/// A program of the name of `real`, first on a `PATH` of its own, that holds
+/// each call whose arguments, spelled ` $* `, match a shell pattern, in a
+/// process whose `LAB_HOLD_GATE` names a gate file: it writes the gate's
+/// name with `.waiting` after it, and waits (up to four minutes, past the
+/// minute a waiter gives a lock) for the gate to exist, then runs `real`. A
+/// process without `LAB_HOLD_GATE` runs `real` at once: a network call that
+/// stalls, for one command.
+pub struct Holding {
+    root: TempDir,
+    path: std::ffi::OsString,
+}
+
+impl Holding {
+    /// Hold each call of `real` whose ` $* ` matches `pattern`.
+    pub fn new(real: &Path, pattern: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("holding directory");
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("holding bin directory");
+        let name = real.file_name().expect("a program has a file name");
+        let script = bin.join(name);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 case \" $* \" in\n\
+                 {pattern})\n\
+                 \x20 if [ -n \"$LAB_HOLD_GATE\" ]; then\n\
+                 \x20   : > \"$LAB_HOLD_GATE.waiting\"\n\
+                 \x20   i=0\n\
+                 \x20   while [ ! -e \"$LAB_HOLD_GATE\" ] && [ $i -lt 4800 ]; do sleep 0.05; i=$((i+1)); done\n\
+                 \x20 fi;;\n\
+                 esac\n\
+                 exec '{}' \"$@\"\n",
+                real.display()
+            ),
+        )
+        .expect("write the holding program");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make the holding program executable");
+        let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").expect("PATH"),
+        )))
+        .expect("join PATH");
+        Self { root, path }
+    }
+
+    /// Hold each `git` call whose ` $* ` matches `pattern`.
+    pub fn git(pattern: &str) -> Self {
+        Self::new(&on_path("git"), pattern)
+    }
+
+    /// The `PATH` with this program first.
+    pub fn path(&self) -> &std::ffi::OsStr {
+        &self.path
+    }
+
+    fn gate(&self) -> PathBuf {
+        self.root.path().join("gate")
+    }
+
+    fn waiting(&self) -> PathBuf {
+        self.root.path().join("gate.waiting")
+    }
+
+    /// Spawn `command` with this program first on its `PATH` and its calls
+    /// held: the child, once one call waits at the gate, or the child's
+    /// output where it exited first.
+    pub fn hold(&self, command: &mut Command) -> Result<std::process::Child, std::process::Output> {
+        let mut child = command
+            .env("PATH", &self.path)
+            .env("LAB_HOLD_GATE", self.gate())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the held command");
+        for _ in 0..12_000 {
+            if self.waiting().exists() {
+                return Ok(child);
+            }
+            if child.try_wait().expect("poll the held command").is_some() {
+                return Err(child.wait_with_output().expect("collect the held command"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        panic!("the held command neither reached its gate nor exited in four minutes");
+    }
+
+    /// Open the gate: the held call, and every later one, goes on.
+    pub fn open(&self) {
+        std::fs::write(self.gate(), "").expect("open the gate");
+    }
+
+    /// Open the gate, and collect `child`.
+    pub fn release(&self, child: std::process::Child) -> Output {
+        self.open();
+        child.wait_with_output().expect("collect the held command")
+    }
+}
+
+/// Where `program` is on this process's `PATH`.
+pub fn on_path(program: &str) -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .map(|directory| directory.join(program))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("{program} on PATH"))
+}
+
+/// A `gh`, in a directory of its own, that answers what a release plan asks
+/// the forge of a registered consumer, `acme/consumer`: its default branch's
+/// head, and no pin file there ([`register_consumer`]).
+pub struct ConsumerForge {
+    root: TempDir,
+}
+
+impl ConsumerForge {
+    pub fn answering() -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("forge directory");
+        let gh = root.path().join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\n\
+             case \" $* \" in\n\
+             *\" graphql \"*)\n\
+             \x20 echo '{\"data\":{\"repository\":{\"defaultBranchRef\":{\"name\":\"main\",\
+             \"target\":{\"oid\":\"1111111111111111111111111111111111111111\"}}}}}';;\n\
+             *\" repos/acme/consumer/contents/\"*)\n\
+             \x20 echo 'gh: Not Found (HTTP 404)' >&2\n\
+             \x20 exit 1;;\n\
+             *)\n\
+             \x20 echo \"unexpected gh $*\" >&2\n\
+             \x20 exit 1;;\n\
+             esac\n",
+        )
+        .expect("write the forge's gh");
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755))
+            .expect("make the forge's gh executable");
+        Self { root }
+    }
+
+    /// The forge's `gh`.
+    pub fn gh(&self) -> PathBuf {
+        self.root.path().join("gh")
+    }
+
+    /// A cache directory of the forge's own, for `XDG_CACHE_HOME`.
+    pub fn cache(&self) -> PathBuf {
+        self.root.path().join("cache")
+    }
+}
+
+/// Register `acme/consumer` as a consumer of the lab fork in `home`'s
+/// registry, whose one table is the fork's ([`ConsumerForge`]).
+pub fn register_consumer(home: &Path) {
+    let registry = home.join("repos.toml");
+    let mut text = std::fs::read_to_string(&registry).expect("read the registry");
+    text.push_str("consumers = [\"acme/consumer\"]\n");
+    std::fs::write(&registry, text).expect("write the registry");
+}
+
 /// What Claude Code's `SessionStart` hook prints for session `session_id`
 /// started in `cwd`, against the registry in `home`.
 ///
