@@ -42,6 +42,19 @@ impl Event {
         self.text("session_id")
     }
 
+    /// What the session's hook state is kept under: the session id, and for
+    /// a subagent its `agent_id` too. A subagent's tool events carry the
+    /// parent's `session_id` and their own `agent_id`, and a subagent's
+    /// context holds none of what the parent was told, nor the parent any of
+    /// what the subagent was told.
+    pub fn state_key(&self) -> Option<String> {
+        let session_id = self.session_id()?;
+        Some(self.text("agent_id").map_or_else(
+            || session_id.to_owned(),
+            |agent| format!("{session_id}.agent-{agent}"),
+        ))
+    }
+
     pub fn cwd(&self) -> Option<&str> {
         self.text("cwd")
     }

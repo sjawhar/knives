@@ -33,7 +33,9 @@ pub struct ModelContext<'a> {
     /// The turn that made this call: until a turn's tool results reach the
     /// context, what they carry is still on its way.
     pub turn: &'a str,
-    /// The envelope nonces of the knives guidance blocks the context holds.
+    /// The envelope nonces of the knives blocks the context holds: guidance
+    /// blocks and claims notices (the field keeps its first name, `guidance`,
+    /// for adapters that send it).
     pub guidance: BTreeSet<&'a str>,
 }
 

@@ -802,11 +802,12 @@ does not interrupt an agent session.
 | B | OpenCode | The in-process TypeScript plugin is a shim that spawns `knives hook opencode`. | `tool.execute.after` uses the notice and guidance parts in one response budget. `chat.system` returns formatted guidance and its raw bodies. `shell.env` uses `KNIVES_OWNER` when set, then resolves an owner from a managed working directory. `compacting` clears session state. |
 | C | oh-my-pi | The `omp/extensions/knives.ts` extension adapts the OpenCode hook core. | `resources_discover` exposes bundled skills. `tool_result` and `before_agent_start` apply the notice and guidance hooks, and `session.compacting` clears state. It leaves Pi's built-in `bash` tool intact, preserving its approval and sandbox behavior. |
 
-Each session records `noticed` and `guided` flags for every repository. The Claude Code adapter
-marks only `noticed` at `SessionStart`, then marks guidance after a relevant foreign-repository
-tool use. It omits guidance when the event working directory is in that repository, because
-Claude Code already loads the session repository's `CLAUDE.md`. The OpenCode adapter marks both
-flags after any nonempty addition, so its notice and guidance consume one budget.
+Each session records, per repository, the notices it had and whether it was `guided`, and per
+fork the claim roster it was told. The Claude Code adapter records the notice at `SessionStart`,
+then marks guidance after a relevant foreign-repository tool use. It omits guidance when the
+event working directory is in that repository, because Claude Code already loads the session
+repository's `CLAUDE.md`. The OpenCode adapter records both after any nonempty addition, so its
+notice and guidance consume one budget.
 
 The OpenCode protocol fails soft. For a parsed event, a processing failure returns that event's
 empty response envelope. Malformed input returns an empty object. Both cases keep the hook exit
@@ -884,8 +885,25 @@ trusted repository, or both — the adapters can produce these two parts:
   git directly. This is the one place the tool addresses the reader directly. It is emitted
   even when the repository has no `AGENTS.md`, which used to mean nothing was emitted at
   all and an agent was never told where it had walked into.
+
+  One notice with every claim and its whole reason ran to about 10k tokens in a busy fork,
+  and came again after any claim changed and at every workspace. So a session keeps the
+  roster it was told and how each claim was last shown, and the notice says only what it
+  lacks: the whole roster once (a line per claim, cut to fit Claude Code's 10,000-character
+  limit, the rest counted), then only what changed, and the claim on the touched workspace's
+  branch whole whenever it was not last shown whole as it is now. The session forgets what it
+  was told when its context loses the block that told it: at compaction and `/clear`, and in
+  oh-my-pi when a shake drops the block. A Claude Code subagent keeps its own record. Claude
+  Code plans a notice without the session lock, so two parallel calls can both deliver it.
+  Claude Code's limit holds for the notice and the guidance together: the notice gets the
+  room the guidance leaves, and when that is too little, the guidance waits for the next
+  call. A registry key longer than 100 characters is cut where a notice or the guidance
+  names it.
 - **The repository's own guidance**, for a repository `[trust]` names, when it has any, framed
-  as data. A managed fork that no trust rule names gets the notice and no guidance.
+  as data. A managed fork that no trust rule names gets the notice and no guidance. Claude
+  Code shows text over its limit only as a preview, so guidance too long for it is given as a
+  pointer to its files, with their lengths, and is recorded as pointed at, not as given. A
+  change to the files points at them again.
 
 Triggered by files a call actually names, `path`, `filePath`, or an absolute or `~`-rooted path
 in a command, and deliberately not by a command's working directory. A
@@ -893,8 +911,8 @@ batch of `gh` and `git` calls whose working directory sat inside a repository us
 spend that repository's one injection while touching no repository content, so a later
 read of a real file got nothing.
 
-The record is stored in a file for each harness and session. Its per-repository `noticed` and
-`guided` flags survive calls made through different OpenCode plugin instances and prevent a
+The record is stored in a file for each harness and session. Its per-repository records and
+per-fork rosters survive calls made through different OpenCode plugin instances and prevent a
 repository from spending the same announcement budget more than once.
 
 ### OpenCode configuration
@@ -918,9 +936,9 @@ For development from a checkout, use its plugin path instead:
 ```
 
 All default to on, and a plain string entry keeps them that way. They are separable
-because they cost very different amounts: the notice is a couple of hundred bytes,
-the guidance can be 35KB of somebody else's contribution rules, and `owner` only exports
-`KNIVES_OWNER` into shell environments.
+because they cost very different amounts: the notice is a line per claim the first time
+and a few lines after that, the guidance can be 35KB of somebody else's contribution
+rules, and `owner` only exports `KNIVES_OWNER` into shell environments.
 
 ### OpenCode binary discovery
 

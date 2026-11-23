@@ -492,6 +492,42 @@ pub fn remotes(root: &Path) -> Result<BTreeMap<String, String>, BindError> {
         .collect()
 }
 
+/// The branches the checkout at `root` has checked out, by git's `HEAD`.
+///
+/// The branch `HEAD` names, else every branch whose tip `HEAD` is (a jj
+/// checkout keeps `HEAD` detached at its working copy's parent, where jj's
+/// bookmarks are git's branches). Empty when there are none, or git could
+/// not say: a reader takes empty as "not read", never as "unclaimed".
+pub fn checked_out_branches(root: &Path) -> Vec<String> {
+    let Ok(output) = git(root)
+        .args([
+            "for-each-ref",
+            "--points-at=HEAD",
+            "--format=%(HEAD)%(refname:lstrip=2)",
+            "refs/heads/",
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let listed = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_at_checked(1))
+        .map(|(head, branch)| (head == "*", branch.to_owned()))
+        .collect::<Vec<_>>();
+    if listed.iter().any(|(current, _)| *current) {
+        listed
+            .into_iter()
+            .filter_map(|(current, branch)| current.then_some(branch))
+            .collect()
+    } else {
+        listed.into_iter().map(|(_, branch)| branch).collect()
+    }
+}
+
 /// The line of git's stderr that explains a failure: the first that is not a
 /// `warning:`, which git prints ahead of some errors, else the first line.
 fn error_line(stderr: &[u8]) -> String {

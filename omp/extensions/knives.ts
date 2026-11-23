@@ -13,19 +13,22 @@ import {
   relevantTools,
 } from "../../plugin/lib/internals.ts";
 
-// The envelope the binary wraps each guidance block in; its nonce is unique per injection.
-const guidanceEnvelope =
-  /<knives-guidance-([0-9a-f]+) repo="[^"]*">[\s\S]*?<\/knives-guidance-\1>/g;
+// The envelopes the binary wraps each guidance block and each claims notice in; the nonce is
+// unique per tool call, and the guidance and notice one call adds share it.
+const blockEnvelope =
+  /<knives-(guidance|notice)-([0-9a-f]+) repo="[^"]*"[^>]*>[\s\S]*?<\/knives-\1-\2>/g;
 
 /**
  * What the tool hook needs to know about the model's context at this call: the turn that made it
  * (the id of the assistant message holding the call) and the nonces of the knives guidance blocks
- * still in the tool results the model sees. omp's shake, pruning and compaction rewrite those
- * results with no event the binary could key on, so this is what tells it a block was lost.
+ * and claims notices still in the tool results the model sees. omp's shake, pruning and compaction
+ * rewrite those results with no event the binary could key on, so this is what tells it a block
+ * was lost: lost guidance is injected again, and a lost notice makes the next notice of its fork
+ * the whole roster again.
  *
  * Only entries after the latest compaction or `/clear` boundary count. A compaction's kept tail
  * may hold a block too; counting it as lost costs one more copy, where counting a lost block as
- * held would leave the session without that guidance.
+ * held would leave the session without that guidance or that roster.
  */
 function modelContext(branch: readonly SessionEntry[], toolCallId: string): ModelContext {
   let turn = toolCallId;
@@ -53,8 +56,8 @@ function modelContext(branch: readonly SessionEntry[], toolCallId: string): Mode
     if (entry.type !== "message" || entry.message.role !== "toolResult") continue;
     for (const part of entry.message.content) {
       if (part.type !== "text") continue;
-      for (const match of part.text.matchAll(guidanceEnvelope)) {
-        if (match[1] !== undefined) guidance.add(match[1]);
+      for (const match of part.text.matchAll(blockEnvelope)) {
+        if (match[2] !== undefined) guidance.add(match[2]);
       }
     }
   }

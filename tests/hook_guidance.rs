@@ -4,14 +4,12 @@
     reason = "fixture setup and envelope inspection failures are test failures"
 )]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use knives::{
     config::GuidanceRoot,
-    hook::guidance::{
-        Guidance, InstructionFile, claim_lines, envelope_nonce, format_guidance, format_notice,
-        guidance_for,
-    },
+    hook::guidance::{Guidance, InstructionFile, envelope_nonce, format_guidance, guidance_for},
+    hook::notice::{Holding, Sightings, Workspace, claim_line, format_notice, held, plan, roster},
     ids::UpstreamName,
     seen::Seen,
     store::{Claim, OwnerKind},
@@ -66,38 +64,214 @@ fn guidance_format_matches_the_plugin_prose_exactly() {
     );
 }
 
-#[test]
-fn notice_format_matches_the_plugin_prose_exactly() {
-    // Given: multiple claimed branches and an unclaimed variant for one repository.
-    let claims = ["a (x)".to_owned(), "b (y)".to_owned()];
+fn notice_claim(repo: &str, branch: &str, owner: &str, why: &str) -> Claim {
+    Claim {
+        repo: repo.to_owned(),
+        branch: branch.to_owned(),
+        owner: owner.to_owned(),
+        kind: OwnerKind::OsUser,
+        why: why.to_owned(),
+        started: "2026-08-02T00:00:00Z".to_owned(),
+        files: vec![],
+        place: None,
+        machine: None,
+        ledger_commit: None,
+    }
+}
 
-    // When: the formatter produces both notice forms.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one table pins every notice form byte for byte, each beside the plan that makes it"
+)]
+fn each_notice_form_reads_exactly_so() {
+    // Given: two claims of one fork, one on feat/x, checked out in the
+    // workspace `my-x`; a later roster where feat/y changed and feat/z is
+    // new; and one where feat/y is gone.
+    let repo = UpstreamName::new("example-repo");
+    let first = [
+        notice_claim("example-repo", "feat/x", "x", "porting the walker"),
+        notice_claim("example-repo", "feat/y", "y", &"why ".repeat(30)),
+    ];
+    let later = [
+        notice_claim("example-repo", "feat/x", "x", "porting the walker"),
+        notice_claim("example-repo", "feat/y", "y", "review fixes"),
+        notice_claim("example-repo", "feat/z", "z", "new work"),
+    ];
+    let last = [
+        notice_claim("example-repo", "feat/x", "x", "porting the walker"),
+        notice_claim("example-repo", "feat/z", "z", "new work"),
+    ];
+    let sightings = Sightings {
+        seen: &Seen::default(),
+        now: "2026-08-03T00:00:00Z".parse().expect("valid timestamp"),
+    };
+    let nothing_whole = |_: &Claim| false;
+    let holding = |roster, noticed| Holding {
+        roster,
+        noticed,
+        had_whole: nothing_whole,
+    };
+    let first_roster = roster(&first, &repo);
+    let later_roster = roster(&later, &repo);
+    let last_roster = roster(&last, &repo);
+    let held_first = held(&first_roster, "1111111111111111");
+    let held_later = held(&later_roster, "2222222222222222");
+    let x = ["feat/x".to_owned()];
+    let at_x = Workspace {
+        name: Some("my-x"),
+        branches: &x,
+    };
+    let at_main = Workspace {
+        name: Some("main"),
+        branches: &[],
+    };
+    let render = |root: &str, planned| {
+        format_notice(
+            &GuidanceRoot {
+                name: "example-repo".to_owned(),
+                root: PathBuf::from(root),
+            },
+            &planned,
+            &sightings,
+            "NONCE",
+        )
+        .text
+    };
+
+    // When: each form is planned.
     let actual = [
-        normalize_nonce(
-            &format_notice(
-                "example-repo",
-                Path::new("/example/repo"),
-                &claims,
-                "0123456789abcdef",
-            ),
-            "notice",
+        // A roster with a claim here and others.
+        render(
+            "/example/my-x",
+            plan(
+                &first_roster,
+                "1111111111111111",
+                &at_x,
+                &holding(None, false),
+            )
+            .expect("roster"),
         ),
-        normalize_nonce(
-            &format_notice(
-                "example-repo",
-                Path::new("/example/repo"),
-                &[],
-                "fedcba9876543210",
-            ),
-            "notice",
+        // A roster with claims and none here.
+        render(
+            "/example/main",
+            plan(
+                &first_roster,
+                "1111111111111111",
+                &at_main,
+                &holding(None, false),
+            )
+            .expect("roster, none here"),
+        ),
+        // A roster whose only claim is here.
+        render(
+            "/example/my-x",
+            plan(
+                &first_roster[..1],
+                "4444444444444444",
+                &at_x,
+                &holding(None, false),
+            )
+            .expect("roster, only here"),
+        ),
+        // Changes, none here.
+        render(
+            "/example/main",
+            plan(
+                &later_roster,
+                "2222222222222222",
+                &at_main,
+                &holding(Some(&held_first), false),
+            )
+            .expect("changes"),
+        ),
+        // Changes with a release and the claim here.
+        render(
+            "/example/my-x",
+            plan(
+                &last_roster,
+                "5555555555555555",
+                &at_x,
+                &holding(Some(&held_later), false),
+            )
+            .expect("changes, released, here"),
+        ),
+        // Unchanged, none here.
+        render(
+            "/example/main",
+            plan(
+                &later_roster,
+                "2222222222222222",
+                &at_main,
+                &holding(Some(&held_later), false),
+            )
+            .expect("unchanged"),
+        ),
+        // Unchanged with the claim here.
+        render(
+            "/example/my-x",
+            plan(
+                &later_roster,
+                "2222222222222222",
+                &at_x,
+                &holding(Some(&held_later), false),
+            )
+            .expect("unchanged, here"),
+        ),
+        // No claim at all.
+        render(
+            "/example/main",
+            plan(&[], "3333333333333333", &at_main, &holding(None, false)).expect("empty"),
         ),
     ];
 
-    // Then: every non-nonce byte matches the notice prose exactly.
-    assert_eq!(actual, [
-        "\n\n<knives-notice-NONCE repo=\"example-repo\" digest=\"0123456789abcdef\">\n/example/repo is a fork managed by knives, and another agent may be working in it.\nBranches claimed here: a (x); b (y).\nUse knives rather than jj or git directly here: `knives status` for the state of\nevery branch, `knives start <branch>` to take a branch and get your own workspace,\n`knives finish <branch>` as soon as your active work there stops — the branch,\nits bookmark, and any open pull request all survive the release.\n</knives-notice-NONCE>".to_owned(),
-        "\n\n<knives-notice-NONCE repo=\"example-repo\" digest=\"fedcba9876543210\">\n/example/repo is a fork managed by knives, and another agent may be working in it.\nNo branch is claimed here right now.\nUse knives rather than jj or git directly here: `knives status` for the state of\nevery branch, `knives start <branch>` to take a branch and get your own workspace,\n`knives finish <branch>` as soon as your active work there stops — the branch,\nits bookmark, and any open pull request all survive the release.\n</knives-notice-NONCE>".to_owned(),
-    ]);
+    // Then: every byte is as written here.
+    let meta = "os-user, claimed 1d ago, not seen within the observation window";
+    let usage = "Use knives rather than jj or git directly here: `knives status` for the state of\nevery branch, `knives start <branch>` to take a branch and get your own workspace,\n`knives finish <branch>` as soon as your active work there stops — the branch,\nits bookmark, and any open pull request all survive the release.";
+    let open = |digest: &str| {
+        format!("\n\n<knives-notice-NONCE repo=\"example-repo\" digest=\"{digest}\">")
+    };
+    let close = "</knives-notice-NONCE>";
+    let x_whole =
+        format!("This workspace's branch is claimed: feat/x (x, {meta}): porting the walker");
+    let y_cut = format!("- feat/y (y, {meta}): {}…", "why ".repeat(20));
+    assert_eq!(
+        actual,
+        [
+            format!(
+                "{}\n/example/my-x is a fork managed by knives, and another agent may be working in it.\n{x_whole}\nOther branches claimed here (1), each reason cut to one line:\n{y_cut}\n{usage}\n{close}",
+                open("1111111111111111")
+            ),
+            format!(
+                "{}\n/example/main is a fork managed by knives, and another agent may be working in it.\nBranches claimed here (2), each reason cut to one line:\n- feat/x (x, {meta}): porting the walker\n{y_cut}\n{usage}\n{close}",
+                open("1111111111111111")
+            ),
+            format!(
+                "{}\n/example/my-x is a fork managed by knives, and another agent may be working in it.\n{x_whole}\nNo other branch is claimed here right now.\n{usage}\n{close}",
+                open("4444444444444444")
+            ),
+            format!(
+                "{}\nThe claims on this fork changed since the notice with digest 1111111111111111; only the changes follow.\n- newly claimed: feat/z (z, {meta}): new work\n- claim changed: feat/y (y, {meta}): review fixes\n{close}",
+                open("2222222222222222")
+            ),
+            format!(
+                "{}\nThe claims on this fork changed since the notice with digest 2222222222222222; only the changes follow.\n{x_whole}\n- released: feat/y\n{close}",
+                open("5555555555555555")
+            ),
+            format!(
+                "{}\n/example/main: the claims on this fork are unchanged since the notice with digest 2222222222222222.\n{close}",
+                open("2222222222222222")
+            ),
+            format!(
+                "{}\n/example/my-x: the claims on this fork are unchanged since the notice with digest 2222222222222222.\n{x_whole}\n{close}",
+                open("2222222222222222")
+            ),
+            format!(
+                "{}\n/example/main is a fork managed by knives, and another agent may be working in it.\nNo branch is claimed here right now.\n{usage}\n{close}",
+                open("3333333333333333")
+            ),
+        ]
+    );
 }
 
 #[test]
@@ -153,31 +327,25 @@ fn claude_md_wins_over_context_md_in_one_directory() {
 }
 
 #[test]
-fn claim_lines_filter_the_repo_and_render_claim_provenance() {
-    // Given: matching claims with and without a reason, plus another repo's claim.
-    let claim = |repo: &str, branch: &str, owner: &str, why: &str| Claim {
-        repo: repo.to_owned(),
-        branch: branch.to_owned(),
-        owner: owner.to_owned(),
-        kind: OwnerKind::OsUser,
-        why: why.to_owned(),
-        started: "2026-08-02T00:00:00Z".to_owned(),
-        files: vec![],
-        place: None,
-        machine: None,
-        ledger_commit: None,
-    };
+fn the_roster_is_this_forks_claims_by_branch_with_provenance() {
+    // Given: claims with and without a reason, plus another fork's claim.
     let claims = [
-        claim("repo", "feature/no-reason", "alex", ""),
-        claim("repo", "feature/reason", "blair", "review fixes"),
-        claim("other", "feature/hidden", "casey", "different repository"),
+        notice_claim("repo", "feature/reason", "blair", "review fixes"),
+        notice_claim("other", "feature/hidden", "casey", "different repository"),
+        notice_claim("repo", "feature/no-reason", "alex", ""),
     ];
-    let now = "2026-08-03T00:00:00Z".parse().expect("valid timestamp");
+    let sightings = Sightings {
+        seen: &Seen::default(),
+        now: "2026-08-03T00:00:00Z".parse().expect("valid timestamp"),
+    };
 
-    // When: lines are rendered for `repo`.
-    let lines = claim_lines(&claims, &UpstreamName::new("repo"), &Seen::default(), now);
+    // When: the roster of `repo` is rendered row by row.
+    let lines = roster(&claims, &UpstreamName::new("repo"))
+        .into_iter()
+        .map(|claim| claim_line(claim, true, &sightings))
+        .collect::<Vec<_>>();
 
-    // Then: only matching claims remain with explicit ownership provenance.
+    // Then: only that fork's claims, by branch, with explicit ownership provenance.
     assert_eq!(
         lines,
         [

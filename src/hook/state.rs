@@ -12,13 +12,21 @@ const PRUNE_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoFlags {
+    /// The root's guidance was given whole.
     #[serde(default)]
     pub guided: bool,
+    /// The root's guidance was too long to give whole, and the session was
+    /// pointed at its files as they were then: the digest of that guidance
+    /// ([`crate::hook::guidance::Guidance::digest`]). A change to the files
+    /// points again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointed: Option<u64>,
 }
 
-/// A guidance block this session's hook put into a tool result, recorded while
+/// A knives block this session's hook put into a tool result, recorded while
 /// the harness shows the hook the model's context (oh-my-pi), keyed by the
-/// block's envelope nonce.
+/// block's envelope nonce. The guidance and the claims notice of one tool
+/// call share the call's nonce, and so one delivery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Delivery {
     /// The turn whose tool call carried the block. Until that turn's results
@@ -31,6 +39,11 @@ struct Delivery {
     /// Digests of the instruction bodies the block carried.
     #[serde(default)]
     bodies: BTreeSet<String>,
+    /// The forks, by the name their claims are kept under, whose roster
+    /// the session holds as told rests on the block: a claims notice of
+    /// theirs was in it.
+    #[serde(default)]
+    forks: BTreeSet<String>,
 }
 
 /// The envelope a tool call's guidance renders in, and the turn of that call.
@@ -40,12 +53,43 @@ pub struct Envelope<'a> {
     pub turn: &'a str,
 }
 
+/// One fork's claim roster as the session was last told it: the roster's
+/// digest and each claimed branch's claim fingerprint
+/// ([`crate::hook::notice::claim_fingerprint`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldRoster {
+    pub digest: String,
+    pub claims: BTreeMap<String, String>,
+}
+
+/// How much of a claim a notice gave: its reason cut to one line (a roster
+/// row), as much as the notice's cap allows, or whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Given {
+    Line,
+    Fitted,
+    Whole,
+}
+
+/// How a claim was last shown to the session: its fingerprint then, and how
+/// much of it was given.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Shown {
+    fingerprint: String,
+    given: Given,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct DiskState {
     #[serde(default)]
     repos: HashMap<PathBuf, RepoFlags>,
     #[serde(default)]
     seen_notices: HashMap<PathBuf, BTreeSet<String>>,
+    #[serde(default)]
+    rosters: BTreeMap<String, HeldRoster>,
+    #[serde(default)]
+    shown_claims: BTreeMap<String, Shown>,
     #[serde(default)]
     guidance_bodies: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,7 +99,14 @@ struct DiskState {
 #[derive(Debug, Default)]
 pub struct SessionState {
     repos: HashMap<PathBuf, RepoFlags>,
+    /// Per workspace root: the digests of the notices it had.
     seen_notices: HashMap<PathBuf, BTreeSet<String>>,
+    /// Per fork, by the name its claims are kept under: the roster the
+    /// session was last told.
+    rosters: BTreeMap<String, HeldRoster>,
+    /// Per claimed branch ([`crate::hook::notice::branch_key`]): how its
+    /// claim was last shown to the session.
+    shown_claims: BTreeMap<String, Shown>,
     /// Digests of the instruction bodies injected since the last compaction.
     guidance_bodies: BTreeSet<String>,
     /// The guidance blocks injected into tool results, by envelope nonce, once
@@ -99,6 +150,12 @@ impl SessionState {
         self.repos.entry(root.to_owned()).or_default().guided = true;
     }
 
+    /// Records that the session was pointed at `root`'s guidance files, as
+    /// they were when their digest was `digest`, in place of their bodies.
+    pub fn mark_pointed(&mut self, root: &Path, digest: u64) {
+        self.repos.entry(root.to_owned()).or_default().pointed = Some(digest);
+    }
+
     pub fn record_notice(&mut self, root: &Path, digest: String) {
         self.seen_notices
             .entry(root.to_owned())
@@ -112,6 +169,54 @@ impl SessionState {
             .is_some_and(|notices| notices.contains(digest))
     }
 
+    /// The roster of the fork whose claims are kept under `fork` that the
+    /// session was last told.
+    pub fn roster(&self, fork: &str) -> Option<&HeldRoster> {
+        self.rosters.get(fork)
+    }
+
+    /// Holds `roster` as the one the session was told of `fork`, and forgets
+    /// how each claim on a branch it no longer holds was shown: a notice that
+    /// told the release of a claim is the last the session saw of it.
+    pub fn hold_roster(&mut self, fork: String, roster: HeldRoster) {
+        let prefix = format!("{fork}\x1f");
+        self.shown_claims.retain(|key, _| {
+            key.strip_prefix(&prefix)
+                .is_none_or(|branch| roster.claims.contains_key(branch))
+        });
+        self.rosters.insert(fork, roster);
+    }
+
+    /// Whether the claim on the branch `key` names was last told to the
+    /// session as fully as a notice can, as it is now (its `fingerprint`):
+    /// whole, or cut only to fit the cap. Either is not told again until the
+    /// claim changes or the context loses it.
+    pub fn told(&self, key: &str, fingerprint: &str) -> bool {
+        self.shown_claims
+            .get(key)
+            .is_some_and(|shown| shown.given >= Given::Fitted && shown.fingerprint == fingerprint)
+    }
+
+    /// Records that the claim on the branch `key` names was shown with
+    /// `fingerprint`, and how much of it was `given`. A claim given more and
+    /// then a line of it, unchanged, keeps the more it was given.
+    pub fn record_shown(&mut self, key: String, fingerprint: String, given: Given) {
+        let given = self
+            .shown_claims
+            .get(&key)
+            .filter(|shown| shown.fingerprint == fingerprint)
+            .map_or(given, |shown| shown.given.max(given));
+        self.shown_claims.insert(key, Shown { fingerprint, given });
+    }
+
+    /// Forgets what the session was told of `fork`'s claims: its roster and
+    /// how each claim was shown, so the next notice tells them all again.
+    fn forget_told(&mut self, fork: &str) {
+        self.rosters.remove(fork);
+        let prefix = format!("{fork}\x1f");
+        self.shown_claims.retain(|key, _| !key.starts_with(&prefix));
+    }
+
     pub fn record_guidance_body(&mut self, digest: String) {
         self.guidance_bodies.insert(digest);
     }
@@ -120,22 +225,28 @@ impl SessionState {
         self.guidance_bodies.contains(digest)
     }
 
-    /// Drops every guidance record the model's context no longer backs.
+    /// Drops every record the model's context no longer backs.
     ///
     /// A delivery is backed while its turn is `turn` or its envelope nonce is
     /// among `held`, the blocks the context holds now; one that is neither was
     /// shaken, pruned or compacted out, or never landed. Its body digests go,
     /// and so does the guided mark of every root that rests on it, so the next
-    /// call touching such a root injects that guidance again. A root guided
-    /// without a delivery (the system prompt held all of it) stays guided: the
-    /// prompt is rebuilt every turn.
+    /// call touching such a root injects that guidance again; and so does
+    /// what the session was told of each fork whose claims notice it carried,
+    /// so the next notice of that fork tells the whole roster and the touched
+    /// workspace's claim whole again. A root guided without a delivery (the
+    /// system prompt held all of it) stays guided: the prompt is rebuilt
+    /// every turn.
     ///
-    /// Guided marks and digests recorded before the harness showed the context
-    /// carry no delivery to check, so the first reconcile drops them all.
+    /// Guided marks, digests and rosters recorded before the harness showed
+    /// the context carry no delivery to check, so the first reconcile drops
+    /// them all.
     pub fn reconcile(&mut self, turn: &str, held: &BTreeSet<&str>) {
         let Some(deliveries) = &mut self.deliveries else {
             self.repos.clear();
             self.guidance_bodies.clear();
+            self.rosters.clear();
+            self.shown_claims.clear();
             self.deliveries = Some(BTreeMap::new());
             return;
         };
@@ -144,6 +255,7 @@ impl SessionState {
             .filter(|(nonce, delivery)| delivery.turn != turn && !held.contains(nonce.as_str()))
             .map(|(nonce, _)| nonce.clone())
             .collect::<Vec<_>>();
+        let mut forgotten = Vec::new();
         for nonce in lost {
             let Some(delivery) = deliveries.remove(&nonce) else {
                 continue;
@@ -154,7 +266,24 @@ impl SessionState {
             for digest in &delivery.bodies {
                 self.guidance_bodies.remove(digest);
             }
+            forgotten.extend(delivery.forks);
         }
+        for fork in forgotten {
+            self.forget_told(&fork);
+        }
+    }
+
+    /// The delivery of the block `envelope` names, made if absent.
+    fn delivery(&mut self, envelope: Envelope<'_>) -> &mut Delivery {
+        self.deliveries
+            .get_or_insert_default()
+            .entry(envelope.nonce.to_owned())
+            .or_insert_with(|| Delivery {
+                turn: envelope.turn.to_owned(),
+                roots: BTreeSet::new(),
+                bodies: BTreeSet::new(),
+                forks: BTreeSet::new(),
+            })
     }
 
     /// Records the block `envelope` names as what `root`'s guidance and the
@@ -165,14 +294,15 @@ impl SessionState {
         root: &Path,
         bodies: BTreeSet<String>,
     ) {
-        self.deliveries.get_or_insert_default().insert(
-            envelope.nonce.to_owned(),
-            Delivery {
-                turn: envelope.turn.to_owned(),
-                roots: BTreeSet::from([root.to_owned()]),
-                bodies,
-            },
-        );
+        let delivery = self.delivery(envelope);
+        delivery.roots.insert(root.to_owned());
+        delivery.bodies.extend(bodies);
+    }
+
+    /// Records the block `envelope` names as what the session's told roster
+    /// of `fork` rests on: it carried a claims notice of that fork.
+    pub fn record_notice_delivery(&mut self, envelope: Envelope<'_>, fork: String) {
+        self.delivery(envelope).forks.insert(fork);
     }
 
     /// Makes `root`'s guided mark rest on the delivery that carried the body
@@ -191,6 +321,8 @@ impl SessionState {
     pub fn clear(&mut self) {
         self.repos.clear();
         self.seen_notices.clear();
+        self.rosters.clear();
+        self.shown_claims.clear();
         self.guidance_bodies.clear();
         if let Some(deliveries) = &mut self.deliveries {
             deliveries.clear();
@@ -214,6 +346,8 @@ impl SessionState {
             .map_or_else(Self::default, |disk| Self {
                 repos: disk.repos,
                 seen_notices: disk.seen_notices,
+                rosters: disk.rosters,
+                shown_claims: disk.shown_claims,
                 guidance_bodies: disk.guidance_bodies,
                 deliveries: disk.deliveries,
             })
@@ -227,6 +361,8 @@ impl SessionState {
             &DiskState {
                 repos: self.repos.clone(),
                 seen_notices: self.seen_notices.clone(),
+                rosters: self.rosters.clone(),
+                shown_claims: self.shown_claims.clone(),
                 guidance_bodies: self.guidance_bodies.clone(),
                 deliveries: self.deliveries.clone(),
             },

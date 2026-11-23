@@ -11,18 +11,25 @@ use crate::hook::claude_code::{
     Event, EventKind, POST_TOOL_USE_WIRE_NAME, SESSION_START_WIRE_NAME, response,
 };
 use crate::hook::guidance::{
-    Guidance, body_digest, claim_lines, envelope_nonce, format_guidance, format_notice,
-    format_refusal, guidance_for, mention_line, notice_digest,
+    Guidance, body_digest, envelope_nonce, format_guidance, format_pointer, guidance_for,
+    mention_line,
+};
+use crate::hook::notice::{
+    self, Holding, NOTICE_CHARS, NOTICE_FLOOR_CHARS, format_notice_within, format_refusal,
 };
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
 use crate::hook::resolve::{Match, argument_paths, match_checkout};
-use crate::hook::state::{Envelope, SessionState};
+use crate::hook::state::{Envelope, Given, HeldRoster, SessionState};
 use crate::ids::UpstreamName;
 use crate::ledger::problem_human_text;
 use crate::lock::LockError;
 use crate::store::{OwnerKind, Store, StoreError, default_state_path};
 
 const CLAUDE_CODE: &str = "claude-code";
+/// The most characters Claude Code takes whole in a hook's
+/// `additionalContext`: above it, the model is shown a file path and the
+/// first 2,000 characters.
+const CLAUDE_CODE_CONTEXT_CHARS: usize = 10_000;
 const OPENCODE: &str = "opencode";
 const RELEVANT_TOOLS: &[&str] = &[
     "Read",
@@ -144,13 +151,13 @@ fn run_opencode(loaded: Result<Registry, ConfigError>) -> anyhow::Result<Option<
     let home = default_config_home();
     let response = match kind {
         OpenCodeEventKind::ToolExecuteAfter => opencode_tool_after(&event, &home, loaded),
-        OpenCodeEventKind::ChatSystem => opencode_chat_system(&event, loaded),
-        OpenCodeEventKind::ShellEnv => opencode_shell_env(&event),
-        OpenCodeEventKind::Compacting => opencode_compacting(&event, &home),
-        OpenCodeEventKind::Other => opencode::empty_response().map_err(Into::into),
+        OpenCodeEventKind::ChatSystem => opencode_chat_system(&event, loaded).map(Some),
+        OpenCodeEventKind::ShellEnv => opencode_shell_env(&event).map(Some),
+        OpenCodeEventKind::Compacting => opencode_compacting(&event, &home).map(Some),
+        OpenCodeEventKind::Other => opencode::empty_response().map(Some).map_err(Into::into),
     };
     match response {
-        Ok(response) => Ok(Some(response)),
+        Ok(response) => Ok(response),
         Err(error) => {
             report(&error);
             empty_opencode_response(kind).map(Some)
@@ -168,13 +175,19 @@ fn empty_opencode_response(kind: OpenCodeEventKind) -> anyhow::Result<String> {
     .map_err(Into::into)
 }
 
+/// Answers a tool call: the claims notice and the guidance it is due, if any.
+/// `None` when the answer is already written: what it carries is recorded in
+/// the session under its lock only once it is, so a hook killed before the
+/// write leaves nothing marked told, while a parallel call of the session
+/// waits for the lock and finds it recorded.
 fn opencode_tool_after(
     event: &OpenCodeEvent,
     home: &Path,
     loaded: Result<Registry, ConfigError>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Option<String>> {
+    let empty = || opencode::tool_response("").map(Some).map_err(Into::into);
     let Some(session_id) = event.session_id() else {
-        return opencode::tool_response("").map_err(Into::into);
+        return empty();
     };
     let Some((registry, paths)) = relevant_tool_paths(
         &ToolCall {
@@ -185,10 +198,10 @@ fn opencode_tool_after(
         loaded,
     )?
     else {
-        return opencode::tool_response("").map_err(Into::into);
+        return empty();
     };
     let Some(matched) = match_checkout(&paths, &registry) else {
-        return opencode::tool_response("").map_err(Into::into);
+        return empty();
     };
     if matched.is_managed()
         && let Some(cwd) = event.cwd()
@@ -209,11 +222,19 @@ fn opencode_tool_after(
     if let Some(context) = &context {
         unlocked.reconcile(context.turn, &context.guidance);
     }
+    // One envelope nonce for every block this call adds: the notice and the
+    // guidance then rest on one delivery, and a harness that reports either
+    // block held reports the other ([`SessionState::reconcile`]).
+    let nonce = envelope_nonce();
     let notice = notice_if_requested(
         &repo,
         requested.notice.then_some(&matched),
         &registry,
-        &unlocked,
+        &Telling {
+            state: &unlocked,
+            nonce: &nonce,
+            cap: NOTICE_CHARS,
+        },
     )?;
     let guidance = (requested.guidance && matched.trusted && !unlocked.repo(&repo.root).guided)
         .then(|| guidance_for(&repo, &matched.candidate))
@@ -221,51 +242,64 @@ fn opencode_tool_after(
     let candidates = Candidates::new(&repo, notice.as_ref(), guidance.as_ref(), &event.system());
     let outstanding = candidates.outstanding(&unlocked);
     if outstanding.is_empty() {
-        return opencode::tool_response("").map_err(Into::into);
+        return empty();
     }
 
+    // The answer for what is outstanding: the notice, and the guidance the
+    // session lacks.
+    let render = |outstanding: &Outstanding| -> anyhow::Result<String> {
+        let mut additions = Vec::new();
+        if outstanding.notice
+            && let Some(notice) = &notice
+        {
+            additions.push(notice.text.clone());
+        }
+        if let Some(guidance) = guidance
+            .clone()
+            .and_then(|guidance| guidance.keeping(&outstanding.bodies, &outstanding.mentions))
+        {
+            additions.push(format_guidance(&repo.name, &guidance, &nonce));
+        }
+        opencode::tool_response(&additions.join("\n")).map_err(Into::into)
+    };
+
     // Parallel tool calls each found these parts outstanding above; only the
-    // one that records them under the session lock renders them.
-    let nonce = envelope_nonce();
+    // one that records them under the session lock renders them, and it
+    // writes them before it records them.
     let envelope = context.as_ref().map(|context| Envelope {
         nonce: &nonce,
         turn: context.turn,
     });
-    let mut claimed = None;
-    let outstanding = match SessionState::update(home, OPENCODE, session_id, |state| {
+    let mut written = None;
+    let updated = SessionState::update(home, OPENCODE, session_id, |state| {
         if let Some(context) = &context {
             state.reconcile(context.turn, &context.guidance);
         }
         let locked = candidates.outstanding(state);
-        candidates.record(state, &locked, envelope);
-        claimed = Some(locked);
-    }) {
-        Ok(_) => claimed.unwrap_or_default(),
+        let delivered = render(&locked).and_then(|answer| write_output(&answer));
+        if delivered.is_ok() {
+            candidates.record(state, &locked, envelope);
+        }
+        written = Some(delivered);
+    });
+    match (updated, written) {
+        (Ok(_), Some(delivered)) => delivered.map(|()| None),
         // Another call of this session holds the record: it delivers what it
         // claims, and whatever it leaves stays due for a later call.
-        Err(error) if matches!(error.downcast_ref(), Some(LockError::Held { .. })) => {
-            Outstanding::default()
-        }
-        Err(error) => {
-            // The state file is a saving: a read-only config home gets its
-            // additions on every event rather than never.
+        (Err(error), _) if matches!(error.downcast_ref(), Some(LockError::Held { .. })) => empty(),
+        // The answer is written; only the record failed.
+        (Err(error), Some(Ok(()))) => {
             report(&error);
-            outstanding
+            Ok(None)
         }
-    };
-
-    let mut additions = Vec::new();
-    if outstanding.notice
-        && let Some(notice) = notice
-    {
-        additions.push(notice.text);
+        // The state file is a saving: a read-only config home gets its
+        // additions on every event rather than never.
+        (Err(error), _) => {
+            report(&error);
+            render(&outstanding).map(Some)
+        }
+        (Ok(_), None) => empty(),
     }
-    if let Some(guidance) =
-        guidance.and_then(|guidance| guidance.keeping(&outstanding.bodies, &outstanding.mentions))
-    {
-        additions.push(format_guidance(&repo.name, &guidance, &nonce));
-    }
-    opencode::tool_response(&additions.join("\n")).map_err(Into::into)
 }
 
 /// What one tool call could add, and which of its parts the session's system
@@ -316,7 +350,7 @@ impl<'a> Candidates<'a> {
     fn outstanding(&self, state: &SessionState) -> Outstanding {
         let notice = self
             .notice
-            .is_some_and(|notice| !state.notice_seen(&self.repo.root, &notice.update.digest));
+            .is_some_and(|notice| notice.update.is_due(state, &self.repo.root));
         let guidance = self.guidance.is_some() && !state.repo(&self.repo.root).guided;
         if !guidance {
             return Outstanding {
@@ -352,7 +386,12 @@ impl<'a> Candidates<'a> {
         if outstanding.notice
             && let Some(notice) = self.notice
         {
-            state.record_notice(&self.repo.root, notice.update.digest.clone());
+            notice.update.apply(state, &self.repo.root);
+            // What the session was told of the fork rests on this block, the
+            // guidance's own where both came (one nonce per call).
+            if let (Some(envelope), Some(claims)) = (envelope, &notice.update.claims) {
+                state.record_notice_delivery(envelope, claims.target.fork.clone());
+            }
         }
         if outstanding.guidance {
             state.mark_guided(&self.repo.root);
@@ -489,8 +528,8 @@ fn run_claude_code(loaded: Result<Registry, ConfigError>) -> anyhow::Result<Opti
         EventKind::PostToolUse => post_tool_use(&event, &home, loaded),
         EventKind::PreCompact => pre_compact(&event, &home),
         EventKind::SessionEnd => {
-            if let Some(session_id) = event.session_id() {
-                SessionState::delete(&home, CLAUDE_CODE, session_id);
+            if let Some(key) = event.state_key() {
+                SessionState::delete(&home, CLAUDE_CODE, &key);
             }
             Ok(None)
         }
@@ -498,17 +537,22 @@ fn run_claude_code(loaded: Result<Registry, ConfigError>) -> anyhow::Result<Opti
     }
 }
 
+/// Answers `SessionStart`. A compaction or a `/clear` leaves a context without
+/// what the session was told, so the session's record is cleared; after a
+/// `/clear` the roster is told at once, as for a new session, while after a
+/// compaction the next tool call tells it. The record is kept only once the
+/// answer is written: a hook killed before that leaves nothing marked told.
 fn session_start(
     event: &Event,
     home: &Path,
     loaded: Result<Registry, ConfigError>,
 ) -> anyhow::Result<Option<String>> {
-    let Some(session_id) = event.session_id() else {
+    let (Some(session_id), Some(key)) = (event.session_id(), event.state_key()) else {
         return Ok(None);
     };
-    let compact = event.source() == Some("compact");
-    if compact {
-        let _ = SessionState::update(home, CLAUDE_CODE, session_id, SessionState::clear)?;
+    let source = event.source();
+    if matches!(source, Some("compact" | "clear")) {
+        let _ = SessionState::update(home, CLAUDE_CODE, &key, SessionState::clear)?;
     }
     let Some(cwd) = event.cwd() else {
         return Ok(None);
@@ -528,20 +572,24 @@ fn session_start(
         );
     }
     let repo = guidance_root(&matched);
-    if compact {
+    if source == Some("compact") {
         return Ok(None);
     }
-    let state = SessionState::load(home, CLAUDE_CODE, session_id);
-    let Some(notice) = notice_if_requested(&repo, Some(&matched), &registry, &state)? else {
+    let state = SessionState::load(home, CLAUDE_CODE, &key);
+    let telling = Telling {
+        state: &state,
+        nonce: &envelope_nonce(),
+        cap: NOTICE_CHARS,
+    };
+    let Some(notice) = notice_if_requested(&repo, Some(&matched), &registry, &telling)? else {
         return Ok(None);
     };
     let (notice, update) = notice.into_parts();
-    remember(home, CLAUDE_CODE, session_id, move |state| {
+    write_output(&response(SESSION_START_WIRE_NAME, &notice)?)?;
+    remember(home, CLAUDE_CODE, &key, move |state| {
         update.apply(state, &repo.root);
     });
-    response(SESSION_START_WIRE_NAME, &notice)
-        .map(Some)
-        .map_err(Into::into)
+    Ok(None)
 }
 
 fn post_tool_use(
@@ -549,7 +597,7 @@ fn post_tool_use(
     home: &Path,
     loaded: Result<Registry, ConfigError>,
 ) -> anyhow::Result<Option<String>> {
-    let Some(session_id) = event.session_id() else {
+    let (Some(session_id), Some(key)) = (event.session_id(), event.state_key()) else {
         return Ok(None);
     };
     let Some((registry, paths)) = relevant_tool_paths(
@@ -579,16 +627,43 @@ fn post_tool_use(
         );
     }
     let repo = guidance_root(&matched);
-    let state = SessionState::load(home, CLAUDE_CODE, session_id);
+    let state = SessionState::load(home, CLAUDE_CODE, &key);
     let flags = state.repo(&repo.root);
-    let notice = notice_if_requested(&repo, Some(&matched), &registry, &state)?;
-    let include_notice = notice.is_some();
     let include_guidance = matched.trusted
         && !flags.guided
         && event
             .cwd()
             .is_some_and(|cwd| !contains_cwd(&repo.root, cwd));
-    if !include_notice && !include_guidance {
+    let nonce = envelope_nonce();
+    let guidance = include_guidance
+        .then(|| guidance_for(&repo, &matched.candidate))
+        .flatten()
+        .and_then(|guidance| claude_code_guidance(&repo.name, &guidance, &nonce, flags.pointed));
+    // Claude Code takes `additionalContext` whole only up to
+    // CLAUDE_CODE_CONTEXT_CHARS, and the notice and the guidance are one
+    // `additionalContext`: the notice gets the room the guidance leaves, and
+    // when that is less than NOTICE_FLOOR_CHARS the guidance waits for the
+    // next call. Each part is within the limit alone, and the two together
+    // are, so the guidance is recorded as given only in the form it was
+    // shown: whole, or as a pointer to its files.
+    let room = CLAUDE_CODE_CONTEXT_CHARS.saturating_sub(
+        guidance
+            .as_ref()
+            .map_or(0, |guidance| guidance.text.chars().count() + 1),
+    );
+    let beside = room >= NOTICE_FLOOR_CHARS;
+    let telling = Telling {
+        state: &state,
+        nonce: &nonce,
+        cap: if beside {
+            room.min(NOTICE_CHARS)
+        } else {
+            NOTICE_CHARS
+        },
+    };
+    let notice = notice_if_requested(&repo, Some(&matched), &registry, &telling)?;
+    let guidance = guidance.filter(|_| notice.is_none() || beside);
+    if notice.is_none() && guidance.is_none() {
         return Ok(None);
     }
 
@@ -596,30 +671,62 @@ fn post_tool_use(
         let (text, update) = notice.into_parts();
         (Some(text), Some(update))
     });
-    let mut parts = Vec::new();
-    if let Some(text) = notice_text {
-        parts.push(text);
-    }
-    let guidance = include_guidance
-        .then(|| guidance_for(&repo, &matched.candidate))
-        .flatten();
-    if let Some(guidance) = &guidance {
-        parts.push(format_guidance(&repo.name, guidance, &envelope_nonce()));
-    }
-    if parts.is_empty() {
-        return Ok(None);
-    }
-    remember(home, CLAUDE_CODE, session_id, move |state| {
+    let pointer = guidance.as_ref().map(|guidance| guidance.pointer);
+    let parts = notice_text
+        .into_iter()
+        .chain(guidance.map(|guidance| guidance.text))
+        .collect::<Vec<_>>();
+    // Recorded only once the answer is written: a hook killed before that
+    // leaves nothing marked told, and the next call tells it again.
+    write_output(&response(POST_TOOL_USE_WIRE_NAME, &parts.join("\n"))?)?;
+    remember(home, CLAUDE_CODE, &key, move |state| {
         if let Some(update) = notice_update {
             update.apply(state, &repo.root);
         }
-        if guidance.is_some() {
-            state.mark_guided(&repo.root);
+        match pointer {
+            Some(None) => state.mark_guided(&repo.root),
+            Some(Some(digest)) => state.mark_pointed(&repo.root, digest),
+            None => {}
         }
     });
-    response(POST_TOOL_USE_WIRE_NAME, &parts.join("\n"))
-        .map(Some)
-        .map_err(Into::into)
+    Ok(None)
+}
+
+/// A repository's guidance as Claude Code is given it.
+struct ClaudeCodeGuidance {
+    text: String,
+    /// The guidance's digest when `text` points at its files in place of
+    /// their bodies ([`format_pointer`]); `None` when they are given whole.
+    pointer: Option<u64>,
+}
+
+/// `guidance` whole when it fits within [`CLAUDE_CODE_CONTEXT_CHARS`], else a
+/// pointer to its files, unless the session was already pointed at them as
+/// they are now (`pointed`): Claude Code shows longer text only as a preview,
+/// which must never count as given. A pointer that does not fit either gives
+/// nothing.
+fn claude_code_guidance(
+    name: &str,
+    guidance: &Guidance,
+    nonce: &str,
+    pointed: Option<u64>,
+) -> Option<ClaudeCodeGuidance> {
+    let whole = format_guidance(name, guidance, nonce);
+    if whole.chars().count() <= CLAUDE_CODE_CONTEXT_CHARS {
+        return Some(ClaudeCodeGuidance {
+            text: whole,
+            pointer: None,
+        });
+    }
+    let digest = guidance.digest();
+    if pointed == Some(digest) {
+        return None;
+    }
+    let text = format_pointer(name, guidance, nonce, CLAUDE_CODE_CONTEXT_CHARS);
+    (text.chars().count() <= CLAUDE_CODE_CONTEXT_CHARS).then_some(ClaudeCodeGuidance {
+        text,
+        pointer: Some(digest),
+    })
 }
 
 /// Persist a session-state change, reporting a failure without failing the
@@ -682,8 +789,8 @@ fn guidance_root(matched: &Match<'_>) -> GuidanceRoot {
 }
 
 fn pre_compact(event: &Event, home: &Path) -> anyhow::Result<Option<String>> {
-    if let Some(session_id) = event.session_id() {
-        let _ = SessionState::update(home, CLAUDE_CODE, session_id, SessionState::clear)?;
+    if let Some(key) = event.state_key() {
+        let _ = SessionState::update(home, CLAUDE_CODE, &key, SessionState::clear)?;
     }
     Ok(None)
 }
@@ -706,14 +813,92 @@ impl PreparedNotice {
     }
 }
 
+/// What delivering a notice records in the session, and what the notice was
+/// decided against.
 struct NoticeStateUpdate {
+    /// The digest the workspace root has had a notice of once delivered.
     digest: String,
+    /// For the claims notice: what else it records, and what it was planned
+    /// against. `None` for a refusal in its place.
+    claims: Option<ClaimsUpdate>,
+}
+
+struct ClaimsUpdate {
+    target: Target,
+    /// The roster the session holds once the notice is delivered.
+    roster: HeldRoster,
+    /// Each claim the notice shows, by [`notice::branch_key`], with its
+    /// fingerprint and how much of it the notice gives ([`notice::shown`]).
+    shown: Vec<(String, String, Given)>,
+    /// What the session held when the notice was planned.
+    basis: Basis,
+}
+
+/// Whom a claims notice is about.
+struct Target {
+    /// The name the fork's claims are kept under.
+    fork: String,
+    /// The claims on the touched workspace's branch, by
+    /// [`notice::branch_key`], each with its fingerprint.
+    here: Vec<(String, String)>,
+}
+
+/// What a claims notice is planned against, in the session: the digest of
+/// its roster of the fork, whether the root had a notice of the roster's
+/// digest, and which claims on the touched workspace's branch it was last
+/// told as fully as a notice can, as they are.
+#[derive(Debug, PartialEq, Eq)]
+struct Basis {
+    held: Option<String>,
+    noticed: bool,
+    told: Vec<bool>,
+}
+
+impl Basis {
+    fn of(state: &SessionState, root: &Path, digest: &str, target: &Target) -> Self {
+        Self {
+            held: state.roster(&target.fork).map(|held| held.digest.clone()),
+            noticed: state.notice_seen(root, digest),
+            told: target
+                .here
+                .iter()
+                .map(|(key, fingerprint)| state.told(key, fingerprint))
+                .collect(),
+        }
+    }
 }
 
 impl NoticeStateUpdate {
-    fn apply(self, state: &mut SessionState, root: &Path) {
-        state.record_notice(root, self.digest);
+    /// Whether `state` still lacks the notice: a refusal until `root` had it;
+    /// a claims notice while the session holds what it was planned against,
+    /// for it was written for that, and a parallel call that recorded
+    /// another notice first leaves whatever is still due to a later call.
+    fn is_due(&self, state: &SessionState, root: &Path) -> bool {
+        self.claims.as_ref().map_or_else(
+            || !state.notice_seen(root, &self.digest),
+            |claims| Basis::of(state, root, &self.digest, &claims.target) == claims.basis,
+        )
     }
+
+    fn apply(&self, state: &mut SessionState, root: &Path) {
+        state.record_notice(root, self.digest.clone());
+        let Some(claims) = &self.claims else {
+            return;
+        };
+        state.hold_roster(claims.target.fork.clone(), claims.roster.clone());
+        for (key, fingerprint, given) in &claims.shown {
+            state.record_shown(key.clone(), fingerprint.clone(), *given);
+        }
+    }
+}
+
+/// What the session holds, and the envelope nonce the call's additions go
+/// in, for [`notice_if_requested`].
+struct Telling<'a> {
+    state: &'a SessionState,
+    nonce: &'a str,
+    /// The most characters the claims notice runs to.
+    cap: usize,
 }
 
 /// The notice for `repo`, the root `matched` was decided for, when one was
@@ -722,8 +907,15 @@ impl NoticeStateUpdate {
 /// whose `upstream` disagrees with the registry ([`crate::bind::Disagreement`]),
 /// nothing for any other match.
 ///
-/// The roster is the claims kept under the fork's upstream name; the notice
-/// names the fork by its registry key.
+/// The claims notice is planned against what the session holds
+/// ([`notice::plan`]): the whole roster when it holds none of this fork, the
+/// changes when it holds an older one, one line when it holds this one and the
+/// root has not had it, and nothing more once it has; and the claim on the
+/// workspace's branch whole whenever the session was not last shown it whole
+/// as it is. The workspace's branch is the one its checkout has checked out
+/// ([`crate::bind::checked_out_branches`]), or the one its directory is named
+/// for. The roster is the claims kept under the fork's upstream name; the
+/// notice names the fork by its registry key.
 ///
 /// A state file this knives refuses to read ([`StoreError::Unmigrated`], or
 /// [`StoreError::FormerNames`] for one still keeping forks under their registry
@@ -738,8 +930,9 @@ fn notice_if_requested(
     repo: &GuidanceRoot,
     matched: Option<&Match<'_>>,
     registry: &Registry,
-    state: &SessionState,
+    telling: &Telling<'_>,
 ) -> anyhow::Result<Option<PreparedNotice>> {
+    let state = telling.state;
     let Some(matched) = matched else {
         return Ok(None);
     };
@@ -761,13 +954,63 @@ fn notice_if_requested(
         Err(error) => return Err(error.into()),
     };
     let claims = all_claims(&store);
-    let digest = notice_digest(&managed.upstream, &repo.root, &claims);
-    if state.notice_seen(&repo.root, &digest) {
+    let roster = notice::roster(&claims, &managed.upstream);
+    let digest = notice::roster_digest(&managed.upstream, &roster);
+    let fork = managed.upstream.as_str().to_owned();
+    let branches = crate::bind::checked_out_branches(&repo.root);
+    let workspace = notice::Workspace {
+        name: repo.root.file_name().and_then(|name| name.to_str()),
+        branches: &branches,
+    };
+    let holding = Holding {
+        roster: state.roster(&fork),
+        noticed: state.notice_seen(&repo.root, &digest),
+        had_whole: |claim: &crate::store::Claim| {
+            state.told(
+                &notice::branch_key(claim),
+                &notice::claim_fingerprint(claim),
+            )
+        },
+    };
+    let Some(plan) = notice::plan(&roster, &digest, &workspace, &holding) else {
         return Ok(None);
-    }
+    };
+    let rendered = format_notice_within(
+        repo,
+        &plan,
+        &notice::Sightings {
+            seen: &crate::seen::load(),
+            now: jiff::Timestamp::now(),
+        },
+        notice::Bounds {
+            nonce: telling.nonce,
+            cap: telling.cap,
+        },
+    );
+    let keyed =
+        |claim: &crate::store::Claim| (notice::branch_key(claim), notice::claim_fingerprint(claim));
+    let target = Target {
+        fork,
+        here: plan.here.iter().map(|(claim, _)| keyed(claim)).collect(),
+    };
+    let update = ClaimsUpdate {
+        basis: Basis::of(state, &repo.root, &digest, &target),
+        roster: notice::held(&roster, &digest),
+        shown: notice::shown(&plan, &rendered.cut)
+            .into_iter()
+            .map(|(claim, given)| {
+                let (key, fingerprint) = keyed(claim);
+                (key, fingerprint, given)
+            })
+            .collect(),
+        target,
+    };
     Ok(Some(PreparedNotice {
-        text: format_notice_for(repo, &managed.upstream, &digest, &claims),
-        update: NoticeStateUpdate { digest },
+        text: rendered.text,
+        update: NoticeStateUpdate {
+            digest,
+            claims: Some(update),
+        },
     }))
 }
 
@@ -795,27 +1038,22 @@ fn refusal_notice(
     }
     Some(PreparedNotice {
         text: format_refusal(&repo.name, &problem_human_text(text)),
-        update: NoticeStateUpdate { digest },
+        update: NoticeStateUpdate {
+            digest,
+            claims: None,
+        },
     })
-}
-
-fn format_notice_for(
-    repo: &GuidanceRoot,
-    upstream: &UpstreamName,
-    digest: &str,
-    claims: &[crate::store::Claim],
-) -> String {
-    let observations = crate::seen::load();
-    let visible_claims = claim_lines(claims, upstream, &observations, jiff::Timestamp::now());
-    format_notice(&repo.name, &repo.root, &visible_claims, digest)
 }
 
 fn all_claims(store: &Store) -> Vec<crate::store::Claim> {
     store.claims(None).into_iter().cloned().collect()
 }
 
+/// Writes `output` to stdout and flushes it, so a write nobody reads fails
+/// here, before the session records what it carried, never at exit.
 fn write_output(output: &str) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(output.as_bytes())?;
+    stdout.flush()?;
     Ok(())
 }
