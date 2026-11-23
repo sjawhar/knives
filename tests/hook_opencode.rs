@@ -7,6 +7,7 @@
 #[path = "common/lab.rs"]
 mod lab;
 
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -466,8 +467,10 @@ fn a_session_that_lost_its_context_is_told_its_roster_again() {
     let file = repos.beta.join("file.txt");
     let first = run_hook(repos.home.path(), &tool_in_context(&file, "first", &[]));
     assert!(addition(&first).contains("feat/claimed"), "was: {first}");
-    let nonces = guidance_nonces(addition(&first));
-    let held = run_hook(repos.home.path(), &tool_in_context(&file, "held", &nonces));
+    let held = run_hook(
+        repos.home.path(),
+        &tool_in_context(&file, "held", &[addition(&first)]),
+    );
     assert_eq!(addition(&held), "");
 
     // When: the context no longer holds the block, as after `/clear`, a shake
@@ -509,6 +512,271 @@ fn after_a_lost_context_a_changed_claim_comes_with_the_whole_roster() {
         "was: {text}"
     );
     assert!(!text.contains("only the changes follow"), "was: {text}");
+}
+
+/// Which omp extension sends a session's tool events.
+#[derive(Debug, Clone, Copy)]
+enum Extension {
+    /// 5.1.0 to 6.1.4's, which reports the guidance blocks alone
+    /// ([`tool_in_old_context`]).
+    Old,
+    /// This tree's, which reports the claims notices too ([`tool_in_context`]).
+    New,
+}
+
+/// An omp session that reads a file once a turn, and whose context holds
+/// every tool result it got until omp's shake takes one out.
+struct OmpSession<'a> {
+    home: &'a Path,
+    extension: Extension,
+    results: Vec<String>,
+}
+
+impl<'a> OmpSession<'a> {
+    const fn new(home: &'a Path, extension: Extension) -> Self {
+        Self {
+            home,
+            extension,
+            results: Vec::new(),
+        }
+    }
+
+    /// The next turn's read of `file`: what the hook added to its result.
+    fn read(&mut self, file: &Path) -> String {
+        let turn = format!("turn-{}", self.results.len() + 1);
+        let held = self.results.iter().map(String::as_str).collect::<Vec<_>>();
+        let event = match self.extension {
+            Extension::Old => tool_in_old_context(file, &turn, &held),
+            Extension::New => tool_in_context(file, &turn, &held),
+        };
+        let added = addition(&run_hook(self.home, &event)).to_owned();
+        self.results.push(added.clone());
+        added
+    }
+
+    /// omp's shake: the result of turn `turn`, counted from 1, leaves the
+    /// context.
+    fn shake(&mut self, turn: usize) {
+        self.results[turn - 1] = "[shaken]".to_owned();
+    }
+}
+
+/// beta's claims: feat/claimed, and feat/other with the reason `why`.
+fn two_claims(why: &str) -> Value {
+    json!({"claims": {
+        "maintainer/beta/feat/claimed": claim("feat/claimed"),
+        "maintainer/beta/feat/other": claim_with_reason("feat/other", why)
+    }})
+}
+
+/// What a session whose omp extension is `extension` was given on each of
+/// six turns that read beta's file, feat/other's reason changed after the
+/// first when `change`.
+fn six_turns(extension: Extension, change: bool) -> Vec<String> {
+    let repos = Repositories::new();
+    repos.write_state(&two_claims("porting"));
+    let file = repos.beta.join("file.txt");
+    let mut session = OmpSession::new(repos.home.path(), extension);
+    let mut turns = vec![session.read(&file)];
+    if change {
+        repos.write_state(&two_claims("review fixes"));
+    }
+    for _ in 2..=6 {
+        turns.push(session.read(&file));
+    }
+    turns
+}
+
+#[test]
+fn an_old_extension_is_told_a_change_once_and_not_the_roster_on_every_turn() {
+    // Given: a session whose omp extension predates the report of claims
+    // notices (5.1.0 to 6.1.4), reading beta on six turns, a claim changed
+    // after the first.
+    let turns = six_turns(Extension::Old, true);
+
+    // Then: the roster, the change, and nothing more. The change's notice has
+    // no guidance block beside it, so that extension never reports it; a
+    // binary that took its absence as the notice lost told the whole roster
+    // again on every later turn.
+    assert!(turns[0].contains("Branches claimed here (2)"), "{turns:#?}");
+    assert!(
+        turns[1].contains("- claim changed: feat/other (agent-one,"),
+        "{turns:#?}"
+    );
+    assert_eq!(turns[2..], ["", "", "", ""], "{turns:#?}");
+}
+
+#[test]
+fn the_new_extension_is_told_a_change_once() {
+    // Given: the same six turns, from an extension that reports claims notices.
+    let turns = six_turns(Extension::New, true);
+
+    // Then: the roster, the change, and nothing more.
+    assert!(turns[0].contains("Branches claimed here (2)"), "{turns:#?}");
+    assert!(
+        turns[1].contains("- claim changed: feat/other (agent-one,"),
+        "{turns:#?}"
+    );
+    assert_eq!(turns[2..], ["", "", "", ""], "{turns:#?}");
+}
+
+#[test]
+fn an_old_extension_with_no_change_is_told_the_roster_once() {
+    // Given: six turns from the old extension, and no claim changed.
+    let turns = six_turns(Extension::Old, false);
+
+    // Then: the roster on the first turn, and nothing after it.
+    assert!(turns[0].contains("Branches claimed here (2)"), "{turns:#?}");
+    assert_eq!(turns[1..], ["", "", "", "", ""], "{turns:#?}");
+}
+
+#[test]
+fn the_new_extension_is_told_the_roster_again_once_a_shake_takes_the_change() {
+    // Given: a session whose extension reports claims notices, told beta's
+    // roster and then a change.
+    let repos = Repositories::new();
+    repos.write_state(&two_claims("porting"));
+    let file = repos.beta.join("file.txt");
+    let mut session = OmpSession::new(repos.home.path(), Extension::New);
+    let _ = session.read(&file);
+    repos.write_state(&two_claims("review fixes"));
+    let change = session.read(&file);
+    assert!(
+        change.contains("- claim changed: feat/other (agent-one,"),
+        "the control: {change}"
+    );
+
+    // When: omp's shake takes the change's result out of the context.
+    session.shake(2);
+    let lost = session.read(&file);
+    let after = session.read(&file);
+
+    // Then: the whole roster, with the change, once.
+    assert!(
+        lost.contains("Branches claimed here (2)") && lost.contains("review fixes"),
+        "{lost}"
+    );
+    assert_eq!(after, "");
+}
+
+#[test]
+fn an_old_extension_that_lost_its_guidance_is_given_it_again_and_keeps_its_roster() {
+    // Given: a session whose extension predates notice reports, told beta's
+    // guidance and roster in one result.
+    let repos = Repositories::new();
+    let file = repos.beta.join("file.txt");
+    let mut session = OmpSession::new(repos.home.path(), Extension::Old);
+    let first = session.read(&file);
+    assert!(
+        first.contains("beta instructions") && first.contains("<knives-notice-"),
+        "the control: {first}"
+    );
+
+    // When: omp's shake takes that result out of the context.
+    session.shake(1);
+    let lost = session.read(&file);
+
+    // Then: the guidance again, which that extension reports. Its report says
+    // nothing of claims notices, so the roster the binary told stands, as it
+    // did before 6.1.5.
+    assert!(lost.contains("beta instructions"), "{lost}");
+    assert!(!lost.contains("<knives-notice-"), "{lost}");
+}
+
+#[test]
+fn a_session_resumed_with_the_new_extension_is_told_a_roster_the_old_one_left_unchecked() {
+    // Given: a session whose old extension was told beta's roster, then a
+    // change whose notice it never reports, then guidance in another
+    // repository, whose call recorded the change's notice as gone.
+    let repos = Repositories::new();
+    repos.write_state(&two_claims("porting"));
+    let file = repos.beta.join("file.txt");
+    let mut session = OmpSession::new(repos.home.path(), Extension::Old);
+    let _ = session.read(&file);
+    repos.write_state(&two_claims("review fixes"));
+    let change = session.read(&file);
+    let elsewhere = session.read(&repos.trusted.join("file.txt"));
+    assert!(
+        change.contains("- claim changed: feat/other (agent-one,"),
+        "the control: {change}"
+    );
+    assert!(
+        elsewhere.contains("trusted instructions") && !elsewhere.contains("<knives-notice-"),
+        "{elsewhere}"
+    );
+
+    // When: the session is resumed in an omp that loads the new extension.
+    session.extension = Extension::New;
+    let resumed = session.read(&file);
+    let after = session.read(&file);
+
+    // Then: the whole roster, once: the record of the change's notice went
+    // with the old report, so nothing says whether the context still holds it.
+    assert!(
+        resumed.contains("Branches claimed here (2)") && resumed.contains("review fixes"),
+        "{resumed}"
+    );
+    assert_eq!(after, "");
+}
+
+#[test]
+fn a_session_resumed_with_the_new_extension_checks_a_change_the_old_one_never_reported() {
+    // Given: a session whose old extension was told beta's roster, then a
+    // change whose notice it never reports, and calls that gave nothing,
+    // so nothing was recorded as gone.
+    let repos = Repositories::new();
+    repos.write_state(&two_claims("porting"));
+    let file = repos.beta.join("file.txt");
+    let mut session = OmpSession::new(repos.home.path(), Extension::Old);
+    let _ = session.read(&file);
+    repos.write_state(&two_claims("review fixes"));
+    let change = session.read(&file);
+    let quiet = session.read(&file);
+    assert!(
+        change.contains("- claim changed: feat/other (agent-one,"),
+        "the control: {change}"
+    );
+    assert_eq!(quiet, "");
+
+    // When: it is resumed with the new extension, and omp's shake later takes
+    // the change's result out of the context.
+    session.extension = Extension::New;
+    let resumed = session.read(&file);
+    session.shake(2);
+    let lost = session.read(&file);
+
+    // Then: nothing while the context holds the change's notice; the whole
+    // roster, with the change, once it is gone.
+    assert_eq!(resumed, "");
+    assert!(
+        lost.contains("Branches claimed here (2)") && lost.contains("review fixes"),
+        "{lost}"
+    );
+}
+
+#[test]
+fn a_session_resumed_with_the_new_extension_checks_the_blocks_the_old_one_reported() {
+    // Given: a session whose old extension was told beta's guidance and
+    // roster in one result.
+    let repos = Repositories::new();
+    let file = repos.beta.join("file.txt");
+    let mut session = OmpSession::new(repos.home.path(), Extension::Old);
+    let _ = session.read(&file);
+
+    // When: it is resumed with the new extension, and omp's shake later takes
+    // that result out of the context.
+    session.extension = Extension::New;
+    let resumed = session.read(&file);
+    session.shake(1);
+    let lost = session.read(&file);
+
+    // Then: nothing while the context holds the result; the guidance and the
+    // roster once it is gone.
+    assert_eq!(resumed, "");
+    assert!(
+        lost.contains("beta instructions") && lost.contains("Branches claimed here (1)"),
+        "{lost}"
+    );
 }
 
 #[test]
@@ -789,12 +1057,11 @@ fn a_fitted_claim_is_told_again_fitted_after_a_lost_context() {
     let first = addition(&first).to_owned();
     assert!(first.contains("… (reason cut: "), "{first}");
     assert_eq!(feat_claimed_given(repos.home.path()), json!("fitted"));
-    let nonce = notice_nonce(&first);
 
     // When: the context holds the notice, and then loses it.
     let held = run_hook(
         repos.home.path(),
-        &tool_in_context(&file, "turn-2", &[nonce]),
+        &tool_in_context(&file, "turn-2", &[first.as_str()]),
     );
     let lost = run_hook(repos.home.path(), &tool_in_context(&file, "turn-3", &[]));
 
@@ -1142,21 +1409,51 @@ fn a_call_that_finds_the_session_record_held_leaves_the_guidance_for_a_later_cal
     );
 }
 
-/// A tool event from a harness that shows the model's context: the turn that
-/// made the call, and the envelope nonces of the guidance blocks it holds.
+/// A tool event as the omp extension sends it: the turn that made the call,
+/// and the knives blocks in the tool results the model's context still holds
+/// (`held`): every block's envelope nonce in `guidance`, and the claims
+/// notices' in `notices` too.
 fn tool_in_context(path: &Path, turn: &str, held: &[&str]) -> Value {
+    let notices = held
+        .iter()
+        .flat_map(|text| block_nonces(text, "notice"))
+        .collect::<BTreeSet<_>>();
+    let mut blocks = held
+        .iter()
+        .flat_map(|text| block_nonces(text, "guidance"))
+        .collect::<BTreeSet<_>>();
+    blocks.extend(&notices);
     let mut event = tool(path, None);
-    event["context"] = json!({"turn": turn, "guidance": held});
+    event["context"] = json!({"turn": turn, "guidance": blocks, "notices": notices});
     event
+}
+
+/// The same event as the omp extension of 5.1.0 to 6.1.4 sends it: its
+/// pattern, `<knives-guidance-([0-9a-f]+) repo="[^"]*">`, finds the guidance
+/// blocks alone, and it sends no `notices`.
+fn tool_in_old_context(path: &Path, turn: &str, held: &[&str]) -> Value {
+    let guidance = held
+        .iter()
+        .flat_map(|text| block_nonces(text, "guidance"))
+        .collect::<BTreeSet<_>>();
+    let mut event = tool(path, None);
+    event["context"] = json!({"turn": turn, "guidance": guidance});
+    event
+}
+
+/// The envelope nonces of the `kind` blocks (`guidance` or `notice`) in a
+/// tool result.
+fn block_nonces<'a>(text: &'a str, kind: &str) -> Vec<&'a str> {
+    let open = format!("<knives-{kind}-");
+    text.lines()
+        .filter_map(|line| line.strip_prefix(open.as_str()))
+        .filter_map(|rest| rest.split_once(' ').map(|(nonce, _)| nonce))
+        .collect()
 }
 
 /// The envelope nonces of the guidance blocks in a tool addition.
 fn guidance_nonces(addition: &str) -> Vec<&str> {
-    addition
-        .lines()
-        .filter_map(|line| line.strip_prefix("<knives-guidance-"))
-        .filter_map(|rest| rest.split_once(' ').map(|(nonce, _)| nonce))
-        .collect()
+    block_nonces(addition, "guidance")
 }
 
 #[test]
@@ -1165,18 +1462,20 @@ fn guidance_the_context_lost_is_injected_again_once() {
     let repos = Repositories::new();
     let file = repos.trusted.join("file.txt");
     let first = run_hook(repos.home.path(), &tool_in_context(&file, "one", &[]));
-    let delivered = guidance_nonces(addition(&first));
-    assert_eq!(delivered.len(), 1, "was: {first}");
+    assert_eq!(guidance_nonces(addition(&first)).len(), 1, "was: {first}");
 
     // When: a later turn reads there while the context holds the block, then
     // two more after the harness shook it out of the context.
     let held = run_hook(
         repos.home.path(),
-        &tool_in_context(&file, "two", &delivered),
+        &tool_in_context(&file, "two", &[addition(&first)]),
     );
     let lost = run_hook(repos.home.path(), &tool_in_context(&file, "three", &[]));
     let again = guidance_nonces(addition(&lost));
-    let after = run_hook(repos.home.path(), &tool_in_context(&file, "four", &again));
+    let after = run_hook(
+        repos.home.path(),
+        &tool_in_context(&file, "four", &[addition(&lost)]),
+    );
 
     // Then: the guidance comes back once, the first time it is missing.
     assert_eq!(addition(&held), "", "was: {held}");
@@ -1223,10 +1522,9 @@ fn a_second_checkout_gets_the_instructions_once_their_only_block_is_lost() {
         repos.home.path(),
         &tool_in_context(&repos.trusted.join("file.txt"), "one", &[]),
     );
-    let delivered = guidance_nonces(addition(&first));
     let repeat = run_hook(
         repos.home.path(),
-        &tool_in_context(&second.join("file.txt"), "two", &delivered),
+        &tool_in_context(&second.join("file.txt"), "two", &[addition(&first)]),
     );
 
     // When: the second checkout is read after that block left the context.
