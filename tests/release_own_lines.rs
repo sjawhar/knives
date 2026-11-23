@@ -333,6 +333,168 @@ fn a_knives_cut_of_members_forking_at_three_trunk_commits_reads_each_carried() {
     assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
 }
 
+/// The file each member of [`next_release_and_control`] adds a line to, in a
+/// region of its own, as the members of a fork add lines to one shared file.
+const SHARED: &str = "shared.txt";
+
+/// [`SHARED`] holding the line of each member of `notes`, of `m0`, `m1` and
+/// `m2`, in that member's region.
+fn shared_txt(notes: &[&str]) -> String {
+    let mut text = String::new();
+    for (region, member, rest) in [
+        ("alpha", "m0", "one\ntwo\n"),
+        ("beta", "m1", "three\nfour\n"),
+        ("gamma", "m2", "five\nsix\n"),
+    ] {
+        text.push_str(region);
+        text.push('\n');
+        if notes.contains(&member) {
+            text.push_str(member);
+            text.push_str(" note\n");
+        }
+        text.push_str(rest);
+    }
+    text
+}
+
+/// A trunk T0 to T3, each changing line L of `l.txt`. `feat/m0` forks at T0
+/// and `feat/m1` at T1, each writing a file of its own and its line of
+/// [`SHARED`]; [`RELEASE`], cut outside knives, merges the two. Then
+/// `feat/m0` advances by a line of its file, `feat/m2` forks at T2 the same
+/// way, and the trunk moves to T3, past every fork point. [`NEXT`] merges
+/// the three ([`THREE_FORKS`]) and holds each one's lines. The control
+/// merges the same parents in the same order and holds [`RELEASE`]'s tree,
+/// which lacks `feat/m2` and `feat/m0`'s advance; no bookmark names it. The
+/// commits of [`NEXT`] and of the control.
+fn next_release_and_control() -> (Lab, TempDir, CommitId, CommitId) {
+    let lab = trunk_with(&[
+        ("l.txt", l_txt("0").as_str()),
+        (SHARED, shared_txt(&[]).as_str()),
+    ]);
+    branch_on(&lab, "main@upstream", "feat/m0", |work| {
+        write_file(work, "m0.txt", "m0\n");
+        write_file(work, SHARED, &shared_txt(&["m0"]));
+    });
+    lab.upstream_trunk_file("l.txt", &l_txt("1"));
+    branch_on(&lab, "main@upstream", "feat/m1", |work| {
+        write_file(work, "m1.txt", "m1\n");
+        write_file(work, SHARED, &shared_txt(&["m1"]));
+    });
+    hand_release(&lab, RELEASE, &["feat/m0", "feat/m1"], |work| {
+        write_file(work, "l.txt", &l_txt("1"));
+        write_file(work, SHARED, &shared_txt(&["m0", "m1"]));
+    });
+    extend_branch(&lab, "feat/m0", "m0.txt", "m0\nmore\n");
+    lab.upstream_trunk_file("l.txt", &l_txt("2"));
+    branch_on(&lab, "main@upstream", "feat/m2", |work| {
+        write_file(work, "m2.txt", "m2\n");
+        write_file(work, SHARED, &shared_txt(&["m2"]));
+    });
+    lab.upstream_trunk_file("l.txt", &l_txt("3"));
+    let next = hand_release(&lab, NEXT, &THREE_FORKS, |work| {
+        write_file(work, "l.txt", &l_txt("2"));
+        write_file(work, SHARED, &shared_txt(&["m0", "m1", "m2"]));
+    });
+    let control = hand_release(&lab, "control", &THREE_FORKS, |work| {
+        jj_in(work, &["restore", "--from", RELEASE]);
+    });
+    jj_in(&lab.work, &["bookmark", "delete", "control"]);
+    let repo = knives::jj::Repo::open(&lab.work).expect("open the work checkout");
+    assert_eq!(
+        repo.parent_commits(control.as_str())
+            .expect("the control's parents"),
+        repo.parent_commits(next.as_str())
+            .expect("the release's parents"),
+        "the control has the release's parents, in order"
+    );
+    let tree_diff = Command::new("jj")
+        .args(["--ignore-working-copy", "diff", "--summary"])
+        .args(["--from", RELEASE, "--to", control.as_str()])
+        .current_dir(&lab.work)
+        .output()
+        .expect("run jj diff");
+    assert!(tree_diff.status.success(), "{}", text(&tree_diff));
+    assert_eq!(
+        stdout(&tree_diff),
+        "",
+        "the control holds the older release's tree"
+    );
+    let (home, _consumer) = release_test_home(&lab);
+    (lab, home, next, control)
+}
+
+#[test]
+fn verify_passes_a_release_that_holds_its_members_and_fails_its_control() {
+    // Given: a release of three members that fork at T0, T1 and T2 and each
+    // add a line to one shared file, with the trunk at T3; and its control,
+    // with the same parents and the tree of the release before it.
+    let (lab, home, next, control) = next_release_and_control();
+
+    // When: each is verified by its commit.
+    let held = verify(&lab, &home, next.as_str());
+    let lacking = verify(&lab, &home, control.as_str());
+
+    // Then: the release reads every member carried, with exit 0.
+    let out = stdout(&held);
+    assert_eq!(held.status.code(), Some(0), "{}", text(&held));
+    assert!(!out.contains("!!"), "{out}");
+    for member in THREE_FORKS {
+        assert!(out.contains(&carried_row(&label(&lab, member))), "{out}");
+    }
+
+    // And: the control reads `feat/m0` and `feat/m2` missing, with the
+    // findings exit, and names each line it lacks under its row; `feat/m1`,
+    // whose lines the older tree holds, reads carried.
+    let out = stdout(&lacking);
+    assert_eq!(lacking.status.code(), Some(FINDINGS), "{}", text(&lacking));
+    let advanced = label(&lab, "feat/m0");
+    let added = label(&lab, "feat/m2");
+    for (member, lost) in [
+        (&advanced, vec!["      m0.txt:2: added line lost ‹more›"]),
+        (
+            &added,
+            vec![
+                "      m2.txt:1: added line lost ‹m2›",
+                "      shared.txt:8: added line lost ‹m2 note›",
+            ],
+        ),
+    ] {
+        let row = missing_row(member);
+        let below: Vec<&str> = out
+            .lines()
+            .skip_while(|line| *line != row)
+            .skip(1)
+            .take_while(|line| line.starts_with("      "))
+            .collect();
+        assert_eq!(below, lost, "{out}");
+    }
+    assert!(out.contains(&carried_row(&label(&lab, "feat/m1"))), "{out}");
+}
+
+#[test]
+fn verify_reports_differ_between_a_release_and_its_control() {
+    // Given: the release of three members and its control, which has the
+    // release's parents and the tree of the release before it.
+    let (lab, home, next, control) = next_release_and_control();
+
+    // When: each is verified by its commit, as JSON.
+    let held = verify_json(&lab, &home, next.as_str());
+    let lacking = verify_json(&lab, &home, control.as_str());
+
+    // Then: the release lists no member missing, and the control lists
+    // exactly the two members whose lines its tree lacks.
+    assert_eq!(held["audit"]["missing"], json!([]), "{held}");
+    assert_eq!(
+        lacking["audit"]["missing"],
+        json!([label(&lab, "feat/m0"), label(&lab, "feat/m2")]),
+        "{lacking}"
+    );
+    for report in [&held, &lacking] {
+        assert_eq!(report["audit"]["unexplained"], json!([]), "{report}");
+        assert_eq!(report["audit"]["inconclusive"], json!([]), "{report}");
+    }
+}
+
 /// [`M`], forked at T2 and writing `m.txt`, and [`RELEASE`], a commit on T0
 /// that holds `M`'s change as a cherry-pick and does not reach `M`'s tip. The
 /// trunk is at T2. The release's commit.
