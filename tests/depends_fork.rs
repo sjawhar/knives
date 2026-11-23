@@ -4126,6 +4126,28 @@ fn offline_an_upstream_this_forks_checkout_origin_spells_is_refused() {
 }
 
 #[test]
+fn with_a_path_checkout_origin_the_registry_origin_spelling_the_upstream_is_this_forks() {
+    // Given: this fork's checkout `origin` is a path, so its own repository
+    // is its registry `origin`, which spells its upstream, maintainer/demo;
+    // the forge answers.
+    let fixture = fixture_with("", UPSTREAM);
+
+    // When: #12 and #13 are named by this fork's key.
+    for text in ["demo#12", "demo#13"] {
+        let output = on(&fixture, text);
+        assert!(output.status.success(), "{text}: {}", said(&output));
+    }
+
+    // Then: each is the upstream's number, with no lookup of it: this fork's
+    // own repository spells the upstream, as the `--on` help says (N128),
+    // never a refusal of a number both repositories have.
+    assert_eq!(
+        fixture.required("feat/alpha"),
+        ["maintainer/demo#12", "maintainer/demo#13"]
+    );
+}
+
+#[test]
 fn a_fork_of_this_fork_with_a_local_origin_names_this_forks_review_pull_request() {
     // Given: config B; `child`, a fork of this fork (its upstream is
     // acme/demo, this fork's repository) whose own repository is a local
