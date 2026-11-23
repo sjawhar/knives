@@ -34,9 +34,13 @@ pub struct ModelContext<'a> {
     /// context, what they carry is still on its way.
     pub turn: &'a str,
     /// The envelope nonces of the knives blocks the context holds: guidance
-    /// blocks and claims notices (the field keeps its first name, `guidance`,
-    /// for adapters that send it).
+    /// blocks and, from an adapter that reports them, claims notices (the
+    /// field keeps its first name, `guidance`, for adapters that send it).
     pub guidance: BTreeSet<&'a str>,
+    /// The envelope nonces of the claims notices the context holds; `None`
+    /// from an adapter that sends no `notices` (the omp extension of 5.1.0 to
+    /// 6.1.6), whose report says nothing of a notice.
+    pub notices: Option<BTreeSet<&'a str>>,
 }
 
 impl Event {
@@ -93,12 +97,8 @@ impl Event {
         let context = self.value.get("context")?;
         Some(ModelContext {
             turn: context.get("turn").and_then(Value::as_str)?,
-            guidance: context
-                .get("guidance")
-                .and_then(Value::as_array)?
-                .iter()
-                .filter_map(Value::as_str)
-                .collect(),
+            guidance: nonces(context, "guidance")?,
+            notices: nonces(context, "notices"),
         })
     }
 
@@ -120,6 +120,13 @@ impl Event {
     fn text(&self, name: &str) -> Option<&str> {
         self.value.get(name).and_then(Value::as_str)
     }
+}
+
+/// The envelope nonces the list `field` of a context names; `None` when the
+/// context has no such list. An empty list is a report too: no such block.
+fn nonces<'a>(context: &'a Value, field: &str) -> Option<BTreeSet<&'a str>> {
+    let nonces = context.get(field)?.as_array()?;
+    Some(nonces.iter().filter_map(Value::as_str).collect())
 }
 
 #[derive(Serialize)]

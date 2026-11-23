@@ -23,10 +23,16 @@ const inflightCap = 4;
 const defaultInvokeTimeoutMs = 10_000;
 
 /**
- * What the harness shows of the model's context at a tool call: the turn that made the call, and
- * the envelope nonces of the knives guidance blocks the context still holds.
+ * What the harness shows of the model's context at a tool call: the turn that made the call, the
+ * envelope nonces of the knives blocks the context still holds (`guidance`: guidance blocks and
+ * claims notices), and those of the claims notices among them (`notices`), which tells the binary
+ * the report covers notices.
  */
-export type ModelContext = { readonly turn: string; readonly guidance: readonly string[] };
+export type ModelContext = {
+  readonly turn: string;
+  readonly guidance: readonly string[];
+  readonly notices: readonly string[];
+};
 type ToolInput = {
   readonly tool: string;
   readonly sessionID: string;

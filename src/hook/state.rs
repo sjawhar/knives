@@ -92,6 +92,8 @@ struct DiskState {
     shown_claims: BTreeMap<String, Shown>,
     #[serde(default)]
     guidance_bodies: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    unchecked_rosters: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     deliveries: Option<BTreeMap<String, Delivery>>,
 }
@@ -104,6 +106,11 @@ pub struct SessionState {
     /// Per fork, by the name its claims are kept under: the roster the
     /// session was last told.
     rosters: BTreeMap<String, HeldRoster>,
+    /// Forks, by the name their claims are kept under, whose roster as told
+    /// rests on a claims notice that a report naming no notices let go: no
+    /// record says whether the context still holds it, so the first report
+    /// that names notices has their rosters told whole again.
+    unchecked_rosters: BTreeSet<String>,
     /// Per claimed branch ([`crate::hook::notice::branch_key`]): how its
     /// claim was last shown to the session.
     shown_claims: BTreeMap<String, Shown>,
@@ -228,34 +235,60 @@ impl SessionState {
     /// Drops every record the model's context no longer backs.
     ///
     /// A delivery is backed while its turn is `turn` or its envelope nonce is
-    /// among `held`, the blocks the context holds now; one that is neither was
-    /// shaken, pruned or compacted out, or never landed. Its body digests go,
-    /// and so does the guided mark of every root that rests on it, so the next
-    /// call touching such a root injects that guidance again; and so does
-    /// what the session was told of each fork whose claims notice it carried,
-    /// so the next notice of that fork tells the whole roster and the touched
-    /// workspace's claim whole again. A root guided without a delivery (the
-    /// system prompt held all of it) stays guided: the prompt is rebuilt
-    /// every turn.
+    /// among `held` or `notices`, the blocks the context holds now; one that
+    /// is neither was shaken, pruned or compacted out, or never landed. Its
+    /// body digests go, and so does the guided mark of every root that rests
+    /// on it, so the next call touching such a root injects that guidance
+    /// again. A root guided without a delivery (the system prompt held all of
+    /// it) stays guided: the prompt is rebuilt every turn.
     ///
-    /// Guided marks, digests and rosters recorded before the harness showed
-    /// the context carry no delivery to check, so the first reconcile drops
-    /// them all.
-    pub fn reconcile(&mut self, turn: &str, held: &BTreeSet<&str>) {
+    /// What the session was told of each fork whose claims notice a lost
+    /// delivery carried goes only when the harness reports claims notices
+    /// (`notices` is `Some`, even empty), so the next notice of that fork
+    /// tells the whole roster and the touched workspace's claim whole again.
+    /// A report without them, as the omp extension of 5.1.0 to 6.1.6 sends,
+    /// does not say whether a notice is gone: before 6.1.5 that extension
+    /// named guidance blocks alone, so it never named a notice that came
+    /// without guidance. Its silence is no loss: the roster told stands, as
+    /// before 6.1.5, and stays unchecked until a report that names notices
+    /// has it told whole again.
+    ///
+    /// Guided marks and digests recorded before the harness showed the
+    /// context carry no delivery to check, so the first reconcile drops them
+    /// all; rosters too, when the report names notices, and otherwise they
+    /// stay unchecked.
+    pub fn reconcile(
+        &mut self,
+        turn: &str,
+        held: &BTreeSet<&str>,
+        notices: Option<&BTreeSet<&str>>,
+    ) {
+        if notices.is_some() {
+            for fork in std::mem::take(&mut self.unchecked_rosters) {
+                self.forget_told(&fork);
+            }
+        }
         let Some(deliveries) = &mut self.deliveries else {
             self.repos.clear();
             self.guidance_bodies.clear();
-            self.rosters.clear();
-            self.shown_claims.clear();
+            if notices.is_some() {
+                self.rosters.clear();
+                self.shown_claims.clear();
+            } else {
+                self.unchecked_rosters.extend(self.rosters.keys().cloned());
+            }
             self.deliveries = Some(BTreeMap::new());
             return;
         };
+        let backed = |nonce: &str| {
+            held.contains(nonce) || notices.is_some_and(|notices| notices.contains(nonce))
+        };
         let lost = deliveries
             .iter()
-            .filter(|(nonce, delivery)| delivery.turn != turn && !held.contains(nonce.as_str()))
+            .filter(|(nonce, delivery)| delivery.turn != turn && !backed(nonce.as_str()))
             .map(|(nonce, _)| nonce.clone())
             .collect::<Vec<_>>();
-        let mut forgotten = Vec::new();
+        let mut forks = BTreeSet::new();
         for nonce in lost {
             let Some(delivery) = deliveries.remove(&nonce) else {
                 continue;
@@ -266,10 +299,14 @@ impl SessionState {
             for digest in &delivery.bodies {
                 self.guidance_bodies.remove(digest);
             }
-            forgotten.extend(delivery.forks);
+            forks.extend(delivery.forks);
         }
-        for fork in forgotten {
-            self.forget_told(&fork);
+        if notices.is_some() {
+            for fork in forks {
+                self.forget_told(&fork);
+            }
+        } else {
+            self.unchecked_rosters.extend(forks);
         }
     }
 
@@ -323,6 +360,7 @@ impl SessionState {
         self.seen_notices.clear();
         self.rosters.clear();
         self.shown_claims.clear();
+        self.unchecked_rosters.clear();
         self.guidance_bodies.clear();
         if let Some(deliveries) = &mut self.deliveries {
             deliveries.clear();
@@ -348,6 +386,7 @@ impl SessionState {
                 seen_notices: disk.seen_notices,
                 rosters: disk.rosters,
                 shown_claims: disk.shown_claims,
+                unchecked_rosters: disk.unchecked_rosters,
                 guidance_bodies: disk.guidance_bodies,
                 deliveries: disk.deliveries,
             })
@@ -363,6 +402,7 @@ impl SessionState {
                 seen_notices: self.seen_notices.clone(),
                 rosters: self.rosters.clone(),
                 shown_claims: self.shown_claims.clone(),
+                unchecked_rosters: self.unchecked_rosters.clone(),
                 guidance_bodies: self.guidance_bodies.clone(),
                 deliveries: self.deliveries.clone(),
             },

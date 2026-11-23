@@ -220,7 +220,7 @@ fn opencode_tool_after(
     let context = event.context();
     let mut unlocked = SessionState::load(home, OPENCODE, session_id);
     if let Some(context) = &context {
-        unlocked.reconcile(context.turn, &context.guidance);
+        unlocked.reconcile(context.turn, &context.guidance, context.notices.as_ref());
     }
     // One envelope nonce for every block this call adds: the notice and the
     // guidance then rest on one delivery, and a harness that reports either
@@ -273,7 +273,7 @@ fn opencode_tool_after(
     let mut written = None;
     let updated = SessionState::update(home, OPENCODE, session_id, |state| {
         if let Some(context) = &context {
-            state.reconcile(context.turn, &context.guidance);
+            state.reconcile(context.turn, &context.guidance, context.notices.as_ref());
         }
         let locked = candidates.outstanding(state);
         let delivered = render(&locked).and_then(|answer| write_output(&answer));

@@ -7,8 +7,11 @@ carries the session's effective system prompt (`ctx.getSystemPrompt()`), and the
 out any instruction file whose text that prompt already holds — the session's own `AGENTS.md`
 or `CLAUDE.md`, and the guidance this adapter adds to the prompt each turn. The call also carries
 the id of the assistant message that made it and the envelope nonces of the knives guidance blocks
-in the tool results after the branch's latest compaction or `/clear`, so the binary injects again
-a block that shake, pruning or compaction took out of the context.
+and claims notices in the tool results after the branch's latest compaction or `/clear` (the
+notices' again under `notices`), so the binary injects again a block that shake, pruning or
+compaction took out of the context. The extensions of knives 6.1.6 and earlier send no `notices`
+(before 6.1.5 they reported guidance blocks alone), and the binary takes a notice missing from such
+a report as held, never as lost.
 
 Install:
 
