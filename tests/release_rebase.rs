@@ -1884,14 +1884,17 @@ fn a_release_branch_with_a_quote_yields_a_rule_jj_accepts() {
 
 #[test]
 fn the_rebase_rule_keeps_upstreams_tags_and_the_trunks_pinned() {
-    // Given: a tag upstream published off its trunk, and a destination with
-    // no relation to anything pinned.
+    // Given: a tag upstream published off its trunk; a destination on the
+    // trunk's tip, so a rebase of the tag moves its own off-trunk commit and
+    // nothing the trunk pins; and a destination with no relation to anything
+    // pinned, for the trunks.
     let lab = Lab::new();
     lab.upstream_branch("maintenance", "maintenance.txt", "maintenance\n");
     lab.upstream_tag("upstream-maintenance-tag", "maintenance");
+    lab.jj_work(["new", "main@upstream", "-m", "destination on the trunk"]);
+    lab.jj_work(["bookmark", "create", "on-trunk", "-r", "@"]);
     lab.jj_work(["new", "root()", "-m", "independent destination"]);
     lab.jj_work(["bookmark", "create", "review-destination", "-r", "@"]);
-    let destination = commit_at(&lab, "review-destination");
     let tag = commit_at(&lab, "upstream-maintenance-tag");
     assert_eq!(
         lab.revision(
@@ -1902,11 +1905,25 @@ fn the_rebase_rule_keeps_upstreams_tags_and_the_trunks_pinned() {
         tag.as_str(),
         "the tag must be one upstream's tags name, or the test proves nothing"
     );
+    assert_eq!(
+        lab.revision(
+            &lab.work,
+            "upstream-maintenance-tag & ::main@upstream",
+            "commit_id"
+        ),
+        "",
+        "the tag must sit off the trunk, or the trunk's pin refuses it instead"
+    );
     let rule = knives::config::RepoEntry::new("u", "o").rebase_immutable_heads();
 
-    for source in ["upstream-maintenance-tag", "main@upstream", "main@origin"] {
+    for (source, destination) in [
+        ("upstream-maintenance-tag", "on-trunk"),
+        ("main@upstream", "review-destination"),
+        ("main@origin", "review-destination"),
+    ] {
         // When: the release rebase's one `jj rebase` is pointed at it.
         let before = commit_at(&lab, source);
+        let destination = commit_at(&lab, destination);
         let refused = knives::jj::rebase_branch_onto(&lab.work, source, &destination, Some(&rule));
 
         // Then: the rule the rebase runs under still refuses it.
