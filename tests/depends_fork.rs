@@ -239,6 +239,13 @@ fn install_forge(shim: &Path, log: &Path, state: &ForgeState) {
             canonical: KEPT_UNDER,
             pulls: &upstream_pulls,
         },
+        // The upstream's former name, which the forge resolves to it, with
+        // the same pull requests, as GitHub does after a rename.
+        Repository {
+            named: "maintainer-old/demo",
+            canonical: KEPT_UNDER,
+            pulls: &upstream_pulls,
+        },
         Repository {
             named: "acme-old/demo",
             canonical: "acme/demo",
@@ -664,9 +671,10 @@ fn a_renamed_fork_repository_is_named_by_any_spelling_and_forgotten_by_any() {
 
     // When / Then: an ambiguous number suggests the spelling `--on` takes,
     // and that spelling and the record's own each record the fork's pull
-    // request under the forge's name.
+    // request under the forge's name. The dependent is feat/base: the fork's
+    // #12 is feat/alpha's own, never offered to feat/alpha.
     fixture.refused(
-        "feat/alpha",
+        "feat/base",
         &["--on", "demo#12"],
         &["`--on maintainer/demo#12`", "`--on acme-old/demo#12`"],
     );
@@ -4072,14 +4080,20 @@ fn offline_an_upstream_this_forks_registry_origin_spells_is_refused() {
         said(&output)
     );
     // ... while this fork's key is read as usual against the checkout's
-    // repository: a number only the upstream has is the upstream's (N123).
+    // repository: a number only the upstream has is the upstream's, and one
+    // only the fork has is its review pull request (N123, N129).
     let output = on(&fixture, "demo#7");
     assert!(output.status.success(), "{}", said(&output));
-    assert_eq!(fixture.required("feat/alpha"), ["maintainer/demo#7"]);
+    let output = on(&fixture, "demo#13");
+    assert!(output.status.success(), "{}", said(&output));
+    assert_eq!(
+        fixture.required("feat/alpha"),
+        ["maintainer/demo#7", "origin:acme/demo#13"]
+    );
 
     // And: a number both have is refused without offering the upstream's
-    // spelling, which would be refused too, and the spelling it offers
-    // records (N123).
+    // spelling, which would be refused too, naming the `origin` that spells
+    // the upstream; the spelling it offers records (N123, N130).
     let depends =
         |args: &[&str]| fixture.knives(&[&["--text", "depends", "feat/base"], args].concat());
     let output = depends(&["--on", "demo#12"]);
@@ -4087,8 +4101,23 @@ fn offline_an_upstream_this_forks_registry_origin_spells_is_refused() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("the review pull request is named `--on acme/demo#12`")
-            && stderr.contains("the upstream's #12 has no spelling here")
+            && stderr.contains(
+                "the upstream's #12 has no spelling here while the registry's origin for demo \
+                 spells its upstream"
+            )
             && !stderr.contains("`--on maintainer/demo#12`"),
+        "{stderr}"
+    );
+
+    // And: for feat/alpha, the head of the fork's #12, that review pull
+    // request cannot be required either, so it is not offered (N132).
+    let output = on(&fixture, "demo#12");
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("neither can be required here")
+            && stderr.contains("acme/demo#12 is feat/alpha's own review pull request")
+            && !stderr.contains("`--on acme/demo#12`"),
         "{stderr}"
     );
     let output = depends(&["--on", "acme/demo#12"]);
@@ -4123,6 +4152,66 @@ fn offline_an_upstream_this_forks_checkout_origin_spells_is_refused() {
     assert_eq!(output.status.code(), Some(3), "{}", said(&output));
     assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
     assert_ne!(fixture.forge_calls(), "");
+
+    // And: with the forge up, this fork's key takes the upstream's number
+    // with no lookup, since this fork's own repository spells the upstream;
+    // the upstream's `<owner>/<name>` names that repository, whose #12 has
+    // a head of no owner of this fork (N129).
+    fixture.forge_now(ForgeNow::Up);
+    let output = on(&fixture, "demo#13");
+    assert!(output.status.success(), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), ["maintainer/demo#13"]);
+    let output = on(&fixture, "maintainer/demo#12");
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "maintainer/demo#12's head upstream-twelve is a branch of an unknown owner, not of \
+             maintainer"
+        ),
+        "{}",
+        said(&output)
+    );
+    assert_eq!(fixture.required("feat/alpha"), ["maintainer/demo#13"]);
+}
+
+#[test]
+fn an_origin_spelling_the_upstream_by_its_former_name_takes_its_number() {
+    // Given: the upstream was renamed from maintainer-old/demo to
+    // maintainer/demo; the registry and this fork's checkout `origin` still
+    // spell it maintainer-old/demo, and the forge answers for it under both
+    // names.
+    let old = "https://forge.invalid/maintainer-old/demo";
+    let fixture = fixture_on(old, old, ORIGIN);
+
+    // When: #12 is named by this fork's key.
+    let output = on(&fixture, "demo#12");
+
+    // Then: one repository, so the upstream's #12, with no lookup of the
+    // number, never one pull request reported as two (N130).
+    assert!(output.status.success(), "{}", said(&output));
+    assert_eq!(fixture.required("feat/alpha"), ["maintainer-old/demo#12"]);
+}
+
+#[test]
+fn the_dependents_own_review_pull_request_is_never_offered() {
+    // Given: the upstream's #12 and the fork's #12, whose head is
+    // feat/alpha.
+    let fixture = fixture();
+
+    // When: feat/alpha names #12 by this fork's key.
+    let output = on(&fixture, "demo#12");
+
+    // Then: refused, offering only the upstream's spelling, and saying why
+    // the other cannot be required (N132).
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("if the upstream's is meant, name it `--on maintainer/demo#12`")
+            && stderr.contains("acme/demo#12 is feat/alpha's own review pull request")
+            && !stderr.contains("`--on acme/demo#12`"),
+        "{stderr}"
+    );
+    assert_eq!(fixture.required("feat/alpha"), Vec::<String>::new());
 }
 
 #[test]
