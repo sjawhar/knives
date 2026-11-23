@@ -981,8 +981,11 @@ fn all_claims(store: &Store) -> Vec<crate::store::Claim> {
     store.claims(None).into_iter().cloned().collect()
 }
 
+/// Writes `output` to stdout and flushes it, so a write nobody reads fails
+/// here, before the session records what it carried, never at exit.
 fn write_output(output: &str) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(output.as_bytes())?;
+    stdout.flush()?;
     Ok(())
 }
