@@ -319,6 +319,22 @@ struct Unasked {
     error: String,
 }
 
+/// A pull request number both this fork's upstream and its own repository
+/// have ([`Context::choice`]).
+#[derive(Clone, Copy)]
+struct Both<'a> {
+    /// This fork's registry key.
+    key: &'a str,
+    upstream_name: &'a UpstreamName,
+    /// This fork's own repository, as the forge names it.
+    own: &'a str,
+    /// The same, as the `origin` read here spells it.
+    spelled: &'a str,
+    number: u64,
+    /// The review pull request on `own`.
+    ours: &'a PullFacts,
+}
+
 /// What GitHub says of a repository it cannot resolve: one that is gone, or
 /// that the token cannot see. It picks the words of a refusal only; it never
 /// stands for an answer that the repository does not exist ([`Context::named`]).
@@ -756,16 +772,18 @@ impl Context<'_, '_> {
     /// fork): when that upstream is a forge repository, the forge is asked
     /// first, as for the `<owner>/<name>` spelling ([`Self::own_under`]),
     /// whether or not that fork's own repository is on the forge, and the
-    /// pull request is this fork's when it says so; a path upstream is never
-    /// asked about. Otherwise, when that fork's upstream and own repository
-    /// are both forge repositories: the one the forge says has it, refused
-    /// when both or neither do, or the upstream's, with no lookup of the
-    /// number, when the forge names that own repository as the upstream;
-    /// when either is no forge repository, the upstream's, with no lookup of
-    /// the number. A review pull request
-    /// on the own repository of a fork other than this one is refused: its
-    /// head is no member of this fork, so nothing here can say when it has
-    /// landed ([`Self::another_forks_review`]).
+    /// pull request is this fork's when it says so; nothing is asked when
+    /// that upstream is a path, or when this fork's own repository names no
+    /// forge repository ([`Self::is_own_under`]). Otherwise, when that fork's
+    /// upstream and own repository are both forge repositories: the one the
+    /// forge says has it, refused when both or neither do; or the upstream's,
+    /// with no lookup of the number, when the forge gives that own repository
+    /// and the upstream one name, as for an `origin` that spells the upstream
+    /// by a name the forge has since changed. When either is no forge
+    /// repository, the upstream's, with no lookup of the number. A review pull
+    /// request on the own repository of a fork other than this one is
+    /// refused: its head is no member of this fork, so nothing here can say
+    /// when it has landed ([`Self::another_forks_review`]).
     fn asked_which(
         &self,
         text: &str,
@@ -797,34 +815,38 @@ impl Context<'_, '_> {
             });
         };
         let own = self.identity(origin)?;
-        if own.name_with_owner.eq_ignore_ascii_case(upstream) {
+        // The upstream as the forge names it now: an `origin` that spells the
+        // upstream by a former name is the upstream all the same, and both
+        // names would answer for one pull request.
+        let renamed;
+        let upstream_now = if own.name_with_owner.eq_ignore_ascii_case(upstream) {
+            &own
+        } else {
+            renamed = self.identity(&entry.upstream)?;
+            &renamed
+        };
+        if upstream_now
+            .name_with_owner
+            .eq_ignore_ascii_case(&own.name_with_owner)
+        {
             return Ok(Requirement::Upstream {
                 repo: upstream_name,
                 number,
             });
         }
-        let theirs = RepoIdentity {
-            name_with_owner: upstream.to_owned(),
-            id: String::new(),
-        };
-        let on_upstream = self.pull(&theirs, number)?;
+        let on_upstream = self.pull(upstream_now, number)?;
         let on_fork = self.pull(&own, number)?;
         let own = own.name_with_owner.to_ascii_lowercase();
         match (on_upstream, on_fork) {
             (Some(theirs), Some(ours)) if this_fork => {
-                let review = format!("`--on {}#{number}`", self.accepted_spelling(&own, spelled));
-                // While an `origin` here spells the upstream, its `<owner>/<name>`
-                // names this fork's own repository first and is refused, so it is
-                // not offered ([`Self::own_origin_named`]).
-                let choice = if self.own_origin_named(upstream_name.as_str()).is_some() {
-                    format!(
-                        "the review pull request is named {review}; the upstream's #{number} has \
-                         no spelling here while the registry's {ORIGIN} for {key} spells its \
-                         upstream: set it to {key}'s own repository, {own}"
-                    )
-                } else {
-                    format!("name the one meant: `--on {upstream_name}#{number}` or {review}")
-                };
+                let choice = self.choice(&Both {
+                    key,
+                    upstream_name: &upstream_name,
+                    own: &own,
+                    spelled,
+                    number,
+                    ours: &ours,
+                });
                 refused(
                     Exit::Usage,
                     format_args!(
@@ -872,6 +894,53 @@ impl Context<'_, '_> {
                      names nothing"
                 ),
             ),
+        }
+    }
+
+    /// What a refusal of a pull request number both this fork's upstream and
+    /// its own repository have offers in its place ([`Both`]). A spelling is
+    /// offered only where `--on` takes it: the review pull request when it
+    /// can be required ([`Self::review_head_refusal`]), the upstream's while
+    /// no `origin` here spells the upstream ([`Self::own_origin_named`]).
+    fn choice(&self, both: &Both<'_>) -> String {
+        let Both {
+            key,
+            upstream_name,
+            own,
+            spelled,
+            number,
+            ours,
+        } = *both;
+        let review = self.review_head_refusal(own, number, ours).map_or_else(
+            || {
+                Ok(format!(
+                    "`--on {}#{number}`",
+                    self.accepted_spelling(own, spelled)
+                ))
+            },
+            Err,
+        );
+        // Only the registry's `origin` can spell the upstream here: when the
+        // checkout's does, this fork's own repository is the upstream, which
+        // takes the upstream's number before any lookup.
+        let upstream = if self.own_origin_named(upstream_name.as_str()).is_some() {
+            Err(format!(
+                "the upstream's #{number} has no spelling here while the registry's {ORIGIN} \
+                 for {key} spells its upstream: set it to {key}'s own repository, {own}"
+            ))
+        } else {
+            Ok(format!("`--on {upstream_name}#{number}`"))
+        };
+        match (upstream, review) {
+            (Ok(upstream), Ok(review)) => format!("name the one meant: {upstream} or {review}"),
+            (Err(why), Ok(review)) => format!("the review pull request is named {review}; {why}"),
+            (Ok(upstream), Err(why)) => format!(
+                "if the upstream's is meant, name it {upstream}; the other cannot be required: \
+                 {why}"
+            ),
+            (Err(upstream_why), Err(why)) => {
+                format!("neither can be required here: {why}; and {upstream_why}")
+            }
         }
     }
 
@@ -934,6 +1003,13 @@ impl Context<'_, '_> {
     /// review pull request by its head; any of these it could not judge, or
     /// would judge as another branch.
     fn review_head(&self, own: &str, number: u64, ours: &PullFacts) -> Result<(), Exit> {
+        self.review_head_refusal(own, number, ours)
+            .map_or(Ok(()), |why| refused(Exit::Usage, why))
+    }
+
+    /// Why [`Self::review_head`] refuses review pull request `number` on
+    /// `own`, without saying it; `None` when it can be required.
+    fn review_head_refusal(&self, own: &str, number: u64, ours: &PullFacts) -> Option<String> {
         let head = BranchName::new(ours.pull.head_ref_name.as_str());
         let owner = own.split_once('/').map_or(own, |(owner, _)| owner);
         if !ours.pull.is_from(owner) {
@@ -942,34 +1018,24 @@ impl Context<'_, '_> {
                 .head_repository_owner
                 .as_ref()
                 .map_or("an unknown owner", |account| account.login.as_str());
-            return refused(
-                Exit::Usage,
-                format_args!(
-                    "{own}#{number}'s head {head} is a branch of {whose}, not of {owner}: no \
-                     member of {}, so nothing here can say when it has landed",
-                    self.fork.name
-                ),
-            );
+            return Some(format!(
+                "{own}#{number}'s head {head} is a branch of {whose}, not of {owner}: no member of \
+                 {}, so nothing here can say when it has landed",
+                self.fork.name
+            ));
         }
         if head == *self.branch {
-            return refused(
-                Exit::Usage,
-                format_args!(
-                    "{own}#{number} is {head}'s own review pull request (head {head}): a branch \
-                     cannot require itself"
-                ),
-            );
+            return Some(format!(
+                "{own}#{number} is {head}'s own review pull request (head {head}): a branch cannot \
+                 require itself"
+            ));
         }
-        if let Some(kind) = self.fork.entry.non_member(&head) {
-            return refused(
-                Exit::Usage,
-                format_args!(
-                    "{own}#{number}'s head {head} is {kind} of {}, not a member branch",
-                    self.fork.name
-                ),
-            );
-        }
-        Ok(())
+        self.fork.entry.non_member(&head).map(|kind| {
+            format!(
+                "{own}#{number}'s head {head} is {kind} of {}, not a member branch",
+                self.fork.name
+            )
+        })
     }
 
     /// The spelling of a fork's own repository that `--on` takes: the name
