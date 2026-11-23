@@ -36,7 +36,7 @@ Reports upstream contribution facts: convention files and their changes since la
 
 ### Locks
 
-- `start` and `finish` hold their branch's lock (`fork-locks/<owner>/<name>.branches/<workspace>.lock` beside `state.json`); `track`, `depends`, `sync` and release writes hold the fork's lock (`fork-locks/<owner>/<name>.lock`). A command waits up to one minute, with pauses from 20 ms doubling to 2 s, with jitter, only for another that holds the same lock. The `state.json` write takes `state.lock`, also with a one-minute wait. Sighting and hook-session locks wait one second, with pauses from 20 ms to 200 ms.
+- `start` and `finish` hold their branch's lock (`fork-locks/<owner>/<name>.branches/<workspace>.lock` beside `state.json`); `track`, `depends`, `sync`, release writes, the sweep `finish` of a release claim runs, and `ledger migrate` hold the fork's lock (`fork-locks/<owner>/<name>.lock`). A command waits up to one minute, with pauses from 20 ms doubling to 2 s, with jitter, only for another that holds the same lock. The `state.json` write takes `state.lock`, also with a one-minute wait. Sighting and hook-session locks wait one second, with pauses from 20 ms to 200 ms.
 - Each lock is the OS advisory lock on its file and ends with its process, also on SIGKILL. Never remove a lock file: a held lock belongs to a running process.
 - When the wait runs out, the command exits `3`:
 
@@ -50,7 +50,7 @@ Reports upstream contribution facts: convention files and their changes since la
 
 ### The immutability rule
 
-`start` writes the fork's `immutable_heads()` into the repository's jj config only when that config states none: trunk on every knives remote, tags, the published release branch, and tags fetched from upstream. It refreshes a rule it wrote and never overwrites a human one. jj's default would pin superseded releases and other forks' PR heads. A published release and its members are immutable to hand commands; `knives release rebase` still moves them.
+`start` writes the fork's `immutable_heads()` into the repository's jj config only when that config states none: trunk on every knives remote, tags, the published release branch, and tags fetched from upstream. It refreshes a rule it wrote and never overwrites a human one. jj's default would pin superseded releases and other forks' PR heads. A published release and its members are immutable to hand commands. Where the checkout states the rule `start` wrote, `knives release rebase` still moves them; under a rule a person stated, it runs under that rule.
 
 ## State a PR link or dependency
 
