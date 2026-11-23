@@ -13,7 +13,9 @@ use crate::hook::claude_code::{
 use crate::hook::guidance::{
     Guidance, body_digest, envelope_nonce, format_guidance, guidance_for, mention_line,
 };
-use crate::hook::notice::{self, Holding, format_notice, format_refusal};
+use crate::hook::notice::{
+    self, Holding, NOTICE_CHARS, NOTICE_FLOOR_CHARS, format_notice_within, format_refusal,
+};
 use crate::hook::opencode::{self, Event as OpenCodeEvent, EventKind as OpenCodeEventKind};
 use crate::hook::resolve::{Match, argument_paths, match_checkout};
 use crate::hook::state::{Envelope, Given, HeldRoster, SessionState};
@@ -23,6 +25,10 @@ use crate::lock::LockError;
 use crate::store::{OwnerKind, Store, StoreError, default_state_path};
 
 const CLAUDE_CODE: &str = "claude-code";
+/// The most characters Claude Code takes whole in a hook's
+/// `additionalContext`: above it, the model is shown a file path and the
+/// first 2,000 characters.
+const CLAUDE_CODE_CONTEXT_CHARS: usize = 10_000;
 const OPENCODE: &str = "opencode";
 const RELEVANT_TOOLS: &[&str] = &[
     "Read",
@@ -226,6 +232,7 @@ fn opencode_tool_after(
         &Telling {
             state: &unlocked,
             nonce: &nonce,
+            cap: NOTICE_CHARS,
         },
     )?;
     let guidance = (requested.guidance && matched.trusted && !unlocked.repo(&repo.root).guided)
@@ -571,6 +578,7 @@ fn session_start(
     let telling = Telling {
         state: &state,
         nonce: &envelope_nonce(),
+        cap: NOTICE_CHARS,
     };
     let Some(notice) = notice_if_requested(&repo, Some(&matched), &registry, &telling)? else {
         return Ok(None);
@@ -620,18 +628,39 @@ fn post_tool_use(
     let repo = guidance_root(&matched);
     let state = SessionState::load(home, CLAUDE_CODE, &key);
     let flags = state.repo(&repo.root);
-    let telling = Telling {
-        state: &state,
-        nonce: &envelope_nonce(),
-    };
-    let notice = notice_if_requested(&repo, Some(&matched), &registry, &telling)?;
-    let include_notice = notice.is_some();
     let include_guidance = matched.trusted
         && !flags.guided
         && event
             .cwd()
             .is_some_and(|cwd| !contains_cwd(&repo.root, cwd));
-    if !include_notice && !include_guidance {
+    let nonce = envelope_nonce();
+    let guidance = include_guidance
+        .then(|| guidance_for(&repo, &matched.candidate))
+        .flatten()
+        .map(|guidance| format_guidance(&repo.name, &guidance, &nonce));
+    // Claude Code takes `additionalContext` whole only up to
+    // CLAUDE_CODE_CONTEXT_CHARS, and the notice and the guidance are one
+    // `additionalContext`: the notice gets the room the guidance leaves, and
+    // when that is less than NOTICE_FLOOR_CHARS the guidance waits for the
+    // next call, so what is recorded is what the model is shown.
+    let room = CLAUDE_CODE_CONTEXT_CHARS.saturating_sub(
+        guidance
+            .as_ref()
+            .map_or(0, |guidance| guidance.chars().count() + 1),
+    );
+    let beside = room >= NOTICE_FLOOR_CHARS;
+    let telling = Telling {
+        state: &state,
+        nonce: &nonce,
+        cap: if beside {
+            room.min(NOTICE_CHARS)
+        } else {
+            NOTICE_CHARS
+        },
+    };
+    let notice = notice_if_requested(&repo, Some(&matched), &registry, &telling)?;
+    let guidance = guidance.filter(|_| notice.is_none() || beside);
+    if notice.is_none() && guidance.is_none() {
         return Ok(None);
     }
 
@@ -639,19 +668,8 @@ fn post_tool_use(
         let (text, update) = notice.into_parts();
         (Some(text), Some(update))
     });
-    let mut parts = Vec::new();
-    if let Some(text) = notice_text {
-        parts.push(text);
-    }
-    let guidance = include_guidance
-        .then(|| guidance_for(&repo, &matched.candidate))
-        .flatten();
-    if let Some(guidance) = &guidance {
-        parts.push(format_guidance(&repo.name, guidance, &envelope_nonce()));
-    }
-    if parts.is_empty() {
-        return Ok(None);
-    }
+    let guided = guidance.is_some();
+    let parts = notice_text.into_iter().chain(guidance).collect::<Vec<_>>();
     // Recorded only once the answer is written: a hook killed before that
     // leaves nothing marked told, and the next call tells it again.
     write_output(&response(POST_TOOL_USE_WIRE_NAME, &parts.join("\n"))?)?;
@@ -659,7 +677,7 @@ fn post_tool_use(
         if let Some(update) = notice_update {
             update.apply(state, &repo.root);
         }
-        if guidance.is_some() {
+        if guided {
             state.mark_guided(&repo.root);
         }
     });
@@ -834,6 +852,8 @@ impl NoticeStateUpdate {
 struct Telling<'a> {
     state: &'a SessionState,
     nonce: &'a str,
+    /// The most characters the claims notice runs to.
+    cap: usize,
 }
 
 /// The notice for `repo`, the root `matched` was decided for, when one was
@@ -910,14 +930,17 @@ fn notice_if_requested(
     let Some(plan) = notice::plan(&roster, &digest, &workspace, &holding) else {
         return Ok(None);
     };
-    let rendered = format_notice(
+    let rendered = format_notice_within(
         repo,
         &plan,
         &notice::Sightings {
             seen: &crate::seen::load(),
             now: jiff::Timestamp::now(),
         },
-        telling.nonce,
+        notice::Bounds {
+            nonce: telling.nonce,
+            cap: telling.cap,
+        },
     );
     let keyed =
         |claim: &crate::store::Claim| (notice::branch_key(claim), notice::claim_fingerprint(claim));

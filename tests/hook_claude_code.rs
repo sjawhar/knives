@@ -1461,3 +1461,88 @@ fn a_forged_jj_pointer_inside_a_git_clone_is_judged_by_the_clones_own_remotes() 
     assert!(context.contains("clone instructions"), "{context}");
     assert!(!context.contains("fork managed by knives"), "{context}");
 }
+
+/// The first `PostToolUse` of a session reading alpha, a trusted managed
+/// fork, with `claims` claims and `guidance` characters of `AGENTS.md`; the
+/// answer's `additionalContext`.
+fn first_read_of_alpha(repos: &Repositories, claims: usize, guidance: usize) -> String {
+    repos.configure(false);
+    std::fs::write(
+        repos.alpha.join("AGENTS.md"),
+        format!("alpha instructions {}", "g".repeat(guidance)),
+    )
+    .expect("write instructions");
+    let mut map = serde_json::Map::new();
+    for n in 0..claims {
+        map.insert(
+            format!("maintainer/alpha/feat/x{n:03}"),
+            json!({
+                "repo": "maintainer/alpha",
+                "branch": format!("feat/x{n:03}"),
+                "owner": format!("agent-{n}"),
+                "why": "porting the walker to the new layout, then the plant tests, then the review fixes",
+                "started": "2026-01-01T00:00:00Z",
+                "files": []
+            }),
+        );
+    }
+    repos.write_state(&json!({ "claims": map }));
+    let read = event(
+        "post-tool-read",
+        &repos.beta,
+        Some(&repos.alpha.join("file.txt")),
+    );
+    additional_context(&run_hook(repos.home.path(), &read))
+}
+
+#[test]
+fn a_small_roster_and_guidance_fit_together() {
+    // The control: one claim and a short guidance.
+    let repos = Repositories::new();
+    let context = first_read_of_alpha(&repos, 1, 100);
+    assert!(context.contains("fork managed by knives"), "{context}");
+    assert!(context.contains("alpha instructions"), "{context}");
+    assert!(context.chars().count() <= 10_000);
+}
+
+#[test]
+fn a_full_roster_beside_guidance_fits_claude_codes_limit() {
+    // Given: 100 claims, enough to fill the notice to its cap, and 3,000
+    // characters of guidance (the review's case was 12,725 characters).
+    let repos = Repositories::new();
+
+    // When / Then: the notice and the guidance in one `additionalContext`
+    // of at most 10,000 characters, the rows that do not fit counted (F3).
+    let context = first_read_of_alpha(&repos, 100, 3_000);
+    assert!(context.contains("fork managed by knives"), "{context}");
+    assert!(context.contains("alpha instructions"), "{context}");
+    assert!(context.contains("more not shown here"), "{context}");
+    assert!(
+        context.chars().count() <= 10_000,
+        "{}",
+        context.chars().count()
+    );
+}
+
+#[test]
+fn guidance_that_leaves_the_notice_too_little_room_waits_for_the_next_call() {
+    // Given: 100 claims and 9,000 characters of guidance.
+    let repos = Repositories::new();
+
+    // When: the first read.
+    let first = first_read_of_alpha(&repos, 100, 9_000);
+
+    // Then: the notice alone, within the limit; the guidance is not recorded
+    // as given, so the next read gives it.
+    assert!(first.contains("fork managed by knives"), "{first}");
+    assert!(!first.contains("alpha instructions"), "{first}");
+    assert!(first.chars().count() <= 10_000, "{}", first.chars().count());
+    let read = event(
+        "post-tool-read",
+        &repos.beta,
+        Some(&repos.alpha.join("file.txt")),
+    );
+    let second = additional_context(&run_hook(repos.home.path(), &read));
+    assert!(second.contains("alpha instructions"), "{second}");
+    assert!(!second.contains("fork managed by knives"), "{second}");
+}

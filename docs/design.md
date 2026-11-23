@@ -632,6 +632,9 @@ trusted repository, or both — the adapters can produce these two parts:
   was told when its context loses the block that told it: at compaction and `/clear`, and in
   oh-my-pi when a shake drops the block. A Claude Code subagent keeps its own record. Claude
   Code plans a notice without the session lock, so two parallel calls can both deliver it.
+  Claude Code's limit holds for the notice and the guidance together: the notice gets the
+  room the guidance leaves, and when that is too little, the guidance waits for the next
+  call. A registry key longer than 100 characters is cut where the notice names it.
 - **The repository's own guidance**, for a repository `[trust]` names, when it has any, framed
   as data. A managed fork that no trust rule names gets the notice and no guidance.
 

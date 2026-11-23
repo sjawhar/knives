@@ -769,6 +769,98 @@ fn a_fresh_jj_checkout_named_for_its_claim_is_told_its_claim() {
     );
 }
 
+/// feat/claimed's claim with a reason too long for the cap, at its
+/// workspace: the session's repositories and the read of a file there.
+fn a_fitted_claim() -> (Repositories, PathBuf, String) {
+    let repos = Repositories::new();
+    let reason = "é—x".repeat(3_333) + "é";
+    repos.write_state(&json!({"claims": {
+        "maintainer/beta/feat/claimed": claim_with_reason("feat/claimed", &reason)
+    }}));
+    let file = repos.beta_workspace("feat-claimed").join("file.txt");
+    (repos, file, reason)
+}
+
+#[test]
+fn a_fitted_claim_is_told_again_fitted_after_a_lost_context() {
+    // Given: a session told feat/claimed's claim fitted to the cap.
+    let (repos, file, _) = a_fitted_claim();
+    let first = run_hook(repos.home.path(), &tool_in_context(&file, "turn-1", &[]));
+    let first = addition(&first).to_owned();
+    assert!(first.contains("… (reason cut: "), "{first}");
+    assert_eq!(feat_claimed_given(repos.home.path()), json!("fitted"));
+    let nonce = notice_nonce(&first);
+
+    // When: the context holds the notice, and then loses it.
+    let held = run_hook(
+        repos.home.path(),
+        &tool_in_context(&file, "turn-2", &[nonce]),
+    );
+    let lost = run_hook(repos.home.path(), &tool_in_context(&file, "turn-3", &[]));
+
+    // Then: nothing while it is held; fitted again once lost, never as one
+    // line (the review's plant that kept what was shown gave a line).
+    assert_eq!(addition(&held), "", "the context still holds the notice");
+    let lost = addition(&lost);
+    assert!(
+        lost.contains("This workspace's branch is claimed: feat/claimed (agent-one,")
+            && lost.contains("… (reason cut: "),
+        "{lost}"
+    );
+}
+
+#[test]
+fn a_fitted_claim_that_changed_is_fitted_again() {
+    // Given: a session told feat/claimed's claim fitted to the cap.
+    let (repos, file, reason) = a_fitted_claim();
+    let here = tool(&file, None);
+    let _ = run_hook(repos.home.path(), &here);
+
+    // When: its reason changes.
+    repos.write_state(&json!({"claims": {
+        "maintainer/beta/feat/claimed": claim_with_reason("feat/claimed", &format!("{reason}!"))
+    }}));
+    let changed = run_hook(repos.home.path(), &here);
+
+    // Then: told again as fully as the cap allows, not as one line (the
+    // review's plant that ignored a fitted claim's fingerprint gave a line).
+    let text = addition(&changed);
+    assert!(text.contains("… (reason cut: "), "{text}");
+    assert_eq!(feat_claimed_given(repos.home.path()), json!("fitted"));
+}
+
+#[test]
+fn a_registry_key_of_10000_characters_keeps_the_notice_within_its_cap() {
+    // Given: beta registered under a key of 10,000 characters, which the
+    // registry takes (the review's case rendered 10,376).
+    let repos = Repositories::new();
+    let key = "k".repeat(10_000);
+    let registry = repos.home.path().join("repos.toml");
+    let text = std::fs::read_to_string(&registry).expect("read the registry");
+    std::fs::write(
+        &registry,
+        text.replace("[repos.beta]", &format!("[repos.{key}]")),
+    )
+    .expect("rewrite the registry");
+
+    // When: a file in beta is read.
+    let output = run_hook(repos.home.path(), &tool(&repos.beta.join("file.txt"), None));
+
+    // Then: the whole notice within its cap, the key cut in the envelope.
+    let notice = notice_block(addition(&output));
+    assert!(
+        notice.chars().count() <= 9_500,
+        "{}",
+        notice.chars().count()
+    );
+    assert!(
+        notice.contains(&format!(" repo=\"{}...\" ", "k".repeat(100))),
+        "{}",
+        &notice[..300.min(notice.len())]
+    );
+    assert!(notice.contains("feat/claimed"), "{notice}");
+}
+
 #[test]
 fn tool_after_in_a_managed_workspace_records_event_identity_and_cwd() {
     let repos = Repositories::new();

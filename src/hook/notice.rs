@@ -463,6 +463,30 @@ fn notice_lines(root: &std::path::Path, plan: &NoticePlan<'_>, sightings: &Sight
 /// same notice.
 pub const NOTICE_CHARS: usize = 9_500;
 
+/// The least room a notice is given beside guidance in one answer.
+///
+/// With less, the guidance waits for the next call (Claude Code's path in
+/// [`crate::commands::hook`]). Every step [`format_notice_within`] takes fits
+/// a notice within this much.
+pub const NOTICE_FLOOR_CHARS: usize = 2_000;
+
+/// The most characters of the fork's registry key a notice names, in its
+/// envelope and in its count of rows left out: the registry takes a key of
+/// any length, and the cap holds for the whole notice.
+pub const KEY_CHARS: usize = 100;
+
+/// The registry key `name` as a notice names it: whole up to
+/// [`KEY_CHARS`], cut there otherwise, with `marker` after the cut.
+fn key_named(name: &str, marker: &str) -> String {
+    let mut characters = name.chars();
+    let kept = characters.by_ref().take(KEY_CHARS).collect::<String>();
+    if characters.next().is_some() {
+        kept + marker
+    } else {
+        kept
+    }
+}
+
 /// How to work in a managed fork, said with the full roster.
 const USAGE: [&str; 4] = [
     "Use knives rather than jj or git directly here: `knives status` for the state of",
@@ -479,24 +503,52 @@ pub struct Rendered {
     pub cut: Vec<bool>,
 }
 
-/// The notice `plan` describes for the workspace `repo`.
-///
-/// `repo` is the workspace's root and the name the registry gives its fork;
-/// `nonce` names the envelope: the call's, which its guidance shares
-/// ([`crate::hook::state::Envelope`]). The notice runs to at most
-/// [`NOTICE_CHARS`]: rows that do not fit are left out and counted, and when
-/// the lines always given are too long alone, the reason of a claim here is
-/// cut, the last one first, and says how much of it is shown.
-#[allow(
-    clippy::too_many_lines,
-    reason = "the cap is met by four ordered steps that share one measure of the notice"
-)]
+/// The notice `plan` describes for the workspace `repo`, within
+/// [`NOTICE_CHARS`] ([`format_notice_within`]).
 pub fn format_notice(
     repo: &GuidanceRoot,
     plan: &NoticePlan<'_>,
     sightings: &Sightings<'_>,
     nonce: &str,
 ) -> Rendered {
+    format_notice_within(
+        repo,
+        plan,
+        sightings,
+        Bounds {
+            nonce,
+            cap: NOTICE_CHARS,
+        },
+    )
+}
+
+/// The envelope a notice goes in, and the most characters it runs to.
+#[derive(Debug, Clone, Copy)]
+pub struct Bounds<'a> {
+    /// The envelope's nonce: the call's, which its guidance shares
+    /// ([`crate::hook::state::Envelope`]).
+    pub nonce: &'a str,
+    /// No less than [`NOTICE_FLOOR_CHARS`].
+    pub cap: usize,
+}
+
+/// The notice `plan` describes for the workspace `repo`, within `bounds`.
+///
+/// `repo` is the workspace's root and the name the registry gives its fork.
+/// Rows that do not fit are left out and counted, and when the lines always
+/// given are too long alone, the reason of a claim here is cut, the last one
+/// first, and says how much of it is shown.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the cap is met by four ordered steps that share one measure of the notice"
+)]
+pub fn format_notice_within(
+    repo: &GuidanceRoot,
+    plan: &NoticePlan<'_>,
+    sightings: &Sightings<'_>,
+    bounds: Bounds<'_>,
+) -> Rendered {
+    let Bounds { nonce, cap } = bounds;
     let Lines {
         mut head,
         rows,
@@ -504,15 +556,15 @@ pub fn format_notice(
     } = notice_lines(&repo.root, plan, sightings);
     let open = format!(
         "\n\n<knives-notice-{nonce} repo=\"{}\" digest=\"{}\">",
-        safe_attribute(&repo.name),
+        safe_attribute(&key_named(&repo.name, "...")),
         plan.digest
     );
     let close = format!("</knives-notice-{nonce}>");
+    let key = crate::ledger::inline_human_text(&key_named(&repo.name, "…"));
     let more = |left: usize| {
         format!(
-            "… and {left} more not shown here: `knives status {} --no-landed` lists every \
-             claim.",
-            crate::ledger::inline_human_text(&repo.name)
+            "… and {left} more not shown here: `knives status {key} --no-landed` lists every \
+             claim."
         )
     };
     // Each line costs its characters and the newline before it.
@@ -532,13 +584,13 @@ pub fn format_notice(
     };
     // 1. Leave rows out, the last first.
     let mut kept = rows.len();
-    while total(&head, kept) > NOTICE_CHARS && kept > 0 {
+    while total(&head, kept) > cap && kept > 0 {
         kept -= 1;
     }
     // 2. Cut the reasons of the claims here, the last first.
     let mut cut = vec![false; plan.here.len()];
     for position in (0..head.len()).rev() {
-        let over = total(&head, kept).saturating_sub(NOTICE_CHARS);
+        let over = total(&head, kept).saturating_sub(cap);
         if over == 0 {
             break;
         }
@@ -562,7 +614,7 @@ pub fn format_notice(
     // 3. Fold the claims here that still do not fit, the last first, into one
     //    line naming their branches as far as it fits.
     let mut folded = Vec::new();
-    while total(&head, kept) > NOTICE_CHARS {
+    while total(&head, kept) > cap {
         let Some(position) = head
             .iter()
             .rposition(|line| matches!(line, Line::Here { .. }))
@@ -582,7 +634,7 @@ pub fn format_notice(
         }
         let lead = format!("… and {} more claims here, cut to fit: ", folded.len());
         head.insert(position, Line::Text(lead.clone()));
-        let room = NOTICE_CHARS.saturating_sub(total(&head, kept));
+        let room = cap.saturating_sub(total(&head, kept));
         let list = folded.join(", ");
         let named = if list.chars().count() <= room {
             list
@@ -598,8 +650,8 @@ pub fn format_notice(
     }
     // 4. Cut the longest line always given, as a last resort: a header that
     //    names a long path or many branches.
-    while total(&head, kept) > NOTICE_CHARS {
-        let over = total(&head, kept) - NOTICE_CHARS;
+    while total(&head, kept) > cap {
+        let over = total(&head, kept) - cap;
         let Some(Line::Text(longest)) = head
             .iter_mut()
             .filter(|line| matches!(line, Line::Text(_)))
@@ -696,9 +748,9 @@ mod tests {
 
     use super::Rendered;
     use super::{
-        Form, Holding, NOTICE_CHARS, NoticePlan, REASON_CHARS, Sightings, Workspace,
-        claim_fingerprint, claim_line, format_notice, held, one_line, plan, roster, roster_digest,
-        shown,
+        Bounds, Form, Holding, KEY_CHARS, NOTICE_CHARS, NOTICE_FLOOR_CHARS, NoticePlan,
+        REASON_CHARS, Sightings, Workspace, claim_fingerprint, claim_line, format_notice,
+        format_notice_within, held, one_line, plan, roster, roster_digest, shown,
     };
     use crate::config::GuidanceRoot;
     use crate::hook::state::{Given, HeldRoster};
@@ -1465,5 +1517,100 @@ mod tests {
             .filter(|(_, given)| *given == Given::Whole)
             .count();
         assert_eq!((whole, fitted), (given, folded));
+    }
+
+    #[test]
+    fn a_registry_key_of_10000_characters_is_cut_in_the_envelope_and_the_count() {
+        // Given: a registry key of 10,000 characters, which the registry
+        // takes (the review's case rendered 10,376), and more claims than fit.
+        let key = "k".repeat(10_000);
+        let claims = (0..300)
+            .map(|n| claim(&format!("feat/other-{n}"), "agent-a", "review"))
+            .collect::<Vec<_>>();
+        let beta = UpstreamName::new("beta");
+        let roster = roster(&claims, &beta);
+        let planned = plan(&roster, "d1", &named("main"), &holding(None, false)).expect("a notice");
+
+        // When: its notice is written.
+        let text = format_notice(
+            &GuidanceRoot {
+                name: key,
+                root: PathBuf::from("/w/main"),
+            },
+            &planned,
+            &Sightings {
+                seen: &Seen::default(),
+                now: at("2026-01-03T00:00:00Z"),
+            },
+            "0123",
+        )
+        .text;
+
+        // Then: within the cap; the key cut to KEY_CHARS in the envelope and
+        // in the count of rows left out, each marked.
+        assert!(
+            text.chars().count() <= NOTICE_CHARS,
+            "{}",
+            text.chars().count()
+        );
+        let cut = "k".repeat(KEY_CHARS);
+        assert!(
+            text.contains(&format!(
+                "<knives-notice-0123 repo=\"{cut}...\" digest=\"d1\">"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("`knives status {cut}… --no-landed`")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn every_step_fits_a_notice_within_the_floor() {
+        // Given: everything at once: a 10,000-character key, a 20,000-character
+        // workspace path, 60 claims here with long multi-byte reasons, and 300
+        // claims elsewhere.
+        let reason = "é—x".repeat(400);
+        let mut claims = (0..60)
+            .map(|n| claim(&format!("feat/hére-{n}"), "agent-a", &reason))
+            .collect::<Vec<_>>();
+        claims.extend((0..300).map(|n| claim(&format!("feat/other-{n}"), "agent-b", "review")));
+        let beta = UpstreamName::new("beta");
+        let branches = (0..60)
+            .map(|n| format!("feat/hére-{n}"))
+            .collect::<Vec<_>>();
+        let workspace = Workspace {
+            name: Some("feat-here"),
+            branches: &branches,
+        };
+        let roster = roster(&claims, &beta);
+        let planned = plan(&roster, "d1", &workspace, &holding(None, false)).expect("a notice");
+        let root = format!("/{}", "p".repeat(20_000));
+
+        // When: it is written within the floor.
+        let rendered = format_notice_within(
+            &GuidanceRoot {
+                name: "k".repeat(10_000),
+                root: PathBuf::from(&root),
+            },
+            &planned,
+            &Sightings {
+                seen: &Seen::default(),
+                now: at("2026-01-03T00:00:00Z"),
+            },
+            Bounds {
+                nonce: "0123",
+                cap: NOTICE_FLOOR_CHARS,
+            },
+        );
+
+        // Then: within it, every claim here cut or folded, never whole.
+        assert!(
+            rendered.text.chars().count() <= NOTICE_FLOOR_CHARS,
+            "{}",
+            rendered.text.chars().count()
+        );
+        assert!(rendered.cut.iter().all(|cut| *cut), "{:?}", rendered.cut);
     }
 }
