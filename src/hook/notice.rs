@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use crate::commands::claim::{owner_kind_label, render_claim_line};
 use crate::commands::wip::workspace_for;
 use crate::config::GuidanceRoot;
-use crate::hook::guidance::{FNV_OFFSET_BASIS, envelope_nonce, fnv1a, safe_attribute};
+use crate::hook::guidance::{FNV_OFFSET_BASIS, envelope_nonce, fnv1a, key_attribute, key_named};
 use crate::hook::state::{Given, HeldRoster};
 use crate::ids::UpstreamName;
 use crate::jj::WorkspaceActivity;
@@ -470,23 +470,6 @@ pub const NOTICE_CHARS: usize = 9_500;
 /// a notice within this much.
 pub const NOTICE_FLOOR_CHARS: usize = 2_000;
 
-/// The most characters of the fork's registry key a notice names, in its
-/// envelope and in its count of rows left out: the registry takes a key of
-/// any length, and the cap holds for the whole notice.
-pub const KEY_CHARS: usize = 100;
-
-/// The registry key `name` as a notice names it: whole up to
-/// [`KEY_CHARS`], cut there otherwise, with `marker` after the cut.
-fn key_named(name: &str, marker: &str) -> String {
-    let mut characters = name.chars();
-    let kept = characters.by_ref().take(KEY_CHARS).collect::<String>();
-    if characters.next().is_some() {
-        kept + marker
-    } else {
-        kept
-    }
-}
-
 /// How to work in a managed fork, said with the full roster.
 const USAGE: [&str; 4] = [
     "Use knives rather than jj or git directly here: `knives status` for the state of",
@@ -556,7 +539,7 @@ pub fn format_notice_within(
     } = notice_lines(&repo.root, plan, sightings);
     let open = format!(
         "\n\n<knives-notice-{nonce} repo=\"{}\" digest=\"{}\">",
-        safe_attribute(&key_named(&repo.name, "...")),
+        key_attribute(&repo.name),
         plan.digest
     );
     let close = format!("</knives-notice-{nonce}>");
@@ -690,7 +673,7 @@ pub fn format_refusal(repo_name: &str, refusal: &str) -> String {
         String::new(),
         format!(
             "<knives-notice-{nonce} repo=\"{}\">",
-            safe_attribute(repo_name)
+            key_attribute(repo_name)
         ),
         "knives cannot read who has claimed which branch of this fork, so do not assume a \
          branch is free:"
@@ -748,11 +731,12 @@ mod tests {
 
     use super::Rendered;
     use super::{
-        Bounds, Form, Holding, KEY_CHARS, NOTICE_CHARS, NOTICE_FLOOR_CHARS, NoticePlan,
-        REASON_CHARS, Sightings, Workspace, claim_fingerprint, claim_line, format_notice,
-        format_notice_within, held, one_line, plan, roster, roster_digest, shown,
+        Bounds, Form, Holding, NOTICE_CHARS, NOTICE_FLOOR_CHARS, NoticePlan, REASON_CHARS,
+        Sightings, Workspace, claim_fingerprint, claim_line, format_notice, format_notice_within,
+        held, one_line, plan, roster, roster_digest, shown,
     };
     use crate::config::GuidanceRoot;
+    use crate::hook::guidance::KEY_CHARS;
     use crate::hook::state::{Given, HeldRoster};
     use crate::ids::UpstreamName;
     use crate::seen::Seen;
@@ -1612,5 +1596,19 @@ mod tests {
             rendered.text.chars().count()
         );
         assert!(rendered.cut.iter().all(|cut| *cut), "{:?}", rendered.cut);
+    }
+
+    #[test]
+    fn a_registry_key_of_10000_characters_is_cut_in_the_refusal_envelope() {
+        // When: the refusal is written under a key of 10,000 characters.
+        let text = super::format_refusal(&"k".repeat(10_000), "the claims file is unreadable");
+
+        // Then: its envelope names the key cut to KEY_CHARS and marked.
+        assert!(
+            text.contains(&format!(" repo=\"{}...\">", "k".repeat(KEY_CHARS))),
+            "{}",
+            &text[..300]
+        );
+        assert!(text.chars().count() < 500, "{}", text.chars().count());
     }
 }

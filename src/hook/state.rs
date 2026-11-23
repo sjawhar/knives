@@ -12,8 +12,15 @@ const PRUNE_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoFlags {
+    /// The root's guidance was given whole.
     #[serde(default)]
     pub guided: bool,
+    /// The root's guidance was too long to give whole, and the session was
+    /// pointed at its files as they were then: the digest of that guidance
+    /// ([`crate::hook::guidance::Guidance::digest`]). A change to the files
+    /// points again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointed: Option<u64>,
 }
 
 /// A knives block this session's hook put into a tool result, recorded while
@@ -141,6 +148,12 @@ impl SessionState {
 
     pub fn mark_guided(&mut self, root: &Path) {
         self.repos.entry(root.to_owned()).or_default().guided = true;
+    }
+
+    /// Records that the session was pointed at `root`'s guidance files, as
+    /// they were when their digest was `digest`, in place of their bodies.
+    pub fn mark_pointed(&mut self, root: &Path, digest: u64) {
+        self.repos.entry(root.to_owned()).or_default().pointed = Some(digest);
     }
 
     pub fn record_notice(&mut self, root: &Path, digest: String) {

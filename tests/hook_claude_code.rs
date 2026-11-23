@@ -4,7 +4,7 @@
     clippy::unreachable,
     reason = "fixture setup failures and JSON shape mismatches are test failures"
 )]
-// allow: SIZE_OK: 1367 lines - real-binary adapter scenarios share one fixture and process harness.
+// allow: SIZE_OK: 1725 lines - real-binary adapter scenarios share one fixture and process harness.
 
 #[path = "common/lab.rs"]
 mod lab;
@@ -1545,4 +1545,181 @@ fn guidance_that_leaves_the_notice_too_little_room_waits_for_the_next_call() {
     let second = additional_context(&run_hook(repos.home.path(), &read));
     assert!(second.contains("alpha instructions"), "{second}");
     assert!(!second.contains("fork managed by knives"), "{second}");
+}
+
+/// The `additionalContext` of a hook's answer, or nothing for no answer.
+fn context_of(output: &str) -> String {
+    if output.trim().is_empty() {
+        String::new()
+    } else {
+        additional_context(output)
+    }
+}
+
+/// alpha's entry in the session's record: `guided` once its guidance was
+/// given whole, `pointed` once the session was pointed at its files.
+fn alpha_flags(repos: &Repositories) -> Value {
+    let file = repos
+        .home
+        .path()
+        .join("hook-sessions")
+        .join(format!("claude-code-{SESSION_ID}.json"));
+    let Ok(text) = std::fs::read_to_string(&file) else {
+        return Value::Null;
+    };
+    let state: Value = serde_json::from_str(&text).expect("session JSON");
+    let alpha = std::fs::canonicalize(&repos.alpha).expect("alpha's path");
+    state["repos"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .find(|(root, _)| std::fs::canonicalize(root).is_ok_and(|root| root == alpha))
+        .map_or(Value::Null, |(_, flags)| flags.clone())
+}
+
+/// `count` reads of a file in alpha from beta: each answer's
+/// `additionalContext`, and alpha's entry in the session's record after it.
+fn reads_of_alpha(repos: &Repositories, count: usize) -> Vec<(String, Value)> {
+    let read = event(
+        "post-tool-read",
+        &repos.beta,
+        Some(&repos.alpha.join("file.txt")),
+    );
+    (0..count)
+        .map(|_| {
+            let context = context_of(&run_hook(repos.home.path(), &read));
+            (context, alpha_flags(repos))
+        })
+        .collect()
+}
+
+fn guided(flags: &Value) -> bool {
+    flags["guided"].as_bool().unwrap_or(false)
+}
+
+#[test]
+fn a_registry_key_of_10000_characters_gives_the_guidance_whole_once() {
+    // Given: alpha, a trusted managed fork, registered under a key of
+    // 10,000 characters, which the registry takes (the review's second call
+    // sent 10,343 characters and recorded alpha guided).
+    let repos = Repositories::new();
+    repos.configure(false);
+    let registry = repos.home.path().join("repos.toml");
+    let text = std::fs::read_to_string(&registry).expect("read the registry");
+    std::fs::write(
+        &registry,
+        text.replace("[repos.alpha]", &format!("[repos.{}]", "k".repeat(10_000))),
+    )
+    .expect("rewrite the registry");
+
+    // When: three reads of a file in alpha.
+    let calls = reads_of_alpha(&repos, 3);
+
+    // Then: every answer within Claude Code's 10,000 characters; one gives
+    // the guidance whole, under the key cut and marked; alpha is guided from
+    // that call on, never before.
+    for (context, _) in &calls {
+        assert!(
+            context.chars().count() <= 10_000,
+            "{}",
+            context.chars().count()
+        );
+    }
+    let giving = calls
+        .iter()
+        .filter(|(context, _)| context.contains("alpha instructions"))
+        .count();
+    assert_eq!(giving, 1, "{calls:?}");
+    let given = calls
+        .iter()
+        .position(|(context, _)| context.contains("alpha instructions"))
+        .expect("a call gives the guidance");
+    assert!(
+        calls[given]
+            .0
+            .contains(&format!(" repo=\"{}...\">", "k".repeat(100))),
+        "{}",
+        calls[given].0
+    );
+    for (call, (_, flags)) in calls.iter().enumerate() {
+        assert_eq!(guided(flags), call >= given, "call {call}: {flags}");
+    }
+}
+
+#[test]
+fn guidance_over_claude_codes_limit_is_pointed_at_and_again_when_it_changes() {
+    // Given: alpha's AGENTS.md runs 28,273 characters past its first words,
+    // as the fork's own does (the review's second call sent 28,633
+    // characters, shown as a preview, and recorded alpha guided).
+    let repos = Repositories::new();
+    repos.configure(false);
+    let agents = repos.alpha.join("AGENTS.md");
+    std::fs::write(
+        &agents,
+        format!("alpha instructions {}", "g".repeat(28_273)),
+    )
+    .expect("write instructions");
+
+    // When: three reads of a file in alpha.
+    let calls = reads_of_alpha(&repos, 3);
+
+    // Then: every answer within 10,000 characters. The first gives the
+    // notice and points at the file with its length, without its body;
+    // alpha is recorded pointed, never guided; the next two say nothing.
+    for (context, flags) in &calls {
+        assert!(
+            context.chars().count() <= 10_000,
+            "{}",
+            context.chars().count()
+        );
+        assert!(!guided(flags), "{flags}");
+    }
+    let (first, flags) = &calls[0];
+    assert!(first.contains("fork managed by knives"), "{first}");
+    assert!(first.contains("AGENTS.md (28292 characters)"), "{first}");
+    assert!(first.contains("read them before you work"), "{first}");
+    assert!(!first.contains("alpha instructions"), "{first}");
+    assert!(flags["pointed"].is_u64(), "{flags}");
+    assert_eq!(calls[1].0, "");
+    assert_eq!(calls[2].0, "");
+
+    // When: the file changes, and a file in alpha is read again.
+    std::fs::write(
+        &agents,
+        format!("alpha instructions {}", "g".repeat(30_000)),
+    )
+    .expect("change instructions");
+    let again = reads_of_alpha(&repos, 1);
+
+    // Then: the session is pointed at it again, with its new length.
+    let (context, changed) = &again[0];
+    assert!(
+        context.contains("AGENTS.md (30019 characters)"),
+        "{context}"
+    );
+    assert!(context.chars().count() <= 10_000);
+    assert!(!guided(changed), "{changed}");
+    assert_ne!(changed["pointed"], flags["pointed"]);
+}
+
+#[test]
+fn guidance_within_claude_codes_limit_is_given_whole_once() {
+    // The control: 1,000 characters of guidance (the review's control: one
+    // answer of 2,076 characters, then nothing twice).
+    let repos = Repositories::new();
+    repos.configure(false);
+    std::fs::write(
+        repos.alpha.join("AGENTS.md"),
+        format!("alpha instructions {}", "g".repeat(1_000)),
+    )
+    .expect("write instructions");
+
+    let calls = reads_of_alpha(&repos, 3);
+
+    let (first, flags) = &calls[0];
+    assert!(first.contains("alpha instructions"), "{first}");
+    assert!(!first.contains("a hook may show"), "{first}");
+    assert!(guided(flags), "{flags}");
+    assert_eq!(calls[1].0, "");
+    assert_eq!(calls[2].0, "");
 }

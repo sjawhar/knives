@@ -634,9 +634,13 @@ trusted repository, or both — the adapters can produce these two parts:
   Code plans a notice without the session lock, so two parallel calls can both deliver it.
   Claude Code's limit holds for the notice and the guidance together: the notice gets the
   room the guidance leaves, and when that is too little, the guidance waits for the next
-  call. A registry key longer than 100 characters is cut where the notice names it.
+  call. A registry key longer than 100 characters is cut where a notice or the guidance
+  names it.
 - **The repository's own guidance**, for a repository `[trust]` names, when it has any, framed
-  as data. A managed fork that no trust rule names gets the notice and no guidance.
+  as data. A managed fork that no trust rule names gets the notice and no guidance. Claude
+  Code shows text over its limit only as a preview, so guidance too long for it is given as a
+  pointer to its files, with their lengths, and is recorded as pointed at, not as given. A
+  change to the files points at them again.
 
 Triggered by files a call actually names, `path`, `filePath`, or an absolute or `~`-rooted path
 in a command, and deliberately not by a command's working directory. A

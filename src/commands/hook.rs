@@ -11,7 +11,8 @@ use crate::hook::claude_code::{
     Event, EventKind, POST_TOOL_USE_WIRE_NAME, SESSION_START_WIRE_NAME, response,
 };
 use crate::hook::guidance::{
-    Guidance, body_digest, envelope_nonce, format_guidance, guidance_for, mention_line,
+    Guidance, body_digest, envelope_nonce, format_guidance, format_pointer, guidance_for,
+    mention_line,
 };
 use crate::hook::notice::{
     self, Holding, NOTICE_CHARS, NOTICE_FLOOR_CHARS, format_notice_within, format_refusal,
@@ -637,16 +638,18 @@ fn post_tool_use(
     let guidance = include_guidance
         .then(|| guidance_for(&repo, &matched.candidate))
         .flatten()
-        .map(|guidance| format_guidance(&repo.name, &guidance, &nonce));
+        .and_then(|guidance| claude_code_guidance(&repo.name, &guidance, &nonce, flags.pointed));
     // Claude Code takes `additionalContext` whole only up to
     // CLAUDE_CODE_CONTEXT_CHARS, and the notice and the guidance are one
     // `additionalContext`: the notice gets the room the guidance leaves, and
     // when that is less than NOTICE_FLOOR_CHARS the guidance waits for the
-    // next call, so what is recorded is what the model is shown.
+    // next call. Each part is within the limit alone, and the two together
+    // are, so the guidance is recorded as given only in the form it was
+    // shown: whole, or as a pointer to its files.
     let room = CLAUDE_CODE_CONTEXT_CHARS.saturating_sub(
         guidance
             .as_ref()
-            .map_or(0, |guidance| guidance.chars().count() + 1),
+            .map_or(0, |guidance| guidance.text.chars().count() + 1),
     );
     let beside = room >= NOTICE_FLOOR_CHARS;
     let telling = Telling {
@@ -668,8 +671,11 @@ fn post_tool_use(
         let (text, update) = notice.into_parts();
         (Some(text), Some(update))
     });
-    let guided = guidance.is_some();
-    let parts = notice_text.into_iter().chain(guidance).collect::<Vec<_>>();
+    let pointer = guidance.as_ref().map(|guidance| guidance.pointer);
+    let parts = notice_text
+        .into_iter()
+        .chain(guidance.map(|guidance| guidance.text))
+        .collect::<Vec<_>>();
     // Recorded only once the answer is written: a hook killed before that
     // leaves nothing marked told, and the next call tells it again.
     write_output(&response(POST_TOOL_USE_WIRE_NAME, &parts.join("\n"))?)?;
@@ -677,11 +683,50 @@ fn post_tool_use(
         if let Some(update) = notice_update {
             update.apply(state, &repo.root);
         }
-        if guided {
-            state.mark_guided(&repo.root);
+        match pointer {
+            Some(None) => state.mark_guided(&repo.root),
+            Some(Some(digest)) => state.mark_pointed(&repo.root, digest),
+            None => {}
         }
     });
     Ok(None)
+}
+
+/// A repository's guidance as Claude Code is given it.
+struct ClaudeCodeGuidance {
+    text: String,
+    /// The guidance's digest when `text` points at its files in place of
+    /// their bodies ([`format_pointer`]); `None` when they are given whole.
+    pointer: Option<u64>,
+}
+
+/// `guidance` whole when it fits within [`CLAUDE_CODE_CONTEXT_CHARS`], else a
+/// pointer to its files, unless the session was already pointed at them as
+/// they are now (`pointed`): Claude Code shows longer text only as a preview,
+/// which must never count as given. A pointer that does not fit either gives
+/// nothing.
+fn claude_code_guidance(
+    name: &str,
+    guidance: &Guidance,
+    nonce: &str,
+    pointed: Option<u64>,
+) -> Option<ClaudeCodeGuidance> {
+    let whole = format_guidance(name, guidance, nonce);
+    if whole.chars().count() <= CLAUDE_CODE_CONTEXT_CHARS {
+        return Some(ClaudeCodeGuidance {
+            text: whole,
+            pointer: None,
+        });
+    }
+    let digest = guidance.digest();
+    if pointed == Some(digest) {
+        return None;
+    }
+    let text = format_pointer(name, guidance, nonce, CLAUDE_CODE_CONTEXT_CHARS);
+    (text.chars().count() <= CLAUDE_CODE_CONTEXT_CHARS).then_some(ClaudeCodeGuidance {
+        text,
+        pointer: Some(digest),
+    })
 }
 
 /// Persist a session-state change, reporting a failure without failing the
