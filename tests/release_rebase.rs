@@ -1797,6 +1797,92 @@ fn after_start_a_hand_restore_into_a_published_release_is_refused() {
 }
 
 #[test]
+fn a_rebase_keeps_a_pin_a_person_added_to_the_rule() {
+    // Given: the rule `knives start` wrote, which a person then made their
+    // own (no knives doc) and widened to pin feat/alpha.
+    let lab = Lab::new();
+    let (home, _tagged) = fork_with_an_old_tagged_release(&lab);
+    let written = knives::jj::repo_immutable_heads(&lab.work)
+        .expect("read the rule")
+        .expect("start wrote a rule");
+    let rule = format!("{} | bookmarks(exact:\"feat/alpha\")", written.rule);
+    lab.jj_work([
+        "config",
+        "set",
+        "--repo",
+        "revset-aliases.\"immutable_heads()\"",
+        &format!(
+            "{{ definition = {}, doc = \"alpha must not move\" }}",
+            toml::Value::String(rule.clone())
+        ),
+    ]);
+    let stated = knives::jj::repo_immutable_heads(&lab.work)
+        .expect("read the rule")
+        .expect("a rule");
+    assert!(
+        !stated.written_by_knives && stated.rule == rule,
+        "{stated:?}"
+    );
+    let alpha = commit_at(&lab, "feat/alpha");
+
+    // When
+    let output = knives_release(&lab, &home, &["rebase", "main@upstream"]);
+
+    // Then: the rebase ran under the person's rule, which refused it, and
+    // the pinned member did not move.
+    assert!(
+        !output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        commit_at(&lab, "feat/alpha"),
+        alpha,
+        "the pinned member moved"
+    );
+}
+
+#[test]
+fn a_release_branch_with_a_quote_yields_a_rule_jj_accepts() {
+    // Given: a registry, read by the production reader, whose release branch
+    // is a valid Git name holding a double quote.
+    let branch = "integration\"quoted";
+    let checked = std::process::Command::new("git")
+        .args(["check-ref-format", "--branch", branch])
+        .output()
+        .expect("run git");
+    assert!(
+        checked.status.success(),
+        "{branch} must be a valid Git branch"
+    );
+    let home = tempfile::tempdir().expect("config home");
+    let config = home.path().join("repos.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[repos.demo]\nupstream = \"u\"\norigin = \"o\"\nrelease_branch = {}\n",
+            toml::Value::String(branch.to_owned())
+        ),
+    )
+    .expect("write the registry");
+    let registry = knives::config::load(&config).expect("read the registry");
+    let rule = registry.repos["demo"].immutable_heads();
+
+    // When: the rule is stated in a checkout's jj config.
+    let lab = Lab::new();
+    knives::jj::set_repo_immutable_heads(&lab.work, &rule).expect("state the rule");
+
+    // Then: jj reads it, and it names the branch whole.
+    assert_eq!(
+        lab.revision(&lab.work, "root()", "immutable"),
+        "true",
+        "jj must accept the rule: {rule}"
+    );
+    assert!(rule.contains(r#"exact:"integration\"quoted""#), "{rule}");
+}
+
+#[test]
 fn a_rebase_refuses_under_the_tag_pinning_rule_an_earlier_knives_start_wrote() {
     // Given: the fork's config still states a rule an earlier knives start
     // wrote, which pins every member beneath the tagged release
