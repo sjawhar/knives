@@ -177,6 +177,19 @@ pub(crate) fn run_rebase(
         println!("{repo}: {shown_release} has no member parents to move; nothing to rebase");
         return Ok(Exit::Incomplete);
     }
+    // The rebase runs under the fork's rebase rule only where the checkout's
+    // rule is the one `knives start` wrote. A rule a person stated, in the
+    // repository or their user config, is theirs: the rebase runs under it as
+    // it stands, and refuses where it pins what would move.
+    let rebase_rule = knives::jj::repo_immutable_heads(path)?
+        .is_some_and(|stated| stated.written_by_knives)
+        .then(|| entry.rebase_immutable_heads());
+    if rebase_rule.is_none() {
+        println!(
+            "{repo}: this checkout's jj config does not state the rule `knives start` writes; \
+             the rebase runs under the immutable_heads() it states"
+        );
+    }
     // Every refusal is behind. From here on the command writes; each write of
     // the release (the shed, the move, the re-describe and the drop) is read
     // into `last` as soon as it is written, and its headings print as
@@ -266,7 +279,7 @@ pub(crate) fn run_rebase(
             }
         }
         let tagged = knives::jj::tagged_commits_a_rebase_copies(path, &release_name, &onto)?;
-        knives::jj::rebase_branch_onto(path, &release_name, &onto)?;
+        knives::jj::rebase_branch_onto(path, &release_name, &onto, rebase_rule.as_deref())?;
         // The move rewrote the release under its change: the release it left
         // is the last write until the re-describe, so a step before that which
         // fails names its headings. It is read by that change, not by its

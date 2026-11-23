@@ -374,7 +374,7 @@ fn start_makes_a_branch_pinned_only_by_an_untracked_remote_ref_rebasable() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(
-            "jj immutable_heads() written to demo's repository config: trunk() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\") | remote_tags(remote=exact:\"upstream\")"
+            "jj immutable_heads() written to demo's repository config: trunk() | tags() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\") | remote_tags(remote=exact:\"upstream\")"
         ),
         "the rule write must be disclosed: {stdout}"
     );
@@ -402,7 +402,7 @@ fn start_makes_a_branch_pinned_only_by_an_untracked_remote_ref_rebasable() {
 }
 
 #[test]
-fn start_keeps_upstreams_tags_immutable_and_leaves_the_forks_own_rewritable() {
+fn start_keeps_upstreams_tags_and_the_forks_published_release_immutable() {
     // Given: a tag upstream published off its trunk, as most of the upstream
     // tags oh-my-pi fetched are, and the fork's own release tag, pushed to
     // origin as the fork's build publishes it
@@ -429,7 +429,8 @@ fn start_keeps_upstreams_tags_immutable_and_leaves_the_forks_own_rewritable() {
     // When: the fork's rule is written
     let output = knives_start(&lab, &home, "feat/gamma");
 
-    // Then: upstream's tag stays immutable wherever it sits; ours is rewritable
+    // Then: upstream's tag stays immutable wherever it sits, and so does the
+    // fork's published release, which no hand command may rewrite
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         lab.revision(&lab.work, "v0.9.1", "immutable"),
@@ -438,8 +439,8 @@ fn start_keeps_upstreams_tags_immutable_and_leaves_the_forks_own_rewritable() {
     );
     assert_eq!(
         lab.revision(&lab.work, "v1.0.0-fork.1", "immutable"),
-        "false",
-        "the fork's own release tag must not pin the commits beneath it"
+        "true",
+        "the fork's published release tag must pin the commits beneath it"
     );
 }
 
@@ -510,7 +511,7 @@ fn start_refreshes_the_rule_it_wrote_when_the_entry_moves_on() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(
-            "jj immutable_heads() refreshed in demo's repository config: trunk() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\") | remote_tags(remote=exact:\"upstream\")"
+            "jj immutable_heads() refreshed in demo's repository config: trunk() | tags() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | remote_bookmarks(exact:\"main\", exact:\"origin\") | remote_tags(remote=exact:\"upstream\")"
         ),
         "was: {stdout}"
     );

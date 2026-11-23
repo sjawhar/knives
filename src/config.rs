@@ -444,28 +444,37 @@ impl RepoEntry {
         }
     }
 
-    /// The `immutable_heads()` this fork runs under: jj's `trunk()`, the trunk by
-    /// name on every remote knives knows — upstream, origin, and the release
-    /// remote when one is configured — and every tag fetched from upstream.
+    /// The `immutable_heads()` this fork runs under: jj's `trunk()` and
+    /// `tags()`, the trunk by name on every remote knives knows — upstream,
+    /// origin, and the release remote when one is configured — the fork's
+    /// release branch on each remote it is published to, and every tag fetched
+    /// from upstream.
     ///
-    /// jj's default adds `untracked_remote_bookmarks()` and `tags()`. In a fork, a
-    /// remote ref that is not trunk is ours or something we build on — a
-    /// superseded release cut a fetch re-materialized, another fork's pull request
-    /// head — and freezing its ancestors protects nothing (a local rewrite never
-    /// reaches a remote; the next fetch restores whatever was dropped) while
-    /// refusing every routine `jj rebase` of a member whose old tip sits under
-    /// one. The fork's own tags are the same: a rewrite moves bookmarks, never
-    /// tags, so the tag keeps naming the published original — locally, so no push
-    /// can move it on the remote. Every release this fork publishes is tagged,
-    /// and a tag on a release merge pinned every member commit beneath it.
+    /// A published release, its tag and the release branch on the remote that
+    /// publishes it, is pinned with everything beneath it, so no hand command
+    /// (`jj restore --into`, `jj squash --into`, `jj rebase`) rewrites it: such a
+    /// rewrite stays local, but every bookmark on the rewritten commits moves to
+    /// the copies, and work pushed from them then carries a release nobody
+    /// published. `knives release rebase`, which must move members beneath an
+    /// old tagged release and the release itself, runs its one `jj rebase`
+    /// under [`Self::rebase_immutable_heads`] instead, behind its own checks,
+    /// and restores every pushed or published name it moved; it does so only
+    /// where the checkout states this rule as `knives start` wrote it.
     ///
-    /// Upstream's tags stay pinned, by where they were fetched from rather than
-    /// by a naming convention: `remote_tags(remote=exact:"upstream")`. Ancestry
-    /// does not cover them — most of the upstream tags a fork fetches sit off
-    /// upstream's trunk (oh-my-pi had 457). Every other tag is the fork's own: its
-    /// published releases and its retention tags alike, which `knives release
-    /// rebase` copies when it moves the members beneath them and then cleans up
-    /// after.
+    /// A dated or series cut (`release/<date>`) is pinned once it is tagged,
+    /// and knives does not tag a cut: the fork's publishing step does. Its
+    /// pushed name is not pinned, because a reap leaves superseded cuts that a
+    /// fetch brings back, and pinning them would wall every hand rebase of a
+    /// member beneath one.
+    ///
+    /// jj's default also adds `untracked_remote_bookmarks()`. In a fork, such a
+    /// ref is a superseded release cut a fetch re-materialized or another
+    /// fork's pull request head, and freezing its ancestors would refuse every
+    /// routine `jj rebase` of a member whose old tip sits under one.
+    ///
+    /// Upstream's tags are pinned by where they were fetched from,
+    /// `remote_tags(remote=exact:"upstream")`, since a fetch may leave them
+    /// remote-only and most sit off upstream's trunk (oh-my-pi had 457).
     ///
     /// The trunks are named outright because `trunk()` need not resolve to them:
     /// `jj git clone` pins the alias to `<trunk>@origin`, and the default picks
@@ -475,29 +484,62 @@ impl RepoEntry {
     /// this into the repository's jj config; knives' own in-process rewrites keep
     /// jj's default pins (`jj::assert_mutable`).
     pub fn immutable_heads(&self) -> String {
-        let trunk = self.default_trunk();
+        self.rule(true)
+    }
+
+    /// The `immutable_heads()` `knives release rebase` runs its `jj rebase`
+    /// under: [`Self::immutable_heads`] without `tags()` and the release
+    /// branch, so the fork's members and releases move while the trunks, the
+    /// series bases and upstream's tags stay pinned.
+    pub fn rebase_immutable_heads(&self) -> String {
+        self.rule(false)
+    }
+
+    /// The rule, with the fork's published releases pinned when `published`.
+    fn rule(&self, published: bool) -> String {
+        let trunk = revset_literal(self.default_trunk());
         let mut remotes = vec![Role::Upstream, Role::Origin];
         if self.has_split_release() {
             remotes.push(Role::Release);
         }
+        let bookmarks = |name: &str, remote: &str| {
+            format!(
+                "remote_bookmarks(exact:{name}, exact:{})",
+                revset_literal(remote)
+            )
+        };
+        // The release branch is pinned on each remote a release is published to.
+        let releases: Vec<String> = self
+            .release_branch
+            .iter()
+            .filter(|_| published)
+            .flat_map(|branch| {
+                let branch = revset_literal(branch);
+                remotes
+                    .iter()
+                    .filter(|remote| **remote != Role::Upstream)
+                    .map(move |remote| bookmarks(&branch, &remote.to_string()))
+            })
+            .collect();
         // A named series' base is pinned on the remote that holds it, for the
         // same reason as the trunk: a release rebase of that series rebuilds
         // its members, never the base they stand on.
         let pinned: Vec<String> = remotes
             .iter()
-            .map(|remote| format!("remote_bookmarks(exact:\"{trunk}\", exact:\"{remote}\")"))
+            .map(|remote| bookmarks(&trunk, &remote.to_string()))
             .chain(self.series.values().map(|series| {
-                format!(
-                    "remote_bookmarks(exact:\"{}\", exact:\"{}\")",
-                    series.base,
-                    series.base_remote.role()
+                bookmarks(
+                    &revset_literal(&series.base),
+                    &series.base_remote.role().to_string(),
                 )
             }))
+            .chain(releases)
             .collect();
         format!(
-            "trunk() | {} | remote_tags(remote=exact:\"{}\")",
+            "trunk() | {}{} | remote_tags(remote=exact:{})",
+            if published { "tags() | " } else { "" },
             pinned.join(" | "),
-            Role::Upstream
+            revset_literal(&Role::Upstream.to_string())
         )
     }
 
@@ -1481,6 +1523,14 @@ pub(crate) fn is_forge_slug(value: &str) -> bool {
     !has_path_syntax(owner) && !owner.starts_with('.') && !has_path_syntax(repository)
 }
 
+/// `value` as a jj revset string literal: in double quotes, with `\` and `"`
+/// escaped as jj's string-literal grammar reads them. A Git branch name may
+/// hold a `"`, and one quoted bare would end the literal early and make the
+/// whole alias invalid.
+fn revset_literal(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1608,6 +1658,34 @@ release = "https://example.invalid/releases.git"
         let registry = load(&write(dir.path(), without)).unwrap();
         assert_eq!(registry.repos["demo"].forbidden, Vec::<String>::new());
         assert_eq!(RepoEntry::new("u", "o").forbidden, Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_rule_pins_tags_and_the_release_branch_on_each_remote_that_publishes_it() {
+        let plain = RepoEntry::new(
+            "https://forge.invalid/up/tool",
+            "https://forge.invalid/me/tool",
+        );
+        assert_eq!(
+            plain.immutable_heads(),
+            "trunk() | tags() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | \
+             remote_bookmarks(exact:\"main\", exact:\"origin\") | \
+             remote_tags(remote=exact:\"upstream\")"
+        );
+        let published = RepoEntry {
+            release_branch: Some("sami".to_owned()),
+            release: Some("https://forge.invalid/me/tool-releases".to_owned()),
+            ..plain
+        };
+        assert_eq!(
+            published.immutable_heads(),
+            "trunk() | tags() | remote_bookmarks(exact:\"main\", exact:\"upstream\") | \
+             remote_bookmarks(exact:\"main\", exact:\"origin\") | \
+             remote_bookmarks(exact:\"main\", exact:\"release\") | \
+             remote_bookmarks(exact:\"sami\", exact:\"origin\") | \
+             remote_bookmarks(exact:\"sami\", exact:\"release\") | \
+             remote_tags(remote=exact:\"upstream\")"
+        );
     }
 
     #[test]
