@@ -61,10 +61,11 @@ pub enum CarryVerdict {
     /// The revision's tip is an ancestor of the target: carried as-is. For a
     /// release target, the release also holds every line of its change from
     /// its base by spec R6, as `members --verify` reads a member's own lines
-    /// ([`crate::jj::Repo::member_lines`]): none lost, none held only by its
-    /// words, and no unresolved conflict in a path of the change. A release
-    /// merge reaches every member it names as a parent whatever its tree
-    /// holds, so ancestry alone does not show a hand resolution kept it.
+    /// ([`crate::jj::Repo::member_lines`]), with two more conditions that
+    /// `--verify` reports and passes: no line is held only by its words, and
+    /// no path of the change holds an unresolved conflict. A release merge
+    /// reaches every member it names as a parent whatever its tree holds, so
+    /// ancestry alone does not show a hand resolution kept it.
     CarriedExact,
     /// Its net tree change leaves the target unchanged, whether the same
     /// content arrived through different commits or the revision itself has
@@ -890,17 +891,23 @@ impl<'a> CheckInput<'a> {
 /// gives a member's own lines ([`holds_own_lines`]), and merged-then-edited
 /// otherwise: a release merge names its members as parents, so every member
 /// is an ancestor whatever the merge's tree holds, and a hand resolution can
-/// drop a member's change while keeping the member a parent. No other input
-/// (a record of the branch it was built on) makes it carried. A tip the
-/// target does not reach is replayed onto it, from their common ancestor
-/// against the trunk ([`Repo::tree_replay_outcome`]) and from its base
-/// against a release ([`Repo::base_replay_outcome`]): an empty replay is
+/// drop a member's change while keeping the member a parent. The two
+/// commands differ in what they leave to a person. A line that the release
+/// holds only by its words, and a path of the change that holds an
+/// unresolved conflict, in the release or at the tip, are findings of
+/// `--verify` that do not fail it (a member held by words reads carried, one
+/// with a conflict reads inconclusive, exit 0), and here each is
+/// merged-then-edited, exit 3. A conflict elsewhere is no conflict of the
+/// change, and the own-lines reading does not see it. No other input (a
+/// record of the branch it was built on) makes it carried. A tip the target
+/// does not reach is replayed onto it, from their common ancestor against
+/// the trunk ([`Repo::tree_replay_outcome`]) and from its base against a
+/// release ([`Repo::base_replay_outcome`]): an empty replay is
 /// carried-rewritten. Otherwise a standing rewrite of the tip that the
 /// target reaches makes it carried-rebased, where, against a release, the
 /// release holds every line of the rewrite's own change from its own base
-/// too. Against a release, a tip that holds an unresolved conflict reads as
-/// a conflicting replay: conflicted where the release does not reach it, and
-/// merged-then-edited where it does.
+/// too. Against a release, a tip that the release does not reach and that
+/// holds an unresolved conflict reads as a conflicting replay: conflicted.
 pub fn check(input: &CheckInput<'_>, target: &Target) -> anyhow::Result<CarryCheck> {
     let release = target.role != TargetRole::UpstreamTrunk;
     if input.repo.is_ancestor(input.tip, &target.commit)? {

@@ -52,7 +52,7 @@ Use the carriage probe (`--carries`), never a source-text search: a symbol's pre
 
 | Verdict | Evidence |
 |---|---|
-| `carried-exact` | The revision tip is an ancestor of the target. Against a release, the release also holds every line of its change, as `members --verify` reads a member's own lines: none lost, none held only by its words, and no unresolved conflict in a path of the change, in the release or at the tip. Other members' lines beside the tip's, at the same place or next to it, change none of its lines. |
+| `carried-exact` | The revision tip is an ancestor of the target. Against a release, the release also holds every line of its change, as `members --verify` reads a member's own lines, and holds none of them only by its words, and no path of the change holds an unresolved conflict, in the release or at the tip: `--verify` reports those two and still passes, so it can read carried a member that `--carries` leaves to you. Other members' lines beside the tip's, at the same place or next to it, change none of its lines. |
 | `merged-then-edited` | An ancestor of the release that lacks a line of its change, holds one only by its words, or holds a conflict in a path of it, or whose tip holds a conflict: later work or a resolution changed what it brought. No record makes it carried; judge it. |
 | `carried-rewritten` | Replaying its net change leaves the target unchanged: equivalent content arrived another way, or it has no net change. |
 | `carried-rebased` | Replay differs, but a commit with its change id is an ancestor. Against a release, that rewrite's own change is also held line by line, as for `carried-exact`, and the tip holds no conflict. Weaker: divergent changes can name different trees. |

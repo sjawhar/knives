@@ -519,21 +519,33 @@ member is a finding (exit `1`). With `--json`, `audit.members` holds each member
 `reading`, `lost`, `held_by_words` and `word_step_skipped`.
 
 `--carries` and `--census` read a tip that a release reaches by its own lines too, from the same
-base, so they answer as `--verify` does. Against the upstream trunk, which knives does not
+base and through the same reader as `--verify`. Against the upstream trunk, which knives does not
 compose, an ancestor tip is `carried-exact`. Against a release, an ancestor tip is
 `carried-exact` where the release holds every line that the tip's change adds, does not hold
 again a hunk that it removes, holds no line of it only by its words, and holds no unresolved
 conflict in a path of it, nor does the tip. Lines that other members added or edited next to the
 tip's lines change none of its lines, so they do not matter. Otherwise it is `merged-then-edited`
 (exit `3`): a person judges it, with the release's commits since that changed its files; no
-`knives depends` record makes it carried. A line that the release changed, so that it holds the
-line only by its words, is a changed line: `--verify` reads the member carried and names the
-line, and `--carries` leaves it to a person. `--carries` and `--census` name no line; `--verify`
-does. A tip that the target does not reach is read by a replay of its change instead. Against
-either target it is `carried-rewritten` when its net change replays empty, else `carried-rebased`
-when a rewrite that stands for it (a successor in jj's operation log, or a commit with its tree)
-is an ancestor and, against a release, the release holds every line of the rewrite's own change
-too, as above, else `conflicted` or `NOT carried`.
+`knives depends` record makes it carried.
+
+The two commands differ in two places, where `--verify` reports and passes and `--carries` leaves
+the judgment to a person. A line that the release changed, so that it holds the line only by its
+words, is a changed line: `--verify` reads the member carried (exit `0`) and names the line, and
+`--carries` reads `merged-then-edited` (exit `3`). A path with an unresolved conflict, in the
+release or at the tip, reads inconclusive in `--verify`, which exits `0` where the member lacks
+nothing else, and `merged-then-edited` in `--carries`. `--carries` and `--census` name no line;
+`--verify` does. What the own-lines reading does not read, it does not read for `--carries`
+either, so both read these as carried: blank lines that the release dropped; the executable bit
+of a file that the member's change adds; a removed hunk that the release writes back edited, or
+puts back in part (the hunk reads put back only where every one of its non-blank lines comes
+back); and a line deleted from a file that the member's own change adds whole, as for a member
+stacked on a branch that adds the file.
+
+A tip that the target does not reach is read by a replay of its change instead. Against either
+target it is `carried-rewritten` when its net change replays empty, else `carried-rebased` when a
+rewrite that stands for it (a successor in jj's operation log, or a commit with its tree) is an
+ancestor and, against a release, the release holds every line of the rewrite's own change too, as
+above, else `conflicted` or `NOT carried`.
 
 Before cutting, the orphan gate looks for commits that only the previous release or its descendants reach. These keep a commit: a local bookmark, a bookmark of `origin` or of the publish remote (tracked or not), each target of such a bookmark that is conflicted, a parent of the previous release, and the upstream trunk. A bookmark with a release name keeps nothing. On a fork with a fixed release branch, a release name is that branch's name alone. On any other fork, it is a name that starts with `release/`. A bookmark of `upstream` other than the upstream trunk, or of any other remote, keeps nothing either, because its owner can delete it. When a commit that nothing keeps would be stranded, the cut refuses (exit `3`) and lists each such commit ID. Pass `--allow-drop` when dropping those commits is intentional. The published remedy lists the commits that a cut would drop through the same keepers.
 
