@@ -17,5 +17,6 @@ all three versions hold.
 
 The members' entries conflict at both places. A hand resolution kept the member's entries
 first at each place, with the other members' entries after them: 5 lines where the member adds
-1, and 66 lines where it adds 41. `src/changelog_union.rs` reads these files
-(`holds_insertions`).
+1, and 66 lines where it adds 41. `src/own_lines.rs` reads these files, and so does
+`tests/release_carries.rs`: `members --verify` and `members --carries` both read the member
+carried, since the release holds every line that the member added.

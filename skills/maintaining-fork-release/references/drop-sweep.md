@@ -40,7 +40,7 @@ $g show <tree>:<path>                                 # the fork copy of a path
 
 ## Settle mechanically, then read the residue
 
-1. `knives release members <candidate> --carries <commit>` settles a row only when it says carried. It replays the commit's change, from its fork point with the trunk, onto the candidate. A commit the candidate reaches whose replay is not empty reads `merged-then-edited` (exit `3`): read that row per line. A later commit's own change includes the changes of the commits before it on its branch, so after one commit that does not settle, later commits read the same.
+1. `knives release members <candidate> --carries <commit>` settles a row only when it says carried. For a commit the candidate reaches, it reads the commit's change, from its fork point with the trunk, by its own lines, as `members <candidate> --verify` does: carried when the candidate holds every line that the change adds, does not put back a hunk that it removed, and holds none of its lines only by their words. A commit the candidate does not reach is replayed onto the candidate instead. A commit the candidate reaches that lacks a line, or holds one only by its words, reads `merged-then-edited` (exit `3`): read that row per line. A later commit's own change includes the changes of the commits before it on its branch, so after one commit that does not settle, later commits read the same.
 2. Count **copies** per path: presence is not a count, because a lost `else:` would settle on an unrelated `else:`. Get the paths from the net diff with `--name-only`, and one path's hunks (`<path diff>` below) by appending `-- 'root:"<path>"'`.
 
    ```sh
