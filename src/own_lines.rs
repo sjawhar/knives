@@ -1511,6 +1511,71 @@ mod tests {
     }
 
     #[test]
+    fn entries_a_resolution_kept_beside_other_members_entries_are_held() {
+        // Given: Rocq's `dev/doc/critical-bugs.md`, cut down to the two
+        // places where a member adds entries, one to the table of contents
+        // and three below it; a release that holds the member's entries
+        // first at each place, with other members' entries after them, as a
+        // hand resolution of the conflicts there wrote them
+        let (base, member, release) = (
+            include_str!("../tests/fixtures/side_by_side/critical-bugs/base.md"),
+            include_str!("../tests/fixtures/side_by_side/critical-bugs/member.md"),
+            include_str!("../tests/fixtures/side_by_side/critical-bugs/release.md"),
+        );
+        let path = "dev/doc/critical-bugs.md";
+
+        // Then: the member is carried, with nothing to name
+        let lines = read(path, file(base), file(member), file(release));
+        assert_eq!(lines.reading, Reading::Carried);
+        assert_eq!(lost(&lines), []);
+        assert_eq!(held(&lines), []);
+
+        // When: the release lacks the member's entry in the table of contents
+        let entry = "      - [incorrect variance inference for a constructor";
+        let lacking: String = release
+            .lines()
+            .filter(|line| !line.starts_with(entry))
+            .flat_map(|line| [line, "\n"])
+            .collect();
+        let lines = read(path, file(base), file(member), file(&lacking));
+        // Then: the member is missing that line
+        assert_eq!(lines.reading, Reading::Missing);
+        assert_eq!(lines.lost.len(), 1);
+        assert_eq!(lines.lost[0].kind, LostKind::Added);
+        assert_eq!(lines.lost[0].line, Some(4));
+    }
+
+    #[test]
+    fn a_deletion_beside_another_members_rewrite_is_carried_and_put_back_is_lost() {
+        // Given: a member that deletes the two `let` lines after a `raise`
+        // line, and another member that rewrote the `raise` line and
+        // inserted lines after it
+        let fork = file(
+            "fail =\n  raise X in\n  let first = 1 in\n  let second = 2 in\n  fail ()\n",
+        );
+        let member = file("fail =\n  raise X in\n  fail ()\n");
+
+        // When: the release holds the other member's lines and the deletion
+        let both = file("fail =\n  raise X\n  and note = 1\n  and trace = 2 in\n  fail ()\n");
+        let lines = read("f.ml", fork.clone(), member.clone(), both);
+        // Then: the member is carried, with nothing to name
+        assert_eq!(lines.reading, Reading::Carried);
+        assert_eq!(lost(&lines), []);
+        assert_eq!(held(&lines), []);
+
+        // When: the release holds the other member's lines and puts the two
+        // `let` lines back
+        let put_back = file(
+            "fail =\n  raise X\n  and note = 1\n  and trace = 2 in\n  let first = 1 in\n  \
+             let second = 2 in\n  fail ()\n",
+        );
+        let lines = read("f.ml", fork, member, put_back);
+        // Then: the member is missing the removed lines, put back
+        assert_eq!(lines.reading, Reading::Missing);
+        assert_eq!(lost(&lines), [(LostKind::Removed, Some(3), Some("  let first = 1 in"))]);
+    }
+
+    #[test]
     fn the_reading_serializes_with_snake_case_fields_and_kebab_case_values() {
         // Given: a reading carried forward, with a line lost by the word
         // limit

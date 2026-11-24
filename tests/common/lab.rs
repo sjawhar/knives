@@ -1432,6 +1432,26 @@ pub fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// `knives release members <release> --verify`, whatever its exit.
+pub fn verify(lab: &Lab, home: &TempDir, release: &str) -> Output {
+    knives_release(lab, home, &["members", release, "--verify"])
+}
+
+/// The label `members --verify` gives the member that `branch` holds.
+pub fn label(lab: &Lab, branch: &str) -> String {
+    format!("{branch}@{}", commit_at(lab, branch).short())
+}
+
+/// The `members --verify` row of a member it reads as carried.
+pub fn carried_row(label: &str) -> String {
+    format!("  {label}: carried (replay empty)")
+}
+
+/// The `members --verify` and cut-audit row of a member read as missing.
+pub fn missing_row(label: &str) -> String {
+    format!("  !! {label}: the cut tree is missing or diverges from the member's content")
+}
+
 /// [`jj`] for an argument list of any length. The command must succeed.
 pub fn jj_in(directory: &Path, args: &[&str]) {
     let status = Command::new("jj")

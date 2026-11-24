@@ -29,8 +29,9 @@ use std::time::{Duration, Instant};
 
 use knives::ids::CommitId;
 use lab::{
-    Lab, ReleaseOutput, commit_at, extend_branch, home_after_first_cut, jj_in, knives_release,
-    release_command, release_test_home, stdout, text, trunk_with,
+    Lab, ReleaseOutput, carried_row, commit_at, extend_branch, home_after_first_cut, jj_in,
+    knives_release, label, missing_row, release_command, release_test_home, stdout, text,
+    trunk_with, verify,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -101,21 +102,6 @@ fn hand_release(lab: &Lab, name: &str, parents: &[&str], edit: impl FnOnce(&Path
     commit_at(lab, name)
 }
 
-/// The label `members --verify` gives the member that `branch` holds.
-fn label(lab: &Lab, branch: &str) -> String {
-    format!("{branch}@{}", commit_at(lab, branch).short())
-}
-
-/// The `members --verify` row of a member it reads as carried.
-fn carried_row(label: &str) -> String {
-    format!("  {label}: carried (replay empty)")
-}
-
-/// The `members --verify` and cut-audit row of a member read as missing.
-fn missing_row(label: &str) -> String {
-    format!("  !! {label}: the cut tree is missing or diverges from the member's content")
-}
-
 /// The lines of a cut's report that name `branch` with a divergence: each
 /// row that reads it missing or carries its divergence forward says so.
 fn divergence_rows<'a>(stdout: &'a str, branch: &str) -> Vec<&'a str> {
@@ -123,11 +109,6 @@ fn divergence_rows<'a>(stdout: &'a str, branch: &str) -> Vec<&'a str> {
         .lines()
         .filter(|line| line.contains(branch) && line.contains("diverge"))
         .collect()
-}
-
-/// `knives release members <release> --verify`, whatever its exit.
-fn verify(lab: &Lab, home: &TempDir, release: &str) -> Output {
-    knives_release(lab, home, &["members", release, "--verify"])
 }
 
 /// The JSON report of the release verb `args`, parsed.
@@ -2422,6 +2403,51 @@ fn carries_reads_carried_rebased_where_the_release_holds_the_rewrites_lines() {
     let output = carries(&lab, &home, first.as_str());
 
     // Then: carried-rebased, with the rewrite as the evidence.
+    let out = stdout(&output);
+    assert!(
+        out.contains(&format!(
+            "carried-rebased    {RELEASE} @ {}  (evidence {}: a rewrite of the change is an \
+             ancestor)",
+            release.short(),
+            rewrite.short()
+        )),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+}
+
+#[test]
+fn carries_reads_carried_rebased_where_a_neighbours_edit_sits_beside_the_rewrites_lines() {
+    // Given: M adds a function after the first line of `lib.js`; N changes
+    // the line right after that place; M is reworded, which makes a rewrite
+    // with M's change id and tree; the release, cut outside knives, merges
+    // the rewrite and N and holds both changes, and does not reach M's first
+    // commit.
+    let trunk = lines(&[IMPORT, VALUE_1, LOG]);
+    let lab = trunk_with(&[(JS, trunk.as_str())]);
+    lab.branch(
+        M,
+        JS,
+        &lines(&[IMPORT, HELPER_OPEN, HELPER_RETURN, CLOSE, VALUE_1, LOG]),
+    );
+    lab.branch(N, JS, &lines(&[IMPORT, VALUE_2, LOG]));
+    let first = commit_at(&lab, M);
+    lab.jj_work(["describe", "-r", M, "-m", "feat/m, reworded"]);
+    let rewrite = commit_at(&lab, M);
+    assert_ne!(rewrite, first, "the reword rewrote M");
+    let release = hand_release(&lab, RELEASE, &[M, N], |work| {
+        let both = lines(&[IMPORT, HELPER_OPEN, HELPER_RETURN, CLOSE, VALUE_2, LOG]);
+        write_file(work, JS, &both);
+    });
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: M's first commit is checked against the release.
+    let output = carries(&lab, &home, first.as_str());
+
+    // Then: carried-rebased, with the rewrite as the evidence: the release
+    // holds every line of the rewrite's change, as `--verify` reads it, and
+    // N's edit beside them changes none of them.
     let out = stdout(&output);
     assert!(
         out.contains(&format!(
