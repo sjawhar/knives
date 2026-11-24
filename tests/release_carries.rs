@@ -1184,7 +1184,7 @@ fn resolved_cut(
 
 /// Each of `names` reads carried in [`CUT`] by every command that reads it:
 /// `members --verify` by the member's own lines (exit 0), `--carries` and the
-/// census (carried-exact). Two commands of one tool give one answer.
+/// census (carried-exact).
 fn assert_every_command_reads_carried(lab: &Lab, home: &tempfile::TempDir, names: &[&str]) {
     let verified = verify(lab, home, CUT);
     let out = stdout(&verified);
