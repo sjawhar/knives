@@ -307,14 +307,14 @@ fn release_carries_answers_merged_then_edited_for_a_parent_whose_change_the_rele
         "{beta}"
     );
     // And: alpha, whose change the release's tree holds, is carried exactly,
-    // and the reason says its change replays empty, not only that it is an
-    // ancestor.
+    // and the reason says the release holds every line of its change, not
+    // only that it is an ancestor.
     let alpha_stdout = String::from_utf8_lossy(&alpha_output.stdout);
     assert!(alpha_output.status.success(), "{alpha_stdout}");
     assert!(
         alpha_stdout.contains(&format!(
             "carried-exact      release/2026-08-04 @ {}  (evidence {}: tip is an ancestor and \
-             its change replays empty onto the release)",
+             the release holds every line of its change)",
             release.short(),
             alpha.short()
         )),
@@ -930,8 +930,7 @@ fn release_carries_answers_merged_then_edited_for_a_member_deleted_then_recreate
 }
 
 #[test]
-fn release_carries_answers_merged_then_edited_for_a_member_whose_deleted_line_the_release_put_back()
-{
+fn release_carries_answers_carried_exact_for_a_member_whose_deleted_line_the_release_put_back() {
     // Given: `feat/del`, stacked on `feat/base`, deletes the line `b`; the
     // release merges it with another branch and puts `b` back by hand.
     let lab = Lab::new();
@@ -944,15 +943,18 @@ fn release_carries_answers_merged_then_edited_for_a_member_whose_deleted_line_th
         ("feat/del", "feat/x"),
         &[("f.txt", Some("a\nb\nc\n"))],
     );
+    let (home, _consumer) = release_test_home(&lab);
 
     // When, then: from the trunk, `f.txt` is one file `feat/del` added as
-    // `a`, `c`, and the release holds it with `b` back, so `feat/del` is
-    // not carried exactly.
-    assert_carried(&lab, "feat/del", false);
+    // `a`, `c`, and the release holds both lines with `b` between them, so
+    // every command reads `feat/del` carried. A member that deletes a line
+    // of a file that its fork point holds is read missing where the release
+    // puts the line back, as in the guard test with a deletion put back.
+    assert_every_command_reads_carried(&lab, &home, &["feat/del"]);
 }
 
 #[test]
-fn release_carries_answers_merged_then_edited_for_a_member_that_deleted_a_line_it_merged_in() {
+fn release_carries_answers_carried_exact_for_a_member_that_deleted_a_line_it_merged_in() {
     // Given: `feat/del`, built on `feat/base`, merges in `feat/u`, which adds
     // `u.txt`, then deletes a line of `u.txt`; the release merges `feat/del`
     // with another branch and puts the line back.
@@ -976,9 +978,13 @@ fn release_carries_answers_merged_then_edited_for_a_member_that_deleted_a_line_i
         ("feat/del", "feat/x"),
         &[("u.txt", Some("x\ny\n"))],
     );
+    let (home, _consumer) = release_test_home(&lab);
 
-    // When, then: `feat/del` is not carried exactly.
-    assert_carried(&lab, "feat/del", false);
+    // When, then: every command reads `feat/del` carried. From the trunk,
+    // `u.txt` is one file that `feat/del` added as `x`, so the line it
+    // deleted after merging it in is no hunk of its own change, and the
+    // release holds `x`.
+    assert_every_command_reads_carried(&lab, &home, &["feat/del"]);
 }
 
 /// `feat/line` changes `README.md`; `feat/member`, stacked on it, writes a
@@ -1084,7 +1090,8 @@ fn release_carries_answers_carried_exact_for_a_stacked_member_whose_whole_line_t
     );
 
     // When, then: its change from the trunk, `feat/line`'s commit with its
-    // own, replays empty, so it is carried exactly with no record.
+    // own, is held whole by the release, so it is carried exactly with no
+    // record.
     assert_carried(&lab, "feat/member", true);
 }
 
@@ -1532,8 +1539,15 @@ fn release_carries_answers_merged_then_edited_for_a_mode_a_side_by_side_release_
     let (home, _consumer) = release_test_home(&lab);
 
     // When, then: the member is not carried exactly: the release holds its
-    // line, but not its mode.
+    // line, but not its mode, and `members --verify` names the mode.
     assert_carried_in(&lab, &home, MEMBER, false);
+    let verified = verify(&lab, &home, CUT);
+    assert_eq!(verified.status.code(), Some(1), "{}", text(&verified));
+    assert!(
+        stdout(&verified).contains("shared.sh: mode differs from the member's (executable yes)"),
+        "{}",
+        text(&verified)
+    );
 
     // And: a release that holds the mode too carries it exactly.
     release_of_member_and_other(&lab, both, 0o755);
@@ -1682,7 +1696,7 @@ fn release_carries_answers_merged_then_edited_for_a_member_beside_a_backup_bookm
 }
 
 #[test]
-fn release_carries_answers_merged_then_edited_for_a_deletion_a_siblings_edit_replaced() {
+fn release_carries_answers_carried_exact_for_a_deletion_a_siblings_edit_replaced() {
     // Given: `feat/foundation` writes `a`, `timeout = 30`, `b`; the member,
     // stacked on it, deletes the timeout line; `feat/sibling`, also on it,
     // sets `timeout = 60`; the release merges both and keeps the sibling's
@@ -1709,11 +1723,11 @@ fn release_carries_answers_merged_then_edited_for_a_deletion_a_siblings_edit_rep
     );
     let (home, _consumer) = release_test_home(&lab);
 
-    // When, then: the member, whose deletion the release does not hold, is
-    // not carried; the sibling, whose line it holds as the sibling left it,
-    // is carried exactly.
-    assert_carried_in(&lab, &home, MEMBER, false);
-    assert_carried_in(&lab, &home, "feat/sibling", true);
+    // When, then: every command reads both carried. From the trunk, the
+    // member's change is `conf.txt` added as `a` and `b`, so the deletion of
+    // the timeout line is no hunk of its own change, and the release holds
+    // both of its lines, with the sibling's line between them.
+    assert_every_command_reads_carried(&lab, &home, &[MEMBER, "feat/sibling"]);
 }
 
 #[test]
@@ -1747,7 +1761,7 @@ fn release_carries_answers_merged_then_edited_for_a_member_that_removed_one_of_t
 }
 
 #[test]
-fn release_carries_answers_merged_then_edited_for_a_deletion_the_release_wrote_back_edited() {
+fn release_carries_answers_carried_exact_for_a_deletion_the_release_wrote_back_edited() {
     // Given: the member empties `README.md`, which the trunk holds as
     // `seed`; the release merges it with another branch and writes
     // `seed, edited` by hand.
@@ -1760,9 +1774,12 @@ fn release_carries_answers_merged_then_edited_for_a_deletion_the_release_wrote_b
         (MEMBER, "feat/other"),
         &[("README.md", Some("seed, edited\n"))],
     );
+    let (home, _consumer) = release_test_home(&lab);
 
-    // When, then: the member is not carried.
-    assert_member_carried(&lab, false);
+    // When, then: every command reads the member carried: a hunk that the
+    // member removed is put back only where the release inserts its lines as
+    // they were, and `seed, edited` is another line.
+    assert_every_command_reads_carried(&lab, &home, &[MEMBER]);
 }
 
 #[test]
@@ -1921,8 +1938,8 @@ fn member_with(lab: &Lab, files: &[(&str, Option<&str>)], mode: Option<u32>) {
 }
 
 #[test]
-fn release_carries_answers_merged_then_edited_for_a_member_whose_mode_the_release_merge_dropped() {
-    // Given: the member makes `shared.sh` executable; the release merges it
+fn release_carries_answers_carried_exact_for_an_added_file_whose_mode_the_release_cleared() {
+    // Given: the member adds an executable `shared.sh`; the release merges it
     // with another branch and clears the mode by hand.
     use std::os::unix::fs::PermissionsExt as _;
     let lab = Lab::new();
@@ -1936,9 +1953,14 @@ fn release_carries_answers_merged_then_edited_for_a_member_whose_mode_the_releas
     .expect("clear the mode");
     lab.jj_work(["bookmark", "create", "release/2026-08-04", "-r", "@"]);
     lab.jj_work(["new"]);
+    let (home, _consumer) = release_test_home(&lab);
 
-    // When, then: the member is not carried.
-    assert_member_carried(&lab, false);
+    // When, then: every command reads the member carried. A change of the
+    // executable bit is read where the member changes the bit of a file that
+    // its fork point holds (the side-by-side mode test below); a file that
+    // the member adds has no bit of its fork point's to change, and
+    // `--verify` has always read its lines alone.
+    assert_every_command_reads_carried(&lab, &home, &[MEMBER]);
 }
 
 #[test]
@@ -2028,7 +2050,7 @@ fn release_carries_reads_a_link_a_member_wrote() {
 }
 
 #[test]
-fn release_carries_answers_merged_then_edited_for_a_member_whose_blank_lines_the_release_dropped() {
+fn release_carries_answers_carried_exact_for_a_member_whose_blank_lines_the_release_dropped() {
     // Given: the member writes lines with blank lines between them; the
     // release merges it with another branch and drops the blank lines.
     let lab = Lab::new();
@@ -2040,9 +2062,11 @@ fn release_carries_answers_merged_then_edited_for_a_member_whose_blank_lines_the
         (MEMBER, "feat/other"),
         &[("shared.txt", Some("x\ny\n"))],
     );
+    let (home, _consumer) = release_test_home(&lab);
 
-    // When, then: the member is not carried.
-    assert_member_carried(&lab, false);
+    // When, then: every command reads the member carried: its own lines are
+    // its non-blank lines, and the release holds them all.
+    assert_every_command_reads_carried(&lab, &home, &[MEMBER]);
 }
 
 #[test]

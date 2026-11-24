@@ -320,6 +320,18 @@ impl MemberLines {
         conflicts.peek().is_some() && conflicts.all(|lost| lost.conflict == Some(ConflictAt::Tip))
     }
 
+    /// Whether the release holds every line of the member's change as the
+    /// member left it: the member reads [`Reading::Carried`], so no line is
+    /// lost and no path holds an unresolved conflict, and the release holds
+    /// no line only by its words, which another change edited. `knives
+    /// release members --carries` and `--census` read a release that reaches
+    /// the member's tip by this: a line that the release changed is a changed
+    /// line, which a person judges.
+    #[must_use]
+    pub fn holds_every_line(&self) -> bool {
+        self.reading == Reading::Carried && self.held_by_words.is_empty()
+    }
+
     /// The reading that the lost entries give.
     fn settled(&self) -> Reading {
         if self
@@ -1529,6 +1541,7 @@ mod tests {
         assert_eq!(lines.reading, Reading::Carried);
         assert_eq!(lost(&lines), []);
         assert_eq!(held(&lines), []);
+        assert!(lines.holds_every_line());
 
         // When: the release lacks the member's entry in the table of contents
         let entry = "      - [incorrect variance inference for a constructor";
@@ -1543,6 +1556,7 @@ mod tests {
         assert_eq!(lines.lost.len(), 1);
         assert_eq!(lines.lost[0].kind, LostKind::Added);
         assert_eq!(lines.lost[0].line, Some(4));
+        assert!(!lines.holds_every_line());
     }
 
     #[test]
@@ -1550,9 +1564,8 @@ mod tests {
         // Given: a member that deletes the two `let` lines after a `raise`
         // line, and another member that rewrote the `raise` line and
         // inserted lines after it
-        let fork = file(
-            "fail =\n  raise X in\n  let first = 1 in\n  let second = 2 in\n  fail ()\n",
-        );
+        let fork =
+            file("fail =\n  raise X in\n  let first = 1 in\n  let second = 2 in\n  fail ()\n");
         let member = file("fail =\n  raise X in\n  fail ()\n");
 
         // When: the release holds the other member's lines and the deletion
@@ -1562,6 +1575,7 @@ mod tests {
         assert_eq!(lines.reading, Reading::Carried);
         assert_eq!(lost(&lines), []);
         assert_eq!(held(&lines), []);
+        assert!(lines.holds_every_line());
 
         // When: the release holds the other member's lines and puts the two
         // `let` lines back
@@ -1572,7 +1586,29 @@ mod tests {
         let lines = read("f.ml", fork, member, put_back);
         // Then: the member is missing the removed lines, put back
         assert_eq!(lines.reading, Reading::Missing);
-        assert_eq!(lost(&lines), [(LostKind::Removed, Some(3), Some("  let first = 1 in"))]);
+        assert_eq!(
+            lost(&lines),
+            [(LostKind::Removed, Some(3), Some("  let first = 1 in"))]
+        );
+    }
+
+    #[test]
+    fn a_line_held_only_by_its_words_is_not_held_as_the_member_left_it() {
+        // Given: a member that adds a call, and a release that holds the
+        // call wrapped in another
+        let lines = read(
+            "lib.js",
+            file("import x\nvalue = 1\nlog()\n"),
+            file("import x\nvalue = 1\nrun(value, 2);\nlog()\n"),
+            file("import x\nvalue = 1\nheld(run(value, 2));\nlog()\n"),
+        );
+
+        // Then: the member reads carried, but its line is held only by its
+        // words, so the release does not hold every line as the member
+        // left it
+        assert_eq!(lines.reading, Reading::Carried);
+        assert_eq!(held(&lines).len(), 1);
+        assert!(!lines.holds_every_line());
     }
 
     #[test]
