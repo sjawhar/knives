@@ -31,9 +31,9 @@ use std::time::{Duration, Instant};
 
 use knives::ids::CommitId;
 use lab::{
-    Lab, ReleaseOutput, carried_row, commit_at, extend_branch, home_after_first_cut, jj_in,
-    knives_release, label, missing_row, release_command, release_test_home, stdout, text,
-    trunk_with, verify,
+    Lab, ReleaseOutput, carried_row, carries, census, census_block, commit_at, extend_branch,
+    home_after_first_cut, jj_in, knives_release, label, missing_row, release_command,
+    release_test_home, stdout, text, trunk_with, verify,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -145,29 +145,6 @@ fn lists_missing(report: &Value, label: &str) -> bool {
     report["audit"]["missing"]
         .as_array()
         .is_some_and(|missing| missing.iter().any(|name| name == label))
-}
-
-/// `knives release members --carries <revision>`, whatever its exit.
-fn carries(lab: &Lab, home: &TempDir, revision: &str) -> Output {
-    knives_release(lab, home, &["members", "--carries", revision])
-}
-
-/// `knives release members --census --no-github`'s standard output.
-fn census(lab: &Lab, home: &TempDir) -> String {
-    stdout(&knives_release(
-        lab,
-        home,
-        &["members", "--census", "--no-github"],
-    ))
-}
-
-/// The census block of `branch`: its row and its checks.
-fn census_block<'a>(stdout: &'a str, branch: &str) -> &'a str {
-    let wanted = format!("  {branch} @");
-    stdout
-        .split("\n\n")
-        .find(|block| block.starts_with(&wanted))
-        .unwrap_or_else(|| panic!("no census block for {branch}: {stdout}"))
 }
 
 /// `knives release cut <name> --at <commit>`, whatever its exit.

@@ -1452,6 +1452,29 @@ pub fn missing_row(label: &str) -> String {
     format!("  !! {label}: the cut tree is missing or diverges from the member's content")
 }
 
+/// `knives release members --carries <revision>`, whatever its exit.
+pub fn carries(lab: &Lab, home: &TempDir, revision: &str) -> Output {
+    knives_release(lab, home, &["members", "--carries", revision])
+}
+
+/// `knives release members --census --no-github`'s standard output.
+pub fn census(lab: &Lab, home: &TempDir) -> String {
+    stdout(&knives_release(
+        lab,
+        home,
+        &["members", "--census", "--no-github"],
+    ))
+}
+
+/// The census block of `branch`: its row and its checks.
+pub fn census_block<'a>(stdout: &'a str, branch: &str) -> &'a str {
+    let wanted = format!("  {branch} @");
+    stdout
+        .split("\n\n")
+        .find(|block| block.starts_with(&wanted))
+        .unwrap_or_else(|| panic!("no census block for {branch}: {stdout}"))
+}
+
 /// [`jj`] for an argument list of any length. The command must succeed.
 pub fn jj_in(directory: &Path, args: &[&str]) {
     let status = Command::new("jj")

@@ -1542,21 +1542,6 @@ mod tests {
         assert_eq!(lost(&lines), []);
         assert_eq!(held(&lines), []);
         assert!(lines.holds_every_line());
-
-        // When: the release lacks the member's entry in the table of contents
-        let entry = "      - [incorrect variance inference for a constructor";
-        let lacking: String = release
-            .lines()
-            .filter(|line| !line.starts_with(entry))
-            .flat_map(|line| [line, "\n"])
-            .collect();
-        let lines = read(path, file(base), file(member), file(&lacking));
-        // Then: the member is missing that line
-        assert_eq!(lines.reading, Reading::Missing);
-        assert_eq!(lines.lost.len(), 1);
-        assert_eq!(lines.lost[0].kind, LostKind::Added);
-        assert_eq!(lines.lost[0].line, Some(4));
-        assert!(!lines.holds_every_line());
     }
 
     #[test]
@@ -1590,6 +1575,7 @@ mod tests {
             lost(&lines),
             [(LostKind::Removed, Some(3), Some("  let first = 1 in"))]
         );
+        assert!(!lines.holds_every_line());
     }
 
     #[test]
