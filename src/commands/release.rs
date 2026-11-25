@@ -3671,7 +3671,7 @@ pub fn lost_lines(
             .map_or_else(String::new, |line| format!(":{line}"));
         let named = match lost.kind {
             LostKind::Added => format!("{path}{at}: added line lost ‹{text}›"),
-            LostKind::Removed => format!("{path}{at}: removed lines put back ‹{text}›"),
+            LostKind::Removed => format!("{path}{at}: removed line put back ‹{text}›"),
             LostKind::File => format!("{path}: file differs from the member's ({text})"),
             LostKind::Mode => format!("{path}: mode differs from the member's ({text})"),
             LostKind::Conflict => format!("{path}: unresolved conflict {text}"),

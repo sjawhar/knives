@@ -17,8 +17,8 @@
 //!   section of a release log holds the same line. Where the survival diff
 //!   replaces a range of the tip's lines with a range of the release's
 //!   lines, the line is followed one level down, by its words.
-//! - A hunk of non-blank lines that the member removed is put back where
-//!   the survival diff inserts any one of them at the hunk's place.
+//! - A non-blank line that the member removed is lost where the survival
+//!   diff inserts it again at the place of its hunk.
 //! - A path that is not text, a deletion, an empty added file and the
 //!   executable bit are each read by a rule of their own
 //!   ([`MemberLines::read_path`]).
@@ -32,7 +32,7 @@ mod placement;
 mod words;
 
 use std::cell::OnceCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 
 use jj_lib::diff::{ContentDiff, DiffHunkKind};
@@ -154,9 +154,9 @@ pub enum Reading {
 pub struct Lost {
     pub path: String,
     pub kind: LostKind,
-    /// For an added line, its line number at the member's tip; for a hunk of
-    /// removed lines, the fork point's line number of its first non-blank
-    /// line. `None` for a path read whole, a mode and a conflict.
+    /// For an added line, its line number at the member's tip; for a removed
+    /// line, its line number at the fork point. `None` for a path read
+    /// whole, a mode and a conflict.
     pub line: Option<u32>,
     /// For a line, its text. For a path read whole, what the member made of
     /// it (`deleted`, `a binary file`, `an empty file`, `a symlink to …`,
@@ -181,8 +181,8 @@ pub enum LostKind {
     /// A non-blank line that the member added, which the release does not
     /// hold.
     Added,
-    /// A hunk of non-blank lines that the member removed, any one of which
-    /// the release holds again at the hunk's place.
+    /// A non-blank line that the member removed, which the release holds
+    /// again at the place where the member removed it.
     Removed,
     /// A path read whole: not text, deleted, or an empty added file.
     File,
@@ -832,56 +832,51 @@ impl<'t> TextPath<'t> {
         Judged::HeldByWords(holding.into_iter().map(|at| hunk.new.start + at).collect())
     }
 
-    /// Reads the non-blank lines that `hunk` removes: the hunk is put back
-    /// where the survival hunks at the hunk's place insert any one of them.
-    /// A removed line that the release holds again there undoes the
-    /// member's removal of it, whatever the release holds of the lines
-    /// around it. The hunk's place is the gaps between tip lines where the
-    /// member removed them; a survival hunk is at that place where its tip
-    /// lines' gaps meet those gaps ([`meet`]).
+    /// Reads the non-blank lines that `hunk` removes: each is put back where
+    /// a survival hunk at the hunk's place inserts it again, whatever the
+    /// release holds of the lines around it. One release line puts back one
+    /// removed line at most, the first of its text. The hunk's place is the
+    /// gaps between tip lines where the member removed them; a survival hunk
+    /// is at that place where its tip lines' gaps meet those gaps
+    /// ([`meet`]).
     fn read_removed(&self, hunk: &Hunk, out: &mut Out<'_>) {
-        let removed: Vec<(usize, &[u8])> = self
-            .fork
-            .get(hunk.old.clone())
-            .unwrap_or_default()
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|&(_, line)| !is_blank(line))
-            .map(|(offset, line)| (hunk.old.start + offset, bare(line)))
-            .collect();
-        let Some(&(first, text)) = removed.first() else {
-            return;
-        };
-        let at_place: Vec<&Hunk> = self
+        let mut inserted: HashMap<&[u8], VecDeque<usize>> = HashMap::new();
+        for survival in self
             .survival
             .iter()
             .filter(|survival| meet(&survival.old, &hunk.new))
-            .collect();
-        let inserted: Vec<&[u8]> = at_place
-            .iter()
-            .flat_map(|survival| self.release.get(survival.new.clone()).unwrap_or_default())
-            .copied()
-            .map(bare)
-            .collect();
-        if removed.iter().any(|&(_, line)| inserted.contains(&line)) {
+        {
+            for at in survival.new.clone() {
+                if let Some(&line) = self.release.get(at) {
+                    inserted.entry(bare(line)).or_default().push_back(at);
+                }
+            }
+        }
+        if inserted.is_empty() {
+            return;
+        }
+        let removed = self.fork.get(hunk.old.clone()).unwrap_or_default();
+        for (offset, &line) in removed.iter().enumerate() {
+            if is_blank(line) {
+                continue;
+            }
+            let Some(at) = inserted
+                .get_mut(bare(line))
+                .and_then(VecDeque::pop_front)
+            else {
+                continue;
+            };
+            let next = at + 1;
             out.lost(
                 entry(
                     self.path,
                     LostKind::Removed,
-                    Some(number(first)),
-                    Some(shown(text)),
+                    Some(number(hunk.old.start + offset)),
+                    Some(shown(bare(line))),
                 ),
-                // The place of the hunk: the release's lines of the
-                // survival hunks there.
-                || {
-                    Place::Lines(
-                        at_place
-                            .iter()
-                            .map(|survival| survival.new.clone())
-                            .collect(),
-                    )
-                },
+                // The place of the line: the release's line that holds it
+                // again.
+                || Place::Lines(vec![at..next]),
             );
         }
     }
@@ -1029,10 +1024,15 @@ mod tests {
             file("a\nx\ny\nb\n"),
         );
 
-        // Then: the hunk is lost, by the fork point's line number of its
-        // first line
+        // Then: each removed line is lost, by its fork point's line number
         assert_eq!(lines.reading, Reading::Missing);
-        assert_eq!(lost(&lines), [(LostKind::Removed, Some(2), Some("x"))]);
+        assert_eq!(
+            lost(&lines),
+            [
+                (LostKind::Removed, Some(2), Some("x")),
+                (LostKind::Removed, Some(3), Some("y")),
+            ]
+        );
     }
 
     #[test]
@@ -1078,20 +1078,33 @@ mod tests {
             file("p\nq\n"),
             file("p\nc\nq\n"),
         );
+        // And: a member that removes two lines `}`, and a release that holds
+        // one `}` again
+        let braces = read(
+            "f.txt",
+            file("a\n  }\n}\n}\nb\n"),
+            file("a\n  }\nb\n"),
+            file("a\n  }\n}\nb\n"),
+        );
 
-        // Then: each hunk is lost, named by its first non-blank line
-        for (lines, first) in [
-            (part, (Some(2), "x")),
-            (brace, (Some(2), "  y();")),
-            (edited, (Some(2), "a")),
-            (emptied, (Some(1), "a")),
-            (last, (Some(2), "a")),
+        // Then: each removed line the release holds again is lost, by its
+        // fork point's line number, and no other
+        let removed = |entries: &[(u32, &'static str)]| -> Vec<_> {
+            entries
+                .iter()
+                .map(|&(line, text)| (LostKind::Removed, Some(line), Some(text)))
+                .collect()
+        };
+        for (lines, wanted) in [
+            (part, removed(&[(2, "x")])),
+            (brace, removed(&[(3, "}")])),
+            (edited, removed(&[(2, "a"), (4, "c")])),
+            (emptied, removed(&[(1, "a"), (3, "c")])),
+            (last, removed(&[(4, "c")])),
+            (braces, removed(&[(3, "}")])),
         ] {
             assert_eq!(lines.reading, Reading::Missing);
-            assert_eq!(
-                lost(&lines),
-                [(LostKind::Removed, first.0, Some(first.1))]
-            );
+            assert_eq!(lost(&lines), wanted);
         }
     }
 
@@ -1448,7 +1461,8 @@ mod tests {
             tip.clone(),
             file("  a = 1\n  b = 2\n  c = 30\n  d = 4\n"),
         );
-        // Then: each of the four lines is lost
+        // Then: each of the four lines is lost, and the three old lines that
+        // the release holds again are put back
         assert_eq!(
             lost(&lines),
             [
@@ -1456,6 +1470,9 @@ mod tests {
                 (LostKind::Added, Some(2), Some("    b = 2")),
                 (LostKind::Added, Some(3), Some("    c = 3")),
                 (LostKind::Added, Some(4), Some("    d = 4")),
+                (LostKind::Removed, Some(1), Some("  a = 1")),
+                (LostKind::Removed, Some(2), Some("  b = 2")),
+                (LostKind::Removed, Some(4), Some("  d = 4")),
             ]
         );
 
@@ -1565,6 +1582,28 @@ mod tests {
         let mut same = candidate;
         same.carry_forward(&both);
         assert_eq!(same.reading, Reading::CarriedForward);
+    }
+
+    #[test]
+    fn a_removed_line_put_back_only_in_the_candidate_is_not_carried_forward() {
+        // Given: a member that removes `a`, `b` and `c`; the previous
+        // release holds `a` again, and the candidate holds `a` and `c`
+        let (fork, tip) = (file("p\na\nb\nc\nq\n"), file("p\nq\n"));
+        let previous = read("f.txt", fork.clone(), tip.clone(), file("p\na\nq\n"));
+        let mut candidate = read("f.txt", fork, tip, file("p\na\nc\nq\n"));
+
+        // When: the candidate carries forward what the previous lacked
+        candidate.carry_forward(&previous);
+
+        // Then: `a` is carried forward and `c`, which the candidate alone
+        // puts back, is not, so the member is missing
+        let forward: Vec<(Option<u32>, bool)> = candidate
+            .lost
+            .iter()
+            .map(|lost| (lost.line, lost.carried_forward))
+            .collect();
+        assert_eq!(forward, [(Some(2), true), (Some(4), false)]);
+        assert_eq!(candidate.reading, Reading::Missing);
     }
 
     #[test]

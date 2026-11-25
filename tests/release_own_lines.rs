@@ -1789,13 +1789,14 @@ fn a_release_that_puts_back_one_line_of_a_removed_hunk_reads_missing() {
         ),
     );
 
-    // When/Then: M reads missing, named by its hunk's first line; N reads
+    // When/Then: M reads missing, and the one line named is the `}`; N reads
     // carried.
     let out = assert_member_missing(&lab, &home);
     assert!(
-        out.contains(&format!("      {JS}:3: removed lines put back ‹go();›")),
+        out.contains(&format!("      {JS}:4: removed line put back ‹}}›")),
         "{out}"
     );
+    assert!(!out.contains("put back ‹go();›"), "{out}");
     assert!(out.contains(&carried_row(&label(&lab, N))), "{out}");
 }
 
@@ -1809,12 +1810,13 @@ fn a_release_that_puts_back_a_removed_run_with_one_line_edited_reads_missing() {
         ("p\na\nb\nc\nq\n", "p\nq\n", "p\na\nX\nc\nq\n"),
     );
 
-    // When/Then: M reads missing; N reads carried.
+    // When/Then: M reads missing, named by `a` and `c`, not `b`; N reads
+    // carried.
     let out = assert_member_missing(&lab, &home);
-    assert!(
-        out.contains("      f.txt:2: removed lines put back ‹a›"),
-        "{out}"
-    );
+    for line in ["f.txt:2: removed line put back ‹a›", "f.txt:4: removed line put back ‹c›"] {
+        assert!(out.contains(&format!("      {line}")), "{out}");
+    }
+    assert!(!out.contains("put back ‹b›"), "{out}");
     assert!(out.contains(&carried_row(&label(&lab, N))), "{out}");
 }
 
@@ -1824,12 +1826,11 @@ fn a_release_that_holds_an_emptied_file_again_with_one_line_edited_reads_missing
     // holds N's version.
     let (lab, home) = neighbour_version_release("f.txt", ("a\nb\nc\n", "", "a\nB\nc\n"));
 
-    // When/Then: M reads missing; N reads carried.
+    // When/Then: M reads missing, named by `a` and `c`; N reads carried.
     let out = assert_member_missing(&lab, &home);
-    assert!(
-        out.contains("      f.txt:1: removed lines put back ‹a›"),
-        "{out}"
-    );
+    for line in ["f.txt:1: removed line put back ‹a›", "f.txt:3: removed line put back ‹c›"] {
+        assert!(out.contains(&format!("      {line}")), "{out}");
+    }
     assert!(out.contains(&carried_row(&label(&lab, N))), "{out}");
 }
 
