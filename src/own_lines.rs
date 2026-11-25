@@ -17,9 +17,8 @@
 //!   section of a release log holds the same line. Where the survival diff
 //!   replaces a range of the tip's lines with a range of the release's
 //!   lines, the line is followed one level down, by its words.
-//! - The non-blank lines of a hunk that the member removed are put back
-//!   where the survival diff inserts all of them, in order, at the hunk's
-//!   place.
+//! - A hunk of non-blank lines that the member removed is put back where
+//!   the survival diff inserts any one of them at the hunk's place.
 //! - A path that is not text, a deletion, an empty added file and the
 //!   executable bit are each read by a rule of their own
 //!   ([`MemberLines::read_path`]).
@@ -182,8 +181,8 @@ pub enum LostKind {
     /// A non-blank line that the member added, which the release does not
     /// hold.
     Added,
-    /// The non-blank lines of a hunk that the member removed, which the
-    /// release puts back at the hunk's place.
+    /// A hunk of non-blank lines that the member removed, any one of which
+    /// the release holds again at the hunk's place.
     Removed,
     /// A path read whole: not text, deleted, or an empty added file.
     File,
@@ -833,12 +832,13 @@ impl<'t> TextPath<'t> {
         Judged::HeldByWords(holding.into_iter().map(|at| hunk.new.start + at).collect())
     }
 
-    /// Reads the non-blank lines that `hunk` removes: they are put back
-    /// where the survival hunks at the hunk's place insert all of them, in
-    /// order, with other lines between them or not. The hunk's place is the
-    /// gaps between tip lines where the member removed them; a survival hunk
-    /// is at that place where its tip lines' gaps meet those gaps
-    /// ([`meet`]).
+    /// Reads the non-blank lines that `hunk` removes: the hunk is put back
+    /// where the survival hunks at the hunk's place insert any one of them.
+    /// A removed line that the release holds again there undoes the
+    /// member's removal of it, whatever the release holds of the lines
+    /// around it. The hunk's place is the gaps between tip lines where the
+    /// member removed them; a survival hunk is at that place where its tip
+    /// lines' gaps meet those gaps ([`meet`]).
     fn read_removed(&self, hunk: &Hunk, out: &mut Out<'_>) {
         let removed: Vec<(usize, &[u8])> = self
             .fork
@@ -864,8 +864,7 @@ impl<'t> TextPath<'t> {
             .copied()
             .map(bare)
             .collect();
-        let lines: Vec<&[u8]> = removed.iter().map(|&(_, line)| line).collect();
-        if is_subsequence(&lines, &inserted) {
+        if removed.iter().any(|&(_, line)| inserted.contains(&line)) {
             out.lost(
                 entry(
                     self.path,
@@ -1037,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_hunk_the_release_puts_back_in_part_is_carried() {
+    fn a_removed_hunk_the_release_puts_back_in_part_is_lost() {
         // Given: a member that removes `x` and `y`, and a release that
         // holds `x` again
         let part = read(
@@ -1054,9 +1053,67 @@ mod tests {
             file("a\nb\n"),
             file("a\n}\nb\n"),
         );
+        // And: a member that removes `a`, `b` and `c`, and a release that
+        // holds `a` and `c` again with an edited `b` between them, as a
+        // modify/delete conflict resolved toward the edit leaves it
+        let edited = read(
+            "f.txt",
+            file("p\na\nb\nc\nq\n"),
+            file("p\nq\n"),
+            file("p\na\nX\nc\nq\n"),
+        );
+        // And: a member that empties a file, and a release that holds the
+        // file again with one line edited
+        let emptied = read(
+            "f.txt",
+            file("a\nb\nc\n"),
+            file(""),
+            file("a\nB\nc\n"),
+        );
+        // And: a member that removes `a`, `b` and `c`, and a release that
+        // holds `c` again, alone
+        let last = read(
+            "f.txt",
+            file("p\na\nb\nc\nq\n"),
+            file("p\nq\n"),
+            file("p\nc\nq\n"),
+        );
 
-        // Then: neither hunk is put back whole, so both members are carried
-        for lines in [part, brace] {
+        // Then: each hunk is lost, named by its first non-blank line
+        for (lines, first) in [
+            (part, (Some(2), "x")),
+            (brace, (Some(2), "  y();")),
+            (edited, (Some(2), "a")),
+            (emptied, (Some(1), "a")),
+            (last, (Some(2), "a")),
+        ] {
+            assert_eq!(lines.reading, Reading::Missing);
+            assert_eq!(
+                lost(&lines),
+                [(LostKind::Removed, first.0, Some(first.1))]
+            );
+        }
+    }
+
+    #[test]
+    fn a_removed_hunk_the_release_holds_no_line_of_is_carried() {
+        // Given: a member that removes `a`, `b` and `c`; one release that
+        // keeps the removal, and one that writes each line back edited
+        let kept = read(
+            "f.txt",
+            file("p\na\nb\nc\nq\n"),
+            file("p\nq\n"),
+            file("p\nq\n"),
+        );
+        let edited = read(
+            "f.txt",
+            file("p\na\nb\nc\nq\n"),
+            file("p\nq\n"),
+            file("p\nA\nB\nC\nq\n"),
+        );
+
+        // Then: neither holds a removed line again, so both read carried
+        for lines in [kept, edited] {
             assert_eq!(lines.reading, Reading::Carried);
             assert_eq!(lost(&lines), []);
         }

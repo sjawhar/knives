@@ -702,7 +702,7 @@ release, as `git blame --reverse` follows a line forward, instead of replaying t
 commit. The member's hunks are the line diff of its base and the tip, and the survival diff is the line
 diff of the tip and the release (jj-lib's `ContentDiff::by_line`). The release carries the member
 when it holds each non-blank line that the member added, and does not hold again, at the hunk's
-place, all the non-blank lines of a hunk that the member removed. A line that the survival diff
+place, any non-blank line of a hunk that the member removed. A line that the survival diff
 replaces is followed by its words (`own_lines::words`, with `own_lines::difflib`, a port of
 Python's `difflib.SequenceMatcher`). It is held when the release's replaced range holds at least
 one of its words and every word that the member's change added to it, and does not hold again, at

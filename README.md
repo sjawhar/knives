@@ -477,8 +477,8 @@ The change is read with no rename detection: a rename is the deletion of the old
 addition of the new one. The release carries the member when all of these hold:
 
 * The release holds each non-blank line that the member added.
-* The release does not hold again, at the place where the member removed them, all the non-blank
-  lines of a hunk that the member removed.
+* The release does not hold again, at the place where the member removed them, any non-blank line
+  of a hunk that the member removed, whatever it holds of the lines around it.
 * Where the release changed a line that the member added or changed, it holds the line by its
   words. It holds at least one of the line's words and every word that the member's change added
   to it. It does not hold again, at that line, all the words that the member's change removed from
