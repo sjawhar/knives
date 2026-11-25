@@ -1943,6 +1943,26 @@ impl Repo {
         bases: &[CommitId],
         tip: &CommitId,
     ) -> Result<Vec<CommitId>, JjError> {
+        Ok(self
+            .merge_commits_between(bases, tip)?
+            .into_iter()
+            .filter_map(|(merge, joins)| joins.then_some(merge))
+            .collect())
+    }
+
+    /// Every merge commit reachable from `tip` but not from any of `bases`,
+    /// newest first, each with whether it joins two or more lines none of the
+    /// bases has ([`Self::merges_between`]).
+    ///
+    /// A merge that joins fewer lines past the bases is still a commit of the
+    /// range: a release cut one of whose members upstream has since merged by
+    /// merge commit has one parent past the trunk, and a branch built on it
+    /// still holds that release cut.
+    pub fn merge_commits_between(
+        &self,
+        bases: &[CommitId],
+        tip: &CommitId,
+    ) -> Result<Vec<(CommitId, bool)>, JjError> {
         let bases = bases
             .iter()
             .map(|base| Ok(self.commit(base.as_str())?.id().clone()))
@@ -1954,15 +1974,16 @@ impl Repo {
             commits.iter().map(jj_lib::commit::Commit::id).collect();
         Ok(commits
             .iter()
-            .filter(|commit| {
-                commit
+            .filter(|commit| commit.parent_ids().len() > 1)
+            .map(|commit| {
+                let joins = commit
                     .parent_ids()
                     .iter()
                     .filter(|parent| in_range.contains(parent))
                     .count()
-                    > 1
+                    > 1;
+                (commit_id(commit.id()), joins)
             })
-            .map(|commit| commit_id(commit.id()))
             .collect())
     }
 

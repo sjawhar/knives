@@ -4,7 +4,10 @@
 //! often a prior release cut — carries everything that merge carried, however
 //! flat its own direct parent count looks. These exercise the real defect: a
 //! branch built on top of an old release renders "flat" until this fires, and
-//! a plain feature branch does not fire at all.
+//! a plain feature branch does not fire at all. A fork that lands each branch
+//! on its release, one merge of the release and the branch, builds the next
+//! release of those landings: each holds the release cut the others hold too,
+//! so only a landing that carries another line the release lacks is stacked.
 
 #![allow(
     clippy::expect_used,
@@ -575,4 +578,212 @@ fn a_member_that_merged_its_own_old_tip_back_in_is_refused_as_stacked_everywhere
         assert!(!stdout.contains(old.short()), "{stdout}");
     }
     assert_eq!(release_parents(&lab, "release/2026-08-04"), before);
+}
+
+/// `feat/<name>`, a branch off the trunk that writes `<name>.txt`, landed on
+/// `on` as a fork lands a branch: one merge of `on` and the branch, under the
+/// bookmark `land/<name>`.
+fn land(lab: &Lab, name: &str, on: &str) {
+    let branch = format!("feat/{name}");
+    let landing = format!("land/{name}");
+    let message = format!("land {branch} on {on}");
+    lab.branch(&branch, &format!("{name}.txt"), &format!("{name}\n"));
+    lab.jj_work(["new", on, branch.as_str(), "-m", message.as_str()]);
+    lab.jj_work(["bookmark", "create", landing.as_str(), "-r", "@"]);
+    lab.jj_work(["new", "main@origin"]);
+}
+
+/// `release/2026-08-04`, a release of `feat/alpha` and `feat/beta`, with each
+/// of `names` landed on it ([`land`]).
+fn landings_on_a_release(names: &[&str]) -> Lab {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    lab.octopus("release/2026-08-04", "feat/alpha", "feat/beta");
+    for name in names {
+        land(&lab, name, "release/2026-08-04");
+    }
+    lab
+}
+
+/// The plan's standard output for the newest release of `lab`.
+fn plan_text(lab: &Lab, home: &tempfile::TempDir) -> String {
+    String::from_utf8_lossy(&knives_release(lab, home, &[]).stdout).into_owned()
+}
+
+/// The plan's verdict on `land/gamma` and `land/delta` as members of
+/// `text`'s release: flat, and neither reported or noted.
+fn assert_landings_flat(text: &str) {
+    assert!(text.contains("3 parent(s), flat"), "{text}");
+    for landing in ["land/gamma", "land/delta"] {
+        assert!(!text.contains(&format!("{landing}'s history")), "{text}");
+        assert!(!text.contains(&format!("member {landing}")), "{text}");
+    }
+}
+
+#[test]
+fn landings_on_a_release_the_other_members_carry_are_not_stacked() {
+    // Given: gamma and delta each landed on release/2026-08-04, and the next
+    // release cut of the two landings. Each landing holds that release's merge
+    // by construction, and the other landing holds it too.
+    let lab = landings_on_a_release(&["gamma", "delta"]);
+    lab.octopus("release/2026-08-05", "land/gamma", "land/delta");
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: the release is planned.
+    let text = plan_text(&lab, &home);
+
+    // Then: neither landing is reported, as stacked or as a note, and the
+    // release reads flat.
+    assert_landings_flat(&text);
+}
+
+#[test]
+fn a_landing_built_on_another_landing_is_still_reported_stacked() {
+    // Given: gamma and epsilon landed on release/2026-08-04, then delta landed
+    // on gamma's landing instead of on the release, and the next release cut
+    // of delta's and epsilon's landings: gamma's landing is no member of it.
+    let lab = landings_on_a_release(&["gamma", "epsilon"]);
+    land(&lab, "delta", "land/gamma");
+    lab.octopus("release/2026-08-05", "land/delta", "land/epsilon");
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: the release is planned.
+    let text = plan_text(&lab, &home);
+
+    // Then: delta's landing is reported stacked, and the release does not
+    // read flat.
+    assert!(text.contains("branch land/delta's history"), "{text}");
+    assert!(text.contains("stacked on a prior merge"), "{text}");
+    assert!(!text.contains("parent(s), flat"), "{text}");
+}
+
+#[test]
+fn a_landing_built_on_another_landing_is_the_one_stacked_member_and_names_the_merge() {
+    // Given: the same release: epsilon's landing on release/2026-08-04, and
+    // delta's landing on gamma's landing.
+    let lab = landings_on_a_release(&["gamma", "epsilon"]);
+    land(&lab, "delta", "land/gamma");
+    lab.octopus("release/2026-08-05", "land/delta", "land/epsilon");
+    let (home, _consumer) = release_test_home(&lab);
+    let delta_landing = commit_at(&lab, "land/delta");
+    let mut brought = [
+        delta_landing.short().to_owned(),
+        commit_at(&lab, "land/gamma").short().to_owned(),
+        commit_at(&lab, "feat/delta").short().to_owned(),
+        commit_at(&lab, "feat/gamma").short().to_owned(),
+    ];
+    brought.sort();
+
+    // When: the release is planned.
+    let text = plan_text(&lab, &home);
+
+    // Then: only delta's landing is stacked. Its finding names the merge that
+    // joins gamma's landing to delta's line, and lists the four commits it
+    // brings: that merge, gamma's landing, and the two lines' own commits.
+    assert!(
+        text.contains("3 parent(s), 1 stacked on a prior merge"),
+        "{text}"
+    );
+    assert!(!text.contains("land/epsilon's history"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "branch land/delta's history holds 1 release cut(s) the other members already \
+             carry, and past them 1 merge commit(s) joining lines none of them has ({})",
+            delta_landing.short()
+        )),
+        "{text}"
+    );
+    let listed = text
+        .lines()
+        .find(|line| line.contains("branch land/delta's history"))
+        .and_then(|line| line.split_once("it brings 4 commit(s) the release does not carry: "))
+        .map_or_else(
+            || panic!("no list of the commits land/delta brings: {text}"),
+            |(_, listed)| listed,
+        );
+    let mut listed: Vec<&str> = listed.split(", ").collect();
+    listed.sort_unstable();
+    assert_eq!(listed, brought, "{text}");
+}
+
+#[test]
+fn include_takes_a_landing_on_a_release_the_members_carry() {
+    // Given: the release of gamma's and delta's landings on
+    // release/2026-08-04, then epsilon landed on that release too.
+    let lab = landings_on_a_release(&["gamma", "delta", "epsilon"]);
+    lab.octopus("release/2026-08-05", "land/gamma", "land/delta");
+    let (home, _consumer) = release_test_home(&lab);
+    let epsilon = commit_at(&lab, "land/epsilon");
+
+    // When: epsilon's landing is included.
+    let output = knives_release(&lab, &home, &["include", "land/epsilon"]);
+
+    // Then: it is taken as a landing, not refused as stacked, and becomes a
+    // parent of the release.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(
+            "demo: land/epsilon lands on 1 release cut(s) whose lines release/2026-08-05 \
+             already carries; it brings only its own 2 commit(s)\n"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        release_parents(&lab, "release/2026-08-05").contains(&epsilon),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn landings_on_an_earlier_write_no_ref_names_are_not_stacked() {
+    // Given: release/2026-08-04 cut by knives, gamma and delta landed on that
+    // write, then feat/alpha advanced, so the name holds a new write and only
+    // the ledger records the one the landings rest on; then the next release
+    // cut of the two landings.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = release_test_home(&lab);
+    let first = knives_release(&lab, &home, &["cut", "release/2026-08-04"]);
+    assert!(first.status.success(), "{first:?}");
+    let first_write = commit_at(&lab, "release/2026-08-04");
+    land(&lab, "gamma", "release/2026-08-04");
+    land(&lab, "delta", "release/2026-08-04");
+    lab::extend_branch(&lab, "feat/alpha", "alpha.txt", "alpha\nmore\n");
+    let advanced = knives_release(&lab, &home, &["advance", "feat/alpha"]);
+    assert!(advanced.status.success(), "{advanced:?}");
+    assert_ne!(commit_at(&lab, "release/2026-08-04"), first_write);
+    lab.octopus("release/2026-08-05", "land/gamma", "land/delta");
+
+    // When: the release is planned.
+    let text = plan_text(&lab, &home);
+
+    // Then: each landing's earlier write, which the ledger alone names, is
+    // carried by the other landing, so neither is stacked.
+    assert_landings_flat(&text);
+}
+
+#[test]
+fn landings_on_a_release_whose_member_upstream_merged_are_not_stacked() {
+    // Given: gamma and delta landed on release/2026-08-04, the next release
+    // cut of the two landings, then upstream merging feat/alpha by merge
+    // commit: release/2026-08-04 now has one parent past the trunk,
+    // feat/beta, and is still the release each landing holds.
+    let lab = landings_on_a_release(&["gamma", "delta"]);
+    lab.octopus("release/2026-08-05", "land/gamma", "land/delta");
+    let (home, _consumer) = release_test_home(&lab);
+    lab.publish_pull("feat/alpha", 7);
+    lab.merge_pull_with_merge_commit(7);
+
+    // When: the release is planned.
+    let text = plan_text(&lab, &home);
+
+    // Then: neither landing is stacked.
+    assert_landings_flat(&text);
 }

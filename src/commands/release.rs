@@ -1831,7 +1831,8 @@ pub fn live_dated_release(
 
 /// Each member's history measured against the others: a merge whose side
 /// lines another member carries is that member's content, not this one's, and
-/// is noted; a merge carrying a line no other member has is a finding.
+/// is noted; a member landed on release cuts the others carry is expected,
+/// and not reported; a merge carrying a line no other member has is a finding.
 fn member_histories(
     context: StackedHistoryContext<'_>,
     parents: &[ReleaseParent],
@@ -1853,7 +1854,7 @@ fn member_histories(
             &label,
             &parent.commit,
         )? {
-            MemberHistory::Linear => {}
+            MemberHistory::Linear | MemberHistory::Landed { .. } => {}
             MemberHistory::CarriedMerges { merges, .. } => plan.notes.push(format!(
                 "member {label} carries merge(s) {} whose side lines the other members already \
                  carry",
@@ -1985,13 +1986,17 @@ fn plan_scanned(
     let member_parents =
         unlanded_members(&repo, (&commit, trunk_tip.as_ref()), &members, &mut plan)?;
     let releases = release_refs_by_commit(&tips, &scheme, publish_remote);
-    let in_hand = [commit.clone()];
+    // The members, carriers left out: what `include` measures a branch
+    // against, so the plan's note for a local branch says what `include`
+    // would do with it.
+    let member_commits: Vec<CommitId> =
+        members.iter().map(|member| member.commit.clone()).collect();
     let written = recorded_release_changes(&repo, ledger, &scheme);
     let stacked_context = (!trunks.is_empty()).then_some(StackedHistoryContext {
         repo: &repo,
         trunks: &trunks,
         releases: &releases,
-        carried: &in_hand,
+        carried: &member_commits,
         written: &written,
         replaced: None,
     });
@@ -2085,8 +2090,9 @@ struct LocalBranchNotes<'a> {
 }
 
 /// Whether `branch`'s history carries merges the release in hand already
-/// carries (`Ok(true)`), none (`Ok(false)`), or more than its own line: `Err`
-/// with the note to print, as `include` measures it.
+/// carries, release cuts it lands on among them (`Ok(true)`), none
+/// (`Ok(false)`), or more than its own line: `Err` with the note to print, as
+/// `include` measures it.
 fn branch_history_note(
     stacked: Option<StackedHistoryContext<'_>>,
     branch: &str,
@@ -2100,7 +2106,7 @@ fn branch_history_note(
             "{}; rebase it off the trunk before including it",
             stacked.detail
         )),
-        MemberHistory::CarriedMerges { .. } => Ok(true),
+        MemberHistory::CarriedMerges { .. } | MemberHistory::Landed { .. } => Ok(true),
         MemberHistory::Linear => Ok(false),
     })
 }
@@ -2136,7 +2142,9 @@ fn merge_branch_verdict(
                 "{}; rebase it off the trunk before advancing onto it",
                 stacked.detail
             )),
-            MemberHistory::CarriedMerges { .. } | MemberHistory::Linear => Ok(false),
+            MemberHistory::CarriedMerges { .. }
+            | MemberHistory::Landed { .. }
+            | MemberHistory::Linear => Ok(false),
         },
     )
 }
