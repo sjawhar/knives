@@ -10,7 +10,7 @@
 //! plain merge, names the file where that changed it, and says whether the
 //! file holds a conflict. The conflict is read from the plain merge of the
 //! release in hand's own parents, so the rule holds whether or not an adopt
-//! recorded the resolution. The shape is INFRA-4895's drop-after-adopt
+//! recorded the resolution. The shape is the drop-after-adopt
 //! probe: M adds a file of its own, D sets lines 5 and 6 of `f`, and A,
 //! made after the first cut, sets line 5 as D does. Before anything is
 //! written, the edit checks what it would write: where it would lose a

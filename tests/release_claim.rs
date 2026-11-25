@@ -8,7 +8,7 @@
 //! and names each one that something other than the release holds, with what
 //! holds it. A newer cut, and `knives release reap`, keep a release that a
 //! live claim holds. Each case runs in a local repository in the shape of run
-//! A of INFRA-4355's probe, with the main checkout's working copy off every
+//! A of the release-claim probe, with the main checkout's working copy off every
 //! commit of the release unless the case says so. These tests drive only the
 //! knives binary.
 

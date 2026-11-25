@@ -1603,7 +1603,7 @@ pub fn adopt(lab: &Lab, home: &TempDir, release: &str, why: &str) {
     );
 }
 
-/// The release of INFRA-4895's drop-after-adopt probe ([`included_release`]).
+/// The release of the drop-after-adopt probe ([`included_release`]).
 const PROBE_RELEASE: &str = "release/2026-08-04";
 /// The probe's member that sets lines 5 and 6 of `f`, as `d809` did.
 const PROBE_D: &str = "feat/d";
