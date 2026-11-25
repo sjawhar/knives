@@ -17,8 +17,8 @@
 //!   section of a release log holds the same line. Where the survival diff
 //!   replaces a range of the tip's lines with a range of the release's
 //!   lines, the line is followed one level down, by its words.
-//! - A non-blank line that the member removed is lost where the survival
-//!   diff inserts it again at the place of its hunk.
+//! - A line that the member removed and that holds a letter or a digit is
+//!   lost where the survival diff inserts it again at the place of its hunk.
 //! - A path that is not text, a deletion, an empty added file and the
 //!   executable bit are each read by a rule of their own
 //!   ([`MemberLines::read_path`]).
@@ -181,8 +181,8 @@ pub enum LostKind {
     /// A non-blank line that the member added, which the release does not
     /// hold.
     Added,
-    /// A non-blank line that the member removed, which the release holds
-    /// again at the place where the member removed it.
+    /// A line that the member removed, holding a letter or a digit, which
+    /// the release holds again at the place where the member removed it.
     Removed,
     /// A path read whole: not text, deleted, or an empty added file.
     File,
@@ -531,6 +531,14 @@ fn is_blank(text: &[u8]) -> bool {
         .all(|&byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c'))
 }
 
+/// Whether `line` holds a letter or a digit: an ASCII letter or digit, or
+/// a byte that is not ASCII, as a letter of another script is. A line of
+/// punctuation and whitespace alone (`}`, `},`, `);`) holds none.
+fn holds_content(line: &[u8]) -> bool {
+    line.iter()
+        .any(|byte| byte.is_ascii_alphanumeric() || !byte.is_ascii())
+}
+
 /// `line` without its line feed: a line as two lines compare.
 fn bare(line: &[u8]) -> &[u8] {
     line.strip_suffix(b"\n").unwrap_or(line)
@@ -832,13 +840,16 @@ impl<'t> TextPath<'t> {
         Judged::HeldByWords(holding.into_iter().map(|at| hunk.new.start + at).collect())
     }
 
-    /// Reads the non-blank lines that `hunk` removes: each is put back where
-    /// a survival hunk at the hunk's place inserts it again, whatever the
-    /// release holds of the lines around it. One release line puts back one
-    /// removed line at most, the first of its text. The hunk's place is the
-    /// gaps between tip lines where the member removed them; a survival hunk
-    /// is at that place where its tip lines' gaps meet those gaps
-    /// ([`meet`]).
+    /// Reads the lines that `hunk` removes that hold a letter or a digit
+    /// ([`holds_content`]): each is put back where a survival hunk at the
+    /// hunk's place inserts it again, whatever the release holds of the
+    /// lines around it. A line of punctuation alone (`}`, `},`, `);`) is not
+    /// read: another change's new code at the same place ends in such lines
+    /// too, so it does not show that the member's line came back. One
+    /// release line puts back one removed line at most, the first of its
+    /// text. The hunk's place is the gaps between tip lines where the member
+    /// removed them; a survival hunk is at that place where its tip lines'
+    /// gaps meet those gaps ([`meet`]).
     fn read_removed(&self, hunk: &Hunk, out: &mut Out<'_>) {
         let mut inserted: HashMap<&[u8], VecDeque<usize>> = HashMap::new();
         for survival in self
@@ -857,16 +868,15 @@ impl<'t> TextPath<'t> {
         }
         let removed = self.fork.get(hunk.old.clone()).unwrap_or_default();
         for (offset, &line) in removed.iter().enumerate() {
-            if is_blank(line) {
+            if !holds_content(line) {
                 continue;
             }
-            let Some(at) = inserted
-                .get_mut(bare(line))
-                .and_then(VecDeque::pop_front)
-            else {
+            let Some(at) = inserted.get_mut(bare(line)).and_then(VecDeque::pop_front) else {
                 continue;
             };
+            // The place of the line: the release's line that holds it again.
             let next = at + 1;
+            let holding = at..next;
             out.lost(
                 entry(
                     self.path,
@@ -874,9 +884,7 @@ impl<'t> TextPath<'t> {
                     Some(number(hunk.old.start + offset)),
                     Some(shown(bare(line))),
                 ),
-                // The place of the line: the release's line that holds it
-                // again.
-                || Place::Lines(vec![at..next]),
+                || Place::Lines(vec![holding]),
             );
         }
     }
@@ -1045,14 +1053,6 @@ mod tests {
             file("a\nb\n"),
             file("a\nx\nb\n"),
         );
-        // And: a member that removes a call and a lone `}`, and a release
-        // that holds the `}` again (K11 (9))
-        let brace = read(
-            "f.txt",
-            file("a\n  y();\n}\nb\n"),
-            file("a\nb\n"),
-            file("a\n}\nb\n"),
-        );
         // And: a member that removes `a`, `b` and `c`, and a release that
         // holds `a` and `c` again with an edited `b` between them, as a
         // modify/delete conflict resolved toward the edit leaves it
@@ -1064,12 +1064,7 @@ mod tests {
         );
         // And: a member that empties a file, and a release that holds the
         // file again with one line edited
-        let emptied = read(
-            "f.txt",
-            file("a\nb\nc\n"),
-            file(""),
-            file("a\nB\nc\n"),
-        );
+        let emptied = read("f.txt", file("a\nb\nc\n"), file(""), file("a\nB\nc\n"));
         // And: a member that removes `a`, `b` and `c`, and a release that
         // holds `c` again, alone
         let last = read(
@@ -1077,6 +1072,50 @@ mod tests {
             file("p\na\nb\nc\nq\n"),
             file("p\nq\n"),
             file("p\nc\nq\n"),
+        );
+        // And: a member that removes a doc comment, a function's first line,
+        // its body and its `}`, and a release that holds all of them again,
+        // the body edited
+        let function = read(
+            "f.ts",
+            file("a\n/** Doc. */\nfunction f() {\n  return 1;\n}\nb\n"),
+            file("a\nb\n"),
+            file("a\n/** Doc. */\nfunction f() {\n  return 2;\n}\nb\n"),
+        );
+
+        // Then: each removed line that holds a letter or a digit and that
+        // the release holds again is lost, by its fork point's line number;
+        // the `}` is not read
+        let removed = |entries: &[(u32, &'static str)]| -> Vec<_> {
+            entries
+                .iter()
+                .map(|&(line, text)| (LostKind::Removed, Some(line), Some(text)))
+                .collect()
+        };
+        for (lines, wanted) in [
+            (part, removed(&[(2, "x")])),
+            (edited, removed(&[(2, "a"), (4, "c")])),
+            (emptied, removed(&[(1, "a"), (3, "c")])),
+            (last, removed(&[(4, "c")])),
+            (
+                function,
+                removed(&[(2, "/** Doc. */"), (3, "function f() {")]),
+            ),
+        ] {
+            assert_eq!(lines.reading, Reading::Missing);
+            assert_eq!(lost(&lines), wanted);
+        }
+    }
+
+    #[test]
+    fn a_removed_line_of_punctuation_alone_the_release_holds_again_is_not_read() {
+        // Given: a member that removes a call and a lone `}`, and a release
+        // that holds the `}` again (K11 (9))
+        let brace = read(
+            "f.txt",
+            file("a\n  y();\n}\nb\n"),
+            file("a\nb\n"),
+            file("a\n}\nb\n"),
         );
         // And: a member that removes two lines `}`, and a release that holds
         // one `}` again
@@ -1086,25 +1125,20 @@ mod tests {
             file("a\n  }\nb\n"),
             file("a\n  }\n}\nb\n"),
         );
+        // And: a member that removes a method and its `},`, and a release
+        // where another change's new method at the same place ends in `},`
+        let neighbour = read(
+            "f.ts",
+            file("{\n  a: 1,\n  b: () => {\n  },\n}\n"),
+            file("{\n  a: 1,\n}\n"),
+            file("{\n  a: 1,\n  c: () => {\n    go();\n  },\n}\n"),
+        );
 
-        // Then: each removed line the release holds again is lost, by its
-        // fork point's line number, and no other
-        let removed = |entries: &[(u32, &'static str)]| -> Vec<_> {
-            entries
-                .iter()
-                .map(|&(line, text)| (LostKind::Removed, Some(line), Some(text)))
-                .collect()
-        };
-        for (lines, wanted) in [
-            (part, removed(&[(2, "x")])),
-            (brace, removed(&[(3, "}")])),
-            (edited, removed(&[(2, "a"), (4, "c")])),
-            (emptied, removed(&[(1, "a"), (3, "c")])),
-            (last, removed(&[(4, "c")])),
-            (braces, removed(&[(3, "}")])),
-        ] {
-            assert_eq!(lines.reading, Reading::Missing);
-            assert_eq!(lost(&lines), wanted);
+        // Then: a `}` or `},` the release holds there does not show that the
+        // member's line came back, so each member is carried
+        for lines in [brace, braces, neighbour] {
+            assert_eq!(lines.reading, Reading::Carried);
+            assert_eq!(lost(&lines), []);
         }
     }
 

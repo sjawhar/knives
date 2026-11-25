@@ -11,7 +11,8 @@ use std::ops::Range;
 
 use super::{
     BINARY_FILE, ContentChange, EMPTY_FILE, Lost, LostKind, Out, SkippedRange, Value, bit_text,
-    entry, file_change, is_binary, is_blank, line_hunks, made_of, meet, number, shown,
+    entry, file_change, holds_content, is_binary, is_blank, line_hunks, made_of, meet, number,
+    shown,
 };
 
 /// Where a lost entry lies in the version it was read against, as spec
@@ -165,8 +166,8 @@ fn marker(line: &[u8], len: usize) -> Option<u8> {
 /// `tip`.
 ///
 /// Each is the lost entry it would be in a version that holds none of the
-/// change: each non-blank added line, each non-blank removed line, a mode,
-/// and a path read whole. A file change is
+/// change: each non-blank added line, each removed line that holds a letter
+/// or a digit, a mode, and a path read whole. A file change is
 /// read as R9's rule reads it ([`file_change`]). A tip that holds a
 /// conflict gives none. Spec R11 compares an advanced member's lines with
 /// those of its old tip by these, by path, kind and text.
@@ -225,7 +226,7 @@ pub fn change_lines(path: &str, fork: &Value, tip: &Value) -> Vec<Lost> {
         }
         let removed = fork_lines.get(hunk.old.clone()).unwrap_or_default();
         for (offset, &text) in removed.iter().enumerate() {
-            if !is_blank(text) {
+            if holds_content(text) {
                 let line = Some(number(hunk.old.start + offset));
                 lines.push(entry(path, LostKind::Removed, line, Some(shown(text))));
             }

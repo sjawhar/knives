@@ -1775,10 +1775,10 @@ fn a_release_that_puts_back_a_two_line_removed_hunk_reads_missing() {
 }
 
 #[test]
-fn a_release_that_puts_back_one_line_of_a_removed_hunk_reads_missing() {
+fn a_release_that_puts_back_one_line_of_a_removed_hunk_reads_carried() {
     // Given: M removes the two lines `go();` and `}`; N removes `go();`
-    // alone; the release holds N's version, so of M's hunk it puts back
-    // the `}`.
+    // alone; the release holds N's version, so of M's hunk it puts back only
+    // a lone `}`.
     let (start, open, finish) = ("start();", "if (ready) {", "finish();");
     let (lab, home) = neighbour_version_release(
         JS,
@@ -1789,15 +1789,15 @@ fn a_release_that_puts_back_one_line_of_a_removed_hunk_reads_missing() {
         ),
     );
 
-    // When/Then: M reads missing, and the one line named is the `}`; N reads
-    // carried.
-    let out = assert_member_missing(&lab, &home);
-    assert!(
-        out.contains(&format!("      {JS}:4: removed line put back ‹}}›")),
-        "{out}"
-    );
-    assert!(!out.contains("put back ‹go();›"), "{out}");
-    assert!(out.contains(&carried_row(&label(&lab, N))), "{out}");
+    // When: the release's members are verified.
+    let output = verify(&lab, &home, RELEASE);
+
+    // Then: M and N read carried.
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    for branch in [M, N] {
+        assert!(out.contains(&carried_row(&label(&lab, branch))), "{out}");
+    }
 }
 
 #[test]
@@ -1805,15 +1805,16 @@ fn a_release_that_puts_back_a_removed_run_with_one_line_edited_reads_missing() {
     // Given: M removes `a`, `b` and `c`; N changes `b` to `X`; the release
     // holds N's version, as a modify/delete conflict resolved toward the
     // edit leaves it: `a` and `c` are back.
-    let (lab, home) = neighbour_version_release(
-        "f.txt",
-        ("p\na\nb\nc\nq\n", "p\nq\n", "p\na\nX\nc\nq\n"),
-    );
+    let (lab, home) =
+        neighbour_version_release("f.txt", ("p\na\nb\nc\nq\n", "p\nq\n", "p\na\nX\nc\nq\n"));
 
     // When/Then: M reads missing, named by `a` and `c`, not `b`; N reads
     // carried.
     let out = assert_member_missing(&lab, &home);
-    for line in ["f.txt:2: removed line put back ‹a›", "f.txt:4: removed line put back ‹c›"] {
+    for line in [
+        "f.txt:2: removed line put back ‹a›",
+        "f.txt:4: removed line put back ‹c›",
+    ] {
         assert!(out.contains(&format!("      {line}")), "{out}");
     }
     assert!(!out.contains("put back ‹b›"), "{out}");
@@ -1828,7 +1829,10 @@ fn a_release_that_holds_an_emptied_file_again_with_one_line_edited_reads_missing
 
     // When/Then: M reads missing, named by `a` and `c`; N reads carried.
     let out = assert_member_missing(&lab, &home);
-    for line in ["f.txt:1: removed line put back ‹a›", "f.txt:3: removed line put back ‹c›"] {
+    for line in [
+        "f.txt:1: removed line put back ‹a›",
+        "f.txt:3: removed line put back ‹c›",
+    ] {
         assert!(out.contains(&format!("      {line}")), "{out}");
     }
     assert!(out.contains(&carried_row(&label(&lab, N))), "{out}");
@@ -1839,15 +1843,34 @@ fn a_release_that_writes_every_removed_line_back_edited_reads_carried() {
     // Given (a control): M removes `a`, `b` and `c`; N changes each of
     // them; the release holds N's version, which holds none of M's removed
     // lines again.
-    let (lab, home) = neighbour_version_release(
-        "f.txt",
-        ("p\na\nb\nc\nq\n", "p\nq\n", "p\nA\nB\nC\nq\n"),
-    );
+    let (lab, home) =
+        neighbour_version_release("f.txt", ("p\na\nb\nc\nq\n", "p\nq\n", "p\nA\nB\nC\nq\n"));
 
     // When/Then: M and N read carried.
     assert_member_carried(&lab, &home);
     let out = stdout(&verify(&lab, &home, RELEASE));
     assert!(out.contains(&carried_row(&label(&lab, N))), "{out}");
+}
+
+#[test]
+fn a_release_where_another_members_method_ends_in_the_removed_lines_brace_reads_carried() {
+    // Given: M removes a method of an object; N adds another method at the
+    // same place; the release holds N's version, whose new method ends in
+    // the `},` that M removed.
+    let (lab, home) = neighbour_version_release(
+        "f.ts",
+        (
+            "const o = {\n  a: 1,\n  b: () => {\n    old();\n  },\n};\n",
+            "const o = {\n  a: 1,\n};\n",
+            "const o = {\n  a: 1,\n  c: () => {\n    go();\n  },\n};\n",
+        ),
+    );
+
+    // When/Then: M and N read carried: the `},` is N's.
+    assert_member_carried(&lab, &home);
+    let out = stdout(&verify(&lab, &home, RELEASE));
+    assert!(out.contains(&carried_row(&label(&lab, N))), "{out}");
+    assert!(!out.contains("put back"), "{out}");
 }
 
 /// The Python file of K11 (12) to (14), whose lines the check words.
