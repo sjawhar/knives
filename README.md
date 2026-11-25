@@ -479,7 +479,10 @@ addition of the new one. The release carries the member when all of these hold:
 
 * The release holds each non-blank line that the member added.
 * The release does not hold again, at the place where the member removed them, all the non-blank
-  lines of a hunk that the member removed.
+  lines of a hunk that the member removed. Nor does it hold again there any line that the member
+  removed and that holds a letter or a digit, whatever it holds of the lines around it. A line of
+  punctuation alone (`}`, `},`, `);`) counts only with its whole hunk: another change's new code at
+  the same place ends in such lines too.
 * Where the release changed a line that the member added or changed, it holds the line by its
   words. It holds at least one of the line's words and every word that the member's change added
   to it. It does not hold again, at that line, all the words that the member's change removed from

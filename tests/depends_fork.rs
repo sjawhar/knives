@@ -4893,34 +4893,147 @@ fn status_table(now: ForgeNow, kind: &str) -> (Said, Said) {
     }
 }
 
-/// What `report` says of `dependent`'s one requirement.
-fn said_of(report: &Value, dependent: &str) -> Said {
+/// A requirement that `status` never judges: an upstream pull request of a
+/// fork the registry does not keep. Every dependent of the status table
+/// holds it besides its own requirement, so a report that judged a
+/// dependent names it: in a problem of its own for a dependent checked as a
+/// row's, and among the needs of its one problem for one whose later work
+/// cannot be read. A met requirement says nothing, so this is what shows
+/// that `status` judged the dependent at all.
+const NAMED: &str = "nobody/named#9";
+
+/// One dependent of the status table: where it is held, its name, the
+/// requirement it holds besides [`NAMED`], and that requirement's short
+/// name ([`KINDS`]).
+struct TableRow {
+    holder: Holder,
+    name: String,
+    requirement: String,
+    kind: &'static str,
+}
+
+/// The status table's dependents: one per holder and requirement kind.
+fn table_rows() -> Vec<TableRow> {
+    HOLDERS
+        .iter()
+        .flat_map(|&(holder, prefix, numbers)| {
+            KINDS.iter().map(move |&(kind, requirement)| TableRow {
+                holder,
+                name: format!("{prefix}-{kind}"),
+                requirement: numbered_for(requirement, numbers),
+                kind,
+            })
+        })
+        .collect()
+}
+
+/// What `report` says of `dependent`'s `requirement`. A report that does
+/// not name `dependent` ([`NAMED`]) is an error: nothing in it shows that
+/// `status` judged the dependent, so its silence is no `Met`.
+fn said_of(report: &Value, dependent: &str, requirement: &str) -> Result<Said, String> {
     let problems = problems(report);
-    if problems.iter().any(|problem| {
-        problem.starts_with(&format!("cannot tell whether {dependent} still needs "))
-    }) {
-        return Said::Deferred;
+    let deferred = format!("cannot tell whether {dependent} still needs ");
+    if let Some(problem) = problems
+        .iter()
+        .find(|problem| problem.starts_with(&deferred))
+    {
+        let needs: Vec<&str> = problem
+            .strip_prefix(&deferred)
+            .and_then(|rest| rest.split_once(": its branch is gone"))
+            .map_or_else(Vec::new, |(needs, _)| needs.split(", ").collect());
+        if !needs.contains(&NAMED) {
+            return Err(format!("its one problem does not name {NAMED}: {problem}"));
+        }
+        return Ok(if needs.contains(&requirement) {
+            Said::Deferred
+        } else {
+            Said::Met
+        });
     }
+    let named = format!("{dependent} requires {NAMED}, ");
+    if !problems.iter().any(|problem| problem.starts_with(&named)) {
+        return Err(format!(
+            "the report does not name {dependent}, so nothing shows that status judged it"
+        ));
+    }
+    // A requirement's text ends at `,`, `:` or ` `: a review pull request
+    // is shown with its head after it, ` (head feat/base, open)`.
+    let ends = |rest: &str| rest.starts_with([',', ':', ' ']);
+    let requires = format!("{dependent} requires {requirement}");
+    let unchecked = format!("whether {dependent} still needs {requirement}");
     if problems.iter().any(|problem| {
-        problem.starts_with(&format!("{dependent} requires "))
-            || problem.contains(&format!("whether {dependent} still needs "))
+        problem.strip_prefix(&requires).is_some_and(ends)
+            || problem
+                .split_once(unchecked.as_str())
+                .is_some_and(|(_, rest)| ends(rest))
     }) {
-        return Said::Unknown;
+        return Ok(Said::Unknown);
     }
     if details(report, "unmet-dependency")
         .iter()
-        .any(|detail| detail.starts_with(&format!("{dependent} requires ")))
+        .any(|detail| detail.strip_prefix(&requires).is_some_and(ends))
     {
-        return Said::Unmet;
+        return Ok(Said::Unmet);
     }
-    Said::Met
+    Ok(Said::Met)
+}
+
+/// What one `status` run, its exit `code` and `report` with the forge
+/// `now`, says against the status table: one line for each of `rows` that
+/// it reads otherwise. A gather failure, then an exit other than 3
+/// (incomplete), is read before any row and is then the one line: a report
+/// that could not gather the fork judged no requirement, and a report of
+/// the table that is complete did not read [`NAMED`], which nothing here
+/// can judge.
+fn disagreements(
+    now: ForgeNow,
+    (code, report): (Option<i32>, &Value),
+    rows: &[TableRow],
+) -> Vec<String> {
+    if let Some(gather) = problems(report)
+        .into_iter()
+        .find(|problem| problem.starts_with("could not gather: "))
+    {
+        return vec![format!(
+            "{now:?}: status could not gather the fork, so it judged no requirement: {gather}"
+        )];
+    }
+    if code != Some(3) {
+        return vec![format!(
+            "{now:?}: status exited {code:?}, not 3: a dependent of the table holds {NAMED}, \
+             which nothing here can judge"
+        )];
+    }
+    rows.iter()
+        .filter_map(|row| {
+            let TableRow {
+                holder,
+                name,
+                requirement,
+                kind,
+            } = row;
+            let (checked, uncertain) = status_table(now, kind);
+            let wanted = if holder.checked() { checked } else { uncertain };
+            match said_of(report, name, requirement) {
+                Ok(got) if got == wanted => None,
+                Ok(got) => Some(format!(
+                    "{now:?}, {holder:?} requiring {requirement}: {got:?}; the table says \
+                     {wanted:?}"
+                )),
+                Err(why) => Some(format!(
+                    "{now:?}, {holder:?} requiring {requirement}: {why}; the table says \
+                     {wanted:?}"
+                )),
+            }
+        })
+        .collect()
 }
 
 #[test]
 fn status_judges_every_requirement_kind_for_every_holder_as_the_table_says() {
     // Given: one dependent per holder and requirement kind, each requiring
-    // that one requirement alone; the upstream has each holder's merged and
-    // open pull request.
+    // that one requirement and [`NAMED`]; the upstream has each holder's
+    // merged and open pull request.
     let fixture = fixture();
     let lab = &fixture.lab;
     fixture.forge(
@@ -4934,33 +5047,36 @@ fn status_judges_every_requirement_kind_for_every_holder_as_the_table_says() {
             })
             .collect::<Vec<_>>(),
     );
-    for (holder, prefix, numbers) in HOLDERS {
-        for (kind, requirement) in KINDS {
-            let name = format!("{prefix}-{kind}");
-            let requirement = numbered_for(requirement, numbers);
-            match holder {
-                Holder::Row | Holder::DeletedOpen => {
-                    lab.branch(&name, &format!("{name}.txt"), &format!("{name}\n"));
-                }
-                Holder::DeletedLanded => {
-                    lab.branch(&name, &format!("{name}.txt"), &format!("{name}\n"));
-                    lab.upstream_trunk_file(&format!("{name}.txt"), &format!("{name}\n"));
-                }
-                Holder::OnOrigin => {
-                    lab.foreign_origin_branch("main@origin", &name, &format!("{name}\n"));
-                    lab.jj_work(["git", "fetch", "--remote", "origin"]);
-                }
-                Holder::NeverRecorded => {}
+    let rows = table_rows();
+    for TableRow {
+        holder,
+        name,
+        requirement,
+        ..
+    } in &rows
+    {
+        match holder {
+            Holder::Row | Holder::DeletedOpen => {
+                lab.branch(name, &format!("{name}.txt"), &format!("{name}\n"));
             }
-            fixture.hold(&name, &[requirement.as_str()]);
-            if matches!(holder, Holder::DeletedOpen | Holder::DeletedLanded) {
-                lab.jj_work(["bookmark", "delete", name.as_str()]);
+            Holder::DeletedLanded => {
+                lab.branch(name, &format!("{name}.txt"), &format!("{name}\n"));
+                lab.upstream_trunk_file(&format!("{name}.txt"), &format!("{name}\n"));
             }
+            Holder::OnOrigin => {
+                lab.foreign_origin_branch("main@origin", name, &format!("{name}\n"));
+                lab.jj_work(["git", "fetch", "--remote", "origin"]);
+            }
+            Holder::NeverRecorded => {}
+        }
+        fixture.hold(name, &[requirement.as_str(), NAMED]);
+        if matches!(holder, Holder::DeletedOpen | Holder::DeletedLanded) {
+            lab.jj_work(["bookmark", "delete", name.as_str()]);
         }
     }
 
-    // When / Then: status, with the forge in each state, says of each
-    // dependent what the table says.
+    // When / Then: status, with the forge in each state, gathers the fork,
+    // names each dependent, and says of each what the table says.
     let mut failed = Vec::new();
     for now in [
         ForgeNow::Up,
@@ -4971,24 +5087,10 @@ fn status_judges_every_requirement_kind_for_every_holder_as_the_table_says() {
         ForgeNow::FormerNameUnseen,
     ] {
         fixture.forge_now(now);
-        let (_, report) = status(&fixture);
-        let before = failed.len();
-        for (holder, prefix, numbers) in HOLDERS {
-            for (kind, requirement) in KINDS {
-                let name = format!("{prefix}-{kind}");
-                let requirement = numbered_for(requirement, numbers);
-                let (checked, uncertain) = status_table(now, kind);
-                let wanted = if holder.checked() { checked } else { uncertain };
-                let got = said_of(&report, &name);
-                if got != wanted {
-                    failed.push(format!(
-                        "{now:?}, {holder:?} requiring {requirement}: {got:?}; the table says \
-                         {wanted:?}"
-                    ));
-                }
-            }
-        }
-        if failed.len() > before {
+        let (code, report) = status(&fixture);
+        let found = disagreements(now, (code, &report), &rows);
+        if !found.is_empty() {
+            failed.extend(found);
             failed.push(format!(
                 "  problems with the forge {now:?}: {:#?}\n  unmet: {:#?}",
                 problems(&report),
@@ -4997,4 +5099,83 @@ fn status_judges_every_requirement_kind_for_every_holder_as_the_table_says() {
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+fn the_status_table_reads_no_row_of_a_report_that_judged_nothing() {
+    // Given: `row-bare`, a branch whose one requirement, the upstream's
+    // merged #31, is met, so `status` says nothing of it; the forge is up.
+    let fixture = fixture();
+    let lab = &fixture.lab;
+    fixture.forge(&[pull_record(31, "MERGED", "row-merged", None)]);
+    let row = |name: &str| TableRow {
+        holder: Holder::Row,
+        name: name.to_owned(),
+        requirement: "maintainer/demo#31".to_owned(),
+        kind: "um",
+    };
+    lab.branch("row-bare", "row-bare.txt", "row-bare\n");
+    fixture.hold("row-bare", &["maintainer/demo#31"]);
+    fixture.forge_now(ForgeNow::Up);
+    let read = |rows: &[TableRow]| {
+        let (code, report) = status(&fixture);
+        (disagreements(ForgeNow::Up, (code, &report), rows), report)
+    };
+
+    // Then: status exits other than 3, and the reading is that exit alone
+    let (said, report) = read(&[row("row-bare")]);
+    assert!(
+        matches!(said.as_slice(), [only] if only.starts_with("Up: status exited ")),
+        "{said:#?}\n{report:#}"
+    );
+
+    // Given: `row-um` too, which requires #31 and [`NAMED`]
+    lab.branch("row-um", "row-um.txt", "row-um\n");
+    fixture.hold("row-um", &["maintainer/demo#31", NAMED]);
+
+    // Then: `row-um` reads Met, as the table says; `row-bare`, which the
+    // report does not name, is the one line
+    let (said, report) = read(&[row("row-um")]);
+    assert_eq!(said, Vec::<String>::new(), "{report:#}");
+    let (said, report) = read(&[row("row-um"), row("row-bare")]);
+    assert!(
+        matches!(said.as_slice(), [only] if only.contains("the report does not name row-bare")),
+        "{said:#?}\n{report:#}"
+    );
+
+    // When: jj cannot read the store's non-git metadata, as under gVisor:
+    // its `extra` tables hold garbage
+    let extra = lab
+        .work_path()
+        .join(".jj")
+        .join("repo")
+        .join("store")
+        .join("extra");
+    let saved: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(&extra)
+        .expect("read the extra tables")
+        .map(|entry| entry.expect("an extra table").path())
+        .filter(|path| path.is_file())
+        .map(|path| {
+            let bytes = std::fs::read(&path).expect("read an extra table");
+            (path, bytes)
+        })
+        .collect();
+    assert!(!saved.is_empty(), "no extra table at {}", extra.display());
+    for (path, _) in &saved {
+        std::fs::write(path, b"not a table").expect("damage an extra table");
+    }
+    let (damaged, report) = read(&[row("row-um")]);
+    for (path, bytes) in &saved {
+        std::fs::write(path, bytes).expect("restore an extra table");
+    }
+
+    // Then: the gather failure is the one line, and no row is read
+    assert!(
+        matches!(damaged.as_slice(), [only]
+            if only.starts_with("Up: status could not gather the fork")),
+        "{damaged:#?}\n{report:#}"
+    );
+    // And: with the store back, `row-um` reads Met again
+    let (said, report) = read(&[row("row-um")]);
+    assert_eq!(said, Vec::<String>::new(), "{report:#}");
 }

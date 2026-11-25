@@ -75,8 +75,8 @@ pub enum Placed {
 /// against the version's text. A conflicted release log can hold
 /// `## [Unreleased]` more than once, and then R8 holds no line. A line that
 /// the survival diff deletes or replaces is placed at the version's lines
-/// of that hunk. A hunk of removed lines that the version puts back is
-/// placed at the version's lines of the survival hunks at the hunk's place.
+/// of that hunk. A removed line that the version puts back is placed at the
+/// version's line that holds it again.
 /// Either is at a conflict where its place meets a conflict region, the
 /// region's edge included. A path read whole, and a mode, are at a conflict
 /// where the version holds a conflict at the path. A version that does not
@@ -165,8 +165,8 @@ fn marker(line: &[u8], len: usize) -> Option<u8> {
 /// `tip`.
 ///
 /// Each is the lost entry it would be in a version that holds none of the
-/// change: each non-blank added line, each hunk of removed lines by its
-/// first non-blank line, a mode, and a path read whole. A file change is
+/// change: each non-blank added line, each non-blank removed line, a mode,
+/// and a path read whole. A file change is
 /// read as R9's rule reads it ([`file_change`]). A tip that holds a
 /// conflict gives none. Spec R11 compares an advanced member's lines with
 /// those of its old tip by these, by path, kind and text.
@@ -224,9 +224,11 @@ pub fn change_lines(path: &str, fork: &Value, tip: &Value) -> Vec<Lost> {
             }
         }
         let removed = fork_lines.get(hunk.old.clone()).unwrap_or_default();
-        if let Some((offset, text)) = removed.iter().enumerate().find(|(_, line)| !is_blank(line)) {
-            let first = Some(number(hunk.old.start + offset));
-            lines.push(entry(path, LostKind::Removed, first, Some(shown(text))));
+        for (offset, &text) in removed.iter().enumerate() {
+            if !is_blank(text) {
+                let line = Some(number(hunk.old.start + offset));
+                lines.push(entry(path, LostKind::Removed, line, Some(shown(text))));
+            }
         }
     }
     lines
