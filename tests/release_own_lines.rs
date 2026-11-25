@@ -1873,6 +1873,27 @@ fn a_release_where_another_members_method_ends_in_the_removed_lines_brace_reads_
     assert!(!out.contains("put back"), "{out}");
 }
 
+#[test]
+fn a_release_that_puts_back_a_stray_brace_the_member_removed_reads_missing() {
+    // Given: M removes a stray `}`; N adds a line at the end; the release
+    // holds N's version, which still has the `}`.
+    let (lab, home) = neighbour_version_release(
+        JS,
+        (
+            "run() {\n  go();\n}\n}\nfinish();\n",
+            "run() {\n  go();\n}\nfinish();\n",
+            "run() {\n  go();\n}\n}\nfinish();\nmore();\n",
+        ),
+    );
+
+    // When/Then: M reads missing: its whole hunk is back, as R9 reads it,
+    // so the `}` is named although it holds no letter or digit; N reads
+    // carried.
+    let out = assert_member_missing(&lab, &home);
+    assert!(out.contains("removed line put back ‹}›"), "{out}");
+    assert!(out.contains(&carried_row(&label(&lab, N))), "{out}");
+}
+
 /// The Python file of K11 (12) to (14), whose lines the check words.
 const PY: &str = "lib.py";
 

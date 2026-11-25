@@ -17,8 +17,9 @@
 //!   section of a release log holds the same line. Where the survival diff
 //!   replaces a range of the tip's lines with a range of the release's
 //!   lines, the line is followed one level down, by its words.
-//! - A line that the member removed and that holds a letter or a digit is
-//!   lost where the survival diff inserts it again at the place of its hunk.
+//! - A non-blank line that the member removed is lost where the survival
+//!   diff inserts it again at the place of its hunk, when it holds a letter
+//!   or a digit, or when every non-blank line of its hunk is back there.
 //! - A path that is not text, a deletion, an empty added file and the
 //!   executable bit are each read by a rule of their own
 //!   ([`MemberLines::read_path`]).
@@ -181,8 +182,9 @@ pub enum LostKind {
     /// A non-blank line that the member added, which the release does not
     /// hold.
     Added,
-    /// A line that the member removed, holding a letter or a digit, which
-    /// the release holds again at the place where the member removed it.
+    /// A non-blank line that the member removed, which the release holds
+    /// again at the place where the member removed it: a line that holds a
+    /// letter or a digit, or any line of a hunk the release puts back whole.
     Removed,
     /// A path read whole: not text, deleted, or an empty added file.
     File,
@@ -840,18 +842,20 @@ impl<'t> TextPath<'t> {
         Judged::HeldByWords(holding.into_iter().map(|at| hunk.new.start + at).collect())
     }
 
-    /// Reads the lines that `hunk` removes that hold a letter or a digit
-    /// ([`holds_content`]): each is put back where a survival hunk at the
-    /// hunk's place inserts it again, whatever the release holds of the
-    /// lines around it. A line of punctuation alone (`}`, `},`, `);`) is not
-    /// read: another change's new code at the same place ends in such lines
-    /// too, so it does not show that the member's line came back. One
-    /// release line puts back one removed line at most, the first of its
-    /// text. The hunk's place is the gaps between tip lines where the member
-    /// removed them; a survival hunk is at that place where its tip lines'
-    /// gaps meet those gaps ([`meet`]).
+    /// Reads the non-blank lines that `hunk` removes. Each is put back where
+    /// a survival hunk at the hunk's place inserts it again, whatever the
+    /// release holds of the lines around it, when it holds a letter or a
+    /// digit ([`holds_content`]), or when the survival hunks there insert
+    /// every non-blank line of the hunk again, in order (R9's whole hunk). A
+    /// line of punctuation alone (`}`, `},`, `);`) is otherwise not read:
+    /// another change's new code at the same place ends in such lines too,
+    /// so it does not show that the member's line came back. One release
+    /// line puts back one removed line at most, the first of its text. The
+    /// hunk's place is the gaps between tip lines where the member removed
+    /// them; a survival hunk is at that place where its tip lines' gaps meet
+    /// those gaps ([`meet`]).
     fn read_removed(&self, hunk: &Hunk, out: &mut Out<'_>) {
-        let mut inserted: HashMap<&[u8], VecDeque<usize>> = HashMap::new();
+        let mut in_order: Vec<(&[u8], usize)> = Vec::new();
         for survival in self
             .survival
             .iter()
@@ -859,16 +863,29 @@ impl<'t> TextPath<'t> {
         {
             for at in survival.new.clone() {
                 if let Some(&line) = self.release.get(at) {
-                    inserted.entry(bare(line)).or_default().push_back(at);
+                    in_order.push((bare(line), at));
                 }
             }
         }
-        if inserted.is_empty() {
+        if in_order.is_empty() {
             return;
         }
         let removed = self.fork.get(hunk.old.clone()).unwrap_or_default();
+        // R9's whole hunk: the release holds every non-blank line of it again.
+        let non_blank: Vec<&[u8]> = removed
+            .iter()
+            .copied()
+            .filter(|line| !is_blank(line))
+            .map(bare)
+            .collect();
+        let texts: Vec<&[u8]> = in_order.iter().map(|&(text, _)| text).collect();
+        let whole = is_subsequence(&non_blank, &texts);
+        let mut inserted: HashMap<&[u8], VecDeque<usize>> = HashMap::new();
+        for (text, at) in in_order {
+            inserted.entry(text).or_default().push_back(at);
+        }
         for (offset, &line) in removed.iter().enumerate() {
-            if !holds_content(line) {
+            if is_blank(line) || !(whole || holds_content(line)) {
                 continue;
             }
             let Some(at) = inserted.get_mut(bare(line)).and_then(VecDeque::pop_front) else {
@@ -1134,11 +1151,58 @@ mod tests {
             file("{\n  a: 1,\n  c: () => {\n    go();\n  },\n}\n"),
         );
 
-        // Then: a `}` or `},` the release holds there does not show that the
-        // member's line came back, so each member is carried
+        // Then: each hunk removed a line that the release does not hold
+        // again, so it is not back whole, and a `}` or `},` the release holds
+        // there does not show that the member's line came back: each member
+        // is carried
         for lines in [brace, braces, neighbour] {
             assert_eq!(lines.reading, Reading::Carried);
             assert_eq!(lost(&lines), []);
+        }
+    }
+
+    #[test]
+    fn a_removed_hunk_of_punctuation_alone_put_back_whole_is_lost() {
+        // Given: a member that removes a stray `}`, and a release that holds
+        // it again
+        let stray = read(
+            "f.txt",
+            file("a\n}\nb\n"),
+            file("a\nb\n"),
+            file("a\n}\nb\n"),
+        );
+        // And: a member that removes a markdown rule, and a release that
+        // holds it again
+        let rule = read(
+            "f.md",
+            file("a\n\n---\n\nb\n"),
+            file("a\n\nb\n"),
+            file("a\n\n---\n\nb\n"),
+        );
+        // And: a member that removes two lines `}`, and a release that holds
+        // both again
+        let braces = read(
+            "f.txt",
+            file("a\n  }\n}\n}\nb\n"),
+            file("a\n  }\nb\n"),
+            file("a\n  }\n}\n}\nb\n"),
+        );
+
+        // Then: the hunk is back whole, as R9 reads it, so each of its lines
+        // is lost, punctuation or not
+        for (lines, wanted) in [
+            (stray, vec![(LostKind::Removed, Some(2), Some("}"))]),
+            (rule, vec![(LostKind::Removed, Some(3), Some("---"))]),
+            (
+                braces,
+                vec![
+                    (LostKind::Removed, Some(3), Some("}")),
+                    (LostKind::Removed, Some(4), Some("}")),
+                ],
+            ),
+        ] {
+            assert_eq!(lines.reading, Reading::Missing);
+            assert_eq!(lost(&lines), wanted);
         }
     }
 
