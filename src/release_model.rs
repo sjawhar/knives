@@ -517,7 +517,8 @@ pub fn stacked_history(
 /// own merge. A branch landed on a release holds that release's cut in its
 /// history by construction, so where the release's other members carry each
 /// release cut the branch holds, it is measured past what they carry
-/// ([`landed_history`]). A release cut no other member carries, and a merge
+/// ([`landed_history`]); a branch whose tip is a release cut is never
+/// measured so. A release cut no other member carries, and a merge
 /// whose side parent the release lacks, carry those lines in: both are
 /// [`MemberHistory::Stacked`], and when the release carries anything the
 /// finding lists every commit the branch would bring.
@@ -568,8 +569,12 @@ pub fn member_history(
     }
     let mut bases: Vec<CommitId> = context.trunks.to_vec();
     bases.extend(context.carried.iter().cloned());
+    // A branch whose tip is itself a release cut is never a landing: the
+    // other members carrying it would vouch for the cut as the cut vouches
+    // for them, and a release misread as a member would read flat.
     if !releases.is_empty()
         && !context.carried.is_empty()
+        && !releases.contains(&tip)
         && let Some(landed) = landed_history(context, &bases, &releases, (branch, tip))?
     {
         return Ok(landed);

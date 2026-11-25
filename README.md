@@ -448,9 +448,12 @@ member is measured past what they carry: a landing that brings one line of its o
 expected, the plan does not report it, and `include` takes it;
 a merge there that joins two or more lines none of them has, as a landing built on another
 landing the release does not carry, is `stacked-history`, and the detail names that merge and
-lists every commit the member brings. `knives status`, `knives preflight` and the first cut
-have no release in hand and measure past the trunk alone, so they still report a landing: a
-pull request opened from it carries the whole release it landed on.
+lists every commit the member brings. A member that is itself a release merge (one a release ref names, or one the ledger records)
+is never read as a landing, so a release that knives reads as a member of the next one is
+still reported.
+`knives status`, `knives preflight` and the first cut have no release in hand and measure past
+the trunk alone, so they still report a landing: a pull request opened from it carries the whole
+release it landed on.
 
 `knives release members --verify` reads each member's own lines in the release.
 `knives release members --carries REVISION` compares the revision with every live release and the

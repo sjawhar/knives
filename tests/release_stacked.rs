@@ -741,6 +741,33 @@ fn include_takes_a_landing_on_a_release_the_members_carry() {
 }
 
 #[test]
+fn a_release_cut_that_is_a_member_beside_a_landing_on_it_is_reported_stacked() {
+    // Given: gamma landed on release/2026-08-04, then the next release cut of
+    // release/2026-08-04 itself and that landing: the shape a release read as
+    // a member takes. The landing carries the cut, and the cut carries itself.
+    let lab = landings_on_a_release(&["gamma"]);
+    lab.octopus("release/2026-08-05", "release/2026-08-04", "land/gamma");
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When: the release is planned.
+    let text = plan_text(&lab, &home);
+
+    // Then: the release cut is reported stacked and named, as before the
+    // landing rule; the landing on it reads as a landing.
+    assert!(
+        text.contains(
+            "branch release/2026-08-04's history past the trunk carries 1 merge commit(s)"
+        ) && text.contains("releases in that history: release/2026-08-04"),
+        "{text}"
+    );
+    assert!(
+        text.contains("3 parent(s), 1 stacked on a prior merge"),
+        "{text}"
+    );
+    assert!(!text.contains("land/gamma's history"), "{text}");
+}
+
+#[test]
 fn landings_on_an_earlier_write_no_ref_names_are_not_stacked() {
     // Given: release/2026-08-04 cut by knives, gamma and delta landed on that
     // write, then feat/alpha advanced, so the name holds a new write and only
