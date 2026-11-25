@@ -1,6 +1,6 @@
 ---
 name: pr-preflight
-description: Use when opening or preparing a PR against an upstream repository or a fork, contributing upstream, before you run gh pr create, or before you write an issue, a comment or a review reply its maintainers read.
+description: Use when opening or preparing a PR against an upstream repository, contributing upstream, before you run gh pr create, or before you write an issue, a comment or a review reply its maintainers read.
 ---
 
 # Upstream PR Preflight Gate

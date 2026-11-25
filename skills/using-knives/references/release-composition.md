@@ -2,7 +2,7 @@
 
 Read this before you plan, cut, `include`, `drop`, `advance` or `rebase` a release, or read `knives release members`. Hand changes, unchecked writes, published releases, reap and pushing: [releases.md](releases.md).
 
-The release model, the verbs and the release-log conflict union: README.md, "Release workflow", and `knives release <verb> --help`. One branch is both member and PR head (fork-work §6).
+The release model, the verbs and the release-log conflict union: README.md, "Release workflow", and `knives release <verb> --help`. One branch is the member, and the upstream PR head unless the two need different bases (fork-work §6).
 
 ## The model's traps
 

@@ -20,7 +20,7 @@ Run `knives ledger migrate` once on each machine. Until then, commands that read
 5. Release a claim with `knives finish` when active work stops, also while a PR waits for review. First record in the ledger why the branch exists and any supersession: `finish` drops the claim's reason. The branch, bookmark and PR stay.
 6. A missing observation is not clearance. Absent, `null`, `0` and `UNKNOWN` differ. Read `problems`.
 7. Keep dependencies. Never keep a dependent in a release and drop its requirement.
-8. One branch is both release member and PR head. Never make a "release-lineage" or sibling copy so that it composes: move the release.
+8. One branch is the release member, and the upstream PR head unless the two need different bases. Never make a "release-lineage" or sibling copy so that it composes: move the release.
 9. Make release names only with `release cut`, never by hand. `--allow-drop` states an intended drop; it is not a way past a refusal.
 10. After any hand change on a release commit, run `knives release adopt <name>` before the next release write.
 11. Before a raw `jj rebase` of a branch, run fork-work's bidirectional gate (§7).

@@ -55,14 +55,14 @@ Shipping a fork member is part of the same work:
 2. Give the tip and the red→green evidence to the release-claim holder, who includes it in the release in hand and publishes; when every consumer pin of that release is frozen on a revision, they first cut the next dated name. Nobody holds the release claim: do this yourself (`maintaining-fork-release`).
 3. The consumer pins the published name and deploys. The member carries the change until upstream ships it.
 
-- A member's PR on the fork remote is for review only. Base it on its series' base, never on a `release/…` cut: merging into a cut fast-forwards that published ref away from the tree consumers pinned. Only `knives release` puts a member in a release.
+- A release member is a branch on the fork remote. Record its review by branch and exact SHA, not as a PR: pull requests target `upstream` only, never the fork. Only `knives release` puts a member in a release.
 - The release owner's process opens the upstream PR (`pr-preflight`) from a signed commit with an `Omp-Session` trailer, once the `placement:` notch says UPSTREAM. It gates nothing: not the release, the pin or the deploy. Ask nobody; wait for no approval.
 - After it opens, its review rounds, body edits, rebases and close are the owning session's work, not a human's.
 
 ## 5. Get your workspace with `knives start`
 
 1. `knives start <branch> --why "what you are doing"` claims the branch and opens a jj workspace on it. Work only there. A `start` that pauses is waiting for another agent's claim lock: let it finish.
-2. When your active work stops, also to wait for review, run `knives finish <branch>`. It returns the claim and removes the workspace; jj keeps the work by change id, and the branch, bookmark and PR stay.
+2. When your active work stops, also to wait for review, run `knives finish <branch>`. It returns the claim and removes the workspace; jj keeps the work by change id, and the branch, bookmark and any upstream PR stay.
 3. A subagent that runs as a session of its own runs knives with `KNIVES_OWNER` set to its parent's owner name (the parent reads it from its claim in `knives status` and passes it on), so its `knives start <branch>` resumes the parent's claim. The parent never releases its claim for the subagent.
 4. For a release name, `knives start <release name>` takes the release claim. Its workspace rests on the root commit, not on a release commit. A hand resolution on the release commit follows step 2 of `maintaining-fork-release`'s `references/release-wide-writes.md`.
 
@@ -74,7 +74,7 @@ Shipping a fork member is part of the same work:
 | Branch in the fork's default workspace | `knives start`. Another agent can be there, and a branch there can inherit a release merge as parent. |
 | Build a branch on a release merge | A PR from it asks the maintainer to review the whole fork. `knives status` flags `stacked-history` only on a branch with an open PR; `knives preflight` checks every branch. |
 | Cut a new release name for a release no consumer pins | Edit the release in hand (`knives release include`, `advance`, `drop`) and push the moved ref. `knives release` lists the pins; a PR branch naming the release is not one. |
-| `jj duplicate` a branch, or keep a second copy | One branch is the release member and the PR head. If it does not compose, move the release, not the branch. `knives release advance --from` recovers a duplicate; it is not a plan. |
+| `jj duplicate` a branch, or keep a second copy | One branch is the release member, and the upstream PR head unless the two need different bases. If it does not compose, move the release, not the branch. `knives release advance --from` recovers a duplicate; it is not a plan. |
 | `jj op restore` | Fix forward: it also discards other agents' operations. |
 | Push to `upstream` | Open a pull request. |
 
