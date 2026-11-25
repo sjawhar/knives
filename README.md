@@ -540,8 +540,8 @@ nothing else, and `merged-then-edited` in `--carries`. `--carries` and `--census
 `--verify` does. What the own-lines reading does not read, it does not read for `--carries`
 either, so both read these as carried: blank lines that the release dropped; the executable bit
 of a file that the member's change adds; a removed hunk that the release writes back edited, or
-puts back in part (the hunk reads put back only where every one of its non-blank lines comes
-back); and a line deleted from a file that the member's own change adds whole, as for a member
+of which it puts back only lines of punctuation alone (`}`, `},`) while other lines of the hunk stay
+removed; and a line deleted from a file that the member's own change adds whole, as for a member
 stacked on a branch that adds the file.
 
 A tip that the target does not reach is read by a replay of its change instead. Against either

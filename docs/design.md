@@ -746,7 +746,7 @@ of one tool read one fact one way, and no second check decides whether a line is
 ancestor tip of the upstream trunk, which knives does not compose, is carried-exact. An ancestor
 tip of a release is carried-exact when the release holds every line of its change from its base
 by the rule above (`Repo::release_base`, `own_lines::MemberLines::holds_every_line`): no line that
-the change added is lost, no hunk that it removed is put back, no line is held only by its words,
+the change added is lost, no line that it removed is put back, no line is held only by its words,
 and no path of the change holds an unresolved conflict, in the release or at the tip. It is
 merged-then-edited otherwise: the answer exits 3 for a person to judge, and lists newest first the
 release's commits the tip does not reach that changed a file of its change, each read against the
@@ -764,9 +764,9 @@ entries at one place that a resolution kept side by side), so a replay decides n
 release reaches. What the own-lines rule does not read it does not read for either command, so
 both read as carried: blank lines that the release dropped; the executable bit of a file that the
 member's change adds, which has no bit of its fork point's to change; a removed hunk that the
-release writes back edited; some lines of a removed hunk that the release puts back, when not
-every non-blank line of the hunk comes back (`own_lines` reads a removal as lost only where all of
-them do); and a line deleted from a file that the member's own change adds whole, as for a member
+release writes back edited; lines of punctuation alone of a removed hunk that the release puts
+back while other lines of the hunk stay removed (`own_lines` reads such a line as lost only with
+its whole hunk); and a line deleted from a file that the member's own change adds whole, as for a member
 stacked on a branch that adds the file, since the deletion is no hunk of its change from the
 trunk. A `knives depends` record of the branch it was built on is named in a note and never
 decides the verdict. A tip the target does not reach is replayed onto it, from their common

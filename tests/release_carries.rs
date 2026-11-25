@@ -1363,20 +1363,20 @@ fn release_carries_answers_merged_then_edited_for_a_hunk_the_release_put_back_in
     // which holds the two lines that the deleter removed, and adopted.
     let (lab, home) = guard_cut(GUARD_INSERTED);
 
-    // When/Then: `members --verify` reads the deleter missing and names the
-    // lines that were put back; `--carries` and the census read it
+    // When/Then: `members --verify` reads the deleter missing and names each
+    // line that was put back; `--carries` and the census read it
     // merged-then-edited. The inserter's lines are all held.
     assert_missing_and_merged_then_edited(
         &lab,
         &home,
         "feat/deleter",
-        "kernel/inductive.ml:4: removed lines put back ‹",
+        "kernel/inductive.ml:4: removed line put back ‹",
     );
     assert_carried_in(&lab, &home, "feat/inserter", true);
 }
 
 #[test]
-fn release_carries_answers_carried_exact_for_a_hunk_the_release_put_back_in_part() {
+fn release_carries_answers_merged_then_edited_for_a_line_the_release_put_back_from_a_hunk() {
     // Given: the member removes `b` and `c` from a file that the trunk holds;
     // the release merges it with another branch and puts `b` back by hand,
     // not `c`.
@@ -1391,8 +1391,36 @@ fn release_carries_answers_carried_exact_for_a_hunk_the_release_put_back_in_part
     );
     let (home, _consumer) = release_test_home(&lab);
 
-    // When, then: every command reads the member carried: a removed hunk
-    // counts as put back only where every non-blank line of it comes back.
+    // When/Then: `b` holds a letter, so putting it back undoes the member's
+    // removal of it, whatever happened to `c`: `members --verify` reads the
+    // member missing and names `b`, and `--carries` and the census read it
+    // merged-then-edited.
+    assert_missing_and_merged_then_edited(
+        &lab,
+        &home,
+        MEMBER,
+        "f.txt:2: removed line put back ‹b›",
+    );
+}
+
+#[test]
+fn release_carries_answers_carried_exact_for_a_lone_brace_put_back_from_a_hunk() {
+    // Given: the member removes a call and the `}` after it; the release
+    // merges it with another branch and puts the `}` back by hand, not the
+    // call (K11 (9)).
+    let lab = trunk_with(&[("f.txt", "a\n  y();\n}\nd\n")]);
+    lab.branch(MEMBER, "f.txt", "a\nd\n");
+    lab.branch("feat/other", "other.txt", "other\n");
+    merge_by_hand(
+        &lab,
+        CUT,
+        (MEMBER, "feat/other"),
+        &[("f.txt", Some("a\n}\nd\n"))],
+    );
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: every command reads the member carried: a line of
+    // punctuation alone counts as put back only with its whole hunk.
     assert_every_command_reads_carried(&lab, &home, &[MEMBER]);
 }
 

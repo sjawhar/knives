@@ -1741,11 +1741,14 @@ mod tests {
              let second = 2 in\n  fail ()\n",
         );
         let lines = read("f.ml", fork, member, put_back);
-        // Then: the member is missing the removed lines, put back
+        // Then: the member is missing each removed line, put back
         assert_eq!(lines.reading, Reading::Missing);
         assert_eq!(
             lost(&lines),
-            [(LostKind::Removed, Some(3), Some("  let first = 1 in"))]
+            [
+                (LostKind::Removed, Some(3), Some("  let first = 1 in")),
+                (LostKind::Removed, Some(4), Some("  let second = 2 in")),
+            ]
         );
         assert!(!lines.holds_every_line());
     }
