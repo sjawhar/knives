@@ -2838,6 +2838,39 @@ fn a_landing_built_on_the_release_before_the_previous_one_brings_only_its_own_li
     assert!(out.contains(&carried_row(&label(&lab, "feat/l"))), "{out}");
 }
 
+#[test]
+fn a_landing_on_the_release_it_follows_that_merged_a_newer_trunk_reads_from_that_release() {
+    // Given: [`RELEASE`] merges the trunk and `feat/a`, which writes `a1`;
+    // the trunk advances; `feat/h`, on the new trunk, adds `h.txt`;
+    // `feat/l`, a landing on RELEASE, merges `feat/h`; `feat/a` then
+    // rewrites `a1` as `a2`; NEXT merges the new trunk, `feat/a` and
+    // `feat/l`. `feat/l`'s fork point with the trunk is the new trunk, which
+    // RELEASE does not hold, so only the release it was built on starts its
+    // change below RELEASE's `a1`.
+    let lab = trunk_with(&[("f.txt", "f\n")]);
+    branch_on(&lab, "main@upstream", "feat/a", |work| {
+        write_file(work, "a.txt", "a1\n");
+    });
+    hand_release(&lab, RELEASE, &["main@upstream", "feat/a"], |_| {});
+    lab.advance_upstream("upstream advance\n");
+    branch_on(&lab, "main@upstream", "feat/h", |work| {
+        write_file(work, "h.txt", "h\n");
+    });
+    hand_release(&lab, "feat/l", &[RELEASE, "feat/h"], |_| {});
+    extend_branch(&lab, "feat/a", "a.txt", "a2\n");
+    hand_release(&lab, NEXT, &["main@upstream", "feat/a", "feat/l"], |_| {});
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: `feat/l` brings what it adds over RELEASE, the new trunk
+    // and `h.txt`, which NEXT holds; RELEASE's `a1`, which `feat/a`
+    // rewrote, is not the landing's. Every member is carried, exit 0.
+    let output = verify(&lab, &home, NEXT);
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(!out.contains("unresolved"), "{out}");
+    assert!(out.contains(&carried_row(&label(&lab, "feat/l"))), "{out}");
+}
+
 /// RELEASE, a merge of the trunk and `feat/a`; then `feat/m`, built on
 /// `base`, writing `m.txt`, whose tip merges `merged` in. NEXT merges the
 /// trunk, `feat/a` and `feat/m` but drops `m.txt` by hand: verify reads
@@ -3062,6 +3095,53 @@ fn verify_reads_a_member_whose_line_a_member_stacked_on_it_rewrote_unresolved() 
     );
     assert!(out.contains("      s.txt:1: added line lost ‹s1›"), "{out}");
     assert!(out.contains(&carried_row(&label(&lab, "feat/s2"))), "{out}");
+}
+
+#[test]
+fn a_put_back_removal_reads_unresolved_by_a_member_built_on_it_and_missing_by_hand() {
+    // Given: `feat/r` removes `r2` from the trunk's `r.txt`; `feat/p`,
+    // stacked on it, puts `r2` back and writes `p.txt`; RELEASE merges both.
+    let lab = trunk_with(&[("r.txt", "r1\nr2\nr3\n")]);
+    branch_on(&lab, "main@upstream", "feat/r", |work| {
+        write_file(work, "r.txt", "r1\nr3\n");
+    });
+    branch_on(&lab, "feat/r", "feat/p", |work| {
+        write_file(work, "r.txt", "r1\nr2\nr3\n");
+        write_file(work, "p.txt", "p\n");
+    });
+    hand_release(&lab, RELEASE, &["feat/r", "feat/p"], |_| {});
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: `feat/r`'s removal, which `feat/p` put back, reads
+    // unresolved, naming `feat/p` and the line, with the findings exit.
+    let output = verify(&lab, &home, RELEASE);
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
+    assert!(
+        out.contains(&unresolved_row(
+            &label(&lab, "feat/r"),
+            &label(&lab, "feat/p")
+        )),
+        "{out}"
+    );
+    assert!(out.contains("removed line put back ‹r2›"), "{out}");
+
+    // And: the same removal that a release put back by hand, with no member
+    // built on `feat/r`, reads `feat/r` missing.
+    let lab = trunk_with(&[("r.txt", "r1\nr2\nr3\n")]);
+    branch_on(&lab, "main@upstream", "feat/r", |work| {
+        write_file(work, "r.txt", "r1\nr3\n");
+    });
+    hand_release(&lab, RELEASE, &["main@upstream", "feat/r"], |work| {
+        write_file(work, "r.txt", "r1\nr2\nr3\n");
+    });
+    let (home, _consumer) = release_test_home(&lab);
+    let output = verify(&lab, &home, RELEASE);
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
+    assert!(out.contains(&missing_row(&label(&lab, "feat/r"))), "{out}");
+    assert!(!out.contains("unresolved"), "{out}");
+    assert!(out.contains("removed line put back ‹r2›"), "{out}");
 }
 
 /// Four branches stacked on one another, merged by hand as a release cut

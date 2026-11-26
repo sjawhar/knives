@@ -447,9 +447,11 @@ release it replaced (in a dated series the newest of our releases named before i
 one; on a fixed branch the branch's release in hand, for a commit with no recorded write): a line
 that release also lacked, of a member it holds, is carried from it, and the member's row says so.
 A member built on a release, a landing among them, starts at that release, so it answers for
-everything its first-parent line holds over it. A member whose every lost line another member
-changed too (that member's tip lacks the line, and the commit the two share holds it) reads
-unresolved: the row names those members and the lines, and the exit is `1`. A text file the
+everything its first-parent line holds over it. A member whose every lost line a member built on
+it changed again (a line it added that the later member rewrote, or one it removed that the later
+member put back: the commit the two share holds the member's version, and the later member's tip
+does not) reads unresolved: the row names those members and the lines, and the exit is `1`. A
+line that only the release, or a member not built on it, changed stays missing. A text file the
 member changed that the release no longer holds at its path reads missing (`absent from the
 release`): no other file is read in its place, so a move another member made is the member's
 review to judge. A release whose commit is a hand edit on top of its cut is verified through the
