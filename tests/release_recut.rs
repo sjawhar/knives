@@ -137,7 +137,12 @@ fn a_cut_that_omits_a_recorded_member_is_refused_until_the_drop_is_stated() {
     );
 
     // And when: the drop is stated.
-    let allowed = knives_release(&lab, &home, &["cut", "release/2026-08-05", "--allow-drop"]);
+    let gamma = commit_at(&lab, "feat/gamma");
+    let allowed = knives_release(
+        &lab,
+        &home,
+        &["cut", "release/2026-08-05", "--allow-drop", gamma.short()],
+    );
 
     // Then: the cut lands and its ledger event records exactly what was dropped.
     let stdout = String::from_utf8_lossy(&allowed.stdout);
@@ -191,7 +196,12 @@ fn a_drop_between_cuts_is_restated_at_the_next_cut() {
     );
 
     // And when: the drop is stated, the cut lands and records it.
-    let allowed = knives_release(&lab, &home, &["cut", "release/2026-08-05", "--allow-drop"]);
+    let beta = commit_at(&lab, "feat/beta");
+    let allowed = knives_release(
+        &lab,
+        &home,
+        &["cut", "release/2026-08-05", "--allow-drop", beta.short()],
+    );
     let stdout = String::from_utf8_lossy(&allowed.stdout);
     assert!(stdout.contains("cut release/2026-08-05 as"), "{stdout}");
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
@@ -362,8 +372,20 @@ fn a_recorded_member_this_repository_cannot_resolve_is_named_in_the_refusal() {
         "{stdout}"
     );
 
-    // And when: the drop is stated, the first cut proceeds.
-    let allowed = knives_release(&lab, &home, &["cut", "release/2026-08-05", "--allow-drop"]);
+    // And when: each drop is stated, the member and the newest write that
+    // no repository here holds, the first cut proceeds.
+    let allowed = knives_release(
+        &lab,
+        &home,
+        &[
+            "cut",
+            "release/2026-08-05",
+            "--allow-drop",
+            "deaddeaddead",
+            "--allow-drop",
+            "feedfeedfeed",
+        ],
+    );
     let stdout = String::from_utf8_lossy(&allowed.stdout);
     assert!(stdout.contains("cut release/2026-08-05 as"), "{stdout}");
 }
@@ -850,8 +872,11 @@ fn a_cut_refuses_when_release_like_described_work_lives_only_in_the_release_line
         "refusal must name the commit: {text}"
     );
     assert!(
-        text.contains("--allow-drop"),
-        "refusal must name the override: {text}"
+        text.contains(&format!(
+            "  name each drop: --allow-drop {}\n",
+            &stacked[..12]
+        )),
+        "refusal must give the override of that commit: {text}"
     );
     let tips = Repo::open(&lab.work)
         .expect("open")
@@ -864,7 +889,11 @@ fn a_cut_refuses_when_release_like_described_work_lives_only_in_the_release_line
     );
 
     // And when: the operator states that dropping the hotfix is intended.
-    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05", "--allow-drop"]);
+    let output = knives_release(
+        &lab,
+        &home,
+        &["cut", "release/2026-08-05", "--allow-drop", &stacked[..12]],
+    );
     assert_eq!(
         output.status.code(),
         Some(1),

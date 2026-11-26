@@ -23,8 +23,8 @@ use knives::config::RepoEntry;
 use knives::ids::ReleaseScheme;
 use knives::jj::Repo;
 use lab::{
-    Lab, ReleaseOutput, commit_at, knives_release, newest_operation_description, operation_ids,
-    release_command, release_parents, release_test_home, release_test_home_pinned,
+    Lab, ReleaseOutput, commit_at, knives, knives_release, newest_operation_description,
+    operation_ids, release_command, release_parents, release_test_home, release_test_home_pinned,
 };
 
 #[test]
@@ -1005,6 +1005,1395 @@ fn a_fixed_cut_records_a_published_composition_that_has_no_recorded_cut_yet() {
         cut.evidence.first().map(String::as_str),
         Some(published.as_str())
     );
+}
+
+/// The release-test home with the fixed release branch `integration` and no
+/// local consumer.
+fn fixed_release_home(lab: &Lab) -> tempfile::TempDir {
+    let (home, _consumer) = release_test_home(lab);
+    std::fs::remove_file(home.path().join("local-consumer")).expect("remove local consumer");
+    let registry = home.path().join("repos.toml");
+    let config = std::fs::read_to_string(&registry).expect("read registry");
+    std::fs::write(
+        &registry,
+        format!("{config}release_branch = \"integration\"\n"),
+    )
+    .expect("configure fixed release branch");
+    home
+}
+
+/// `integration` composed outside knives as a compose script makes a
+/// release: one merge whose first parent is the release in hand, then
+/// `feat/alpha`, `feat/beta` and `feat/gamma`, four parents in all, not
+/// pushed. Returns its commit.
+fn compose_by_hand(lab: &Lab) -> knives::ids::CommitId {
+    lab.jj_work([
+        "new",
+        "-r",
+        "integration",
+        "-r",
+        "feat/alpha",
+        "-r",
+        "feat/beta",
+        "-r",
+        "feat/gamma",
+        "-m",
+        "integration, composed by hand",
+    ]);
+    lab.jj_work(["bookmark", "set", "integration", "-r", "@"]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    assert_eq!(release_parents(lab, "integration").len(), 4);
+    commit_at(lab, "integration")
+}
+
+/// Push `integration` and fetch it back. Returns the publish remote's
+/// commit of it, which is the local one.
+fn publish_integration(lab: &Lab) -> knives::ids::CommitId {
+    lab.push_branch("integration");
+    lab.fetch_work();
+    let published = commit_at(lab, "integration@origin");
+    assert_eq!(commit_at(lab, "integration"), published);
+    published
+}
+
+/// [`compose_by_hand`], then [`publish_integration`].
+fn publish_a_release_made_by_hand(lab: &Lab) -> knives::ids::CommitId {
+    let composed = compose_by_hand(lab);
+    let published = publish_integration(lab);
+    assert_eq!(published, composed);
+    published
+}
+
+/// The newest event the fork's ledger records about `integration`.
+fn newest_integration_event(home: &tempfile::TempDir) -> knives::ledger::Entry {
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .read()
+        .expect("read ledger")
+        .entries;
+    entries
+        .into_iter()
+        .rev()
+        .find(|entry| entry.subject.as_deref() == Some("integration"))
+        .expect("an event of integration")
+}
+
+/// The release-drift findings of `knives --json audit demo --no-github`,
+/// run against the lab's own origin with the same ledger; the registry is
+/// put back afterwards.
+fn release_drifts(lab: &Lab, home: &tempfile::TempDir) -> Vec<serde_json::Value> {
+    let registry = home.path().join("repos.toml");
+    let configured = std::fs::read_to_string(&registry).expect("read registry");
+    std::fs::write(
+        &registry,
+        configured.replace(
+            "origin = \"https://forge.invalid/acme/work.git\"",
+            &format!("origin = \"{}\"", lab.temp_origin().display()),
+        ),
+    )
+    .expect("point the registry at the lab's origin");
+    let output = knives(lab, home, &["--json", "audit", "demo", "--no-github"]);
+    std::fs::write(&registry, configured).expect("restore the registry");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("audit emits JSON ({error}): {}", both_streams(&output)));
+    report["findings"]
+        .as_array()
+        .map(|findings| {
+            findings
+                .iter()
+                .filter(|finding| finding["kind"] == "release-drift")
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_fixed_cut_records_the_published_merge_whose_first_parent_is_the_previous_cut() {
+    // Given: a fixed release branch cut by knives and pushed, then the
+    // branch composed by hand as one merge of four parents, the previous cut
+    // first, and pushed: the shape a compose script publishes.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let home = fixed_release_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both_streams(&first));
+    lab.push_branch("integration");
+    lab.fetch_work();
+    let cut = commit_at(&lab, "integration");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let published = publish_a_release_made_by_hand(&lab);
+
+    // When: a plain cut runs.
+    let output = knives_release(&lab, &home, &["cut"]);
+
+    // Then: it records the published commit, makes no commit, and moves no
+    // bookmark.
+    let out = both_streams(&output);
+    assert_ne!(output.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: recorded published composition integration@origin ({}) as the cut; previous \
+             recorded cut integration was {}",
+            published.short(),
+            cut.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(commit_at(&lab, "integration"), published, "{out}");
+    assert_eq!(commit_at(&lab, "integration@origin"), published);
+
+    // And: its event names the published commit, its three members, and
+    // the previous cut as a carrier, never a member.
+    let event = newest_integration_event(&home);
+    assert_eq!(event.evidence.first(), Some(&published.as_str().to_owned()));
+    let mut members: Vec<&str> = event.evidence[1..].iter().map(String::as_str).collect();
+    members.sort_unstable();
+    let mut wanted = ["feat/alpha", "feat/beta", "feat/gamma"]
+        .map(|branch| lab.revision(lab.work_path(), branch, "commit_id"));
+    wanted.sort_unstable();
+    assert_eq!(
+        members,
+        wanted
+            .iter()
+            .map(|commit| commit.trim())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        event
+            .parents
+            .iter()
+            .any(|parent| parent.commit == cut.as_str()
+                && parent.branches == ["integration earlier write (carrier, not a member)"]),
+        "{event:?}"
+    );
+    assert!(
+        event.text.contains(&format!(
+            "; carries integration's earlier write(s), not members: {}",
+            cut.short()
+        )),
+        "{}",
+        event.text
+    );
+
+    // And: once recorded, the same cut has nothing to do.
+    let repeated = knives_release(&lab, &home, &["cut"]);
+    let repeated_out = both_streams(&repeated);
+    assert_eq!(repeated.status.code(), Some(3), "{repeated_out}");
+    assert!(
+        repeated_out.contains(&format!(
+            "demo: refusing to cut integration: identical to integration@origin ({}); nothing to \
+             cut",
+            published.short()
+        )),
+        "{repeated_out}"
+    );
+}
+
+#[test]
+fn a_fixed_cut_of_a_published_commit_edited_by_hand_records_it_unchecked_and_makes_nothing() {
+    // Given: a fixed release branch cut by knives and pushed, then the branch
+    // composed by hand as one merge with `alpha.txt` edited in the merge
+    // itself, and pushed. A cut of the composition in hand would make that
+    // tree on those parents, its earlier write left out.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let home = fixed_release_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both_streams(&first));
+    lab.push_branch("integration");
+    lab.fetch_work();
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    compose_by_hand(&lab);
+    lab.jj_work(["edit", "integration"]);
+    std::fs::write(
+        lab.work_path().join("alpha.txt"),
+        "alpha, edited in the merge\n",
+    )
+    .expect("edit the merge");
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let published = publish_integration(&lab);
+    let ledger = || {
+        knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+            .read()
+            .expect("read ledger")
+            .entries
+            .len()
+    };
+    let before = ledger();
+
+    // When: a plain cut runs.
+    let output = knives_release(&lab, &home, &["cut"]);
+
+    // Then: it records the published commit, says knives could not check
+    // it against its recorded writes (the event carries the unchecked mark),
+    // writes one event, makes no commit, and leaves the bookmark on it.
+    let out = both_streams(&output);
+    assert_ne!(output.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: recorded published composition integration@origin ({}) as the cut",
+            published.short()
+        )),
+        "{out}"
+    );
+    assert!(out.contains("knives could not check integration"), "{out}");
+    assert_eq!(ledger(), before + 1, "{out}");
+    assert_eq!(commit_at(&lab, "integration"), published, "{out}");
+}
+
+/// What [`unpushed_cut_lab`] makes: the lab and home, the first cut, the cut
+/// the publish remote never held, and the published commit.
+struct UnpushedCut {
+    lab: Lab,
+    home: tempfile::TempDir,
+    cut: knives::ids::CommitId,
+    wrong: knives::ids::CommitId,
+    published: knives::ids::CommitId,
+}
+
+impl UnpushedCut {
+    /// How many entries the fork's ledger holds.
+    fn events(&self) -> usize {
+        knives::ledger::Ledger::at(self.home.path().join("ledger").join("demo"))
+            .read()
+            .expect("read ledger")
+            .entries
+            .len()
+    }
+}
+
+/// A fixed release branch cut by knives and pushed; then the branch composed
+/// by hand of the previous cut, `feat/alpha`, `feat/beta` and `feat/gamma`;
+/// then a cut of the three members alone that the publish remote's history
+/// does not hold, as Cut8's dc16713e. A fixed branch's cut now records only
+/// the publish remote's commit, so that cut is made by pushing a composition
+/// afresh of the three members and recording it, then pushing the
+/// composition by hand over it: the remote's history no longer holds it.
+/// That cut is then abandoned. The ledger's newest write is the cut the
+/// remote's history does not hold.
+fn unpushed_cut_lab() -> UnpushedCut {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let home = fixed_release_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both_streams(&first));
+    lab.push_branch("integration");
+    lab.fetch_work();
+    let cut = commit_at(&lab, "integration");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let composed = compose_by_hand(&lab);
+    // A bookmark keeps the composition out of the cut's orphan gate.
+    lab.jj_work(["bookmark", "create", "keep", "-r", composed.as_str()]);
+    let wrong = compose_integration(&lab, &["feat/alpha", "feat/beta", "feat/gamma"]);
+    publish_integration(&lab);
+    let recorded = knives_release(&lab, &home, &["cut"]);
+    assert_ne!(
+        recorded.status.code(),
+        Some(3),
+        "{}",
+        both_streams(&recorded)
+    );
+    assert_eq!(
+        newest_integration_event(&home).evidence.first(),
+        Some(&wrong.as_str().to_owned()),
+        "fixture: the fresh composition is the newest recorded write"
+    );
+    lab.jj_work(["bookmark", "delete", "keep"]);
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "integration",
+        "-r",
+        composed.as_str(),
+        "--allow-backwards",
+    ]);
+    let published = publish_integration(&lab);
+    assert_eq!(published, composed);
+    lab.jj_work(["abandon", wrong.as_str()]);
+    assert!(
+        !release_drifts(&lab, &home).is_empty(),
+        "control: the audit reads the unpushed cut as the newest"
+    );
+    UnpushedCut {
+        lab,
+        home,
+        cut,
+        wrong,
+        published,
+    }
+}
+
+#[test]
+fn a_fixed_cut_over_an_abandoned_write_never_pushed_is_refused_naming_corrects() {
+    // Given: [`unpushed_cut_lab`].
+    let state = unpushed_cut_lab();
+    let (lab, home, before) = (&state.lab, &state.home, state.events());
+
+    // When: a plain cut runs.
+    let refused = knives_release(lab, home, &["cut"]);
+
+    // Then: it is refused, naming the unpushed cut and `--corrects`, and
+    // nothing is written or moved.
+    let out = both_streams(&refused);
+    assert_eq!(refused.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut integration: its newest write, the recorded cut {}, is \
+             abandoned and not in integration@origin ({})'s history, so the publish remote never \
+             held it; `knives release cut --corrects {}` withdraws it and records {} in its \
+             place; nothing was written",
+            state.wrong.short(),
+            state.published.short(),
+            state.wrong.short(),
+            state.published.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(state.events(), before, "{out}");
+    assert_eq!(commit_at(lab, "integration"), state.published, "{out}");
+
+    // When: --corrects names another write.
+    let other = knives_release(lab, home, &["cut", "--corrects", state.cut.as_str()]);
+
+    // Then: it is refused, naming the newest write, and nothing is written.
+    let other_out = both_streams(&other);
+    assert_eq!(other.status.code(), Some(3), "{other_out}");
+    assert!(
+        other_out.contains(&format!(
+            "integration's newest write is the recorded cut {}, and --corrects withdraws only \
+             that one",
+            state.wrong.short()
+        )),
+        "{other_out}"
+    );
+    assert_eq!(state.events(), before, "{other_out}");
+}
+
+#[test]
+fn a_fixed_cut_with_corrects_withdraws_the_write_never_pushed_and_records_the_published_commit() {
+    // Given: [`unpushed_cut_lab`].
+    let state = unpushed_cut_lab();
+    let (lab, home, before) = (&state.lab, &state.home, state.events());
+    let (wrong, published) = (&state.wrong, &state.published);
+
+    // When: the cut runs with --corrects naming the unpushed cut.
+    let corrected = knives_release(lab, home, &["cut", "--corrects", wrong.as_str()]);
+
+    // Then: the ledger withdraws that cut, then records the published commit
+    // after the cut it follows; the audit finds no drift; and the bookmark
+    // stays.
+    let out = both_streams(&corrected);
+    assert_ne!(corrected.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: recorded published composition integration@origin ({}) as the cut; previous \
+             recorded cut integration was {}",
+            published.short(),
+            state.cut.short()
+        )),
+        "{out}"
+    );
+    // And: the withdrawal's line is printed, saying the published commit
+    // carries every member of the withdrawn cut.
+    assert!(
+        out.contains(&format!(
+            "demo: withdrew integration's recorded write (a cut) {}: integration@origin never \
+             held it, and the cut of {} records the published commit in its place; {} carries \
+             every member of it\n",
+            wrong.short(),
+            published.short(),
+            published.short()
+        )),
+        "{out}"
+    );
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .read()
+        .expect("read ledger")
+        .entries;
+    assert_eq!(entries.len(), before + 2, "{out}");
+    let withdrawal = &entries[entries.len() - 2];
+    assert!(
+        withdrawal.text.starts_with(&format!(
+            "withdrew integration's recorded write (a cut) {}: integration@origin never held it",
+            wrong.short()
+        )),
+        "{}",
+        withdrawal.text
+    );
+    assert_eq!(
+        withdrawal.evidence,
+        [wrong.as_str().to_owned(), published.as_str().to_owned()]
+    );
+    let recorded = &entries[entries.len() - 1];
+    assert_eq!(
+        recorded.evidence.first(),
+        Some(&published.as_str().to_owned())
+    );
+    let drifts = release_drifts(lab, home);
+    assert!(drifts.is_empty(), "{drifts:?}");
+    assert_eq!(commit_at(lab, "integration"), *published);
+
+    // And: the same correction again is refused, as the published commit is
+    // the newest write now, and a plain cut has nothing to do.
+    let again = knives_release(lab, home, &["cut", "--corrects", wrong.as_str()]);
+    assert_eq!(again.status.code(), Some(3), "{}", both_streams(&again));
+    let plain = knives_release(lab, home, &["cut"]);
+    let plain_out = both_streams(&plain);
+    assert_eq!(plain.status.code(), Some(3), "{plain_out}");
+    assert!(plain_out.contains("nothing to cut"), "{plain_out}");
+}
+
+#[test]
+fn a_fixed_cut_with_corrects_records_the_newer_of_two_unrecorded_releases_over_the_older() {
+    // Given: [`unpushed_cut_lab`], whose published release P8 the ledger does
+    // not record; then `feat/delta` added and the branch composed by hand
+    // again, P9: a merge of P8, then `feat/alpha`, `feat/beta`, `feat/gamma`
+    // and `feat/delta`, pushed. P8 and P9 are both published, and neither is
+    // recorded; the ledger's newest write is the abandoned cut.
+    let state = unpushed_cut_lab();
+    let (lab, home, before) = (&state.lab, &state.home, state.events());
+    let (p8, wrong) = (&state.published, &state.wrong);
+    lab.branch("feat/delta", "delta.txt", "delta\n");
+    lab.jj_work([
+        "new",
+        "-r",
+        "integration",
+        "-r",
+        "feat/alpha",
+        "-r",
+        "feat/beta",
+        "-r",
+        "feat/gamma",
+        "-r",
+        "feat/delta",
+        "-m",
+        "integration, composed by hand again",
+    ]);
+    lab.jj_work(["bookmark", "set", "integration", "-r", "@"]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let p9 = publish_integration(lab);
+    assert_eq!(release_parents(lab, "integration").first(), Some(p8));
+
+    // When: the cut runs with --corrects naming the abandoned cut; then
+    // again with --at naming P8; then a plain cut.
+    let entries_before = ledger_len(home);
+    let refused = knives_release(lab, home, &["cut", "--corrects", wrong.as_str()]);
+    assert_refused_until_recorded(&refused, (home, entries_before), &p9, &[p8]);
+    let older = knives_release(
+        lab,
+        home,
+        &["cut", "--corrects", wrong.as_str(), "--at", p8.as_str()],
+    );
+    assert_ne!(older.status.code(), Some(3), "{}", both_streams(&older));
+    let corrected = knives_release(lab, home, &["cut"]);
+
+    // Then: the ledger withdraws that cut and records P8, then P9, with P8
+    // as an earlier write it carries and the four branches as its members;
+    // the audit finds no drift, and the bookmark stays on P9.
+    let out = both_streams(&corrected);
+    assert_ne!(corrected.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: recorded published composition integration@origin ({}) as the cut",
+            p9.short()
+        )),
+        "{out}"
+    );
+    let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .read()
+        .expect("read ledger")
+        .entries;
+    assert_eq!(entries.len(), before + 3, "{out}");
+    let withdrawal = &entries[entries.len() - 3];
+    assert_eq!(
+        withdrawal.evidence,
+        [wrong.as_str().to_owned(), p8.as_str().to_owned()]
+    );
+    assert_eq!(
+        entries[entries.len() - 2].evidence.first(),
+        Some(&p8.as_str().to_owned())
+    );
+    let recorded = &entries[entries.len() - 1];
+    assert_eq!(recorded.evidence.first(), Some(&p9.as_str().to_owned()));
+    assert!(
+        recorded
+            .parents
+            .iter()
+            .any(|parent| parent.commit == p8.as_str()
+                && parent.branches == ["integration earlier write (carrier, not a member)"]),
+        "{recorded:?}"
+    );
+    assert_eq!(recorded.evidence.len(), 5, "{recorded:?}");
+    let drifts = release_drifts(lab, home);
+    assert!(drifts.is_empty(), "{drifts:?}");
+    assert_eq!(commit_at(lab, "integration"), p9);
+}
+
+/// A bookmark `name` at a merge of `parents`, the working copy off it.
+/// Returns its commit.
+fn merge_branch(lab: &Lab, name: &str, parents: &[&str]) -> knives::ids::CommitId {
+    let mut args = vec!["new"];
+    for parent in parents {
+        args.extend(["-r", parent]);
+    }
+    let message = format!("{name}: a merge");
+    args.extend(["-m", message.as_str()]);
+    lab::jj_in(lab.work_path(), &args);
+    lab.jj_work(["bookmark", "create", name, "-r", "@"]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    commit_at(lab, name)
+}
+
+/// A bookmark `name` at one commit on `base` that writes `file`, the working
+/// copy off it. Returns its commit.
+fn commit_on(lab: &Lab, name: &str, base: &str, file: &str) -> knives::ids::CommitId {
+    lab.jj_work(["new", "-r", base, "-m", name]);
+    std::fs::write(lab.work_path().join(file), format!("{name}\n")).expect("write the file");
+    lab.jj_work(["bookmark", "create", name, "-r", "@"]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    commit_at(lab, name)
+}
+
+/// `integration` moved to a merge of `parents` composed by hand, not pushed,
+/// the working copy off it. Returns its commit.
+fn compose_integration(lab: &Lab, parents: &[&str]) -> knives::ids::CommitId {
+    let mut args = vec!["new"];
+    for parent in parents {
+        args.extend(["-r", parent]);
+    }
+    args.extend(["-m", "integration, composed by hand"]);
+    lab::jj_in(lab.work_path(), &args);
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "integration",
+        "-r",
+        "@",
+        "--allow-backwards",
+    ]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    commit_at(lab, "integration")
+}
+
+/// A fixed release branch cut by knives of `feat/alpha` and `feat/beta`,
+/// and pushed. Returns the lab, its home and the cut.
+fn first_fixed_cut() -> (Lab, tempfile::TempDir, knives::ids::CommitId) {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let home = fixed_release_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both_streams(&first));
+    let cut = publish_integration(&lab);
+    (lab, home, cut)
+}
+
+/// How many entries the fork's ledger holds.
+fn ledger_len(home: &tempfile::TempDir) -> usize {
+    knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
+        .read()
+        .expect("read ledger")
+        .entries
+        .len()
+}
+
+/// Whether `event` records `commit` as an earlier write it carries: a
+/// parent with the carrier label.
+fn records_carrier(event: &knives::ledger::Entry, commit: &knives::ids::CommitId) -> bool {
+    event.parents.iter().any(|parent| {
+        parent.commit == commit.as_str()
+            && parent.branches == ["integration earlier write (carrier, not a member)"]
+    })
+}
+
+/// Whether `event` records `commit` as a member: in its evidence after the
+/// write, and no carrier.
+fn records_member(event: &knives::ledger::Entry, commit: &knives::ids::CommitId) -> bool {
+    event
+        .evidence
+        .iter()
+        .skip(1)
+        .any(|member| member == commit.as_str())
+        && !records_carrier(event, commit)
+}
+
+/// Assert that `output`, a cut, recorded `published` with `carrier` as its
+/// earlier write and each of `members` as a member.
+fn assert_recorded_with(
+    (output, home): (&std::process::Output, &tempfile::TempDir),
+    published: &knives::ids::CommitId,
+    carrier: &knives::ids::CommitId,
+    members: &[&knives::ids::CommitId],
+) {
+    let out = both_streams(output);
+    assert_ne!(output.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: recorded published composition integration@origin ({}) as the cut",
+            published.short()
+        )),
+        "{out}"
+    );
+    let event = newest_integration_event(home);
+    assert_eq!(event.evidence.first(), Some(&published.as_str().to_owned()));
+    assert!(records_carrier(&event, carrier), "{event:?}");
+    for member in members {
+        assert!(records_member(&event, member), "{member:?}: {event:?}");
+    }
+}
+
+/// Assert that `output`, a cut of `published`, a commit made on a release
+/// published on the newest recorded write and never recorded, refused to
+/// read which parent is that release: it names each of `unknown` and the
+/// record of that release first with `--at`, and the ledger still holds
+/// `before` entries.
+fn assert_refused_until_recorded(
+    output: &std::process::Output,
+    (home, before): (&tempfile::TempDir, usize),
+    published: &knives::ids::CommitId,
+    unknown: &[&knives::ids::CommitId],
+) {
+    let out = both_streams(output);
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "refusing to cut integration: no parent of {} is a write of integration the ledger \
+             records",
+            published.short()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("record it first (`knives release cut --at <commit>`)"),
+        "{out}"
+    );
+    for parent in unknown {
+        assert!(
+            out.contains(&format!(
+                "{}, a parent of {}, holds integration's earlier write",
+                parent.short(),
+                published.short()
+            )),
+            "{out}"
+        );
+    }
+    assert_eq!(ledger_len(home), before, "{out}");
+}
+
+/// `cut --at <commit>` on the fixed branch, which must record it.
+fn record_at(lab: &Lab, home: &tempfile::TempDir, commit: &knives::ids::CommitId) {
+    let output = knives_release(lab, home, &["cut", "--at", commit.as_str()]);
+    assert_ne!(output.status.code(), Some(3), "{}", both_streams(&output));
+    assert_eq!(
+        newest_integration_event(home).evidence.first(),
+        Some(&commit.as_str().to_owned())
+    );
+}
+
+#[test]
+fn a_fixed_cut_records_a_member_merged_into_the_previous_cut_as_a_member() {
+    // Given: [`first_fixed_cut`]; `feat/delta`, a merge of `feat/x` into
+    // that cut, as a branch merged into the release is; then the branch
+    // composed by hand of the cut, `feat/gamma` and `feat/delta`, pushed.
+    let (lab, home, cut) = first_fixed_cut();
+    lab.branch("feat/x", "x.txt", "x\n");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let delta = merge_branch(&lab, "feat/delta", &["integration", "feat/x"]);
+    compose_integration(&lab, &["integration", "feat/gamma", "feat/delta"]);
+    let published = publish_integration(&lab);
+
+    // When: a plain cut runs.
+    let output = knives_release(&lab, &home, &["cut"]);
+
+    // Then: it records the published commit with the cut, its first parent,
+    // as its carrier, and `feat/gamma` and `feat/delta`, which descends from
+    // the cut, as members.
+    let gamma = commit_at(&lab, "feat/gamma");
+    assert_recorded_with((&output, &home), &published, &cut, &[&gamma, &delta]);
+}
+
+#[test]
+fn a_fixed_cut_records_members_built_on_releases_beside_the_unrecorded_release_they_follow() {
+    // Given: [`first_fixed_cut`] W1; P8 composed by hand of W1 and
+    // `feat/gamma`, pushed and not recorded; then P9, oh-my-pi's Cut9 shape:
+    // a merge of P8, `feat/d1`, a merge of `feat/y` into P8, and `fix/d2`, a
+    // commit on W1; pushed. Every parent of P9 descends from W1.
+    let (lab, home, w1) = first_fixed_cut();
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let p8 = compose_integration(&lab, &["integration", "feat/gamma"]);
+    publish_integration(&lab);
+    lab.branch("feat/y", "y.txt", "y\n");
+    let d1 = merge_branch(&lab, "feat/d1", &[p8.as_str(), "feat/y"]);
+    let d2 = commit_on(&lab, "fix/d2", w1.as_str(), "d2.txt");
+    compose_integration(&lab, &[p8.as_str(), "feat/d1", "fix/d2"]);
+    let p9 = publish_integration(&lab);
+
+    // When: a plain cut runs; then P8 is recorded with --at, and the plain
+    // cut runs again.
+    let before = ledger_len(&home);
+    let refused = knives_release(&lab, &home, &["cut"]);
+    assert_refused_until_recorded(&refused, (&home, before), &p9, &[&p8, &d1, &d2]);
+    record_at(&lab, &home, &p8);
+    let output = knives_release(&lab, &home, &["cut"]);
+
+    // Then: it records P9 with P8, its first parent, as its carrier, and
+    // both other parents as members.
+    assert_recorded_with((&output, &home), &p9, &p8, &[&d1, &d2]);
+}
+
+#[test]
+fn a_fixed_cut_records_a_landing_on_an_unrecorded_release_as_a_member_beside_it() {
+    // Given: [`first_fixed_cut`] W1; P8 composed by hand of W1 and
+    // `feat/gamma`, pushed and not recorded; then P9, a merge of P8 and
+    // `fix/landing`, a branch whose base is P8; pushed.
+    let (lab, home, _) = first_fixed_cut();
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let p8 = compose_integration(&lab, &["integration", "feat/gamma"]);
+    publish_integration(&lab);
+    let landing = commit_on(&lab, "fix/landing", p8.as_str(), "landing.txt");
+    compose_integration(&lab, &[p8.as_str(), "fix/landing"]);
+    let p9 = publish_integration(&lab);
+
+    // When: a plain cut runs; then P8 is recorded with --at, and the plain
+    // cut runs again.
+    let before = ledger_len(&home);
+    let refused = knives_release(&lab, &home, &["cut"]);
+    assert_refused_until_recorded(&refused, (&home, before), &p9, &[&p8, &landing]);
+    record_at(&lab, &home, &p8);
+    let output = knives_release(&lab, &home, &["cut"]);
+
+    // Then: it records P9 with P8 as its carrier and the landing as a
+    // member.
+    assert_recorded_with((&output, &home), &p9, &p8, &[&landing]);
+}
+
+/// A fixed release branch cut of `feat/alpha` and pushed; `feat/beta`
+/// included and pushed; `feat/gamma` included and not pushed, so that edit
+/// stays visible; then the release's bookmark moved back to the pushed
+/// edit. Returns the lab, its home, the pushed edit, the edit not pushed and
+/// `feat/gamma`'s commit.
+fn visible_unpushed_edit_lab() -> (
+    Lab,
+    tempfile::TempDir,
+    knives::ids::CommitId,
+    knives::ids::CommitId,
+    knives::ids::CommitId,
+) {
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let home = fixed_release_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both_streams(&first));
+    publish_integration(&lab);
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let included = knives_release(&lab, &home, &["include", "feat/beta"]);
+    assert!(included.status.success(), "{}", both_streams(&included));
+    let published = publish_integration(&lab);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
+    assert!(included.status.success(), "{}", both_streams(&included));
+    let unpushed = commit_at(&lab, "integration");
+    lab.jj_work([
+        "bookmark",
+        "set",
+        "integration",
+        "-r",
+        published.as_str(),
+        "--allow-backwards",
+    ]);
+    assert!(
+        lab::is_visible(&lab, &unpushed),
+        "fixture: the edit stays visible"
+    );
+    let gamma = commit_at(&lab, "feat/gamma");
+    (lab, home, published, unpushed, gamma)
+}
+
+#[test]
+fn a_fixed_cut_with_corrects_refuses_a_newest_write_still_visible_and_writes_nothing() {
+    // Given: [`visible_unpushed_edit_lab`].
+    let (lab, home, published, unpushed, gamma) = visible_unpushed_edit_lab();
+    let before = ledger_len(&home);
+
+    // When: the cut runs with --corrects naming the visible edit.
+    let corrected = knives_release(&lab, &home, &["cut", "--corrects", unpushed.as_str()]);
+
+    // Then: it is refused, as the edit is not abandoned, with how to keep it
+    // and how to withdraw it, and nothing is written.
+    let out = both_streams(&corrected);
+    assert_eq!(corrected.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut integration --corrects {}: the recorded edit {} is visible, so \
+             it is not abandoned, and a correction withdraws only a write nothing keeps: to keep \
+             it, move integration to it (`jj bookmark set integration -r {} --allow-backwards`) \
+             and push it; to withdraw it, abandon it first (`jj abandon {}`); nothing was written",
+            unpushed.as_str(),
+            unpushed.short(),
+            unpushed.short(),
+            unpushed.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(ledger_len(&home), before, "{out}");
+
+    // When: it is abandoned, as the refusal says, and the cut runs again.
+    lab.jj_work(["abandon", unpushed.as_str()]);
+    let corrected = knives_release(&lab, &home, &["cut", "--corrects", unpushed.as_str()]);
+
+    // Then: the withdrawal and the cut are written, and the withdrawal's
+    // line names `feat/gamma`, which only the withdrawn edit held and the
+    // published commit does not carry.
+    let out = both_streams(&corrected);
+    assert_ne!(corrected.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: withdrew integration's recorded write (an edit) {}: integration@origin never \
+             held it, and the cut of {} records the published commit in its place; {} does not \
+             carry 1 member(s) of it: feat/gamma@{}\n",
+            unpushed.short(),
+            published.short(),
+            published.short(),
+            gamma.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(ledger_len(&home), before + 2, "{out}");
+}
+
+/// The fix-forward a refusal gives past `published`, the publish remote's
+/// commit of `integration`, for `what` the subject lacks: a merge of
+/// `published` and a branch that carries it, pushed, then the cut again.
+fn fix_forward_text(published: &knives::ids::CommitId, what: &str) -> String {
+    format!(
+        "to carry {what}, make integration a merge of {p} and a branch that carries it (`jj new \
+         {p} <branch> -m 'integration, fixed forward on {p}'`, `jj bookmark set integration -r \
+         @`, then `jj new 'trunk()'`), push integration, then cut again, which records that \
+         merge with {p} as its carrier",
+        p = published.short()
+    )
+}
+
+/// The clause a refusal gives after `nothing was recorded; ` where
+/// `published`, the publish remote's commit of `integration`, holds commits
+/// that `write`, its newest recorded write, lacks: record `published` as it
+/// is, each drop named, then the fix-forward past it; never the move back
+/// to the write.
+fn record_then_fix_forward(
+    published: &knives::ids::CommitId,
+    write: &knives::ids::CommitId,
+) -> String {
+    format!(
+        "integration@origin ({p}) holds commits that {w}, its newest recorded write, lacks, and \
+         knives never moves integration behind its publish remote: re-run with --allow-drop \
+         naming each drop below, which records {p} as it is and names each drop; then, {}",
+        fix_forward_text(published, "what this cut lacks"),
+        p = published.short(),
+        w = write.short()
+    )
+}
+
+/// Each value the `  name each drop: --allow-drop …` line of `out` gives,
+/// as `--allow-drop VALUE` arguments for the run that states them.
+fn named_drops(out: &str) -> Vec<String> {
+    let line = out
+        .lines()
+        .find_map(|line| line.strip_prefix("  name each drop: "))
+        .unwrap_or_else(|| panic!("no `name each drop:` line: {out}"));
+    line.split("--allow-drop ")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .flat_map(|value| ["--allow-drop".to_owned(), value.to_owned()])
+        .collect()
+}
+
+/// A cut of `integration` with `drops` ([`named_drops`]) stated.
+fn cut_dropping(lab: &Lab, home: &tempfile::TempDir, drops: &[String]) -> std::process::Output {
+    let mut args = vec!["cut"];
+    args.extend(drops.iter().map(String::as_str));
+    knives_release(lab, home, &args)
+}
+
+#[test]
+fn a_fixed_cut_lacking_a_fix_past_its_newest_write_records_it_then_names_a_fix_forward() {
+    // Given: a fixed release branch cut of `feat/alpha` and `feat/beta`,
+    // fixed by hand in place and adopted, the newest recorded write, and
+    // pushed; then the branch published outside knives on that adopt, as
+    // oh-my-pi's Cut9 is on its Cut7: a merge of the adopt and `feat/gamma`
+    // whose own tree changes the fixed file, pushed.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let home = fixed_release_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both_streams(&first));
+    lab::edit_by_hand(&lab, "integration", &[("fix.txt", "fixed by hand\n")]);
+    lab::adopt(&lab, &home, "integration", "a fix by hand");
+    let adopt = publish_integration(&lab);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    lab.jj_work([
+        "new",
+        "-r",
+        "integration",
+        "-r",
+        "feat/gamma",
+        "-m",
+        "integration, published by hand",
+    ]);
+    std::fs::write(lab.work_path().join("fix.txt"), "changed by hand\n").expect("write fix.txt");
+    lab.jj_work(["bookmark", "set", "integration", "-r", "@"]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let published = publish_integration(&lab);
+    let before = ledger_len(&home);
+
+    // When: a plain cut runs.
+    let output = knives_release(&lab, &home, &["cut"]);
+
+    // Then: it is refused, naming the adopt's fix. Its remedy records the
+    // published commit as it is, the drop named, then carries the fix past
+    // it: never the move of `integration` back to the adopt, behind what
+    // the publish remote holds, nor an edit by hand, which would rewrite the
+    // published commit. Nothing is written, and no bookmark moves.
+    let out = both_streams(&output);
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut: this cut does not carry the fix by hand of integration's \
+             adopt {}, in 1 file(s): fix.txt\n  nothing was recorded; {}\n  name each drop: \
+             --allow-drop fix.txt\n",
+            adopt.short(),
+            record_then_fix_forward(&published, &adopt)
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("--allow-backwards"), "{out}");
+    assert!(!out.contains("by hand to hold it"), "{out}");
+    assert_eq!(ledger_len(&home), before, "{out}");
+    assert_eq!(commit_at(&lab, "integration"), published);
+    assert_eq!(commit_at(&lab, "integration@origin"), published);
+
+    // When: the cut runs again with the drop it names.
+    let recorded = cut_dropping(&lab, &home, &named_drops(&out));
+
+    // Then: it records the published commit as it is: the adopt its carrier
+    // and `feat/gamma` a member.
+    let gamma = commit_at(&lab, "feat/gamma");
+    assert_recorded_with((&recorded, &home), &published, &adopt, &[&gamma]);
+
+    // When: the fix-forward is made as the refusal says, with a branch on
+    // the published commit that puts the fix back, and pushed; then the cut
+    // runs again.
+    lab.jj_work(["new", "-r", published.as_str(), "-m", "fix/forward"]);
+    std::fs::write(lab.work_path().join("fix.txt"), "fixed by hand\n").expect("write fix.txt");
+    lab.jj_work(["bookmark", "create", "fix/forward", "-r", "@"]);
+    let message = format!("integration, fixed forward on {}", published.short());
+    lab.jj_work([
+        "new",
+        "-r",
+        published.as_str(),
+        "-r",
+        "fix/forward",
+        "-m",
+        message.as_str(),
+    ]);
+    lab.jj_work(["bookmark", "set", "integration", "-r", "@"]);
+    lab.jj_work(["new", "-r", "main@origin"]);
+    let forward = publish_integration(&lab);
+    let output = knives_release(&lab, &home, &["cut"]);
+
+    // Then: it records the merge with the published commit, now the newest
+    // recorded write, as its carrier and the branch as a member, and drops
+    // nothing.
+    let branch = commit_at(&lab, "fix/forward");
+    assert_recorded_with((&output, &home), &forward, &published, &[&branch]);
+    let out = both_streams(&output);
+    assert!(!out.contains("--allow-drop"), "{out}");
+}
+
+/// [`visible_unpushed_edit_lab`], then `integration` published outside
+/// knives on the pushed edit: a merge of it and `feat/delta`, pushed. The
+/// edit not pushed, the newest recorded write, is beside that merge, not
+/// under it. Returns the lab, its home, the published merge and the edit
+/// not pushed.
+fn published_beside_the_newest_write_lab() -> (
+    Lab,
+    tempfile::TempDir,
+    knives::ids::CommitId,
+    knives::ids::CommitId,
+) {
+    let (lab, home, pushed, unpushed, _gamma) = visible_unpushed_edit_lab();
+    lab.branch("feat/delta", "delta.txt", "delta\n");
+    compose_integration(&lab, &[pushed.as_str(), "feat/delta"]);
+    let published = publish_integration(&lab);
+    (lab, home, published, unpushed)
+}
+
+#[test]
+fn a_fixed_cut_and_its_correction_never_move_the_branch_to_a_write_beside_its_published_commit() {
+    // Given: [`published_beside_the_newest_write_lab`].
+    let (lab, home, published, unpushed) = published_beside_the_newest_write_lab();
+    let before = ledger_len(&home);
+
+    // When: a plain cut runs, then the cut with --corrects naming the edit.
+    let plain = knives_release(&lab, &home, &["cut"]);
+    let corrected = knives_release(&lab, &home, &["cut", "--corrects", unpushed.as_str()]);
+
+    // Then: both are refused, write nothing and move no bookmark. The plain
+    // cut lacks `feat/gamma`, which only the edit holds, and names the
+    // record of the published merge, then the fix-forward on it; the
+    // correction names the edit's abandon and the correction again, which
+    // records the published merge, then the fix-forward for what the edit
+    // held. Neither names the move of `integration` to the edit, which would
+    // leave the published merge behind.
+    let plain_out = both_streams(&plain);
+    assert_eq!(plain.status.code(), Some(3), "{plain_out}");
+    assert!(
+        plain_out.contains(&format!(
+            "  nothing was recorded; {}\n  name each drop: --allow-drop {}\n",
+            record_then_fix_forward(&published, &unpushed),
+            commit_at(&lab, "feat/gamma").short()
+        )),
+        "{plain_out}"
+    );
+    let corrected_out = both_streams(&corrected);
+    assert_eq!(corrected.status.code(), Some(3), "{corrected_out}");
+    assert!(
+        corrected_out.contains(&format!(
+            "demo: refusing to cut integration --corrects {}: the recorded edit {u} is visible, \
+             so it is not abandoned, and a correction withdraws only a write nothing keeps; \
+             integration@origin ({p}) holds commits that it lacks, and knives never moves \
+             integration behind its publish remote: abandon it (`jj abandon {u}`) and run this \
+             again, which records {p} and names each member of it that {p} lacks; then, {}; \
+             nothing was written",
+            unpushed.as_str(),
+            fix_forward_text(&published, "what it held"),
+            u = unpushed.short(),
+            p = published.short()
+        )),
+        "{corrected_out}"
+    );
+    for out in [&plain_out, &corrected_out] {
+        assert!(!out.contains("--allow-backwards"), "{out}");
+    }
+    assert_eq!(ledger_len(&home), before);
+    assert_eq!(commit_at(&lab, "integration"), published);
+    assert_eq!(commit_at(&lab, "integration@origin"), published);
+}
+
+#[test]
+fn a_fixed_cut_in_a_clone_without_the_newest_write_says_to_fetch_and_cut_again_never_to_move() {
+    // Given: [`published_beside_the_newest_write_lab`] with `feat/gamma`
+    // pushed, and the second clone fetched: it holds the published merge
+    // and `feat/gamma`, and not the edit, so nothing there can tell whether
+    // the edit holds the published merge.
+    let (lab, home, published, unpushed) = published_beside_the_newest_write_lab();
+    lab.push_branch("feat/gamma");
+    let upstream = lab.upstream.display().to_string();
+    lab.jj_at(
+        &lab.second,
+        ["git", "remote", "add", "upstream", upstream.as_str()],
+    );
+    lab.jj_at(&lab.second, ["git", "fetch", "--all-remotes"]);
+    let before = ledger_len(&home);
+
+    // When: a plain cut runs in the second clone.
+    let output = lab::knives_command(
+        &lab.second,
+        home.path(),
+        lab.temp_path(),
+        &["--text", "release", "--repo", "demo", "cut"],
+    )
+    .output()
+    .expect("run knives in the second clone");
+
+    // Then: it is refused, naming the edit it cannot hold, with the fetch
+    // and the cut again, never the move of `integration` to the edit; and
+    // nothing is written.
+    let out = both_streams(&output);
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "  nothing was recorded; fetch, then cut again: this repository does not hold {u}, \
+             integration's newest recorded write, so it cannot tell whether that write holds \
+             integration@origin ({p}), and knives never moves integration behind its publish \
+             remote; if the fetch does not bring {u}, `knives release adopt integration` records \
+             the commit this repository holds as integration's newest write, or re-run with \
+             --allow-drop to state the drop is intended\n",
+            u = unpushed.short(),
+            p = published.short()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("--allow-backwards"), "{out}");
+    assert_eq!(ledger_len(&home), before, "{out}");
+}
+
+#[test]
+fn a_fixed_cut_beside_its_newest_write_records_the_published_merge_then_the_fix_forward_on_it() {
+    // Given: [`published_beside_the_newest_write_lab`]: the published merge
+    // is on an earlier write, beside the newest one, and lacks
+    // `feat/gamma`, which only the newest write holds. The plain cut is
+    // refused: record the published merge as it is, then the fix-forward.
+    let (lab, home, published, unpushed) = published_beside_the_newest_write_lab();
+    let refused = knives_release(&lab, &home, &["cut"]);
+    let out = both_streams(&refused);
+    assert_eq!(refused.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&record_then_fix_forward(&published, &unpushed)),
+        "{out}"
+    );
+
+    // When: the cut runs again with the drop it names.
+    let recorded = cut_dropping(&lab, &home, &named_drops(&out));
+
+    // Then: it records the published merge as it is, the pushed edit its
+    // carrier and `feat/delta` a member.
+    let (pushed, delta) = (
+        lab::release_parents(&lab, "integration")[0].clone(),
+        commit_at(&lab, "feat/delta"),
+    );
+    assert_recorded_with((&recorded, &home), &published, &pushed, &[&delta]);
+
+    // When: the fix-forward is made as the refusal prints it, with
+    // `feat/gamma` as the branch, and pushed; then the cut runs again.
+    let message = format!("integration, fixed forward on {}", published.short());
+    lab.jj_work([
+        "new",
+        published.short(),
+        "feat/gamma",
+        "-m",
+        message.as_str(),
+    ]);
+    lab.jj_work(["bookmark", "set", "integration", "-r", "@"]);
+    lab.jj_work(["new", "trunk()"]);
+    let forward = publish_integration(&lab);
+    let output = knives_release(&lab, &home, &["cut"]);
+
+    // Then: the push kept the published merge in the branch's history, and
+    // the cut records the fix-forward with the published merge, its first
+    // parent and now the newest recorded write, as its carrier and
+    // `feat/gamma` as its member, dropping nothing.
+    let opened = Repo::open(&lab.work).expect("open work checkout");
+    assert!(
+        opened
+            .is_ancestor(&published, &forward)
+            .expect("read ancestry"),
+        "the push left the published merge behind"
+    );
+    let gamma = commit_at(&lab, "feat/gamma");
+    assert_recorded_with((&output, &home), &forward, &published, &[&gamma]);
+    let out = both_streams(&output);
+    assert!(!out.contains("--allow-drop"), "{out}");
+    assert!(
+        !records_member(&newest_integration_event(&home), &published),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_recorded_write_with_an_empty_commit_never_brings_back_the_move_behind_the_published_commit() {
+    // Given: [`published_beside_the_newest_write_lab`], and a peer's cut
+    // event of `integration`, older than every write here, whose commit is
+    // empty, as a peer's ledger can carry.
+    let (lab, home, published, unpushed) = published_beside_the_newest_write_lab();
+    let alpha = commit_at(&lab, "feat/alpha");
+    std::fs::write(
+        home.path()
+            .join("ledger")
+            .join("demo")
+            .join("20260101T000000.000000000Z-0000.md"),
+        format!(
+            "+++\n\
+             ts = \"2026-01-01T00:00:00Z\"\n\
+             owner = \"a-peer\"\n\
+             subject = \"integration\"\n\
+             kind = \"event\"\n\
+             evidence = [\"\", \"{}\"]\n\
+             +++\n\
+             cut integration as  with 1 parent(s): feat/alpha@{}\n",
+            alpha.as_str(),
+            alpha.short()
+        ),
+    )
+    .expect("write a peer's cut event by hand");
+    let before = ledger_len(&home);
+
+    // When: a plain cut runs.
+    let output = knives_release(&lab, &home, &["cut"]);
+
+    // Then: the empty commit names no write, so the refusal still names the
+    // record of the published merge and the fix-forward on it, never the
+    // move of `integration` to the newest write; nothing is written.
+    let out = both_streams(&output);
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "  nothing was recorded; {}\n",
+            record_then_fix_forward(&published, &unpushed)
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("--allow-backwards"), "{out}");
+    assert_eq!(ledger_len(&home), before, "{out}");
+}
+
+#[test]
+fn a_fixed_cut_with_corrects_refuses_a_write_the_publish_remote_holds_or_descends_from() {
+    // Given: [`first_fixed_cut`]: the publish remote holds the newest
+    // recorded write.
+    let (lab, home, cut) = first_fixed_cut();
+    let before = ledger_len(&home);
+    let refusal = |published: &knives::ids::CommitId| {
+        format!(
+            "demo: refusing to cut integration --corrects {}: integration@origin ({}) holds that \
+             write or a rewrite of it, so it was published; nothing was written",
+            cut.as_str(),
+            published.short()
+        )
+    };
+
+    // When: the cut runs with --corrects naming that write.
+    let held = knives_release(&lab, &home, &["cut", "--corrects", cut.as_str()]);
+
+    // Then: it is refused as published, and nothing is written.
+    let out = both_streams(&held);
+    assert_eq!(held.status.code(), Some(3), "{out}");
+    assert!(out.contains(&refusal(&cut)), "{out}");
+    assert_eq!(ledger_len(&home), before, "{out}");
+
+    // When: the branch is composed by hand on that write with `feat/gamma`
+    // and pushed, so the publish remote descends from it, and the cut runs
+    // with --corrects naming it again.
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    compose_integration(&lab, &["integration", "feat/gamma"]);
+    let published = publish_integration(&lab);
+    let descended = knives_release(&lab, &home, &["cut", "--corrects", cut.as_str()]);
+
+    // Then: it is refused as published, and nothing is written.
+    let out = both_streams(&descended);
+    assert_eq!(descended.status.code(), Some(3), "{out}");
+    assert!(out.contains(&refusal(&published)), "{out}");
+    assert_eq!(ledger_len(&home), before, "{out}");
+}
+
+#[test]
+fn a_fixed_cut_with_corrects_refuses_a_write_whose_rewrite_the_publish_remote_holds() {
+    // Given: a fixed release branch cut by knives and not pushed, then
+    // reworded (`jj describe`, the same change under a new commit) and the
+    // rewrite pushed: the cut is hidden, and the publish remote holds its
+    // rewrite.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let home = fixed_release_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both_streams(&first));
+    let cut = commit_at(&lab, "integration");
+    lab.jj_work([
+        "describe",
+        "-r",
+        "integration",
+        "-m",
+        "integration, reworded",
+    ]);
+    let published = publish_integration(&lab);
+    assert_ne!(published, cut, "fixture: the rewrite is a new commit");
+    assert!(!lab::is_visible(&lab, &cut), "fixture: the cut is hidden");
+    let before = ledger_len(&home);
+
+    // When: the cut runs with --corrects naming the cut.
+    let corrected = knives_release(&lab, &home, &["cut", "--corrects", cut.as_str()]);
+
+    // Then: it is refused as published, and nothing is written.
+    let out = both_streams(&corrected);
+    assert_eq!(corrected.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut integration --corrects {}: integration@origin ({}) holds that \
+             write or a rewrite of it, so it was published; nothing was written",
+            cut.as_str(),
+            published.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(ledger_len(&home), before, "{out}");
+}
+
+#[test]
+fn a_fixed_cut_with_corrects_refuses_a_write_whose_rewrite_a_later_published_commit_holds() {
+    // Given: a fixed release cut by knives and not pushed, reworded and
+    // pushed, then a later published commit made on that rewrite. The
+    // original cut is hidden, but the publish remote holds its rewrite in
+    // history.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let home = fixed_release_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both_streams(&first));
+    let cut = commit_at(&lab, "integration");
+    lab.jj_work([
+        "describe",
+        "-r",
+        "integration",
+        "-m",
+        "integration, reworded",
+    ]);
+    let rewrite = publish_integration(&lab);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    compose_integration(&lab, &[rewrite.as_str(), "feat/gamma"]);
+    let published = publish_integration(&lab);
+    assert!(!lab::is_visible(&lab, &cut), "fixture: the cut is hidden");
+    let before = ledger_len(&home);
+
+    // When: the cut runs with --corrects naming the hidden original cut.
+    let corrected = knives_release(&lab, &home, &["cut", "--corrects", cut.as_str()]);
+
+    // Then: it is refused as published, and nothing is written.
+    let out = both_streams(&corrected);
+    assert_eq!(corrected.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut integration --corrects {}: integration@origin ({}) holds that \
+             write or a rewrite of it, so it was published; nothing was written",
+            cut.as_str(),
+            published.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(ledger_len(&home), before, "{out}");
+}
+
+#[test]
+fn a_fixed_cut_with_corrects_refuses_a_composition_in_hand_that_is_not_the_published_commit() {
+    // Given: [`unpushed_cut_lab`], then `feat/delta` and the branch composed
+    // by hand on the published commit, not pushed.
+    let state = unpushed_cut_lab();
+    let (lab, home, before) = (&state.lab, &state.home, state.events());
+    lab.branch("feat/delta", "delta.txt", "delta\n");
+    let local = compose_integration(lab, &["integration", "feat/delta"]);
+
+    // When: the cut runs with --corrects naming the abandoned cut.
+    let corrected = knives_release(lab, home, &["cut", "--corrects", state.wrong.as_str()]);
+
+    // Then: it is refused, naming the move to the published commit; nothing
+    // is written, and the bookmark stays.
+    let out = both_streams(&corrected);
+    assert_eq!(corrected.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut integration --corrects {}: the composition in hand is not \
+             integration@origin ({}), the commit a correction records: `jj bookmark set \
+             integration -r {} --allow-backwards` moves it there; nothing was written",
+            state.wrong.as_str(),
+            state.published.short(),
+            state.published.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(state.events(), before, "{out}");
+    assert_eq!(commit_at(lab, "integration"), local);
 }
 
 #[test]
@@ -2381,12 +3770,14 @@ fn a_cut_refuses_to_drop_a_fix_an_adopt_recorded_after_the_previous_cut() {
     );
 }
 
-/// A cut of `feat/alpha` and `feat/beta`, then `fix.txt` added by hand in
+/// A cut of `feat/alpha` and `feat/beta`, then `files` added by hand in
 /// place (`jj squash` into the release, which keeps its change id) and
 /// adopted, which the ledger records as the release's newest write; then
 /// the release's bookmark back at the cut's commit, as a machine that never
 /// fetched the adopt has it. Returns the adopt's commit.
-fn release_behind_its_adopted_fix() -> (Lab, tempfile::TempDir, knives::ids::CommitId) {
+fn release_behind_its_adopted_fix(
+    files: &[&str],
+) -> (Lab, tempfile::TempDir, knives::ids::CommitId) {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
@@ -2395,7 +3786,9 @@ fn release_behind_its_adopted_fix() -> (Lab, tempfile::TempDir, knives::ids::Com
     assert!(first.status.success(), "{}", both_streams(&first));
     let cut = commit_at(&lab, "release/2026-08-04");
     lab.jj_work(["new", "-r", "release/2026-08-04"]);
-    std::fs::write(lab.work_path().join("fix.txt"), "fixed by hand\n").expect("write fix.txt");
+    for file in files {
+        std::fs::write(lab.work_path().join(file), "fixed by hand\n").expect("write the fix");
+    }
     lab.jj_work(["squash", "--into", "release/2026-08-04"]);
     lab.jj_work(["new", "-r", "main@origin"]);
     let adopted = knives_release(
@@ -2418,25 +3811,101 @@ fn release_behind_its_adopted_fix() -> (Lab, tempfile::TempDir, knives::ids::Com
 }
 
 #[test]
-fn a_cut_without_a_fix_an_adopt_recorded_goes_ahead_under_allow_drop_and_names_the_adopt() {
+fn a_cut_without_a_fix_an_adopt_recorded_goes_ahead_only_where_allow_drop_names_each_file() {
     // Given: the release's bookmark back at the cut, behind the adopt of its
-    // fix by hand.
-    let (lab, home, adopt) = release_behind_its_adopted_fix();
+    // fix by hand at `also.txt` and `fix.txt`.
+    let (lab, home, adopt) = release_behind_its_adopted_fix(&["also.txt", "fix.txt"]);
+    let not_cut = || {
+        Repo::open(&lab.work)
+            .expect("open work checkout")
+            .resolve_commit("release/2026-08-05")
+            .is_err()
+    };
 
-    // When: the next release is cut, the drop stated.
-    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05", "--allow-drop"]);
+    // When: the next release is cut with the drop of one file stated.
+    let one = knives_release(
+        &lab,
+        &home,
+        &["cut", "release/2026-08-05", "--allow-drop", "fix.txt"],
+    );
 
-    // Then: it is cut without the fix, and both its line and its event name
-    // the adopt, its release and its commit.
-    let out = both_streams(&output);
-    assert_eq!(output.status.code(), Some(0), "{out}");
+    // Then: it is refused, naming the adopt and both files, and giving the
+    // `--allow-drop` of each; nothing is cut.
+    let out = both_streams(&one);
+    assert_eq!(one.status.code(), Some(3), "{out}");
     assert!(
         out.contains(&format!(
-            "demo: --allow-drop: cutting without the fix by hand of release/2026-08-04's adopt \
-             {}, in 1 file(s): fix.txt\n",
+            "demo: refusing to cut: this cut does not carry the fix by hand of \
+             release/2026-08-04's adopt {}, in 2 file(s): also.txt, fix.txt\n",
             adopt.short()
         )),
         "{out}"
+    );
+    assert!(
+        out.contains("  name each drop: --allow-drop also.txt --allow-drop fix.txt\n"),
+        "{out}"
+    );
+    assert!(not_cut(), "{out}");
+
+    // When: both drops are stated, and one more value that names no drop.
+    let stray = knives_release(
+        &lab,
+        &home,
+        &[
+            "cut",
+            "release/2026-08-05",
+            "--allow-drop",
+            "also.txt",
+            "--allow-drop",
+            "fix.txt",
+            "--allow-drop",
+            "nothing.txt",
+        ],
+    );
+
+    // Then: it is refused for that value, no line says the cut goes without
+    // a file, and nothing is cut.
+    let stray_out = both_streams(&stray);
+    assert_eq!(stray.status.code(), Some(3), "{stray_out}");
+    assert!(
+        stray_out.contains(
+            "demo: refusing: --allow-drop nothing.txt names no drop of this write; nothing was \
+             written\n"
+        ),
+        "{stray_out}"
+    );
+    assert!(
+        !stray_out.contains("--allow-drop: cutting without"),
+        "{stray_out}"
+    );
+    assert!(not_cut(), "{stray_out}");
+
+    // When: each drop is stated, one file by the adopt and its path.
+    let adopt_file = format!("{}:fix.txt", adopt.short());
+    let both = knives_release(
+        &lab,
+        &home,
+        &[
+            "cut",
+            "release/2026-08-05",
+            "--allow-drop",
+            "also.txt",
+            "--allow-drop",
+            &adopt_file,
+        ],
+    );
+
+    // Then: it is cut without the fix, and both its line and its event name
+    // the adopt, its release, its commit and both files.
+    let both_out = both_streams(&both);
+    assert_eq!(both.status.code(), Some(0), "{both_out}");
+    assert!(
+        both_out.contains(&format!(
+            "demo: --allow-drop: cutting without the fix by hand of release/2026-08-04's adopt \
+             {}, in 2 file(s): also.txt, fix.txt\n",
+            adopt.short()
+        )),
+        "{both_out}"
     );
     let entries = knives::ledger::Ledger::at(home.path().join("ledger").join("demo"))
         .read()
@@ -2450,7 +3919,7 @@ fn a_cut_without_a_fix_an_adopt_recorded_goes_ahead_under_allow_drop_and_names_t
     assert!(
         event.text.contains(&format!(
             "; previous cut release/2026-08-04 recorded 2 member(s); all carried; without the fix \
-             by hand of release/2026-08-04's adopt {}",
+             by hand of release/2026-08-04's adopt {}, in 2 file(s): also.txt, fix.txt",
             adopt.short()
         )),
         "{}",

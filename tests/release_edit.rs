@@ -1292,7 +1292,8 @@ fn the_next_cut_abandons_a_cut_a_working_copy_left_behind() {
     lab.jj_work(["new", "main"]);
 
     // When: the next cut reaps the old name.
-    let output = knives_release(&lab, &home, &["cut", "release/2026-08-05", "--allow-drop"]);
+    let (output, _) =
+        lab::knives_release_naming_each_drop(&lab, &home, &["cut", "release/2026-08-05"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
 

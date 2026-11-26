@@ -938,12 +938,20 @@ pub fn members_event_text(members: &[(String, CommitId)]) -> String {
 }
 
 /// The newest parent set recorded for `release`: the last cut, include, drop,
-/// advance or rebase event that wrote one. Empty when nothing was recorded.
+/// advance or rebase event that wrote one, a withdrawn write's aside
+/// ([`Withdrawn`]). Empty when nothing was recorded.
 pub fn last_recorded_parents<'a>(entries: &'a [Entry], release: &str) -> &'a [RecordedParent] {
+    let withdrawn = Withdrawn::read(entries);
     entries
         .iter()
         .rev()
         .filter(|entry| entry.kind == Kind::Event && entry.subject.as_deref() == Some(release))
+        .filter(|entry| {
+            entry
+                .evidence
+                .first()
+                .is_none_or(|write| !withdrawn.withdraws(release, &CommitId::new(write.as_str())))
+        })
         .map(|entry| entry.parents.as_slice())
         .find(|parents| !parents.is_empty())
         .unwrap_or_default()
@@ -1043,30 +1051,136 @@ pub fn carries_member_line(
     )
 }
 
-/// The newest structural cut event, optionally scoped to a release name.
+/// The newest structural cut event, optionally scoped to a release name: the
+/// newest cut event ([`cut_record`]) whose write no event withdraws
+/// ([`Withdrawn`]).
 pub fn last_recorded_cut(entries: &[Entry], subject: Option<&str>) -> Option<RecordedCut> {
-    entries.iter().rev().find_map(|entry| {
-        let entry_subject = entry.subject.as_deref()?;
-        if subject.is_some_and(|subject| subject != entry_subject)
-            || entry.kind != Kind::Event
-            || !entry.text.starts_with(&format!("cut {entry_subject} as "))
-        {
-            return None;
-        }
-        let (commit, members) = entry.evidence.split_first()?;
-        if members.is_empty() {
-            return None;
-        }
-        Some(RecordedCut {
-            kind: RecordedWriteKind::Cut,
-            name: entry_subject.to_owned(),
-            commit: CommitId::new(commit.as_str()),
-            members: members
-                .iter()
-                .map(|sha| CommitId::new(sha.as_str()))
-                .collect(),
-        })
+    let withdrawn = Withdrawn::read(entries);
+    entries
+        .iter()
+        .rev()
+        .filter(|entry| subject.is_none_or(|subject| entry.subject.as_deref() == Some(subject)))
+        .filter_map(cut_record)
+        .find(|cut| !withdrawn.withdraws(&cut.name, &cut.commit))
+}
+
+/// The cut `entry` records, read from it alone: an event whose text begins
+/// `cut <subject> as `, its evidence the commit and then its parents. The
+/// members are the parents less each one that its parent set labels as a
+/// carrier ([`carrier_label`]): the published commit of a fixed branch that a
+/// cut records may have the release it followed as a parent, and that is an
+/// earlier write, never a member. `None` for any other entry, and for a cut
+/// event with no member.
+fn cut_record(entry: &Entry) -> Option<RecordedCut> {
+    let subject = entry.subject.as_deref()?;
+    if entry.kind != Kind::Event || !entry.text.starts_with(&format!("cut {subject} as ")) {
+        return None;
+    }
+    let commit = entry.evidence.first()?;
+    let carrier = carrier_label(subject);
+    let members = event_members(entry, |parent| parent.branches.contains(&carrier));
+    if members.is_empty() {
+        return None;
+    }
+    Some(RecordedCut {
+        kind: RecordedWriteKind::Cut,
+        name: subject.to_owned(),
+        commit: CommitId::new(commit.as_str()),
+        members,
     })
+}
+
+/// What the text of an event that withdraws a recorded write begins with,
+/// after `withdrew ` and the release ([`withdrawal_text`]).
+const WITHDREW: &str = "'s recorded write ";
+
+/// The text of the event that withdraws a recorded write of `release`.
+///
+/// `write`, of `kind`, is one that `remote`, the publish remote, never
+/// held: `withdrew <release>'s recorded write (a cut) <commit>: …`, naming
+/// `published`, the commit that `cut --corrects` records in its place. The
+/// event's evidence is the write, then `published` ([`withdrawn_write`]).
+pub fn withdrawal_text(
+    release: &str,
+    (kind, write): (RecordedWriteKind, &CommitId),
+    (remote, published): (&str, &CommitId),
+) -> String {
+    let kind = match kind {
+        RecordedWriteKind::Cut => "a cut",
+        RecordedWriteKind::Edit => "an edit",
+    };
+    format!(
+        "withdrew {release}{WITHDREW}({kind}) {}: {release}@{remote} never held it, and the cut \
+         of {} records the published commit in its place",
+        write.short(),
+        published.short()
+    )
+}
+
+/// The recorded write of `release` that `entry` withdraws.
+///
+/// It is the entry's first evidence, where it is an event of `release`
+/// whose text begins `withdrew <release>'s recorded write `
+/// ([`withdrawal_text`]). `None` for any other entry.
+pub fn withdrawn_write(entry: &Entry, release: &str) -> Option<CommitId> {
+    if entry.kind != Kind::Event || entry.subject.as_deref() != Some(release) {
+        return None;
+    }
+    entry
+        .text
+        .strip_prefix("withdrew ")?
+        .strip_prefix(release)?
+        .strip_prefix(WITHDREW)?;
+    entry
+        .evidence
+        .first()
+        .map(|write| CommitId::new(write.as_str()))
+}
+
+/// Every recorded write that an event of `entries` withdraws, each with its
+/// release ([`withdrawn_write`]).
+///
+/// A write of a fixed branch that the publish remote never held is withdrawn
+/// by the cut that records the branch's published commit in its place
+/// (`cut --corrects`). Every reader of the release's writes then reads it as
+/// never written: it is no previous cut, no newest write, no earlier write and
+/// no reference of a fix by hand ([`recorded_write_events`],
+/// [`last_recorded_cut`], [`last_series_cut`], [`last_recorded_parents`]).
+#[derive(Debug, Default)]
+pub struct Withdrawn<'a>(Vec<(&'a str, CommitId)>);
+
+impl<'a> Withdrawn<'a> {
+    pub fn read(entries: &'a [Entry]) -> Self {
+        Self(
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let release = entry.subject.as_deref()?;
+                    withdrawn_write(entry, release).map(|write| (release, write))
+                })
+                .collect(),
+        )
+    }
+
+    /// Whether `commit`, a recorded write of `release`, is withdrawn. A
+    /// ledger may give either commit short, so one names the other where it
+    /// begins with it and gives at least as much of it as a short commit
+    /// does, 12 characters: a shorter id, as a peer's ledger can carry, would
+    /// withdraw every write whose commit begins with it.
+    pub fn withdraws(&self, release: &str, commit: &CommitId) -> bool {
+        let commit = commit.as_str();
+        self.0.iter().any(|(from, withdrawn)| {
+            let (shorter, longer) = if commit.len() <= withdrawn.as_str().len() {
+                (commit, withdrawn.as_str())
+            } else {
+                (withdrawn.as_str(), commit)
+            };
+            *from == release
+                && !shorter.is_empty()
+                && shorter.len() >= longer.len().min(12)
+                && longer.starts_with(shorter)
+        })
+    }
 }
 
 /// The members a cut or edit event records: its evidence after the commit,
@@ -1139,31 +1253,36 @@ pub fn recorded_write_events<'a>(
     entries: &'a [Entry],
     release: &'a str,
 ) -> impl Iterator<Item = (&'a Entry, RecordedWrite)> + 'a {
-    entries.iter().rev().filter_map(move |entry| {
-        if entry.kind != Kind::Event || entry.subject.as_deref() != Some(release) {
-            return None;
-        }
-        if let Some(cut) = last_recorded_cut(std::slice::from_ref(entry), None) {
-            return Some((
+    let withdrawn = Withdrawn::read(entries);
+    entries
+        .iter()
+        .rev()
+        .filter_map(move |entry| {
+            if entry.kind != Kind::Event || entry.subject.as_deref() != Some(release) {
+                return None;
+            }
+            if let Some(cut) = cut_record(entry) {
+                return Some((
+                    entry,
+                    RecordedWrite {
+                        kind: RecordedWriteKind::Cut,
+                        commit: cut.commit,
+                    },
+                ));
+            }
+            let rest = entry.text.strip_prefix("edited ")?.strip_prefix(release)?;
+            if !(rest.starts_with(':') || rest.starts_with(' ')) {
+                return None;
+            }
+            Some((
                 entry,
                 RecordedWrite {
-                    kind: RecordedWriteKind::Cut,
-                    commit: cut.commit,
+                    kind: RecordedWriteKind::Edit,
+                    commit: CommitId::new(entry.evidence.first()?.as_str()),
                 },
-            ));
-        }
-        let rest = entry.text.strip_prefix("edited ")?.strip_prefix(release)?;
-        if !(rest.starts_with(':') || rest.starts_with(' ')) {
-            return None;
-        }
-        Some((
-            entry,
-            RecordedWrite {
-                kind: RecordedWriteKind::Edit,
-                commit: CommitId::new(entry.evidence.first()?.as_str()),
-            },
-        ))
-    })
+            ))
+        })
+        .filter(move |(_, write)| !withdrawn.withdraws(release, &write.commit))
 }
 
 /// The newest recorded write of the newest release that `entries` record in
@@ -1183,13 +1302,20 @@ pub fn newest_release_write(
     except: Option<&str>,
 ) -> Option<RecordedCut> {
     let (name, event, write) = series_write_events(entries, scheme, except).next()?;
-    let carrier = carrier_label(name);
     Some(RecordedCut {
         kind: write.kind,
         name: name.to_owned(),
         commit: write.commit,
-        members: event_members(event, |parent| parent.branches.contains(&carrier)),
+        members: recorded_write_members(event, name),
     })
+}
+
+/// The members that `event`, a cut or edit event of `release`, records:
+/// its evidence after the write ([`event_members`]), less each parent that
+/// its parent set labels as a carrier ([`carrier_label`]).
+pub fn recorded_write_members(event: &Entry, release: &str) -> Vec<CommitId> {
+    let carrier = carrier_label(release);
+    event_members(event, |parent| parent.branches.contains(&carrier))
 }
 
 /// A recorded write of a series ([`series_writes`]): the release it wrote
@@ -1344,11 +1470,9 @@ pub struct AdoptedFixFiles {
     /// a `fix_files` list ([`Entry::fix_files`]), which an older knives
     /// writes. The text joins a list's files with `, ` and ends the list at
     /// `; ` or ` (why: `, so it cannot tell a path that holds one of those
-    /// from two paths ([`adopted_fix_text`]). A reader that measures the
-    /// adopt holds only those of [`Self::files`] that the adopt's own tree
-    /// holds, beside the files that its change changes; a reader that cannot
-    /// measure it holds each of them, where the text reads whole
-    /// ([`AdoptedFixText::unread`]).
+    /// from two paths ([`adopted_fix_text`]). A reader holds only those of
+    /// [`Self::files`] that the adopt's own tree holds, beside the files
+    /// that its change changes.
     pub from_text: bool,
 }
 
@@ -1357,17 +1481,15 @@ pub struct AdoptedFixFiles {
 const TEXT_SEPARATORS: [&str; 3] = [", ", "; ", " (why: "];
 
 /// The most pieces that a path read from a list of an `adopt` event's text
-/// joins ([`text_paths`]), and that a list read whole has
-/// ([`AdoptedFixText::unread`]).
+/// joins ([`text_paths`]).
 ///
 /// A path that holds up to 15 separators reads back whole; a path that
 /// holds more is not read, as a path that a person names holds a few
-/// separators at most. So a reader that measures the adopt reads its fix's
-/// files from its change, and a reader that cannot measure it cannot read a
-/// list of more pieces whole. The cap bounds the reading of a list of `n`
-/// pieces, which any peer's ledger may carry, to at most `16 * n` paths of
-/// at most 16 pieces each: every run of its pieces would be
-/// `n * (n + 1) / 2` paths, each up to the whole list long.
+/// separators at most, and the adopt's own change names its files. The cap
+/// bounds the reading of a list of `n` pieces, which any peer's ledger may
+/// carry, to at most `16 * n` paths of at most 16 pieces each: every run of
+/// its pieces would be `n * (n + 1) / 2` paths, each up to the whole list
+/// long.
 pub const TEXT_PATH_PIECES: usize = 16;
 
 /// Where each piece of `list`, one list of files in an `adopt` event's
@@ -1430,11 +1552,7 @@ fn text_paths<'a>(lists: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
 }
 
 /// What an `adopt` event of `release` names as the files of its fix by
-/// hand, read once.
-///
-/// It gives the files ([`AdoptedFixText::files`]), and whether a reader
-/// that cannot measure the adopt reads them whole, and why not
-/// ([`AdoptedFixText::unread`]).
+/// hand, read once ([`AdoptedFixText::files`]).
 ///
 /// The files are those it resolved by hand ([`ADOPTED_RESOLVED`]), then
 /// those it changed beyond the baseline's conflicts ([`ADOPTED_BEYOND`]), as
@@ -1457,17 +1575,6 @@ fn text_paths<'a>(lists: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
 /// whole. A path that holds a separator does not read back whole from a
 /// list, so each list gives every path of at most [`TEXT_PATH_PIECES`]
 /// pieces that it may name ([`text_paths`]).
-///
-/// The text reads whole where each path that its lists may name is one that
-/// the text gives. It does not where the text after [`ADOPTED_RESOLVED`]
-/// holds one of the parts that `adopt` writes after that list, once or
-/// more: a path and a reason are free text, so the list may end there or
-/// name a path that holds that part, the text reads two ways, and the
-/// reading that ends the list there may name fewer files
-/// ([`UnreadFixText::Marker`]). Nor does it where a list has more than
-/// [`TEXT_PATH_PIECES`] pieces, as such a list may name a path of more
-/// pieces, which the text does not give ([`UnreadFixText::Pieces`]). The
-/// `fix_files` list reads whole at any length.
 pub fn adopted_fix_text<'a>(entry: &'a Entry, release: &str) -> AdoptedFixText<'a> {
     let Some((_, parts)) = adopted_fix_parts(entry, release) else {
         return AdoptedFixText(FixNames::Nothing);
@@ -1478,25 +1585,8 @@ pub fn adopted_fix_text<'a>(entry: &'a Entry, release: &str) -> AdoptedFixText<'
     let parts = parts
         .rsplit_once("; parents: ")
         .map_or(parts, |(parts, _)| parts);
-    let marker = parts.strip_prefix(ADOPTED_RESOLVED).and_then(|resolved| {
-        RESOLVED_LIST_ENDS
-            .iter()
-            .filter_map(|&end| resolved.find(end).map(|at| (at, end)))
-            .min_by_key(|&(at, _)| at)
-            .map(|(_, end)| end)
-    });
     let (resolved, beyond) = text_lists(parts);
-    let unread = marker.map(UnreadFixText::Marker).or_else(|| {
-        std::iter::once(resolved)
-            .chain(beyond)
-            .any(|list| text_pieces(list).nth(TEXT_PATH_PIECES).is_some())
-            .then_some(UnreadFixText::Pieces)
-    });
-    AdoptedFixText(FixNames::Text {
-        resolved,
-        beyond,
-        unread,
-    })
+    AdoptedFixText(FixNames::Text { resolved, beyond })
 }
 
 /// What an `adopt` event names as the files of its fix by hand, read once
@@ -1513,26 +1603,14 @@ enum FixNames<'a> {
     Listed(&'a [FixFile]),
     /// Its text alone, as an older knives writes it: the files resolved by
     /// hand, then those changed beyond the baseline's conflicts
-    /// ([`text_lists`]), and why the text does not read whole, where it
-    /// does not.
+    /// ([`text_lists`]).
     Text {
         resolved: &'a str,
         beyond: Option<&'a str>,
-        unread: Option<UnreadFixText>,
     },
 }
 
 impl AdoptedFixText<'_> {
-    /// Why a reader that cannot measure the adopt cannot read the files of
-    /// its fix whole from its event, or `None` where it can
-    /// ([`adopted_fix_text`]).
-    pub const fn unread(&self) -> Option<UnreadFixText> {
-        match self.0 {
-            FixNames::Text { unread, .. } => unread,
-            FixNames::Nothing | FixNames::Listed(_) => None,
-        }
-    }
-
     /// The files of the fix, each path once: the `fix_files` list, or every
     /// path that the text's lists may name ([`text_paths`]), at most
     /// [`TEXT_PATH_PIECES`] for each piece of a list.
@@ -1550,9 +1628,7 @@ impl AdoptedFixText<'_> {
                     from_text: false,
                 }
             }
-            FixNames::Text {
-                resolved, beyond, ..
-            } => AdoptedFixFiles {
+            FixNames::Text { resolved, beyond } => AdoptedFixFiles {
                 files: text_paths(std::iter::once(resolved).chain(beyond))
                     .into_iter()
                     .map(str::to_owned)
@@ -1561,18 +1637,6 @@ impl AdoptedFixText<'_> {
             },
         }
     }
-}
-
-/// Why an older `adopt` event's text does not read whole
-/// ([`adopted_fix_text`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnreadFixText {
-    /// The text after its list of files resolved by hand opens holds this
-    /// part, one of [`RESOLVED_LIST_ENDS`]: the list may end there or name a
-    /// path that holds it.
-    Marker(&'static str),
-    /// A list of its files has more than [`TEXT_PATH_PIECES`] pieces.
-    Pieces,
 }
 
 /// The parts that `adopt` writes after an event's list of files resolved by
@@ -1673,7 +1737,7 @@ pub struct EarlierWrites {
     /// ([`carrier_label`]): only a recorded write's own record of its
     /// fast-forward parent writes that label, so the commit is a carrier
     /// though no event records it as a write (a resolution pushed on top of
-    /// a write, then squashed into it and fast-forwarded onto).
+    /// a write, then a parent of the release made again on it).
     labelled: Vec<CommitId>,
 }
 
@@ -1953,6 +2017,7 @@ pub fn last_series_cut(entries: &[Entry], entry: &RepoEntry) -> Option<RecordedC
         return last_recorded_cut(entries, None);
     }
     let scheme = entry.release_scheme();
+    let withdrawn = Withdrawn::read(entries);
     entries
         .iter()
         .rev()
@@ -1962,7 +2027,8 @@ pub fn last_series_cut(entries: &[Entry], entry: &RepoEntry) -> Option<RecordedC
                 .as_deref()
                 .is_some_and(|subject| scheme.owns(subject))
         })
-        .find_map(|recorded| last_recorded_cut(std::slice::from_ref(recorded), None))
+        .filter_map(cut_record)
+        .find(|cut| !withdrawn.withdraws(&cut.name, &cut.commit))
 }
 
 /// What a cut's composition gate holds the cut subject against.
@@ -2408,12 +2474,114 @@ mod unchecked_mark_tests {
 }
 
 #[cfg(test)]
+mod withdrawn_tests {
+    use super::{
+        CommitId, Entry, RecordedParent, RecordedWriteKind, Withdrawn, carrier_label,
+        carrier_tests::event, last_recorded_cut, last_recorded_parents, recorded_writes,
+        withdrawal_text,
+    };
+
+    const RELEASE: &str = "integration";
+
+    fn commit(digit: char) -> CommitId {
+        CommitId::new(digit.to_string().repeat(40))
+    }
+
+    /// A cut of [`RELEASE`] at `created`, whose parents are `member0000000`
+    /// and, where given, `carrier`, labelled as a carrier.
+    fn cut(created: &CommitId, carrier: Option<&CommitId>) -> Entry {
+        let mut entry = event(
+            RELEASE,
+            format!(
+                "cut {RELEASE} as {} with 1 parent(s): feat/member",
+                created.short()
+            ),
+            created,
+        );
+        if let Some(carrier) = carrier {
+            entry.evidence.push(carrier.as_str().to_owned());
+            entry.parents.push(RecordedParent {
+                commit: carrier.as_str().to_owned(),
+                branches: vec![carrier_label(RELEASE)],
+            });
+        }
+        entry
+    }
+
+    /// The withdrawal of `w`, a cut of [`RELEASE`], that names `p`, the
+    /// published commit, with `id` as the withdrawn write's commit.
+    fn withdrawal(w: &CommitId, id: &str, p: &CommitId) -> Entry {
+        let mut entry = event(
+            RELEASE,
+            withdrawal_text(RELEASE, (RecordedWriteKind::Cut, w), ("origin", p)),
+            w,
+        );
+        entry.evidence = vec![id.to_owned(), p.as_str().to_owned()];
+        entry.parents.clear();
+        entry
+    }
+
+    #[test]
+    fn a_withdrawn_write_is_never_written_and_a_labelled_carrier_is_no_member() {
+        // Given: a cut A, a cut W, and a withdrawal of W that names P, the
+        // published commit; then a cut of P with A as a labelled carrier.
+        let (a, w, p) = (commit('a'), commit('b'), commit('c'));
+        let before = [cut(&a, None), cut(&w, None), withdrawal(&w, w.as_str(), &p)];
+
+        // Then: W is no write and no previous cut; A is.
+        assert_eq!(
+            recorded_writes(&before, RELEASE)
+                .map(|write| write.commit)
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&a)
+        );
+        assert_eq!(
+            last_recorded_cut(&before, Some(RELEASE)).map(|cut| cut.commit),
+            Some(a.clone())
+        );
+        assert_eq!(
+            last_recorded_parents(&before, RELEASE),
+            cut(&a, None).parents.as_slice()
+        );
+
+        // And: once P is cut with A as its carrier, P is the previous cut,
+        // and its members leave A out.
+        let mut after = before.to_vec();
+        after.push(cut(&p, Some(&a)));
+        let recorded = last_recorded_cut(&after, None).expect("a recorded cut");
+        assert_eq!(recorded.commit, p);
+        assert_eq!(recorded.members, [CommitId::new("member0000000")]);
+
+        // And (control): without the withdrawal, W is the newest write.
+        let unwithdrawn = [cut(&a, None), cut(&w, None)];
+        assert_eq!(
+            recorded_writes(&unwithdrawn, RELEASE)
+                .next()
+                .map(|write| write.commit),
+            Some(w.clone())
+        );
+
+        // And: a withdrawal whose id is shorter than a short commit
+        // withdraws nothing; one of 12 characters withdraws its write.
+        for (length, withdrawn) in [(11, false), (12, true)] {
+            let id = w.as_str().get(..length).expect("a short id");
+            let entries = [cut(&a, None), cut(&w, None), withdrawal(&w, id, &p)];
+            assert_eq!(
+                Withdrawn::read(&entries).withdraws(RELEASE, &w),
+                withdrawn,
+                "{id}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod adopted_fix_tests {
     use std::collections::HashSet;
 
     use super::{
-        AdoptedFixFiles, CommitId, TEXT_PATH_PIECES, UnreadFixText, adopted_fix_replaces,
-        adopted_fix_text, carrier_tests::event,
+        AdoptedFixFiles, CommitId, TEXT_PATH_PIECES, adopted_fix_replaces, adopted_fix_text,
+        carrier_tests::event,
     };
     use crate::ledger::{Entry, FixChange, FixFile};
 
@@ -2574,127 +2742,12 @@ mod adopted_fix_tests {
     }
 
     #[test]
-    fn an_older_adopt_event_reads_whole_only_where_each_list_has_at_most_sixteen_pieces() {
-        // Given: adopts whose text names a list of 16 pieces or a list of
-        // 17, as the files resolved by hand or as those changed beyond the
-        // baseline's conflicts, as a knives from before the `fix_files` list
-        // writes them; a reason that holds 17 pieces after a list of 16; and
-        // an adopt that changed no file.
-        let joined = |pieces: usize| {
-            (1..=pieces)
-                .map(|piece| format!("p{piece:02}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let (sixteen, seventeen) = (joined(16), joined(17));
-        let cases = [
-            (format!("resolved by hand: {sixteen}"), None),
-            (
-                format!("changed beyond the baseline's conflicts: {sixteen} (why: {seventeen})"),
-                None,
-            ),
-            (
-                format!("resolved by hand: {seventeen}"),
-                Some(UnreadFixText::Pieces),
-            ),
-            (
-                format!("changed beyond the baseline's conflicts: {seventeen} (why: a fix)"),
-                Some(UnreadFixText::Pieces),
-            ),
-            ("why: nothing changed".to_owned(), None),
-        ];
-
-        for (parts, unread) in cases {
-            let entry = adopted(&parts);
-
-            // When: a reader asks whether the event reads whole.
-            // Then: it does exactly where no list of files has more than 16
-            // pieces, whatever its reason holds; a list of 16 pieces reads
-            // whole, and its files are read, the path of 16 pieces among them.
-            assert_eq!(
-                adopted_fix_text(&entry, "integration").unread(),
-                unread,
-                "{parts}"
-            );
-            if unread.is_none() && parts.contains(&sixteen) {
-                assert!(
-                    named_files(&entry, "integration").files.contains(&sixteen),
-                    "{parts}"
-                );
-            }
-        }
-
-        // And: an event with its `fix_files` list reads whole at any length.
-        let listed = Entry {
-            fix_files: vec![FixFile {
-                path: seventeen.clone(),
-                change: FixChange::Resolved,
-            }],
-            ..adopted(&format!("resolved by hand: {seventeen}"))
-        };
-        assert_eq!(adopted_fix_text(&listed, "integration").unread(), None);
-    }
-
-    #[test]
-    fn an_older_adopt_events_resolved_list_that_another_part_follows_does_not_read_whole() {
-        // Given: adopts that resolved `notes/a` by hand, whose text, as a
-        // knives from before the `fix_files` list writes it, follows that
-        // list with each part that `adopt` writes after it: the files changed
-        // beyond the baseline's conflicts, a reason, carriers, and added
-        // lines absent. Each reads as one path that holds the part too.
-        let cases = [
-            (
-                "resolved by hand: notes/a; changed beyond the baseline's conflicts: b.txt (why: \
-                 a fix)",
-                "; changed beyond the baseline's conflicts: ",
-            ),
-            (
-                "resolved by hand: notes/a; why: b.md; why: kept the fix",
-                "; why: ",
-            ),
-            (
-                "resolved by hand: notes/a; carriers: 0123456789ab",
-                "; carriers: ",
-            ),
-            (
-                "resolved by hand: notes/a; added lines absent: feat/x 1 of 2 in notes/a",
-                "; added lines absent: ",
-            ),
-            (
-                "resolved by hand: notes/a; carriers: 0123456789ab; why: b.md",
-                "; carriers: ",
-            ),
-        ];
-
-        for (parts, marker) in cases {
-            let entry = adopted(parts);
-
-            // When: a reader that cannot measure the adopt asks whether the
-            // event reads whole.
-            // Then: it does not, and names the first such part: the list may
-            // end there or name a path that holds it.
-            assert_eq!(
-                adopted_fix_text(&entry, "integration").unread(),
-                Some(UnreadFixText::Marker(marker)),
-                "{parts}"
-            );
-
-            // And: the same event with its `fix_files` list reads whole.
-            let listed = Entry {
-                fix_files: vec![FixFile {
-                    path: "notes/a".to_owned(),
-                    change: FixChange::Resolved,
-                }],
-                ..entry
-            };
-            assert_eq!(adopted_fix_text(&listed, "integration").unread(), None);
-        }
-
-        // And: a resolved list that no other part follows reads whole, a
-        // path that holds `; parents: ` among its files, as every event ends
-        // at its last `; parents: `; and so does a text with no resolved
-        // list, whose list changed beyond the baseline's conflicts reads up
-        // to its last ` (why: `, a path that holds `; why: ` among its files.
+    fn an_older_adopt_events_lists_end_at_its_last_parents_and_its_last_reason() {
+        // Given: a resolved list that no other part follows, a path that
+        // holds `; parents: ` among its files, as every event ends at its
+        // last `; parents: `; and a text with no resolved list, whose list
+        // changed beyond the baseline's conflicts reads up to its last
+        // ` (why: `, a path that holds `; why: ` among its files.
         for (parts, path) in [
             ("resolved by hand: notes/a, b.txt", "notes/a, b.txt"),
             (
@@ -2707,11 +2760,15 @@ mod adopted_fix_tests {
                 "notes/a; why: b.md",
             ),
         ] {
+            // When: its files are read.
             let entry = adopted(parts);
-            let text = adopted_fix_text(&entry, "integration");
-            assert_eq!(text.unread(), None, "{parts}");
+
+            // Then: the path is among them.
             assert!(
-                text.files().files.iter().any(|file| file == path),
+                named_files(&entry, "integration")
+                    .files
+                    .iter()
+                    .any(|file| file == path),
                 "{parts}"
             );
         }

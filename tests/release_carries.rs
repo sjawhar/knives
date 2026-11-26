@@ -2490,7 +2490,8 @@ fn carries_superseded_only_carriage_is_findings() {
         ],
     );
     assert!(dropped.status.success(), "{dropped:?}");
-    let second = knives_release(&lab, &home, &["cut", "release/2026-08-05", "--allow-drop"]);
+    let (second, _) =
+        lab::knives_release_naming_each_drop(&lab, &home, &["cut", "release/2026-08-05"]);
     assert!(second.status.success(), "{second:?}");
 
     // Publish the preserved historical commit under its release name only after

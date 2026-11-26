@@ -952,6 +952,55 @@ fn a_write_over_a_release_whose_matched_write_is_absent_is_unchecked_not_refused
 }
 
 #[test]
+fn a_waived_absent_write_does_not_carry_forward_a_new_members_lost_line() {
+    // Given: the cut made in another clone and never pushed; in the second
+    // clone, which does not hold that cut, the release made by hand again
+    // from its members and a new member `feat/gamma`, without `gamma two`.
+    let (lab, home, second, cut) = made_again_in_second_clone(&[]);
+    let old = Repo::open(&second)
+        .expect("open")
+        .resolve_commit(DATED)
+        .expect("resolve the release");
+    lab.jj_at(&second, ["new", "-r", "main@origin", "-m", "feat/gamma"]);
+    std::fs::write(second.join("gamma.txt"), "gamma one\ngamma two\n").expect("write gamma.txt");
+    lab.jj_at(&second, ["bookmark", "create", "feat/gamma", "-r", "@"]);
+    lab.jj_at(
+        &second,
+        [
+            "new",
+            "feat/alpha@origin",
+            "feat/beta@origin",
+            "feat/gamma",
+            "-m",
+            DATED,
+        ],
+    );
+    std::fs::write(second.join("gamma.txt"), "gamma one\n").expect("drop gamma two");
+    lab.jj_at(
+        &second,
+        ["bookmark", "set", DATED, "-r", "@", "--allow-backwards"],
+    );
+    step_off_onto_trunk_in(&lab, &second);
+    lab.jj_at(&second, ["abandon", old.as_str()]);
+    let before = ledger_entries(&home).len();
+
+    // When: the next cut names only the absent write as a drop.
+    let output = release_in(
+        &lab,
+        &home,
+        &second,
+        &["cut", NEXT, "--allow-drop", cut.short()],
+    );
+
+    // Then: that waiver does not let the composition in hand answer for the
+    // new member's line. The cut refuses, names the line, and writes nothing.
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    assert!(out.contains("gamma two"), "{out}");
+    assert_eq!(ledger_entries(&home).len(), before, "{out}");
+}
+
+#[test]
 fn adopt_records_a_release_whose_matched_write_is_absent_and_the_next_write_is_checked() {
     // Given (q6): the same release in hand, its cut absent here.
     let (lab, home, second, _cut) = made_again_in_second_clone(&[("notes.txt", "by hand\n")]);
@@ -1389,10 +1438,32 @@ fn one_member_beside_the_carrier(lab: &Lab, name: &str, under: &CommitId) {
     lab.jj_work(["rebase", "-r", name, "-d", destination.as_str()]);
 }
 
-#[test]
-fn a_resolution_on_top_of_a_published_fixed_release_names_the_squash_past_immutability() {
-    // Given (q12): a fixed release cut and pushed, a resolution made on top
-    // of it; the release commit it sits on is the publish remote's.
+/// The refusal of a write over `name`, whose commit `child` the publish
+/// remote does not hold and whose every parent is the earlier write `under`,
+/// which it holds: the resolution is rebased onto `under` and its members,
+/// and `under` is never rewritten; then `then`.
+fn rebase_remedy(name: &str, (under, child): (&CommitId, &CommitId), then: &str) -> String {
+    let (under, child) = (under.short(), child.short());
+    format!(
+        "every parent of {name} is an earlier write, and the publish remote holds {under}, which \
+         is never rewritten: rebase the resolution onto {under} and {under}'s members (`jj rebase \
+         -r {child} -d {under} -d 'parents({under})'`), which rewrites only the resolution, \
+         {then}"
+    )
+}
+
+/// Assert that `out` advises no rewrite of a commit: no squash, and nothing
+/// past jj's immutability.
+fn assert_no_rewrite_advised(out: &str) {
+    for rewrite in ["jj squash", "--ignore-immutable"] {
+        assert!(!out.contains(rewrite), "{rewrite}: {out}");
+    }
+}
+
+/// A fixed release cut of `feat/alpha` and pushed, then a resolution made on
+/// top of it and not pushed; `feat/gamma` waits to be included. Returns the
+/// lab, its home, the cut the publish remote holds and the resolution.
+fn resolution_on_a_published_fixed_release() -> (Lab, tempfile::TempDir, CommitId, CommitId) {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     step_off_onto_trunk(&lab);
@@ -1402,25 +1473,29 @@ fn a_resolution_on_top_of_a_published_fixed_release_names_the_squash_past_immuta
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
     step_off_onto_trunk(&lab);
     let (under, child) = resolution_on_top(&lab, FIXED);
+    (lab, home, under, child)
+}
+
+#[test]
+fn a_resolution_on_top_of_a_published_fixed_release_names_a_rebase_that_rewrites_nothing_published()
+{
+    // Given (q12): [`resolution_on_a_published_fixed_release`]: the release
+    // commit the resolution sits on is the publish remote's.
+    let (lab, home, under, child) = resolution_on_a_published_fixed_release();
     let before = operation_ids(&lab.work);
 
     // When: a write runs over it.
     let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
 
-    // Then: refused, naming the squash past immutability and the adopts.
+    // Then: refused, naming the rebase of the resolution alone and the
+    // adopt, and no rewrite of the published commit.
     assert_eq!(included.status.code(), Some(3), "{}", text(&included));
     assert!(
-        stdout(&included).contains(&format!(
-            "every parent of {FIXED} is an earlier write: squash the resolution into the release \
-             commit (`jj squash --from {} --into {} --use-destination-message \
-             --ignore-immutable`, as that commit is published), then adopt, and adopt again \
-             after the fast-forward rebase",
-            child.short(),
-            under.short()
-        )),
+        stdout(&included).contains(&rebase_remedy(FIXED, (&under, &child), "then adopt")),
         "{}",
         text(&included)
     );
+    assert_no_rewrite_advised(&stdout(&included));
 
     // When (control): one member parent beside the carrier.
     lab.jj_work(["op", "restore", before[0].as_str()]);
@@ -1430,6 +1505,48 @@ fn a_resolution_on_top_of_a_published_fixed_release_names_the_squash_past_immuta
 
     // Then: unchecked, not refused.
     assert_unchecked(&out, (FIXED, FIXED), &home, Why::NoMatch);
+}
+
+#[test]
+fn a_resolution_rebased_as_its_refusal_says_is_adopted_and_the_published_write_stays() {
+    // Given: [`resolution_on_a_published_fixed_release`], then the rebase
+    // its refusal names, run as it prints it.
+    let (lab, home, under, child) = resolution_on_a_published_fixed_release();
+    let members = format!("parents({})", under.short());
+    lab.jj_work([
+        "rebase",
+        "-r",
+        child.short(),
+        "-d",
+        under.short(),
+        "-d",
+        members.as_str(),
+    ]);
+
+    // When: it is adopted, then a member is included.
+    let adopted = release_ran(&lab, &home, &["adopt", FIXED, "--why", "the resolution"]);
+    let event = newest_event(&home, FIXED);
+    let rebased = release_parents(&lab, FIXED);
+    let notes = file_in(&lab.work, FIXED, "notes.txt");
+    let included = release_ran(&lab, &home, &["include", "feat/gamma"]);
+
+    // Then: the adopt records the rebased resolution, on the published
+    // write as its carrier and `feat/alpha`, with the resolution's tree; the
+    // include goes through, checked; and the publish remote still holds the
+    // write, which no command rewrote.
+    assert!(adopted.contains("as the newest write"), "{adopted}");
+    assert_eq!(rebased, [under.clone(), commit_at(&lab, "feat/alpha")]);
+    assert_eq!(notes, "by hand\n");
+    assert!(
+        event
+            .parents
+            .iter()
+            .any(|parent| parent.commit == under.as_str()
+                && parent.branches == [format!("{FIXED} earlier write (carrier, not a member)")]),
+        "{event:?}"
+    );
+    assert!(!included.contains("could not check"), "{included}");
+    assert_eq!(commit_at(&lab, &format!("{FIXED}@origin")), under);
 }
 
 #[test]
@@ -1457,7 +1574,7 @@ fn a_resolution_on_top_of_a_tagged_dated_release_gets_the_published_remedy() {
             "{DATED} is published (tag v1.0.0 names {}), so a hand edit cannot be recorded under \
              it: move {DATED} to {}, the recorded write the resolution sits on (`jj bookmark set \
              {DATED} -r {} --allow-backwards`), then if the working copy is on {} or on an empty \
-             commit on it, `jj new 'trunk()'`, then cut a new dated name with `--allow-drop`, \
+             commit on it, `jj new 'trunk()'`, then cut a new dated name with `--allow-drop {}`, \
              which must print \
              `--allow-drop: nothing dropped` naming exactly {} (any other answer is a stop), \
              then `jj restore --from {} --into <new name>`, then adopt the new name, then `jj \
@@ -1466,6 +1583,7 @@ fn a_resolution_on_top_of_a_tagged_dated_release_gets_the_published_remedy() {
             under.short(),
             under.short(),
             under.short(),
+            child.short(),
             child.short(),
             child.short(),
             child.short(),
@@ -1499,11 +1617,12 @@ fn a_resolution_on_top_of_a_tagged_dated_release_gets_the_published_remedy() {
     );
 }
 
-#[test]
-fn a_resolution_on_top_of_a_release_with_no_recorded_write_is_refused_to_run_again() {
-    // Given (q12): a release merged by hand, no write of it recorded, pushed,
-    // then a resolution made on top of it: its only parent is the publish
-    // remote's commit of the name, a carrier.
+/// A release merged by hand, no write of it recorded, pushed, then a
+/// resolution made on top of it and not pushed: its only parent is the
+/// publish remote's commit of the name, a carrier; `feat/gamma` waits to be
+/// included. Returns the lab, its home, that commit and the resolution.
+fn resolution_on_a_pushed_release_with_no_recorded_write()
+-> (Lab, tempfile::TempDir, CommitId, CommitId) {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
@@ -1513,24 +1632,31 @@ fn a_resolution_on_top_of_a_release_with_no_recorded_write_is_refused_to_run_aga
     lab.branch("feat/gamma", "gamma.txt", "gamma\n");
     step_off_onto_trunk(&lab);
     let (under, child) = resolution_on_top(&lab, DATED);
+    (lab, home, under, child)
+}
+
+#[test]
+fn a_resolution_on_top_of_a_release_with_no_recorded_write_is_refused_to_run_again() {
+    // Given (q12): [`resolution_on_a_pushed_release_with_no_recorded_write`].
+    let (lab, home, under, child) = resolution_on_a_pushed_release_with_no_recorded_write();
     let before = operation_ids(&lab.work);
 
     // When: a write runs over it.
     let included = knives_release(&lab, &home, &["include", "feat/gamma"]);
 
-    // Then: refused, naming the squash and the write to run again.
+    // Then: refused, naming the rebase of the resolution alone and the write
+    // to run again, and no rewrite of the published commit.
     assert_eq!(included.status.code(), Some(3), "{}", text(&included));
     assert!(
-        stdout(&included).contains(&format!(
-            "every parent of {DATED} is an earlier write: squash the resolution into the release \
-             commit (`jj squash --from {} --into {} --use-destination-message \
-             --ignore-immutable`, as that commit is published), then run the write again",
-            child.short(),
-            under.short()
+        stdout(&included).contains(&rebase_remedy(
+            DATED,
+            (&under, &child),
+            "then run the write again"
         )),
         "{}",
         text(&included)
     );
+    assert_no_rewrite_advised(&stdout(&included));
 
     // When (control): one member parent beside the carrier.
     lab.jj_work(["op", "restore", before[0].as_str()]);
@@ -1541,6 +1667,33 @@ fn a_resolution_on_top_of_a_release_with_no_recorded_write_is_refused_to_run_aga
     // Then: a name with no recorded write is not refused: the write goes
     // through, says knives could not check the release, and marks its event.
     assert_unchecked(&out, (DATED, DATED), &home, Why::NoRecord);
+}
+
+#[test]
+fn a_resolution_rebased_as_its_refusal_says_over_a_release_with_no_recorded_write_is_written() {
+    // Given: [`resolution_on_a_pushed_release_with_no_recorded_write`], then
+    // the rebase its refusal names, run as it prints it.
+    let (lab, home, under, child) = resolution_on_a_pushed_release_with_no_recorded_write();
+    let members = format!("parents({})", under.short());
+    lab.jj_work([
+        "rebase",
+        "-r",
+        child.short(),
+        "-d",
+        under.short(),
+        "-d",
+        members.as_str(),
+    ]);
+
+    // When: the write runs again.
+    let out = release_ran(&lab, &home, &["include", "feat/gamma"]);
+
+    // Then: it goes through, unchecked as a name with no recorded write is,
+    // keeps the resolution, and the publish remote still holds the commit,
+    // which no command rewrote.
+    assert_unchecked(&out, (DATED, DATED), &home, Why::NoRecord);
+    assert_eq!(file_in(&lab.work, DATED, "notes.txt"), "by hand\n");
+    assert_eq!(commit_at(&lab, &format!("{DATED}@origin")), under);
 }
 
 /// A fixed release cut of alpha (grown to two commits) and beta, pushed
@@ -1700,9 +1853,9 @@ fn a_hand_edit_of_a_tagged_release_the_publish_remote_lacks_gets_the_published_r
     );
     let (ledger, operations) = (ledger_entries(&home), operation_ids(&lab.work));
 
-    // When: the next cut runs, stating the drop the orphan gate would ask
-    // about (the tag keeps the pre-edit commit beside the edit).
-    let cut = knives_release(&lab, &home, &["cut", NEXT, "--allow-drop"]);
+    // When: the next cut runs, stating each drop the orphan gate asks about
+    // (the tag keeps the pre-edit commit beside the edit).
+    let (cut, _) = lab::knives_release_naming_each_drop(&lab, &home, &["cut", NEXT]);
 
     // Then: it prints the published remedy and writes nothing.
     assert_eq!(cut.status.code(), Some(3), "{}", text(&cut));
@@ -1733,7 +1886,9 @@ fn a_hand_edit_of_a_tagged_release_the_publish_remote_lacks_gets_the_published_r
         "--allow-backwards",
     ]);
     // The edit left behind is the person's to drop: the cut states it.
-    let out = release_ran(&lab, &home, &["cut", NEXT, "--allow-drop"]);
+    let (cut, _) = lab::knives_release_naming_each_drop(&lab, &home, &["cut", NEXT]);
+    let out = text(&cut);
+    assert_ne!(cut.status.code(), Some(3), "{out}");
     assert!(out.contains(&format!("cut {NEXT} as")), "{out}");
     edit_by_hand(&lab, NEXT, &[("alpha.txt", "alpha, repaired\n")]);
     let redone = commit_at(&lab, NEXT);
@@ -1935,7 +2090,7 @@ fn a_write_over_an_unchecked_write_stays_unchecked_until_adopt() {
     // event carries no mark.
     assert!(clean.contains("cut release/2026-08-06 as"), "{clean}");
     assert!(!clean.contains("could not check"), "{clean}");
-    assert!(!clean.contains("unrecorded"), "{clean}");
+    assert!(!clean.contains("the unrecorded in-hand release"), "{clean}");
     assert!(
         clean.contains("diverges where the release in hand (a recorded write) already does"),
         "{clean}"
@@ -2263,8 +2418,29 @@ fn the_published_remedy_taken_in_the_clone_that_pushed_the_resolution_ends_quiet
     assert_eq!(commit_at(&lab, &format!("{DATED}@origin")), child);
 }
 
+/// The refusal of a write or `adopt` over `name` at `child`, which the
+/// publish remote holds and whose every parent is the earlier write `under`:
+/// a new release commit on `child` and `under`'s members, the name moved
+/// onto it and the working copy off it, then adopt; neither commit is ever
+/// rewritten. Where `track`, the name is tracked first.
+fn new_commit_remedy(name: &str, (under, child): (&CommitId, &CommitId), track: bool) -> String {
+    let (under, child) = (under.short(), child.short());
+    let track = if track {
+        format!("track it (`jj bookmark track {name}@origin`), then ")
+    } else {
+        String::new()
+    };
+    format!(
+        "every parent of {name} is an earlier write, and the publish remote holds {under}, which \
+         is never rewritten: {track}make a new release commit on {child} and {under}'s members, \
+         which takes {child}'s tree (`jj new {child} 'parents({under})' -m '{name}, made again on \
+         {child}'`), move {name} onto it (`jj bookmark set {name} -r @`), then step off it (`jj \
+         new 'trunk()'`), then adopt"
+    )
+}
+
 #[test]
-fn an_all_carrier_release_held_only_as_the_remote_ref_names_the_track_before_the_squash() {
+fn an_all_carrier_release_held_only_as_the_remote_ref_names_the_track_before_a_new_commit() {
     // Given (q12): a fixed release cut, a resolution made on top of it and
     // pushed from the work checkout; a fresh clone holds the name only as
     // `integration@origin`.
@@ -2280,20 +2456,15 @@ fn an_all_carrier_release_held_only_as_the_remote_ref_names_the_track_before_the
     // When: it is adopted there.
     let adopted = release_in(&lab, &home, &clone, &["adopt", FIXED]);
 
-    // Then: refused, naming the track before the squash.
+    // Then: refused, naming the track before a new release commit, and no
+    // rewrite of either published commit.
     assert_eq!(adopted.status.code(), Some(3), "{}", text(&adopted));
     assert!(
-        stdout(&adopted).contains(&format!(
-            "every parent of {FIXED} is an earlier write: track it (`jj bookmark track \
-             {FIXED}@origin`), then squash the resolution into the release commit (`jj squash \
-             --from {} --into {} --use-destination-message --ignore-immutable`, as that commit \
-             is published)",
-            child.short(),
-            under.short()
-        )),
+        stdout(&adopted).contains(&new_commit_remedy(FIXED, (&under, &child), true)),
         "{}",
         text(&adopted)
     );
+    assert_no_rewrite_advised(&stdout(&adopted));
 
     // When (control): the name is tracked, then adopted.
     lab.jj_at(&clone, ["bookmark", "track", "integration@origin"]);
@@ -2302,42 +2473,11 @@ fn an_all_carrier_release_held_only_as_the_remote_ref_names_the_track_before_the
     // Then: the same refusal, with no track step.
     assert_eq!(adopted.status.code(), Some(3), "{}", text(&adopted));
     assert!(
-        stdout(&adopted).contains(&format!(
-            "every parent of {FIXED} is an earlier write: squash the resolution into the release \
-             commit (`jj squash --from {} --into {} --use-destination-message \
-             --ignore-immutable`",
-            child.short(),
-            under.short()
-        )),
+        stdout(&adopted).contains(&new_commit_remedy(FIXED, (&under, &child), false)),
         "{}",
         text(&adopted)
     );
-
-    // When (control): the squash the remedy names, run without the track,
-    // then adopt.
-    lab.jj_at(&clone, ["bookmark", "forget", FIXED]);
-    let before = ledger_entries(&home);
-    lab.jj_at(
-        &clone,
-        [
-            "squash",
-            "--from",
-            child.as_str(),
-            "--into",
-            under.as_str(),
-            "--use-destination-message",
-            "--ignore-immutable",
-        ],
-    );
-    let adopted = release_in(&lab, &home, &clone, &["adopt", FIXED, "--why", "redo"]);
-
-    // Then: the squash moved no local name, so adopt records nothing.
-    assert!(
-        !stdout(&adopted).contains("as the newest write"),
-        "{}",
-        text(&adopted)
-    );
-    assert_eq!(ledger_entries(&home), before);
+    assert_no_rewrite_advised(&stdout(&adopted));
 }
 
 /// The content of `file` at `revision` in checkout `dir`.
@@ -2363,16 +2503,13 @@ fn file_in(dir: &Path, revision: &str, file: &str) -> String {
 }
 
 /// A fixed release whose publish remote holds an all-carrier commit C, a
-/// resolution on top of the cut W; in a fresh clone the name is tracked, C
-/// squashed into W, adopted, fast-forwarded onto C, adopted again and
-/// pushed, then a member included (q12, D13). When `push_first`, the push
-/// comes before that second adopt, which then refuses: C, no longer the
-/// publish remote's commit, reads as a member. Returns the include's and the
-/// plan's output, the release's parents, C, and the resolution's file at the
-/// release.
-fn squashed_resolution_fast_forwarded(
-    push_first: bool,
-) -> (String, Vec<CommitId>, CommitId, String) {
+/// resolution on top of the cut W; in a fresh clone the name is tracked and
+/// its refusal's remedy run as it prints it: a new commit on C and W's
+/// members, which takes C's tree, the name moved onto it and the working
+/// copy off it; then adopted and pushed, then a member included (q12, D13).
+/// Returns the include's and the plan's output, the release's parents, C,
+/// and the resolution's file at the release.
+fn published_resolution_made_again() -> (String, Vec<CommitId>, CommitId, String) {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     lab.branch("feat/beta", "beta.txt", "beta\n");
@@ -2393,56 +2530,42 @@ fn squashed_resolution_fast_forwarded(
             "feat/beta@origin",
         ],
     );
+    let refused = release_in(&lab, &home, &clone, &["adopt", FIXED]);
+    assert!(
+        stdout(&refused).contains(&new_commit_remedy(FIXED, (&under, &child), false)),
+        "{}",
+        text(&refused)
+    );
+    let members = format!("parents({})", under.short());
+    let description = format!("{FIXED}, made again on {}", child.short());
     lab.jj_at(
         &clone,
         [
-            "squash",
-            "--from",
-            child.as_str(),
-            "--into",
-            under.as_str(),
-            "--use-destination-message",
-            "--ignore-immutable",
+            "new",
+            child.short(),
+            members.as_str(),
+            "-m",
+            description.as_str(),
         ],
     );
-    let out = ok_in(
+    lab.jj_at(&clone, ["bookmark", "set", FIXED, "-r", "@"]);
+    lab.jj_at(&clone, ["new", "trunk()"]);
+    let adopted = ok_in(
         &lab,
         &home,
         &clone,
         &["adopt", FIXED, "--why", "the resolution"],
     );
-    assert!(out.contains("as the newest write"), "{out}");
-    fast_forward_in(&lab, &clone, FIXED);
-    let push = |lab: &Lab| {
-        lab.jj_at(
-            &clone,
-            ["git", "push", "--remote", "origin", "--bookmark", FIXED],
-        );
-    };
-    if push_first {
-        push(&lab);
-    }
-    let adopted = release_in(&lab, &home, &clone, &["adopt", FIXED]);
-    if push_first {
-        // Pushed, C is no longer the publish remote's commit, so it reads as
-        // a member, and the release's members match no recorded write.
-        assert_eq!(adopted.status.code(), Some(3), "{}", text(&adopted));
-        assert!(
-            stdout(&adopted).contains(&format!(
-                "demo: {FIXED}'s members differ from every recorded write; "
-            )),
-            "{}",
-            text(&adopted)
-        );
-    } else {
-        assert_eq!(adopted.status.code(), Some(0), "{}", text(&adopted));
-        assert!(
-            stdout(&adopted).contains("as the newest write"),
-            "{}",
-            text(&adopted)
-        );
-        push(&lab);
-    }
+    assert!(adopted.contains("as the newest write"), "{adopted}");
+    lab.jj_at(
+        &clone,
+        ["git", "push", "--remote", "origin", "--bookmark", FIXED],
+    );
+    assert_eq!(
+        commit_in(&clone, &format!("{FIXED}@origin")),
+        commit_in(&clone, FIXED)
+    );
+    assert_eq!(commit_in(&clone, under.as_str()), under);
 
     // When: one more write runs: a member is included.
     branch_in(&lab, &clone, "feat/delta");
@@ -2457,30 +2580,18 @@ fn squashed_resolution_fast_forwarded(
 }
 
 #[test]
-fn a_squashed_resolution_fast_forwarded_onto_is_a_carrier_by_its_recorded_label() {
-    // Given/When: the fast-forwarded resolution adopted again, then pushed,
-    // then a member included.
-    let (out, parents, child, notes) = squashed_resolution_fast_forwarded(false);
+fn a_published_resolution_made_again_is_a_carrier_by_its_recorded_label() {
+    // Given/When: the release made again on the published resolution,
+    // adopted, then pushed, then a member included.
+    let (out, parents, child, notes) = published_resolution_made_again();
 
     // Then: C, which only the adopt's record of its fast-forward parent
-    // names, is left out as a carrier: nothing reads as stacked, and the
-    // resolution is kept.
+    // names once the push has moved past it, is left out as a carrier:
+    // nothing reads as stacked, and the resolution is kept.
     assert!(!out.contains("stacked"), "{out}");
     assert!(!parents.contains(&child), "{parents:?}");
     assert_eq!(parents.len(), 3, "{parents:?}");
     assert_eq!(notes, "by hand\n");
-}
-
-#[test]
-fn a_fast_forward_parent_adopted_after_the_push_is_unlabelled_and_reads_as_stacked() {
-    // Given/When (control): the same, pushed before the second adopt, so
-    // C is no longer the publish remote's commit and the adopt refuses
-    // rather than label it.
-    let (out, parents, child, _) = squashed_resolution_fast_forwarded(true);
-
-    // Then: C is carried as a member, stacked on a prior merge.
-    assert!(out.contains("stacked on a prior merge"), "{out}");
-    assert!(parents.contains(&child), "{parents:?}");
 }
 
 /// The working-copy commit of checkout `dir`, snapshotted.
@@ -2592,9 +2703,9 @@ fn resolution_never_pushed_in_a_fresh_clone(
 }
 
 /// The remedy up to its adopt in `clone`: the name moved back to W, the
-/// working copy to the trunk, a new dated cut with `--allow-drop`, which
-/// must find exactly `left` still visible, the resolution restored into it,
-/// adopted.
+/// working copy to the trunk, a new dated cut with the `--allow-drop` of each
+/// commit of `left`, which must find exactly them still visible, the
+/// resolution restored into it, adopted.
 fn remedy_to_its_adopt(
     (lab, home, clone): (&Lab, &tempfile::TempDir, &Path),
     (written, resolution): (&CommitId, &CommitId),
@@ -2612,7 +2723,11 @@ fn remedy_to_its_adopt(
         ],
     );
     lab.jj_at(clone, ["new", "trunk()"]);
-    let out = ok_in(lab, home, clone, &["cut", NEXT, "--allow-drop"]);
+    let mut args = vec!["cut", NEXT];
+    for commit in left {
+        args.extend(["--allow-drop", commit.short()]);
+    }
+    let out = ok_in(lab, home, clone, &args);
     assert!(out.contains(&format!("cut {NEXT} as")), "{out}");
     // The flag waives the drop guard alone: the recorded-member check has
     // nothing to waive.
@@ -2648,10 +2763,15 @@ fn assert_f19_remedy(
     let out = stdout(&refused);
     assert_eq!(refused.status.code(), Some(3), "{}", text(&refused));
     let named: Vec<&str> = left.iter().map(|commit| commit.short()).collect();
+    let flags: Vec<String> = named
+        .iter()
+        .map(|short| format!("--allow-drop {short}"))
+        .collect();
     assert!(
         out.contains(&format!(
-            "cut a new dated name with `--allow-drop`, which must print `--allow-drop: nothing \
-             dropped` naming exactly {} (any other answer is a stop)",
+            "cut a new dated name with `{}`, which must print `--allow-drop: nothing dropped` \
+             naming exactly {} (any other answer is a stop)",
+            flags.join(" "),
             named.join(", ")
         )),
         "{out}"

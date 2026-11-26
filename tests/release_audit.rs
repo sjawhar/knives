@@ -31,6 +31,7 @@ use std::process::Command;
 fn context<'a>(trunk: &'a CommitId, previous: Option<&'a CommitId>) -> AuditContext<'a> {
     AuditContext {
         previous,
+        forward_members: None,
         upstream_trunk: trunk,
         trunk_parents: &[],
         trunk_parent_base: None,

@@ -566,6 +566,7 @@ fn dispatch_release(
             name,
             allow_drop,
             at,
+            corrects,
         }) => run_release(
             fork,
             extra_consumers,
@@ -573,6 +574,7 @@ fn dispatch_release(
                 name,
                 allow_drop,
                 at,
+                corrects,
             },
             bound,
         ),
