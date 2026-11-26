@@ -423,17 +423,11 @@ branch name, with a `pr-<n>` bookmark understood as the fetched head of that num
 That is a good default and a bad rule, so `knives track` overrides it and accepts any
 upstream PR, in any state, from any author: a PR opened before this tool existed, one the
 maintainer closed because they wanted a different approach, or somebody else's that we
-carry because ours was superseded. It asks the forge first. A fork's review PR has its own
-number on the fork's repository, and stated as the upstream's number it named another PR;
-the upstream numbers in the thousands, so most small fork numbers are upstream numbers
-too. So `track --pr <n>` is refused when the fork's #n has the branch as its head and the
-upstream's #n does not (naming both), when only the fork has #n, and when neither does.
-An upstream #n whose head is another branch is accepted: it is someone else's PR we carry.
-A head is the branch's only by its name and its owner together, the owner of the fork's own
-repository as the forge names it now: an outside contributor's branch of the same name is
-another head, and so is one of a former owner that a remote here still spells. The fork's
-own repository is the one the checkout's `origin` remote names when that is a forge
-repository, else the registry's, as `status` and `depends` read it.
+carry because ours was superseded. When the upstream and the fork's own repository are two
+forge repositories, it asks the upstream for the number first, and refuses a number the
+upstream does not have. The fork's own repository is the one the checkout's `origin`
+remote names when that is a forge repository, else the registry's, as `status` and
+`depends` read it.
 
 ### Dependencies
 
@@ -443,23 +437,17 @@ work, which is exactly what happened when one repo's #4545 was dropped while a s
 #49 still needed it. An upstream pull request is satisfied when it has merged; an open PR
 may still change or be rejected.
 
-A requirement says what it names, because a fork and its upstream number their pull
-requests apart: `<upstream>#<n>` is a pull request on the fork's upstream,
-`origin:<owner>/<name>#<n>` a review pull request on the fork's own repository, and
-`origin:<owner>/<name>:<branch>` a member branch of the fork. `knives depends --on
-<repo>#<n>`, the registry name, used to mean the upstream's pull request, and recorded an
-unrelated one where the fork's review pull request was meant. Another fork's key is first
-read as below, and names this fork's own repository when that fork's upstream is it.
-Otherwise, when the fork's upstream and own repository are both forge repositories, it asks
-the forge which has #n, and refuses when both do, naming both, or when neither does; when
-the forge names the fork's own repository as its upstream, #n is the upstream's with no
-lookup of the number. When either is no forge repository, there is no such lookup, and #n
-is the upstream's. A review pull request is
-recorded only on the fork's own repository, and only when its head is a member branch of
-the fork: a branch of the fork's owner that is not the dependent itself, a base, a release
-or a fetched `pr-<n>` head. A review pull request on another fork's repository is refused:
-its head is that fork's branch, which nothing here can judge, so the dependent names the
-upstream pull request it becomes. The same branches are refused as member branches.
+A requirement says what it names: `<upstream>#<n>` is a pull request on the fork's
+upstream, and `origin:<owner>/<name>:<branch>` a member branch of the fork. Pull requests
+go upstream, so a pull request on a fork's own repository is refused, by any spelling: this
+fork's own `<owner>/<name>`, another fork's, or the key of a fork whose upstream is this
+fork's own repository. `<repo>#<n>`, by a registry key or by an upstream's
+`<owner>/<name>`, is that upstream's pull request, with no forge call. A record of a fork
+pull request, `origin:<owner>/<name>#<n>`, which an older knives wrote, is still read, so
+the ledger that holds it reads whole. `status` judges none and asks no forge about it: each
+is a problem that names the `knives depends <branch> --forget <record>` command that takes
+it back. A member branch is refused when it is the dependent itself, a base, a release or
+a fetched `pr-<n>` head.
 
 A member branch is satisfied once its current tip's work is in the upstream trunk: its row
 is landed, or its landed verdict is in the trunk (set by the probe, or by its merged
@@ -472,22 +460,7 @@ the local tip lacks (a local bookmark that did not follow a fetch), or the row h
 local tip (a conflicted bookmark), that origin tip must pass too, as it would for a machine
 holding only it. A merge alone is not enough: a pull
 request merged into anything but the trunk, or a branch advanced past what merged, leaves
-work the upstream lacks. A review pull request is satisfied once its head, the member it
-carries, has landed upstream, judged at the head commit the forge reports for it, not at
-whatever a branch of that name points at here: by that branch's row only when the local
-tip is that commit, else by the commit itself. A head commit this checkout lacks (the
-branch moved since the last fetch) is a problem until it is fetched; if its branch was
-deleted, the problem says to fetch a ref that still holds the commit: the base it merged
-into, or the pull request's own `refs/pull/<n>/head`. The report names the head. Its
-own state is not the rule: a review pull request merges into a review base or into
-another member, which says nothing about the upstream, and while the member is in the
-fork's release only, dropping it from the release breaks the dependent. A review pull
-request is judged by its head only on the fork's own repository, the one the forge names
-for this fork's `origin` (a record under any other name counts when the forge resolves
-that name to it, so a record from before a rename still counts, and a registry and a
-checkout naming two live repositories are not merged), and when its head is a branch of
-that repository's owner and a member branch; any other is a problem that says why, never
-met. A member no copy here holds cannot be judged, and is a problem until it is fetched;
+work the upstream lacks. A member no copy here holds cannot be judged, and is a problem until it is fetched;
 the problem says its work may still be in a review base it merged into before it was
 deleted. Without the landed probe (`status --no-landed`), a member not shown landed stays
 an unmet finding: what is not shown to have landed is still needed. So does one under
@@ -517,11 +490,11 @@ carried later can change it; each one that is unmet or cannot be judged is a pro
 names the dependent, what could not be read, what was seen of the requirement, and the
 `knives depends <dependent> --forget …` command that takes those back, with a fetch
 suggested only when the recorded commit is not here. The command takes each requirement's
-records in one run while the forge answers as it did for `status`: every record of its pull
-request number or member on a repository that is not another fork's and that the forge did
-not name as another, each as spelled (a member by its branch name when every such record
-spells a spelling here and the name holds no `#`); a record on another fork's repository,
-or one the forge named as another, alone. If the forge stops answering between `status`
+records in one run while the forge answers as it did for `status`: every record of its
+member on a repository that is not another fork's and that the forge did not name as
+another, each as spelled (by its branch name when every such record spells a spelling here
+and the name holds no `#`); a pull request, a record on another fork's repository, or one
+the forge named as another, alone. If the forge stops answering between `status`
 and the forget, a record `status` left out because the forge named it apart may be meant
 again: the forget is refused (exit 3) and prints a command that takes it too. The problem
 says when the command takes a record it does not list. Under
@@ -534,80 +507,42 @@ A requirement is taken back by a `depends` forget followed by the list without i
 entries stamped in that order and written newest first: a run cut short between them
 leaves the list as it was, never empty. `--forget` takes a requirement by any spelling
 `--on` takes or the record's own; an `origin:` prefix always names this fork's own
-repository. A review pull request recorded under two names of the fork's repository, as
-before and after a rename, is one requirement: the forge ties the names, any spelling
-takes back every record of it, and `--on` names it as the list already holds it. A
-member recorded under two spellings here is one requirement too. A member record on a
-repository that is neither a spelling here nor another fork's is a record of this fork's
-member only when the forge names that repository as the fork's own, as for a review pull
-request: with the forge down, a forget whose outcome depends on it is refused (exit 3),
-and `--on` writes this fork's spelling beside it and says the two may be one requirement.
-With the forge up, `--on` reuses a record the forge places as the fork's own, and writes
-its own beside one the forge names as another repository's, which is another requirement.
-A text spells a record when it parses to the same kind, number or branch, and repository,
-the repository's letter case aside; a branch name's case always counts. A pull request
-named `<owner>/<name>#<n>` by this fork's registered upstream is recorded with no forge
-call, unless a spelling of this fork's own repository (its checkout's or registry's
-`origin`) is that upstream too: the name then spells this fork's own repository first (see
-below). One named by another fork's upstream, by its `<owner>/<name>` or its registry key,
-may be this fork's own repository under another name, when a fork of this fork is
-registered after a rename or a transfer, and nothing here tells the two apart: the forge
-is asked, and it is this fork's review pull request when the forge names this fork's
-repository so, or redirects the name to it; the other fork's upstream pull request
-otherwise. `--forget` reads either spelling the same way. When the forge cannot be asked,
-nothing is recorded (exit 3), and the refusal names that fork: a review pull request
-recorded as an upstream one reads met once it merges anywhere, so refusing is the safe
-failure. The refusal says to run it again when the forge answers, or, when the forge said it
-cannot resolve a repository, names the repository it could not resolve (that upstream, or
-this fork's own): it is gone, the token cannot see it, or the forge is failing, so run it
-again later or check the repository. The cost is that an offline `--on` to another project's
-pull request waits for the forge; and, with the forge up, one named by another fork's
-upstream is refused when the forge cannot resolve that upstream or this fork's own
-repository, since only those answers say whether the two are one. When this fork's own
-repository names no forge repository (neither its checkout's `origin` nor its registry's is
-a forge URL), it cannot be another fork's upstream under another name on the forge, and that
-question is not asked: a pull request named by that upstream's `<owner>/<name>` is then
-recorded with no forge call, while one named by the fork's registry key still asks the forge
-which of that fork's two repositories has the number when both are forge repositories.
-Another fork whose upstream is no forge repository, such as a path, has no `<owner>/<name>`:
-its pull requests are named by its registry key exactly and recorded with no forge call, and
-the key in another letter case is refused (exit 2), naming the key. This fork's own path
-upstream is its registry key too, taken in any letter case: `DEMO#12` records `demo#12`,
-with no forge call. With the forge down, then, a pull request is recorded only when naming it
-needs no forge question: by `<owner>/<name>`, one of this fork's upstream, or of another
-fork's when this fork's own repository names no forge repository; by a registry key, one of a
-fork whose upstream or own repository names no forge repository (such as `local#12`), when
-that fork is this one, its upstream is a path, or this fork's own repository names no forge
-repository. One exception: when this fork's checkout or registry `origin` spells its
-upstream, `<owner>/<name>#<n>` of that upstream names this fork's own repository first,
-which only the forge can place, so it is refused (exit 3) offline. Such an `origin` is a
-configuration error: set it to this fork's own repository. With the forge up, what each
-spelling does depends on which `origin` spells the upstream. When only the registry's does,
-and the checkout's names this fork's repository, that upstream's `<owner>/<name>` is refused
-(exit 2: not this fork's own repository), while this fork's key is read as usual against the
-checkout's repository: a number only the upstream has is the upstream's, one only the fork
-has is its review pull request, and one both have is refused without offering the upstream
-spelling, which has none while the registry `origin` spells the upstream. When this fork's
-own repository spells the upstream, its key takes the upstream's number with no lookup, and
-`<owner>/<name>` names a review pull request there. Any other text that only the forge can
-read is refused (exit 3).
-An upstream's `<owner>/<name>#<n>` is taken back without the forge. The forge has no
-answer that means a repository does not exist: GitHub answers a name it cannot resolve the
-same way for a repository that is gone, for one the token cannot see, and in some
-outages. So a record whose repository the forge does not name, by that answer or by a
-failure, is one the forge could not be asked about. The texts of one command are weighed
-together: when counting each such record as named would take back more than the forge's
-answers take, make a text ambiguous, or join two records a text names into one
-requirement, nothing is taken back (exit 3), so neither an outage nor a repository the
-token cannot see decides what a forget takes. Each such refusal prints a command that names
-every record of that pull request number or member on a repository that is not another
-fork's, each as it is spelled (a member by its branch name when every such record spells a
-spelling here, and the name holds no `#`): every candidate is then named directly, so no
-forge answer changes what it takes. It can take a record the forge showed is another
-repository's: with the forge unable to say which repository one text names, any of them
-may be meant; to keep one, run the forget again when the forge answers. When the text may
-name two requirements, the refusal prints one such command for each, never one that takes
-both. A text spelled exactly as a held upstream record names that record alone, whether or
+repository. A member recorded under two spellings here is one requirement. A member record
+on a repository that is neither a spelling here nor another fork's is a record of this
+fork's member only when the forge names that repository as the fork's own: with the forge
+down, a forget whose outcome depends on it is refused (exit 3), and `--on` writes this
+fork's spelling beside it and says the two may be one requirement. With the forge up,
+`--on` reuses a record the forge places as the fork's own, and writes its own beside one
+the forge names as another repository's, which is another requirement. A text spells a
+record when it parses to the same kind, number or branch, and repository, the
+repository's letter case aside; a branch name's case always counts.
+
+A pull request is named with no forge call: by a registry key, that fork's upstream's; by
+an upstream's `<owner>/<name>`, that upstream's. A spelling of this fork's own repository
+is read first, and refused as a fork pull request, so when this fork's checkout or
+registry `origin` spells its upstream, that upstream's `<owner>/<name>#<n>` is refused.
+Such an `origin` is a configuration error: set it to this fork's own repository. Another
+fork whose upstream is no forge repository, such as a path, has no `<owner>/<name>`: its
+pull requests are named by its registry key exactly, and the key in another letter case is
+refused (exit 2), naming the key. This fork's own path upstream is its registry key too,
+taken in any letter case: `DEMO#12` records `demo#12`.
+
+A pull request record is taken back without the forge: an upstream one as it is spelled
+or as `--on` names it, a fork one as it is spelled. Only a member record whose repository
+no spelling here gives needs the forge. The forge has no answer that means a repository
+does not exist: GitHub answers a name it cannot resolve the same way for a repository that
+is gone, for one the token cannot see, and in some outages. So a record whose repository
+the forge does not name, by that answer or by a failure, is one the forge could not be
+asked about. The texts of one command are weighed together: when counting each such
+record as named would take back more than the forge's answers take, nothing is taken back
+(exit 3), so neither an outage nor a repository the token cannot see decides what a forget
+takes. Each such refusal prints a command that names every record of that member on a
+repository that is not another fork's, each as it is spelled (by its branch name when
+every such record spells a spelling here, and the name holds no `#`): every candidate is
+then named directly, so no forge answer changes what it takes. It can take a record the
+forge showed is another repository's: with the forge unable to say which repository one
+text names, any of them may be meant; to keep one, run the forget again when the forge
+answers. A text spelled exactly as a held upstream record names that record alone, whether or
 not the registry knows its repository, and a `<repo>#<n>` text the registry reads as a pull
 request names that pull request, as `--on` reads it, even when a member branch is named
 so. A record on another fork's own repository is never a record of this fork's: a bare

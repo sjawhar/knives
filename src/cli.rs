@@ -394,11 +394,10 @@ pub enum Command {
     /// is a sensible default and a bad rule. This accepts any upstream pull request in
     /// any state from any author: one opened before this tool existed, one the
     /// maintainer closed because they wanted a different approach, or somebody else's
-    /// that we are carrying because ours was superseded. The number is asked of the
-    /// forge, because the fork's own repository numbers its review pull requests
-    /// apart: refused when the fork's pull request of that number has this branch
-    /// as its head and the upstream's does not, when only the fork has the number,
-    /// and when neither has it.
+    /// that we are carrying because ours was superseded. When the upstream and
+    /// the fork's own repository are two forge repositories, the number is
+    /// asked of the upstream, and refused when it has no pull request of that
+    /// number.
     Track {
         branch: String,
         /// The upstream pull request's number.
@@ -424,8 +423,10 @@ pub enum Command {
     ///
     /// A requirement is a pull request or a member branch, and the record says
     /// which: `<upstream>#<n>` is a pull request on the fork's upstream,
-    /// `origin:<owner>/<name>#<n>` a review pull request on the fork's own
-    /// repository, `origin:<owner>/<name>:<branch>` a member branch of this fork.
+    /// `origin:<owner>/<name>:<branch>` a member branch of this fork. A pull
+    /// request on a fork's own repository is refused: pull requests go
+    /// upstream. A record of one, `origin:<owner>/<name>#<n>`, that an older
+    /// knives wrote is read, and `--forget` takes it back as it is spelled.
     ///
     /// `--forget` takes a requirement back; with `--on` it corrects one. The
     /// removal is a ledger entry, so every machine running this knives that
@@ -434,57 +435,31 @@ pub enum Command {
     /// forget whose list holds one as requiring nothing.
     Depends {
         branch: String,
-        /// What it needs, repeatable. `<repo>#<number>`, `<repo>` the registry
-        /// name: another fork's key is first asked about as below, and names
-        /// this fork's own repository when its upstream is that. Otherwise,
-        /// when that fork's upstream and own repository are both forge
-        /// repositories, knives asks the forge which has that pull request, and
-        /// refuses when both or neither do (when the forge names that fork's
-        /// own repository as its upstream, the upstream's, with no lookup of
-        /// the number); when either is no forge repository, there is no such
-        /// lookup, and it is the upstream's. `<owner>/<name>#<number>`: the
-        /// upstream's pull request, or the fork's when `<owner>/<name>` is its
-        /// own repository. Another fork's upstream, by either spelling, may be
-        /// this fork's repository under another name, so the forge is asked,
-        /// and nothing is recorded (exit 3) when it cannot say. The question is
-        /// skipped when this fork's own repository names no forge repository
-        /// (neither its checkout's nor its registry's `origin` is a forge URL).
-        /// Another fork whose upstream is a path is named by its registry key
-        /// exactly, with no forge call, and its key in another letter case is
-        /// refused (exit 2); this fork's own path upstream is taken in any
-        /// letter case. With the forge down, a pull request is recorded only
-        /// when naming it needs no forge question: this fork's upstream's, by
-        /// `<owner>/<name>`, unless this fork's checkout or registry `origin`
-        /// spells that upstream; another fork's upstream's, by `<owner>/<name>`,
-        /// when this fork's own repository names no forge repository; and, by a
-        /// registry key, one of a fork whose upstream or own repository names no
-        /// forge repository, when that fork is this one, its upstream is a
-        /// path, or this fork's own repository names no forge repository. An
-        /// `origin` that spells this fork's upstream is a configuration error.
-        /// With the forge up, when only the registry's `origin` spells it and
-        /// the checkout's names this fork's repository, that upstream's
-        /// `<owner>/<name>` is refused (exit 2: not this fork's own
-        /// repository), while this fork's key is read as usual against the
-        /// checkout's repository, and a number both have is refused without
-        /// offering the upstream spelling; when this fork's own repository
-        /// spells it (as when the checkout's `origin` is a path), this fork's
-        /// key takes the upstream's number with no lookup. A review pull
-        /// request on another fork's repository is refused, and so is one whose
-        /// head is not a member branch of the fork's owner. A branch name: a
-        /// member branch of this fork.
+        /// What it needs, repeatable. `<repo>#<number>`: with `<repo>` a
+        /// registry name, a pull request on that fork's upstream; with `<repo>`
+        /// an upstream's `<owner>/<name>`, a pull request on it. No forge is
+        /// asked. A fork whose upstream is a path is named by its registry key
+        /// exactly, and its key in another letter case is refused (exit 2);
+        /// this fork's own path upstream is taken in any letter case. A pull
+        /// request on a fork's own repository is refused (exit 2): one named by
+        /// this fork's own `<owner>/<name>`, by another fork's, or by the key
+        /// of a fork whose upstream is this fork's own repository. A spelling
+        /// of this fork's own repository is read so first: an `origin` that
+        /// spells this fork's upstream is a configuration error. A branch name:
+        /// a member branch of this fork.
         #[arg(long = "on", required_unless_present = "forget")]
         on: Vec<String>,
         /// A requirement to take back, repeatable: as its record spells it, or
-        /// as `--on` would. Every record of it is taken back, whatever spelling
-        /// of the fork's repository each carries; a record on another fork's
-        /// repository is never one of this fork's. The texts are weighed
-        /// together: when the forge cannot say whether a record is named (it
-        /// is down, or cannot see a repository), and counting it would take
-        /// back more, or tell two requirements from one, nothing is taken
-        /// back (exit 3), and the refusal prints a command no forge answer
-        /// changes: one that names every record of that number or member on a
-        /// repository that is not another fork's, or, when the text may name
-        /// two requirements, one such command for each.
+        /// as `--on` would. Every record of a member is taken back, whatever
+        /// spelling of the fork's repository each carries; a record on another
+        /// fork's repository is never one of this fork's. A fork pull request
+        /// record is taken back as it is spelled. The texts are weighed
+        /// together: when the forge cannot say whether a member record is
+        /// named (it is down, or cannot see a repository), and counting it
+        /// would take back more, nothing is taken back (exit 3), and the
+        /// refusal prints a command no forge answer changes: one that names
+        /// every record of that member on a repository that is not another
+        /// fork's.
         #[arg(long)]
         forget: Vec<String>,
         /// Registry name. Defaults to the repo you are standing in.

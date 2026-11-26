@@ -503,26 +503,28 @@ pub fn pull_number_from_bookmark(name: &str) -> Option<u64> {
 /// Dependencies cross forks, which is the case that motivated them: a change
 /// in one fork needing a pull request in a sibling, where dropping one from a
 /// release without the other ships a release that cannot work. Within one
-/// fork, a member can need another member, or the review pull request on the
-/// fork's own repository that carries it. Each token says which it names:
+/// fork, a member can need another member. Each token says which it names:
 ///
 /// - `<repo>#<number>`: pull request `<number>` on the upstream of the fork
 ///   kept under `<repo>`, its [`UpstreamName`].
-/// - `origin:<owner>/<name>#<number>`: review pull request `<number>` on a
-///   fork's own repository, the one its `origin` remote names, as the forge
-///   names it.
 /// - `origin:<owner>/<name>:<branch>`: the member branch `<branch>` of the
 ///   fork whose ledger states it, pushed to its own repository
 ///   `<owner>/<name>`. A ref name holds no `:`, so the first one after the
 ///   repository ends it. The repository says where the branch was when it
 ///   was stated; the branch is looked up in that fork, whatever its
 ///   repository is called since.
+/// - `origin:<owner>/<name>#<number>`: pull request `<number>` on a fork's
+///   own repository ([`Requirement::ForkPull`]), which only an older knives wrote.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Requirement {
     Upstream {
         repo: UpstreamName,
         number: u64,
     },
+    /// A pull request on a fork's own repository. Pull requests go upstream,
+    /// so `depends` records none; one an older knives recorded is still
+    /// read, so its ledger reads whole, and `status` names the command that
+    /// takes it back.
     ForkPull {
         repository: String,
         number: u64,
@@ -573,7 +575,7 @@ impl Requirement {
         })
     }
 
-    /// The repository a review pull request or member record spells.
+    /// The repository a fork pull request or member record spells.
     pub fn repository(&self) -> Option<&str> {
         match self {
             Self::ForkPull { repository, .. } | Self::ForkBranch { repository, .. } => {
@@ -583,11 +585,10 @@ impl Requirement {
         }
     }
 
-    /// Whether this and `other` are records of one review pull request
-    /// number, or of one member branch, whatever repository each spells.
-    pub fn same_number_or_member(&self, other: &Self) -> bool {
+    /// Whether this and `other` are records of one member branch, whatever
+    /// repository each spells.
+    pub fn same_member(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::ForkPull { number: one, .. }, Self::ForkPull { number: two, .. }) => one == two,
             (Self::ForkBranch { branch: one, .. }, Self::ForkBranch { branch: two, .. }) => {
                 one == two
             }
