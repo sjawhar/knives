@@ -1684,7 +1684,7 @@ pub(crate) fn run_track(
 ) -> anyhow::Result<Exit> {
     let target = &BranchTarget::new(fork.upstream.clone(), branch.clone());
     if let Some(number) = pr
-        && let Err(exit) = crate::depends::upstream_pull(fork, bound.registry, branch, number)
+        && let Err(exit) = crate::depends::upstream_pull(fork, number)
     {
         return Ok(exit);
     }
