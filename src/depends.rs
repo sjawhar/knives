@@ -475,6 +475,19 @@ fn refused<T>(exit: Exit, message: impl Display) -> Result<T, Exit> {
     Err(exit)
 }
 
+/// Refuse `text`, a pull request on `repository`, a fork's own repository:
+/// pull requests go upstream, so none is a requirement.
+fn fork_pull_refused(text: &str, repository: &str) -> Result<Requirement, Exit> {
+    refused(
+        Exit::Usage,
+        format_args!(
+            "{text} names a pull request on {repository}, a fork's own repository: pull \
+             requests go upstream, so no branch depends on one. Name the upstream pull \
+             request as `<repo>#<number>`, or the member branch by its name"
+        ),
+    )
+}
+
 /// `<repo>` of `text` when `text` is `<repo>#<number>`, with the number.
 fn numbered(text: &str) -> Option<(&str, u64)> {
     let (repo, number) = text.rsplit_once('#')?;
@@ -500,7 +513,7 @@ impl Context<'_, '_> {
         if text.starts_with("origin:") {
             return match Requirement::parse(text) {
                 Some(Requirement::ForkPull { repository, .. }) => {
-                    self.fork_pull_refused(text, &repository)
+                    fork_pull_refused(text, &repository)
                 }
                 Some(Requirement::ForkBranch { repository, branch }) => {
                     if let Some(key) = self.other_fork(&repository) {
@@ -544,7 +557,7 @@ impl Context<'_, '_> {
     /// The upstream pull request `<repo>#<number>` names: by a registry name,
     /// that fork's upstream's; by an upstream's `<owner>/<name>`, that
     /// upstream's. No forge is asked. A pull request on a fork's own
-    /// repository is refused ([`Self::fork_pull_refused`]): named by a
+    /// repository is refused ([`fork_pull_refused`]): named by a
     /// spelling of this fork's own repository here, by another fork's own
     /// repository, or by the key of a fork whose upstream is this fork's own
     /// repository. A spelling of this fork's own repository is read so before
@@ -561,7 +574,7 @@ impl Context<'_, '_> {
                 && let Some(slug) = remote_slug(&entry.upstream)
                 && self.is_own_repository(slug)
             {
-                return self.fork_pull_refused(text, slug);
+                return fork_pull_refused(text, slug);
             }
             return Ok(Requirement::Upstream {
                 repo: upstream,
@@ -569,7 +582,7 @@ impl Context<'_, '_> {
             });
         }
         if self.own_origin_named(repo).is_some() {
-            return self.fork_pull_refused(text, repo);
+            return fork_pull_refused(text, repo);
         }
         if let Some(upstream) = self.registry.resolve(repo) {
             if upstream != self.fork.upstream && self.others_upstream(repo).is_none() {
@@ -593,7 +606,7 @@ impl Context<'_, '_> {
             });
         }
         if self.other_fork(repo).is_some() {
-            return self.fork_pull_refused(text, repo);
+            return fork_pull_refused(text, repo);
         }
         if self.has_branch(text) {
             return self.member_branch(text);
@@ -612,19 +625,6 @@ impl Context<'_, '_> {
                 "unknown repo {repo} in {text}; known: {}, or a branch of {}",
                 known.join(", "),
                 self.fork.name
-            ),
-        )
-    }
-
-    /// Refuse `text`, a pull request on `repository`, a fork's own
-    /// repository: pull requests go upstream, so none is a requirement.
-    fn fork_pull_refused(&self, text: &str, repository: &str) -> Result<Requirement, Exit> {
-        refused(
-            Exit::Usage,
-            format_args!(
-                "{text} names a pull request on {repository}, a fork's own repository: pull \
-                 requests go upstream, so no branch depends on one. Name the upstream pull \
-                 request as `<repo>#<number>`, or the member branch by its name"
             ),
         )
     }
@@ -1189,9 +1189,11 @@ impl Context<'_, '_> {
                     let Some(other) = held.repository() else {
                         continue;
                     };
-                    match own.as_ref().map_err(Clone::clone).and_then(|own| {
-                        named_as(other).map(|name| name.eq_ignore_ascii_case(own))
-                    }) {
+                    match own
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .and_then(|own| named_as(other).map(|name| name.eq_ignore_ascii_case(own)))
+                    {
                         Ok(true) if alias.is_none() => alias = Some(held.clone()),
                         Ok(_) => {}
                         Err(_) => unplaced.push(held.clone()),

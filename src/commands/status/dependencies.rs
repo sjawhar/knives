@@ -256,18 +256,17 @@ impl DependencyResults<'_> {
         let mut tokens: Vec<String> = Vec::new();
         let mut besides: Vec<String> = Vec::new();
         for &requirement in open {
-            let of_it: Vec<&Requirement> = if requirement.repository().is_none()
-                || spelled(requirement, &self.apart)
-            {
-                vec![requirement]
-            } else {
-                held.iter()
-                    .filter(|record| {
-                        !spelled(record, &self.apart) && record.same_member(requirement)
-                    })
-                    .chain([requirement])
-                    .collect()
-            };
+            let of_it: Vec<&Requirement> =
+                if requirement.repository().is_none() || spelled(requirement, &self.apart) {
+                    vec![requirement]
+                } else {
+                    held.iter()
+                        .filter(|record| {
+                            !spelled(record, &self.apart) && record.same_member(requirement)
+                        })
+                        .chain([requirement])
+                        .collect()
+                };
             match requirement {
                 Requirement::ForkBranch { branch, .. }
                     if !branch.as_str().contains('#')
