@@ -34,9 +34,11 @@ mod words;
 
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::ops::Range;
 
 use jj_lib::diff::{ContentDiff, DiffHunkKind};
+use sha2::Digest as _;
 
 use crate::changelog_union;
 use crate::ids::CommitId;
@@ -166,6 +168,8 @@ pub struct Lost {
     /// For a line, its text. For a path read whole, what the member made of
     /// it (`deleted`, `a binary file`, `an empty file`, `a symlink to …`,
     /// `a submodule at …`); for a mode, `executable yes` or `executable no`;
+    /// for [`LostKind::AddedFileChanged`], a stable digest of the release
+    /// file's non-blank lines, used only to carry forward the same version;
     /// for a conflict, where it is (`in the release` or `at the member's
     /// tip`).
     pub text: Option<String>,
@@ -319,12 +323,16 @@ impl MemberLines {
     /// line. A member whose every lost line is carried forward reads carried
     /// forward, or inconclusive where a path cannot be read; one with any
     /// other lost line still reads missing. A file the member adds that the
-    /// release before changed too is carried forward like a line.
+    /// release before changed too is carried forward only where the release
+    /// holds the same non-blank lines: its entry's text is their digest.
     pub fn carry_forward(&mut self, previous: &Self) {
         for lost in &mut self.lost {
             lost.carried_forward = lost.kind != LostKind::Conflict
                 && previous.lost.iter().any(|before| {
-                    before.kind == lost.kind && before.path == lost.path && before.line == lost.line
+                    before.kind == lost.kind
+                        && before.path == lost.path
+                        && before.line == lost.line
+                        && (lost.kind != LostKind::AddedFileChanged || before.text == lost.text)
                 });
         }
         self.reading = self.settled();
@@ -483,11 +491,18 @@ impl Out<'_> {
         }
         if change.adds_file
             && self.lost.len() == before
-            && release.is_some_and(|(_, held)| non_blank_lines(held).ne(non_blank_lines(content)))
+            && let Some((_, held)) =
+                release.filter(|(_, held)| non_blank_lines(held).ne(non_blank_lines(content)))
         {
-            self.lost(entry(path, LostKind::AddedFileChanged, None, None), || {
-                Place::Path
-            });
+            self.lost(
+                entry(
+                    path,
+                    LostKind::AddedFileChanged,
+                    None,
+                    Some(non_blank_digest(held)),
+                ),
+                || Place::Path,
+            );
         }
     }
 }
@@ -498,6 +513,25 @@ fn non_blank_lines(text: &[u8]) -> impl Iterator<Item = &[u8]> {
     text.split_inclusive(|byte| *byte == b'\n')
         .filter(|line| !is_blank(line))
         .map(bare)
+}
+
+/// A stable digest of `text`'s non-blank lines, each without its line
+/// ending, with its length before it. An [`LostKind::AddedFileChanged`] entry
+/// carries this: a later release carries the entry forward only where its
+/// added file has the same non-blank lines.
+fn non_blank_digest(text: &[u8]) -> String {
+    let mut hash = sha2::Sha256::new();
+    for line in non_blank_lines(text) {
+        let length = u64::try_from(line.len()).unwrap_or(u64::MAX);
+        hash.update(length.to_be_bytes());
+        hash.update(line);
+    }
+    let digest: [u8; 32] = hash.finalize().into();
+    let mut text = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
 }
 
 /// What a member did to a file that its tip holds, from what its fork
@@ -1600,11 +1634,8 @@ mod tests {
             // the third lacks it
             assert_eq!(held.reading, Reading::Carried, "{content:?}");
             assert_eq!(other.reading, Reading::Inconclusive, "{content:?}");
-            assert_eq!(
-                lost(&other),
-                [(LostKind::AddedFileChanged, None, None)],
-                "{content:?}"
-            );
+            assert_eq!(lost(&other)[0].0, LostKind::AddedFileChanged, "{content:?}");
+            assert!(other.lost[0].text.is_some(), "{content:?}");
             assert_eq!(
                 lost(&absent),
                 [(LostKind::File, None, Some("an empty file"))],
@@ -1619,9 +1650,11 @@ mod tests {
         // holds another version of it with both lines (a line the member's
         // history removed, put back, or another change's edit)
         let changed = read("f.txt", Value::Absent, file("a\nc\n"), file("a\nb\nc\n"));
-        // Then: the member is inconclusive, with the file named
+        // Then: the member is inconclusive, with the file and a digest of
+        // the release's non-blank lines named
         assert_eq!(changed.reading, Reading::Inconclusive);
-        assert_eq!(lost(&changed), [(LostKind::AddedFileChanged, None, None)]);
+        assert_eq!(lost(&changed)[0].0, LostKind::AddedFileChanged);
+        assert!(changed.lost[0].text.is_some());
         assert!(!changed.holds_every_line());
         assert!(!changed.conflicted_only_at_tip());
 
@@ -1642,13 +1675,23 @@ mod tests {
         assert_eq!(dropped.reading, Reading::Carried);
         assert_eq!(blank.reading, Reading::Carried);
 
-        // Given: the release before changed the file too
-        let mut again = read("f.txt", Value::Absent, file("a\nc\n"), file("a\nb\nc\n"));
-        let previous = read("f.txt", Value::Absent, file("a\nc\n"), file("a\nc\nd\n"));
-        // When: the reading carries forward what the release before lacked
-        again.carry_forward(&previous);
-        // Then: the file is carried forward, as a line would be
-        assert_eq!(again.reading, Reading::CarriedForward);
+        // Given: a release before that changed the file's non-blank lines,
+        // and one that held the same lines with a blank line added
+        let mut different = read("f.txt", Value::Absent, file("a\nc\n"), file("a\nb\nc\n"));
+        let previous_different = read("f.txt", Value::Absent, file("a\nc\n"), file("a\nc\nd\n"));
+        let mut same = read("f.txt", Value::Absent, file("a\nc\n"), file("a\nb\nc\n"));
+        let previous_same = read("f.txt", Value::Absent, file("a\nc\n"), file("a\n\nb\nc\n"));
+        assert_ne!(different.lost[0].text, previous_different.lost[0].text);
+        assert_eq!(same.lost[0].text, previous_same.lost[0].text);
+
+        // When: each reading carries forward what the release before lacked
+        different.carry_forward(&previous_different);
+        same.carry_forward(&previous_same);
+        // Then: an entry whose file changed differently is not carried
+        // forward (plant A carries every entry unconditionally), while one
+        // that holds the same non-blank lines is
+        assert_eq!(different.reading, Reading::Inconclusive);
+        assert_eq!(same.reading, Reading::CarriedForward);
     }
 
     #[test]
@@ -2013,5 +2056,22 @@ mod tests {
                 "release_words": 30_004,
             }])
         );
+    }
+
+    #[test]
+    fn an_added_file_changed_entry_serializes_its_version_digest() {
+        // Given: a member that adds `f.txt`, and a release that holds another
+        // version of it
+        let lines = read("f.txt", Value::Absent, file("a\nc\n"), file("a\nb\nc\n"));
+
+        // When: it is written as JSON
+        let json = serde_json::to_value(&lines).expect("the reading serializes");
+
+        // Then: the unreadable entry names its kind and the stable digest of
+        // the release file's non-blank lines, so a later audit can carry
+        // forward only that same version
+        assert_eq!(json["reading"], "inconclusive");
+        assert_eq!(json["lost"][0]["kind"], "added-file-changed");
+        assert_eq!(json["lost"][0]["text"], non_blank_digest(b"a\nb\nc\n"));
     }
 }
