@@ -676,7 +676,8 @@ Every gate's check of whether a release carries a member reads the member by its
 (`own_lines`, through `jj::Repo::member_lines`, or `jj::Candidate::member_lines` for a cut's
 candidate): `members --verify`, the audits of a knives cut and of `cut NAME --at`
 (`release::audit_cut`), and the composition gate (`release::uncarried_recorded_members`).
-`--carries` and `--census` do not (below). A release merge names its members as parents, so
+`--carries` and `--census` read a tip that a release reaches the same way (below). A release
+merge names its members as parents, so
 every member is an ancestor whatever the merge's tree holds, and only the content shows whether a
 hand resolution kept a member's change. The member's own change is the diff from its fork point
 with the upstream trunk (`Repo::fork_point`) to its tip, read with no rename detection. So the
@@ -739,20 +740,42 @@ single-target query. It also answers when no release exists, against the upstrea
 rather than refusing; that is the only target needed to decide whether unreleased work would be
 orphaned. A revision is safe only when a live release or the trunk carries its content; a
 superseded release is consulted only after those targets miss and does not make the result safe.
-It reads by replay, not by own lines (`carriage::check`): fixtures where a release put back a line
-a member deleted, wrote it back edited, kept a sibling's edit over the deletion, or dropped a
-member's executable bit or blank lines read carried by own lines and are not. An ancestor tip of
-the upstream trunk, which knives does not compose, is carried-exact. An ancestor tip of a release
-is carried-exact only when its change from its base by the rule above (`Repo::release_base`)
-replays empty, with no conflict, onto the release (`Repo::base_replay_outcome`), and
+A tip that a release reaches is read by its own lines, as `members --verify` reads a member,
+through the same reader (`carriage::holds_own_lines`, over `jj::Repo::member_lines`): two commands
+of one tool read one fact one way, and no second check decides whether a line is held. An
+ancestor tip of the upstream trunk, which knives does not compose, is carried-exact. An ancestor
+tip of a release is carried-exact when the release holds every line of its change from its base
+by the rule above (`Repo::release_base`, `own_lines::MemberLines::holds_every_line`): no line that
+the change added is lost, no line that it removed is put back, no line is held only by its words,
+and no path of the change holds an unresolved conflict, in the release or at the tip. It is
 merged-then-edited otherwise: the answer exits 3 for a person to judge, and lists newest first the
 release's commits the tip does not reach that changed a file of its change, each read against the
-automatic merge of its parents (`Repo::edited_since`). A `knives depends` record of the branch it
-was built on is named in a note and never decides the verdict. A tip the target does not reach is
-replayed onto it from their common ancestor (`Repo::tree_replay_outcome`): an empty replay is
-carried-rewritten, and otherwise a standing rewrite that the target reaches makes it
-carried-rebased, else conflicted or not-carried. In the census a merged-then-edited row is no
-orphan and does not change the exit.
+automatic merge of its parents (`Repo::edited_since`). The commands differ in two places, where
+`--verify` reports and passes and `--carries` leaves the judgment to a person. A line that another
+change edited, which the release holds only by its words, is a changed line: `--verify` reads the
+member carried (exit 0) and names the line, and `--carries` reads merged-then-edited. A path of
+the change that holds an unresolved conflict, in the release or at the tip, is inconclusive in
+`--verify`, which exits 0 where the member lacks nothing else, and merged-then-edited in
+`--carries`. A conflict in another path is no conflict of the change, and neither command sees it.
+Lines that other changes added or edited next to the tip's own are no line of the tip's. A replay
+of the tip's change onto the release conflicts there though nothing of the tip is missing (a
+member's deletion beside another member's rewrite of the line before it, or several members'
+entries at one place that a resolution kept side by side), so a replay decides no tip that the
+release reaches. What the own-lines rule does not read it does not read for either command, so
+both read as carried: blank lines that the release dropped; the executable bit of a file that the
+member's change adds, which has no bit of its fork point's to change; a removed hunk that the
+release writes back edited; lines of punctuation alone of a removed hunk that the release puts
+back while other lines of the hunk stay removed (`own_lines` reads such a line as lost only with
+its whole hunk); and a line deleted from a file that the member's own change adds whole, as for a member
+stacked on a branch that adds the file, since the deletion is no hunk of its change from the
+trunk. A `knives depends` record of the branch it was built on is named in a note and never
+decides the verdict. A tip the target does not reach is replayed onto it, from their common
+ancestor against the trunk (`Repo::tree_replay_outcome`) and from its base against a release
+(`Repo::base_replay_outcome`): an empty replay is carried-rewritten, and otherwise a standing
+rewrite that the target reaches makes it carried-rebased, where, against a release, the release
+holds every line of the rewrite's own change from its own base too, by the same reading, else
+conflicted or not-carried. In the census a merged-then-edited row is no orphan and does not change
+the exit.
 
 `knives release members --census` turns that same check into a census. Its primary matrix contains
 every maintained branch against the live releases and upstream trunk. Superseded releases are

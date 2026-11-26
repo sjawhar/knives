@@ -854,9 +854,12 @@ pub enum ReleaseAction {
     /// direction: is REV's content carried — by REF when one is given,
     /// otherwise by every live release and the upstream trunk before any
     /// superseded cut (the rigorous "is this safe to delete"; grep answers a
-    /// different question). Against a release it reads REV's own lines in
-    /// the same way, and it reads `conflicted` only for such a conflict.
-    /// Against the upstream trunk, ancestry and a replay of REV decide.
+    /// different question). A release that reaches REV carries it where the
+    /// release holds every line of REV's own change, read as `--verify`
+    /// reads it; where the release lacks a line, or holds one only by its
+    /// words, or either holds an unresolved conflict there, a person judges.
+    /// Where a release does not reach REV, and against the upstream trunk,
+    /// ancestry and a replay of REV decide.
     /// `--census` asks that of every maintained branch at once.
     Members {
         /// The release ref to inspect. Defaults to the release in hand. With

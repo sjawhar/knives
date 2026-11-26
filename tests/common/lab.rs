@@ -1432,6 +1432,49 @@ pub fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// `knives release members <release> --verify`, whatever its exit.
+pub fn verify(lab: &Lab, home: &TempDir, release: &str) -> Output {
+    knives_release(lab, home, &["members", release, "--verify"])
+}
+
+/// The label `members --verify` gives the member that `branch` holds.
+pub fn label(lab: &Lab, branch: &str) -> String {
+    format!("{branch}@{}", commit_at(lab, branch).short())
+}
+
+/// The `members --verify` row of a member it reads as carried.
+pub fn carried_row(label: &str) -> String {
+    format!("  {label}: carried (replay empty)")
+}
+
+/// The `members --verify` and cut-audit row of a member read as missing.
+pub fn missing_row(label: &str) -> String {
+    format!("  !! {label}: the cut tree is missing or diverges from the member's content")
+}
+
+/// `knives release members --carries <revision>`, whatever its exit.
+pub fn carries(lab: &Lab, home: &TempDir, revision: &str) -> Output {
+    knives_release(lab, home, &["members", "--carries", revision])
+}
+
+/// `knives release members --census --no-github`'s standard output.
+pub fn census(lab: &Lab, home: &TempDir) -> String {
+    stdout(&knives_release(
+        lab,
+        home,
+        &["members", "--census", "--no-github"],
+    ))
+}
+
+/// The census block of `branch`: its row and its checks.
+pub fn census_block<'a>(stdout: &'a str, branch: &str) -> &'a str {
+    let wanted = format!("  {branch} @");
+    stdout
+        .split("\n\n")
+        .find(|block| block.starts_with(&wanted))
+        .unwrap_or_else(|| panic!("no census block for {branch}: {stdout}"))
+}
+
 /// [`jj`] for an argument list of any length. The command must succeed.
 pub fn jj_in(directory: &Path, args: &[&str]) {
     let status = Command::new("jj")

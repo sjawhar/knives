@@ -3649,8 +3649,8 @@ pub const LOST_LINE_INDENT: &str = "      ";
 /// the range.
 ///
 /// This is the one renderer of a member's lacking lines, which `members
-/// --verify`, the audit of a cut, the composition gate, `--carries` and
-/// `--census` print under the row that names the member;
+/// --verify`, the audit of a cut and the composition gate print under the
+/// row that names the member (`--carries` and `--census` name no line);
 /// [`held_by_words_lines`] names the lines it holds only by their words.
 /// Each text is read from the repository, so it is escaped.
 pub fn lost_lines(
