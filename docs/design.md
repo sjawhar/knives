@@ -404,7 +404,9 @@ release-name bookmark gets its own `problems` line, and the trunk is `knives sta
 `divergence` finding, not the audit's. The forbidden-identifier scans run on at most eight threads
 however wide the machine: several owners audit one checkout in the same minute.
 
-`knives notch` has two moods, split by `-m`: bare it reads, `-m` writes.
+`knives notch` has two moods, split by `-m`: bare it reads, `-m` writes. A `-m` must hold text:
+an empty or whitespace-only one is a usage error that writes nothing, as a note with evidence and
+an anchor but no text says what it is about and never what happened.
 Reading is intentional and nothing injects notches into a session, so the bare form returns the
 newest human notes and folds machine events into one count rather than letting routine events
 hide decisions. `--events` reads the full chronology; `--dispositions` reads every terminal
