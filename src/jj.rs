@@ -798,12 +798,17 @@ impl Repo {
     /// starts (spec R6, [`Self::release_base`]), replayed onto `target`, with
     /// a release log the target holds as a union left out ([`replayed_tree`]).
     ///
-    /// This answers whether `target`'s tree holds a revision it already
-    /// reaches. [`Self::tree_replay_outcome`] cannot: its base is the common
-    /// ancestor of the two, which for such a revision is the revision itself,
-    /// so it always reads empty. A conflict counts only at a path of the
-    /// revision's change: one the target holds elsewhere is not the
-    /// revision's, and the replay carries it along unchanged.
+    /// `--carries` and `--census` read a revision that a release does not
+    /// reach this way ([`crate::carriage::check`]). One that the release
+    /// reaches is read by its own lines ([`Self::member_lines`]), as `members
+    /// --verify` reads it: a replay conflicts where another change edited a
+    /// line next to the revision's, though no line of the revision is
+    /// missing. The caller passes a revision that the target does not reach,
+    /// and [`Self::release_base`] then gives a base that does not descend
+    /// from it, so the change from `base` never runs backwards. A conflict
+    /// counts only at a path of the revision's change: one the target holds
+    /// elsewhere is not the revision's, and the replay carries it along
+    /// unchanged.
     pub fn base_replay_outcome(
         &self,
         revision: &CommitId,
@@ -813,10 +818,6 @@ impl Repo {
         let base = self.commit(base.as_str())?;
         let revision = self.commit(revision.as_str())?;
         let target = self.commit(target.as_str())?;
-        // `base..revision` is empty exactly when the base already reaches the tip.
-        if self.backend_is_ancestor(revision.id(), base.id())? {
-            return Ok(RebaseOutcome::Empty);
-        }
         let mut changed = Vec::new();
         for entry in collect_stream(
             base.tree()

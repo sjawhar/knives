@@ -4,9 +4,11 @@
 //! reports a dropped member's content. Carries compares a revision's net content
 //! with each target, stops before superseded releases when a live one carries,
 //! and answers against the trunk when no release exists. A release that names a
-//! member as a parent carries it exactly only when the member's change from
-//! its fork point with the trunk replays empty onto it; any other ancestor of
-//! the release is merged-then-edited, whatever the member records, and the
+//! member as a parent carries it exactly only when it holds every line of the
+//! member's own change from its fork point with the trunk, as `--verify` reads
+//! the member's own lines: none lost, none held only by its words, and no
+//! unresolved conflict in the change's paths. Any other ancestor of the
+//! release is merged-then-edited, whatever the member records, and the
 //! trunk carries any ancestor. The census finds orphan branches, respects
 //! an open pull, excludes anonymous heads, and says unanswered when the forge
 //! withholds a fact or is unavailable.
@@ -28,8 +30,9 @@ mod release_forge;
 use forge_shim::{install_failing_gh, path_with_gh_shim, pull_record};
 use knives::jj::Repo;
 use lab::{
-    Lab, ReleaseOutput, commit_at, extend_branch, home_after_first_cut, knives_release,
-    release_command, release_parents, release_test_home, text,
+    Lab, ReleaseOutput, adopt, carried_row, census, census_block, commit_at, conflicts_of,
+    edit_by_hand, extend_branch, home_after_first_cut, knives_release, label, missing_row,
+    release_command, release_parents, release_test_home, stdout, text, trunk_with, verify,
 };
 use release_forge::{ReleaseWithSnapshotForgeInput, release_with_snapshot_forge};
 use std::process::Command;
@@ -304,14 +307,14 @@ fn release_carries_answers_merged_then_edited_for_a_parent_whose_change_the_rele
         "{beta}"
     );
     // And: alpha, whose change the release's tree holds, is carried exactly,
-    // and the reason says its change replays empty, not only that it is an
-    // ancestor.
+    // and the reason says the release holds every line of its change, not
+    // only that it is an ancestor.
     let alpha_stdout = String::from_utf8_lossy(&alpha_output.stdout);
     assert!(alpha_output.status.success(), "{alpha_stdout}");
     assert!(
         alpha_stdout.contains(&format!(
             "carried-exact      release/2026-08-04 @ {}  (evidence {}: tip is an ancestor and \
-             its change replays empty onto the release)",
+             the release holds every line of its change)",
             release.short(),
             alpha.short()
         )),
@@ -492,6 +495,8 @@ fn release_carries_answers_merged_then_edited_for_an_ancestor_a_hand_resolution_
 
 /// The branch the release-resolution tests ask about.
 const MEMBER: &str = "feat/member";
+/// The release that the tests of the own-lines reading cut and ask about.
+const CUT: &str = "release/2026-08-04";
 
 /// Write each of `files` in the work checkout, or remove it for `None`.
 fn write_by_hand(lab: &Lab, files: &[(&str, Option<&str>)]) {
@@ -553,7 +558,7 @@ fn assert_carried(lab: &Lab, name: &str, carried: bool) {
 /// `merged-then-edited` (its commits are in the release; what it brought was
 /// changed since), never a carried verdict.
 fn assert_carried_in(lab: &Lab, home: &tempfile::TempDir, name: &str, carried: bool) {
-    let release = commit_at(lab, "release/2026-08-04");
+    let release = commit_at(lab, CUT);
     assert!(
         Repo::open(&lab.work)
             .expect("open the lab")
@@ -561,7 +566,7 @@ fn assert_carried_in(lab: &Lab, home: &tempfile::TempDir, name: &str, carried: b
             .expect("ancestry answerable"),
         "{name} must be an ancestor of the release"
     );
-    for target in ["release/2026-08-04", release.as_str()] {
+    for target in [CUT, release.as_str()] {
         let output = knives_release(lab, home, &["members", target, "--carries", name]);
         let stdout = String::from_utf8_lossy(&output.stdout);
         if carried {
@@ -927,8 +932,7 @@ fn release_carries_answers_merged_then_edited_for_a_member_deleted_then_recreate
 }
 
 #[test]
-fn release_carries_answers_merged_then_edited_for_a_member_whose_deleted_line_the_release_put_back()
-{
+fn release_carries_answers_carried_exact_for_a_put_back_line_of_a_file_the_change_adds_whole() {
     // Given: `feat/del`, stacked on `feat/base`, deletes the line `b`; the
     // release merges it with another branch and puts `b` back by hand.
     let lab = Lab::new();
@@ -937,19 +941,22 @@ fn release_carries_answers_merged_then_edited_for_a_member_whose_deleted_line_th
     lab.branch("feat/x", "x.txt", "x\n");
     merge_by_hand(
         &lab,
-        "release/2026-08-04",
+        CUT,
         ("feat/del", "feat/x"),
         &[("f.txt", Some("a\nb\nc\n"))],
     );
+    let (home, _consumer) = release_test_home(&lab);
 
     // When, then: from the trunk, `f.txt` is one file `feat/del` added as
-    // `a`, `c`, and the release holds it with `b` back, so `feat/del` is
-    // not carried exactly.
-    assert_carried(&lab, "feat/del", false);
+    // `a`, `c`, and the release holds both lines with `b` between them, so
+    // every command reads `feat/del` carried. A member that deletes a line
+    // of a file that its fork point holds is read missing where the release
+    // puts the line back (the deleter of the guard tests).
+    assert_every_command_reads_carried(&lab, &home, &["feat/del"]);
 }
 
 #[test]
-fn release_carries_answers_merged_then_edited_for_a_member_that_deleted_a_line_it_merged_in() {
+fn release_carries_answers_carried_exact_for_a_member_that_deleted_a_line_it_merged_in() {
     // Given: `feat/del`, built on `feat/base`, merges in `feat/u`, which adds
     // `u.txt`, then deletes a line of `u.txt`; the release merges `feat/del`
     // with another branch and puts the line back.
@@ -969,13 +976,17 @@ fn release_carries_answers_merged_then_edited_for_a_member_that_deleted_a_line_i
     lab.branch("feat/x", "x.txt", "x\n");
     merge_by_hand(
         &lab,
-        "release/2026-08-04",
+        CUT,
         ("feat/del", "feat/x"),
         &[("u.txt", Some("x\ny\n"))],
     );
+    let (home, _consumer) = release_test_home(&lab);
 
-    // When, then: `feat/del` is not carried exactly.
-    assert_carried(&lab, "feat/del", false);
+    // When, then: every command reads `feat/del` carried. From the trunk,
+    // `u.txt` is one file that `feat/del` added as `x`, so the line it
+    // deleted after merging it in is no hunk of its own change, and the
+    // release holds `x`.
+    assert_every_command_reads_carried(&lab, &home, &["feat/del"]);
 }
 
 /// `feat/line` changes `README.md`; `feat/member`, stacked on it, writes a
@@ -1081,7 +1092,8 @@ fn release_carries_answers_carried_exact_for_a_stacked_member_whose_whole_line_t
     );
 
     // When, then: its change from the trunk, `feat/line`'s commit with its
-    // own, replays empty, so it is carried exactly with no record.
+    // own, is held whole by the release, so it is carried exactly with no
+    // record.
     assert_carried(&lab, "feat/member", true);
 }
 
@@ -1137,6 +1149,412 @@ fn release_carries_answers_merged_then_edited_for_members_a_resolution_discarded
     // member's line, whatever commit last edited the text in its place.
     assert_carried_in(&lab, &home, "feat/alpha", false);
     assert_carried_in(&lab, &home, "feat/beta", false);
+}
+
+/// A knives cut, [`CUT`], of `members`, each `(branch, file, content)` a
+/// branch on a trunk that holds `trunk`, which leaves `file` conflicted. The
+/// conflict is resolved by hand to `resolution`, and `knives release adopt`
+/// records it.
+fn resolved_cut(
+    trunk: &[(&str, &str)],
+    members: &[(&str, &str, &str)],
+    (file, resolution): (&str, &str),
+) -> (Lab, tempfile::TempDir) {
+    let lab = trunk_with(trunk);
+    for (branch, path, content) in members {
+        lab.branch(branch, path, content);
+    }
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", CUT]);
+    assert!(
+        stdout(&cut).contains(&format!("cut {CUT} as")),
+        "{}",
+        text(&cut)
+    );
+    assert_eq!(conflicts_of(&lab, CUT), [file], "{}", text(&cut));
+    edit_by_hand(&lab, CUT, &[(file, resolution)]);
+    adopt(&lab, &home, CUT, &format!("resolve {file} by hand"));
+    assert_eq!(
+        conflicts_of(&lab, CUT),
+        Vec::<String>::new(),
+        "the adopt left a conflict"
+    );
+    (lab, home)
+}
+
+/// Each of `names` reads carried in [`CUT`] by every command that reads it:
+/// `members --verify` by the member's own lines (exit 0), `--carries` and the
+/// census (carried-exact).
+fn assert_every_command_reads_carried(lab: &Lab, home: &tempfile::TempDir, names: &[&str]) {
+    let verified = verify(lab, home, CUT);
+    let out = stdout(&verified);
+    assert_eq!(verified.status.code(), Some(0), "{}", text(&verified));
+    for name in names {
+        assert!(out.contains(&carried_row(&label(lab, name))), "{out}");
+        assert_carried_in(lab, home, name, true);
+    }
+    let census_out = census(lab, home);
+    for name in names {
+        assert!(
+            census_block(&census_out, name).contains(&format!("carried-exact      {CUT} @ ")),
+            "{census_out}"
+        );
+    }
+}
+
+/// `name` reads missing in [`CUT`] by `members --verify` (exit 1), with
+/// `lost`, the start of a line it names under the member's row, and
+/// merged-then-edited by `--carries` (exit 3) and the census.
+fn assert_missing_and_merged_then_edited(
+    lab: &Lab,
+    home: &tempfile::TempDir,
+    name: &str,
+    lost: &str,
+) {
+    let verified = verify(lab, home, CUT);
+    let out = stdout(&verified);
+    assert_eq!(verified.status.code(), Some(1), "{}", text(&verified));
+    assert!(out.contains(&missing_row(&label(lab, name))), "{out}");
+    assert!(
+        out.lines()
+            .any(|line| line.starts_with("      ") && line.contains(lost)),
+        "no line under the row names {lost}: {out}"
+    );
+    assert_carried_in(lab, home, name, false);
+    let census_out = census(lab, home);
+    let block = census_block(&census_out, name);
+    assert!(
+        block.contains(&format!("merged-then-edited {CUT} @ ")),
+        "{census_out}"
+    );
+    assert!(!block.contains("carried-"), "{census_out}");
+}
+
+/// The file of [`bugs_cut`], which its members add entries to.
+const BUGS: &str = "doc/bugs.md";
+/// The entry that `feat/alpha` adds to [`BUGS`].
+const ALPHA_ENTRY: &str = "- [alpha bug](#alpha-bug)";
+/// The two entries that `feat/beta` adds to [`BUGS`].
+const BETA_ENTRIES: [&str; 2] = [
+    "- [beta bug](#beta-bug)",
+    "- [beta second bug](#beta-second-bug)",
+];
+
+/// [`BUGS`], a list of known bugs, with `entries` after its first entry:
+/// the place where each member of [`bugs_cut`] adds its own.
+fn bugs_with(entries: &[&str]) -> String {
+    let mut bugs = String::from("# Known bugs\n\n- [first bug](#first-bug)\n");
+    for entry in entries {
+        bugs.push_str(entry);
+        bugs.push('\n');
+    }
+    bugs.push_str("- [last bug](#last-bug)\n");
+    bugs
+}
+
+/// [`resolved_cut`] of `feat/alpha`, which adds [`ALPHA_ENTRY`] to the
+/// trunk's [`BUGS`], `feat/beta`, which adds [`BETA_ENTRIES`] at the same
+/// place, and `feat/gamma`, which writes a file of its own: two members'
+/// entries at one place conflict. `resolution` is the new text of [`BUGS`].
+fn bugs_cut(resolution: &str) -> (Lab, tempfile::TempDir) {
+    resolved_cut(
+        &[(BUGS, bugs_with(&[]).as_str())],
+        &[
+            ("feat/alpha", BUGS, bugs_with(&[ALPHA_ENTRY]).as_str()),
+            ("feat/beta", BUGS, bugs_with(&BETA_ENTRIES).as_str()),
+            ("feat/gamma", "gamma.txt", "gamma\n"),
+        ],
+        (BUGS, resolution),
+    )
+}
+
+#[test]
+fn release_carries_answers_carried_exact_for_members_a_resolution_put_side_by_side() {
+    // Given: a cut whose conflict in `doc/bugs.md`, two members' entries at
+    // one place, was resolved by hand to every entry of both and adopted.
+    let union = bugs_with(&[ALPHA_ENTRY, BETA_ENTRIES[0], BETA_ENTRIES[1]]);
+    let (lab, home) = bugs_cut(&union);
+
+    // When/Then: `members --verify` reads each member carried by its own
+    // lines, and `--carries` and the census give the same answer: the
+    // release holds every line of each member's change, and the other
+    // member's entries beside them change none of its lines.
+    assert_every_command_reads_carried(&lab, &home, &["feat/alpha", "feat/beta", "feat/gamma"]);
+}
+
+#[test]
+fn release_carries_answers_merged_then_edited_for_a_line_a_side_by_side_resolution_dropped() {
+    // Given: the same cut, resolved by hand to alpha's entry and beta's first
+    // entry beside it, without beta's second entry, and adopted.
+    let (lab, home) = bugs_cut(&bugs_with(&[ALPHA_ENTRY, BETA_ENTRIES[0]]));
+
+    // When/Then: `members --verify` reads beta missing and names the line it
+    // lacks; `--carries` and the census read it merged-then-edited, never
+    // carried. Alpha, whose entry the release holds, is carried by all three.
+    assert_missing_and_merged_then_edited(
+        &lab,
+        &home,
+        "feat/beta",
+        "doc/bugs.md:5: added line lost ‹- [beta second bug](#beta-second-bug)›",
+    );
+    assert_carried_in(&lab, &home, "feat/alpha", true);
+}
+
+/// The file of [`guard_cut`].
+const INDUCTIVE: &str = "kernel/inductive.ml";
+/// The trunk's [`INDUCTIVE`]: a function whose `raise` line is followed by two
+/// `let` lines.
+const GUARD: &str = "let check_guard env t =\n  let fail () =\n    \
+                     raise (CoFixGuardError (env,NotGuardedForm t)) in\n  \
+                     let first = Array.length env in\n  let second = first + 1 in\n  fail ()\n";
+/// `feat/deleter`'s [`INDUCTIVE`]: [`GUARD`] with the two `let` lines
+/// deleted.
+const GUARD_DELETED: &str = "let check_guard env t =\n  let fail () =\n    \
+                             raise (CoFixGuardError (env,NotGuardedForm t)) in\n  fail ()\n";
+/// `feat/inserter`'s [`INDUCTIVE`]: [`GUARD`] with the `raise` line rewritten,
+/// its ` in` removed, and two definitions inserted after it.
+const GUARD_INSERTED: &str = "let check_guard env t =\n  let fail () =\n    \
+                              raise (CoFixGuardError (env,NotGuardedForm t))\n  \
+                              and note () = Feedback.msg_debug (str \"guard failed\")\n  \
+                              and trace () = Feedback.msg_debug (str \"guard traced\") in\n  \
+                              let first = Array.length env in\n  let second = first + 1 in\n  \
+                              fail ()\n";
+/// [`INDUCTIVE`] with both changes: the inserter's lines and the deleter's
+/// deletion.
+const GUARD_BOTH: &str = "let check_guard env t =\n  let fail () =\n    \
+                          raise (CoFixGuardError (env,NotGuardedForm t))\n  \
+                          and note () = Feedback.msg_debug (str \"guard failed\")\n  \
+                          and trace () = Feedback.msg_debug (str \"guard traced\") in\n  \
+                          fail ()\n";
+
+/// [`resolved_cut`] of `feat/deleter`, which deletes the two `let` lines that
+/// follow the `raise` line of [`GUARD`], and `feat/inserter`, which rewrites
+/// the `raise` line and inserts lines right after it: the member's deletion
+/// stands next to another member's edit, so the two conflict. `resolution`
+/// is the new text of [`INDUCTIVE`].
+fn guard_cut(resolution: &str) -> (Lab, tempfile::TempDir) {
+    resolved_cut(
+        &[(INDUCTIVE, GUARD)],
+        &[
+            ("feat/deleter", INDUCTIVE, GUARD_DELETED),
+            ("feat/inserter", INDUCTIVE, GUARD_INSERTED),
+        ],
+        (INDUCTIVE, resolution),
+    )
+}
+
+#[test]
+fn release_carries_answers_carried_exact_for_a_deletion_beside_another_members_rewrite() {
+    // Given: a cut whose conflict, the deleter's deletion of two lines
+    // right after the line that the inserter rewrote, was resolved by hand
+    // to the inserter's lines and the deletion, and adopted.
+    let (lab, home) = guard_cut(GUARD_BOTH);
+
+    // When/Then: `members --verify` reads both members carried, and
+    // `--carries` and the census give the same answer: the release holds
+    // every line that each change adds and removes, and the other member's
+    // edit beside the deletion is no line of the deleter's.
+    assert_every_command_reads_carried(&lab, &home, &["feat/deleter", "feat/inserter"]);
+}
+
+#[test]
+fn release_carries_answers_merged_then_edited_for_a_hunk_the_release_put_back_in_a_trunk_file() {
+    // Given: the same cut, resolved by hand to the inserter's text alone,
+    // which holds the two lines that the deleter removed, and adopted.
+    let (lab, home) = guard_cut(GUARD_INSERTED);
+
+    // When/Then: `members --verify` reads the deleter missing and names each
+    // line that was put back; `--carries` and the census read it
+    // merged-then-edited. The inserter's lines are all held.
+    assert_missing_and_merged_then_edited(
+        &lab,
+        &home,
+        "feat/deleter",
+        "kernel/inductive.ml:4: removed line put back ‹",
+    );
+    assert_carried_in(&lab, &home, "feat/inserter", true);
+}
+
+#[test]
+fn release_carries_answers_merged_then_edited_for_a_line_the_release_put_back_from_a_hunk() {
+    // Given: the member removes `b` and `c` from a file that the trunk holds;
+    // the release merges it with another branch and puts `b` back by hand,
+    // not `c`.
+    let lab = trunk_with(&[("f.txt", "a\nb\nc\nd\n")]);
+    lab.branch(MEMBER, "f.txt", "a\nd\n");
+    lab.branch("feat/other", "other.txt", "other\n");
+    merge_by_hand(
+        &lab,
+        CUT,
+        (MEMBER, "feat/other"),
+        &[("f.txt", Some("a\nb\nd\n"))],
+    );
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When/Then: `b` holds a letter, so putting it back undoes the member's
+    // removal of it, whatever happened to `c`: `members --verify` reads the
+    // member missing and names `b`, and `--carries` and the census read it
+    // merged-then-edited.
+    assert_missing_and_merged_then_edited(
+        &lab,
+        &home,
+        MEMBER,
+        "f.txt:2: removed line put back ‹b›",
+    );
+}
+
+#[test]
+fn release_carries_answers_carried_exact_for_a_lone_brace_put_back_from_a_hunk() {
+    // Given: the member removes a call and the `}` after it; the release
+    // merges it with another branch and puts the `}` back by hand, not the
+    // call (K11 (9)).
+    let lab = trunk_with(&[("f.txt", "a\n  y();\n}\nd\n")]);
+    lab.branch(MEMBER, "f.txt", "a\nd\n");
+    lab.branch("feat/other", "other.txt", "other\n");
+    merge_by_hand(
+        &lab,
+        CUT,
+        (MEMBER, "feat/other"),
+        &[("f.txt", Some("a\n}\nd\n"))],
+    );
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: every command reads the member carried: a line of
+    // punctuation alone counts as put back only with its whole hunk.
+    assert_every_command_reads_carried(&lab, &home, &[MEMBER]);
+}
+
+/// Rocq's `dev/doc/critical-bugs.md`, as `tests/fixtures/side_by_side` holds
+/// it.
+const CRITICAL_BUGS: &str = "dev/doc/critical-bugs.md";
+const CRITICAL_BUGS_BASE: &str = include_str!("fixtures/side_by_side/critical-bugs/base.md");
+const CRITICAL_BUGS_MEMBER: &str = include_str!("fixtures/side_by_side/critical-bugs/member.md");
+const CRITICAL_BUGS_RELEASE: &str = include_str!("fixtures/side_by_side/critical-bugs/release.md");
+
+/// [`MEMBER`], which writes [`CRITICAL_BUGS_MEMBER`] on a trunk that holds
+/// [`CRITICAL_BUGS_BASE`], and `feat/other`, merged by hand as [`CUT`]
+/// with [`CRITICAL_BUGS`] as `release`.
+fn critical_bugs_release(release: &str) -> Lab {
+    let lab = trunk_with(&[(CRITICAL_BUGS, CRITICAL_BUGS_BASE)]);
+    lab.branch(MEMBER, CRITICAL_BUGS, CRITICAL_BUGS_MEMBER);
+    lab.branch("feat/other", "other.txt", "other\n");
+    merge_by_hand(
+        &lab,
+        CUT,
+        (MEMBER, "feat/other"),
+        &[(CRITICAL_BUGS, Some(release))],
+    );
+    lab
+}
+
+#[test]
+fn release_carries_answers_carried_exact_for_real_entries_a_resolution_kept_beside_others() {
+    // Given: the member adds one entry to the table of contents of Rocq's
+    // `critical-bugs.md` and three below it; a release holds the member's
+    // entries first at each place, with other members' entries after them,
+    // as a hand resolution of the conflicts there wrote them.
+    let lab = critical_bugs_release(CRITICAL_BUGS_RELEASE);
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When/Then: every command reads the member carried.
+    assert_every_command_reads_carried(&lab, &home, &[MEMBER]);
+}
+
+#[test]
+fn release_carries_answers_merged_then_edited_for_a_real_entry_the_release_lacks() {
+    // Given: the same release without the member's entry in the table of
+    // contents.
+    let entry = "      - [incorrect variance inference for a constructor";
+    let lacking: String = CRITICAL_BUGS_RELEASE
+        .lines()
+        .filter(|line| !line.starts_with(entry))
+        .flat_map(|line| [line, "\n"])
+        .collect();
+    assert_eq!(
+        lacking.lines().count() + 1,
+        CRITICAL_BUGS_RELEASE.lines().count(),
+        "the fixture lost one line"
+    );
+    let lab = critical_bugs_release(&lacking);
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When/Then: `members --verify` reads the member missing and names the
+    // entry; `--carries` and the census read it merged-then-edited.
+    assert_missing_and_merged_then_edited(
+        &lab,
+        &home,
+        MEMBER,
+        "dev/doc/critical-bugs.md:4: added line lost ‹",
+    );
+}
+
+/// [`MEMBER`] and `feat/other`, merged by hand as [`CUT`] with `file`
+/// written as `content` and its mode set to `mode`. The release moves there
+/// from wherever it was.
+fn release_of_member_and_other(lab: &Lab, (file, content): (&str, &str), mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    lab.jj_work(["new", "-r", MEMBER, "-r", "feat/other", "-m", "release"]);
+    let path = lab.work.join(file);
+    std::fs::write(&path, content).expect("resolve by hand");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("set the mode");
+    lab.jj_work(["bookmark", "set", CUT, "-r", "@", "--allow-backwards"]);
+    lab.jj_work(["new"]);
+}
+
+#[test]
+fn release_carries_answers_merged_then_edited_for_a_mode_a_side_by_side_release_dropped() {
+    // Given: the trunk holds `shared.sh`, not executable; the member adds a
+    // line to it and makes it executable; `feat/other` adds a line at the
+    // same place; a release made by hand holds both lines side by side and
+    // clears the mode.
+    let lab = trunk_with(&[("shared.sh", "first\nlast\n")]);
+    member_with(
+        &lab,
+        &[("shared.sh", Some("first\nmember\nlast\n"))],
+        Some(0o755),
+    );
+    lab.branch("feat/other", "shared.sh", "first\nother\nlast\n");
+    let both = ("shared.sh", "first\nmember\nother\nlast\n");
+    release_of_member_and_other(&lab, both, 0o644);
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: the member is not carried exactly: the release holds its
+    // line, but not its mode, and `members --verify` names the mode.
+    assert_carried_in(&lab, &home, MEMBER, false);
+    let verified = verify(&lab, &home, CUT);
+    assert_eq!(verified.status.code(), Some(1), "{}", text(&verified));
+    assert!(
+        stdout(&verified).contains("shared.sh: mode differs from the member's (executable yes)"),
+        "{}",
+        text(&verified)
+    );
+
+    // And: a release that holds the mode too carries it exactly.
+    release_of_member_and_other(&lab, both, 0o755);
+    assert_carried_in(&lab, &home, MEMBER, true);
+}
+
+#[test]
+fn release_carries_answers_merged_then_edited_for_a_binary_file_a_release_holds_side_by_side() {
+    // Given: the trunk holds `shared.bin`, whose NUL byte makes it no text;
+    // the member and `feat/other` each add a line at one place of it; a
+    // release made by hand holds both lines side by side.
+    let lab = trunk_with(&[("shared.bin", "first\n\0\nlast\n")]);
+    member_with(
+        &lab,
+        &[("shared.bin", Some("first\n\0\nmember\nlast\n"))],
+        None,
+    );
+    lab.branch("feat/other", "shared.bin", "first\n\0\nother\nlast\n");
+    release_of_member_and_other(
+        &lab,
+        ("shared.bin", "first\n\0\nmember\nother\nlast\n"),
+        0o644,
+    );
+
+    // When, then: the member is not carried exactly: a file that is no text
+    // is not read by its lines.
+    assert_member_carried(&lab, false);
 }
 
 #[test]
@@ -1258,7 +1676,7 @@ fn release_carries_answers_merged_then_edited_for_a_member_beside_a_backup_bookm
 }
 
 #[test]
-fn release_carries_answers_merged_then_edited_for_a_deletion_a_siblings_edit_replaced() {
+fn release_carries_answers_carried_exact_for_a_replaced_line_of_a_file_the_change_adds_whole() {
     // Given: `feat/foundation` writes `a`, `timeout = 30`, `b`; the member,
     // stacked on it, deletes the timeout line; `feat/sibling`, also on it,
     // sets `timeout = 60`; the release merges both and keeps the sibling's
@@ -1279,17 +1697,17 @@ fn release_carries_answers_merged_then_edited_for_a_deletion_a_siblings_edit_rep
     );
     merge_by_hand(
         &lab,
-        "release/2026-08-04",
+        CUT,
         (MEMBER, "feat/sibling"),
         &[("conf.txt", Some("a\ntimeout = 60\nb\n"))],
     );
     let (home, _consumer) = release_test_home(&lab);
 
-    // When, then: the member, whose deletion the release does not hold, is
-    // not carried; the sibling, whose line it holds as the sibling left it,
-    // is carried exactly.
-    assert_carried_in(&lab, &home, MEMBER, false);
-    assert_carried_in(&lab, &home, "feat/sibling", true);
+    // When, then: every command reads both carried. From the trunk, the
+    // member's change adds `conf.txt` whole, as `a` and `b`, so the deletion
+    // of the timeout line is no hunk of its own change, and the release
+    // holds both of its lines, with the sibling's line between them.
+    assert_every_command_reads_carried(&lab, &home, &[MEMBER, "feat/sibling"]);
 }
 
 #[test]
@@ -1323,7 +1741,7 @@ fn release_carries_answers_merged_then_edited_for_a_member_that_removed_one_of_t
 }
 
 #[test]
-fn release_carries_answers_merged_then_edited_for_a_deletion_the_release_wrote_back_edited() {
+fn release_carries_answers_carried_exact_for_a_deletion_the_release_wrote_back_edited() {
     // Given: the member empties `README.md`, which the trunk holds as
     // `seed`; the release merges it with another branch and writes
     // `seed, edited` by hand.
@@ -1332,13 +1750,16 @@ fn release_carries_answers_merged_then_edited_for_a_deletion_the_release_wrote_b
     lab.branch("feat/other", "other.txt", "other\n");
     merge_by_hand(
         &lab,
-        "release/2026-08-04",
+        CUT,
         (MEMBER, "feat/other"),
         &[("README.md", Some("seed, edited\n"))],
     );
+    let (home, _consumer) = release_test_home(&lab);
 
-    // When, then: the member is not carried.
-    assert_member_carried(&lab, false);
+    // When, then: every command reads the member carried: a hunk that the
+    // member removed is put back only where the release inserts its lines as
+    // they were, and `seed, edited` is another line.
+    assert_every_command_reads_carried(&lab, &home, &[MEMBER]);
 }
 
 #[test]
@@ -1497,8 +1918,8 @@ fn member_with(lab: &Lab, files: &[(&str, Option<&str>)], mode: Option<u32>) {
 }
 
 #[test]
-fn release_carries_answers_merged_then_edited_for_a_member_whose_mode_the_release_merge_dropped() {
-    // Given: the member makes `shared.sh` executable; the release merges it
+fn release_carries_answers_carried_exact_for_an_added_file_whose_mode_the_release_cleared() {
+    // Given: the member adds an executable `shared.sh`; the release merges it
     // with another branch and clears the mode by hand.
     use std::os::unix::fs::PermissionsExt as _;
     let lab = Lab::new();
@@ -1510,11 +1931,16 @@ fn release_carries_answers_merged_then_edited_for_a_member_whose_mode_the_releas
         std::fs::Permissions::from_mode(0o644),
     )
     .expect("clear the mode");
-    lab.jj_work(["bookmark", "create", "release/2026-08-04", "-r", "@"]);
+    lab.jj_work(["bookmark", "create", CUT, "-r", "@"]);
     lab.jj_work(["new"]);
+    let (home, _consumer) = release_test_home(&lab);
 
-    // When, then: the member is not carried.
-    assert_member_carried(&lab, false);
+    // When, then: every command reads the member carried. A change of the
+    // executable bit is read where the member changes the bit of a file that
+    // its fork point holds (the side-by-side mode test above); a file that
+    // the member adds has no bit of its fork point's to change, and
+    // `--verify` has always read its lines alone.
+    assert_every_command_reads_carried(&lab, &home, &[MEMBER]);
 }
 
 #[test]
@@ -1604,7 +2030,7 @@ fn release_carries_reads_a_link_a_member_wrote() {
 }
 
 #[test]
-fn release_carries_answers_merged_then_edited_for_a_member_whose_blank_lines_the_release_dropped() {
+fn release_carries_answers_carried_exact_for_a_member_whose_blank_lines_the_release_dropped() {
     // Given: the member writes lines with blank lines between them; the
     // release merges it with another branch and drops the blank lines.
     let lab = Lab::new();
@@ -1612,13 +2038,15 @@ fn release_carries_answers_merged_then_edited_for_a_member_whose_blank_lines_the
     lab.branch("feat/other", "other.txt", "other\n");
     merge_by_hand(
         &lab,
-        "release/2026-08-04",
+        CUT,
         (MEMBER, "feat/other"),
         &[("shared.txt", Some("x\ny\n"))],
     );
+    let (home, _consumer) = release_test_home(&lab);
 
-    // When, then: the member is not carried.
-    assert_member_carried(&lab, false);
+    // When, then: every command reads the member carried: its own lines are
+    // its non-blank lines, and the release holds them all.
+    assert_every_command_reads_carried(&lab, &home, &[MEMBER]);
 }
 
 #[test]
@@ -2137,14 +2565,6 @@ fn census_lab() -> (Lab, tempfile::TempDir) {
     lab.jj_work(["bookmark", "forget", "history/alpha-release"]);
     lab.branch("feat/beta", "beta.txt", "beta\n");
     (lab, home)
-}
-
-fn census_block<'a>(stdout: &'a str, branch: &str) -> &'a str {
-    let wanted = format!("  {branch} @");
-    stdout
-        .split("\n\n")
-        .find(|block| block.starts_with(&wanted))
-        .unwrap_or_else(|| panic!("no census block for {branch}: {stdout}"))
 }
 
 #[test]

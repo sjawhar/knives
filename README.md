@@ -362,7 +362,7 @@ reads `not on this machine`, and an entry with two is refused with both paths na
 | `knives finish` | hand a branch back so another agent can pick it up; its bookmark and any open pull request survive. It snapshots the workspace into jj first and names the commit that keeps it, and refuses while another process on this machine works in the workspace or when the claim was taken on another host or agent box. When jj cannot snapshot the working copy whole it hands the claim back all the same, keeps the workspace exactly as it is, and exits `3`, and the next `knives start` of that branch adopts that directory. The ledger records its `--why`, with or without `--force`. The finish of a release claim, once jj holds no workspace of the claim (it forgot it, or there was none), abandons the earlier commits of the release that nothing holds, in one jj operation, and names each one that something other than the release holds, with what holds it; while the release holds conflicts, it abandons none and says so. On a fork whose `ledger` is set, it releases the claim on that ledger's repository; when it cannot read or write that claim, it leaves the state file and the workspace as they were and exits `3` |
 | `knives track` | state which upstream pull request a branch belongs to, when inference cannot find it; when the upstream and the fork's own repository are two forge repositories, the upstream is asked, and a number it does not have is refused |
 | `knives depends BRANCH [--on REQ]... [--forget REQ]...` | record that a branch cannot land before a pull request on its fork's upstream or a member branch, and say which in the record; `REPO#N` is a pull request on that fork's upstream, with no forge call; a pull request on a fork's own repository is refused, since pull requests go upstream, and a record of one an older knives wrote is still read, reported by `status` and taken back by `--forget` as it is spelled; `--forget` takes a requirement back, with `--on` corrects one, takes nothing back (exit 3) when the forge cannot say whether more member records are meant, and every machine running this knives that shares the ledger reads the same list |
-| `knives notch [SUBJECT] [-m TEXT] [--disposition TOKEN]` | read the ledger or write a human note; dispositions require evidence, `--dispositions` reads terminal rulings, and `--verify` re-checks selected entries |
+| `knives notch [SUBJECT] [-m TEXT] [--disposition TOKEN]` | read the ledger or write a human note; `-m` must hold text, and an empty or whitespace-only one is a usage error (exit `2`) that writes nothing; dispositions require evidence, `--dispositions` reads terminal rulings, and `--verify` re-checks selected entries |
 | `knives ledger sweep` | commit, pull and push the shared ledger; every write sends its own entries before it exits, so a sweep sends what a write could not, or pulls |
 | `knives ledger migrate` | move what an older knives left onto what this one reads: the branch statements `state.json` kept, one statement entry each, and every fork's ledger directory, state keys and workspace sightings from its registry key to its upstream name; a second run changes nothing |
 | `knives release` | plan a release, edit its membership, cut one, record one cut or finished by hand, or reap superseded cuts |
@@ -425,8 +425,8 @@ A release re-signed or metaedited after a knives write, by `jj describe`, `jj si
 A push made a fast-forward of the release's published position — the release rebased onto its own parents and `<release>@<publish remote>`, its tree then put back with `jj restore` — gives the release an earlier write of itself as one more parent: a carrier. A carrier is any parent the ledger records as a cut or edit of the name, the publish remote's commit of it, a visible rewrite of either, a commit whose change id a recorded cut or edit event of the name names (a pushed copy keeps its write's change id), or a parent a recorded event of the name lists as `<name> earlier write (carrier, not a member)`, a label that only `adopt`'s record of the fast-forward parent it took writes; it is never a member. `knives release adopt` accepts it, the plan and `members` label it `<name> earlier write (carrier, not a member)` and count it as no stacked member, and every write that composes from the release's parents (`include`, `drop`, `advance`, `cut`, `rebase`) leaves it out: the release is first written again on its other parents with its own tree, so whatever it resolved over the carrier becomes its own change and carries forward. Each push adds one carrier and the next write leaves it out, so carriers never pile up. The fork runs `knives release adopt` after the fast-forward rebase and before the push, so the ledger's newest write is the commit the push publishes, and pushes that commit with a plain `git push`, never `jj git push`, which moves the remote branch whenever it is still where jj last fetched it, a sideways or backward move included. A write then hides, in the same operation, each head it leaves that nothing holds (no bookmark, working copy, tag, or remote ref other than the name's own tracked ref on its publish remote) when that head is an earlier write of the name or a commit whose newer version is still visible, and names each one; so a carrier a write leaves out stays hidden behind its publish ref. Any other head it leaves, such as a member with no bookmark, stays visible for audit to report. While the written release carries conflicts it hides nothing.
 Without that `adopt`, nothing records the pushed commit: another machine's next edit over it is marked `; unchecked: W absent`, and its next cut is refused until it holds the newest recorded write. A push that git refuses after `adopt` leaves a recorded write that the fork lacks, and `audit` reports `release-drift` for it until the next write or `adopt`.
 
-One branch is both the release member and the upstream pull request head; there is never a
-second copy. New branches fork from the release's shared base (`knives start` puts them there,
+One branch is the release member, and the upstream pull request head unless the two need
+different bases; there is never a second copy in the release lineage. New branches fork from the release's shared base (`knives start` puts them there,
 or on the fetched upstream trunk when no release exists) and are linear past it, so a new branch
 composes into the release without forcing a rebase; an existing branch is continued from its tip,
 and a name that exists only on upstream is still a new branch here. Moving the composition to a newer trunk is
@@ -448,7 +448,8 @@ upstream trunk. `knives release members TARGET --carries REVISION` asks exactly 
 `knives release members --census` asks that of every maintained branch.
 
 Against a release, `--verify`, the audits of `release cut` and its composition gate read a
-member by its own lines. Its own change is the diff from its fork point with the
+member by its own lines, and so do `--carries` and `--census` for a tip that the release reaches
+(below). Its own change is the diff from its fork point with the
 upstream trunk to its tip. So the upstream commits after that fork point are not charged to it,
 however far the trunk has moved, and members that fork at different trunk commits are each
 measured from their own fork point.
@@ -520,14 +521,34 @@ the member's content` for a missing one, with each line that it lacks below the 
 member is a finding (exit `1`). With `--json`, `audit.members` holds each member's reading:
 `reading`, `lost`, `held_by_words` and `word_step_skipped`.
 
-`--carries` and `--census` do not read own lines. Against the upstream trunk, which knives does
-not compose, an ancestor tip is `carried-exact`. Against a release, an ancestor tip is
-`carried-exact` only when its change, from the base above, replays empty onto the release, and
-`merged-then-edited` (exit `3`) otherwise: a person judges it, with the release's commits since
-that changed its files; no `knives depends` record makes it carried. Against either, a tip that
-the target does not reach is `carried-rewritten` when its net change replays empty, else
-`carried-rebased` when a rewrite that stands for it (a successor in jj's operation log, or a
-commit with its tree) is an ancestor, else `conflicted` or `NOT carried`.
+`--carries` and `--census` read a tip that a release reaches by its own lines too, from the same
+base and through the same reader as `--verify`. Against the upstream trunk, which knives does not
+compose, an ancestor tip is `carried-exact`. Against a release, an ancestor tip is
+`carried-exact` where the release holds every line that the tip's change adds, does not hold
+again a hunk that it removes, holds no line of it only by its words, and holds no unresolved
+conflict in a path of it, nor does the tip. Lines that other members added or edited next to the
+tip's lines change none of its lines, so they do not matter. Otherwise it is `merged-then-edited`
+(exit `3`): a person judges it, with the release's commits since that changed its files; no
+`knives depends` record makes it carried.
+
+The two commands differ in two places, where `--verify` reports and passes and `--carries` leaves
+the judgment to a person. A line that the release changed, so that it holds the line only by its
+words, is a changed line: `--verify` reads the member carried (exit `0`) and names the line, and
+`--carries` reads `merged-then-edited` (exit `3`). A path with an unresolved conflict, in the
+release or at the tip, reads inconclusive in `--verify`, which exits `0` where the member lacks
+nothing else, and `merged-then-edited` in `--carries`. `--carries` and `--census` name no line;
+`--verify` does. What the own-lines reading does not read, it does not read for `--carries`
+either, so both read these as carried: blank lines that the release dropped; the executable bit
+of a file that the member's change adds; a removed hunk that the release writes back edited, or
+of which it puts back only lines of punctuation alone (`}`, `},`) while other lines of the hunk stay
+removed; and a line deleted from a file that the member's own change adds whole, as for a member
+stacked on a branch that adds the file.
+
+A tip that the target does not reach is read by a replay of its change instead. Against either
+target it is `carried-rewritten` when its net change replays empty, else `carried-rebased` when a
+rewrite that stands for it (a successor in jj's operation log, or a commit with its tree) is an
+ancestor and, against a release, the release holds every line of the rewrite's own change too, as
+above, else `conflicted` or `NOT carried`.
 
 Before cutting, the orphan gate looks for commits that only the previous release or its descendants reach. These keep a commit: a local bookmark, a bookmark of `origin` or of the publish remote (tracked or not), each target of such a bookmark that is conflicted, a parent of the previous release, and the upstream trunk. A bookmark with a release name keeps nothing. On a fork with a fixed release branch, a release name is that branch's name alone. On any other fork, it is a name that starts with `release/`. A bookmark of `upstream` other than the upstream trunk, or of any other remote, keeps nothing either, because its owner can delete it. When a commit that nothing keeps would be stranded, the cut refuses (exit `3`) and lists each such commit ID. Pass `--allow-drop` when dropping those commits is intentional. The published remedy lists the commits that a cut would drop through the same keepers.
 

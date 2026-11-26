@@ -32,6 +32,17 @@ fn reason_text(value: &str) -> Result<String, String> {
         .ok_or_else(|| "a why must hold a reason, not be empty or only whitespace".to_owned())
 }
 
+/// A notch's `-m` that holds text. A note is read later by someone who was
+/// not there, and an empty or whitespace-only one tells them nothing: its
+/// evidence and anchor say what it is about, never what happened. A shell
+/// that substitutes a message it could not read, as `-m "$(cat file)"`
+/// after a `cat` that failed, passes an empty one.
+fn note_text(value: &str) -> Result<String, String> {
+    (!value.trim().is_empty())
+        .then(|| value.to_owned())
+        .ok_or_else(|| "a note must hold text, not be empty or only whitespace".to_owned())
+}
+
 /// Process exit codes, as a type so a command cannot invent one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
@@ -466,8 +477,10 @@ pub enum Command {
         /// The branch or release ref this is about. Omit it to read the whole
         /// repository, or to write an entry about the repository itself.
         subject: Option<String>,
-        /// Record this text as a note. Without it, `notch` reads.
-        #[arg(short = 'm', long = "message")]
+        /// Record this text as a note. Without it, `notch` reads. It must hold
+        /// text: an empty or whitespace-only one is a usage error (exit 2), and
+        /// nothing is written.
+        #[arg(short = 'm', long = "message", value_parser = note_text)]
         message: Option<String>,
         /// A commit id, `file:line`, `<repo>#<number>` or URL backing the note.
         /// Repeatable, and it may name another repo.
@@ -829,9 +842,12 @@ pub enum ReleaseAction {
     /// direction: is REV's content carried — by REF when one is given,
     /// otherwise by every live release and the upstream trunk before any
     /// superseded cut (the rigorous "is this safe to delete"; grep answers a
-    /// different question). Against a release it reads REV's own lines in
-    /// the same way, and it reads `conflicted` only for such a conflict.
-    /// Against the upstream trunk, ancestry and a replay of REV decide.
+    /// different question). A release that reaches REV carries it where the
+    /// release holds every line of REV's own change, read as `--verify`
+    /// reads it; where the release lacks a line, or holds one only by its
+    /// words, or either holds an unresolved conflict there, a person judges.
+    /// Where a release does not reach REV, and against the upstream trunk,
+    /// ancestry and a replay of REV decide.
     /// `--census` asks that of every maintained branch at once.
     Members {
         /// The release ref to inspect. Defaults to the release in hand. With

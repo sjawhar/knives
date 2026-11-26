@@ -20,7 +20,7 @@ Run `knives ledger migrate` once on each machine. Until then, commands that read
 5. Release a claim with `knives finish` when active work stops, also while a PR waits for review. First record in the ledger why the branch exists and any supersession: `finish` drops the claim's reason. The branch, bookmark and PR stay.
 6. A missing observation is not clearance. Absent, `null`, `0` and `UNKNOWN` differ. Read `problems`.
 7. Keep dependencies. Never keep a dependent in a release and drop its requirement.
-8. One branch is both release member and PR head. Never make a "release-lineage" or sibling copy so that it composes: move the release.
+8. One branch is the release member, and the upstream PR head unless the two need different bases. Never make a "release-lineage" or sibling copy so that it composes: move the release.
 9. Make release names only with `release cut`, never by hand. `--allow-drop` states an intended drop; it is not a way past a refusal.
 10. After any hand change on a release commit, run `knives release adopt <name>` before the next release write.
 11. Before a raw `jj rebase` of a branch, run fork-work's bidirectional gate (§7).
@@ -52,10 +52,10 @@ Use the carriage probe (`--carries`), never a source-text search: a symbol's pre
 
 | Verdict | Evidence |
 |---|---|
-| `carried-exact` | The revision tip is an ancestor of the target. Against a release, its change also replays empty onto the release's tree, and the tip holds no unresolved conflict. |
-| `merged-then-edited` | An ancestor of the release whose replay is not empty, or whose tip holds a conflict: later work changed what it brought. No record makes it carried; judge it. |
+| `carried-exact` | The revision tip is an ancestor of the target. Against a release, the release also holds every line of its change, as `members --verify` reads a member's own lines, and holds none of them only by its words, and no path of the change holds an unresolved conflict, in the release or at the tip: `--verify` reports those two and still passes, so it can read carried a member that `--carries` leaves to you. Other members' lines beside the tip's, at the same place or next to it, change none of its lines. |
+| `merged-then-edited` | An ancestor of the release that lacks a line of its change, puts back a line it removed, holds one only by its words, or holds a conflict in a path of it, in the release or at the tip: later work or a resolution changed what it brought. No record makes it carried; judge it. |
 | `carried-rewritten` | Replaying its net change leaves the target unchanged: equivalent content arrived another way, or it has no net change. |
-| `carried-rebased` | Replay differs, but a commit with its change id is an ancestor. Against a release, that rewrite's own change also replays empty, and the tip holds no conflict. Weaker: divergent changes can name different trees. |
+| `carried-rebased` | Replay differs, but a commit with its change id is an ancestor. Against a release, that rewrite's own change is also held line by line, as for `carried-exact`, and the tip holds no conflict. Weaker: divergent changes can name different trees. |
 | `NOT carried` (JSON `not-carried`) | Replay leaves a clean non-empty diff, and no rewrite is in the target. |
 | `conflicted` | Replay conflicts, or the tip holds a conflict against a release, and no rewrite counts. Some content can be present: judge it. |
 
