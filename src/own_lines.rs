@@ -264,8 +264,9 @@ impl MemberLines {
     /// - A path that the member deletes, and one that the tip holds as a
     ///   symlink or a submodule, is read whole: the release lacks it unless
     ///   it holds the tip's value there.
-    /// - A file: where the member changes its executable bit, the release's
-    ///   file must have the tip's bit. A file that is not text, whose first
+    /// - A file: where the member changes its executable bit, or adds the
+    ///   file, a release that holds a file there must give it the tip's bit.
+    ///   A file that is not text, whose first
     ///   8000 bytes hold a NUL byte, is read whole: where the member changed
     ///   its content, the release's file must hold the tip's. A text file
     ///   that the member adds with no non-blank line is carried where the
@@ -397,7 +398,16 @@ impl Out<'_> {
     ) {
         let release = file_of(release);
         let change = file_change(fork, (executable, content));
-        if change.bit_changed && release.is_none_or(|(bit, _)| bit != executable) {
+        // A member sets the bit where it changes the bit of a file the fork
+        // point holds, and where it adds the file. A release that lacks an
+        // added file lacks all of it, and the content's entries say so: its
+        // missing bit adds nothing.
+        let bit_lost = if change.adds_file {
+            release.is_some_and(|(bit, _)| bit != executable)
+        } else {
+            change.bit_changed && release.is_none_or(|(bit, _)| bit != executable)
+        };
+        if bit_lost {
             let bit = bit_text(executable);
             self.lost(entry(path, LostKind::Mode, None, Some(bit)), || Place::Path);
         }
@@ -435,6 +445,9 @@ impl Out<'_> {
 struct FileChange<'v> {
     /// Whether the fork point holds a file with the other executable bit.
     bit_changed: bool,
+    /// Whether the fork point holds no file there: the member adds the
+    /// file, and with it the tip's executable bit.
+    adds_file: bool,
     content: ContentChange<'v>,
 }
 
@@ -468,6 +481,7 @@ fn file_change<'v>(fork: &'v Value, (executable, content): (bool, &[u8])) -> Fil
     };
     FileChange {
         bit_changed: before.is_some_and(|(bit, _)| bit != executable),
+        adds_file: before.is_none(),
         content,
     }
 }
@@ -1451,6 +1465,49 @@ mod tests {
         // Then: both are carried
         assert_eq!(kept.reading, Reading::Carried);
         assert_eq!(binary.reading, Reading::Carried);
+    }
+
+    #[test]
+    fn an_added_files_bit_is_lost_where_the_release_holds_the_file_with_the_other_bit() {
+        // Given: a member that adds an executable file and one that is not,
+        // and releases that hold each with the other bit
+        let cleared = read(
+            "run.sh",
+            Value::Absent,
+            file_with_bit(true, b"x\n"),
+            file_with_bit(false, b"x\n"),
+        );
+        let set = read(
+            "notes.txt",
+            Value::Absent,
+            file_with_bit(false, b"x\n"),
+            file_with_bit(true, b"x\n"),
+        );
+        // Then: each bit is lost, and named
+        assert_eq!(
+            lost(&cleared),
+            [(LostKind::Mode, None, Some("executable yes"))]
+        );
+        assert_eq!(lost(&set), [(LostKind::Mode, None, Some("executable no"))]);
+
+        // Given: releases that keep the bit with another text, or lack the
+        // file
+        let kept = read(
+            "run.sh",
+            Value::Absent,
+            file_with_bit(true, b"x\n"),
+            file_with_bit(true, b"x\ny\n"),
+        );
+        let absent = read(
+            "run.sh",
+            Value::Absent,
+            file_with_bit(true, b"x\n"),
+            Value::Absent,
+        );
+        // Then: the first is carried, and the second lacks the line alone:
+        // its missing bit adds nothing
+        assert_eq!(kept.reading, Reading::Carried);
+        assert_eq!(lost(&absent), [(LostKind::Added, Some(1), Some("x"))]);
     }
 
     #[test]
