@@ -2571,3 +2571,274 @@ fn carries_reads_not_carried_where_the_release_reverts_a_rewrites_lines() {
     );
     assert_eq!(output.status.code(), Some(FINDINGS), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// A file the release no longer holds: no other file stands in for it.
+// ---------------------------------------------------------------------------
+
+/// Files a member or a release writes, by path and content.
+type Files<'f> = &'f [(&'f str, &'f str)];
+
+/// A moved shape of a removal: its name, the trunk's files, what `feat/m`
+/// writes to `g.txt`, and `feat/o`'s files, which the release takes.
+type RemovalCase<'c> = (&'c str, Files<'c>, &'c str, Files<'c>);
+
+/// A moved shape of an addition: its name and the lost line verify names;
+/// the trunk's `g.txt` and `feat/m`'s; `feat/o`'s files and the release's;
+/// and a decoy file, where one is added.
+type AdditionCase<'c> = (
+    (&'c str, &'c str),
+    (&'c str, &'c str),
+    (Files<'c>, Files<'c>),
+    Option<(&'c str, &'c str)>,
+);
+
+/// The same change in place: its name and the lost line verify names, if
+/// any; the trunk's `g.txt` and `feat/m`'s; `feat/o`'s `g.txt` and the
+/// release's.
+type InPlaceCase<'c> = (
+    (&'c str, Option<&'c str>),
+    (&'c str, &'c str),
+    (&'c str, &'c str),
+);
+
+/// The lines `l<n>` for each `n` of `lines`, one per line.
+fn numbered(lines: impl IntoIterator<Item = u32>) -> String {
+    let mut text = String::new();
+    for line in lines {
+        text.push('l');
+        text.push_str(&line.to_string());
+        text.push('\n');
+    }
+    text
+}
+
+/// The trunk holds `trunk`, `g.txt` first; `feat/m` writes `mine` to
+/// `g.txt`; `feat/o` writes `theirs`, and removes `g.txt` where `moves`;
+/// with `decoy`, `feat/q` adds that file. [`RELEASE`] merges the trunk and
+/// those members and holds `kept` (and no `g.txt` where `feat/o` moves it).
+/// `members --verify` of it, and `feat/m`'s label.
+fn moved_case(
+    (trunk, mine): (Files<'_>, &str),
+    (moves, theirs, kept): (bool, Files<'_>, Files<'_>),
+    decoy: Option<(&str, &str)>,
+) -> (Output, String) {
+    let lab = trunk_with(trunk);
+    branch_on(&lab, "main@upstream", "feat/m", |work| {
+        write_file(work, "g.txt", mine);
+    });
+    let apply = |work: &Path, files: &[(&str, &str)]| {
+        if moves {
+            std::fs::remove_file(work.join("g.txt")).expect("move g.txt away");
+        }
+        for (path, content) in files {
+            write_file(work, path, content);
+        }
+    };
+    branch_on(&lab, "main@upstream", "feat/o", |work| apply(work, theirs));
+    let mut members = vec!["main@upstream", "feat/m", "feat/o"];
+    if let Some((path, content)) = decoy {
+        branch_on(&lab, "main@upstream", "feat/q", |work| {
+            write_file(work, path, content);
+        });
+        members.push("feat/q");
+    }
+    hand_release(&lab, RELEASE, &members, |work| {
+        apply(work, kept);
+        if let Some((path, content)) = decoy {
+            write_file(work, path, content);
+        }
+    });
+    let (home, _consumer) = release_test_home(&lab);
+    (verify(&lab, &home, RELEASE), label(&lab, "feat/m"))
+}
+
+/// `alpha one` to `foxtrot six`, one word pair a line.
+const SIX: &str = "alpha one\nbravo two\ncharlie three\ndelta four\necho five\nfoxtrot six\n";
+/// [`SIX`] without `charlie three`.
+const SIX_RM: &str = "alpha one\nbravo two\ndelta four\necho five\nfoxtrot six\n";
+
+/// The line `members --verify` names under a member whose `g.txt` the
+/// release no longer holds.
+const G_GONE: &str = "      g.txt: file differs from the member's (absent from the release)";
+
+#[test]
+fn a_removal_in_a_file_another_member_moved_reads_missing() {
+    // Given: `feat/m` deletes one line of `g.txt`; `feat/o` moves the file
+    // elsewhere, and the release takes `feat/o`'s files, which hold the line
+    // again. The reviewers' shapes: a rename that edits the line above or
+    // below the removal (round 12's rm-nbr, rm-nbr-after), a split whose part
+    // edits a line beside it (rm-nbr-split), a rename that rewrites half the
+    // file (round 11's rm-under), a split at the removed line
+    // (split-boundary-rm), a split that pairs the tail (split-paired-rm),
+    // and a move into a file the trunk already holds (rm-into-existing).
+    let twelve = numbered(1..=12);
+    let without = |gone: u32| numbered((1..=12).filter(|line| *line != gone));
+    let (no6, no9, no10) = (without(6), without(9), without(10));
+    let (h1_4, h1_8, h9_12) = (numbered(1..=4), numbered(1..=8), numbered(9..=12));
+    let h1_paired = format!("{h1_8}x1\nx2\nx3\n");
+    let into_existing = format!("kilo\n{SIX}");
+    let nbr_before =
+        "alpha one\nbravo two edited\ncharlie three\ndelta four\necho five\nfoxtrot six\n";
+    let nbr_after =
+        "alpha one\nbravo two\ncharlie three\ndelta four edited\necho five\nfoxtrot six\n";
+    let under = "ALPHA ONE\nbravo two\ncharlie three\ndelta four\nECHO FIVE\nFOXTROT SIX\n";
+    let six = [("g.txt", SIX)];
+    let numbered_g = [("g.txt", twelve.as_str())];
+    let existing = [("g.txt", SIX), ("k.txt", "kilo\n")];
+    let to_nbr_before = [("h.txt", nbr_before)];
+    let to_nbr_after = [("h.txt", nbr_after)];
+    let to_under = [("h.txt", under)];
+    let split_three = [
+        ("h1.txt", h1_4.as_str()),
+        ("h2.txt", "l5\nl6\nl7 edited\nl8\n"),
+        ("h3.txt", h9_12.as_str()),
+    ];
+    let split_two = [("h1.txt", h1_8.as_str()), ("h2.txt", h9_12.as_str())];
+    let split_paired = [("h1.txt", h1_paired.as_str()), ("h2.txt", h9_12.as_str())];
+    let to_existing = [("k.txt", into_existing.as_str())];
+    let cases: [RemovalCase<'_>; 7] = [
+        ("rm-nbr", &six, SIX_RM, &to_nbr_before),
+        ("rm-nbr-after", &six, SIX_RM, &to_nbr_after),
+        ("rm-nbr-split", &numbered_g, no6.as_str(), &split_three),
+        ("rm-under", &six, SIX_RM, &to_under),
+        ("split-boundary-rm", &numbered_g, no9.as_str(), &split_two),
+        ("split-paired-rm", &numbered_g, no10.as_str(), &split_paired),
+        ("rm-into-existing", &existing, SIX_RM, &to_existing),
+    ];
+    for (shape, trunk, mine, theirs) in cases {
+        // When: `members --verify` reads the release.
+        let (output, member) = moved_case((trunk, mine), (true, theirs, theirs), None);
+
+        // Then: `feat/m` reads missing: its file is absent from the release,
+        // and no other file is read in its place, so the absence holds none
+        // of its removal.
+        let out = stdout(&output);
+        assert_eq!(output.status.code(), Some(FINDINGS), "{shape}: {out}");
+        assert!(out.contains(&missing_row(&member)), "{shape}: {out}");
+        assert!(out.contains(G_GONE), "{shape}: {out}");
+    }
+}
+
+#[test]
+fn an_addition_in_a_file_another_member_moved_reads_missing_whatever_file_holds_it() {
+    // Given: `feat/m` inserts a line into `g.txt`; `feat/o` moves the file
+    // elsewhere. The reviewers' shapes: a rename that refreshes a header
+    // beside a new file that copies the header and the line (round 12's
+    // hdr-decoy), a split at the line beside a new file that starts with
+    // it (split-edge-decoy), a rename that replaces the line above beside a
+    // new file holding the imports (round 11's decoy-neighbour), and a split
+    // whose part the release puts the line at the top of
+    // (split-boundary-add-carried).
+    let header =
+        "// part of the acme tool\n// licensed under the mit terms\n// see the license file\n";
+    let header_new = "// part of the acme tool, 2026\n// licensed under the mit terms, 2026\n// see the license file, 2026\n";
+    let hdr_g = format!("{header}use a;\nuse b;\nfn g() {{\n    one();\n}}\n");
+    let hdr_m = format!("{header}use a;\nuse b;\nuse c;\nfn g() {{\n    one();\n}}\n");
+    let hdr_o = format!("{header_new}use a;\nuse b;\nfn g() {{\n    one();\n}}\n");
+    let hdr_decoy = format!("{header}use a;\nuse b;\nuse c;\nfn d() {{\n    other();\n}}\n");
+    let (h1, h2) = (numbered(1..=8), numbered(9..=12));
+    let split_m = format!("{h1}new line\n{h2}");
+    let h2_with = format!("new line\n{h2}");
+    let twelve = numbered(1..=12);
+    let imports = "use a;\nuse b;\nfn g() {\n    one();\n}\n";
+    let imports_m = "use a;\nuse b;\nuse c;\nfn g() {\n    one();\n}\n";
+    let imports_o = "use a;\nuse b2;\nuse b3;\nuse b4;\nfn g() {\n    one();\n}\n";
+    let imports_decoy = "use a;\nuse b;\nuse c;\nfn d() {\n    other();\n}\n";
+    let to_hdr = [("h.txt", hdr_o.as_str())];
+    let to_imports = [("h.txt", imports_o)];
+    let split = [("h1.txt", h1.as_str()), ("h2.txt", h2.as_str())];
+    let split_with = [("h1.txt", h1.as_str()), ("h2.txt", h2_with.as_str())];
+    let cases: [AdditionCase<'_>; 4] = [
+        (
+            ("hdr-decoy", "added line lost ‹use c;›"),
+            (hdr_g.as_str(), hdr_m.as_str()),
+            (&to_hdr, &to_hdr),
+            Some(("d.txt", hdr_decoy.as_str())),
+        ),
+        (
+            ("split-edge-decoy", "added line lost ‹new line›"),
+            (twelve.as_str(), split_m.as_str()),
+            (&split, &split),
+            Some(("d.txt", "new line\nl9\nl10\nl11\nl12\n")),
+        ),
+        (
+            ("decoy-neighbour", "added line lost ‹use c;›"),
+            (imports, imports_m),
+            (&to_imports, &to_imports),
+            Some(("d.txt", imports_decoy)),
+        ),
+        (
+            ("split-boundary-add-carried", "added line lost ‹new line›"),
+            (twelve.as_str(), split_m.as_str()),
+            (&split, &split_with),
+            None,
+        ),
+    ];
+    for ((shape, lost), (trunk, mine), (theirs, kept), decoy) in cases {
+        // When: `members --verify` reads the release.
+        let (output, member) = moved_case((&[("g.txt", trunk)], mine), (true, theirs, kept), decoy);
+
+        // Then: `feat/m` reads missing, naming its file and its line: no
+        // file the release added, the one its line went to or a copy, is
+        // read in its place. The last shape is the cost: the release holds
+        // the line in `h2.txt`, and the member's review judges that.
+        let out = stdout(&output);
+        assert_eq!(output.status.code(), Some(FINDINGS), "{shape}: {out}");
+        assert!(out.contains(&missing_row(&member)), "{shape}: {out}");
+        assert!(out.contains(G_GONE), "{shape}: {out}");
+        assert!(out.contains(lost), "{shape}: {out}");
+    }
+}
+
+#[test]
+fn the_same_changes_in_place_read_as_the_release_holds_them() {
+    // Given: the moved shapes' changes with no move: `feat/o` edits `g.txt`
+    // in place, and the release holds `feat/o`'s file as it is or with
+    // `feat/m`'s change carried into it.
+    let nbr = "alpha one\nbravo two edited\ncharlie three\ndelta four\necho five\nfoxtrot six\n";
+    let nbr_rm = "alpha one\nbravo two edited\ndelta four\necho five\nfoxtrot six\n";
+    let imports_o = "use a;\nuse b2;\nfn g() {\n    one();\n}\n";
+    let imports_o_c = "use a;\nuse b2;\nuse c;\nfn g() {\n    one();\n}\n";
+    let imports = "use a;\nuse b;\nfn g() {\n    one();\n}\n";
+    let imports_m = "use a;\nuse b;\nuse c;\nfn g() {\n    one();\n}\n";
+    let cases: [InPlaceCase<'_>; 4] = [
+        (
+            ("rm-dropped", Some("removed line put back ‹charlie three›")),
+            (SIX, SIX_RM),
+            (nbr, nbr),
+        ),
+        (("rm-carried", None), (SIX, SIX_RM), (nbr, nbr_rm)),
+        (
+            ("add-dropped", Some("added line lost ‹use c;›")),
+            (imports, imports_m),
+            (imports_o, imports_o),
+        ),
+        (
+            ("add-carried", None),
+            (imports, imports_m),
+            (imports_o, imports_o_c),
+        ),
+    ];
+    for ((shape, lost), (trunk, mine), (theirs, kept)) in cases {
+        // When: `members --verify` reads the release.
+        let (output, member) = moved_case(
+            (&[("g.txt", trunk)], mine),
+            (false, &[("g.txt", theirs)], &[("g.txt", kept)]),
+            None,
+        );
+
+        // Then: a release that lacks `feat/m`'s change reads it missing,
+        // naming the line, and one that carries it reads it carried: the
+        // reading that reads every moved shape missing can read carried.
+        let out = stdout(&output);
+        assert!(!out.contains(G_GONE), "{shape}: {out}");
+        let code = if lost.is_some() { FINDINGS } else { 0 };
+        assert_eq!(output.status.code(), Some(code), "{shape}: {out}");
+        let row = lost.map_or_else(|| carried_row(&member), |_| missing_row(&member));
+        assert!(out.contains(&row), "{shape}: {out}");
+        if let Some(lost) = lost {
+            assert!(out.contains(lost), "{shape}: {out}");
+        }
+    }
+}

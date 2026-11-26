@@ -76,6 +76,10 @@ const TEXT_FILE: &str = "a text file";
 /// with no non-blank line.
 const EMPTY_FILE: &str = "an empty file";
 
+/// The text of a [`LostKind::File`] entry for a text file that the member
+/// changed and that the release no longer holds at its path.
+const GONE_FILE: &str = "absent from the release";
+
 /// The most characters of a line that a reading names, as the prototype of
 /// the rule showed a line; a longer line is cut there, with `…` after it.
 const TEXT_CAP: usize = 300;
@@ -167,11 +171,12 @@ pub struct Lost {
     pub line: Option<u32>,
     /// For a line, its text. For a path read whole, what the member made of
     /// it (`deleted`, `a binary file`, `an empty file`, `a symlink to …`,
-    /// `a submodule at …`); for a mode, `executable yes` or `executable no`;
-    /// for [`LostKind::AddedFileChanged`], a stable digest of the release
-    /// file's non-blank lines, used only to carry forward the same version;
-    /// for a conflict, where it is (`in the release` or `at the member's
-    /// tip`).
+    /// `a submodule at …`), or `absent from the release` for a text file the
+    /// member changed that the release no longer holds; for a mode,
+    /// `executable yes` or `executable no`; for
+    /// [`LostKind::AddedFileChanged`], a stable digest of the release file's
+    /// non-blank lines, used only to carry forward the same version; for a
+    /// conflict, where it is (`in the release` or `at the member's tip`).
     pub text: Option<String>,
     /// Whether the release before this one lacks the same line too
     /// ([`MemberLines::carry_forward`]).
@@ -194,7 +199,8 @@ pub enum LostKind {
     /// again at the place where the member removed it: a line that holds a
     /// letter or a digit, or any line of a hunk the release puts back whole.
     Removed,
-    /// A path read whole: not text, deleted, or an empty added file.
+    /// A path read whole: not text, deleted, or an empty added file; or a
+    /// text file the member changed that the release no longer holds.
     File,
     /// The executable bit that the member changed, or set on a file it adds.
     Mode,
@@ -298,6 +304,11 @@ impl MemberLines {
     ///   path. A text file that the release holds as a file that is not text
     ///   is lost whole. Every other text file is read line by line; a
     ///   version that holds no file there reads as empty.
+    /// - A text file that the member changed, and that the release no longer
+    ///   holds at its path, is also lost as a file (`absent from the
+    ///   release`): another change moved or removed it, and nothing here
+    ///   follows it into another file, so its absence holds none of the
+    ///   member's removals. The member's review judges where its change went.
     pub fn read_path(&mut self, values: &PathValues) {
         let path = values.path.as_str();
         if values.tip == Value::Conflict {
@@ -305,6 +316,18 @@ impl MemberLines {
         } else if values.release == Value::Conflict {
             self.lost.push(conflict_entry(path, ConflictAt::Release));
         } else if values.tip != values.release {
+            if values.release == Value::Absent
+                && let (Some(_), Some((executable, content))) =
+                    (file_of(&values.fork), file_of(&values.tip))
+                && matches!(
+                    file_change(&values.fork, (executable, content)).content,
+                    ContentChange::Text(_)
+                )
+            {
+                let gone = GONE_FILE.to_owned();
+                self.lost
+                    .push(entry(path, LostKind::File, None, Some(gone)));
+            }
             let mut out = Out {
                 lost: &mut self.lost,
                 held_by_words: &mut self.held_by_words,
@@ -1523,6 +1546,28 @@ mod tests {
         // holds it does not
         assert_eq!(gone.reading, Reading::Carried);
         assert_eq!(lost(&kept), [(LostKind::File, None, Some("deleted"))]);
+    }
+
+    #[test]
+    fn a_changed_text_file_the_release_no_longer_holds_is_lost_as_a_file() {
+        // Given: a member that removes a line of a file, one that adds a
+        // line to it, and a release that holds no file there (another change
+        // moved or removed it)
+        let removed = read("g.txt", file("a\nb\nc\n"), file("a\nc\n"), Value::Absent);
+        let added = read("g.txt", file("a\n"), file("a\nb\n"), Value::Absent);
+
+        // Then: each is lost as a file absent from the release, whose
+        // absence holds no removal; the added line is lost too
+        let gone = (LostKind::File, None, Some("absent from the release"));
+        assert_eq!(lost(&removed), [gone]);
+        assert_eq!(lost(&added), [gone, (LostKind::Added, Some(2), Some("b"))]);
+
+        // And: the removal is carried where the release holds the file
+        // without the line, and a file the member added reads as before
+        let held = read("g.txt", file("a\nb\nc\n"), file("a\nc\n"), file("a\nc\n"));
+        assert_eq!(held.reading, Reading::Carried);
+        let new = read("g.txt", Value::Absent, file("b\n"), Value::Absent);
+        assert_eq!(lost(&new), [(LostKind::Added, Some(1), Some("b"))]);
     }
 
     #[test]
