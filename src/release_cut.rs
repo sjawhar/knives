@@ -502,6 +502,7 @@ pub(crate) fn run_release(
         } else {
             carried_from
         };
+        let releases = release::known_releases(&ledger, entry, &tips);
         let context = release::AuditContext {
             previous: followed_in_hand
                 .map(|write| &write.commit)
@@ -518,6 +519,7 @@ pub(crate) fn run_release(
             drift_from: previous_commit
                 .as_ref()
                 .map(|previous| (previous, release::DriftBase::PreviousRelease)),
+            releases: &releases,
         };
         // A cut names a composition consumers can pin. When the publish remote
         // already holds the previous cut with exactly this tree on exactly these
@@ -1437,6 +1439,12 @@ fn report_cut_audit(
 ) -> Option<Exit> {
     for name in &audit.carried {
         println!("{}", release::carried_row(name, carried_from));
+    }
+    for (name, by) in &audit.unresolved {
+        println!("{}", release::unresolved_row(name, by));
+        for line in audit.unresolved_lines_of(name) {
+            println!("{line}");
+        }
     }
     // Each name is a member's bookmark, read from the repository.
     for name in &audit.inconclusive {
@@ -2639,9 +2647,13 @@ struct CompletedCut<'a> {
 impl CompletedCut<'_> {
     /// The exit of the cut's checks: findings where the audit or the
     /// composition gate could not read a member, or a fix by hand, for an
-    /// unresolved conflict; else 0.
+    /// unresolved conflict, or the audit read a member unresolved
+    /// ([`release::CutAudit::unresolved`]); else 0.
     const fn exit(&self) -> Exit {
-        if self.audit.inconclusive.is_empty() && !self.check.is_inconclusive() {
+        if self.audit.inconclusive.is_empty()
+            && self.audit.unresolved.is_empty()
+            && !self.check.is_inconclusive()
+        {
             Exit::Ok
         } else {
             Exit::Findings
@@ -3135,6 +3147,7 @@ fn record_hand_cut(
             trunk_parent_base: Some(&composed.base),
             drift_trunk: &composed.base,
             drift_from: Some(composed.drift_from(follows.as_ref().map(|(_, previous)| previous))),
+            releases: &[],
         },
         carried_from: release::CarriedFrom::Unledgered,
         waivable: false,

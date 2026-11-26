@@ -340,23 +340,25 @@ impl MemberLines {
     }
 
     /// Carries forward, line by line, what `previous`, the reading of the
-    /// same member, from the same fork point and tip, against the release
-    /// before this one, lacks too: a lost entry other than a conflict is
-    /// carried forward where `previous` lost one of the same path, kind and
-    /// line. A member whose every lost line is carried forward reads carried
-    /// forward, or inconclusive where a path cannot be read; one with any
-    /// other lost line still reads missing. A file the member adds that the
-    /// release before changed too is carried forward only where the release
-    /// holds the same non-blank lines: its entry's text is their digest.
+    /// same member, from the same fork point and tip, against another commit
+    /// (the release before this one, or another member's tip) lacks too: a
+    /// lost entry other than a conflict is carried forward where `previous`
+    /// lost one of the same path, kind and line. An entry an earlier call
+    /// carried forward stays so. A member whose every lost line is carried
+    /// forward reads carried forward, or inconclusive where a path cannot be
+    /// read; one with any other lost line still reads missing. A file the
+    /// member adds that `previous` changed too is carried forward only where
+    /// both hold the same non-blank lines: its entry's text is their digest.
     pub fn carry_forward(&mut self, previous: &Self) {
         for lost in &mut self.lost {
-            lost.carried_forward = lost.kind != LostKind::Conflict
-                && previous.lost.iter().any(|before| {
-                    before.kind == lost.kind
-                        && before.path == lost.path
-                        && before.line == lost.line
-                        && (lost.kind != LostKind::AddedFileChanged || before.text == lost.text)
-                });
+            lost.carried_forward = lost.carried_forward
+                || lost.kind != LostKind::Conflict
+                    && previous.lost.iter().any(|before| {
+                        before.kind == lost.kind
+                            && before.path == lost.path
+                            && before.line == lost.line
+                            && (lost.kind != LostKind::AddedFileChanged || before.text == lost.text)
+                    });
         }
         self.reading = self.settled();
     }

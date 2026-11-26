@@ -100,6 +100,31 @@ pub fn previous_release_for_record(
     newest_release_but(tips, (&scheme, entry.publish_remote()), Some(name))
 }
 
+/// The release `name` replaced.
+///
+/// It is the newest release of the series whose name sorts strictly before
+/// `name` in the series' one order ([`ReleaseScheme::cut_key`]). A later
+/// release is never one `name` replaced, and `name` with no key, or a fixed
+/// branch, replaced none here.
+pub fn release_replaced_by(
+    entry: &RepoEntry,
+    tips: &BookmarkTips,
+    name: &str,
+) -> Option<(BookmarkRef, CommitId)> {
+    let scheme = entry.release_scheme();
+    let key = scheme.cut_key(name)?;
+    tips.iter()
+        .filter(|(reference, _)| is_our_release(reference, &scheme, entry.publish_remote()))
+        .filter_map(|(reference, commit)| {
+            scheme
+                .cut_key(reference.branch().as_str())
+                .filter(|other| *other < key)
+                .map(|other| (other, reference, commit))
+        })
+        .max_by_key(|(other, reference, _)| (*other, u8::from(reference.is_local())))
+        .map(|(_, reference, commit)| (reference.clone(), commit.clone()))
+}
+
 /// Every locally held, non-release, non-trunk branch and its current tip.
 pub fn carried_branches(
     repo: &Repo,

@@ -37,6 +37,7 @@ fn context<'a>(trunk: &'a CommitId, previous: Option<&'a CommitId>) -> AuditCont
         trunk_parent_base: None,
         drift_trunk: trunk,
         drift_from: previous.map(|previous| (previous, DriftBase::PreviousRelease)),
+        releases: &[],
     }
 }
 

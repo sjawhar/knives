@@ -1083,29 +1083,71 @@ impl Repo {
         release: &CommitId,
     ) -> Result<MemberLines, JjError> {
         let release = self.commit(release.as_str())?.tree();
-        self.member_lines_in(label, (fork_point, tip), &release)
+        self.member_lines_in(label, (fork_point, tip), (&release, &EverythingMatcher))
+    }
+
+    /// [`Self::member_lines`] against `release` at `paths` alone
+    /// (repository-internal, `/`-separated): the member's change elsewhere is
+    /// not read.
+    pub fn member_lines_at(
+        &self,
+        label: &str,
+        (fork_point, tip): (&CommitId, &CommitId),
+        (release, paths): (&CommitId, &[String]),
+    ) -> Result<MemberLines, JjError> {
+        let paths = paths
+            .iter()
+            .map(|path| internal_path(path.as_str()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let release = self.commit(release.as_str())?.tree();
+        let matcher = jj_lib::matchers::FilesMatcher::new(paths);
+        self.member_lines_in(label, (fork_point, tip), (&release, &matcher))
+    }
+
+    /// Whether the trees of `left` and `right` hold different values at any
+    /// of `paths` (repository-internal, `/`-separated).
+    pub fn differs_at(
+        &self,
+        left: &CommitId,
+        right: &CommitId,
+        paths: &[String],
+    ) -> Result<bool, JjError> {
+        let (left, right) = (
+            self.commit(left.as_str())?.tree(),
+            self.commit(right.as_str())?.tree(),
+        );
+        for path in paths {
+            let path = internal_path(path)?;
+            let value = |tree: &MergedTree| {
+                block_on(tree.path_value(path)).map_err(|error| store_error(&error))
+            };
+            if value(&left)? != value(&right)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// [`Self::member_lines`] against `release`, a tree that no published
     /// commit need hold: a candidate's ([`Candidate::member_lines`]).
     ///
     /// The member's paths are those where the trees of `fork_point` and
-    /// `tip` differ, read with no copy records, so a rename is the deletion
-    /// of one path and the addition of another. Each path is read with the
-    /// three values there ([`own_value`]); a path where the release holds
-    /// the tip's own resolved value loses nothing, and its contents are not
-    /// read.
+    /// `tip` differ, that `matcher` matches, read with no copy records, so a
+    /// rename is the deletion of one path and the addition of another. Each
+    /// path is read with the three values there ([`own_value`]); a path
+    /// where the release holds the tip's own resolved value loses nothing,
+    /// and its contents are not read.
     fn member_lines_in(
         &self,
         label: &str,
         (fork_point, tip): (&CommitId, &CommitId),
-        release: &MergedTree,
+        (release, matcher): (&MergedTree, &dyn jj_lib::matchers::Matcher),
     ) -> Result<MemberLines, JjError> {
         let fork_tree = self.commit(fork_point.as_str())?.tree();
         let tip_tree = self.commit(tip.as_str())?.tree();
         let store = self.repo.store();
         let mut lines = MemberLines::new(label.to_owned(), tip.clone(), fork_point.clone());
-        for entry in collect_stream(fork_tree.diff_stream(&tip_tree, &EverythingMatcher)) {
+        for entry in collect_stream(fork_tree.diff_stream(&tip_tree, matcher)) {
             let values = entry.values.map_err(|error| store_error(&error))?;
             let held =
                 block_on(release.path_value(&entry.path)).map_err(|error| store_error(&error))?;
@@ -4407,8 +4449,11 @@ impl Candidate {
         label: &str,
         (fork_point, tip): (&CommitId, &CommitId),
     ) -> Result<MemberLines, JjError> {
-        self.repo
-            .member_lines_in(label, (fork_point, tip), &self.commit.tree())
+        self.repo.member_lines_in(
+            label,
+            (fork_point, tip),
+            (&self.commit.tree(), &EverythingMatcher),
+        )
     }
 
     /// The paths of the change `resolution` holds against `baseline`, the

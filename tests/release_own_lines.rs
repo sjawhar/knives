@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use knives::ids::CommitId;
 use lab::{
     Lab, ReleaseOutput, carried_row, carries, census, census_block, commit_at, extend_branch,
-    home_after_first_cut, jj_in, knives_release, label, missing_row, release_command,
+    fixed_home, home_after_first_cut, jj_in, knives_release, label, missing_row, release_command,
     release_test_home, stdout, text, trunk_with, verify,
 };
 use serde_json::{Value, json};
@@ -2570,6 +2570,621 @@ fn carries_reads_not_carried_where_the_release_reverts_a_rewrites_lines() {
         "{out}"
     );
     assert_eq!(output.status.code(), Some(FINDINGS), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// `--verify` reads against the release a release replaced.
+// ---------------------------------------------------------------------------
+
+/// The row `members --verify` gives a member the release it replaced held
+/// and whose every lost line that release lacked too.
+fn followed_row(label: &str) -> String {
+    format!("  {label}: carried from the previous release, which lacked the same lines")
+}
+
+/// A flat release `name` that merges the trunk and `feat/member` but holds
+/// the trunk's tree: it lacks the member's whole change.
+fn flat_without_member_content(lab: &Lab, name: &str, description: &str) {
+    jj_in(
+        &lab.work,
+        &["new", "main@origin", "feat/member", "-m", description],
+    );
+    jj_in(&lab.work, &["restore", "--from", "main@origin"]);
+    jj_in(&lab.work, &["bookmark", "create", name, "-r", "@"]);
+    jj_in(&lab.work, &["new"]);
+}
+
+#[test]
+fn verify_carries_forward_only_a_member_the_release_it_follows_holds() {
+    // Given: [`RELEASE`] merges `feat/a`, which writes `a1` and `a2`, and
+    // drops `a2` by hand; [`NEXT`] merges `feat/a` and `feat/n`, new to it,
+    // and drops both `a2` and `feat/n`'s line.
+    let lab = trunk_with(&[("f.txt", "f\n")]);
+    branch_on(&lab, "main@upstream", "feat/a", |work| {
+        write_file(work, "a.txt", "a1\na2\n");
+    });
+    branch_on(&lab, "main@upstream", "feat/n", |work| {
+        write_file(work, "n.txt", "n\n");
+    });
+    hand_release(&lab, RELEASE, &["feat/a"], |work| {
+        write_file(work, "a.txt", "a1\n");
+    });
+    hand_release(&lab, NEXT, &["feat/a", "feat/n"], |work| {
+        write_file(work, "a.txt", "a1\n");
+        write_file(work, "n.txt", "");
+    });
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: `feat/a`, whose line the release before lacked too, is
+    // carried from it, and says so; `feat/n`, which that release never
+    // held, is missing, with the findings exit.
+    let output = verify(&lab, &home, NEXT);
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
+    assert!(out.contains(&followed_row(&label(&lab, "feat/a"))), "{out}");
+    assert!(out.contains(&missing_row(&label(&lab, "feat/n"))), "{out}");
+}
+
+#[test]
+fn a_later_release_does_not_excuse_an_older_releases_missing_member() {
+    // Given: RELEASE lacks `feat/member`'s change; verify reads it missing.
+    let lab = Lab::new();
+    lab.branch(
+        "feat/member",
+        "member.txt",
+        "member payload that must be present\n",
+    );
+    flat_without_member_content(&lab, RELEASE, "older flat release omitted member");
+    let old = commit_at(&lab, RELEASE);
+    let (home, _consumer) = release_test_home(&lab);
+    let before = verify(&lab, &home, RELEASE);
+    assert_eq!(before.status.code(), Some(FINDINGS), "{}", text(&before));
+
+    // When: a later release, NEXT, lacks it the same way.
+    flat_without_member_content(&lab, NEXT, "newer flat release also omitted member");
+
+    // Then: RELEASE still reads the member missing, asked by its name or by
+    // its commit: NEXT is not a release RELEASE replaced.
+    for asked in [RELEASE, old.as_str()] {
+        let after = verify(&lab, &home, asked);
+        let out = stdout(&after);
+        assert_eq!(
+            after.status.code(),
+            Some(FINDINGS),
+            "{asked}: {}",
+            text(&after)
+        );
+        assert!(
+            !out.contains("carried from the previous release"),
+            "{asked}: {out}"
+        );
+        assert!(
+            out.contains(&missing_row(&label(&lab, "feat/member"))),
+            "{asked}: {out}"
+        );
+    }
+}
+
+#[test]
+fn a_release_carries_the_lines_the_release_it_replaced_already_lacked() {
+    // Given: RELEASE and then NEXT, each lacking `feat/member`'s change.
+    let lab = Lab::new();
+    lab.branch("feat/member", "member.txt", "member payload\n");
+    flat_without_member_content(&lab, RELEASE, "approved old resolution");
+    flat_without_member_content(&lab, NEXT, "new flat release preserves old resolution");
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: NEXT carries the member from RELEASE, exit 0.
+    let output = verify(&lab, &home, NEXT);
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        out.contains(&followed_row(&label(&lab, "feat/member"))),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_foreign_remote_release_name_does_not_change_the_subjects_predecessor() {
+    // Given: RELEASE lacks `feat/member`'s change and NEXT, later, too.
+    let lab = Lab::new();
+    lab.branch("feat/member", "member.txt", "member payload\n");
+    flat_without_member_content(&lab, RELEASE, "older flat release omitted member");
+    let old = commit_at(&lab, RELEASE);
+    flat_without_member_content(&lab, NEXT, "newer flat release omitted member");
+    let (home, _consumer) = release_test_home(&lab);
+    let before = verify(&lab, &home, old.as_str());
+    assert_eq!(before.status.code(), Some(FINDINGS), "{}", text(&before));
+
+    // When: an upstream ref of a later release name lands on RELEASE's commit
+    // (a private fixture repository, fetched, with no local bookmark).
+    let pushed = Command::new("git")
+        .arg("-C")
+        .arg(&lab.work)
+        .arg("push")
+        .arg(&lab.upstream)
+        .arg(format!("{}:refs/heads/release/2026-08-06", old.as_str()))
+        .output()
+        .expect("push a foreign release name");
+    assert!(pushed.status.success(), "{}", text(&pushed));
+    lab.jj_work(["git", "fetch", "--remote", "upstream"]);
+    if knives::jj::Repo::open(&lab.work)
+        .expect("open the lab")
+        .local_bookmark_tip("release/2026-08-06")
+        .is_some()
+    {
+        lab.jj_work(["bookmark", "delete", "release/2026-08-06"]);
+    }
+
+    // Then: asked by its commit, RELEASE still reads the member missing: a
+    // foreign ref is no name of ours.
+    let after = verify(&lab, &home, old.as_str());
+    assert_eq!(after.status.code(), Some(FINDINGS), "{}", text(&after));
+}
+
+#[test]
+fn a_note_is_not_a_recorded_write_of_a_fixed_branch_candidate() {
+    // Given: on a fixed branch `fork`, a candidate that lacks the member's
+    // change as `fork` already does: verify carries it from `fork`.
+    let lab = Lab::new();
+    lab.branch("feat/member", "member.txt", "member payload\n");
+    flat_without_member_content(&lab, "fork", "fork");
+    flat_without_member_content(&lab, "candidate", "candidate");
+    let candidate = commit_at(&lab, "candidate");
+    let home = fixed_home(&lab, "fork");
+    let before = verify(&lab, &home, candidate.as_str());
+    assert_eq!(before.status.code(), Some(0), "{}", text(&before));
+
+    // When: a notch names the candidate as its evidence.
+    let note = Command::new(env!("CARGO_BIN_EXE_knives"))
+        .args([
+            "--text",
+            "notch",
+            "candidate",
+            "--repo",
+            "demo",
+            "-m",
+            "candidate under review",
+            "--evidence",
+            candidate.as_str(),
+        ])
+        .current_dir(&lab.work)
+        .env("KNIVES_CONFIG_HOME", home.path())
+        .env("HOME", lab.temp_path())
+        .output()
+        .expect("run knives notch");
+    assert!(note.status.success(), "{}", text(&note));
+
+    // Then: the note is no write of the release, so the reading stands.
+    let after = verify(&lab, &home, candidate.as_str());
+    assert_eq!(after.status.code(), Some(0), "{}", text(&after));
+}
+
+// ---------------------------------------------------------------------------
+// A member built on a release, or stacked on another member, is read from
+// there.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn verify_reads_a_landing_on_an_older_release_from_where_it_meets_the_release_it_follows() {
+    // Given: [`RELEASE`] merges `feat/b` and `feat/a`, which writes `a1`;
+    // `feat/l`, a landing built on RELEASE, writes `l.txt`; [`NEXT`], made on
+    // RELEASE, rewrites `a1` as `a2`; `feat/a` then rewrites it the same way;
+    // `release/2026-08-06` merges `feat/a` and `feat/l`. By spec R6
+    // `feat/l`'s change starts at the trunk, as no other parent holds
+    // `feat/b`, so it holds RELEASE's `a1`.
+    let lab = trunk_with(&[("f.txt", "f\n")]);
+    branch_on(&lab, "main@upstream", "feat/b", |work| {
+        write_file(work, "b.txt", "b\n");
+    });
+    branch_on(&lab, "main@upstream", "feat/a", |work| {
+        write_file(work, "a.txt", "a1\n");
+    });
+    hand_release(&lab, RELEASE, &["feat/b", "feat/a"], |_| {});
+    branch_on(&lab, RELEASE, "feat/l", |work| {
+        write_file(work, "l.txt", "l\n");
+    });
+    hand_release(&lab, NEXT, &[RELEASE], |work| {
+        write_file(work, "a.txt", "a2\n");
+    });
+    extend_branch(&lab, "feat/a", "a.txt", "a2\n");
+    hand_release(&lab, "release/2026-08-06", &["feat/a", "feat/l"], |_| {});
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: `feat/l` brings only `l.txt`: its change starts where it
+    // meets NEXT, the release it follows, so RELEASE's `a1`, which NEXT
+    // rewrote, is not charged to it. Every member is carried, exit 0.
+    let output = verify(&lab, &home, "release/2026-08-06");
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(!out.contains("!!"), "{out}");
+    assert!(out.contains(&carried_row(&label(&lab, "feat/l"))), "{out}");
+}
+
+#[test]
+fn a_landing_built_on_the_release_before_the_previous_one_brings_only_its_own_lines() {
+    // Given: RELEASE and NEXT, flat merges of the trunk and `feat/a`, each
+    // writing its own `x.txt` by hand (`x1`, then `x2`); `feat/l`, a landing
+    // merge of RELEASE and `feat/h`, which adds `h.txt`; and a third release
+    // of the trunk, `feat/a` and `feat/l` that holds NEXT's `x2` and `h.txt`.
+    let lab = trunk_with(&[("f.txt", "f\n")]);
+    branch_on(&lab, "main@upstream", "feat/a", |work| {
+        write_file(work, "a.txt", "a1\n");
+    });
+    branch_on(&lab, "main@upstream", "feat/h", |work| {
+        write_file(work, "h.txt", "h\n");
+    });
+    hand_release(&lab, RELEASE, &["main@upstream", "feat/a"], |work| {
+        write_file(work, "x.txt", "x1\n");
+    });
+    hand_release(&lab, NEXT, &["main@upstream", "feat/a"], |work| {
+        write_file(work, "x.txt", "x2\n");
+    });
+    hand_release(&lab, "feat/l", &[RELEASE, "feat/h"], |_| {});
+    hand_release(
+        &lab,
+        "release/2026-08-06",
+        &["main@upstream", "feat/a", "feat/l"],
+        |work| write_file(work, "x.txt", "x2\n"),
+    );
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: the landing brings only what it adds over its own first
+    // parent, RELEASE: `h.txt`, which the release holds. RELEASE's `x1`,
+    // which NEXT rewrote, is not the landing's, so every member is carried.
+    let output = verify(&lab, &home, "release/2026-08-06");
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(out.contains(&carried_row(&label(&lab, "feat/l"))), "{out}");
+}
+
+/// RELEASE, a merge of the trunk and `feat/a`; then `feat/m`, built on
+/// `base`, writing `m.txt`, whose tip merges `merged` in. NEXT merges the
+/// trunk, `feat/a` and `feat/m` but drops `m.txt` by hand: verify reads
+/// `feat/m` missing, naming the line.
+fn member_that_merged_in(base: &str, merged: impl FnOnce(&Lab) -> &'static str) {
+    let lab = trunk_with(&[("f.txt", "f\n")]);
+    branch_on(&lab, "main@upstream", "feat/a", |work| {
+        write_file(work, "a.txt", "a\n");
+    });
+    hand_release(&lab, RELEASE, &["main@upstream", "feat/a"], |_| {});
+    branch_on(&lab, base, "feat/m", |work| {
+        write_file(work, "m.txt", "m\n");
+    });
+    let other = merged(&lab);
+    hand_release(&lab, "feat/m-merged", &["feat/m", other], |_| {});
+    jj_in(
+        &lab.work,
+        &["bookmark", "set", "feat/m", "-r", "feat/m-merged"],
+    );
+    jj_in(&lab.work, &["bookmark", "delete", "feat/m-merged"]);
+    if other != "main@upstream" {
+        jj_in(&lab.work, &["bookmark", "delete", other]);
+    }
+    hand_release(&lab, NEXT, &["main@upstream", "feat/a", "feat/m"], |work| {
+        std::fs::remove_file(work.join("m.txt")).expect("drop m.txt");
+    });
+    let (home, _consumer) = release_test_home(&lab);
+    let output = verify(&lab, &home, NEXT);
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
+    assert!(out.contains(&missing_row(&label(&lab, "feat/m"))), "{out}");
+    assert!(out.contains("m.txt:1: added line lost ‹m›"), "{out}");
+}
+
+#[test]
+fn a_member_that_merged_the_trunk_in_still_answers_for_its_earlier_commits() {
+    // Given, when, then: a trunk merge at the tip is no landing, built on
+    // the trunk or on RELEASE.
+    for base in ["main@upstream", RELEASE] {
+        member_that_merged_in(base, |lab| {
+            lab.advance_upstream("upstream advance\n");
+            "main@upstream"
+        });
+    }
+}
+
+#[test]
+fn a_feature_branch_that_merged_another_branch_still_answers_for_its_earlier_commits() {
+    // Given, when, then: `feat/m`'s first parent was built on the trunk, not
+    // on a release, so a merge of another branch at its tip is no landing.
+    member_that_merged_in("main@upstream", |lab| {
+        branch_on(lab, "main@upstream", "feat/x", |work| {
+            write_file(work, "x.txt", "x\n");
+        });
+        "feat/x"
+    });
+}
+
+/// The reviewer's release-based feature: RELEASE merges the trunk and `feat/a`;
+/// `feat/own`, built on RELEASE, adds `own.txt`; with `merges`, a merge of
+/// `feat/other`, a branch on the trunk, into it is the member's tip
+/// (`feat/merged`). NEXT merges the trunk, `feat/a` and the member, without
+/// `own.txt` where `drops`. The lab, its home and the member's branch.
+fn feature_on_release(merges: bool, drops: bool) -> (Lab, TempDir, &'static str) {
+    let lab = trunk_with(&[("f.txt", "base\n")]);
+    lab.branch("feat/a", "a.txt", "a\n");
+    hand_release(&lab, RELEASE, &["main@upstream", "feat/a"], |_| {});
+    branch_on(&lab, RELEASE, "feat/own", |work| {
+        write_file(work, "own.txt", "own feature payload\n");
+    });
+    let member = if merges {
+        lab.branch("feat/other", "other.txt", "other payload\n");
+        hand_release(&lab, "feat/merged", &["feat/own", "feat/other"], |_| {});
+        jj_in(&lab.work, &["bookmark", "delete", "feat/own", "feat/other"]);
+        "feat/merged"
+    } else {
+        "feat/own"
+    };
+    hand_release(&lab, NEXT, &["main@upstream", "feat/a", member], |work| {
+        if drops {
+            std::fs::remove_file(work.join("own.txt")).expect("drop own.txt");
+        }
+    });
+    let (home, _consumer) = release_test_home(&lab);
+    (lab, home, member)
+}
+
+#[test]
+fn merging_a_branch_into_a_release_based_feature_does_not_erase_the_features_own_commit() {
+    // Given, when, then: with the merge, as without it, NEXT dropping
+    // `own.txt` reads the feature missing, naming its line; keeping it reads
+    // the feature carried.
+    for merges in [false, true] {
+        let (lab, home, member) = feature_on_release(merges, true);
+        let output = verify(&lab, &home, NEXT);
+        let out = stdout(&output);
+        assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
+        assert!(out.contains(&missing_row(&label(&lab, member))), "{out}");
+        assert!(out.contains("‹own feature payload›"), "{out}");
+        let (lab, home, member) = feature_on_release(merges, false);
+        let output = verify(&lab, &home, NEXT);
+        let out = stdout(&output);
+        assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+        assert!(out.contains(&carried_row(&label(&lab, member))), "{out}");
+    }
+}
+
+/// A landing on RELEASE: it merges `feat/x` (adding `x.txt`), takes a fix of
+/// its own (`fix.txt`), then merges `feat/y` (adding `y.txt`); NEXT merges
+/// the trunk, `feat/a` and the landing, without `drop` where one is named.
+fn landing_of_three_steps(drop: Option<&str>) -> (Lab, TempDir) {
+    let lab = trunk_with(&[("f.txt", "base\n")]);
+    lab.branch("feat/a", "a.txt", "a\n");
+    hand_release(&lab, RELEASE, &["main@upstream", "feat/a"], |_| {});
+    lab.branch("feat/x", "x.txt", "x\n");
+    hand_release(&lab, "land-1", &[RELEASE, "feat/x"], |_| {});
+    branch_on(&lab, "land-1", "land-2", |work| {
+        write_file(work, "fix.txt", "fix\n");
+    });
+    lab.branch("feat/y", "y.txt", "y\n");
+    hand_release(&lab, "feat/land", &["land-2", "feat/y"], |_| {});
+    jj_in(
+        &lab.work,
+        &["bookmark", "delete", "land-1", "land-2", "feat/x", "feat/y"],
+    );
+    hand_release(
+        &lab,
+        NEXT,
+        &["main@upstream", "feat/a", "feat/land"],
+        |work| {
+            if let Some(file) = drop {
+                std::fs::remove_file(work.join(file)).expect("drop a file");
+            }
+        },
+    );
+    let (home, _consumer) = release_test_home(&lab);
+    (lab, home)
+}
+
+#[test]
+fn a_landing_answers_for_every_step_it_brought_over_its_release() {
+    // Given, when, then: NEXT holding all of it reads the landing carried.
+    let (lab, home) = landing_of_three_steps(None);
+    let output = verify(&lab, &home, NEXT);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+
+    // And: dropping what an earlier step merged, or the landing's own fix
+    // between its merges, reads it missing, naming that line.
+    for (file, line) in [("x.txt", "‹x›"), ("fix.txt", "‹fix›")] {
+        let (lab, home) = landing_of_three_steps(Some(file));
+        let output = verify(&lab, &home, NEXT);
+        let out = stdout(&output);
+        assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
+        assert!(
+            out.contains(&missing_row(&label(&lab, "feat/land"))),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("{file}:1: added line lost {line}")),
+            "{out}"
+        );
+    }
+}
+
+#[test]
+fn a_landing_on_a_cut_the_previous_release_holds_reads_from_that_cut() {
+    // Given: `old-cut`, a merge of the trunk and `feat/a` with no release
+    // name; `feat/x` adds `x.txt` and `feat/x2`, on it, adds `x2.txt`; NEXT
+    // merges `old-cut` and `feat/x2`; `feat/l`, a landing, merges `feat/x`
+    // into `old-cut`. `feat/l` and NEXT share `old-cut` and `feat/x`, neither
+    // older than the other, so they have no one commit where they meet.
+    let lab = trunk_with(&[("f.txt", "f\n")]);
+    lab.branch("feat/a", "a.txt", "a\n");
+    lab.branch("feat/x", "x.txt", "x\n");
+    branch_on(&lab, "feat/x", "feat/x2", |work| {
+        write_file(work, "x2.txt", "x2\n");
+    });
+    hand_release(&lab, "old-cut", &["main@upstream", "feat/a"], |_| {});
+    hand_release(&lab, NEXT, &["old-cut", "feat/x2"], |_| {});
+    hand_release(&lab, "feat/l", &["old-cut", "feat/x"], |_| {});
+    hand_release(
+        &lab,
+        "release/2026-08-06",
+        &["main@upstream", "feat/a", "feat/x2", "feat/l"],
+        |_| {},
+    );
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: the landing reads from `old-cut`, the commit of its line
+    // NEXT holds, so it brings `x.txt`, which the release holds: carried.
+    let output = verify(&lab, &home, "release/2026-08-06");
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(out.contains(&carried_row(&label(&lab, "feat/l"))), "{out}");
+}
+
+#[test]
+fn verify_reads_a_member_whose_line_a_member_stacked_on_it_rewrote_unresolved() {
+    // Given: `feat/s2`, stacked on `feat/s1`, rewrites the line `feat/s1`
+    // wrote; the release merges both, holding `feat/s2`'s line.
+    let lab = trunk_with(&[("f.txt", "f\n")]);
+    branch_on(&lab, "main@upstream", "feat/s1", |work| {
+        write_file(work, "s.txt", "s1\n");
+    });
+    branch_on(&lab, "feat/s1", "feat/s2", |work| {
+        write_file(work, "s.txt", "s2\n");
+    });
+    hand_release(&lab, RELEASE, &["feat/s1", "feat/s2"], |_| {});
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: `feat/s1`'s line, which `feat/s2` rewrote, reads
+    // unresolved, naming `feat/s2` and the line, with the findings exit.
+    let output = verify(&lab, &home, RELEASE);
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
+    assert!(
+        out.contains(&unresolved_row(
+            &label(&lab, "feat/s1"),
+            &label(&lab, "feat/s2")
+        )),
+        "{out}"
+    );
+    assert!(out.contains("      s.txt:1: added line lost ‹s1›"), "{out}");
+    assert!(out.contains(&carried_row(&label(&lab, "feat/s2"))), "{out}");
+}
+
+/// Four branches stacked on one another, merged by hand as a release cut
+/// outside knives: `feat/base` writes `base.txt`; `feat/pr`, on it, writes
+/// `pr.txt`; `feat/other`, on `feat/base` too, rewrites `base.txt`;
+/// `feat/later`, on `feat/pr`, rewrites `pr.txt` and then writes
+/// `later.txt`. No two of their lines share a word. Each of `files` is then
+/// written (or, for `None`, removed) by hand in the merge. `cut --at` of
+/// it, whatever its exit.
+fn stacked_hand_cut(files: &[(&str, Option<&str>)]) -> (Lab, Output) {
+    let lab = trunk_with(&[("f.txt", "f\n")]);
+    branch_on(&lab, "main@upstream", "feat/base", |work| {
+        write_file(work, "base.txt", "base line\n");
+    });
+    branch_on(&lab, "feat/base", "feat/pr", |work| {
+        write_file(work, "pr.txt", "pr line\n");
+    });
+    branch_on(&lab, "feat/base", "feat/other", |work| {
+        write_file(work, "base.txt", "other rewrite\n");
+    });
+    branch_on(&lab, "feat/pr", "feat/later", |work| {
+        write_file(work, "pr.txt", "later rewrite\n");
+    });
+    extend_branch(&lab, "feat/later", "later.txt", "later own\n");
+    let commit = hand_release(
+        &lab,
+        RELEASE,
+        &["feat/base", "feat/pr", "feat/other", "feat/later"],
+        |work| {
+            for (file, content) in files {
+                match content {
+                    Some(content) => write_file(work, file, content),
+                    None => std::fs::remove_file(work.join(file)).expect("remove by hand"),
+                }
+            }
+        },
+    );
+    let (home, _consumer) = release_test_home(&lab);
+    let output = record(&lab, &home, RELEASE, &commit);
+    (lab, output)
+}
+
+/// The row a member reads where every line the release lacks of it was
+/// changed by `by`, other members, too.
+fn unresolved_row(member: &str, by: &str) -> String {
+    format!(
+        "  {member}: unresolved: {by} changed the lines this release lacks too; the member's \
+         review judges them"
+    )
+}
+
+#[test]
+fn a_hand_cut_of_members_stacked_on_one_another_is_recorded_with_its_overlaps_unresolved() {
+    // Given, when: the four merged by hand, nothing changed in the merge.
+    let (lab, recorded) = stacked_hand_cut(&[]);
+
+    // Then: it is recorded, with the findings exit, and no member is
+    // missing. Each member keeps its own base, so it answers for every line
+    // below it: `feat/base`'s line, which `feat/other` rewrote, is charged to
+    // `feat/base`, `feat/pr` and `feat/later`, and `feat/pr`'s line, which
+    // `feat/later` rewrote, to `feat/pr`. Each of those reads unresolved,
+    // naming the members that changed its lines and the lines.
+    let out = stdout(&recorded);
+    assert_eq!(
+        recorded.status.code(),
+        Some(FINDINGS),
+        "{}",
+        text(&recorded)
+    );
+    assert!(
+        out.contains(&recorded_line(RELEASE, &commit_at(&lab, RELEASE))),
+        "{out}"
+    );
+    assert!(!out.contains("!!"), "{out}");
+    for (member, by) in [
+        ("feat/base", "feat/other"),
+        ("feat/pr", "feat/other, feat/later"),
+        ("feat/later", "feat/other"),
+    ] {
+        assert!(out.contains(&unresolved_row(member, by)), "{member}: {out}");
+    }
+    assert!(
+        out.contains("base.txt:1: added line lost ‹base line›"),
+        "{out}"
+    );
+    assert!(out.contains("pr.txt:1: added line lost ‹pr line›"), "{out}");
+}
+
+#[test]
+fn a_cut_tree_without_a_stacked_members_change_is_refused_naming_that_member_alone() {
+    // Given, when: the four merged by hand with `later.txt`, which
+    // `feat/later` alone wrote, removed in the merge, or its line changed.
+    for change in [None, Some("changed by hand\n")] {
+        let (_lab, recorded) = stacked_hand_cut(&[("later.txt", change)]);
+
+        // Then: it is refused, naming `feat/later` alone (a record names
+        // each member by its branch).
+        let out = stdout(&recorded);
+        assert_eq!(recorded.status.code(), Some(REFUSED), "{}", text(&recorded));
+        assert!(out.contains(&missing_row("feat/later")), "{out}");
+        for member in ["feat/base", "feat/pr", "feat/other"] {
+            assert!(!out.contains(&missing_row(member)), "{member}: {out}");
+        }
+    }
+}
+
+#[test]
+fn a_cut_tree_that_changes_a_line_a_stacked_member_rewrote_is_refused_naming_the_rewriter() {
+    // Given, when: the four merged by hand with `pr.txt`, whose line
+    // `feat/pr` wrote and `feat/later` rewrote, changed by hand.
+    let (_lab, recorded) = stacked_hand_cut(&[("pr.txt", Some("changed by hand\n"))]);
+
+    // Then: it is refused, naming `feat/later`, whose rewrite is gone;
+    // `feat/pr`'s lines are ones `feat/later` and `feat/other` changed too,
+    // so `feat/pr` reads unresolved, naming them, and is not refused.
+    let out = stdout(&recorded);
+    assert_eq!(recorded.status.code(), Some(REFUSED), "{}", text(&recorded));
+    assert!(out.contains(&missing_row("feat/later")), "{out}");
+    assert!(!out.contains(&missing_row("feat/pr")), "{out}");
+    assert!(
+        out.contains(&unresolved_row("feat/pr", "feat/other, feat/later")),
+        "{out}"
+    );
 }
 
 // ---------------------------------------------------------------------------

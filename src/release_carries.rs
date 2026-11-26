@@ -87,7 +87,12 @@ pub(crate) fn run_release_members(
 fn members_exit(report: &release::MembersReport, verify: bool) -> Exit {
     if !report.problems.is_empty() {
         Exit::Incomplete
-    } else if verify && report.audit.as_ref().is_some_and(|audit| !audit.passed()) {
+    } else if verify
+        && report
+            .audit
+            .as_ref()
+            .is_some_and(|audit| !audit.passed() || !audit.unresolved.is_empty())
+    {
         Exit::Findings
     } else {
         Exit::Ok

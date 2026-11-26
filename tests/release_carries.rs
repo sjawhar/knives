@@ -1212,6 +1212,20 @@ fn release_carries_answers_merged_then_edited_for_members_a_resolution_discarded
     // member's line, whatever commit last edited the text in its place.
     assert_carried_in(&lab, &home, "feat/alpha", false);
     assert_carried_in(&lab, &home, "feat/beta", false);
+
+    // And: `members --verify` reads both members of the cut under the edit
+    // missing, and says it read them there: the edit on top of the cut,
+    // whose one parent is an earlier write of the release, hides neither.
+    let verify = knives_release(&lab, &home, &["members", "--verify"]);
+    let out = stdout(&verify);
+    assert_eq!(verify.status.code(), Some(1), "{}", text(&verify));
+    for member in ["feat/alpha", "feat/beta"] {
+        assert!(out.contains(&missing_row(&label(&lab, member))), "{out}");
+    }
+    assert!(
+        out.contains("has one parent; --verify reads the members of the merge below it"),
+        "{out}"
+    );
 }
 
 /// A knives cut, [`CUT`], of `members`, each `(branch, file, content)` a
@@ -2690,6 +2704,35 @@ fn census_lab() -> (Lab, tempfile::TempDir) {
     lab.jj_work(["bookmark", "forget", "history/alpha-release"]);
     lab.branch("feat/beta", "beta.txt", "beta\n");
     (lab, home)
+}
+
+#[test]
+fn census_answers_every_row_when_one_members_base_cannot_be_read() {
+    // Given: `feat/alpha`, cut into the release, and `feat/beta`, two
+    // commits, whose first commit's object is then removed from the store,
+    // so the line `feat/beta` was built on cannot be read.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    extend_branch(&lab, "feat/beta", "beta-more.txt", "more\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let first = lab.revision(lab.work_path(), "feat/beta-", "commit_id");
+    let git_dir = lab.jj_work_output(["git", "root"]);
+    let (prefix, rest) = first.trim().split_at(2);
+    let object = std::path::Path::new(git_dir.trim())
+        .join("objects")
+        .join(prefix)
+        .join(rest);
+    std::fs::remove_file(&object).expect("remove the loose object of feat/beta's first commit");
+
+    // When: the census checks every maintained branch.
+    let out = census(&lab, &home);
+
+    // Then: it answers `feat/alpha`'s row; `feat/beta`'s trouble is its own.
+    assert!(
+        census_block(&out, "feat/alpha").contains("carried-exact"),
+        "{out}"
+    );
 }
 
 #[test]
