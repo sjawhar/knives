@@ -66,6 +66,10 @@ const CONFLICT_IN_RELEASE: &str = "in the release";
 /// The text of a [`LostKind::File`] entry for a file that is not text.
 const BINARY_FILE: &str = "a binary file";
 
+/// The text of a [`LostKind::File`] entry for a text file of the member's
+/// that the release holds as a file that is not text.
+const TEXT_FILE: &str = "a text file";
+
 /// The text of a [`LostKind::File`] entry for a file that the member added
 /// with no non-blank line.
 const EMPTY_FILE: &str = "an empty file";
@@ -266,12 +270,13 @@ impl MemberLines {
     ///   it holds the tip's value there.
     /// - A file: where the member changes its executable bit, or adds the
     ///   file, a release that holds a file there must give it the tip's bit.
-    ///   A file that is not text, whose first
-    ///   8000 bytes hold a NUL byte, is read whole: where the member changed
-    ///   its content, the release's file must hold the tip's. A text file
-    ///   that the member adds with no non-blank line is carried where the
-    ///   release holds a file at that path. Every other text file is read
-    ///   line by line; a version that holds no file there reads as empty.
+    ///   A file that is not text, whose first 8000 bytes hold a NUL byte, is
+    ///   read whole: where the member changed its content, the release's
+    ///   file must hold the tip's. A text file that the member adds with no
+    ///   non-blank line is carried where the release holds a file at that
+    ///   path. A text file that the release holds as a file that is not text
+    ///   is lost whole. Every other text file is read line by line; a
+    ///   version that holds no file there reads as empty.
     pub fn read_path(&mut self, values: &PathValues) {
         let path = values.path.as_str();
         if values.tip == Value::Conflict {
@@ -429,11 +434,22 @@ impl Out<'_> {
                     });
                 }
             }
-            ContentChange::Text(fork_text) => {
-                let empty: &[u8] = &[];
-                let held = release.map_or(empty, |(_, held)| held);
-                TextPath::new(path, fork_text, content, held).read(self);
-            }
+            ContentChange::Text(fork_text) => match release {
+                // A file that is not text holds none of the lines of the
+                // member's text file, and its bytes are no reading of them:
+                // the whole file differs.
+                Some((_, held)) if is_binary(held) => {
+                    let made = TEXT_FILE.to_owned();
+                    self.lost(entry(path, LostKind::File, None, Some(made)), || {
+                        Place::Path
+                    });
+                }
+                _ => {
+                    let empty: &[u8] = &[];
+                    let held = release.map_or(empty, |(_, held)| held);
+                    TextPath::new(path, fork_text, content, held).read(self);
+                }
+            },
         }
     }
 }
@@ -1508,6 +1524,19 @@ mod tests {
         // its missing bit adds nothing
         assert_eq!(kept.reading, Reading::Carried);
         assert_eq!(lost(&absent), [(LostKind::Added, Some(1), Some("x"))]);
+    }
+
+    #[test]
+    fn a_text_file_the_release_holds_as_a_binary_file_is_lost_whole() {
+        // Given: a member that adds a text file, and one that changes one,
+        // and releases that hold each with the member's lines and a NUL byte
+        let added = read("f.txt", Value::Absent, file("a\nc\n"), file("a\nc\n\0\n"));
+        let changed = read("f.txt", file("a\nb\n"), file("a\nc\n"), file("a\nc\n\0\n"));
+        // Then: each file is lost whole, and named as text
+        for lines in [added, changed] {
+            assert_eq!(lines.reading, Reading::Missing);
+            assert_eq!(lost(&lines), [(LostKind::File, None, Some("a text file"))]);
+        }
     }
 
     #[test]
