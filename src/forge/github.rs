@@ -2951,6 +2951,67 @@ exit 1
     }
 
     #[test]
+    fn a_row_only_an_author_search_finds_gets_its_head_owner_from_a_call_of_its_own() {
+        // The pages cover the window the wide list reaches, but an author
+        // search reaches past it: #900 is on no page, so only a call for #900
+        // answers its owner. The forge refuses GraphQL's head owner, as an
+        // organisation closed to classic tokens does, so nothing else can.
+        let _environment = environment_lock();
+        let environment = EnvironmentGuard::capture(&["PATH"]);
+        let gh = tempfile::tempdir().expect("fake gh directory");
+        install_fake_gh(
+            &environment,
+            gh.path(),
+            r#"#!/bin/sh
+echo "$*" >> "$(dirname "$0")/calls.log"
+case " $* " in
+  *" pr list "*)
+    case "$*" in
+      *headRepositoryOwner*)
+        echo 'GraphQL: closed-org forbids access via a personal access token (classic).' >&2
+        exit 1 ;;
+      *"author:me"*) echo '[{"number":900,"state":"OPEN","headRefName":"feat/old","headRefOid":"bb","updatedAt":"2026-01-01T00:00:00Z","url":"u900","baseRefName":"main"}]' ;;
+      *) echo '[{"number":7,"state":"OPEN","headRefName":"main","headRefOid":"aa","updatedAt":"2026-08-01T00:00:00Z","url":"u7","baseRefName":"main"},{"number":8,"state":"OPEN","headRefName":"feat/a","headRefOid":"ab","updatedAt":"2026-08-01T00:00:00Z","url":"u8","baseRefName":"main"}]' ;;
+    esac ;;
+  *" api "*)
+    case "$2" in
+      *"/pulls?"*"&page=1") echo '[{"number":7,"head":{"ref":"main","repo":{"owner":{"login":"closed-org"}}}},{"number":8,"head":{"ref":"feat/a","repo":{"owner":{"login":"me"}}}}]' ;;
+      *"/pulls?"*) echo '[]' ;;
+      *"/pulls/900") echo '{"number":900,"head":{"ref":"feat/old","repo":{"owner":{"login":"me"}}}}' ;;
+      *) printf '%s' '{"message":"Not Found","status":"404"}'; echo 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
+    esac ;;
+  *) echo "unexpected gh $*" >&2; exit 1 ;;
+esac
+"#,
+        );
+        let target = RepoIdentity {
+            name_with_owner: "up-org/up".to_owned(),
+            id: "R_up".to_owned(),
+        };
+
+        let rows = CliForge
+            .list_pull_requests(gh.path(), &target, &["me".to_owned()])
+            .expect("the list reads past the refused field");
+
+        let owner = |number: u64| {
+            rows.iter()
+                .find(|row| row.number == number)
+                .and_then(|row| row.head_repository_owner.as_ref())
+                .map(|account| account.login.as_str())
+        };
+        assert_eq!(rows.len(), 3);
+        assert_eq!(owner(7), Some("closed-org"));
+        assert_eq!(owner(8), Some("me"));
+        assert_eq!(owner(900), Some("me"), "the call for the row no page holds");
+        // One call for #900, and none for a row a page answered.
+        let calls = fs::read_to_string(gh.path().join("calls.log")).expect("read the calls");
+        let asked = |path: &str| calls.lines().filter(|line| *line == path).count();
+        assert_eq!(asked("api repos/up-org/up/pulls/900"), 1, "{calls}");
+        assert_eq!(asked("api repos/up-org/up/pulls/7"), 0, "{calls}");
+        assert_eq!(asked("api repos/up-org/up/pulls/8"), 0, "{calls}");
+    }
+
+    #[test]
     fn only_the_forges_404_means_no_such_pull_request() {
         // Everything else is the call's own failure: tolerating a 401 would
         // read "this token cannot see the repository" as "no such number",
