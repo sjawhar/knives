@@ -12,7 +12,7 @@
 
 use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Install a fake `gh` that answers the full snapshot protocol: repository
 /// identity, cold list, warm sweep, and by-number facts.
@@ -93,6 +93,9 @@ fn install_snapshot_gh_configured(shim: &Path, pulls: &str, options: SnapshotGhO
     let sweep = shim.join("sweep.json");
     let facts_payload = shim.join("facts.json");
     let timeline_payload = shim.join("timeline.json");
+    // The head owner is read over REST, one page of the list and one call per
+    // number the page missed (src/forge/github.rs).
+    let (rest_page, rest_pulls) = write_rest_payloads(shim, &pulls);
     // gh exits 1 whenever the reply names errors, after printing it.
     let facts_answer = if facts_reply.get("errors").is_none() {
         format!("cat \"{}\"", facts_payload.display())
@@ -140,26 +143,113 @@ fn install_snapshot_gh_configured(shim: &Path, pulls: &str, options: SnapshotGhO
     let gh = shim.join("gh");
     install_executable(
         &gh,
-        &format!(
-            "#!/bin/sh\ncase \" $* \" in\n\
-             *\" repo view \"*) cat \"{}\" ;;\n\
-             *\" pr list \"*) cat \"{}\" ;;\n\
-             *\" api graphql \"*)\n\
-               case \"$*\" in\n\
-                 *\"timelineItems\"*) cat \"{}\" ;;\n\
-                 *\"pullRequest(number:\"*) {} ;;\n\
-                 *\"orderBy: {{field: UPDATED_AT\"*) cat \"{}\" ;;\n\
-                 *) echo \"unexpected GraphQL invocation: $*\" >&2; exit 1 ;;\n\
-               esac ;;\n\
-             *) echo \"unexpected gh invocation: $*\" >&2; exit 1 ;;\n\
-             esac\n",
-            identity.display(),
-            list.display(),
-            timeline_payload.display(),
-            facts_answer,
-            sweep.display(),
-        ),
+        &snapshot_gh_script(&ShimAnswers {
+            identity: &identity,
+            list: &list,
+            timeline: &timeline_payload,
+            facts: &facts_answer,
+            sweep: &sweep,
+            rest_page: &rest_page,
+            rest_pulls: &rest_pulls,
+        }),
     );
+}
+
+/// Where the fake gh reads each answer from; `facts` is a shell fragment,
+/// since a facts reply naming errors also writes stderr and exits 1.
+struct ShimAnswers<'a> {
+    identity: &'a Path,
+    list: &'a Path,
+    timeline: &'a Path,
+    facts: &'a str,
+    sweep: &'a Path,
+    rest_page: &'a Path,
+    rest_pulls: &'a Path,
+}
+
+/// The fake gh itself: the snapshot protocol over GraphQL, and the head-owner
+/// read over REST — one page of the list, one call per number, 404 for a
+/// number this forge does not have.
+fn snapshot_gh_script(answers: &ShimAnswers<'_>) -> String {
+    format!(
+        "#!/bin/sh\ncase \" $* \" in\n\
+         *\" repo view \"*) cat \"{}\" ;;\n\
+         *\" pr list \"*) cat \"{}\" ;;\n\
+         *\" api graphql \"*)\n\
+           case \"$*\" in\n\
+             *\"timelineItems\"*) cat \"{}\" ;;\n\
+             *\"pullRequest(number:\"*) {} ;;\n\
+             *\"orderBy: {{field: UPDATED_AT\"*) cat \"{}\" ;;\n\
+             *) echo \"unexpected GraphQL invocation: $*\" >&2; exit 1 ;;\n\
+           esac ;;\n\
+         *\" api \"*)\n\
+           case \"$2\" in\n\
+             *\"/pulls?\"*)\n\
+               case \"$2\" in\n\
+                 *\"&page=1\"*) cat \"{}\" ;;\n\
+                 *) echo '[]' ;;\n\
+               esac ;;\n\
+             *\"/pulls/\"*)\n\
+               number=\"${{2##*/}}\"\n\
+               if [ -f \"{}/$number.json\" ]; then\n\
+                 cat \"{}/$number.json\"\n\
+               else\n\
+                 printf '%s' '{{\"message\":\"Not Found\",\"status\":\"404\"}}'\n\
+                 echo 'gh: Not Found (HTTP 404)' >&2\n\
+                 exit 1\n\
+               fi ;;\n\
+             *) echo \"unexpected gh api invocation: $*\" >&2; exit 1 ;;\n\
+           esac ;;\n\
+         *) echo \"unexpected gh invocation: $*\" >&2; exit 1 ;;\n\
+         esac\n",
+        answers.identity.display(),
+        answers.list.display(),
+        answers.timeline.display(),
+        answers.facts,
+        answers.sweep.display(),
+        answers.rest_page.display(),
+        answers.rest_pulls.display(),
+        answers.rest_pulls.display(),
+    )
+}
+
+/// Write what the REST head-owner read asks for: one page of the list, and
+/// one file per pull request. Returns the page and the directory.
+fn write_rest_payloads(shim: &Path, pulls: &[serde_json::Value]) -> (PathBuf, PathBuf) {
+    let page = shim.join("rest-page.json");
+    let directory = shim.join("rest");
+    std::fs::create_dir_all(&directory).expect("create REST pull directory");
+    let rows = pulls.iter().map(rest_row).collect::<Vec<_>>();
+    for row in &rows {
+        let number = row["number"].as_u64().expect("pull request number");
+        std::fs::write(
+            directory.join(format!("{number}.json")),
+            serde_json::to_vec(row).expect("serialize REST pull request"),
+        )
+        .expect("write REST pull request");
+    }
+    std::fs::write(
+        &page,
+        serde_json::to_vec(&rows).expect("serialize REST page"),
+    )
+    .expect("write REST page");
+    (page, directory)
+}
+
+/// The REST shape of one pull request, read for its head owner alone: a row
+/// stating no owner has no head repository, as a deleted one does.
+fn rest_row(pull: &serde_json::Value) -> serde_json::Value {
+    let owner = pull
+        .get("headRepositoryOwner")
+        .and_then(|owner| owner.get("login"))
+        .cloned();
+    serde_json::json!({
+        "number": pull.get("number"),
+        "head": {
+            "ref": pull.get("headRefName"),
+            "repo": owner.map(|login| serde_json::json!({"owner": {"login": login}})),
+        },
+    })
 }
 
 /// The by-number facts reply: one row per pull not withheld, each refused head
@@ -306,12 +396,16 @@ pub struct Repository<'a> {
 /// (`api graphql -f owner=… -f name=…`) the pull requests it asks about of
 /// the repository its `owner` and `name` fields name, a number that
 /// repository does not have, or the query does not ask about, being absent
-/// from the reply. A status snapshot's warm sweep finds nothing. A call
-/// naming any other repository fails as gh does for one that does not
-/// exist, or that the token cannot see, but a list of one is empty. A pull
-/// request row may repeat a field to replace [`pull_record_with_fields`]'s
-/// default: the last one is kept. Each call's arguments are appended to
-/// `log`.
+/// from the reply. The head owner is read over REST, as src/forge/github.rs
+/// reads it: `api repos/<owner>/<name>/pulls?…&page=1` gives every pull
+/// request's head owner, a later page is empty, and `api
+/// repos/<owner>/<name>/pulls/<n>` gives one, or the forge's 404 for a
+/// number that repository does not have. A status snapshot's warm sweep
+/// finds nothing. A call naming any other repository fails as gh does for
+/// one that does not exist, or that the token cannot see, but a list of one,
+/// GraphQL or REST, is empty. A pull request row may repeat a field to
+/// replace [`pull_record_with_fields`]'s default: the last one is kept. Each
+/// call's arguments are appended to `log`.
 pub fn install_repository_gh(shim: &Path, repositories: &[Repository<'_>], log: &Path) {
     install_repository_gh_failing(shim, repositories, &[], log);
 }
@@ -325,24 +419,13 @@ pub fn install_repository_gh_failing(
     failing: &[&str],
     log: &Path,
 ) {
-    let sweep = json_file(
-        shim,
-        "sweep.json",
-        &serde_json::json!({
-            "data": {
-                "repository": {
-                    "pullRequests": {
-                        "pageInfo": {"hasNextPage": false},
-                        "nodes": [],
-                    }
-                }
-            }
-        }),
-    );
+    let sweep = empty_sweep(shim);
     let mut views = String::new();
     let mut lists = String::new();
     let mut facts = String::new();
+    let mut rest = String::new();
     let outage = "echo \"HTTP 502: Bad Gateway (https://api.github.com/graphql)\" >&2; exit 1 ;;";
+    let rest_outage = "echo \"HTTP 502: Bad Gateway (https://api.github.com/$2)\" >&2; exit 1 ;;";
     for repository in failing {
         let repository = repository.to_ascii_lowercase();
         let (owner, name) = repository
@@ -351,6 +434,7 @@ pub fn install_repository_gh_failing(
         writeln!(views, "  {repository}) {outage}").expect("write to a string");
         writeln!(lists, "  {repository}) {outage}").expect("write to a string");
         writeln!(facts, "  \"{owner} {name}\") {outage}").expect("write to a string");
+        writeln!(rest, "  \"{owner} {name}\") {rest_outage}").expect("write to a string");
     }
     for (index, repository) in repositories.iter().enumerate() {
         let named = repository.named.to_ascii_lowercase();
@@ -371,6 +455,7 @@ pub fn install_repository_gh_failing(
         cat_arm(&mut lists, &named, &list);
         cat_arm(&mut views, &named, &identity);
         facts.push_str(&facts_arm(shim, (owner, name), &pulls, &sweep));
+        rest.push_str(&rest_arm(shim, (owner, name), &pulls));
     }
     install_executable(
         &shim.join("gh"),
@@ -405,12 +490,71 @@ pub fn install_repository_gh_failing(
                esac\n\
                echo \"GraphQL: Could not resolve to a Repository with the name '$owner/$name'.\" >&2\n\
                exit 1 ;;\n\
+             \"api repos/\"*)\n\
+               path=${{2#repos/}}\n\
+               rest_owner=${{path%%/*}}\n\
+               path=${{path#*/}}\n\
+               rest_name=${{path%%/*}}\n\
+               path=${{path#*/}}\n\
+               case \"$(printf '%s %s' \"$rest_owner\" \"$rest_name\" | tr 'A-Z' 'a-z')\" in\n\
+             {rest}\
+               esac\n\
+               case \"$path\" in \"pulls?\"*) echo '[]'; exit 0 ;; esac\n\
+               printf '%s' '{{\"message\":\"Not Found\",\"status\":\"404\"}}'\n\
+               echo 'gh: Not Found (HTTP 404)' >&2\n\
+               exit 1 ;;\n\
              esac\n\
              echo \"unexpected gh invocation: $*\" >&2\n\
              exit 1\n",
             log = log.display(),
         ),
     );
+}
+
+/// A status snapshot's warm sweep that finds nothing, written to `shim`; its
+/// path.
+fn empty_sweep(shim: &Path) -> PathBuf {
+    json_file(
+        shim,
+        "sweep.json",
+        &serde_json::json!({
+            "data": {
+                "repository": {
+                    "pullRequests": {
+                        "pageInfo": {"hasNextPage": false},
+                        "nodes": [],
+                    }
+                }
+            }
+        }),
+    )
+}
+
+/// The `case` arm that answers the REST head-owner read on `owner`/`name`,
+/// whose pull requests are `pulls`: page 1 of the list holds every one of
+/// them, a later page is empty, and one pull request is its own file; a
+/// number with no file falls through to the forge's 404. A reinstall can
+/// hide a repository or change its pull requests, so the files are kept by
+/// the repository's name, and cleared first.
+fn rest_arm(shim: &Path, (owner, name): (&str, &str), pulls: &[serde_json::Value]) -> String {
+    let dir = shim.join(format!("rest-{owner}-{name}"));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("clear the REST directory");
+    }
+    std::fs::create_dir_all(&dir).expect("create the REST directory");
+    let (page, each) = write_rest_payloads(&dir, pulls);
+    format!(
+        "  \"{owner} {name}\")\n\
+         \x20   case \"$path\" in\n\
+         \x20   \"pulls?\"*\"&page=1\") cat \"{page}\"; exit 0 ;;\n\
+         \x20   \"pulls?\"*) echo '[]'; exit 0 ;;\n\
+         \x20   \"pulls/\"*)\n\
+         \x20     number=${{path#pulls/}}\n\
+         \x20     if [ -f \"{each}/$number.json\" ]; then cat \"{each}/$number.json\"; exit 0; fi ;;\n\
+         \x20   esac ;;\n",
+        page = page.display(),
+        each = each.display(),
+    )
 }
 
 /// The `case` arm that answers a by-number facts query on `owner`/`name`,

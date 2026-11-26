@@ -652,3 +652,76 @@ fn an_empty_subject_is_usage_and_does_not_write_a_nameless_entry() {
     let parsed: serde_json::Value = serde_json::from_slice(&ledger.stdout).expect("JSON");
     assert_eq!(parsed["matched"], 0);
 }
+
+#[test]
+fn an_empty_message_is_usage_and_does_not_write_a_note_with_no_text() {
+    // Given: a repo whose ledger holds nothing yet.
+    let checkout = checkout();
+    let home = home();
+    let note = |message: &str| {
+        knives(
+            &home,
+            &checkout,
+            checkout.path(),
+            &[
+                "--text",
+                "notch",
+                "feat/log-queue",
+                "--evidence",
+                "06d778b9",
+                "-m",
+                message,
+                "--repo",
+                "a-repo",
+            ],
+        )
+    };
+    let matched = || {
+        let ledger = knives(
+            &home,
+            &checkout,
+            checkout.path(),
+            &["--json", "notch", "--repo", "a-repo"],
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&ledger.stdout).expect("JSON");
+        parsed["matched"].clone()
+    };
+
+    for blank in ["", "   ", "\n"] {
+        // When: a note is written with evidence and a message that is empty
+        // or only whitespace, as `-m "$(cat file)"` passes after a `cat`
+        // that failed.
+        let output = note(blank);
+
+        // Then: a usage error that names the flag, and no note is written:
+        // its evidence and anchor would say what it is about, and nothing
+        // would say what happened.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{blank:?}: {stderr}");
+        assert!(
+            stderr.contains("--message")
+                && stderr.contains("a note must hold text, not be empty or only whitespace"),
+            "{blank:?}: {stderr}"
+        );
+        assert_eq!(matched(), 0, "{blank:?}");
+    }
+
+    // When (control): the same command with text.
+    let output = note("pushed round 6");
+
+    // Then: the note is written with that text.
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(matched(), 1);
+    let shown = stdout(&knives(
+        &home,
+        &checkout,
+        checkout.path(),
+        &["--text", "notch", "--repo", "a-repo"],
+    ));
+    assert!(shown.contains("pushed round 6"), "was: {shown}");
+}
