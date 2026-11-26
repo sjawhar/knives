@@ -90,7 +90,7 @@ jobs:
           # The tarball stores its entries under ./, so name the member explicitly.
           sudo tar xzf "$archive" -C /usr/local/bin ./jj
           jj --version
-      - run: cargo nextest run --all-targets --all-features --workspace
+      - run: cargo nextest run --all-features --workspace --lib --no-fail-fast -E 'test(a_row_only_an_author_search_finds_gets_its_head_owner_from_a_call_of_its_own) | test(one_pull_request_answers_its_own_head_owner)'
 
   opencode-plugin:
     runs-on: ubuntu-latest

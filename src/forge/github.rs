@@ -531,7 +531,8 @@ impl Forge for CliForge {
             &owners,
             pull_requests.iter().map(|pull_request| pull_request.number),
         );
-        owners.extend(Self::head_owners_each(repo, repository, &missing)?);
+        // CONTROL ONLY, never merged: plant A, the per-number top-up removed.
+        let _ = (&missing, &mut owners);
         for pull_request in &mut pull_requests {
             pull_request.head_repository_owner = owners
                 .get(&pull_request.number)
