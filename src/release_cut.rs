@@ -1440,9 +1440,9 @@ fn report_cut_audit(
     // Each name is a member's bookmark, read from the repository.
     for name in &audit.inconclusive {
         println!(
-            "  {}: content check inconclusive (an unresolved conflict; re-check after resolving \
-             it)",
-            inline_human_text(name)
+            "  {}: content check inconclusive ({})",
+            inline_human_text(name),
+            release::INCONCLUSIVE_WHY
         );
         for line in audit.lost_lines_of(name) {
             println!("{line}");
@@ -1965,10 +1965,10 @@ fn uncarried_cut_lines(
     for member in &check.inconclusive {
         let holder = held.holder(&member.commit);
         lines.push(format!(
-            "  {}: recorded by the {}; carry check inconclusive (an unresolved conflict; \
-             re-check after resolving it)",
+            "  {}: recorded by the {}; carry check inconclusive ({})",
             inline_human_text(&member.name),
-            holder.title(&inline_human_text(&holder.recorded().name))
+            holder.title(&inline_human_text(&holder.recorded().name)),
+            release::INCONCLUSIVE_WHY
         ));
         lines.extend(check.lost_lines_of(&member.commit));
     }

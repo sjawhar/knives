@@ -2563,8 +2563,7 @@ pub fn render_members(report: &MembersReport) -> String {
         }
         for name in &audit.inconclusive {
             lines.push(format!(
-                "  {}: content check inconclusive (an unresolved conflict; re-check after \
-                 resolving it)",
+                "  {}: content check inconclusive ({INCONCLUSIVE_WHY})",
                 inline_human_text(name)
             ));
             lines.extend(audit.lost_lines_of(name));
@@ -3660,11 +3659,12 @@ pub fn audit_cut(
         // A line the release held against already lacked is that release's
         // resolution, carried forward, not a loss: refusing it would make
         // every release with a hand-resolved conflict fail its own re-cut
-        // forever. Whether that resolution is recorded is the caller's
-        // question, not this audit's: a hand edit nothing recorded may have
-        // dropped a member's line, so it is `knives release adopt` that
-        // measures it before a cut.
-        if lines.reading == Reading::Missing
+        // forever. The same holds for a file a member adds that a resolution
+        // changed, which reads inconclusive. Whether that resolution is
+        // recorded is the caller's question, not this audit's: a hand edit
+        // nothing recorded may have dropped a member's line, so it is
+        // `knives release adopt` that measures it before a cut.
+        if matches!(lines.reading, Reading::Missing | Reading::Inconclusive)
             && let Some(previous) = context.previous
             && context
                 .forward_members
@@ -3711,6 +3711,12 @@ pub fn audit_cut(
 /// member's row ([`lost_lines`]).
 pub const LOST_LINE_INDENT: &str = "      ";
 
+/// Why a member's content check is inconclusive, as each row that names one
+/// says: a path of its change the reading cannot read, named on the line
+/// below the row.
+pub const INCONCLUSIVE_WHY: &str = "an unresolved conflict, or a file it adds that the release \
+                                    changed; read the path named below, then re-check";
+
 /// The lines that name what one member's reading against a release lacks,
 /// each after `indent`.
 ///
@@ -3719,11 +3725,11 @@ pub const LOST_LINE_INDENT: &str = "      ";
 ///
 /// There is one line for each lost entry that the release before did not
 /// lack too, in the reading's order. A line that the member added and the
-/// release does not hold, a hunk the member removed that the release holds
-/// again, a path read whole, an executable bit and a path the reading cannot
-/// read for its unresolved conflict are each named with their path; the
-/// lines of a range that the word step did not follow are named once, by
-/// the range.
+/// release does not hold, a line the member removed that the release holds
+/// again, a path read whole, an executable bit, a path the reading cannot
+/// read for its unresolved conflict, and a file the member adds that the
+/// release changed are each named with their path; the lines of a range that
+/// the word step did not follow are named once, by the range.
 ///
 /// This is the one renderer of a member's lacking lines, which `members
 /// --verify`, the audit of a cut and the composition gate print under the
@@ -3752,6 +3758,10 @@ pub fn lost_lines(
             LostKind::File => format!("{path}: file differs from the member's ({text})"),
             LostKind::Mode => format!("{path}: mode differs from the member's ({text})"),
             LostKind::Conflict => format!("{path}: unresolved conflict {text}"),
+            LostKind::AddedFileChanged => format!(
+                "{path}: the member adds this file, and the release changed it; read the \
+                 change (a line the member's history removed may be back)"
+            ),
             LostKind::WordLimit => {
                 let skipped = word_step_skipped.iter().enumerate().find(|(_, range)| {
                     range.path == lost.path

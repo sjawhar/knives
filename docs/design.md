@@ -657,7 +657,19 @@ release log follows its own clause (under "Expect real
 conflicts" below). A path that is not text (a NUL byte in its first 8000 bytes, a symlink or a
 submodule) is carried where the release holds the tip's value there, a deletion where the release
 holds nothing there, an added text file with no non-blank line where the release holds a file
-there, and a changed executable bit where the release's file has the tip's bit. An edit of another
+there, and the executable bit of a file that the member adds, or whose bit it changes, where the
+release's file has the tip's bit. A text file of the member's that the release holds as a file that
+is not text is lost whole (`a text file`): its bytes are no reading of the member's lines. A file
+that the member adds is its change whole: where the release holds another version of it, blank
+lines aside, and the reading lost nothing of it, the path cannot be read
+(`LostKind::AddedFileChanged`), as a conflict cannot. The member's change from the trunk holds
+such a file whole, so it cannot show a line that the member's own history removed (a member stacked
+on a branch that adds the file, or one that merged such a branch in); rather than walk that
+history, the rule leaves the file to a person, and an innocent edit of it by another change, or a
+hand resolution of it, needs that look too. A cut's audit carries such an entry forward where the
+release before it held the same change (`release::audit_cut`), as it carries a lost line, so a
+resolution does not fail its own re-cut forever. Spec R11's placement reads the same rule. An edit
+of another
 change next to the member's lines, in the same merge hunk or on the same line, that keeps the
 member's own words makes no member read missing, unless it puts back what the member removed. A
 path where the release, or the member's tip, holds an unresolved conflict cannot be read. There
@@ -699,13 +711,10 @@ of the tip's change onto the release conflicts there though nothing of the tip i
 member's deletion beside another member's rewrite of the line before it, or several members'
 entries at one place that a resolution kept side by side), so a replay decides no tip that the
 release reaches. What the own-lines rule does not read it does not read for either command, so
-both read as carried: blank lines that the release dropped; the executable bit of a file that the
-member's change adds, which has no bit of its fork point's to change; a removed hunk that the
-release writes back edited; lines of punctuation alone of a removed hunk that the release puts
-back while other lines of the hunk stay removed (`own_lines` reads such a line as lost only with
-its whole hunk); and a line deleted from a file that the member's own change adds whole, as for a member
-stacked on a branch that adds the file, since the deletion is no hunk of its change from the
-trunk. A `knives depends` record of the branch it was built on is named in a note and never
+both read as carried: blank lines that the release dropped; a removed hunk that the release
+writes back edited; and lines of punctuation alone of a removed hunk that the release puts back
+while other lines of the hunk stay removed (`own_lines` reads such a line as lost only with its
+whole hunk). A `knives depends` record of the branch it was built on is named in a note and never
 decides the verdict. A tip the target does not reach is replayed onto it, from their common
 ancestor against the trunk (`Repo::tree_replay_outcome`) and from its base against a release
 (`Repo::base_replay_outcome`): an empty replay is carried-rewritten, and otherwise a standing

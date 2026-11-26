@@ -1935,17 +1935,16 @@ fn an_include_that_puts_back_a_removal_from_an_added_files_history_is_refused() 
     // When: `feat/del` is included.
     let output = knives_release(&lab, &home, &["include", "feat/del"]);
 
-    // Then: the edit's check reads the history of the file `feat/del` adds,
-    // refuses (exit 3), writes nothing, and names `b` with its source commit.
+    // Then: `feat/del`'s change adds `f.txt` as `a`, `c`, which the
+    // candidate holds another version of, as the plain merge of the new
+    // parents does not: the edit's check refuses (exit 3), writes nothing,
+    // and names the file.
     let out = text(&output);
     assert_eq!(output.status.code(), Some(3), "{out}");
     before.assert_kept(&lab, &home, &out);
     assert!(out.contains(&refusal_line("f.txt", "feat/del")), "{out}");
     assert!(
-        out.contains(&format!(
-            "      f.txt:2: removed line put back ‹b› (from {})\n",
-            base.short()
-        )),
+        out.contains("      f.txt: the member adds this file, and the release changed it"),
         "{out}"
     );
     assert!(out.contains(&remedy_line()), "{out}");

@@ -489,10 +489,12 @@ addition of the new one. The release carries the member when all of these hold:
   it. A line that the member changed only in whitespace is held only where the line diff keeps it
   byte for byte.
 * A text file that the member adds with no non-blank line is held where the release has a file at
-  that path. A file that the member deletes is held where the release has no file there. A change
-  of the executable bit is held where the release's file has the tip's bit.
+  that path. A file that the member deletes is held where the release has no file there. The
+  executable bit of a file that the member adds, or whose bit it changes, is held where the
+  release's file has the tip's bit.
 * A path that is not text (a binary file, a symlink or a submodule) is held where the release holds
-  there what the member's tip holds.
+  there what the member's tip holds. A text file that the release holds as a binary file is lost
+  whole.
 * A line that the member added to a `CHANGELOG.md` or `RELEASE_NOTES.md` is also held by the
   release-log rule (above).
 
@@ -509,14 +511,21 @@ member's own. Such a line does not make the member read missing and changes no e
 Each command names these lines in its text. `members --verify` also names them in its JSON
 report.
 
-A path where the release, or the member's tip, holds an unresolved conflict cannot be read. A
-member with such a path reads inconclusive, where the member lacks nothing else. A member with
-such a path and a lost line elsewhere reads missing. A conflict in another path of the release
-does not change the reading.
+A path where the release, or the member's tip, holds an unresolved conflict cannot be read. Nor can
+a file that the member adds, where the release holds another version of it, blank lines aside, and
+the reading lost no line of it: the member's change from the trunk holds the file whole, so it
+cannot show a line that the member's own history removed from it, as for a member stacked on a
+branch that adds the file. A person reads such a file; an edit of it by another change, or a hand
+resolution of it, needs that look too. A cut's audit carries such a file forward where the release
+before it held the same change. A member with
+such a path reads inconclusive, where the member lacks nothing else. A member with such a path and
+a lost line elsewhere reads missing. A conflict in another path of the release does not change the
+reading.
 
 `--verify` prints one row for each member: `<member>: carried (replay empty)` for a member that
-the release carries, `<member>: content check inconclusive (an unresolved conflict; re-check after
-resolving it)` for an inconclusive one, and `!! <member>: the cut tree is missing or diverges from
+the release carries, `<member>: content check inconclusive (an unresolved conflict, or a file it
+adds that the release changed; read the path named below, then re-check)` for an inconclusive one,
+and `!! <member>: the cut tree is missing or diverges from
 the member's content` for a missing one, with each line that it lacks below the row. A missing
 member is a finding (exit `1`). With `--json`, `audit.members` holds each member's reading:
 `reading`, `lost`, `held_by_words` and `word_step_skipped`.
@@ -538,11 +547,9 @@ words, is a changed line: `--verify` reads the member carried (exit `0`) and nam
 release or at the tip, reads inconclusive in `--verify`, which exits `0` where the member lacks
 nothing else, and `merged-then-edited` in `--carries`. `--carries` and `--census` name no line;
 `--verify` does. What the own-lines reading does not read, it does not read for `--carries`
-either, so both read these as carried: blank lines that the release dropped; the executable bit
-of a file that the member's change adds; a removed hunk that the release writes back edited, or
-of which it puts back only lines of punctuation alone (`}`, `},`) while other lines of the hunk stay
-removed; and a line deleted from a file that the member's own change adds whole, as for a member
-stacked on a branch that adds the file.
+either, so both read these as carried: blank lines that the release dropped; and a removed hunk
+that the release writes back edited, or of which it puts back only lines of punctuation alone
+(`}`, `},`) while other lines of the hunk stay removed.
 
 A tip that the target does not reach is read by a replay of its change instead. Against either
 target it is `carried-rewritten` when its net change replays empty, else `carried-rebased` when a
