@@ -4,6 +4,7 @@ Read this when you read `knives status [REPO|--all]` rows, states or columns. A 
 
 - One named repository gives an object; `--all` gives an array. A claim on a deleted branch still has a row.
 - `--no-landed` skips the trunk replay probe, the slow part. Under `--no-github`, an unknown PR state does not mean no PR.
+- `status` checks `stacked-history` (a merge in the branch's history past the trunk, such as a release cut) only on a branch with an open upstream PR; `knives preflight` checks every branch.
 
 ## State precedence
 
