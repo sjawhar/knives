@@ -1265,9 +1265,11 @@ impl UnpushedCut {
 }
 
 /// A fixed release branch cut by knives and pushed; then the branch composed
-/// by hand of the previous cut, `feat/alpha`, `feat/beta` and `feat/gamma`,
-/// and cut while it is not pushed, which writes a cut of the three members
-/// alone, as Cut8's dc16713e was written; then that cut abandoned, the
+/// by hand of the previous cut, `feat/alpha`, `feat/beta` and `feat/gamma`;
+/// then a cut of the three members alone, which the remote never held, as
+/// Cut8's dc16713e was. That cut is now made from a composition afresh of the
+/// three members: a cut of the composition on the previous cut now refuses
+/// before its push. Then that cut and the fresh composition abandoned, the
 /// bookmark back on the composition by hand, and that pushed. The ledger's
 /// newest write is the cut the remote never held.
 fn unpushed_cut_lab() -> UnpushedCut {
@@ -1284,6 +1286,7 @@ fn unpushed_cut_lab() -> UnpushedCut {
     let composed = compose_by_hand(&lab);
     // A bookmark keeps the composition out of the cut's orphan gate.
     lab.jj_work(["bookmark", "create", "keep", "-r", composed.as_str()]);
+    let fresh = compose_integration(&lab, &["feat/alpha", "feat/beta", "feat/gamma"]);
     let unpushed = knives_release(&lab, &home, &["cut"]);
     assert_ne!(
         unpushed.status.code(),
@@ -1306,6 +1309,8 @@ fn unpushed_cut_lab() -> UnpushedCut {
         "--allow-backwards",
     ]);
     lab.jj_work(["abandon", wrong.as_str()]);
+    let fresh_left = format!("{} & visible_heads()", fresh.as_str());
+    lab.jj_work(["abandon", fresh_left.as_str()]);
     let published = publish_integration(&lab);
     assert_eq!(published, composed);
     assert!(
@@ -2299,6 +2304,50 @@ fn a_fixed_cut_with_corrects_refuses_a_write_whose_rewrite_the_publish_remote_ho
     let before = ledger_len(&home);
 
     // When: the cut runs with --corrects naming the cut.
+    let corrected = knives_release(&lab, &home, &["cut", "--corrects", cut.as_str()]);
+
+    // Then: it is refused as published, and nothing is written.
+    let out = both_streams(&corrected);
+    assert_eq!(corrected.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains(&format!(
+            "demo: refusing to cut integration --corrects {}: integration@origin ({}) holds that \
+             write or a rewrite of it, so it was published; nothing was written",
+            cut.as_str(),
+            published.short()
+        )),
+        "{out}"
+    );
+    assert_eq!(ledger_len(&home), before, "{out}");
+}
+
+#[test]
+fn a_fixed_cut_with_corrects_refuses_a_write_whose_rewrite_a_later_published_commit_holds() {
+    // Given: a fixed release cut by knives and not pushed, reworded and
+    // pushed, then a later published commit made on that rewrite. The
+    // original cut is hidden, but the publish remote holds its rewrite in
+    // history.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let home = fixed_release_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both_streams(&first));
+    let cut = commit_at(&lab, "integration");
+    lab.jj_work([
+        "describe",
+        "-r",
+        "integration",
+        "-m",
+        "integration, reworded",
+    ]);
+    let rewrite = publish_integration(&lab);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    compose_integration(&lab, &[rewrite.as_str(), "feat/gamma"]);
+    let published = publish_integration(&lab);
+    assert!(!lab::is_visible(&lab, &cut), "fixture: the cut is hidden");
+    let before = ledger_len(&home);
+
+    // When: the cut runs with --corrects naming the hidden original cut.
     let corrected = knives_release(&lab, &home, &["cut", "--corrects", cut.as_str()]);
 
     // Then: it is refused as published, and nothing is written.

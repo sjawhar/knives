@@ -3877,6 +3877,12 @@ pub struct CompositionCheck {
     /// names under each member the subject lacks, and the lines it holds
     /// only by their words.
     pub members: Vec<MemberLines>,
+    /// The recorded members, none of them a parent of the subject nor
+    /// superseded, that the subject carries: by ancestry, through a rewrite
+    /// that stands for one, by a twin, or by their own lines. A record of a
+    /// published commit keeps each one in its event, so the next gate holds
+    /// the commit's successor to it too.
+    pub held: Vec<CommitId>,
 }
 
 impl CompositionCheck {
@@ -4460,6 +4466,7 @@ pub fn uncarried_recorded_members(
             continue;
         }
         if reaches_any(repo, member, delta)? {
+            check.held.push(member.clone());
             continue;
         }
         let rewrites = repo.standing_rewrites_of(member)?;
@@ -4471,12 +4478,14 @@ pub fn uncarried_recorded_members(
             }
         }
         if rewritten {
+            check.held.push(member.clone());
             continue;
         }
         if let Some(twin) = repo.same_tree_between(member, delta.base, delta.parents)? {
             check
                 .twins
                 .push((recorded_member_name(member, delta.tips), twin));
+            check.held.push(member.clone());
             continue;
         }
         if repo.is_ancestor(member, delta.trunk)? {
@@ -4507,7 +4516,7 @@ pub fn uncarried_recorded_members(
             )?);
         }
         match lines.reading {
-            Reading::Carried | Reading::CarriedForward => {}
+            Reading::Carried | Reading::CarriedForward => check.held.push(member.clone()),
             Reading::Inconclusive => check.inconclusive.push(recorded),
             Reading::Missing => check.dropped.push(recorded),
         }

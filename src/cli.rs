@@ -613,8 +613,9 @@ pub enum ReleaseAction {
     ///
     /// On a fixed release branch whose composition in hand is the publish
     /// remote's commit, the cut records that commit and never makes another;
-    /// `--at REV` records REV, a commit the publish remote's commit is or
-    /// holds, so that releases published one on the other are recorded in
+    /// one built on that commit and not pushed yet is refused: push it, then
+    /// cut. `--at REV` records REV, a commit the publish remote's commit is
+    /// or holds, so that releases published one on the other are recorded in
     /// order. A parent that is an earlier write of the branch the ledger
     /// records is a carrier, and every other parent a member. Where no
     /// parent is such a write and a parent holds one, the cut refuses and
@@ -623,9 +624,9 @@ pub enum ReleaseAction {
     /// is read against the recorded write the commit follows, never against
     /// the commit itself: a member whose line it lacks is refused, unless
     /// that write recorded the member and lacked the line too, or
-    /// `--allow-drop` names the member. The event keeps the followed write's
-    /// members that the commit holds through a carrier. Drift is measured
-    /// from the commit's carrier.
+    /// `--allow-drop` names the member. The event keeps each recorded member
+    /// the commit carries but does not merge. Drift is measured from the
+    /// commit's carrier.
     ///
     /// With `--at`, record a release cut outside knives instead: the commit
     /// REV becomes NAME's recorded cut, and no commit is made. NAME must sort

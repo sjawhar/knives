@@ -483,14 +483,19 @@ pub(crate) fn run_release(
         // commit is: a line of a member that write did not record, or did not
         // already lack, is missing. That reading never checks less than one
         // against the release in hand itself, which lacks every line it lacks.
-        let followed_in_hand = matches!(carried_from, release::CarriedFrom::Unchecked)
+        // Where this repository does not hold that write, nothing here answers
+        // for a line the release in hand lacks: nothing is carried forward,
+        // so a waiver of the absent write never waives a member's lost line.
+        let newest_elsewhere = matches!(carried_from, release::CarriedFrom::Unchecked)
             .then(|| {
-                gate.baseline.newest_write.as_ref().filter(|write| {
-                    previous_commit.as_ref() != Some(&write.commit)
-                        && opened.resolve_commit(write.commit.as_str()).is_ok()
-                })
+                gate.baseline
+                    .newest_write
+                    .as_ref()
+                    .filter(|write| previous_commit.as_ref() != Some(&write.commit))
             })
             .flatten();
+        let followed_in_hand =
+            newest_elsewhere.filter(|write| opened.resolve_commit(write.commit.as_str()).is_ok());
         let carried_from = if followed_in_hand.is_some() {
             release::CarriedFrom::NewestWrite
         } else {
@@ -500,7 +505,11 @@ pub(crate) fn run_release(
             previous: followed_in_hand
                 .map(|write| &write.commit)
                 .or(previous_commit.as_ref()),
-            forward_members: followed_in_hand.map(|write| write.members.as_slice()),
+            forward_members: match (followed_in_hand, newest_elsewhere) {
+                (Some(write), _) => Some(write.members.as_slice()),
+                (None, Some(_)) => Some(&[]),
+                (None, None) => None,
+            },
             upstream_trunk: &trunk,
             trunk_parents: &[],
             trunk_parent_base: None,
@@ -653,11 +662,8 @@ pub(crate) fn run_release(
                     return Ok(exit);
                 }
                 let (audit, check) = (&checked.audit, &checked.check);
-                let through_carriers = held_through_carriers(
-                    &opened,
-                    published,
-                    followed.map_or(&[][..], |write| write.members.as_slice()),
-                )?;
+                // Every recorded member the gate found the commit carries
+                // stays one, however it carries it.
                 let completed = CompletedCut {
                     name: &name,
                     request: &request,
@@ -669,7 +675,7 @@ pub(crate) fn run_release(
                     check,
                     stated_drop: None,
                     waived: &checked.waived,
-                    through_carriers: &through_carriers,
+                    kept_members: &check.held,
                     // Recorded as published, not written: knives unioned nothing.
                     unions: &[],
                     unchecked: &unchecked,
@@ -697,6 +703,26 @@ pub(crate) fn run_release(
                 }
                 worst = worst.worst(completed.exit());
                 return Ok(worst);
+            }
+            // A composition in hand built on the published commit, which the
+            // publish remote does not hold yet, would be cut as a commit of
+            // its own on its parents, the published commit left out with
+            // every member it holds. A fixed branch's cut records what is
+            // published, so it says to push first; the cut then records it.
+            if fixed_branch
+                && let Some(remote) = remote_tip
+                && remote != previous_tip
+                && opened.is_ancestor(remote, previous_tip)?
+            {
+                println!(
+                    "{repo}: refusing to cut {name}: the composition in hand ({}) is built on \
+                     {shown_previous}@{publish_remote} ({}), and a fixed branch's cut records \
+                     the published commit, never a commit of its own; push {shown_previous}, \
+                     then `knives release cut`, which records it; nothing was written",
+                    previous_tip.short(),
+                    remote.short()
+                );
+                return Ok(Exit::Incomplete);
             }
             if let Some(published) = published
                 && !fixed_branch
@@ -779,7 +805,7 @@ pub(crate) fn run_release(
                 check: &check,
                 stated_drop: orphaned.as_ref(),
                 waived: &[],
-                through_carriers: &[],
+                kept_members: &[],
                 unions: &unions,
                 unchecked: &unchecked,
                 composition: None,
@@ -1009,8 +1035,9 @@ impl Withdrawal {
 /// in `ledger`; the composition in hand, `previous`, must be the publish
 /// remote's commit of the branch, or with `--at` (`at`) the commit it names,
 /// which the publish remote holds ([`fixed_record_at`]); the publish
-/// remote's commit must be neither the write nor a descendant of it, as a
-/// write it holds was published; and the write must be abandoned: a visible
+/// remote's commit must be neither the write, nor a rewrite that stands for
+/// it, nor a descendant of either, as a write it holds was published
+/// ([`unpushed_newest_write`]); and the write must be abandoned: a visible
 /// one is still to be pushed, and nothing here says its members may go.
 ///
 /// Its refusal of a visible write says to keep it by the move of the branch
@@ -1113,10 +1140,13 @@ fn correction(
 /// The newest recorded write of `name`, a fixed branch, in `ledger`, where
 /// `published`, the publish remote's commit of the branch, never held it:
 /// this repository holds the write, and `published` is neither it, nor a
-/// descendant of it, nor a rewrite of it (the same change). `None`
-/// otherwise, and where this repository does not hold the write: nothing
-/// here can tell that write from one a fetch would bring, and the
-/// composition gate refuses to be held against it
+/// descendant of it or of a rewrite that stands for it
+/// ([`knives::jj::Repo::standing_rewrites_of`]), nor a rewrite of it (the
+/// same change). A write reworded or re-signed, then published and built on,
+/// was published: its recorded id is hidden, and only its rewrite is in
+/// `published`'s history. `None` otherwise, and where this repository does
+/// not hold the write: nothing here can tell that write from one a fetch
+/// would bring, and the composition gate refuses to be held against it
 /// ([`release::CompositionCheck::absent_write`]).
 fn unpushed_newest_write(
     opened: &knives::jj::Repo,
@@ -1133,6 +1163,11 @@ fn unpushed_newest_write(
             == opened.change_id_of(published.as_str())?
     {
         return Ok(None);
+    }
+    for rewrite in opened.standing_rewrites_of(&newest.commit)? {
+        if opened.is_ancestor(&rewrite, published)? {
+            return Ok(None);
+        }
     }
     Ok(Some(newest))
 }
@@ -1173,29 +1208,6 @@ fn moves_behind_published(
         }
     }
     Ok(true)
-}
-
-/// The members of `members`, the newest recorded write's, that `published`,
-/// a fixed branch's published commit, holds in its history but not as a
-/// parent: the members it carries through a carrier
-/// ([`CompletedCut::through_carriers`]). A member this repository does not
-/// hold is left out: nothing here can read whether the commit holds it.
-fn held_through_carriers(
-    opened: &knives::jj::Repo,
-    published: &CommitId,
-    members: &[CommitId],
-) -> anyhow::Result<Vec<CommitId>> {
-    let parents = opened.parent_commits(published.as_str())?;
-    let mut held = Vec::new();
-    for member in members {
-        if !parents.contains(member)
-            && opened.resolve_commit(member.as_str()).is_ok()
-            && opened.is_ancestor(member, published)?
-        {
-            held.push(member.clone());
-        }
-    }
-    Ok(held)
 }
 
 /// The composition that a fixed branch's `cut --at REV` records: REV, under
@@ -2580,11 +2592,13 @@ struct CompletedCut<'a> {
     /// record go ahead without ([`waived_members`]): the event says the
     /// commit is recorded without those members' lines.
     waived: &'a [(String, CommitId)],
-    /// The members of the newest recorded write that a fixed branch's
-    /// published commit holds only through a carrier, not as parents: the
-    /// event keeps each in its evidence, so the next record is held to it
-    /// as the gate held this one, and a later loss of its lines is named.
-    through_carriers: &'a [CommitId],
+    /// The recorded members of the previous cut and the newest recorded
+    /// write that a fixed branch's published commit carries but does not
+    /// merge, through a carrier or a rewrite
+    /// ([`release::CompositionCheck::held`]): the event keeps each in its
+    /// evidence, so the next record is held to it as the gate held this one,
+    /// and a later loss of its lines is named.
+    kept_members: &'a [CommitId],
     scheme: &'a ReleaseScheme,
     /// The records the cut was held against ([`CompositionGate::held`]), for
     /// its event to restate.
@@ -2682,7 +2696,7 @@ fn record_cut_event(
         .filter(|sha| !evidence.contains(sha))
         .collect();
     evidence.extend(unverified);
-    let kept_text = keep_members_held_through_carriers(cut.through_carriers, &mut evidence);
+    let kept_text = keep_recorded_members(cut.kept_members, &mut evidence);
     let delta = restated_delta(cut.held, cut.check);
     let mut recorded = recorded_parents(&opened, entry, &parents)?;
     recorded.extend(
@@ -2721,11 +2735,12 @@ fn record_cut_event(
 }
 
 /// Add to `evidence` each of `held`'s members it does not hold yet, and the
-/// event text that names them ([`CompletedCut::through_carriers`]). A member
-/// the commit holds through a carrier stays a recorded member, as an edit
-/// event keeps every member: a record that listed only the commit's parents
-/// would drop it from every later gate.
-fn keep_members_held_through_carriers(held: &[CommitId], evidence: &mut Vec<String>) -> String {
+/// event text that names them ([`CompletedCut::kept_members`]). A recorded
+/// member the commit carries but does not merge, through a carrier or a
+/// rewrite, stays a recorded member, as an edit event keeps every member: a
+/// record that listed only the commit's parents would drop it from every
+/// later gate.
+fn keep_recorded_members(held: &[CommitId], evidence: &mut Vec<String>) -> String {
     let kept: Vec<&CommitId> = held
         .iter()
         .filter(|member| !evidence.iter().any(|sha| sha == member.as_str()))
@@ -2736,7 +2751,7 @@ fn keep_members_held_through_carriers(held: &[CommitId], evidence: &mut Vec<Stri
     evidence.extend(kept.iter().map(|member| member.as_str().to_owned()));
     let shorts: Vec<&str> = kept.iter().map(|member| member.short()).collect();
     format!(
-        "; holds {} member(s) of its newest recorded write through its earlier write(s): {}",
+        "; keeps {} recorded member(s) it carries but does not merge: {}",
         shorts.len(),
         shorts.join(", ")
     )
@@ -3101,7 +3116,7 @@ fn record_hand_cut(
         check: &checked.check,
         stated_drop: None,
         waived: &[],
-        through_carriers: &[],
+        kept_members: &[],
         // Recorded, not written: knives unioned nothing.
         unions: &[],
         unchecked: "",

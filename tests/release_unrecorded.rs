@@ -952,6 +952,55 @@ fn a_write_over_a_release_whose_matched_write_is_absent_is_unchecked_not_refused
 }
 
 #[test]
+fn a_waived_absent_write_does_not_carry_forward_a_new_members_lost_line() {
+    // Given: the cut made in another clone and never pushed; in the second
+    // clone, which does not hold that cut, the release made by hand again
+    // from its members and a new member `feat/gamma`, without `gamma two`.
+    let (lab, home, second, cut) = made_again_in_second_clone(&[]);
+    let old = Repo::open(&second)
+        .expect("open")
+        .resolve_commit(DATED)
+        .expect("resolve the release");
+    lab.jj_at(&second, ["new", "-r", "main@origin", "-m", "feat/gamma"]);
+    std::fs::write(second.join("gamma.txt"), "gamma one\ngamma two\n").expect("write gamma.txt");
+    lab.jj_at(&second, ["bookmark", "create", "feat/gamma", "-r", "@"]);
+    lab.jj_at(
+        &second,
+        [
+            "new",
+            "feat/alpha@origin",
+            "feat/beta@origin",
+            "feat/gamma",
+            "-m",
+            DATED,
+        ],
+    );
+    std::fs::write(second.join("gamma.txt"), "gamma one\n").expect("drop gamma two");
+    lab.jj_at(
+        &second,
+        ["bookmark", "set", DATED, "-r", "@", "--allow-backwards"],
+    );
+    step_off_onto_trunk_in(&lab, &second);
+    lab.jj_at(&second, ["abandon", old.as_str()]);
+    let before = ledger_entries(&home).len();
+
+    // When: the next cut names only the absent write as a drop.
+    let output = release_in(
+        &lab,
+        &home,
+        &second,
+        &["cut", NEXT, "--allow-drop", cut.short()],
+    );
+
+    // Then: that waiver does not let the composition in hand answer for the
+    // new member's line. The cut refuses, names the line, and writes nothing.
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    assert!(out.contains("gamma two"), "{out}");
+    assert_eq!(ledger_entries(&home).len(), before, "{out}");
+}
+
+#[test]
 fn adopt_records_a_release_whose_matched_write_is_absent_and_the_next_write_is_checked() {
     // Given (q6): the same release in hand, its cut absent here.
     let (lab, home, second, _cut) = made_again_in_second_clone(&[("notes.txt", "by hand\n")]);

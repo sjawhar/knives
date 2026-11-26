@@ -879,17 +879,18 @@ fn a_landing_on_the_carrier_never_answers_for_a_member_under_it() {
 #[test]
 fn a_cut_over_an_unpushed_hand_composition_is_refused_where_a_new_members_line_is_lost() {
     // Given: W1, a cut of `feat/alpha`, pushed; then `integration` composed
-    // by hand of W1 and `feat/gamma` (five lines), its third line left out,
-    // and not pushed: the composition in hand, which no knives write or
-    // adopt measured.
+    // afresh by hand of `feat/alpha` and `feat/gamma` (five lines), its third
+    // line left out, and not pushed: the composition in hand, which no knives
+    // write or adopt measured. It is not built on W1, so the push-first
+    // refusal does not apply.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let home = fixed_home(&lab);
     let first = knives_release(&lab, &home, &["cut"]);
     assert!(first.status.success(), "{}", both(&first));
-    let w1 = publish(&lab);
+    publish(&lab);
     lab.branch("feat/gamma", "gamma.txt", "g1\ng2\ng3\ng4\ng5\n");
-    compose(&lab, &[w1.as_str(), "feat/gamma"], |work| {
+    compose(&lab, &["feat/alpha", "feat/gamma"], |work| {
         std::fs::write(work.join("gamma.txt"), "g1\ng2\ng4\ng5\n").expect("write gamma.txt");
     });
     let before = entries(&home).len();
@@ -904,6 +905,39 @@ fn a_cut_over_an_unpushed_hand_composition_is_refused_where_a_new_members_line_i
     assert_eq!(cut.status.code(), Some(3), "{out}");
     assert!(out.contains("‹g3›"), "{out}");
     assert_eq!(entries(&home).len(), before, "{out}");
+}
+
+#[test]
+fn a_fixed_branch_composition_on_the_published_release_refuses_until_pushed() {
+    // Given: W1, a cut of `feat/alpha`, pushed; then an unpushed
+    // composition on W1 with a whole new `feat/gamma`. Its own parent set
+    // does not contain the published release's carrier after a candidate
+    // rebuild, so building another cut would lose W1's recorded members from
+    // the event.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha one\nalpha two\n");
+    let home = fixed_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both(&first));
+    let w1 = publish(&lab);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let composition = compose(&lab, &[w1.as_str(), "feat/gamma"], |_| {});
+    let before = entries(&home).len();
+
+    // When: a plain cut runs before the composition is pushed.
+    let cut = knives_release(&lab, &home, &["cut"]);
+
+    // Then: it refuses and writes nothing, because fixed-branch recording
+    // takes the exact published commit. The remedy names the push before the
+    // next cut.
+    let out = both(&cut);
+    assert_eq!(cut.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains("push integration, then `knives release cut`"),
+        "{out}"
+    );
+    assert_eq!(entries(&home).len(), before, "{out}");
+    assert_eq!(commit_at(&lab, "integration"), composition, "{out}");
 }
 
 #[test]
@@ -943,6 +977,65 @@ fn a_member_the_published_commit_holds_through_its_carrier_stays_recorded() {
     // Then: P1's record kept `feat/alpha` a recorded member through its
     // carrier, so P2's cut is refused, names `alpha two`, and writes
     // nothing.
+    assert!(
+        records_member(&event, &commit_at(&lab, "feat/alpha")),
+        "{event:?}"
+    );
+    let out = both(&cut);
+    assert_eq!(cut.status.code(), Some(3), "{out}");
+    assert!(out.contains("alpha two"), "{out}");
+    assert_eq!(entries(&home).len(), before, "{out}");
+}
+
+#[test]
+fn a_member_kept_by_a_record_stays_recorded_past_an_edit_and_the_next_record() {
+    // Given: W1, a cut of `feat/alpha` (two lines), pushed; P1, published by
+    // hand as a merge of W1 and `feat/gamma`, and recorded, which keeps
+    // `feat/alpha` a recorded member through W1; then `include feat/zeta`,
+    // whose edit event lists only its parents, pushed and recorded.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha one\nalpha two\n");
+    let home = fixed_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both(&first));
+    let w1 = publish(&lab);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    compose(&lab, &[w1.as_str(), "feat/gamma"], |_| {});
+    publish(&lab);
+    let recorded = knives_release(&lab, &home, &["cut"]);
+    assert_ne!(
+        recorded.status.code(),
+        Some(3),
+        "fixture: {}",
+        both(&recorded)
+    );
+    lab.branch("feat/zeta", "zeta.txt", "zeta\n");
+    let included = knives_release(&lab, &home, &["include", "feat/zeta"]);
+    assert_ne!(
+        included.status.code(),
+        Some(3),
+        "fixture: {}",
+        both(&included)
+    );
+    let edit = publish(&lab);
+    let after_edit = knives_release(&lab, &home, &["cut"]);
+    let event = newest_event(&home);
+
+    // When: P3, published by hand as a merge of that edit and `feat/eta`
+    // without `alpha two`, is cut.
+    lab.branch("feat/eta", "eta.txt", "eta\n");
+    compose(&lab, &[edit.as_str(), "feat/eta"], |work| {
+        std::fs::write(work.join("alpha.txt"), "alpha one\n").expect("write alpha.txt");
+    });
+    publish(&lab);
+    let before = entries(&home).len();
+    let cut = knives_release(&lab, &home, &["cut"]);
+
+    // Then: the edit's record kept `feat/alpha`, which it carries but does
+    // not merge, so P3's cut is refused, names `alpha two`, and writes
+    // nothing.
+    assert_ne!(after_edit.status.code(), Some(3), "{}", both(&after_edit));
+    assert_eq!(event.evidence.first(), Some(&edit.as_str().to_owned()));
     assert!(
         records_member(&event, &commit_at(&lab, "feat/alpha")),
         "{event:?}"
