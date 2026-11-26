@@ -829,7 +829,10 @@ fn status_names_the_forget_command_for_a_fork_pull_request_record_and_asks_no_fo
              nothing judges: pull requests go upstream. Forget it, and name the upstream pull \
              request or member branch it stood for: `knives depends feat/alpha --forget {record}`"
         );
-        assert!(said_now.contains(&wanted), "{record}: {said_now:?}\n{report}");
+        assert!(
+            said_now.contains(&wanted),
+            "{record}: {said_now:?}\n{report}"
+        );
     }
     assert_eq!(
         details(&report, "unmet-dependency"),
@@ -3504,7 +3507,7 @@ enum Said {
 /// dependent whose requirements are checked as a row's, and of one whose
 /// later work cannot be read ([`Holder::checked`]).
 fn status_table(now: ForgeNow, kind: &str) -> (Said, Said) {
-    use ForgeNow::{Down, FormerNameFails, FormerNameUnseen, OwnUnseen, UpstreamUnseen};
+    use ForgeNow::{Down, OwnUnseen, UpstreamUnseen};
     use Said::{Deferred, Met, Unknown, Unmet};
     // Whether the forge answers what judging `kind` needs: this fork's
     // upstream pull requests and a member's squash evidence come from the
