@@ -396,12 +396,16 @@ pub struct Repository<'a> {
 /// (`api graphql -f owner=… -f name=…`) the pull requests it asks about of
 /// the repository its `owner` and `name` fields name, a number that
 /// repository does not have, or the query does not ask about, being absent
-/// from the reply. A status snapshot's warm sweep finds nothing. A call
-/// naming any other repository fails as gh does for one that does not
-/// exist, or that the token cannot see, but a list of one is empty. A pull
-/// request row may repeat a field to replace [`pull_record_with_fields`]'s
-/// default: the last one is kept. Each call's arguments are appended to
-/// `log`.
+/// from the reply. The head owner is read over REST, as src/forge/github.rs
+/// reads it: `api repos/<owner>/<name>/pulls?…&page=1` gives every pull
+/// request's head owner, a later page is empty, and `api
+/// repos/<owner>/<name>/pulls/<n>` gives one, or the forge's 404 for a
+/// number that repository does not have. A status snapshot's warm sweep
+/// finds nothing. A call naming any other repository fails as gh does for
+/// one that does not exist, or that the token cannot see, but a list of one,
+/// GraphQL or REST, is empty. A pull request row may repeat a field to
+/// replace [`pull_record_with_fields`]'s default: the last one is kept. Each
+/// call's arguments are appended to `log`.
 pub fn install_repository_gh(shim: &Path, repositories: &[Repository<'_>], log: &Path) {
     install_repository_gh_failing(shim, repositories, &[], log);
 }
@@ -415,24 +419,13 @@ pub fn install_repository_gh_failing(
     failing: &[&str],
     log: &Path,
 ) {
-    let sweep = json_file(
-        shim,
-        "sweep.json",
-        &serde_json::json!({
-            "data": {
-                "repository": {
-                    "pullRequests": {
-                        "pageInfo": {"hasNextPage": false},
-                        "nodes": [],
-                    }
-                }
-            }
-        }),
-    );
+    let sweep = empty_sweep(shim);
     let mut views = String::new();
     let mut lists = String::new();
     let mut facts = String::new();
+    let mut rest = String::new();
     let outage = "echo \"HTTP 502: Bad Gateway (https://api.github.com/graphql)\" >&2; exit 1 ;;";
+    let rest_outage = "echo \"HTTP 502: Bad Gateway (https://api.github.com/$2)\" >&2; exit 1 ;;";
     for repository in failing {
         let repository = repository.to_ascii_lowercase();
         let (owner, name) = repository
@@ -441,6 +434,7 @@ pub fn install_repository_gh_failing(
         writeln!(views, "  {repository}) {outage}").expect("write to a string");
         writeln!(lists, "  {repository}) {outage}").expect("write to a string");
         writeln!(facts, "  \"{owner} {name}\") {outage}").expect("write to a string");
+        writeln!(rest, "  \"{owner} {name}\") {rest_outage}").expect("write to a string");
     }
     for (index, repository) in repositories.iter().enumerate() {
         let named = repository.named.to_ascii_lowercase();
@@ -461,6 +455,7 @@ pub fn install_repository_gh_failing(
         cat_arm(&mut lists, &named, &list);
         cat_arm(&mut views, &named, &identity);
         facts.push_str(&facts_arm(shim, (owner, name), &pulls, &sweep));
+        rest.push_str(&rest_arm(shim, (owner, name), &pulls));
     }
     install_executable(
         &shim.join("gh"),
@@ -495,12 +490,71 @@ pub fn install_repository_gh_failing(
                esac\n\
                echo \"GraphQL: Could not resolve to a Repository with the name '$owner/$name'.\" >&2\n\
                exit 1 ;;\n\
+             \"api repos/\"*)\n\
+               path=${{2#repos/}}\n\
+               rest_owner=${{path%%/*}}\n\
+               path=${{path#*/}}\n\
+               rest_name=${{path%%/*}}\n\
+               path=${{path#*/}}\n\
+               case \"$(printf '%s %s' \"$rest_owner\" \"$rest_name\" | tr 'A-Z' 'a-z')\" in\n\
+             {rest}\
+               esac\n\
+               case \"$path\" in \"pulls?\"*) echo '[]'; exit 0 ;; esac\n\
+               printf '%s' '{{\"message\":\"Not Found\",\"status\":\"404\"}}'\n\
+               echo 'gh: Not Found (HTTP 404)' >&2\n\
+               exit 1 ;;\n\
              esac\n\
              echo \"unexpected gh invocation: $*\" >&2\n\
              exit 1\n",
             log = log.display(),
         ),
     );
+}
+
+/// A status snapshot's warm sweep that finds nothing, written to `shim`; its
+/// path.
+fn empty_sweep(shim: &Path) -> PathBuf {
+    json_file(
+        shim,
+        "sweep.json",
+        &serde_json::json!({
+            "data": {
+                "repository": {
+                    "pullRequests": {
+                        "pageInfo": {"hasNextPage": false},
+                        "nodes": [],
+                    }
+                }
+            }
+        }),
+    )
+}
+
+/// The `case` arm that answers the REST head-owner read on `owner`/`name`,
+/// whose pull requests are `pulls`: page 1 of the list holds every one of
+/// them, a later page is empty, and one pull request is its own file; a
+/// number with no file falls through to the forge's 404. A reinstall can
+/// hide a repository or change its pull requests, so the files are kept by
+/// the repository's name, and cleared first.
+fn rest_arm(shim: &Path, (owner, name): (&str, &str), pulls: &[serde_json::Value]) -> String {
+    let dir = shim.join(format!("rest-{owner}-{name}"));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("clear the REST directory");
+    }
+    std::fs::create_dir_all(&dir).expect("create the REST directory");
+    let (page, each) = write_rest_payloads(&dir, pulls);
+    format!(
+        "  \"{owner} {name}\")\n\
+         \x20   case \"$path\" in\n\
+         \x20   \"pulls?\"*\"&page=1\") cat \"{page}\"; exit 0 ;;\n\
+         \x20   \"pulls?\"*) echo '[]'; exit 0 ;;\n\
+         \x20   \"pulls/\"*)\n\
+         \x20     number=${{path#pulls/}}\n\
+         \x20     if [ -f \"{each}/$number.json\" ]; then cat \"{each}/$number.json\"; exit 0; fi ;;\n\
+         \x20   esac ;;\n",
+        page = page.display(),
+        each = each.display(),
+    )
 }
 
 /// The `case` arm that answers a by-number facts query on `owner`/`name`,
