@@ -213,6 +213,44 @@ fn a_hand_cut_release_is_recorded_by_one_command() {
 }
 
 #[test]
+fn a_record_that_supersedes_a_release_with_a_stale_parent_exits_on_its_own_result() {
+    // Given: knives cut `feat/base` and `feat/pr`, stacked on it, as
+    // RELEASE; then `feat/base` took `feat/pr` by moving onto it and went on
+    // with a commit, `feat/pr`'s bookmark kept. RELEASE's parent at
+    // `feat/base`'s old tip now carries no bookmark: a stale parent, a
+    // finding of the plan of RELEASE.
+    let lab = Lab::new();
+    lab.branch("feat/base", "base.txt", "base\n");
+    lab.jj_work(["new", "-r", "feat/base", "-m", "feat/pr"]);
+    std::fs::write(lab.work.join("pr.txt"), "pr\n").expect("write feat/pr");
+    lab.jj_work(["bookmark", "create", "feat/pr", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    lab.jj_work(["bookmark", "set", "feat/base", "-r", "feat/pr"]);
+    lab.jj_work(["new", "-r", "feat/base", "-m", "feat/base goes on"]);
+    std::fs::write(lab.work.join("after.txt"), "after\n").expect("write feat/base");
+    lab.jj_work(["bookmark", "set", "feat/base", "-r", "@"]);
+    lab.jj_work(["new", "-r", "main@origin", "-r", "feat/base", "-m", "next"]);
+    let next = commit_of(&lab, "@");
+    lab.jj_work(["new"]);
+
+    // When: a hand merge of the trunk and `feat/base` is recorded as the
+    // next release.
+    let recorded = record(&lab, &home, "release/2026-08-05", &next);
+
+    // Then: it is recorded and exits 0: the stale parent is RELEASE's,
+    // which the record supersedes.
+    let out = text(&recorded);
+    assert!(
+        out.contains(&recorded_line("release/2026-08-05", &next)),
+        "{out}"
+    );
+    assert_eq!(recorded.status.code(), Some(0), "{out}");
+}
+
+#[test]
 fn recording_an_absent_name_makes_its_bookmark_at_the_commit() {
     // Given: a release merged by hand that no ref names.
     let lab = Lab::new();

@@ -255,11 +255,12 @@ pub(crate) fn run_release(
         if let Some(at) = at
             && !fixed_branch
         {
-            return Ok(worst.worst(record_hand_cut(
-                (fork, &opened, &lock),
-                (&name, at, &allow_drop),
-                bound,
-            )?));
+            return Ok(
+                match record_hand_cut((fork, &opened, &lock), (&name, at, &allow_drop), bound)? {
+                    Ok(own) => own,
+                    Err(exit) => worst.worst(exit),
+                },
+            );
         }
         let trunk_name = entry.trunk_ref();
         let trunk = opened.resolve_commit(&trunk_name)?;
@@ -3067,12 +3068,13 @@ fn waived_members(
 /// exists, and the event recorded, which the process sends to a shared
 /// ledger before it exits; the commit's repeated headings print once after
 /// them, even where the record fails after the bookmark was made
-/// ([`write_hand_cut`]).
+/// ([`write_hand_cut`]). `Ok` holds the exit of a record that was written,
+/// `Err` the exit of a refusal, which wrote nothing.
 fn record_hand_cut(
     (fork, opened, lock): (&Fork<'_>, &knives::jj::Repo, &CutLock),
     (name, at, allow_drop): (&str, &str, &AllowDrop),
     bound: Bound<'_>,
-) -> anyhow::Result<Exit> {
+) -> anyhow::Result<Result<Exit, Exit>> {
     let (repo, entry) = (&fork.name, fork.entry);
     // The pulled plan refused on any problem this read finds.
     let ledger = Ledger::for_fork(fork).read()?.entries;
@@ -3086,7 +3088,7 @@ fn record_hand_cut(
         &trunk,
     )? {
         Ok(held) => held,
-        Err(exit) => return Ok(exit),
+        Err(exit) => return Ok(Err(exit)),
     };
     let commit = &held.commit;
     let writes = EarlierWrites::read(opened, name, &ledger, held.published.as_ref())?;
@@ -3097,7 +3099,7 @@ fn record_hand_cut(
         (&tips, &trunk, follows.as_ref()),
     )? {
         Ok(composed) => composed,
-        Err(exit) => return Ok(exit),
+        Err(exit) => return Ok(Err(exit)),
     };
     let parents = opened.parent_commits(commit.as_str())?;
     let record = Some((name, commit));
@@ -3139,10 +3141,10 @@ fn record_hand_cut(
     };
     let checked = match checked_committed_cut(repo, &committed, (&gate, allow_drop))? {
         Ok(checked) => checked,
-        Err(exit) => return Ok(exit),
+        Err(exit) => return Ok(Err(exit)),
     };
     if let Some(exit) = allow_drop.settle(repo) {
-        return Ok(exit);
+        return Ok(Err(exit));
     }
     // The event records the members, never a parent the trunk holds.
     let cut = CompletedCut {
@@ -3166,6 +3168,7 @@ fn record_hand_cut(
     release::with_last_write_headings(|last| {
         write_hand_cut(fork, &cut, (held.named, unpushed), (bound, last))
     })
+    .map(Ok)
 }
 
 /// The writes of `cut NAME --at REV` once every gate passed: the local
