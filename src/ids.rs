@@ -565,14 +565,10 @@ impl Requirement {
                 branch,
             });
         }
-        let (repository, number) = rest.rsplit_once('#')?;
-        if !is_repository(repository) {
-            return None;
-        }
-        Some(Self::ForkPull {
-            repository: repository.to_owned(),
-            number: number.parse().ok()?,
-        })
+        // CONTROL ONLY, never merged: an old fork pull request record no
+        // longer parses.
+        let _ = rest;
+        None
     }
 
     /// The repository a fork pull request or member record spells.
