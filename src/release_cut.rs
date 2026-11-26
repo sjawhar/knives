@@ -663,7 +663,10 @@ pub(crate) fn run_release(
                 }
                 let (audit, check) = (&checked.audit, &checked.check);
                 // Every recorded member the gate found the commit carries
-                // stays one, however it carries it.
+                // stays one, however it carries it, and so does each one whose
+                // lost line `--allow-drop` waived and that the commit's
+                // history holds ([`kept_members`]).
+                let kept = kept_members(&opened, check, published)?;
                 let completed = CompletedCut {
                     name: &name,
                     request: &request,
@@ -675,7 +678,7 @@ pub(crate) fn run_release(
                     check,
                     stated_drop: None,
                     waived: &checked.waived,
-                    kept_members: &check.held,
+                    kept_members: &kept,
                     // Recorded as published, not written: knives unioned nothing.
                     unions: &[],
                     unchecked: &unchecked,
@@ -704,23 +707,29 @@ pub(crate) fn run_release(
                 worst = worst.worst(completed.exit());
                 return Ok(worst);
             }
-            // A composition in hand built on the published commit, which the
-            // publish remote does not hold yet, would be cut as a commit of
-            // its own on its parents, the published commit left out with
-            // every member it holds. A fixed branch's cut records what is
-            // published, so it says to push first; the cut then records it.
+            // A fixed branch's cut records the publish remote's commit, never
+            // a commit of its own over a composition no knives write measured:
+            // one built on that commit, on a rewrite of it or afresh would be
+            // cut on its parents with the published commit and its members
+            // left out, a commit the remote cannot take as a fast-forward. So
+            // it says to push first; the cut then records it. A write knives
+            // recorded and that is not pushed yet is cut as main has always
+            // cut it: its members are recorded, and the gate holds the rest.
             if fixed_branch
-                && let Some(remote) = remote_tip
-                && remote != previous_tip
-                && opened.is_ancestor(remote, previous_tip)?
+                && remote_tip != Some(previous_tip)
+                && !previous_writes.contains(previous_tip)
             {
+                let remote = remote_tip.map_or_else(
+                    || "names no commit".to_owned(),
+                    |remote| format!("is {}", remote.short()),
+                );
                 println!(
-                    "{repo}: refusing to cut {name}: the composition in hand ({}) is built on \
-                     {shown_previous}@{publish_remote} ({}), and a fixed branch's cut records \
-                     the published commit, never a commit of its own; push {shown_previous}, \
-                     then `knives release cut`, which records it; nothing was written",
-                    previous_tip.short(),
-                    remote.short()
+                    "{repo}: refusing to cut {name}: the composition in hand ({}) is no write the \
+                     ledger records and not {shown_previous}@{publish_remote}, which {remote}, \
+                     and a fixed branch's cut records the published commit, never a commit of \
+                     its own; push {shown_previous}, then `knives release cut`, which records \
+                     it; nothing was written",
+                    previous_tip.short()
                 );
                 return Ok(Exit::Incomplete);
             }
@@ -782,6 +791,12 @@ pub(crate) fn run_release(
         // The publish rebuilds the audited tree, so the candidate's unions are
         // what ships.
         let unions = candidate.unions().to_vec();
+        // A fixed branch's cut of a write knives recorded keeps each recorded
+        // member it does not merge, as a record does ([`kept_members`]).
+        let kept = match previous_commit.as_ref() {
+            Some(in_hand) if fixed_branch => kept_members(&opened, &check, in_hand)?,
+            _ => Vec::new(),
+        };
         // The publish is the cut's write, read as soon as it is done: its
         // repeated headings print with its report, or once after a step
         // before the report that fails.
@@ -805,7 +820,7 @@ pub(crate) fn run_release(
                 check: &check,
                 stated_drop: orphaned.as_ref(),
                 waived: &[],
-                kept_members: &[],
+                kept_members: &kept,
                 unions: &unions,
                 unchecked: &unchecked,
                 composition: None,
@@ -2734,12 +2749,37 @@ fn record_cut_event(
     Ok(())
 }
 
+/// The recorded members a fixed branch's cut or record keeps in its event
+/// though it does not merge them ([`CompletedCut::kept_members`]): each one
+/// the gate found the subject carries ([`release::CompositionCheck::held`]),
+/// and each one whose lost line `--allow-drop` waived that `subject`, the
+/// published commit or the composition in hand, holds in its history, so
+/// the next record is held to the lines it still has. A waived member the
+/// subject never merged is not kept: it lacks every line of it, and keeping
+/// it would carry each of them forward. A member this repository does not
+/// hold is left out: nothing here can read it.
+fn kept_members(
+    opened: &knives::jj::Repo,
+    check: &release::CompositionCheck,
+    subject: &CommitId,
+) -> anyhow::Result<Vec<CommitId>> {
+    let mut kept = check.held.clone();
+    for dropped in &check.dropped {
+        if opened.resolve_commit(dropped.commit.as_str()).is_ok()
+            && opened.is_ancestor(&dropped.commit, subject)?
+        {
+            kept.push(dropped.commit.clone());
+        }
+    }
+    Ok(kept)
+}
+
 /// Add to `evidence` each of `held`'s members it does not hold yet, and the
 /// event text that names them ([`CompletedCut::kept_members`]). A recorded
-/// member the commit carries but does not merge, through a carrier or a
-/// rewrite, stays a recorded member, as an edit event keeps every member: a
-/// record that listed only the commit's parents would drop it from every
-/// later gate.
+/// member the commit does not merge, carried through a carrier or a rewrite
+/// or with a lost line `--allow-drop` waived, stays a recorded member, as an
+/// edit event keeps every member: a record that listed only the commit's
+/// parents would drop it from every later gate.
 fn keep_recorded_members(held: &[CommitId], evidence: &mut Vec<String>) -> String {
     let kept: Vec<&CommitId> = held
         .iter()
@@ -2751,7 +2791,7 @@ fn keep_recorded_members(held: &[CommitId], evidence: &mut Vec<String>) -> Strin
     evidence.extend(kept.iter().map(|member| member.as_str().to_owned()));
     let shorts: Vec<&str> = kept.iter().map(|member| member.short()).collect();
     format!(
-        "; keeps {} recorded member(s) it carries but does not merge: {}",
+        "; keeps {} recorded member(s) it does not merge: {}",
         shorts.len(),
         shorts.join(", ")
     )

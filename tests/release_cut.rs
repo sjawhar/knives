@@ -1266,12 +1266,13 @@ impl UnpushedCut {
 
 /// A fixed release branch cut by knives and pushed; then the branch composed
 /// by hand of the previous cut, `feat/alpha`, `feat/beta` and `feat/gamma`;
-/// then a cut of the three members alone, which the remote never held, as
-/// Cut8's dc16713e was. That cut is now made from a composition afresh of the
-/// three members: a cut of the composition on the previous cut now refuses
-/// before its push. Then that cut and the fresh composition abandoned, the
-/// bookmark back on the composition by hand, and that pushed. The ledger's
-/// newest write is the cut the remote never held.
+/// then a cut of the three members alone that the publish remote's history
+/// does not hold, as Cut8's dc16713e. A fixed branch's cut now records only
+/// the publish remote's commit, so that cut is made by pushing a composition
+/// afresh of the three members and recording it, then pushing the
+/// composition by hand over it: the remote's history no longer holds it.
+/// That cut is then abandoned. The ledger's newest write is the cut the
+/// remote's history does not hold.
 fn unpushed_cut_lab() -> UnpushedCut {
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
@@ -1286,18 +1287,19 @@ fn unpushed_cut_lab() -> UnpushedCut {
     let composed = compose_by_hand(&lab);
     // A bookmark keeps the composition out of the cut's orphan gate.
     lab.jj_work(["bookmark", "create", "keep", "-r", composed.as_str()]);
-    let fresh = compose_integration(&lab, &["feat/alpha", "feat/beta", "feat/gamma"]);
-    let unpushed = knives_release(&lab, &home, &["cut"]);
+    let wrong = compose_integration(&lab, &["feat/alpha", "feat/beta", "feat/gamma"]);
+    publish_integration(&lab);
+    let recorded = knives_release(&lab, &home, &["cut"]);
     assert_ne!(
-        unpushed.status.code(),
+        recorded.status.code(),
         Some(3),
         "{}",
-        both_streams(&unpushed)
+        both_streams(&recorded)
     );
-    let wrong = commit_at(&lab, "integration");
-    assert_ne!(
-        wrong, composed,
-        "the cut of a composition not pushed made a commit"
+    assert_eq!(
+        newest_integration_event(&home).evidence.first(),
+        Some(&wrong.as_str().to_owned()),
+        "fixture: the fresh composition is the newest recorded write"
     );
     lab.jj_work(["bookmark", "delete", "keep"]);
     lab.jj_work([
@@ -1308,11 +1310,9 @@ fn unpushed_cut_lab() -> UnpushedCut {
         composed.as_str(),
         "--allow-backwards",
     ]);
-    lab.jj_work(["abandon", wrong.as_str()]);
-    let fresh_left = format!("{} & visible_heads()", fresh.as_str());
-    lab.jj_work(["abandon", fresh_left.as_str()]);
     let published = publish_integration(&lab);
     assert_eq!(published, composed);
+    lab.jj_work(["abandon", wrong.as_str()]);
     assert!(
         !release_drifts(&lab, &home).is_empty(),
         "control: the audit reads the unpushed cut as the newest"

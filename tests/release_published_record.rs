@@ -877,12 +877,11 @@ fn a_landing_on_the_carrier_never_answers_for_a_member_under_it() {
 }
 
 #[test]
-fn a_cut_over_an_unpushed_hand_composition_is_refused_where_a_new_members_line_is_lost() {
+fn a_fresh_composition_is_refused_until_pushed_then_its_record_refuses_a_new_members_lost_line() {
     // Given: W1, a cut of `feat/alpha`, pushed; then `integration` composed
     // afresh by hand of `feat/alpha` and `feat/gamma` (five lines), its third
-    // line left out, and not pushed: the composition in hand, which no knives
-    // write or adopt measured. It is not built on W1, so the push-first
-    // refusal does not apply.
+    // line left out, and not pushed: dc16713e's shape, a composition that
+    // does not descend from the published W1.
     let lab = Lab::new();
     lab.branch("feat/alpha", "alpha.txt", "alpha\n");
     let home = fixed_home(&lab);
@@ -890,21 +889,150 @@ fn a_cut_over_an_unpushed_hand_composition_is_refused_where_a_new_members_line_i
     assert!(first.status.success(), "{}", both(&first));
     publish(&lab);
     lab.branch("feat/gamma", "gamma.txt", "g1\ng2\ng3\ng4\ng5\n");
-    compose(&lab, &["feat/alpha", "feat/gamma"], |work| {
+    let composition = compose(&lab, &["feat/alpha", "feat/gamma"], |work| {
         std::fs::write(work.join("gamma.txt"), "g1\ng2\ng4\ng5\n").expect("write gamma.txt");
     });
+    let before = entries(&home).len();
+
+    // When: a plain cut runs; then the composition is pushed and cut again.
+    let unpushed = knives_release(&lab, &home, &["cut"]);
+    let bookmark = commit_at(&lab, "integration");
+    publish(&lab);
+    let pushed = knives_release(&lab, &home, &["cut"]);
+
+    // Then: the first is refused with the push and makes no commit; the
+    // second reads `feat/gamma` against W1, the newest recorded write, which
+    // never recorded it, so the lost line is missing: refused, named, and
+    // nothing is written by either.
+    let out = both(&unpushed);
+    assert_eq!(unpushed.status.code(), Some(3), "{out}");
+    assert!(
+        out.contains("push integration, then `knives release cut`"),
+        "{out}"
+    );
+    assert_eq!(bookmark, composition, "{out}");
+    let out = both(&pushed);
+    assert_eq!(pushed.status.code(), Some(3), "{out}");
+    assert!(out.contains("‹g3›"), "{out}");
+    assert_eq!(entries(&home).len(), before, "{out}");
+}
+
+#[test]
+fn a_composition_on_a_rewrite_of_the_published_release_is_refused_until_pushed() {
+    // Given: W1, a cut of `feat/alpha`, pushed; P1, published by hand as a
+    // merge of W1 and `feat/gamma`, and recorded; then P1 reworded here, the
+    // remote still at P1, and a composition of the rewrite and `feat/zeta`,
+    // not pushed.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let home = fixed_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both(&first));
+    let w1 = publish(&lab);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    compose(&lab, &[w1.as_str(), "feat/gamma"], |_| {});
+    publish(&lab);
+    let recorded = knives_release(&lab, &home, &["cut"]);
+    assert_ne!(
+        recorded.status.code(),
+        Some(3),
+        "fixture: {}",
+        both(&recorded)
+    );
+    lab.jj_work(["describe", "-r", "integration", "-m", "P1, reworded"]);
+    let rewrite = commit_at(&lab, "integration");
+    lab.branch("feat/zeta", "zeta.txt", "zeta\n");
+    let composition = compose(&lab, &[rewrite.as_str(), "feat/zeta"], |_| {});
     let before = entries(&home).len();
 
     // When: a plain cut runs.
     let cut = knives_release(&lab, &home, &["cut"]);
 
-    // Then: `feat/gamma` is read against W1, the newest recorded write,
-    // which never recorded it, so the lost line is missing: the cut is
-    // refused, names it, and writes nothing.
+    // Then: it is refused with the push, makes no commit, and writes
+    // nothing.
     let out = both(&cut);
     assert_eq!(cut.status.code(), Some(3), "{out}");
-    assert!(out.contains("‹g3›"), "{out}");
+    assert!(
+        out.contains("push integration, then `knives release cut`"),
+        "{out}"
+    );
+    assert_eq!(commit_at(&lab, "integration"), composition, "{out}");
     assert_eq!(entries(&home).len(), before, "{out}");
+}
+
+#[test]
+fn a_hand_composition_before_the_first_push_is_refused() {
+    // Given: W1, a cut of `feat/alpha`, never pushed, so the publish remote
+    // names no commit of `integration`; then `integration` composed by hand
+    // of W1 and `feat/gamma`.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let home = fixed_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both(&first));
+    let w1 = commit_at(&lab, "integration");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let composition = compose(&lab, &[w1.as_str(), "feat/gamma"], |_| {});
+    let before = entries(&home).len();
+
+    // When: a plain cut runs.
+    let cut = knives_release(&lab, &home, &["cut"]);
+
+    // Then: refused with the push, no commit made, nothing written.
+    let out = both(&cut);
+    assert_eq!(cut.status.code(), Some(3), "{out}");
+    assert!(out.contains("which names no commit"), "{out}");
+    assert!(
+        out.contains("push integration, then `knives release cut`"),
+        "{out}"
+    );
+    assert_eq!(commit_at(&lab, "integration"), composition, "{out}");
+    assert_eq!(entries(&home).len(), before, "{out}");
+}
+
+#[test]
+fn an_include_then_a_cut_before_the_push_keeps_a_member_the_record_kept() {
+    // Given: W1, a cut of `feat/alpha` (two lines), pushed; P1, published by
+    // hand as a merge of W1 and `feat/gamma`, and recorded, which keeps
+    // `feat/alpha` through W1; then `include feat/zeta`, whose edit leaves W1
+    // out, and a cut of that write before it is pushed.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha one\nalpha two\n");
+    let home = fixed_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both(&first));
+    let w1 = publish(&lab);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    compose(&lab, &[w1.as_str(), "feat/gamma"], |_| {});
+    publish(&lab);
+    let recorded = knives_release(&lab, &home, &["cut"]);
+    assert_ne!(
+        recorded.status.code(),
+        Some(3),
+        "fixture: {}",
+        both(&recorded)
+    );
+    lab.branch("feat/zeta", "zeta.txt", "zeta\n");
+    let included = knives_release(&lab, &home, &["include", "feat/zeta"]);
+    assert_ne!(
+        included.status.code(),
+        Some(3),
+        "fixture: {}",
+        both(&included)
+    );
+
+    // When: the write is cut before it is pushed.
+    let cut = knives_release(&lab, &home, &["cut"]);
+
+    // Then: the cut goes ahead, and its event keeps `feat/alpha`, which it
+    // carries but does not merge.
+    assert_ne!(cut.status.code(), Some(3), "{}", both(&cut));
+    let event = newest_event(&home);
+    assert!(event.text.starts_with("cut integration as"), "{event:?}");
+    assert!(
+        records_member(&event, &commit_at(&lab, "feat/alpha")),
+        "{event:?}"
+    );
 }
 
 #[test]
@@ -985,6 +1113,124 @@ fn a_member_the_published_commit_holds_through_its_carrier_stays_recorded() {
     assert_eq!(cut.status.code(), Some(3), "{out}");
     assert!(out.contains("alpha two"), "{out}");
     assert_eq!(entries(&home).len(), before, "{out}");
+}
+
+#[test]
+fn a_member_whose_line_a_record_waives_stays_recorded() {
+    // Given: W1, a cut of `feat/alpha` (`alpha one`, `alpha two`), pushed;
+    // P1, published by hand as a merge of W1 and `feat/gamma` without `alpha
+    // two`, recorded with the drop its refusal names; then P2, published as
+    // a merge of P1 and `feat/zeta` that also drops `alpha one`, which P1
+    // held.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha one\nalpha two\n");
+    let home = fixed_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both(&first));
+    let w1 = publish(&lab);
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let p1 = compose(&lab, &[w1.as_str(), "feat/gamma"], |work| {
+        std::fs::write(work.join("alpha.txt"), "alpha one\n").expect("write alpha.txt");
+    });
+    publish(&lab);
+    let refused = knives_release(&lab, &home, &["cut"]);
+    let recorded = cut_dropping(&lab, &home, &named_drops(&both(&refused)));
+    assert_ne!(
+        recorded.status.code(),
+        Some(3),
+        "fixture: {}",
+        both(&recorded)
+    );
+    let event = newest_event(&home);
+    lab.branch("feat/zeta", "zeta.txt", "zeta\n");
+    compose(&lab, &[p1.as_str(), "feat/zeta"], |work| {
+        std::fs::write(work.join("alpha.txt"), "").expect("write alpha.txt");
+    });
+    publish(&lab);
+    let before = entries(&home).len();
+
+    // When: a plain cut runs.
+    let cut = knives_release(&lab, &home, &["cut"]);
+
+    // Then: P1's record kept `feat/alpha`, whose line it waived, so P2's cut
+    // is refused, names `alpha one`, and writes nothing.
+    assert_eq!(event.evidence.first(), Some(&p1.as_str().to_owned()));
+    assert!(
+        records_member(&event, &commit_at(&lab, "feat/alpha")),
+        "{event:?}"
+    );
+    let out = both(&cut);
+    assert_eq!(cut.status.code(), Some(3), "{out}");
+    assert!(out.contains("alpha one"), "{out}");
+    assert_eq!(entries(&home).len(), before, "{out}");
+}
+
+#[test]
+fn a_member_another_member_descends_from_stays_recorded() {
+    // Given: W1, a cut of `feat/alpha`, pushed; `feat/alpha2`, a commit on
+    // `feat/alpha`; then P1, published by hand as a merge of W1 and
+    // `feat/alpha2`, which reaches `feat/alpha` by ancestry.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let home = fixed_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both(&first));
+    let w1 = publish(&lab);
+    let alpha = commit_at(&lab, "feat/alpha");
+    commit_files(
+        &lab,
+        "feat/alpha2",
+        alpha.as_str(),
+        &[("alpha2.txt", "alpha2\n")],
+    );
+    let p1 = compose(&lab, &[w1.as_str(), "feat/alpha2"], |_| {});
+    publish(&lab);
+
+    // When: a plain cut runs.
+    let cut = knives_release(&lab, &home, &["cut"]);
+
+    // Then: P1 is recorded, and its event keeps `feat/alpha`, which it does
+    // not merge.
+    assert_ne!(cut.status.code(), Some(3), "{}", both(&cut));
+    let event = newest_event(&home);
+    assert_eq!(event.evidence.first(), Some(&p1.as_str().to_owned()));
+    assert!(records_member(&event, &alpha), "{event:?}");
+}
+
+#[test]
+fn a_member_rewritten_in_place_stays_recorded_by_its_recorded_commit() {
+    // Given: W1, a cut of `feat/alpha`, pushed; `feat/alpha` then reworded,
+    // which hides the recorded commit; then P1, published by hand as a merge
+    // of W1, the rewrite and `feat/gamma`.
+    let lab = Lab::new();
+    lab.branch("feat/alpha", "alpha.txt", "alpha\n");
+    let home = fixed_home(&lab);
+    let first = knives_release(&lab, &home, &["cut"]);
+    assert!(first.status.success(), "{}", both(&first));
+    let w1 = publish(&lab);
+    let alpha = commit_at(&lab, "feat/alpha");
+    lab.jj_work(["describe", "-r", "feat/alpha", "-m", "feat/alpha, reworded"]);
+    let rewrite = commit_at(&lab, "feat/alpha");
+    assert_ne!(rewrite, alpha, "fixture: the describe rewrote feat/alpha");
+    // The describe rebased the local `integration` onto the rewrite; the
+    // publish remote still holds W1, the commit P1 merges.
+    let rebased = commit_at(&lab, "integration");
+    lab.branch("feat/gamma", "gamma.txt", "gamma\n");
+    let p1 = compose(&lab, &[w1.as_str(), rewrite.as_str(), "feat/gamma"], |_| {});
+    if rebased != w1 {
+        lab.jj_work(["abandon", rebased.as_str()]);
+    }
+    publish(&lab);
+
+    // When: a plain cut runs.
+    let cut = knives_release(&lab, &home, &["cut"]);
+
+    // Then: P1 is recorded, and its event keeps the recorded `feat/alpha`,
+    // which P1 carries through its rewrite.
+    assert_ne!(cut.status.code(), Some(3), "{}", both(&cut));
+    let event = newest_event(&home);
+    assert_eq!(event.evidence.first(), Some(&p1.as_str().to_owned()));
+    assert!(records_member(&event, &alpha), "{event:?}");
 }
 
 #[test]
