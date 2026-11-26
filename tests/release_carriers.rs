@@ -570,24 +570,31 @@ fn an_advance_over_a_carrier_keeps_the_hand_resolution_and_the_working_copy() {
 }
 
 #[test]
-fn a_cut_over_a_carrier_keeps_the_hand_resolution_and_the_working_copy() {
-    // Given: the adopted carrier state with a hand resolution, a working
-    // copy left on the release.
+fn a_cut_over_a_published_carrier_records_it_and_keeps_the_hand_resolution_and_the_working_copy() {
+    // Given: the adopted carrier state with a hand resolution, pushed, a
+    // working copy left on the release.
     let state = resolved_carrier_state();
     let (lab, home) = (&state.lab, &state.home);
     lab.jj_work(["new", RELEASE]);
 
-    // When: the fixed release is cut again, its candidate audited and the
-    // publish rebuilding it.
+    // When: the fixed release is cut again.
     let cut = release_ok(lab, home, &["cut"]);
 
-    // Then: the cut holds the resolution and carries no carrier. The
-    // resolution holds both members' lines, so the audit carries neither
-    // forward. The plan it prints first shows the release in hand, carrier
-    // included.
+    // Then: the cut records the published release, carrier and all, and
+    // makes no commit: a cut of a fixed branch records what is published.
+    // The resolution holds both members' lines, so the audit carries
+    // neither forward.
+    assert!(
+        cut.contains(&format!(
+            "demo: recorded published composition {RELEASE}@origin ({}) as the cut",
+            state.release.short()
+        )),
+        "{cut}"
+    );
     assert!(!cut.contains("carried forward"), "{cut}");
+    assert_eq!(commit_at(lab, RELEASE), state.release, "{cut}");
     assert_resolution_kept(lab, "cut");
-    assert!(!release_parents(lab, RELEASE).contains(&state.carrier));
+    assert!(release_parents(lab, RELEASE).contains(&state.carrier));
     assert_working_copy_on(lab, &state.release, "cut");
     assert_no_anonymous_head(lab, home, "cut");
 }

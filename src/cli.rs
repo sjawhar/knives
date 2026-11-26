@@ -623,6 +623,22 @@ pub enum ReleaseAction {
     /// On a fork that shares its ledger, the cut's ledger event is pushed
     /// there before the command exits.
     ///
+    /// On a fixed release branch whose composition in hand is the publish
+    /// remote's commit, the cut records that commit and never makes another;
+    /// `--at REV` records REV, a commit the publish remote's commit is or
+    /// holds, so that releases published one on the other are recorded in
+    /// order. A parent that is an earlier write of the branch the ledger
+    /// records is a carrier, and every other parent a member. Where no
+    /// parent is such a write and a parent holds one, the cut refuses and
+    /// names that parent: it may be a release published on that write and
+    /// never recorded (record it first with `--at`), or a member. Each member
+    /// is read against the recorded write the commit follows, never against
+    /// the commit itself: a member whose line it lacks is refused, unless
+    /// that write recorded the member and lacked the line too, or
+    /// `--allow-drop` names the member. The event keeps the followed write's
+    /// members that the commit holds through a carrier. Drift is measured
+    /// from the commit's carrier.
+    ///
     /// With `--at`, record a release cut outside knives instead: the commit
     /// REV becomes NAME's recorded cut, and no commit is made. NAME must sort
     /// after every other release of the series, so record the older name
@@ -636,51 +652,44 @@ pub enum ReleaseAction {
     /// `adopt` of any release of the series recorded, file by file: at each
     /// file where the file's reference, the newest recorded write that holds
     /// it with no conflict, still holds the adopt's content, REV's own tree
-    /// must carry the adopt's change there, by a replay where this
-    /// repository can measure the adopt, else by holding what the reference
-    /// holds there, nothing included. A write that leaves the file
-    /// conflicted is no reference and does not end the hold. A deletion is
-    /// content: a REV that holds a file the fix deleted lacks the fix. For an
-    /// adopt this repository cannot measure, as where it does not hold the
-    /// adopt, each named file is held to what its reference holds, and a
-    /// reference that holds nothing there holds the fix as an absence. An
-    /// adopt event that an older knives wrote names its files in its text
-    /// alone; each path that its text may name is held where this
-    /// repository cannot measure the adopt, and where it can, each such path
-    /// that the adopt's own tree holds. Where this repository cannot measure
-    /// the adopt and that text does not read whole (a list of more than 16
-    /// pieces, or a list of files resolved by hand that another part
-    /// follows, which may end there or name a path that holds that part),
-    /// REV is refused, naming the adopt, and the fetch of its commit where
-    /// this repository does not hold it and origin or the publish remote has
-    /// a branch or tag at it, else `--allow-drop` alone. `--allow-drop` is
-    /// the last resort there: it also waives the checks of each recorded
-    /// member, of the newest recorded write and of each other fix by hand. A
-    /// repository that does not hold the newest write is refused and told to
-    /// fetch it. No reap runs, and the release is not signed or pushed; its
-    /// ledger event is pushed as a cut's is.
+    /// must carry the adopt's change there, by a replay. A write that leaves
+    /// the file conflicted is no reference and does not end the hold. A
+    /// deletion is content: a REV that holds a file the fix deleted lacks
+    /// the fix. An adopt whose commit this repository does not hold holds
+    /// nothing: the command names it and goes on. A repository that does not
+    /// hold the newest write is refused and told to fetch it. No reap runs,
+    /// and the release is not signed or pushed; its ledger event is pushed as
+    /// a cut's is.
     Cut {
         /// The dated release name, `release/[<series>/]YYYY-MM-DD[.N|-<label>]`.
         /// It must sort after the newest release of the series. Omit it for a
         /// configured fixed release branch.
         name: Option<String>,
-        /// Proceed even when the cut would drop something: commits reachable
-        /// only from the previous release lineage, members that the
-        /// previous cut's ledger event or the newest recorded write of the
-        /// newest release the ledger records in the series holds, a file of
-        /// a fix by hand that an `adopt` of any release of the series
-        /// recorded and the file's reference still holds, a fix by hand
-        /// whose files this repository cannot read whole, or the newest write
-        /// itself where this repository does not hold it. The refusal lists
-        /// exactly what, each file of a fix by name.
-        #[arg(long)]
-        allow_drop: bool,
+        /// Proceed without one drop the refusal names, and only that one;
+        /// repeat it for each. DROP is a member's commit (one the gate names,
+        /// or one whose line a fixed branch's published commit lacks), a
+        /// commit the orphan gate names, or the newest recorded write's
+        /// commit where this repository does not hold it, each by at least
+        /// its first 12 characters; or a file of a fix by hand by its path, or
+        /// `ADOPT:PATH` for one adopt's fix alone. The refusal lists each
+        /// drop and gives its `--allow-drop`. A drop that no DROP names still
+        /// refuses, and so does a DROP that names no drop.
+        #[arg(long, value_name = "DROP")]
+        allow_drop: Vec<String>,
         /// Record a release cut outside knives: the commit becomes NAME's
-        /// recorded cut; no commit is made. A dated or series NAME only: a
-        /// fixed release branch records its published composition with a
-        /// plain `cut`.
+        /// recorded cut; no commit is made. On a fixed release branch, omit
+        /// NAME: REV must be the publish remote's commit of the branch or in
+        /// its history, and is recorded as a plain `cut` records that commit.
         #[arg(long, value_name = "REV")]
         at: Option<String>,
+        /// On a fixed release branch, withdraw WRITE, the branch's newest
+        /// recorded write, which the publish remote never held, and record
+        /// the published commit (or `--at`'s) in its place. The composition
+        /// in hand must be that commit, and the publish remote must not hold
+        /// WRITE. The ledger keeps both events: no reader takes WRITE for a
+        /// write of the branch again.
+        #[arg(long, value_name = "WRITE")]
+        corrects: Option<String>,
     },
     /// Rebase the composition onto an upstream commit: `jj rebase -b <release> -d <target>`.
     ///

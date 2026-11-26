@@ -221,8 +221,9 @@ fn edit_the_published_release(lab: &Lab) -> CommitId {
 fn published_remedy(previous: &CommitId, edited: &CommitId, dropped: Option<&CommitId>) -> String {
     let stated = dropped.map_or_else(String::new, |commit| {
         format!(
-            " with `--allow-drop`, which must print `--allow-drop: nothing dropped` naming \
+            " with `--allow-drop {}`, which must print `--allow-drop: nothing dropped` naming \
              exactly {} (any other answer is a stop)",
+            commit.short(),
             commit.short()
         )
     });

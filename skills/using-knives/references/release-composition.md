@@ -35,7 +35,7 @@ The release model, the verbs and the release-log conflict union: README.md, "Rel
 - the release in hand is unrecorded: adopt it ([releases.md](releases.md)).
 - the write would lose lines of a remaining member (`include`, `drop` and `advance` only). The edit names each path, member and line, and writes nothing. A line at a conflict that the write leaves is not counted. Read the named lines first. Then run the edit again with `--allow-loss '<reason>'`, put the lines back by hand, and record that with `knives release adopt <name> --why '<reason>'` ([releases.md](releases.md)).
 
-`--allow-loss` and the cut's `--allow-drop` differ. `--allow-drop` lets a cut leave out members, commits, a fix by hand, or a newest write that this repository does not hold. `--allow-loss` lets an edit write a file that loses a remaining member's lines. Each needs a stated intent; neither is a way past a refusal you have not read.
+`--allow-loss` and the cut's `--allow-drop` differ. `--allow-drop <drop>` lets a cut leave out the one member, commit, fix-by-hand file, or newest write that this repository does not hold, that it names; repeat it per drop, as the refusal's last line gives. `--allow-loss` lets an edit write a file that loses a remaining member's lines. Each needs a stated intent; neither is a way past a refusal you have not read.
 
 An unreadable consumer, or a shared ledger that did not pull, blocks every plan, cut and edit. With no consumer registered or passed, the plan treats the release as unpinned.
 

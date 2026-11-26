@@ -1604,8 +1604,9 @@ fn a_cut_with_allow_drop_names_the_lines_a_dropped_member_lacks() {
     let dropped = knives_release(&lab, &home, &["drop", M, "--why", "not this time"]);
     assert_eq!(dropped.status.code(), Some(0), "{}", text(&dropped));
 
-    // When: the next cut is taken with `--allow-drop`.
-    let output = knives_release(&lab, &home, &["cut", NEXT, "--allow-drop"]);
+    // When: the next cut is taken with M's drop stated.
+    let m = commit_at(&lab, M);
+    let output = knives_release(&lab, &home, &["cut", NEXT, "--allow-drop", m.short()]);
 
     // Then: the cut goes ahead, its `--allow-drop` line names M, and after
     // it the gate names each line of M that the cut lacks.

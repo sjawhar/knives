@@ -753,6 +753,44 @@ pub fn knives_release(lab: &Lab, home: &tempfile::TempDir, args: &[&str]) -> std
         .expect("run knives release")
 }
 
+/// [`knives_release`] of `args`, run again with the `--allow-drop` of each
+/// drop a refusal names (its `  name each drop: ` line) until no refusal
+/// names one more, for a test whose drops are not what it checks: an older
+/// knives took a bare `--allow-drop` for every drop at once. Returns the
+/// last run and the drops it named, in the order named.
+pub fn knives_release_naming_each_drop(
+    lab: &Lab,
+    home: &tempfile::TempDir,
+    args: &[&str],
+) -> (std::process::Output, Vec<String>) {
+    let mut drops: Vec<String> = Vec::new();
+    loop {
+        let mut all: Vec<&str> = args.to_vec();
+        for drop in &drops {
+            all.extend(["--allow-drop", drop.as_str()]);
+        }
+        let output = knives_release(lab, home, &all);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let new: Vec<String> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("  name each drop: "))
+            .flat_map(|flags| flags.split("--allow-drop "))
+            .map(str::trim)
+            .filter(|drop| !drop.is_empty())
+            .map(|drop| {
+                drop.strip_prefix('\'')
+                    .and_then(|quoted| quoted.strip_suffix('\''))
+                    .map_or_else(|| drop.to_owned(), |quoted| quoted.replace("'\\''", "'"))
+            })
+            .filter(|drop| !drops.contains(drop))
+            .collect();
+        if output.status.code() != Some(3) || new.is_empty() {
+            return (output, drops);
+        }
+        drops.extend(new);
+    }
+}
+
 fn git<const N: usize>(directory: &Path, trunk: &str, args: [&str; N]) {
     let status = git_command(directory, trunk)
         .args(args)
