@@ -29,9 +29,9 @@ const PREVIOUS: &str = "release/2026-08-04";
 const NEXT: &str = "release/2026-08-05";
 
 /// A fork whose publish remote is a remote of its own, `release`, in the
-/// shape of INFRA-4355's rehearsal: the previous release P, a flat merge of
+/// shape of the orphan gate's rehearsal: the previous release P, a flat merge of
 /// alpha and beta, pushed to `release` and tagged; and C1, a commit on top of
-/// P that the next cut does not carry, as `bet-1213/n1` was on 8.0.9.
+/// P that the next cut does not carry, as a lane's branch was on 8.0.9.
 ///
 /// Only `holder`, a `(remote, branch)`, holds C1: the branch is pushed there
 /// and forgotten here, so it is that remote's alone, and untracked. `None`

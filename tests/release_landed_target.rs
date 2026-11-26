@@ -10,7 +10,7 @@
 //! exit 3 and writes nothing. Where no member would stay, it refuses as
 //! before. The same holds whether the rebase moved the release or found
 //! that it already contains the target. The shapes are those of
-//! INFRA-4895's drop-after-adopt probe (versions 3 and 4), with the forge
+//! the drop-after-adopt probe (versions 3 and 4), with the forge
 //! faked by the snapshot shim. These tests drive only the knives binary.
 
 #![allow(
