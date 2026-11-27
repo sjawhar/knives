@@ -562,7 +562,7 @@ When releases publish to a separate remote, `knives audit` holds each release re
 
 Its gates come in this order. Each refusal writes nothing and exits `3`, unless the gate says otherwise:
 
-1. NAME is a dated cut of the series, in the grammar above, that git can hold as a ref. Else the command is a usage error (exit `2`). `--at` on a fixed release branch is a usage error too: a plain `cut` records that branch's published composition.
+1. NAME is a dated cut of the series, in the grammar above, that git can hold as a ref. Else the command is a usage error (exit `2`). On a fixed release branch, `knives release cut --at REV` takes no NAME: REV must be the publish remote's commit of the branch or one in its history, the oldest unrecorded release first.
 2. The plan has no problems, and a shared ledger pulls.
 3. REV names one commit. That commit has no conflict, is no workspace's working copy, and shares history with the trunk: the root commit, and a commit made on the root apart from the trunk, are refused.
 4. When the ledger records a write of NAME and its newest write is REV, the command says that NAME at REV `is already recorded`, writes nothing, and exits with the plan's exit (`0` when the plan is clean). When the newest write is another commit, the refusal names that commit: a commit made over a recorded write is recorded with `knives release adopt`.
