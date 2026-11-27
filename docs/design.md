@@ -155,9 +155,14 @@ request without trying to track a branch named `#<n>`. Readers can select notes,
 dispositions; the last class means notes that carry the optional field.
 
 `knives notch --verify` re-checks selected entries against all commits visible to the repository
-and its local bookmark tips. It flags a missing commit-shaped evidence token, a vanished anchor,
-or a subject whose anchor no longer matches its local tip. That makes an old entry's context
-inspectable without rewriting its past-tense record.
+and the tips of each entry's subject, its local bookmark and the same name on each remote. It flags
+a missing commit-shaped evidence token, a vanished anchor, or an anchor that has moved: the rule a
+note's anchor was chosen by (below), applied to the repository now, lands elsewhere. A note its
+evidence anchored at a remote's tip holds while that tip does, whatever the local bookmark holds; a
+note anchored at the local bookmark is flagged once that bookmark moves, even while a remote still
+holds the old commit. Where the rule lands nowhere, the anchor has moved only when every tip of the
+subject here has left it; a subject with no tip here was deleted, which leaves the entry valid. That
+makes an old entry's context inspectable without rewriting its past-tense record.
 
 ## Forge snapshot and cache
 

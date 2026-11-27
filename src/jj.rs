@@ -599,32 +599,58 @@ impl Repo {
     /// Each only where it points at one commit, as [`Self::bookmark_tips`]
     /// keeps them; empty when `name` is no bookmark here.
     pub fn tips_of(&self, name: &str) -> Vec<(BookmarkRef, CommitId)> {
-        let view = self.repo.view();
-        let Some((_, targets)) = view.bookmarks().find(|(found, _)| found.as_str() == name) else {
-            return Vec::new();
-        };
+        self.repo
+            .view()
+            .bookmarks()
+            .find(|(found, _)| found.as_str() == name)
+            .map_or_else(Vec::new, |(_, targets)| {
+                Self::tips_from(name, targets.local_target, targets.remote_refs)
+            })
+    }
+
+    /// [`Self::tips_of`] of each of `names` that is a bookmark here, by name,
+    /// read in one pass over the view.
+    pub fn tips_of_each(
+        &self,
+        names: &BTreeSet<&str>,
+    ) -> BTreeMap<String, Vec<(BookmarkRef, CommitId)>> {
+        self.repo
+            .view()
+            .bookmarks()
+            .filter(|(name, _)| names.contains(name.as_str()))
+            .map(|(name, targets)| {
+                let tips =
+                    Self::tips_from(name.as_str(), targets.local_target, targets.remote_refs);
+                (name.as_str().to_owned(), tips)
+            })
+            .collect()
+    }
+
+    /// The tips of the bookmark `name`, from its local target and its remote
+    /// refs, as [`Self::tips_of`] reads them.
+    fn tips_from<'a>(
+        name: &str,
+        local: &RefTarget,
+        remote_refs: impl IntoIterator<Item = (&'a JjRemoteName, &'a RemoteRef)>,
+    ) -> Vec<(BookmarkRef, CommitId)> {
         let branch = BranchName::new(name);
-        let local = targets
-            .local_target
+        let local = local
             .as_normal()
             .map(|commit| (BookmarkRef::Local(branch.clone()), commit_id(commit)));
-        let remote = targets
-            .remote_refs
-            .into_iter()
-            .filter_map(|(remote, target)| {
-                let remote = RemoteName::new(remote.as_str());
-                if remote.is_git_view() {
-                    return None;
-                }
-                let commit = commit_id(target.target.as_normal()?);
-                Some((
-                    BookmarkRef::Remote {
-                        branch: branch.clone(),
-                        remote,
-                    },
-                    commit,
-                ))
-            });
+        let remote = remote_refs.into_iter().filter_map(|(remote, target)| {
+            let remote = RemoteName::new(remote.as_str());
+            if remote.is_git_view() {
+                return None;
+            }
+            let commit = commit_id(target.target.as_normal()?);
+            Some((
+                BookmarkRef::Remote {
+                    branch: branch.clone(),
+                    remote,
+                },
+                commit,
+            ))
+        });
         local.into_iter().chain(remote).collect()
     }
 

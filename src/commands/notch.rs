@@ -11,8 +11,8 @@ use crate::cli::Exit;
 use crate::commands::claim::{Bound, current_identity};
 use crate::ids::{BookmarkRef, BranchName, BranchTarget, RepoName, short_id};
 use crate::ledger::{
-    Anchoring, Draft, Entry, EntryClass, Filter, Kind, Ledger, LedgerError, Scribe, VerifyFlag,
-    body_human_text, inline_human_text, select, verify_entries,
+    Anchoring, Draft, Entry, EntryClass, Filter, Kind, Ledger, LedgerError, Scribe, SubjectNow,
+    VerifyFlag, anchor_in, body_human_text, inline_human_text, select, verify_entries,
 };
 use crate::store::{Store, default_state_path};
 
@@ -367,16 +367,23 @@ fn verify(
         .into_iter()
         .map(|commit| commit.as_str().to_owned())
         .collect();
-    let tips = crate::jj::Repo::open(path)?
-        .bookmark_tips()?
-        .into_iter()
-        .filter_map(|(reference, tip)| {
-            reference
-                .is_local()
-                .then(|| (reference.branch().to_string(), tip.as_str().to_owned()))
-        })
+    // Each entry is checked against where the writer's rule anchors it now,
+    // from its subject's tips here, local and on each remote: an entry its
+    // evidence anchored at origin's head holds while that head does.
+    let checkout = crate::jj::Repo::open(path)?;
+    let subjects: std::collections::BTreeSet<&str> = selected
+        .iter()
+        .filter_map(|entry| entry.subject.as_deref())
         .collect();
-    let flags = verify_entries(&selected, &visible, &tips);
+    let tips = checkout.tips_of_each(&subjects);
+    let flags = verify_entries(&selected, &visible, |entry| {
+        let Some(subject) = entry.subject.as_deref() else {
+            return SubjectNow::default();
+        };
+        let tips = tips.get(subject).map_or(&[][..], Vec::as_slice);
+        let (anchor, _) = anchor_in(&checkout, subject, &entry.evidence, tips);
+        SubjectNow { anchor, tips }
+    });
     Ok(Report::Verified {
         repo: repo.to_string(),
         checked: selected.len(),
