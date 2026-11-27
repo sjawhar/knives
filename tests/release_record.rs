@@ -213,6 +213,91 @@ fn a_hand_cut_release_is_recorded_by_one_command() {
 }
 
 #[test]
+fn a_record_that_supersedes_a_release_with_a_stale_parent_exits_on_its_own_result() {
+    // Given: knives cut `feat/base` and `feat/pr`, stacked on it, as
+    // RELEASE; then `feat/base` took `feat/pr` by moving onto it and went on
+    // with a commit, `feat/pr`'s bookmark kept. RELEASE's parent at
+    // `feat/base`'s old tip now carries no bookmark: a stale parent, a
+    // finding of the plan of RELEASE.
+    let lab = Lab::new();
+    lab.branch("feat/base", "base.txt", "base\n");
+    lab.jj_work(["new", "-r", "feat/base", "-m", "feat/pr"]);
+    std::fs::write(lab.work.join("pr.txt"), "pr\n").expect("write feat/pr");
+    lab.jj_work(["bookmark", "create", "feat/pr", "-r", "@"]);
+    lab.jj_work(["new"]);
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = knives_release(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(cut.status.code(), Some(0), "{}", text(&cut));
+    lab.jj_work(["bookmark", "set", "feat/base", "-r", "feat/pr"]);
+    lab.jj_work(["new", "-r", "feat/base", "-m", "feat/base goes on"]);
+    std::fs::write(lab.work.join("after.txt"), "after\n").expect("write feat/base");
+    lab.jj_work(["bookmark", "set", "feat/base", "-r", "@"]);
+    lab.jj_work(["new", "-r", "main@origin", "-r", "feat/base", "-m", "next"]);
+    let next = commit_of(&lab, "@");
+    lab.jj_work(["new"]);
+
+    // When: a hand merge of the trunk and `feat/base` is recorded as the
+    // next release.
+    let recorded = record(&lab, &home, "release/2026-08-05", &next);
+
+    // Then: it is recorded and exits 0: the stale parent is RELEASE's,
+    // which the record supersedes.
+    let out = text(&recorded);
+    assert!(
+        out.contains(&recorded_line("release/2026-08-05", &next)),
+        "{out}"
+    );
+    assert_eq!(recorded.status.code(), Some(0), "{out}");
+}
+
+#[test]
+fn a_record_of_a_stacked_member_without_its_base_counts_the_bases_work_as_its_own() {
+    // Given: `feat/pr`, stacked on `feat/base`, and hand merges of the trunk
+    // and `feat/pr` alone, one as it merges and one with `feat/base`'s file
+    // removed by hand: `feat/base` is left out, its commit riding in under
+    // `feat/pr`.
+    for drops in [false, true] {
+        let lab = Lab::new();
+        lab.branch("feat/base", "base.txt", "base\n");
+        lab.jj_work(["new", "-r", "feat/base", "-m", "feat/pr"]);
+        std::fs::write(lab.work.join("pr.txt"), "pr\n").expect("write feat/pr");
+        lab.jj_work(["bookmark", "create", "feat/pr", "-r", "@"]);
+        lab.jj_work(["new", "-r", "main@origin", "-r", "feat/pr", "-m", "release"]);
+        if drops {
+            std::fs::remove_file(lab.work.join("base.txt")).expect("drop base.txt");
+        }
+        // `jj new` snapshots the merge, with the removal, before it is read.
+        lab.jj_work(["new"]);
+        let release = commit_of(&lab, "@-");
+        let (home, _consumer) = release_test_home(&lab);
+
+        // When: it is recorded.
+        let recorded = record(&lab, &home, RELEASE, &release);
+
+        // Then: `feat/pr`'s own change from the trunk holds `feat/base`'s
+        // file: the merge that holds it is recorded, exit 0, and the one
+        // that dropped it is refused, exit 3, naming `feat/pr` and the file.
+        let out = text(&recorded);
+        if drops {
+            assert_eq!(recorded.status.code(), Some(3), "{out}");
+            assert!(
+                out.lines().any(|line| {
+                    line.contains("!! feat/pr")
+                        && line.contains(
+                            "the cut tree is missing or diverges from the member's content",
+                        )
+                }),
+                "{out}"
+            );
+            assert!(out.contains("base.txt:1: added line lost ‹base›"), "{out}");
+        } else {
+            assert!(out.contains(&recorded_line(RELEASE, &release)), "{out}");
+            assert_eq!(recorded.status.code(), Some(0), "{out}");
+        }
+    }
+}
+
+#[test]
 fn recording_an_absent_name_makes_its_bookmark_at_the_commit() {
     // Given: a release merged by hand that no ref names.
     let lab = Lab::new();

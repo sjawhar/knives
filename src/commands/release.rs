@@ -1809,6 +1809,10 @@ pub enum CarriedFrom {
     /// knives wrote or `adopt` recorded, and the row says it is carried
     /// forward.
     NewestWrite,
+    /// The release `members --verify` reads a release against: the one it
+    /// replaced, never a later one ([`release_replaced`]). The row says the
+    /// member is carried from it.
+    Followed,
 }
 
 /// The row for a member the audited release diverges from exactly where the
@@ -1841,7 +1845,22 @@ pub fn carried_row(name: &str, from: CarriedFrom) -> String {
         CarriedFrom::NewestWrite => format!(
             "  {name}: diverges where the newest recorded write already does; carried forward"
         ),
+        CarriedFrom::Followed => {
+            format!("  {name}: carried from the previous release, which lacked the same lines")
+        }
     }
+}
+
+/// The row for a member the audited release lacks only lines of that `by`,
+/// other members, changed too ([`CutAudit::unresolved`]).
+pub fn unresolved_row(name: &str, by: &str) -> String {
+    // Both names are members' bookmarks, read from the repository.
+    format!(
+        "  {}: unresolved: {} changed the lines this release lacks too; the member's review \
+         judges them",
+        crate::ledger::inline_human_text(name),
+        crate::ledger::inline_human_text(by)
+    )
 }
 
 /// What a cut's drift is measured from, which its unexplained rows name
@@ -2435,14 +2454,95 @@ fn member_label(member: &MemberRow) -> String {
     )
 }
 
+/// The release the release `name` at `commit` replaced.
+///
+/// `--verify` reads it against that release, never a later one
+/// ([`gather_members`]). In a dated series: the newest release strictly
+/// older by the series' order, read by its own name or, asked by its commit,
+/// by the newest dated name on it. On a fixed branch: the branch's release
+/// in hand, for a commit the ledger records no write of (a candidate); a
+/// recorded write replaced an earlier one this reading does not name. One
+/// with none follows none, and carries nothing forward; so does one that
+/// reaches its candidate.
+fn release_replaced(
+    opened: &Repo,
+    (entry, tips): (&RepoEntry, &BookmarkTips),
+    (name, commit): (&str, &CommitId),
+    ledger: &[Entry],
+) -> anyhow::Result<Option<CommitId>> {
+    let scheme = entry.release_scheme();
+    let replaced = if let ReleaseScheme::Fixed(_) = scheme {
+        // Only a write of the release counts as recorded: a notch or any
+        // other event naming the commit is none.
+        let recorded = crate::release_model::series_writes(ledger, &scheme, None)
+            .iter()
+            .any(|write| write.commit == *commit);
+        (!recorded)
+            .then(|| crate::release_model::previous_release_for_cut(entry, tips))
+            .flatten()
+    } else {
+        let asked = BookmarkRef::parse(name).branch().as_str().to_owned();
+        let named = if scheme.cut_key(&asked).is_some() {
+            Some(asked)
+        } else {
+            // Only our own release refs name the commit: an upstream or
+            // other foreign ref of a release name is none of ours.
+            tips.iter()
+                .filter(|(reference, at)| {
+                    *at == commit && is_our_release(reference, &scheme, entry.publish_remote())
+                })
+                .map(|(reference, _)| reference.branch().as_str().to_owned())
+                .filter(|branch| scheme.cut_key(branch).is_some())
+                .max_by(|left, right| scheme.cut_key(left).cmp(&scheme.cut_key(right)))
+        };
+        named.and_then(|named| crate::release_model::release_replaced_by(entry, tips, &named))
+    };
+    Ok(match replaced.map(|(_, previous)| previous) {
+        Some(previous) if previous != *commit && !opened.is_ancestor(commit, &previous)? => {
+            Some(previous)
+        }
+        _ => None,
+    })
+}
+
+/// The commits that name a release's members for `--verify`: its own
+/// `parents`, or, for a release whose commit has one parent (a hand edit on
+/// top of its cut), the parents of the nearest merge on its first-parent
+/// line that `trunk` does not reach. With no such merge, its own parents.
+fn composing_parents(
+    opened: &Repo,
+    parents: &[CommitId],
+    trunk: &CommitId,
+) -> anyhow::Result<Vec<CommitId>> {
+    let mut below = parents.to_vec();
+    loop {
+        let [only] = below.as_slice() else {
+            return Ok(if below.len() > 1 {
+                below
+            } else {
+                parents.to_vec()
+            });
+        };
+        if opened.is_ancestor(only, trunk)? {
+            return Ok(parents.to_vec());
+        }
+        below = opened.parent_commits(only.as_str())?;
+    }
+}
+
 /// Gather the parents, holders, and optional content audit for a named release.
 ///
 /// `ledger` is the fork's ledger: the writes it records under the name, with
 /// the publish remote's commit of it, are the carriers a row labels
 /// ([`EarlierWrites`]). `verify` reads each member's own lines (`--verify`),
-/// each from the member's own fork point with the upstream trunk, against no
-/// previous release: a member whose lines the tree does not hold reads as
-/// missing, however the release came to drop them.
+/// each from its base ([`member_base`]), against the release it replaced,
+/// never a later one ([`release_replaced`]). A member that release holds
+/// and that lacks only lines that release also lacks is carried from it,
+/// and the report says so per member; a member whose lines the tree does
+/// not hold otherwise reads as missing, however the release came to drop
+/// them. A release whose commit is a hand edit on top of its cut is
+/// verified through that cut's parents ([`composing_parents`]): its rows
+/// are those, and a note says so.
 pub fn gather_members(
     opened: &Repo,
     fork: &Fork<'_>,
@@ -2475,32 +2575,50 @@ pub fn gather_members(
         remote: RemoteName::new(entry.publish_remote()),
     });
     let writes = EarlierWrites::read(opened, release.as_str(), ledger, published)?;
+    let mut notes = Vec::new();
+    let read = match (&trunk, verify) {
+        (Some(trunk), true) => composing_parents(opened, &parents, trunk)?,
+        _ => parents.clone(),
+    };
+    if read != parents {
+        notes.push(format!(
+            "{} has one parent; --verify reads the members of the merge below it",
+            commit.short()
+        ));
+    }
     let members = parent_rows(
         opened,
-        (release_parents(&tips, &parents), &writes),
+        (release_parents(&tips, &read), &writes),
         (trunk.as_ref(), &successions),
     )?;
     let audit = if verify {
         trunk
             .as_ref()
-            .map(|trunk| {
+            .map(|trunk| -> anyhow::Result<CutAudit> {
                 let members: Vec<(String, CommitId)> = members
                     .iter()
                     .filter(|member| is_member(member))
                     .map(|member| (member_label(member), member.commit.clone()))
                     .collect();
+                let follows = release_replaced(opened, (entry, &tips), (name, &commit), ledger)?;
+                let member_tips: Vec<CommitId> =
+                    members.iter().map(|(_, tip)| tip.clone()).collect();
+                let fork_point = opened.fork_point_of(&member_tips, trunk)?;
                 audit_cut(
                     &fork.checkout.path,
                     &members,
                     CutSubject::Committed(&commit),
                     AuditContext {
-                        previous: None,
+                        previous: follows.as_ref(),
                         forward_members: None,
+                        releases: &known_releases(ledger, entry, &tips),
                         upstream_trunk: trunk,
                         trunk_parents: &[],
                         trunk_parent_base: None,
-                        drift_trunk: trunk,
-                        drift_from: None,
+                        drift_trunk: &fork_point,
+                        drift_from: follows
+                            .as_ref()
+                            .map(|previous| (previous, DriftBase::PreviousRelease)),
                     },
                 )
             })
@@ -2515,7 +2633,7 @@ pub fn gather_members(
         parent_count,
         members,
         audit,
-        notes: Vec::new(),
+        notes,
         problems,
     })
 }
@@ -2559,7 +2677,11 @@ pub fn render_members(report: &MembersReport) -> String {
     }
     if let Some(audit) = &report.audit {
         for name in &audit.carried {
-            lines.push(carried_row(name, CarriedFrom::Unledgered));
+            lines.push(carried_row(name, CarriedFrom::Followed));
+        }
+        for (name, by) in &audit.unresolved {
+            lines.push(unresolved_row(name, by));
+            lines.extend(audit.unresolved_lines_of(name));
         }
         for name in &audit.inconclusive {
             lines.push(format!(
@@ -2571,6 +2693,10 @@ pub fn render_members(report: &MembersReport) -> String {
         for member in report.members.iter().filter(|member| is_member(member)) {
             let name = member_label(member);
             if !audit.carried.contains(&name)
+                && !audit
+                    .unresolved
+                    .iter()
+                    .any(|(unresolved, _)| *unresolved == name)
                 && !audit.inconclusive.contains(&name)
                 && !audit.missing.contains(&name)
             {
@@ -3319,6 +3445,11 @@ pub struct CutAudit {
     /// each row says how the previous release stands to its recorded writes
     /// ([`carried_row`]).
     pub carried: Vec<String>,
+    /// Members the subject lacks only lines of that another member changed
+    /// too ([`read_overlaps`]), each with the members whose changes overlap.
+    /// Not carried: each is listed with its lines for its review, and makes
+    /// `--verify` and a cut exit with findings; it refuses nothing.
+    pub unresolved: Vec<(String, String)>,
     /// Each member's own lines against the cut, carried or not, each from its
     /// fork point with the upstream trunk ([`audit_cut`]): what the cut
     /// lacks of them, and the lines it holds only by their words.
@@ -3339,6 +3470,26 @@ impl CutAudit {
             .find(|lines| lines.label == name)
             .map_or_else(Vec::new, |lines| {
                 lost_lines((&lines.lost, &lines.word_step_skipped), LOST_LINE_INDENT)
+            })
+    }
+
+    /// The lines that name what the member labelled `name` lacks, as
+    /// [`Self::lost_lines_of`], with the lines another member changed too,
+    /// to print under an unresolved row ([`unresolved_row`]).
+    pub fn unresolved_lines_of(&self, name: &str) -> Vec<String> {
+        self.members
+            .iter()
+            .find(|lines| lines.label == name)
+            .map_or_else(Vec::new, |lines| {
+                let lost: Vec<Lost> = lines
+                    .lost
+                    .iter()
+                    .map(|lost| Lost {
+                        carried_forward: false,
+                        ..lost.clone()
+                    })
+                    .collect();
+                lost_lines((&lost, &lines.word_step_skipped), LOST_LINE_INDENT)
             })
     }
 
@@ -3409,6 +3560,28 @@ pub struct AuditContext<'a> {
     /// row of a file no member explains names ([`unexplained_row`]). `None`
     /// runs no drift check, as for a first cut.
     pub drift_from: Option<(&'a CommitId, DriftBase)>,
+    /// The commits knives knows as releases of the series ([`known_releases`]),
+    /// which a member may be built on ([`member_base`]).
+    pub releases: &'a [CommitId],
+}
+
+/// The commits knives knows as releases of `entry`'s series.
+///
+/// Each write the ledger records in it ([`crate::release_model::series_writes`])
+/// and the tip of each of our own release refs ([`is_our_release`]). No other
+/// commit is one, however it was merged.
+pub fn known_releases(ledger: &[Entry], entry: &RepoEntry, tips: &BookmarkTips) -> Vec<CommitId> {
+    let scheme = entry.release_scheme();
+    let mut releases: Vec<CommitId> = crate::release_model::series_writes(ledger, &scheme, None)
+        .into_iter()
+        .map(|write| write.commit)
+        .collect();
+    for (reference, at) in tips {
+        if is_our_release(reference, &scheme, entry.publish_remote()) && !releases.contains(at) {
+            releases.push(at.clone());
+        }
+    }
+    releases
 }
 
 /// Workspaces knives made for a branch that is gone and that nobody holds.
@@ -3599,21 +3772,23 @@ impl CutSubject<'_> {
 /// Verify the cut actually contains what it merged (spec 1.3).
 ///
 /// Each member is read by its own lines (spec R9): its own change is the
-/// diff from its base by spec R6 to its tip, its fork point with
-/// `context.upstream_trunk`, or, for a member the trunk contains, the base
-/// that the subject's parents give it ([`Repo::release_base`]): a member is
-/// a parent, so one the trunk contains is carried by ancestry. The cut
-/// carries a member where it holds each line that the change adds and does
-/// not hold again what it removes ([`jj::Repo::member_lines`]).
+/// diff from its base to its tip ([`member_base`]). Its base is its fork
+/// point with `context.upstream_trunk`, or, for a member the trunk contains,
+/// the base the subject's parents give it ([`Repo::release_base`]). A member
+/// stacked on another member keeps that base. A member built on a release
+/// starts at that release. The cut carries a member where it holds each line
+/// that the change adds and does not hold again what it removes
+/// ([`jj::Repo::member_lines`]).
+///
 /// A member whose own path holds an unresolved conflict, in the cut or at
-/// the member's tip, cannot be read there: it is inconclusive where it
-/// lacks nothing else. A member that lacks a line fails the audit, unless
-/// `context.previous` lacks that line too, read from the same base:
-/// a member whose every lost line the previous release lacked is carried
-/// forward ([`MemberLines::carry_forward`]). Where `context.forward_members`
-/// names the members that may carry forward, only those do, and every
-/// other member that lacks a line is missing. Each parent that the trunk
-/// holds (`context.trunk_parents`) is read beside the members, from
+/// the member's tip, cannot be read there: it is inconclusive where it lacks
+/// nothing else. A member that lacks a line fails the audit, unless
+/// `context.previous`, which holds the member, lacks that line too, read
+/// from the same base, or another member changed it too ([`read_overlaps`]).
+/// `context.forward_members` restricts carry-forward to the recorded members
+/// of a fixed branch's followed write. A member whose every lost line is
+/// otherwise carried forward reads unresolved. Each parent the trunk holds
+/// (`context.trunk_parents`) is read beside the members, from
 /// `context.trunk_parent_base`.
 ///
 /// The drift is what changed since `context.drift_from`, the release the
@@ -3649,11 +3824,7 @@ pub fn audit_cut(
     for ((name, tip), trunk_parent_base) in read {
         let base = match trunk_parent_base {
             Some(base) => base.clone(),
-            None => opened.release_base(
-                (tip, &opened.change_base(tip, context.upstream_trunk)?),
-                &parents,
-                || opened.taken_in(tip, context.upstream_trunk),
-            )?,
+            None => member_base(&opened, tip, (parents.as_slice(), &context))?,
         };
         let mut lines = subject.member_lines(&opened, name, (&base, tip))?;
         // A line the release held against already lacked is that release's
@@ -3663,18 +3834,31 @@ pub fn audit_cut(
         // changed, which reads inconclusive. Whether that resolution is
         // recorded is the caller's question, not this audit's: a hand edit
         // nothing recorded may have dropped a member's line, so it is
-        // `knives release adopt` that measures it before a cut.
+        // `knives release adopt` that measures it before a cut. Only a member
+        // that release holds (its tip is an ancestor of it) carries anything
+        // forward: a member new to the subject was never in it, so that
+        // release lacks all of the member's lines, and none of that is a
+        // resolution.
         if matches!(lines.reading, Reading::Missing | Reading::Inconclusive)
             && let Some(previous) = context.previous
+            && opened.is_ancestor(tip, previous)?
             && context
                 .forward_members
                 .is_none_or(|members| members.contains(tip))
         {
             lines.carry_forward(&opened.member_lines(name, (&base, tip), previous)?);
         }
+        let overlaps = if lines.reading == Reading::Missing {
+            read_overlaps(&opened, (tip, &base), members, &mut lines)?
+        } else {
+            Vec::new()
+        };
         match lines.reading {
             Reading::Carried => {}
             Reading::Inconclusive => audit.inconclusive.push(name.clone()),
+            Reading::CarriedForward if !overlaps.is_empty() => {
+                audit.unresolved.push((name.clone(), overlaps.join(", ")));
+            }
             Reading::CarriedForward => audit.carried.push(name.clone()),
             Reading::Missing => audit.missing.push(name.clone()),
         }
@@ -3705,6 +3889,169 @@ pub fn audit_cut(
             .collect();
     }
     Ok(audit)
+}
+
+/// Where the own change of the member at `tip` starts in a subject with
+/// `parents`: its base by spec R6 ([`Repo::release_base`]), moved up in two
+/// cases. A member new to the subject that was built on the release it
+/// follows shares that history with it: what it brings starts where it
+/// meets that release, so that release's lines, which it judged, are not
+/// charged to it. A member built on a release, that one or an older one, a
+/// landing among them, brings everything over that release
+/// ([`built_on_release`]). A member stacked on another member keeps its own
+/// base, so it answers for every line below it; where the other member's
+/// change overlaps it, it reads unresolved ([`read_overlaps`]).
+fn member_base(
+    opened: &Repo,
+    tip: &CommitId,
+    (parents, context): (&[CommitId], &AuditContext<'_>),
+) -> anyhow::Result<CommitId> {
+    let mut base = opened.release_base(
+        (tip, &opened.change_base(tip, context.upstream_trunk)?),
+        parents,
+        || opened.taken_in(tip, context.upstream_trunk),
+    )?;
+    let Some(previous) = context.previous else {
+        return Ok(base);
+    };
+    if opened.is_ancestor(tip, previous)? {
+        return Ok(base);
+    }
+    // On criss-cross history `fork_point_of` gives `previous` itself, which
+    // the tip does not reach: no base.
+    let met = opened.fork_point_of(std::slice::from_ref(tip), previous)?;
+    if met != base && opened.is_ancestor(&met, tip)? && opened.is_ancestor(&base, &met)? {
+        base = met;
+    }
+    // Where the member already reads from that release or past it (where it
+    // meets `previous`), it keeps that base.
+    if let Some(release) = built_on_release(opened, tip, (previous, context))?
+        && !opened.is_ancestor(&release, &base)?
+    {
+        base = release;
+    }
+    Ok(base)
+}
+
+/// How many commits of a member's first-parent line are read for the
+/// release it was built on ([`built_on_release`]).
+const MOST_LINE_STEPS: usize = 10_000;
+
+/// The release the member at `tip` was built on: the newest commit of its
+/// first-parent line, below its tip, that is `previous`, a release knives
+/// knows ([`AuditContext::releases`]) or a commit `previous` holds, met
+/// before any commit the upstream trunk holds. Every commit above it on that
+/// line is the member's own, a merge or not: a landing's merges of reviewed
+/// branches, a fix between them, or a feature's own commits under a later
+/// merge. `None` for a member built on the trunk, or on no such commit.
+fn built_on_release(
+    opened: &Repo,
+    tip: &CommitId,
+    (previous, context): (&CommitId, &AuditContext<'_>),
+) -> anyhow::Result<Option<CommitId>> {
+    let mut at = tip.clone();
+    for _ in 0..MOST_LINE_STEPS {
+        let Some(first) = opened.parent_commits(at.as_str())?.into_iter().next() else {
+            return Ok(None);
+        };
+        if opened.is_ancestor(&first, context.upstream_trunk)? {
+            return Ok(None);
+        }
+        if first == *previous
+            || context.releases.contains(&first)
+            || opened.is_ancestor(&first, previous)?
+        {
+            return Ok(Some(first));
+        }
+        at = first;
+    }
+    Ok(None)
+}
+
+/// Marks each lost line of `lines`, the reading of the member at `tip` whose
+/// change starts at `base`, that another member of the subject changed too:
+/// that member's tip lacks it while the commit the two share holds it (for a
+/// member stacked on this one, the shared commit is `tip` itself). Only the
+/// history says two changes overlap. Such a line is not carried: the member
+/// reads unresolved, for its review, and the other member answers for its
+/// own change on its own reading. The members whose changes overlap, where
+/// every lost line is so; otherwise none, and `lines` is as it was. A member
+/// left with a path no reading answers (a conflict, or a file it adds that
+/// the release changed, [`LostKind::AddedFileChanged`]) is not unresolved:
+/// its lost lines stay missing, named. Only the paths of lines still lost
+/// are read, and another member not at all where it holds what the shared
+/// commit holds there.
+fn read_overlaps(
+    opened: &Repo,
+    (tip, base): (&CommitId, &CommitId),
+    members: &[(String, CommitId)],
+    lines: &mut MemberLines,
+) -> anyhow::Result<Vec<String>> {
+    let label = lines.label.clone();
+    let marked: Vec<bool> = lines.lost.iter().map(|lost| lost.carried_forward).collect();
+    // A path absent from the release is not a line another member changed.
+    // Following it would turn an unresolved file identity into a false
+    // overlap.
+    let paths: Vec<String> = lines
+        .lost
+        .iter()
+        .filter(|lost| !lost.carried_forward && lost.kind != LostKind::File)
+        .map(|lost| lost.path.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut by = Vec::new();
+    for (other, other_tip) in members {
+        if other_tip == tip {
+            continue;
+        }
+        let stacked = opened.is_ancestor(tip, other_tip)?;
+        let shared = if stacked {
+            tip.clone()
+        } else {
+            opened.fork_point_of(std::slice::from_ref(tip), other_tip)?
+        };
+        if !opened.differs_at(&shared, other_tip, &paths)? {
+            continue;
+        }
+        let mut changed = opened.member_lines_at(&label, (base, tip), (other_tip, &paths))?;
+        changed.lost.retain(|lost| lost.kind != LostKind::File);
+        if !stacked {
+            let unshared = opened.member_lines_at(&label, (base, tip), (&shared, &paths))?;
+            changed.lost.retain(|lost| {
+                !unshared.lost.iter().any(|before| {
+                    before.kind == lost.kind && before.path == lost.path && before.line == lost.line
+                })
+            });
+        }
+        let carried = lines
+            .lost
+            .iter()
+            .filter(|lost| lost.carried_forward)
+            .count();
+        lines.carry_forward(&changed);
+        if lines
+            .lost
+            .iter()
+            .filter(|lost| lost.carried_forward)
+            .count()
+            > carried
+        {
+            by.push(other.clone());
+        }
+        if lines.reading == Reading::CarriedForward {
+            return Ok(by);
+        }
+        if lines.reading != Reading::Missing {
+            break;
+        }
+    }
+    for (lost, was) in lines.lost.iter_mut().zip(marked) {
+        lost.carried_forward = was;
+    }
+    let unchanged = MemberLines::new(label, lines.commit.clone(), lines.fork_point.clone());
+    lines.carry_forward(&unchanged);
+    Ok(Vec::new())
 }
 
 /// How far each line that names what a member lacks is indented under the
@@ -3856,8 +4203,8 @@ pub struct CompositionCheck {
     /// candidate or at the member's tip, and which lack nothing else:
     /// unanswerable either way, exactly as the audit reports it.
     pub inconclusive: Vec<RecordedMember>,
-    /// Recorded members carried by another commit with exactly their tree,
-    /// reachable from a parent: the member rendered for a human, and the twin.
+    /// Recorded members carried by a parent of the subject with exactly
+    /// their tree: the member rendered for a human, and the twin.
     pub twins: Vec<(String, CommitId)>,
     /// Whether this repository does not hold the newest recorded write
     /// ([`CompositionBaseline::newest_write`]). Nothing here can tell what
@@ -4360,7 +4707,7 @@ fn fix_baseline(
 #[derive(Debug)]
 pub struct CompositionDelta<'a> {
     pub baseline: &'a CompositionBaseline,
-    /// The cut's parents, for the identity and ancestry fast paths.
+    /// The cut's parents, for identity, rewrite and same-tree fast paths.
     pub parents: &'a [CommitId],
     /// The audit's base: what every current member forks from. A recorded
     /// member that is an ancestor of it entered the cut through the base — how
@@ -4382,22 +4729,28 @@ pub struct CompositionDelta<'a> {
 /// Members the baseline records that the cut subject does not carry, and the
 /// fixes by hand that the series holds that it lacks.
 ///
-/// Identity and ancestry account for a member that is still a parent, was
-/// advanced past, or entered through the cut's base. A member whose change was
-/// rewritten — `jj rebase` keeps the change id and mints a new commit — is
-/// carried when a rewrite that stands for it is reachable from a parent or
-/// the base: a successor of it, or a commit with its tree
-/// ([`Repo::standing_rewrites_of`]). The recorded commit itself is never an
-/// ancestor again after a rebase. A commit that only shares its change id,
-/// such as the older version a newer member replaced, carries nothing for
-/// it here, and the checks below measure the member. The one exception is
-/// the succession the ledger records: a member of the previous cut whose
-/// change id a member of the newest write has is superseded by that member,
-/// as `advance` recorded it, and is not held; that member is. A member
-/// recreated outside jj with exactly its tree is carried when that twin is
-/// reachable
-/// from a parent past the base ([`Repo::same_tree_between`]), and the twin
-/// is named. A member that none of these account for is read by its own
+/// Identity accounts for a member that is still a parent or entered through
+/// the cut's base. Ancestry through another member parent does not carry it:
+/// the checks below read that member's own lines against the subject. A
+/// member whose change was rewritten — `jj rebase` keeps the change id and
+/// mints a new commit — is carried when a rewrite that stands for it is a
+/// parent or the base reaches it ([`Repo::standing_rewrites_of`]); a rewrite
+/// reached only through another parent, as under a landing built on it,
+/// carries nothing, and the member's lines are read. The recorded commit
+/// itself is never an ancestor again after a rebase. A commit that only
+/// shares its change id, such as the older version a newer member replaced,
+/// carries nothing for it here, and the checks below measure the member.
+/// The one exception is the succession the ledger records: a member of the
+/// previous cut whose change id a member of the newest write has is
+/// superseded by that member, as `advance` recorded it, and is not held;
+/// that member is. A member recreated outside jj, or reworded, with exactly
+/// its tree is carried when that twin is a parent ([`Repo::same_tree`]), and
+/// the twin is named. A twin under a parent carries nothing on its own: the
+/// member's lines are read, and the twin then excuses one finding only, the
+/// file the member adds that the subject changed, which no reading can
+/// answer ([`Repo::same_tree_between`], [`LostKind::AddedFileChanged`]). A
+/// member that lacks a line, or whose path is conflicted, is never excused.
+/// A member that none of these account for is read by its own
 /// lines against the subject ([`jj::Repo::member_lines`]), the same measure
 /// [`audit_cut`] applies to current members, taken from the member's own
 /// fork point so a moved base is never charged to the member: that accounts
@@ -4479,22 +4832,12 @@ pub fn uncarried_recorded_members(
             check.held.push(member.clone());
             continue;
         }
-        let rewrites = repo.standing_rewrites_of(member)?;
-        let mut rewritten = false;
-        for rewrite in &rewrites {
-            if reaches_any(repo, rewrite, delta)? {
-                rewritten = true;
-                break;
+        if let Some(carried) = carried_by_rewrite_or_twin(repo, member, delta)? {
+            if let Carriage::Twin(twin) = carried {
+                check
+                    .twins
+                    .push((recorded_member_name(member, delta.tips), twin));
             }
-        }
-        if rewritten {
-            check.held.push(member.clone());
-            continue;
-        }
-        if let Some(twin) = repo.same_tree_between(member, delta.base, delta.parents)? {
-            check
-                .twins
-                .push((recorded_member_name(member, delta.tips), twin));
             check.held.push(member.clone());
             continue;
         }
@@ -4525,6 +4868,12 @@ pub fn uncarried_recorded_members(
                 &write.commit,
             )?);
         }
+        if let Some(twin) = excusing_twin(repo, (member, &lines), delta)? {
+            check.twins.push((recorded.name, twin));
+            check.held.push(member.clone());
+            check.members.push(lines);
+            continue;
+        }
         match lines.reading {
             Reading::Carried | Reading::CarriedForward => check.held.push(member.clone()),
             Reading::Inconclusive => check.inconclusive.push(recorded),
@@ -4533,6 +4882,70 @@ pub fn uncarried_recorded_members(
         check.members.push(lines);
     }
     Ok(check)
+}
+
+/// What carries a recorded member that is neither a parent nor reached by
+/// the base ([`carried_by_rewrite_or_twin`]).
+enum Carriage {
+    /// A rewrite that stands for it, which carries it unnamed.
+    Rewrite,
+    /// A parent with exactly its tree, which the report names.
+    Twin(CommitId),
+}
+
+/// What carries the recorded member at `member`, where anything does.
+///
+/// A rewrite that stands for it ([`Repo::standing_rewrites_of`]) carries it
+/// where it is a parent or the base reaches it; a twin, a commit with
+/// exactly its tree ([`Repo::same_tree`]), where it is a parent. One
+/// reached only through another parent, as under a landing built on it,
+/// carries nothing here: the member's lines are read, and a twin under a
+/// parent may then excuse the one finding no reading answers
+/// ([`excusing_twin`]).
+fn carried_by_rewrite_or_twin(
+    repo: &Repo,
+    member: &CommitId,
+    delta: &CompositionDelta<'_>,
+) -> anyhow::Result<Option<Carriage>> {
+    for rewrite in &repo.standing_rewrites_of(member)? {
+        if delta.parents.contains(rewrite) || reaches_any(repo, rewrite, delta)? {
+            return Ok(Some(Carriage::Rewrite));
+        }
+    }
+    for parent in delta.parents {
+        if repo.same_tree(member, parent)? {
+            return Ok(Some(Carriage::Twin(parent.clone())));
+        }
+    }
+    Ok(None)
+}
+
+/// The twin that excuses the one finding of `lines`, the reading of the
+/// recorded member at `member` against the subject, where it has one.
+///
+/// A commit with exactly the member's tree under a parent
+/// ([`Repo::same_tree_between`]) excuses one finding and no other: the file
+/// the member adds that the subject changed, which no reading can answer
+/// ([`LostKind::AddedFileChanged`]). That is the recut shape, a member
+/// recreated with its tree and then grown. The twin holds the member's tree
+/// exactly, so that file is the member's content, and a subject that
+/// carries the twin carries it. A member that lacks a line, or whose path
+/// is conflicted, is never excused.
+fn excusing_twin(
+    repo: &Repo,
+    (member, lines): (&CommitId, &MemberLines),
+    delta: &CompositionDelta<'_>,
+) -> anyhow::Result<Option<CommitId>> {
+    if lines.reading != Reading::Inconclusive
+        || !lines
+            .lost
+            .iter()
+            .filter(|lost| !lost.carried_forward)
+            .all(|lost| lost.kind == LostKind::AddedFileChanged)
+    {
+        return Ok(None);
+    }
+    Ok(repo.same_tree_between(member, delta.base, delta.parents)?)
 }
 
 /// Record what the subject lacks of `fix`, one of the fixes by hand that the
@@ -4628,21 +5041,17 @@ fn recorded_member(commit: &CommitId, tips: &BookmarkTips) -> RecordedMember {
     }
 }
 
-/// Whether the cut's base or any of its parents reaches `commit`.
+/// Whether the cut's base reaches `commit`.
+///
+/// A member's ancestry through another parent is not evidence that the
+/// subject retained the member's lines. The own-line reading below decides
+/// that case, so a landing on a release cannot hide a loss in that release.
 fn reaches_any(
     repo: &Repo,
     commit: &CommitId,
     delta: &CompositionDelta<'_>,
 ) -> anyhow::Result<bool> {
-    if repo.is_ancestor(commit, delta.base)? {
-        return Ok(true);
-    }
-    for parent in delta.parents {
-        if repo.is_ancestor(commit, parent)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(repo.is_ancestor(commit, delta.base)?)
 }
 
 /// `feat/gamma@a9a6c3e8ad93` when a local bookmark still holds the commit,
@@ -5568,6 +5977,7 @@ mod members_tests {
             unexplained: vec!["Cargo.lock".to_owned()],
             inconclusive: Vec::new(),
             members: Vec::new(),
+            unresolved: Vec::new(),
         };
 
         let rendered = render_members(&report(Some(audit)));
@@ -5579,7 +5989,7 @@ mod members_tests {
                 "- bbbbbbbbbbbb feat/beta advanced to cccccccccccc\n",
                 "- dddddddddddd bare commit — nothing holds it\n",
                 "- eeeeeeeeeeee main@upstream (base parent)\n",
-                "  feat/alpha@aaaaaaaaaaaa: the ledger records no write of the release in hand, so nothing measured its divergence from this member; check that divergence by hand\n",
+                "  feat/alpha@aaaaaaaaaaaa: carried from the previous release, which lacked the same lines\n",
                 "  feat/beta@bbbbbbbbbbbb: carried (replay empty)\n",
                 "  !! dddddddddddd: the cut tree is missing or diverges from the member's content\n",
                 "  !! Cargo.lock: changed between the previous release and this cut with no member or trunk explaining it"
@@ -5661,6 +6071,7 @@ mod members_tests {
                 inconclusive: Vec::new(),
                 carried: Vec::new(),
                 members: Vec::new(),
+                unresolved: Vec::new(),
             }),
             notes: Vec::new(),
             problems: Vec::new(),

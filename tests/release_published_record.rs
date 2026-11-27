@@ -860,7 +860,7 @@ fn a_landing_on_the_carrier_never_answers_for_a_member_under_it() {
     // Given: [`landing_on_a_recorded_release`], whose merge P2 drops `beta
     // two`, a line of `feat/beta`, P1's member. `feat/land` descends from
     // `feat/beta` only through P1.
-    let (lab, home, _) = landing_on_a_recorded_release(|work| {
+    let (lab, home, land) = landing_on_a_recorded_release(|work| {
         std::fs::write(work.join("beta.txt"), "beta one\n").expect("write beta.txt");
     });
     let before = entries(&home).len();
@@ -873,6 +873,15 @@ fn a_landing_on_the_carrier_never_answers_for_a_member_under_it() {
     let out = both(&cut);
     assert_eq!(cut.status.code(), Some(3), "{out}");
     assert!(out.contains("beta two"), "{out}");
+    let beta = commit_at(&lab, "feat/beta");
+    assert!(
+        out.contains(&format!("--allow-drop {}", beta.short())),
+        "{out}"
+    );
+    assert!(
+        !out.contains(&format!("--allow-drop {}", land.short())),
+        "{out}"
+    );
     assert_eq!(entries(&home).len(), before, "{out}");
 }
 
@@ -1440,7 +1449,7 @@ fn a_line_a_later_member_kept_of_a_member_it_rewrites_is_still_audited() {
     let (lab, home, p1) = unrecorded_release_over_the_first_cut();
     let older = knives_release(&lab, &home, &["cut", "--at", p1.as_str()]);
     assert_ne!(older.status.code(), Some(3), "fixture: {}", both(&older));
-    let rewrite = commit_files(
+    let _rewrite = commit_files(
         &lab,
         "feat/rewrite",
         "feat/beta",
@@ -1455,13 +1464,14 @@ fn a_line_a_later_member_kept_of_a_member_it_rewrites_is_still_audited() {
     // When: a plain cut runs.
     let cut = knives_release(&lab, &home, &["cut"]);
 
-    // Then: `feat/rewrite` answers for `feat/beta`'s lines it kept: the cut
-    // is refused naming `beta two` and its flag, and writes nothing.
+    // Then: the composition gate reads `feat/beta` by its own lines. A
+    // later member's ancestry does not excuse a line P2 drops.
     let out = both(&cut);
     assert_eq!(cut.status.code(), Some(3), "{out}");
     assert!(out.contains("beta two"), "{out}");
+    let beta = commit_at(&lab, "feat/beta");
     assert!(
-        out.contains(&format!("--allow-drop {}", rewrite.short())),
+        out.contains(&format!("--allow-drop {}", beta.short())),
         "{out}"
     );
     assert_eq!(entries(&home).len(), before, "{out}");

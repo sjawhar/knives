@@ -255,11 +255,12 @@ pub(crate) fn run_release(
         if let Some(at) = at
             && !fixed_branch
         {
-            return Ok(worst.worst(record_hand_cut(
-                (fork, &opened, &lock),
-                (&name, at, &allow_drop),
-                bound,
-            )?));
+            return Ok(
+                match record_hand_cut((fork, &opened, &lock), (&name, at, &allow_drop), bound)? {
+                    Ok(own) => own,
+                    Err(exit) => worst.worst(exit),
+                },
+            );
         }
         let trunk_name = entry.trunk_ref();
         let trunk = opened.resolve_commit(&trunk_name)?;
@@ -501,6 +502,7 @@ pub(crate) fn run_release(
         } else {
             carried_from
         };
+        let releases = release::known_releases(&ledger, entry, &tips);
         let context = release::AuditContext {
             previous: followed_in_hand
                 .map(|write| &write.commit)
@@ -517,6 +519,7 @@ pub(crate) fn run_release(
             drift_from: previous_commit
                 .as_ref()
                 .map(|previous| (previous, release::DriftBase::PreviousRelease)),
+            releases: &releases,
         };
         // A cut names a composition consumers can pin. When the publish remote
         // already holds the previous cut with exactly this tree on exactly these
@@ -1437,6 +1440,12 @@ fn report_cut_audit(
 ) -> Option<Exit> {
     for name in &audit.carried {
         println!("{}", release::carried_row(name, carried_from));
+    }
+    for (name, by) in &audit.unresolved {
+        println!("{}", release::unresolved_row(name, by));
+        for line in audit.unresolved_lines_of(name) {
+            println!("{line}");
+        }
     }
     // Each name is a member's bookmark, read from the repository.
     for name in &audit.inconclusive {
@@ -2639,9 +2648,13 @@ struct CompletedCut<'a> {
 impl CompletedCut<'_> {
     /// The exit of the cut's checks: findings where the audit or the
     /// composition gate could not read a member, or a fix by hand, for an
-    /// unresolved conflict; else 0.
+    /// unresolved conflict, or the audit read a member unresolved
+    /// ([`release::CutAudit::unresolved`]); else 0.
     const fn exit(&self) -> Exit {
-        if self.audit.inconclusive.is_empty() && !self.check.is_inconclusive() {
+        if self.audit.inconclusive.is_empty()
+            && self.audit.unresolved.is_empty()
+            && !self.check.is_inconclusive()
+        {
             Exit::Ok
         } else {
             Exit::Findings
@@ -3068,12 +3081,13 @@ fn waived_members(
 /// exists, and the event recorded, which the process sends to a shared
 /// ledger before it exits; the commit's repeated headings print once after
 /// them, even where the record fails after the bookmark was made
-/// ([`write_hand_cut`]).
+/// ([`write_hand_cut`]). `Ok` holds the exit of a record that was written,
+/// `Err` the exit of a refusal, which wrote nothing.
 fn record_hand_cut(
     (fork, opened, lock): (&Fork<'_>, &knives::jj::Repo, &CutLock),
     (name, at, allow_drop): (&str, &str, &AllowDrop),
     bound: Bound<'_>,
-) -> anyhow::Result<Exit> {
+) -> anyhow::Result<Result<Exit, Exit>> {
     let (repo, entry) = (&fork.name, fork.entry);
     // The pulled plan refused on any problem this read finds.
     let ledger = Ledger::for_fork(fork).read()?.entries;
@@ -3087,7 +3101,7 @@ fn record_hand_cut(
         &trunk,
     )? {
         Ok(held) => held,
-        Err(exit) => return Ok(exit),
+        Err(exit) => return Ok(Err(exit)),
     };
     let commit = &held.commit;
     let writes = EarlierWrites::read(opened, name, &ledger, held.published.as_ref())?;
@@ -3098,7 +3112,7 @@ fn record_hand_cut(
         (&tips, &trunk, follows.as_ref()),
     )? {
         Ok(composed) => composed,
-        Err(exit) => return Ok(exit),
+        Err(exit) => return Ok(Err(exit)),
     };
     let parents = opened.parent_commits(commit.as_str())?;
     let record = Some((name, commit));
@@ -3134,16 +3148,17 @@ fn record_hand_cut(
             trunk_parent_base: Some(&composed.base),
             drift_trunk: &composed.base,
             drift_from: Some(composed.drift_from(follows.as_ref().map(|(_, previous)| previous))),
+            releases: &[],
         },
         carried_from: release::CarriedFrom::Unledgered,
         waivable: false,
     };
     let checked = match checked_committed_cut(repo, &committed, (&gate, allow_drop))? {
         Ok(checked) => checked,
-        Err(exit) => return Ok(exit),
+        Err(exit) => return Ok(Err(exit)),
     };
     if let Some(exit) = allow_drop.settle(repo) {
-        return Ok(exit);
+        return Ok(Err(exit));
     }
     // The event records the members, never a parent the trunk holds.
     let cut = CompletedCut {
@@ -3167,6 +3182,7 @@ fn record_hand_cut(
     release::with_last_write_headings(|last| {
         write_hand_cut(fork, &cut, (held.named, unpushed), (bound, last))
     })
+    .map(Ok)
 }
 
 /// The writes of `cut NAME --at REV` once every gate passed: the local
