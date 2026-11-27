@@ -582,8 +582,10 @@ fn a_cut_over_a_published_carrier_records_it_and_keeps_the_hand_resolution_and_t
 
     // Then: the cut records the published release, carrier and all, and
     // makes no commit: a cut of a fixed branch records what is published.
-    // The resolution holds both members' lines, so the audit carries
-    // neither forward.
+    // The resolution holds both members' lines, but each member adds
+    // `shared.txt`, which the resolution changed: the audit cannot read it,
+    // and carries it forward from the newest recorded write, which held the
+    // same resolution.
     assert!(
         cut.contains(&format!(
             "demo: recorded published composition {RELEASE}@origin ({}) as the cut",
@@ -591,7 +593,14 @@ fn a_cut_over_a_published_carrier_records_it_and_keeps_the_hand_resolution_and_t
         )),
         "{cut}"
     );
-    assert!(!cut.contains("carried forward"), "{cut}");
+    for member in ["feat/alpha", "feat/beta"] {
+        assert!(
+            cut.contains(&format!(
+                "{member}: diverges where the newest recorded write already does; carried forward"
+            )),
+            "{cut}"
+        );
+    }
     assert_eq!(commit_at(lab, RELEASE), state.release, "{cut}");
     assert_resolution_kept(lab, "cut");
     assert!(release_parents(lab, RELEASE).contains(&state.carrier));

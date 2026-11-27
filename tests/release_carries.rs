@@ -932,7 +932,7 @@ fn release_carries_answers_merged_then_edited_for_a_member_deleted_then_recreate
 }
 
 #[test]
-fn release_carries_answers_carried_exact_for_a_put_back_line_of_a_file_the_change_adds_whole() {
+fn release_carries_answers_merged_then_edited_for_a_removed_line_put_back_in_an_added_file() {
     // Given: `feat/del`, stacked on `feat/base`, deletes the line `b`; the
     // release merges it with another branch and puts `b` back by hand.
     let lab = Lab::new();
@@ -947,16 +947,16 @@ fn release_carries_answers_carried_exact_for_a_put_back_line_of_a_file_the_chang
     );
     let (home, _consumer) = release_test_home(&lab);
 
-    // When, then: from the trunk, `f.txt` is one file `feat/del` added as
-    // `a`, `c`, and the release holds both lines with `b` between them, so
-    // every command reads `feat/del` carried. A member that deletes a line
-    // of a file that its fork point holds is read missing where the release
-    // puts the line back (the deleter of the guard tests).
-    assert_every_command_reads_carried(&lab, &home, &["feat/del"]);
+    // When, then: from the trunk, `f.txt` is one file that `feat/del` adds
+    // as `a`, `c`, so the deletion of `b` is no hunk of its change. The
+    // release holds another version of the file, so no command reads
+    // `feat/del` carried: `--verify` reads it inconclusive and names the
+    // file, and `--carries` and the census read it merged-then-edited.
+    assert_inconclusive_and_merged_then_edited(&lab, &home, "feat/del", "f.txt: the member adds");
 }
 
 #[test]
-fn release_carries_answers_carried_exact_for_a_member_that_deleted_a_line_it_merged_in() {
+fn release_carries_answers_merged_then_edited_for_a_removed_line_put_back_in_a_merged_in_file() {
     // Given: `feat/del`, built on `feat/base`, merges in `feat/u`, which adds
     // `u.txt`, then deletes a line of `u.txt`; the release merges `feat/del`
     // with another branch and puts the line back.
@@ -982,11 +982,74 @@ fn release_carries_answers_carried_exact_for_a_member_that_deleted_a_line_it_mer
     );
     let (home, _consumer) = release_test_home(&lab);
 
-    // When, then: every command reads `feat/del` carried. From the trunk,
-    // `u.txt` is one file that `feat/del` added as `x`, so the line it
-    // deleted after merging it in is no hunk of its own change, and the
-    // release holds `x`.
-    assert_every_command_reads_carried(&lab, &home, &["feat/del"]);
+    // When, then: from the trunk, `u.txt` is one file that `feat/del` adds
+    // as `x`, and the release holds another version of it: no command reads
+    // `feat/del` carried.
+    assert_inconclusive_and_merged_then_edited(&lab, &home, "feat/del", "u.txt: the member adds");
+}
+
+#[test]
+fn release_carries_answers_carried_exact_for_an_added_file_the_release_keeps_whole() {
+    // Given (a control): `feat/del`, stacked on `feat/base`, deletes `b` from
+    // the file `feat/base` adds; the release merges `feat/del` with another
+    // branch and keeps the file as `feat/del` left it.
+    let lab = Lab::new();
+    lab.branch("feat/base", "f.txt", "a\nb\nc\n");
+    child_by_hand(&lab, "feat/del", "feat/base", &[("f.txt", Some("a\nc\n"))]);
+    lab.branch("feat/x", "x.txt", "x\n");
+    merge_by_hand(&lab, CUT, ("feat/del", "feat/x"), &[]);
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: the release holds the file the member adds whole, so every
+    // command reads both members carried.
+    assert_every_command_reads_carried(&lab, &home, &["feat/del", "feat/x"]);
+}
+
+#[test]
+fn release_carries_answers_carried_exact_for_a_text_file_the_release_keeps_as_text() {
+    // Given (a control): the member adds `c` to a text file the trunk holds;
+    // the release merges it with another branch and writes a line `d` after
+    // it by hand.
+    let lab = trunk_with(&[("f.txt", "a\nb\n")]);
+    lab.branch(MEMBER, "f.txt", "a\nb\nc\n");
+    lab.branch("feat/other", "other.txt", "other\n");
+    merge_by_hand(
+        &lab,
+        CUT,
+        (MEMBER, "feat/other"),
+        &[("f.txt", Some("a\nb\nc\nd\n"))],
+    );
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: the release holds the member's line in a text file, so
+    // every command reads the member carried.
+    assert_every_command_reads_carried(&lab, &home, &[MEMBER]);
+}
+
+#[test]
+fn release_carries_answers_merged_then_edited_for_an_added_text_file_the_release_made_binary() {
+    // Given: the member adds `f.txt` as `a`, `c`; the release merges it with
+    // another branch and writes `a`, `c` followed by a NUL byte.
+    let lab = Lab::new();
+    lab.branch("feat/del", "f.txt", "a\nc\n");
+    lab.branch("feat/x", "x.txt", "x\n");
+    merge_by_hand(
+        &lab,
+        CUT,
+        ("feat/del", "feat/x"),
+        &[("f.txt", Some("a\nc\n\0\n"))],
+    );
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: a file that is not text holds none of a text file's lines,
+    // so `members --verify` reads the member missing and names the file, and
+    // `--carries` and the census read it merged-then-edited.
+    assert_missing_and_merged_then_edited(
+        &lab,
+        &home,
+        "feat/del",
+        "f.txt: file differs from the member's (a text file)",
+    );
 }
 
 /// `feat/line` changes `README.md`; `feat/member`, stacked on it, writes a
@@ -1219,6 +1282,42 @@ fn assert_missing_and_merged_then_edited(
         out.lines()
             .any(|line| line.starts_with("      ") && line.contains(lost)),
         "no line under the row names {lost}: {out}"
+    );
+    assert_carried_in(lab, home, name, false);
+    let census_out = census(lab, home);
+    let block = census_block(&census_out, name);
+    assert!(
+        block.contains(&format!("merged-then-edited {CUT} @ ")),
+        "{census_out}"
+    );
+    assert!(!block.contains("carried-"), "{census_out}");
+}
+
+/// `name` reads inconclusive in [`CUT`] by `members --verify` (exit 0, the
+/// row says why), with `named`, the start of a line it names under the
+/// member's row, and merged-then-edited by `--carries` (exit 3) and the
+/// census: never carried.
+fn assert_inconclusive_and_merged_then_edited(
+    lab: &Lab,
+    home: &tempfile::TempDir,
+    name: &str,
+    named: &str,
+) {
+    let verified = verify(lab, home, CUT);
+    let out = stdout(&verified);
+    assert_eq!(verified.status.code(), Some(0), "{}", text(&verified));
+    assert!(
+        out.contains(&format!(
+            "  {}: content check inconclusive ({})",
+            label(lab, name),
+            knives::commands::release::INCONCLUSIVE_WHY
+        )),
+        "{out}"
+    );
+    assert!(
+        out.lines()
+            .any(|line| line.starts_with("      ") && line.contains(named)),
+        "no line under the row names {named}: {out}"
     );
     assert_carried_in(lab, home, name, false);
     let census_out = census(lab, home);
@@ -1676,7 +1775,8 @@ fn release_carries_answers_merged_then_edited_for_a_member_beside_a_backup_bookm
 }
 
 #[test]
-fn release_carries_answers_carried_exact_for_a_replaced_line_of_a_file_the_change_adds_whole() {
+fn release_carries_answers_merged_then_edited_for_a_replaced_line_of_a_file_the_change_adds_whole()
+{
     // Given: `feat/foundation` writes `a`, `timeout = 30`, `b`; the member,
     // stacked on it, deletes the timeout line; `feat/sibling`, also on it,
     // sets `timeout = 60`; the release merges both and keeps the sibling's
@@ -1703,11 +1803,14 @@ fn release_carries_answers_carried_exact_for_a_replaced_line_of_a_file_the_chang
     );
     let (home, _consumer) = release_test_home(&lab);
 
-    // When, then: every command reads both carried. From the trunk, the
-    // member's change adds `conf.txt` whole, as `a` and `b`, so the deletion
-    // of the timeout line is no hunk of its own change, and the release
-    // holds both of its lines, with the sibling's line between them.
-    assert_every_command_reads_carried(&lab, &home, &[MEMBER, "feat/sibling"]);
+    // When, then: from the trunk, the member's change adds `conf.txt` whole,
+    // as `a` and `b`, so it cannot show the deletion of `timeout = 30`; the
+    // release holds another version of the file, which a person reads: the
+    // member reads inconclusive in `--verify` and merged-then-edited in
+    // `--carries`, though the sibling's `timeout = 60` is an innocent edit.
+    // The sibling, whose file the release holds whole, reads carried.
+    assert_inconclusive_and_merged_then_edited(&lab, &home, MEMBER, "conf.txt: the member adds");
+    assert_carried_in(&lab, &home, "feat/sibling", true);
 }
 
 #[test]
@@ -1918,7 +2021,7 @@ fn member_with(lab: &Lab, files: &[(&str, Option<&str>)], mode: Option<u32>) {
 }
 
 #[test]
-fn release_carries_answers_carried_exact_for_an_added_file_whose_mode_the_release_cleared() {
+fn release_carries_answers_merged_then_edited_for_an_added_files_cleared_executable_bit() {
     // Given: the member adds an executable `shared.sh`; the release merges it
     // with another branch and clears the mode by hand.
     use std::os::unix::fs::PermissionsExt as _;
@@ -1935,11 +2038,32 @@ fn release_carries_answers_carried_exact_for_an_added_file_whose_mode_the_releas
     lab.jj_work(["new"]);
     let (home, _consumer) = release_test_home(&lab);
 
-    // When, then: every command reads the member carried. A change of the
-    // executable bit is read where the member changes the bit of a file that
-    // its fork point holds (the side-by-side mode test above); a file that
-    // the member adds has no bit of its fork point's to change, and
-    // `--verify` has always read its lines alone.
+    // When, then: the member's change sets the bit of the file it adds, and
+    // the release dropped it: every command reads the member missing.
+    assert_missing_and_merged_then_edited(
+        &lab,
+        &home,
+        MEMBER,
+        "shared.sh: mode differs from the member's (executable yes)",
+    );
+}
+
+#[test]
+fn release_carries_answers_carried_exact_for_an_added_executable_file_the_release_keeps_whole() {
+    // Given (a control): the member adds an executable `shared.sh`; the
+    // release merges it with another branch, keeps the file and its bit,
+    // and writes a file of its own.
+    let lab = Lab::new();
+    member_with(&lab, &[("shared.sh", Some("run\n"))], Some(0o755));
+    lab.branch("feat/other", "other.txt", "other\n");
+    lab.jj_work(["new", "-r", MEMBER, "-r", "feat/other", "-m", "release"]);
+    std::fs::write(lab.work.join("own.txt"), "own\n").expect("write a file of its own");
+    lab.jj_work(["bookmark", "create", CUT, "-r", "@"]);
+    lab.jj_work(["new"]);
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: the release holds the member's file whole, with its bit,
+    // so every command reads the member carried.
     assert_every_command_reads_carried(&lab, &home, &[MEMBER]);
 }
 

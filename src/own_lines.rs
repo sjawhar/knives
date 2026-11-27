@@ -34,9 +34,11 @@ mod words;
 
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::ops::Range;
 
 use jj_lib::diff::{ContentDiff, DiffHunkKind};
+use sha2::Digest as _;
 
 use crate::changelog_union;
 use crate::ids::CommitId;
@@ -65,6 +67,10 @@ const CONFLICT_IN_RELEASE: &str = "in the release";
 
 /// The text of a [`LostKind::File`] entry for a file that is not text.
 const BINARY_FILE: &str = "a binary file";
+
+/// The text of a [`LostKind::File`] entry for a text file of the member's
+/// that the release holds as a file that is not text.
+const TEXT_FILE: &str = "a text file";
 
 /// The text of a [`LostKind::File`] entry for a file that the member added
 /// with no non-blank line.
@@ -162,6 +168,8 @@ pub struct Lost {
     /// For a line, its text. For a path read whole, what the member made of
     /// it (`deleted`, `a binary file`, `an empty file`, `a symlink to …`,
     /// `a submodule at …`); for a mode, `executable yes` or `executable no`;
+    /// for [`LostKind::AddedFileChanged`], a stable digest of the release
+    /// file's non-blank lines, used only to carry forward the same version;
     /// for a conflict, where it is (`in the release` or `at the member's
     /// tip`).
     pub text: Option<String>,
@@ -188,7 +196,7 @@ pub enum LostKind {
     Removed,
     /// A path read whole: not text, deleted, or an empty added file.
     File,
-    /// The executable bit that the member changed.
+    /// The executable bit that the member changed, or set on a file it adds.
     Mode,
     /// A line that the member added, in a replaced range of more than
     /// [`WORD_LIMIT`] words, which the word step did not follow.
@@ -196,6 +204,23 @@ pub enum LostKind {
     /// An unresolved conflict in the path, in the release or at the
     /// member's tip: the rule cannot read the path.
     Conflict,
+    /// A file that the member adds, which the release holds with another
+    /// value, though the reading lost no line, bit or kind of it. The
+    /// member's change from the fork point holds the file whole, so it
+    /// cannot show a line that the member's own history removed from the
+    /// file (a member stacked on a branch that adds it): the rule cannot
+    /// tell such a line put back from another change's edit, and leaves
+    /// the file to a person, as it does a conflict.
+    AddedFileChanged,
+}
+
+impl LostKind {
+    /// Whether the rule cannot read the path of an entry of this kind, so
+    /// it makes the member inconclusive rather than missing: an unresolved
+    /// conflict, or a file the member adds that the release changed.
+    const fn unreadable(self) -> bool {
+        matches!(self, Self::Conflict | Self::AddedFileChanged)
+    }
 }
 
 /// Which side holds the unresolved conflict of a [`LostKind::Conflict`]
@@ -264,13 +289,15 @@ impl MemberLines {
     /// - A path that the member deletes, and one that the tip holds as a
     ///   symlink or a submodule, is read whole: the release lacks it unless
     ///   it holds the tip's value there.
-    /// - A file: where the member changes its executable bit, the release's
-    ///   file must have the tip's bit. A file that is not text, whose first
-    ///   8000 bytes hold a NUL byte, is read whole: where the member changed
-    ///   its content, the release's file must hold the tip's. A text file
-    ///   that the member adds with no non-blank line is carried where the
-    ///   release holds a file at that path. Every other text file is read
-    ///   line by line; a version that holds no file there reads as empty.
+    /// - A file: where the member changes its executable bit, or adds the
+    ///   file, a release that holds a file there must give it the tip's bit.
+    ///   A file that is not text, whose first 8000 bytes hold a NUL byte, is
+    ///   read whole: where the member changed its content, the release's
+    ///   file must hold the tip's. A text file that the member adds with no
+    ///   non-blank line is carried where the release holds a file at that
+    ///   path. A text file that the release holds as a file that is not text
+    ///   is lost whole. Every other text file is read line by line; a
+    ///   version that holds no file there reads as empty.
     pub fn read_path(&mut self, values: &PathValues) {
         let path = values.path.as_str();
         if values.tip == Value::Conflict {
@@ -295,12 +322,17 @@ impl MemberLines {
     /// carried forward where `previous` lost one of the same path, kind and
     /// line. A member whose every lost line is carried forward reads carried
     /// forward, or inconclusive where a path cannot be read; one with any
-    /// other lost line still reads missing.
+    /// other lost line still reads missing. A file the member adds that the
+    /// release before changed too is carried forward only where the release
+    /// holds the same non-blank lines: its entry's text is their digest.
     pub fn carry_forward(&mut self, previous: &Self) {
         for lost in &mut self.lost {
             lost.carried_forward = lost.kind != LostKind::Conflict
                 && previous.lost.iter().any(|before| {
-                    before.kind == lost.kind && before.path == lost.path && before.line == lost.line
+                    before.kind == lost.kind
+                        && before.path == lost.path
+                        && before.line == lost.line
+                        && (lost.kind != LostKind::AddedFileChanged || before.text == lost.text)
                 });
         }
         self.reading = self.settled();
@@ -310,15 +342,16 @@ impl MemberLines {
     /// conflict at the member's tip ([`ConflictAt::Tip`]), whether or not
     /// the release holds one there too: [`Self::read_path`] records a path
     /// conflicted at both as at the tip. `false` where no path holds a
-    /// conflict.
+    /// conflict, and where the member cannot be read at a file it adds
+    /// ([`LostKind::AddedFileChanged`]).
     #[must_use]
     pub fn conflicted_only_at_tip(&self) -> bool {
-        let mut conflicts = self
+        let mut unreadable = self
             .lost
             .iter()
-            .filter(|lost| lost.kind == LostKind::Conflict)
+            .filter(|lost| lost.kind.unreadable() && !lost.carried_forward)
             .peekable();
-        conflicts.peek().is_some() && conflicts.all(|lost| lost.conflict == Some(ConflictAt::Tip))
+        unreadable.peek().is_some() && unreadable.all(|lost| lost.conflict == Some(ConflictAt::Tip))
     }
 
     /// Whether the release holds every line of the member's change as the
@@ -335,13 +368,20 @@ impl MemberLines {
 
     /// The reading that the lost entries give.
     fn settled(&self) -> Reading {
+        let open = |lost: &&Lost| !lost.carried_forward;
         if self
             .lost
             .iter()
-            .any(|lost| lost.kind != LostKind::Conflict && !lost.carried_forward)
+            .filter(open)
+            .any(|lost| !lost.kind.unreadable())
         {
             Reading::Missing
-        } else if self.lost.iter().any(|lost| lost.kind == LostKind::Conflict) {
+        } else if self
+            .lost
+            .iter()
+            .filter(open)
+            .any(|lost| lost.kind.unreadable())
+        {
             Reading::Inconclusive
         } else if self.lost.is_empty() {
             Reading::Carried
@@ -389,7 +429,10 @@ impl Out<'_> {
 
     /// Reads a path that the tip holds as a file, with its executable bit
     /// and content: the bit, then the content, each as [`file_change`]
-    /// reads the member's change of it.
+    /// reads the member's change of it. A file that the member adds is its
+    /// change whole: where the release holds another version of it, blank
+    /// lines aside, and the reading lost nothing of it, the path is left to
+    /// a person ([`LostKind::AddedFileChanged`]).
     fn read_file(
         &mut self,
         (path, fork, release): (&str, &Value, &Value),
@@ -397,7 +440,17 @@ impl Out<'_> {
     ) {
         let release = file_of(release);
         let change = file_change(fork, (executable, content));
-        if change.bit_changed && release.is_none_or(|(bit, _)| bit != executable) {
+        let before = self.lost.len();
+        // A member sets the bit where it changes the bit of a file the fork
+        // point holds, and where it adds the file. A release that lacks an
+        // added file lacks all of it, and the content's entries say so: its
+        // missing bit adds nothing.
+        let bit_lost = if change.adds_file {
+            release.is_some_and(|(bit, _)| bit != executable)
+        } else {
+            change.bit_changed && release.is_none_or(|(bit, _)| bit != executable)
+        };
+        if bit_lost {
             let bit = bit_text(executable);
             self.lost(entry(path, LostKind::Mode, None, Some(bit)), || Place::Path);
         }
@@ -419,13 +472,66 @@ impl Out<'_> {
                     });
                 }
             }
-            ContentChange::Text(fork_text) => {
-                let empty: &[u8] = &[];
-                let held = release.map_or(empty, |(_, held)| held);
-                TextPath::new(path, fork_text, content, held).read(self);
-            }
+            ContentChange::Text(fork_text) => match release {
+                // A file that is not text holds none of the lines of the
+                // member's text file, and its bytes are no reading of them:
+                // the whole file differs.
+                Some((_, held)) if is_binary(held) => {
+                    let made = TEXT_FILE.to_owned();
+                    self.lost(entry(path, LostKind::File, None, Some(made)), || {
+                        Place::Path
+                    });
+                }
+                _ => {
+                    let empty: &[u8] = &[];
+                    let held = release.map_or(empty, |(_, held)| held);
+                    TextPath::new(path, fork_text, content, held).read(self);
+                }
+            },
+        }
+        if change.adds_file
+            && self.lost.len() == before
+            && let Some((_, held)) =
+                release.filter(|(_, held)| non_blank_lines(held).ne(non_blank_lines(content)))
+        {
+            self.lost(
+                entry(
+                    path,
+                    LostKind::AddedFileChanged,
+                    None,
+                    Some(non_blank_digest(held)),
+                ),
+                || Place::Path,
+            );
         }
     }
+}
+
+/// The non-blank lines of `text`, each without its line ending: what a
+/// reading compares of a file, since it reads no blank line.
+fn non_blank_lines(text: &[u8]) -> impl Iterator<Item = &[u8]> {
+    text.split_inclusive(|byte| *byte == b'\n')
+        .filter(|line| !is_blank(line))
+        .map(bare)
+}
+
+/// A stable digest of `text`'s non-blank lines, each without its line
+/// ending, with its length before it. An [`LostKind::AddedFileChanged`] entry
+/// carries this: a later release carries the entry forward only where its
+/// added file has the same non-blank lines.
+fn non_blank_digest(text: &[u8]) -> String {
+    let mut hash = sha2::Sha256::new();
+    for line in non_blank_lines(text) {
+        let length = u64::try_from(line.len()).unwrap_or(u64::MAX);
+        hash.update(length.to_be_bytes());
+        hash.update(line);
+    }
+    let digest: [u8; 32] = hash.finalize().into();
+    let mut text = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
 }
 
 /// What a member did to a file that its tip holds, from what its fork
@@ -435,6 +541,9 @@ impl Out<'_> {
 struct FileChange<'v> {
     /// Whether the fork point holds a file with the other executable bit.
     bit_changed: bool,
+    /// Whether the fork point holds no file there: the member adds the
+    /// file, and with it the tip's executable bit.
+    adds_file: bool,
     content: ContentChange<'v>,
 }
 
@@ -468,6 +577,7 @@ fn file_change<'v>(fork: &'v Value, (executable, content): (bool, &[u8])) -> Fil
     };
     FileChange {
         bit_changed: before.is_some_and(|(bit, _)| bit != executable),
+        adds_file: before.is_none(),
         content,
     }
 }
@@ -1454,21 +1564,134 @@ mod tests {
     }
 
     #[test]
-    fn an_added_file_with_no_non_blank_line_is_carried_where_the_release_holds_a_file() {
+    fn an_added_files_bit_is_lost_where_the_release_holds_the_file_with_the_other_bit() {
+        // Given: a member that adds an executable file and one that is not,
+        // and releases that hold each with the other bit
+        let cleared = read(
+            "run.sh",
+            Value::Absent,
+            file_with_bit(true, b"x\n"),
+            file_with_bit(false, b"x\n"),
+        );
+        let set = read(
+            "notes.txt",
+            Value::Absent,
+            file_with_bit(false, b"x\n"),
+            file_with_bit(true, b"x\n"),
+        );
+        // Then: each bit is lost, and named
+        assert_eq!(
+            lost(&cleared),
+            [(LostKind::Mode, None, Some("executable yes"))]
+        );
+        assert_eq!(lost(&set), [(LostKind::Mode, None, Some("executable no"))]);
+
+        // Given: releases that keep the file whole, with its bit, beside
+        // another file, or lack the file
+        let kept = read(
+            "run.sh",
+            Value::Absent,
+            file_with_bit(true, b"x\n"),
+            file_with_bit(true, b"x\n"),
+        );
+        let absent = read(
+            "run.sh",
+            Value::Absent,
+            file_with_bit(true, b"x\n"),
+            Value::Absent,
+        );
+        // Then: the first is carried, and the second lacks the line alone:
+        // its missing bit adds nothing
+        assert_eq!(kept.reading, Reading::Carried);
+        assert_eq!(lost(&absent), [(LostKind::Added, Some(1), Some("x"))]);
+    }
+
+    #[test]
+    fn a_text_file_the_release_holds_as_a_binary_file_is_lost_whole() {
+        // Given: a member that adds a text file, and one that changes one,
+        // and releases that hold each with the member's lines and a NUL byte
+        let added = read("f.txt", Value::Absent, file("a\nc\n"), file("a\nc\n\0\n"));
+        let changed = read("f.txt", file("a\nb\n"), file("a\nc\n"), file("a\nc\n\0\n"));
+        // Then: each file is lost whole, and named as text
+        for lines in [added, changed] {
+            assert_eq!(lines.reading, Reading::Missing);
+            assert_eq!(lost(&lines), [(LostKind::File, None, Some("a text file"))]);
+        }
+    }
+
+    #[test]
+    fn an_added_file_with_no_non_blank_line_is_carried_where_the_release_holds_it_whole() {
         // Given: a member that adds an empty file and one of blank lines
         for content in ["", "\n  \n"] {
-            // When: the release holds a file there, or none
-            let held = read("e.txt", Value::Absent, file(content), file("other\n"));
+            // When: the release holds the same file there, another one, or
+            // none
+            let held = read("e.txt", Value::Absent, file(content), file(content));
+            let other = read("e.txt", Value::Absent, file(content), file("other\n"));
             let absent = read("e.txt", Value::Absent, file(content), Value::Absent);
 
-            // Then: the first carries it, and the second does not
+            // Then: the first carries it; the second, which can put back a
+            // line the member's history emptied out, is left to a person;
+            // the third lacks it
             assert_eq!(held.reading, Reading::Carried, "{content:?}");
+            assert_eq!(other.reading, Reading::Inconclusive, "{content:?}");
+            assert_eq!(lost(&other)[0].0, LostKind::AddedFileChanged, "{content:?}");
+            assert!(other.lost[0].text.is_some(), "{content:?}");
             assert_eq!(
                 lost(&absent),
                 [(LostKind::File, None, Some("an empty file"))],
                 "{content:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_added_file_the_release_changed_is_left_to_a_person() {
+        // Given: a member that adds `f.txt` as `a`, `c`, and a release that
+        // holds another version of it with both lines (a line the member's
+        // history removed, put back, or another change's edit)
+        let changed = read("f.txt", Value::Absent, file("a\nc\n"), file("a\nb\nc\n"));
+        // Then: the member is inconclusive, with the file and a digest of
+        // the release's non-blank lines named
+        assert_eq!(changed.reading, Reading::Inconclusive);
+        assert_eq!(lost(&changed)[0].0, LostKind::AddedFileChanged);
+        assert!(changed.lost[0].text.is_some());
+        assert!(!changed.holds_every_line());
+        assert!(!changed.conflicted_only_at_tip());
+
+        // Given: a release that lacks a line of it, and a member that changes
+        // a file the fork point holds in the same way
+        let lacking = read("f.txt", Value::Absent, file("a\nc\n"), file("a\nb\n"));
+        let modified = read("f.txt", file("a\n"), file("a\nc\n"), file("a\nb\nc\n"));
+        // Then: the first is missing its line, and names no other entry; the
+        // second is read line by line and carried
+        assert_eq!(lost(&lacking), [(LostKind::Added, Some(2), Some("c"))]);
+        assert_eq!(modified.reading, Reading::Carried);
+
+        // Given: a release that drops a blank line of the added file, or
+        // adds one, and holds every other line as the tip does
+        let dropped = read("f.txt", Value::Absent, file("a\n\nc\n"), file("a\nc\n"));
+        let blank = read("f.txt", Value::Absent, file("a\nc\n"), file("a\n\nc\n"));
+        // Then: both are carried: the reading reads no blank line
+        assert_eq!(dropped.reading, Reading::Carried);
+        assert_eq!(blank.reading, Reading::Carried);
+
+        // Given: a release before that changed the file's non-blank lines,
+        // and one that held the same lines with a blank line added
+        let mut different = read("f.txt", Value::Absent, file("a\nc\n"), file("a\nb\nc\n"));
+        let previous_different = read("f.txt", Value::Absent, file("a\nc\n"), file("a\nc\nd\n"));
+        let mut same = read("f.txt", Value::Absent, file("a\nc\n"), file("a\nb\nc\n"));
+        let previous_same = read("f.txt", Value::Absent, file("a\nc\n"), file("a\n\nb\nc\n"));
+        assert_ne!(different.lost[0].text, previous_different.lost[0].text);
+        assert_eq!(same.lost[0].text, previous_same.lost[0].text);
+
+        // When: each reading carries forward what the release before lacked
+        different.carry_forward(&previous_different);
+        same.carry_forward(&previous_same);
+        // Then: an entry whose file changed differently is not carried
+        // forward (plant A carries every entry unconditionally), while one
+        // that holds the same non-blank lines is
+        assert_eq!(different.reading, Reading::Inconclusive);
+        assert_eq!(same.reading, Reading::CarriedForward);
     }
 
     #[test]
@@ -1833,5 +2056,22 @@ mod tests {
                 "release_words": 30_004,
             }])
         );
+    }
+
+    #[test]
+    fn an_added_file_changed_entry_serializes_its_version_digest() {
+        // Given: a member that adds `f.txt`, and a release that holds another
+        // version of it
+        let lines = read("f.txt", Value::Absent, file("a\nc\n"), file("a\nb\nc\n"));
+
+        // When: it is written as JSON
+        let json = serde_json::to_value(&lines).expect("the reading serializes");
+
+        // Then: the unreadable entry names its kind and the stable digest of
+        // the release file's non-blank lines, so a later audit can carry
+        // forward only that same version
+        assert_eq!(json["reading"], "inconclusive");
+        assert_eq!(json["lost"][0]["kind"], "added-file-changed");
+        assert_eq!(json["lost"][0]["text"], non_blank_digest(b"a\nb\nc\n"));
     }
 }

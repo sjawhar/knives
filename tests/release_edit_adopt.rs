@@ -1904,3 +1904,48 @@ fn an_edit_reads_no_line_of_a_fast_forwarded_member_whose_other_parents_share_no
     assert_eq!(output.status.code(), Some(0), "{cut}\n{out}");
     assert!(has_line(&out, &no_base_line(A)), "{out}");
 }
+
+#[test]
+fn an_include_that_puts_back_a_removal_from_an_added_files_history_is_refused() {
+    // Given: a base commit off the trunk adds `f.txt` as `a`, `b`, `c`;
+    // `feat/p`, stacked on it, deletes `b`; a cut of `feat/m` and `feat/p`
+    // is edited by hand to put `b` back and adopted; `feat/del`, also
+    // stacked on that base commit, deletes `b`.
+    let lab = Lab::new();
+    lab.jj_work(["new", "-r", "main@origin", "-m", "add f.txt"]);
+    std::fs::write(lab.work.join("f.txt"), "a\nb\nc\n").expect("write f.txt");
+    lab.jj_work(["new", "-m", "feat/p"]);
+    let base = commit_at(&lab, lab.revision(&lab.work, "@-", "commit_id").trim());
+    std::fs::write(lab.work.join("f.txt"), "a\nc\n").expect("delete b in feat/p");
+    std::fs::write(lab.work.join("p.txt"), "p\n").expect("write p.txt");
+    lab.jj_work(["bookmark", "create", "feat/p", "-r", "@"]);
+    member(&lab, M, &[("m.txt", "m\n")]);
+    let (home, _consumer) = release_test_home(&lab);
+    let cut = release_ran(&lab, &home, &["cut", RELEASE]);
+    assert_eq!(release_parents(&lab, RELEASE).len(), 2, "{cut}");
+    edit_by_hand(&lab, RELEASE, &[("f.txt", "a\nb\nc\n")]);
+    adopt(&lab, &home, RELEASE, "put b back by hand");
+    lab.jj_work(["new", "-r", base.as_str(), "-m", "feat/del"]);
+    std::fs::write(lab.work.join("f.txt"), "a\nc\n").expect("delete b in feat/del");
+    std::fs::write(lab.work.join("del.txt"), "del\n").expect("write del.txt");
+    lab.jj_work(["bookmark", "create", "feat/del", "-r", "@"]);
+    lab.jj_work(["new", "main@origin"]);
+    let before = Untouched::read(&lab, &home);
+
+    // When: `feat/del` is included.
+    let output = knives_release(&lab, &home, &["include", "feat/del"]);
+
+    // Then: `feat/del`'s change adds `f.txt` as `a`, `c`, which the
+    // candidate holds another version of, as the plain merge of the new
+    // parents does not: the edit's check refuses (exit 3), writes nothing,
+    // and names the file.
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    before.assert_kept(&lab, &home, &out);
+    assert!(out.contains(&refusal_line("f.txt", "feat/del")), "{out}");
+    assert!(
+        out.contains("      f.txt: the member adds this file, and the release changed it"),
+        "{out}"
+    );
+    assert!(out.contains(&remedy_line()), "{out}");
+}

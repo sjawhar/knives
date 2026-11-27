@@ -2383,9 +2383,10 @@ fn a_conflict_in_the_members_path_is_inconclusive_and_one_elsewhere_is_not() {
     let out = stdout(&output);
     assert!(
         out.contains(&format!(
-            "  {}: content check inconclusive (an unresolved conflict; re-check after resolving \
-             it)\n      f.txt: unresolved conflict in the release",
-            label(&lab, M)
+            "  {}: content check inconclusive ({})\n      f.txt: unresolved conflict in the \
+             release",
+            label(&lab, M),
+            knives::commands::release::INCONCLUSIVE_WHY
         )),
         "{out}"
     );
