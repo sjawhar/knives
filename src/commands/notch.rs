@@ -11,8 +11,8 @@ use crate::cli::Exit;
 use crate::commands::claim::{Bound, current_identity};
 use crate::ids::{BookmarkRef, BranchName, BranchTarget, RepoName, short_id};
 use crate::ledger::{
-    Anchoring, Draft, Entry, EntryClass, Filter, Kind, Ledger, LedgerError, Scribe, SubjectNow,
-    VerifyFlag, anchor_in, body_human_text, inline_human_text, select, verify_entries,
+    Anchoring, Draft, Entry, EntryClass, Filter, Kind, Ledger, LedgerError, Scribe, VerifyFlag,
+    body_human_text, inline_human_text, select, verify_entries,
 };
 use crate::store::{Store, default_state_path};
 
@@ -228,7 +228,7 @@ fn anchor_warning(entry: &Entry, anchoring: &Anchoring) -> Option<String> {
         .subject
         .as_deref()
         .filter(|subject| !subject.starts_with('#'))?;
-    if anchoring.by_evidence {
+    if entry.anchor_ref.is_some() {
         return None;
     }
     // A remote's name is read from the checkout's configuration.
@@ -367,22 +367,16 @@ fn verify(
         .into_iter()
         .map(|commit| commit.as_str().to_owned())
         .collect();
-    // Each entry is checked against where the writer's rule anchors it now,
-    // from its subject's tips here, local and on each remote: an entry its
+    // Each entry's anchor is checked against the ref it was read from, among
+    // its subject's tips here, local and on each remote: an entry its
     // evidence anchored at origin's head holds while that head does.
-    let checkout = crate::jj::Repo::open(path)?;
     let subjects: std::collections::BTreeSet<&str> = selected
         .iter()
         .filter_map(|entry| entry.subject.as_deref())
         .collect();
-    let tips = checkout.tips_of_each(&subjects);
-    let flags = verify_entries(&selected, &visible, |entry| {
-        let Some(subject) = entry.subject.as_deref() else {
-            return SubjectNow::default();
-        };
-        let tips = tips.get(subject).map_or(&[][..], Vec::as_slice);
-        let (anchor, _) = anchor_in(&checkout, subject, &entry.evidence, tips);
-        SubjectNow { anchor, tips }
+    let tips = crate::jj::Repo::open(path)?.tips_of_each(&subjects);
+    let flags = verify_entries(&selected, &visible, |subject| {
+        tips.get(subject).map_or(&[][..], Vec::as_slice)
     });
     Ok(Report::Verified {
         repo: repo.to_string(),
@@ -493,6 +487,7 @@ mod tests {
             text: text.to_owned(),
             evidence: Vec::new(),
             anchor: Some("6c42fe71aaaaaaaa".to_owned()),
+            anchor_ref: None,
             pr: Some(1157),
             parents: Vec::new(),
             fix_files: Vec::new(),
@@ -637,6 +632,7 @@ mod tests {
                     text: format!("event {second}"),
                     evidence: Vec::new(),
                     anchor: None,
+                    anchor_ref: None,
                     pr: Some(7),
                     parents: Vec::new(),
                     fix_files: Vec::new(),
@@ -662,6 +658,7 @@ mod tests {
                 text: "human note".to_owned(),
                 evidence: Vec::new(),
                 anchor: None,
+                anchor_ref: None,
                 pr: Some(7),
                 parents: Vec::new(),
                 fix_files: Vec::new(),

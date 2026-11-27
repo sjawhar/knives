@@ -1220,6 +1220,7 @@ mod repeated_transition_tests {
             text: text.to_owned(),
             evidence: Vec::new(),
             anchor: None,
+            anchor_ref: None,
             pr,
             parents: Vec::new(),
             fix_files: Vec::new(),

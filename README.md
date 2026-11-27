@@ -102,10 +102,11 @@ subject also stamps that pull request, so `knives notch --pr <n>` finds it witho
 fictional branch. Bare `knives notch` shows the newest human notes and folds machine events into
 one count; `--events` reads their full chronology. `--verify` re-checks selected
 commit-shaped evidence and anchors against the repository as it is now. A note is anchored at
-the subject's tip that its `--evidence` names, local or on a remote, else at its local bookmark.
-When its evidence names none of the subject's tips, and that local bookmark is missing or a remote
-holds the subject elsewhere, the write says so on stderr. `--verify` flags an anchor as moved when
-that rule, applied to the repository now, lands elsewhere.
+the subject's tip that its `--evidence` names, local or on a remote, else at its local bookmark;
+an entry its evidence anchored records that ref as `anchor_ref`. When its evidence names none of
+the subject's tips, and that local bookmark is missing or a remote holds the subject elsewhere, the
+write says so on stderr. `--verify` flags an anchor as moved when the ref it was read from is at
+another commit now.
 
 A fork's ledger travels between machines when its `repos.toml` entry names the repository its
 ledger belongs to (`ledger = "<owner>/<name>"`), and a git directory over the ledger root has that

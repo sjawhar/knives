@@ -1197,6 +1197,7 @@ mod tests {
                 text: "stated".to_owned(),
                 evidence: Vec::new(),
                 anchor: None,
+                anchor_ref: None,
                 pr: None,
                 parents: Vec::new(),
                 fix_files: Vec::new(),

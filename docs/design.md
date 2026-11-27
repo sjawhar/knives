@@ -156,13 +156,13 @@ dispositions; the last class means notes that carry the optional field.
 
 `knives notch --verify` re-checks selected entries against all commits visible to the repository
 and the tips of each entry's subject, its local bookmark and the same name on each remote. It flags
-a missing commit-shaped evidence token, a vanished anchor, or an anchor that has moved: the rule a
-note's anchor was chosen by (below), applied to the repository now, lands elsewhere. A note its
-evidence anchored at a remote's tip holds while that tip does, whatever the local bookmark holds; a
-note anchored at the local bookmark is flagged once that bookmark moves, even while a remote still
-holds the old commit. Where the rule lands nowhere, the anchor has moved only when every tip of the
-subject here has left it; a subject with no tip here was deleted, which leaves the entry valid. That
-makes an old entry's context inspectable without rewriting its past-tense record.
+a missing commit-shaped evidence token, a vanished anchor, or an anchor that has moved: the ref the
+anchor was read from is at another commit now. That ref is the one the note's evidence chose, which
+the entry records as `anchor_ref` (below), else the subject's local bookmark. A note its evidence
+anchored at a remote's tip holds while that tip does, whatever the local bookmark holds; a note
+anchored at the local bookmark, by its evidence or not, is flagged once that bookmark moves, even
+while a remote still holds the old commit. A ref that is gone here, a deleted branch, leaves the
+entry valid. That makes an old entry's context inspectable without rewriting its past-tense record.
 
 ## Forge snapshot and cache
 
@@ -421,7 +421,8 @@ the number of sibling entries it masks. A disposition token prefixes that compac
 
 A written note's anchor is the subject's tip, chosen among the subject's own refs: when an
 `--evidence` item resolves to one of its tips here, the local bookmark or the same name on a
-remote, the note is anchored there, else at what the subject resolves to here, its local
+remote (the local one first where several hold the commit), the note is anchored there and records
+that ref as `anchor_ref`, else it is anchored at what the subject resolves to here, its local
 bookmark. A clone's local bookmark can stay behind the head another clone pushed, or be missing,
 while the note is evidence of that head. Evidence that is no tip of the subject, such as the trunk
 commit a reproduction ran on, never anchors it. A note its evidence did not anchor, on a subject
