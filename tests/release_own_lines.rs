@@ -3175,6 +3175,181 @@ fn an_overlapped_line_beside_an_added_file_the_release_changed_stays_missing() {
     assert!(!out.contains(&format!("{member}: unresolved")), "{out}");
 }
 
+#[test]
+fn a_landing_on_a_rebased_member_never_hides_a_line_it_dropped() {
+    // Given: the first cut of `feat/alpha` (`alpha one`, `alpha two`) and
+    // `feat/beta`; `feat/alpha` pushed, rebased in a second clone onto a
+    // newer trunk (another tree, so no twin of the recorded commit), pushed
+    // and fetched here; `feat/land`, built on the rebased `feat/alpha`,
+    // drops `alpha two` and adds `land.txt`; NEXT, made by hand of
+    // `feat/land` and `feat/beta`.
+    let lab = trunk_with(&[("f.txt", "f\n")]);
+    lab.branch("feat/alpha", "alpha.txt", "alpha one\nalpha two\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let older = commit_at(&lab, "feat/alpha");
+    lab.push_branch("feat/alpha");
+    lab.upstream_trunk_file("t.txt", "trunk\n");
+    let second = lab.second.clone();
+    let upstream = lab.upstream.display().to_string();
+    lab.jj_at(
+        &second,
+        ["git", "remote", "add", "upstream", upstream.as_str()],
+    );
+    lab.jj_at(&second, ["git", "fetch", "--all-remotes"]);
+    lab.jj_at(
+        &second,
+        ["bookmark", "track", "feat/alpha", "--remote", "origin"],
+    );
+    lab.jj_at(
+        &second,
+        ["rebase", "-r", "feat/alpha", "-d", "main@upstream"],
+    );
+    lab.jj_at(
+        &second,
+        [
+            "git",
+            "push",
+            "--remote",
+            "origin",
+            "--bookmark",
+            "feat/alpha",
+        ],
+    );
+    lab.fetch_work();
+    assert_ne!(
+        commit_at(&lab, "feat/alpha"),
+        older,
+        "the second clone rebased"
+    );
+    branch_on(&lab, "feat/alpha", "feat/land", |work| {
+        write_file(work, "alpha.txt", "alpha one\n");
+        write_file(work, "land.txt", "land\n");
+    });
+    let next = hand_release(&lab, NEXT, &["feat/land", "feat/beta"], |_| {});
+
+    // When: NEXT is recorded.
+    let recorded = record(&lab, &home, NEXT, &next);
+
+    // Then: the rebased `feat/alpha` is no parent, so it carries nothing;
+    // the recorded `feat/alpha` is read by its lines, and the record is
+    // refused naming `alpha two`.
+    let out = text(&recorded);
+    assert_eq!(recorded.status.code(), Some(REFUSED), "{out}");
+    assert!(out.contains("alpha two"), "{out}");
+}
+
+#[test]
+fn a_reworded_member_carries_as_a_parent_and_never_under_a_landing() {
+    for under_landing in [true, false] {
+        // Given: the first cut of `feat/alpha` (`alpha one`, `alpha two`)
+        // and `feat/beta`; `feat/alpha` reworded (the same tree); NEXT made
+        // by hand of `feat/beta` and either `feat/land`, built on the
+        // reworded `feat/alpha`, which drops `alpha two` and adds
+        // `land.txt`, or the reworded `feat/alpha` itself.
+        let lab = trunk_with(&[("f.txt", "f\n")]);
+        lab.branch("feat/alpha", "alpha.txt", "alpha one\nalpha two\n");
+        lab.branch("feat/beta", "beta.txt", "beta\n");
+        let (home, _consumer) = home_after_first_cut(&lab);
+        jj_in(
+            &lab.work,
+            &[
+                "describe",
+                "--ignore-immutable",
+                "-r",
+                "feat/alpha",
+                "-m",
+                "feat/alpha, reworded",
+            ],
+        );
+        let first = if under_landing {
+            branch_on(&lab, "feat/alpha", "feat/land", |work| {
+                write_file(work, "alpha.txt", "alpha one\n");
+                write_file(work, "land.txt", "land\n");
+            });
+            "feat/land"
+        } else {
+            "feat/alpha"
+        };
+        let next = hand_release(&lab, NEXT, &[first, "feat/beta"], |_| {});
+
+        // When: NEXT is recorded.
+        let recorded = record(&lab, &home, NEXT, &next);
+
+        // Then: under a landing, the reworded `feat/alpha` carries nothing,
+        // and the record is refused naming `alpha two`; as a parent, it
+        // carries the recorded `feat/alpha`, and the record goes ahead.
+        let out = text(&recorded);
+        if under_landing {
+            assert_eq!(recorded.status.code(), Some(REFUSED), "{out}");
+            assert!(out.contains("alpha two"), "{out}");
+        } else {
+            assert_eq!(recorded.status.code(), Some(0), "{out}");
+            assert!(!out.contains("alpha two"), "{out}");
+        }
+    }
+}
+
+/// The recut shape a twin under a parent is for: the first cut of
+/// `feat/alpha`, which adds `alpha.txt`, and `feat/beta`; `feat/alpha`
+/// recreated as `feat/alpha2` with its exact tree where `exact`, else with
+/// one line of `alpha.txt` changed; `advance --from` moves the member onto
+/// it, and a commit on top of it changes `alpha.txt` again, so the twin is
+/// under the parent, not the parent. NEXT merges the trunk, `feat/alpha2`
+/// and `feat/beta`, with `also` written by hand. The record's output.
+fn recut_with_a_twin_under_a_parent(exact: bool, also: impl FnOnce(&Path)) -> String {
+    let lab = trunk_with(&[("f.txt", "f\n")]);
+    lab.branch("feat/alpha", "alpha.txt", "alpha one\nalpha two\n");
+    lab.branch("feat/beta", "beta.txt", "beta\n");
+    let (home, _consumer) = home_after_first_cut(&lab);
+    let alpha = commit_at(&lab, "feat/alpha");
+    let recreated = if exact {
+        "alpha one\nalpha two\n"
+    } else {
+        "alpha one\nalpha other\n"
+    };
+    lab.branch("feat/alpha2", "alpha.txt", recreated);
+    let moved = knives_release(
+        &lab,
+        &home,
+        &["advance", "feat/alpha2", "--from", alpha.as_str()],
+    );
+    assert_eq!(moved.status.code(), Some(0), "{}", text(&moved));
+    extend_branch(
+        &lab,
+        "feat/alpha2",
+        "alpha.txt",
+        "alpha one\nalpha two\nmore\n",
+    );
+    let advanced = knives_release(&lab, &home, &["advance", "feat/alpha2"]);
+    assert_eq!(advanced.status.code(), Some(0), "{}", text(&advanced));
+    let next = hand_release(&lab, NEXT, &["feat/alpha2", "feat/beta"], also);
+    text(&record(&lab, &home, NEXT, &next))
+}
+
+#[test]
+fn a_twin_under_a_parent_excuses_only_the_added_file_the_release_changed() {
+    // Given, when, then: the twin's own commit is under the parent, so the
+    // member is read by its lines; its only finding is `alpha.txt`, the
+    // file it adds that the release changed, which the twin excuses.
+    let out = recut_with_a_twin_under_a_parent(true, |_| {});
+    assert!(out.contains("as its cut"), "{out}");
+    assert!(!out.contains("the member adds this file"), "{out}");
+
+    // And: a line the release dropped is a second finding, which no twin
+    // excuses: the record is refused, naming the line.
+    let out = recut_with_a_twin_under_a_parent(true, |work| {
+        write_file(work, "beta.txt", "");
+    });
+    assert!(out.contains("‹beta›"), "{out}");
+    assert!(!out.contains("as its cut"), "{out}");
+
+    // And: a near-twin, whose tree differs by one line, excuses nothing:
+    // the member stays inconclusive, naming the file.
+    let out = recut_with_a_twin_under_a_parent(false, |_| {});
+    assert!(out.contains("the member adds this file"), "{out}");
+}
+
 /// Four branches stacked on one another, merged by hand as a release cut
 /// outside knives: `feat/base` writes `base.txt`; `feat/pr`, on it, writes
 /// `pr.txt`; `feat/other`, on `feat/base` too, rewrites `base.txt`;

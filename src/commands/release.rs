@@ -4203,8 +4203,8 @@ pub struct CompositionCheck {
     /// candidate or at the member's tip, and which lack nothing else:
     /// unanswerable either way, exactly as the audit reports it.
     pub inconclusive: Vec<RecordedMember>,
-    /// Recorded members carried by another commit with exactly their tree,
-    /// reachable from a parent: the member rendered for a human, and the twin.
+    /// Recorded members carried by a parent of the subject with exactly
+    /// their tree: the member rendered for a human, and the twin.
     pub twins: Vec<(String, CommitId)>,
     /// Whether this repository does not hold the newest recorded write
     /// ([`CompositionBaseline::newest_write`]). Nothing here can tell what
@@ -4733,19 +4733,24 @@ pub struct CompositionDelta<'a> {
 /// the cut's base. Ancestry through another member parent does not carry it:
 /// the checks below read that member's own lines against the subject. A
 /// member whose change was rewritten — `jj rebase` keeps the change id and
-/// mints a new commit — is carried when a rewrite that stands for it is
-/// reachable from a parent or the base ([`Repo::standing_rewrites_of`]).
-/// The recorded commit itself is never an ancestor again after a rebase. A
-/// commit that only shares its change id, such as the older version a newer
-/// member replaced, carries nothing for it here, and the checks below
-/// measure the member. The one exception is
-/// the succession the ledger records: a member of the previous cut whose
-/// change id a member of the newest write has is superseded by that member,
-/// as `advance` recorded it, and is not held; that member is. A member
-/// recreated outside jj with exactly its tree is carried when that twin is
-/// reachable
-/// from a parent past the base ([`Repo::same_tree_between`]), and the twin
-/// is named. A member that none of these account for is read by its own
+/// mints a new commit — is carried when a rewrite that stands for it is a
+/// parent or the base reaches it ([`Repo::standing_rewrites_of`]); a rewrite
+/// reached only through another parent, as under a landing built on it,
+/// carries nothing, and the member's lines are read. The recorded commit
+/// itself is never an ancestor again after a rebase. A commit that only
+/// shares its change id, such as the older version a newer member replaced,
+/// carries nothing for it here, and the checks below measure the member.
+/// The one exception is the succession the ledger records: a member of the
+/// previous cut whose change id a member of the newest write has is
+/// superseded by that member, as `advance` recorded it, and is not held;
+/// that member is. A member recreated outside jj, or reworded, with exactly
+/// its tree is carried when that twin is a parent ([`Repo::same_tree`]), and
+/// the twin is named. A twin under a parent carries nothing on its own: the
+/// member's lines are read, and the twin then excuses one finding only, the
+/// file the member adds that the subject changed, which no reading can
+/// answer ([`Repo::same_tree_between`], [`LostKind::AddedFileChanged`]). A
+/// member that lacks a line, or whose path is conflicted, is never excused.
+/// A member that none of these account for is read by its own
 /// lines against the subject ([`jj::Repo::member_lines`]), the same measure
 /// [`audit_cut`] applies to current members, taken from the member's own
 /// fork point so a moved base is never charged to the member: that accounts
@@ -4827,25 +4832,12 @@ pub fn uncarried_recorded_members(
             check.held.push(member.clone());
             continue;
         }
-        // A rewrite that stands for the member carries it where the base or
-        // a parent reaches it: the rewrite is the member's own change, so a
-        // parent that holds it holds the member.
-        let rewrites = repo.standing_rewrites_of(member)?;
-        let mut rewritten = false;
-        for rewrite in &rewrites {
-            if reaches_any(repo, rewrite, delta)? || repo.reached_by(rewrite, delta.parents)? {
-                rewritten = true;
-                break;
+        if let Some(carried) = carried_by_rewrite_or_twin(repo, member, delta)? {
+            if let Carriage::Twin(twin) = carried {
+                check
+                    .twins
+                    .push((recorded_member_name(member, delta.tips), twin));
             }
-        }
-        if rewritten {
-            check.held.push(member.clone());
-            continue;
-        }
-        if let Some(twin) = repo.same_tree_between(member, delta.base, delta.parents)? {
-            check
-                .twins
-                .push((recorded_member_name(member, delta.tips), twin));
             check.held.push(member.clone());
             continue;
         }
@@ -4876,6 +4868,12 @@ pub fn uncarried_recorded_members(
                 &write.commit,
             )?);
         }
+        if let Some(twin) = excusing_twin(repo, (member, &lines), delta)? {
+            check.twins.push((recorded.name, twin));
+            check.held.push(member.clone());
+            check.members.push(lines);
+            continue;
+        }
         match lines.reading {
             Reading::Carried | Reading::CarriedForward => check.held.push(member.clone()),
             Reading::Inconclusive => check.inconclusive.push(recorded),
@@ -4884,6 +4882,70 @@ pub fn uncarried_recorded_members(
         check.members.push(lines);
     }
     Ok(check)
+}
+
+/// What carries a recorded member that is neither a parent nor reached by
+/// the base ([`carried_by_rewrite_or_twin`]).
+enum Carriage {
+    /// A rewrite that stands for it, which carries it unnamed.
+    Rewrite,
+    /// A parent with exactly its tree, which the report names.
+    Twin(CommitId),
+}
+
+/// What carries the recorded member at `member`, where anything does.
+///
+/// A rewrite that stands for it ([`Repo::standing_rewrites_of`]) carries it
+/// where it is a parent or the base reaches it; a twin, a commit with
+/// exactly its tree ([`Repo::same_tree`]), where it is a parent. One
+/// reached only through another parent, as under a landing built on it,
+/// carries nothing here: the member's lines are read, and a twin under a
+/// parent may then excuse the one finding no reading answers
+/// ([`excusing_twin`]).
+fn carried_by_rewrite_or_twin(
+    repo: &Repo,
+    member: &CommitId,
+    delta: &CompositionDelta<'_>,
+) -> anyhow::Result<Option<Carriage>> {
+    for rewrite in &repo.standing_rewrites_of(member)? {
+        if delta.parents.contains(rewrite) || reaches_any(repo, rewrite, delta)? {
+            return Ok(Some(Carriage::Rewrite));
+        }
+    }
+    for parent in delta.parents {
+        if repo.same_tree(member, parent)? {
+            return Ok(Some(Carriage::Twin(parent.clone())));
+        }
+    }
+    Ok(None)
+}
+
+/// The twin that excuses the one finding of `lines`, the reading of the
+/// recorded member at `member` against the subject, where it has one.
+///
+/// A commit with exactly the member's tree under a parent
+/// ([`Repo::same_tree_between`]) excuses one finding and no other: the file
+/// the member adds that the subject changed, which no reading can answer
+/// ([`LostKind::AddedFileChanged`]). That is the recut shape, a member
+/// recreated with its tree and then grown. The twin holds the member's tree
+/// exactly, so that file is the member's content, and a subject that
+/// carries the twin carries it. A member that lacks a line, or whose path
+/// is conflicted, is never excused.
+fn excusing_twin(
+    repo: &Repo,
+    (member, lines): (&CommitId, &MemberLines),
+    delta: &CompositionDelta<'_>,
+) -> anyhow::Result<Option<CommitId>> {
+    if lines.reading != Reading::Inconclusive
+        || !lines
+            .lost
+            .iter()
+            .filter(|lost| !lost.carried_forward)
+            .all(|lost| lost.kind == LostKind::AddedFileChanged)
+    {
+        return Ok(None);
+    }
+    Ok(repo.same_tree_between(member, delta.base, delta.parents)?)
 }
 
 /// Record what the subject lacks of `fix`, one of the fixes by hand that the
