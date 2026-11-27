@@ -101,7 +101,10 @@ A disposition is a terminal, past-tense ruling (`merged-elsewhere`, `withdrawn`,
 subject also stamps that pull request, so `knives notch --pr <n>` finds it without tracking a
 fictional branch. Bare `knives notch` shows the newest human notes and folds machine events into
 one count; `--events` reads their full chronology. `--verify` re-checks selected
-commit-shaped evidence and anchors against the repository as it is now.
+commit-shaped evidence and anchors against the repository as it is now. A note is anchored at
+the subject's tip that its `--evidence` names, local or on a remote, else at its local bookmark;
+when that local bookmark is missing or a remote holds the subject elsewhere, the write says so on
+stderr.
 
 A fork's ledger travels between machines when its `repos.toml` entry names the repository its
 ledger belongs to (`ledger = "<owner>/<name>"`), and a git directory over the ledger root has that

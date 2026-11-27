@@ -414,6 +414,17 @@ ruling. `--verify` re-checks selected entries without writing. The `status` brea
 other half: each branch shows its newest note when one exists, otherwise its newest event, with
 the number of sibling entries it masks. A disposition token prefixes that compact text.
 
+A written note's anchor is the subject's tip, chosen among the subject's own refs: when an
+`--evidence` item resolves to one of its tips here, the local bookmark or the same name on a
+remote, the note is anchored there, else at what the subject resolves to here, its local
+bookmark. A clone's local bookmark can stay behind the head another clone pushed, or be missing,
+while the note is evidence of that head. Evidence that is no tip of the subject, such as the trunk
+commit a reproduction ran on, never anchors it. A note its evidence did not anchor, on a subject
+that resolves to no commit here or that a remote holds at another commit, is written as before and
+its writer is warned on stderr; where a remote holds the subject, the warning says to name the head
+with `--evidence`. knives' advice comes before refusal, and an unresolvable anchor never cost an
+entry.
+
 `knives repos` and `knives status` are deliberately separate: one answers "what am I maintaining", the other "what is the current state and what is being worked on right now". Conflating them was an earlier mistake in this design. `knives status` emits a problem-first map: `UNANSWERED` precedes the aligned branch table (`branch`, `state`, `tip`, `push`, `pr`, `review`, `checks`, `landed`, `claim`, `seen`, `notch`), followed by grouped findings. Absent display values are `-`; `push` displays `pushed` when its machine field is absent, and a divergent bookmark displays `divergent` in `tip`. `claim` and `seen` carry claim ownership and observation instead of a separate claims section. On-screen status display tokens use `failing` for failing checks and `none-ran` when no checks run.
 
 ### Which PR belongs to a branch

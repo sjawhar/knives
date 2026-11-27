@@ -725,3 +725,238 @@ fn an_empty_message_is_usage_and_does_not_write_a_note_with_no_text() {
     ));
     assert!(shown.contains("pushed round 6"), "was: {shown}");
 }
+
+/// A registry naming the lab's fork `demo` by its upstream.
+fn lab_home(lab: &lab::Lab) -> tempfile::TempDir {
+    let home = tempfile::tempdir().expect("create config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
+            lab.upstream.display()
+        ),
+    )
+    .expect("write registry");
+    home
+}
+
+/// `knives --json notch <subject> -m … [--evidence <each>] --repo demo`, run in
+/// the lab's work checkout.
+fn notch_in(lab: &lab::Lab, home: &tempfile::TempDir, subject: &str, evidence: &[&str]) -> Output {
+    let mut args = vec![
+        "--json",
+        "notch",
+        subject,
+        "-m",
+        "PR head pushed",
+        "--repo",
+        "demo",
+    ];
+    for &item in evidence {
+        args.extend(["--evidence", item]);
+    }
+    lab::knives_command(&lab.work, home.path(), lab.temp_path(), &args)
+        .env("KNIVES_OWNER", "ses_fff688")
+        .output()
+        .expect("run knives")
+}
+
+/// The anchor of the entry a successful JSON write reports; `None` when the
+/// entry has none.
+fn written_anchor(output: &Output) -> Option<String> {
+    assert_eq!(output.status.code(), Some(0), "{}", lab::text(output));
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    parsed["wrote"]
+        .get("anchor")
+        .map(|anchor| anchor.as_str().expect("an anchor is a string").to_owned())
+}
+
+/// `fix-stale` here at one commit and on origin at another that no ancestry
+/// joins: what a clone's bookmark keeps when another clone rewrote the branch
+/// and pushed it, and this clone fetched without moving its own. Its commit
+/// here, then on origin.
+fn stale_bookmark(lab: &lab::Lab) -> (String, String) {
+    lab.branch("fix-stale", "stale.txt", "the head this clone last made\n");
+    lab.foreign_origin_branch(
+        "main@origin",
+        "fix-stale",
+        "the head another clone pushed\n",
+    );
+    lab.jj_work(["git", "fetch", "--remote", "origin"]);
+    let here = lab::commit_at(lab, "fix-stale").as_str().to_owned();
+    let origin = lab::commit_at(lab, "fix-stale@origin").as_str().to_owned();
+    assert_ne!(here, origin, "the fixture's bookmark is not stale");
+    (here, origin)
+}
+
+/// `fix-gone` only on origin, with no local bookmark: a branch another clone
+/// pushed, fetched here and never tracked. Its commit on origin.
+fn origin_only_bookmark(lab: &lab::Lab) -> String {
+    lab.foreign_origin_branch("main@origin", "fix-gone", "pushed by another clone\n");
+    lab.jj_work(["git", "fetch", "--remote", "origin"]);
+    lab::commit_at(lab, "fix-gone@origin").as_str().to_owned()
+}
+
+#[test]
+fn a_note_on_a_stale_bookmark_is_anchored_at_the_origin_head_its_evidence_names() {
+    // Given: a local bookmark left behind origin by another clone's push.
+    let lab = lab::Lab::new();
+    let home = lab_home(&lab);
+    let (here, origin) = stale_bookmark(&lab);
+
+    for evidence in [origin.as_str(), &origin[..8]] {
+        // When: a note names origin's head as its evidence, whole or as the
+        // short id a note's text quotes.
+        let wrote = notch_in(&lab, &home, "fix-stale", &[evidence]);
+
+        // Then: the note is anchored at that head, not at the stale local
+        // bookmark, and the write warns of nothing.
+        assert_eq!(
+            written_anchor(&wrote).as_deref(),
+            Some(origin.as_str()),
+            "{evidence}: anchored behind origin (local is {here}): {}",
+            lab::text(&wrote)
+        );
+        assert!(wrote.stderr.is_empty(), "{evidence}: {}", lab::text(&wrote));
+    }
+
+    // When: a note names the local head as its evidence instead.
+    let wrote = notch_in(&lab, &home, "fix-stale", &[here.as_str()]);
+
+    // Then: it is anchored there, and nothing is warned: the writer chose that
+    // head, so origin's other one is not news.
+    assert_eq!(
+        written_anchor(&wrote).as_deref(),
+        Some(here.as_str()),
+        "{}",
+        lab::text(&wrote)
+    );
+    assert!(wrote.stderr.is_empty(), "{}", lab::text(&wrote));
+}
+
+#[test]
+fn a_note_on_a_branch_only_origin_holds_is_anchored_at_the_head_its_evidence_names() {
+    // Given: a branch this clone has only as `fix-gone@origin`.
+    let lab = lab::Lab::new();
+    let home = lab_home(&lab);
+    let origin = origin_only_bookmark(&lab);
+
+    // When: a note names origin's head as its evidence.
+    let wrote = notch_in(&lab, &home, "fix-gone", &[origin.as_str()]);
+
+    // Then: the note is anchored at that head rather than left with none.
+    assert_eq!(
+        written_anchor(&wrote).as_deref(),
+        Some(origin.as_str()),
+        "{}",
+        lab::text(&wrote)
+    );
+    assert!(wrote.stderr.is_empty(), "{}", lab::text(&wrote));
+}
+
+#[test]
+fn a_note_without_evidence_keeps_the_local_anchor_and_says_what_origin_holds() {
+    // Given: a stale bookmark, a branch only origin holds, and (the control) a
+    // branch whose local bookmark is what it pushed to origin.
+    let lab = lab::Lab::new();
+    let home = lab_home(&lab);
+    let (here, origin) = stale_bookmark(&lab);
+    let gone = origin_only_bookmark(&lab);
+    lab.branch("fix-pushed", "pushed.txt", "pushed\n");
+    lab.push_branch("fix-pushed");
+    let pushed = lab::commit_at(&lab, "fix-pushed").as_str().to_owned();
+
+    // When: a note on the stale bookmark names no evidence.
+    let stale = notch_in(&lab, &home, "fix-stale", &[]);
+
+    // Then: it is anchored at the local bookmark, as before, and the write
+    // warns that origin holds another head, and how to anchor there.
+    assert_eq!(
+        written_anchor(&stale).as_deref(),
+        Some(here.as_str()),
+        "{}",
+        lab::text(&stale)
+    );
+    let warned = String::from_utf8_lossy(&stale.stderr);
+    assert!(
+        warned.contains(&format!(
+            "warning: fix-stale is at {} here but on origin at {}, so this note is anchored at \
+             {}; name the head it is about with --evidence to anchor it there",
+            &here[..12],
+            &origin[..12],
+            &here[..12]
+        )),
+        "{warned}"
+    );
+
+    // When: a note on the branch only origin holds names no evidence.
+    let missing = notch_in(&lab, &home, "fix-gone", &[]);
+
+    // Then: it has no anchor, as before, and the write says so.
+    assert_eq!(written_anchor(&missing), None, "{}", lab::text(&missing));
+    let warned = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        warned.contains(&format!(
+            "warning: fix-gone resolves to no commit here but is on origin at {}, so this note \
+             has no anchor; name the head it is about with --evidence to anchor it there",
+            &gone[..12]
+        )),
+        "{warned}"
+    );
+
+    // When (control): a note on the branch whose local bookmark origin holds.
+    let agreed = notch_in(&lab, &home, "fix-pushed", &[]);
+
+    // Then: anchored at its tip, with nothing to warn of.
+    assert_eq!(
+        written_anchor(&agreed).as_deref(),
+        Some(pushed.as_str()),
+        "{}",
+        lab::text(&agreed)
+    );
+    assert!(agreed.stderr.is_empty(), "{}", lab::text(&agreed));
+}
+
+#[test]
+fn evidence_that_is_no_head_of_the_subject_does_not_anchor_the_note() {
+    // Given: a stale bookmark, and a branch whose local bookmark origin holds.
+    let lab = lab::Lab::new();
+    let home = lab_home(&lab);
+    let (here, origin) = stale_bookmark(&lab);
+    lab.branch("fix-pushed", "pushed.txt", "pushed\n");
+    lab.push_branch("fix-pushed");
+    let pushed = lab::commit_at(&lab, "fix-pushed").as_str().to_owned();
+    // The commit a placement note cites: the trunk a reproduction ran on,
+    // which every branch here holds and none is at.
+    let trunk = lab::commit_at(&lab, "main@origin").as_str().to_owned();
+
+    // When: a note on each cites the trunk commit as its evidence.
+    let stale = notch_in(&lab, &home, "fix-stale", &[trunk.as_str()]);
+    let agreed = notch_in(&lab, &home, "fix-pushed", &[trunk.as_str()]);
+
+    // Then: neither is anchored at the trunk. The stale one keeps its local
+    // anchor and warns that origin holds another head; the other is anchored
+    // at its tip with nothing to warn of.
+    assert_eq!(
+        written_anchor(&stale).as_deref(),
+        Some(here.as_str()),
+        "{}",
+        lab::text(&stale)
+    );
+    assert!(
+        String::from_utf8_lossy(&stale.stderr).contains(&format!(
+            "warning: fix-stale is at {} here but on origin at {}",
+            &here[..12],
+            &origin[..12]
+        )),
+        "{}",
+        lab::text(&stale)
+    );
+    assert_eq!(
+        written_anchor(&agreed).as_deref(),
+        Some(pushed.as_str()),
+        "{}",
+        lab::text(&agreed)
+    );
+    assert!(agreed.stderr.is_empty(), "{}", lab::text(&agreed));
+}

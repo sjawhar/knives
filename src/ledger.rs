@@ -28,7 +28,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use serde::{Deserialize, Serialize};
 
 use crate::config::default_config_path;
-use crate::ids::UpstreamName;
+use crate::ids::{BookmarkRef, CommitId, UpstreamName};
 use crate::statement::Statement;
 
 pub mod transitions;
@@ -300,9 +300,12 @@ pub struct Entry {
     /// survived red-teaming cited one; every false finding lacked one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<String>,
-    /// The subject's tip when this was written, absent when it did not resolve.
+    /// The subject's tip when this was written, absent when it did not resolve:
+    /// of its tips here, local and on each remote, the one the entry's evidence
+    /// names, else what the subject resolves to here ([`Scribe`]).
     ///
-    /// Never caller-supplied. A branch deleted since leaves the entry valid with
+    /// Never caller-supplied: evidence chooses among the subject's own tips and
+    /// names no other commit. A branch deleted since leaves the entry valid with
     /// no anchor; a tip that has moved tells the reader to re-verify.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
@@ -1275,6 +1278,18 @@ impl<'a> Draft<'a> {
     }
 }
 
+/// The subject's refs a write read to anchor its entry
+/// ([`Scribe::record_reading`]).
+#[derive(Debug, Default)]
+pub struct Anchoring {
+    /// Where the subject points here: its local tip, then its tip on each
+    /// remote ([`crate::jj::Repo::tips_of`]). Empty when it is no bookmark
+    /// here, the entry has no subject, or the checkout could not be read.
+    pub tips: Vec<(BookmarkRef, CommitId)>,
+    /// Whether the anchor is the tip the entry's evidence named.
+    pub by_evidence: bool,
+}
+
 /// Where automatic events go, and who is writing them.
 ///
 /// Bound once per command rather than threaded as four arguments: every event a
@@ -1329,9 +1344,17 @@ impl Scribe {
         self.record_to(draft).map(|(entry, _)| entry)
     }
 
+    /// [`Scribe::record`], with the subject's refs its anchor was chosen
+    /// from, for a writer that tells its caller what the anchor misses.
+    pub fn record_reading(&self, draft: &Draft<'_>) -> Result<(Entry, Anchoring), LedgerError> {
+        let (entry, anchoring) = self.stamped(draft, true);
+        let _ = self.write(&entry)?;
+        Ok((entry, anchoring))
+    }
+
     /// [`Scribe::record`], with the path of the file the entry was written to.
     pub fn record_to(&self, draft: &Draft<'_>) -> Result<(Entry, PathBuf), LedgerError> {
-        let entry = self.stamped(draft);
+        let (entry, _) = self.stamped(draft, false);
         let path = self.write(&entry)?;
         Ok((entry, path))
     }
@@ -1344,18 +1367,24 @@ impl Scribe {
     /// forget followed by the list it leaves never lands as the forget alone,
     /// which would erase every requirement.
     pub fn record_in_order(&self, drafts: &[Draft<'_>]) -> Result<Vec<Entry>, LedgerError> {
-        let entries: Vec<Entry> = drafts.iter().map(|draft| self.stamped(draft)).collect();
+        let entries: Vec<Entry> = drafts
+            .iter()
+            .map(|draft| self.stamped(draft, false).0)
+            .collect();
         for entry in entries.iter().rev() {
             let _ = self.write(entry)?;
         }
         Ok(entries)
     }
 
-    /// `draft` as an entry, its automatic fields stamped.
-    fn stamped(&self, draft: &Draft<'_>) -> Entry {
-        Entry {
-            ts: monotonic_after(draft.statement.as_ref().and_then(|stated| stated.replaces))
-                .to_string(),
+    /// `draft` as an entry, its automatic fields stamped, and the subject's
+    /// refs its anchor was chosen from ([`Scribe::anchor`]).
+    fn stamped(&self, draft: &Draft<'_>, reading: bool) -> (Entry, Anchoring) {
+        let ts = monotonic_after(draft.statement.as_ref().and_then(|stated| stated.replaces))
+            .to_string();
+        let (anchor, anchoring) = self.anchor(draft, reading);
+        let entry = Entry {
+            ts,
             owner: self.owner.clone(),
             email: self
                 .email
@@ -1370,7 +1399,7 @@ impl Scribe {
                 .map(|stated| stated.statement.clone()),
             text: draft.text.clone(),
             evidence: draft.evidence.clone(),
-            anchor: self.anchor(draft.subject),
+            anchor,
             pr: draft.pr,
             parents: draft.parents.clone(),
             fix_files: draft.fix_files.clone(),
@@ -1381,7 +1410,8 @@ impl Scribe {
             previous_started: draft.previous_started.clone(),
             previous_last_seen: draft.previous_last_seen.clone(),
             previous_why: draft.previous_why.clone(),
-        }
+        };
+        (entry, anchoring)
     }
 
     /// Write `entry` as one file and list it among what this process
@@ -1405,18 +1435,52 @@ impl Scribe {
         self.record(&Draft::event(subject, text, pr))
     }
 
-    /// The subject's tip now, or nothing when it does not resolve.
+    /// The subject's tip now, or nothing when it does not resolve, with the
+    /// subject's refs it was chosen from: read when `reading`, or when the
+    /// draft names evidence, which needs them.
+    ///
+    /// The tip the draft's evidence names, when an item of it resolves to one
+    /// of the subject's tips here, local or on a remote
+    /// ([`crate::jj::Repo::tips_of`]): a clone's local bookmark can be behind
+    /// the head another clone pushed, or missing, while the entry is evidence
+    /// of that head. Evidence that is no tip of the subject, such as the
+    /// trunk commit a reproduction ran on, never anchors it, so the anchor is
+    /// always where the subject points. Else what the subject resolves to
+    /// here, its local bookmark.
     ///
     /// One local repository open per append. A branch deleted since, a reaped
     /// release ref, and a checkout that is not a repository all land here, and
     /// none of them is a reason to lose the entry.
-    fn anchor(&self, subject: Option<&str>) -> Option<String> {
-        let subject = subject?;
-        crate::jj::Repo::open(self.checkout.as_ref()?)
-            .ok()?
-            .resolve_commit(subject)
-            .ok()
-            .map(|commit| commit.as_str().to_owned())
+    fn anchor(&self, draft: &Draft<'_>, reading: bool) -> (Option<String>, Anchoring) {
+        let Some(subject) = draft.subject else {
+            return (None, Anchoring::default());
+        };
+        let Some(repo) = self
+            .checkout
+            .as_ref()
+            .and_then(|checkout| crate::jj::Repo::open(checkout).ok())
+        else {
+            return (None, Anchoring::default());
+        };
+        let tips = if reading || !draft.evidence.is_empty() {
+            repo.tips_of(subject)
+        } else {
+            Vec::new()
+        };
+        let named = if tips.is_empty() {
+            None
+        } else {
+            draft
+                .evidence
+                .iter()
+                .filter_map(|item| repo.resolve_commit(item.trim()).ok())
+                .find(|commit| tips.iter().any(|(_, tip)| tip == commit))
+        };
+        let by_evidence = named.is_some();
+        let anchor = named
+            .or_else(|| repo.resolve_commit(subject).ok())
+            .map(|commit| commit.as_str().to_owned());
+        (anchor, Anchoring { tips, by_evidence })
     }
 }
 

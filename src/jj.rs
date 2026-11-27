@@ -594,6 +594,40 @@ impl Repo {
         Ok(tips)
     }
 
+    /// Where the bookmark `name` points here: its local tip, then its tip on
+    /// each remote, jj's `git` view left out ([`RemoteName::is_git_view`]).
+    /// Each only where it points at one commit, as [`Self::bookmark_tips`]
+    /// keeps them; empty when `name` is no bookmark here.
+    pub fn tips_of(&self, name: &str) -> Vec<(BookmarkRef, CommitId)> {
+        let view = self.repo.view();
+        let Some((_, targets)) = view.bookmarks().find(|(found, _)| found.as_str() == name) else {
+            return Vec::new();
+        };
+        let branch = BranchName::new(name);
+        let local = targets
+            .local_target
+            .as_normal()
+            .map(|commit| (BookmarkRef::Local(branch.clone()), commit_id(commit)));
+        let remote = targets
+            .remote_refs
+            .into_iter()
+            .filter_map(|(remote, target)| {
+                let remote = RemoteName::new(remote.as_str());
+                if remote.is_git_view() {
+                    return None;
+                }
+                let commit = commit_id(target.target.as_normal()?);
+                Some((
+                    BookmarkRef::Remote {
+                        branch: branch.clone(),
+                        remote,
+                    },
+                    commit,
+                ))
+            });
+        local.into_iter().chain(remote).collect()
+    }
+
     /// Bookmarks whose target is conflicted, with every commit they point at.
     ///
     /// These are exactly the divergent branches, and `bookmark_tips` cannot
