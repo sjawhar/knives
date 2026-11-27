@@ -155,9 +155,14 @@ request without trying to track a branch named `#<n>`. Readers can select notes,
 dispositions; the last class means notes that carry the optional field.
 
 `knives notch --verify` re-checks selected entries against all commits visible to the repository
-and its local bookmark tips. It flags a missing commit-shaped evidence token, a vanished anchor,
-or a subject whose anchor no longer matches its local tip. That makes an old entry's context
-inspectable without rewriting its past-tense record.
+and the tips of each entry's subject, its local bookmark and the same name on each remote. It flags
+a missing commit-shaped evidence token, a vanished anchor, or an anchor that has moved: the ref the
+anchor was read from is at another commit now. That ref is the one the note's evidence chose, which
+the entry records as `anchor_ref` (below), else the subject's local bookmark. A note its evidence
+anchored at a remote's tip holds while that tip does, whatever the local bookmark holds; a note
+anchored at the local bookmark, by its evidence or not, is flagged once that bookmark moves, even
+while a remote still holds the old commit. A ref that is gone here, a deleted branch, leaves the
+entry valid. That makes an old entry's context inspectable without rewriting its past-tense record.
 
 ## Forge snapshot and cache
 
@@ -413,6 +418,18 @@ hide decisions. `--events` reads the full chronology; `--dispositions` reads eve
 ruling. `--verify` re-checks selected entries without writing. The `status` breadcrumb is the
 other half: each branch shows its newest note when one exists, otherwise its newest event, with
 the number of sibling entries it masks. A disposition token prefixes that compact text.
+
+A written note's anchor is the subject's tip, chosen among the subject's own refs: when an
+`--evidence` item resolves to one of its tips here, the local bookmark or the same name on a
+remote (the local one first where several hold the commit), the note is anchored there and records
+that ref as `anchor_ref`, else it is anchored at what the subject resolves to here, its local
+bookmark. A clone's local bookmark can stay behind the head another clone pushed, or be missing,
+while the note is evidence of that head. Evidence that is no tip of the subject, such as the trunk
+commit a reproduction ran on, never anchors it. A note its evidence did not anchor, on a subject
+that resolves to no commit here or that a remote holds at another commit, is written as before and
+its writer is warned on stderr; where a remote holds the subject, the warning says to name the head
+with `--evidence`. knives' advice comes before refusal, and an unresolvable anchor never cost an
+entry.
 
 `knives repos` and `knives status` are deliberately separate: one answers "what am I maintaining", the other "what is the current state and what is being worked on right now". Conflating them was an earlier mistake in this design. `knives status` emits a problem-first map: `UNANSWERED` precedes the aligned branch table (`branch`, `state`, `tip`, `push`, `pr`, `review`, `checks`, `landed`, `claim`, `seen`, `notch`), followed by grouped findings. Absent display values are `-`; `push` displays `pushed` when its machine field is absent, and a divergent bookmark displays `divergent` in `tip`. `claim` and `seen` carry claim ownership and observation instead of a separate claims section. On-screen status display tokens use `failing` for failing checks and `none-ran` when no checks run.
 

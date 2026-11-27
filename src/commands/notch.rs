@@ -9,9 +9,9 @@
 use crate::bind::Fork;
 use crate::cli::Exit;
 use crate::commands::claim::{Bound, current_identity};
-use crate::ids::{BranchName, BranchTarget, RepoName, short_id};
+use crate::ids::{BookmarkRef, BranchName, BranchTarget, RepoName, short_id};
 use crate::ledger::{
-    Draft, Entry, EntryClass, Filter, Kind, Ledger, LedgerError, Scribe, VerifyFlag,
+    Anchoring, Draft, Entry, EntryClass, Filter, Kind, Ledger, LedgerError, Scribe, VerifyFlag,
     body_human_text, inline_human_text, select, verify_entries,
 };
 use crate::store::{Store, default_state_path};
@@ -213,6 +213,60 @@ fn wrote_line(repo: &str, entry: &Entry) -> String {
     )
 }
 
+/// What `entry`'s anchor misses, for its writer: the subject resolves to no
+/// commit here, or a remote holds it at another commit than the one the
+/// anchor took. `None` when the entry's evidence named the anchor, when every
+/// ref of the subject holds the anchor, and for an entry about the repository
+/// or a pull request, which no ref anchors.
+///
+/// A warning, never a refusal: the entry is written either way, as every
+/// other unresolvable anchor leaves an entry valid ([`Entry::anchor`]). Where
+/// a remote holds the subject, the line says to name the head with
+/// `--evidence`, which anchors the next note there.
+fn anchor_warning(entry: &Entry, anchoring: &Anchoring) -> Option<String> {
+    let subject = entry
+        .subject
+        .as_deref()
+        .filter(|subject| !subject.starts_with('#'))?;
+    if entry.anchor_ref.is_some() {
+        return None;
+    }
+    // A remote's name is read from the checkout's configuration.
+    let elsewhere: Vec<String> = anchoring
+        .tips
+        .iter()
+        .filter_map(|(reference, tip)| match reference {
+            BookmarkRef::Remote { remote, .. } if entry.anchor.as_deref() != Some(tip.as_str()) => {
+                Some(format!(
+                    "on {} at {}",
+                    inline_human_text(remote.as_str()),
+                    tip.short()
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    let shown = inline_human_text(subject);
+    let hint = "name the head it is about with --evidence to anchor it there";
+    match (entry.anchor.as_deref(), elsewhere.is_empty()) {
+        (Some(_), true) => None,
+        (Some(anchor), false) => {
+            let anchor = short_id(anchor);
+            Some(format!(
+                "{shown} is at {anchor} here but {}, so this note is anchored at {anchor}; {hint}",
+                elsewhere.join(" and ")
+            ))
+        }
+        (None, false) => Some(format!(
+            "{shown} resolves to no commit here but is {}, so this note has no anchor; {hint}",
+            elsewhere.join(" and ")
+        )),
+        (None, true) => Some(format!(
+            "{shown} resolves to no commit here, so this note has no anchor"
+        )),
+    }
+}
+
 fn pr_subject(subject: Option<&str>) -> Option<u64> {
     subject?.strip_prefix('#')?.parse().ok()
 }
@@ -313,16 +367,17 @@ fn verify(
         .into_iter()
         .map(|commit| commit.as_str().to_owned())
         .collect();
-    let tips = crate::jj::Repo::open(path)?
-        .bookmark_tips()?
-        .into_iter()
-        .filter_map(|(reference, tip)| {
-            reference
-                .is_local()
-                .then(|| (reference.branch().to_string(), tip.as_str().to_owned()))
-        })
+    // Each entry's anchor is checked against the ref it was read from, among
+    // its subject's tips here, local and on each remote: an entry its
+    // evidence anchored at origin's head holds while that head does.
+    let subjects: std::collections::BTreeSet<&str> = selected
+        .iter()
+        .filter_map(|entry| entry.subject.as_deref())
         .collect();
-    let flags = verify_entries(&selected, &visible, &tips);
+    let tips = crate::jj::Repo::open(path)?.tips_of_each(&subjects);
+    let flags = verify_entries(&selected, &visible, |subject| {
+        tips.get(subject).map_or(&[][..], Vec::as_slice)
+    });
     Ok(Report::Verified {
         repo: repo.to_string(),
         checked: selected.len(),
@@ -368,12 +423,15 @@ pub fn run(request: &Request<'_>, output: crate::cli::Output) -> anyhow::Result<
                 });
             let owner = current_identity(request.bound)?.owner;
             let scribe = Scribe::new(ledger, upstream.clone(), path.clone(), owner);
-            let written = scribe.record(&Draft {
+            let (written, anchoring) = scribe.record_reading(&Draft {
                 kind: Kind::Note,
                 disposition: request.disposition.map(str::to_owned),
                 evidence: request.evidence.to_vec(),
                 ..Draft::event(request.subject, text.to_owned(), pr)
             })?;
+            if let Some(warning) = anchor_warning(&written, &anchoring) {
+                eprintln!("warning: {warning}");
+            }
             Report::Written {
                 repo: repo.to_string(),
                 wrote: Box::new(written),
@@ -429,6 +487,7 @@ mod tests {
             text: text.to_owned(),
             evidence: Vec::new(),
             anchor: Some("6c42fe71aaaaaaaa".to_owned()),
+            anchor_ref: None,
             pr: Some(1157),
             parents: Vec::new(),
             fix_files: Vec::new(),
@@ -573,6 +632,7 @@ mod tests {
                     text: format!("event {second}"),
                     evidence: Vec::new(),
                     anchor: None,
+                    anchor_ref: None,
                     pr: Some(7),
                     parents: Vec::new(),
                     fix_files: Vec::new(),
@@ -598,6 +658,7 @@ mod tests {
                 text: "human note".to_owned(),
                 evidence: Vec::new(),
                 anchor: None,
+                anchor_ref: None,
                 pr: Some(7),
                 parents: Vec::new(),
                 fix_files: Vec::new(),

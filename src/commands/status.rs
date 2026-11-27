@@ -1228,6 +1228,7 @@ mod tests {
             text: format!("first\n{}", "x".repeat(140)),
             evidence: Vec::new(),
             anchor: None,
+            anchor_ref: None,
             pr: None,
             parents: Vec::new(),
             fix_files: Vec::new(),

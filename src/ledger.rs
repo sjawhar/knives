@@ -16,8 +16,8 @@
 //! past-tense judgment stays true, while a cached disposition goes wrong the
 //! moment upstream moves.
 
+use std::collections::BTreeSet;
 use std::collections::hash_map::RandomState;
-use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::Write as _;
@@ -28,7 +28,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use serde::{Deserialize, Serialize};
 
 use crate::config::default_config_path;
-use crate::ids::UpstreamName;
+use crate::ids::{BookmarkRef, CommitId, UpstreamName};
 use crate::statement::Statement;
 
 pub mod transitions;
@@ -300,12 +300,23 @@ pub struct Entry {
     /// survived red-teaming cited one; every false finding lacked one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<String>,
-    /// The subject's tip when this was written, absent when it did not resolve.
+    /// The subject's tip when this was written, absent when it did not resolve:
+    /// of its tips here, local and on each remote, the one the entry's evidence
+    /// names, else what the subject resolves to here ([`Scribe`]).
     ///
-    /// Never caller-supplied. A branch deleted since leaves the entry valid with
+    /// Never caller-supplied: evidence chooses among the subject's own tips and
+    /// names no other commit. A branch deleted since leaves the entry valid with
     /// no anchor; a tip that has moved tells the reader to re-verify.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
+    /// The ref [`Entry::anchor`] was read from, where the entry's evidence chose
+    /// it: `<subject>` for the local bookmark, `<subject>@<remote>` for a
+    /// remote's, the local one first where several hold the commit. Absent
+    /// where the anchor is what the subject resolves to here, its local
+    /// bookmark, and on every entry an older knives wrote. `--verify` reads
+    /// this ref, not whichever ref holds the commit now ([`verify_entries`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_ref: Option<String>,
     /// The pull request stated for the subject, from its live `pull` statement
     /// only. Never a forge call: this is a write path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -434,6 +445,8 @@ struct Frontmatter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     anchor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pr: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     parents: Vec<RecordedParent>,
@@ -467,6 +480,7 @@ impl Frontmatter {
             statement: None,
             evidence: entry.evidence.clone(),
             anchor: entry.anchor.clone(),
+            anchor_ref: entry.anchor_ref.clone(),
             pr: entry.pr,
             parents: entry.parents.clone(),
             fix_files: entry.fix_files.clone(),
@@ -508,6 +522,7 @@ impl Frontmatter {
             text,
             evidence: self.evidence,
             anchor: self.anchor,
+            anchor_ref: self.anchor_ref,
             pr: self.pr,
             parents: self.parents,
             fix_files: self.fix_files,
@@ -997,12 +1012,24 @@ pub struct VerifyFlag {
     pub what: String,
 }
 
-/// Re-check commit-shaped evidence and anchors against a visibility-scoped
-/// commit listing. A short evidence SHA matches a visible full id by prefix.
-pub fn verify_entries(
+/// Re-check commit-shaped evidence and anchors against the repository.
+///
+/// Evidence against a visibility-scoped commit listing, where a short SHA
+/// matches a visible full id by prefix; anchors against the tips of each
+/// entry's subject here (`tips`: its local bookmark, then the same name on
+/// each remote, [`crate::jj::Repo::tips_of`]).
+///
+/// An anchor has moved when the ref it was read from is at another commit now:
+/// the ref its evidence chose ([`Entry::anchor_ref`]), else the subject's
+/// local bookmark. A note its evidence anchored at a remote's tip holds while
+/// that tip does, whatever the local bookmark holds; a note anchored at the
+/// local bookmark, by its evidence or not, is flagged once that bookmark
+/// moves, even while a remote still holds the old commit. A ref that is gone
+/// here (a deleted branch) leaves the entry valid.
+pub fn verify_entries<'t>(
     entries: &[Entry],
     visible: &BTreeSet<String>,
-    tips: &BTreeMap<String, String>,
+    tips: impl Fn(&str) -> &'t [(BookmarkRef, CommitId)],
 ) -> Vec<VerifyFlag> {
     let mut flags = Vec::new();
     for entry in entries {
@@ -1015,28 +1042,56 @@ pub fn verify_entries(
                 });
             }
         }
-        if let Some(anchor) = &entry.anchor {
-            if !visible_contains(visible, anchor) {
-                flags.push(VerifyFlag {
-                    ts: entry.ts.clone(),
-                    subject: entry.subject.clone(),
-                    what: format!("anchor {anchor} vanished"),
-                });
-            } else if let Some(tip) = entry
+        let Some(anchor) = &entry.anchor else {
+            continue;
+        };
+        let what = if visible_contains(visible, anchor) {
+            entry
                 .subject
                 .as_deref()
-                .and_then(|subject| tips.get(subject))
-                && !tip.starts_with(anchor)
-            {
-                flags.push(VerifyFlag {
-                    ts: entry.ts.clone(),
-                    subject: entry.subject.clone(),
-                    what: format!("anchor moved: {anchor} -> {tip}"),
-                });
-            }
+                .and_then(|subject| moved(entry, anchor, tips(subject)))
+        } else {
+            Some(format!("anchor {anchor} vanished"))
+        };
+        if let Some(what) = what {
+            flags.push(VerifyFlag {
+                ts: entry.ts.clone(),
+                subject: entry.subject.clone(),
+                what,
+            });
         }
     }
     flags
+}
+
+/// `anchor moved: <anchor> -> <tip> (<ref>)` when the ref `entry`'s anchor was
+/// read from ([`verify_entries`]) is at another commit in `tips`; `None` while
+/// it holds, and when that ref is not here.
+fn moved(entry: &Entry, anchor: &str, tips: &[(BookmarkRef, CommitId)]) -> Option<String> {
+    let read_from = |reference: &BookmarkRef| {
+        entry
+            .anchor_ref
+            .as_deref()
+            .map_or_else(|| reference.is_local(), |name| spells(reference, name))
+    };
+    let (reference, tip) = tips.iter().find(|(reference, _)| read_from(reference))?;
+    let tip = tip.as_str();
+    if tip.starts_with(anchor) {
+        return None;
+    }
+    Some(format!("anchor moved: {anchor} -> {tip} ({reference})"))
+}
+
+/// Whether `name` spells `reference` as it displays: `<branch>` for a local
+/// bookmark, `<branch>@<remote>` for a remote's.
+fn spells(reference: &BookmarkRef, name: &str) -> bool {
+    let rest = name.strip_prefix(reference.branch().as_str());
+    match reference {
+        BookmarkRef::Local(_) => rest == Some(""),
+        BookmarkRef::Remote { remote, .. } => {
+            rest.and_then(|rest| rest.strip_prefix('@')) == Some(remote.as_str())
+        }
+    }
 }
 
 fn is_commit_token(token: &str) -> bool {
@@ -1275,6 +1330,16 @@ impl<'a> Draft<'a> {
     }
 }
 
+/// The subject's refs a write read to anchor its entry
+/// ([`Scribe::record_reading`]).
+#[derive(Debug, Default)]
+pub struct Anchoring {
+    /// Where the subject points here: its local tip, then its tip on each
+    /// remote ([`crate::jj::Repo::tips_of`]). Empty when it is no bookmark
+    /// here, the entry has no subject, or the checkout could not be read.
+    pub tips: Vec<(BookmarkRef, CommitId)>,
+}
+
 /// Where automatic events go, and who is writing them.
 ///
 /// Bound once per command rather than threaded as four arguments: every event a
@@ -1329,9 +1394,17 @@ impl Scribe {
         self.record_to(draft).map(|(entry, _)| entry)
     }
 
+    /// [`Scribe::record`], with the subject's refs its anchor was chosen
+    /// from, for a writer that tells its caller what the anchor misses.
+    pub fn record_reading(&self, draft: &Draft<'_>) -> Result<(Entry, Anchoring), LedgerError> {
+        let (entry, anchoring) = self.stamped(draft, true);
+        let _ = self.write(&entry)?;
+        Ok((entry, anchoring))
+    }
+
     /// [`Scribe::record`], with the path of the file the entry was written to.
     pub fn record_to(&self, draft: &Draft<'_>) -> Result<(Entry, PathBuf), LedgerError> {
-        let entry = self.stamped(draft);
+        let (entry, _) = self.stamped(draft, false);
         let path = self.write(&entry)?;
         Ok((entry, path))
     }
@@ -1344,18 +1417,24 @@ impl Scribe {
     /// forget followed by the list it leaves never lands as the forget alone,
     /// which would erase every requirement.
     pub fn record_in_order(&self, drafts: &[Draft<'_>]) -> Result<Vec<Entry>, LedgerError> {
-        let entries: Vec<Entry> = drafts.iter().map(|draft| self.stamped(draft)).collect();
+        let entries: Vec<Entry> = drafts
+            .iter()
+            .map(|draft| self.stamped(draft, false).0)
+            .collect();
         for entry in entries.iter().rev() {
             let _ = self.write(entry)?;
         }
         Ok(entries)
     }
 
-    /// `draft` as an entry, its automatic fields stamped.
-    fn stamped(&self, draft: &Draft<'_>) -> Entry {
-        Entry {
-            ts: monotonic_after(draft.statement.as_ref().and_then(|stated| stated.replaces))
-                .to_string(),
+    /// `draft` as an entry, its automatic fields stamped, and the subject's
+    /// refs its anchor was chosen from ([`Scribe::anchor`]).
+    fn stamped(&self, draft: &Draft<'_>, reading: bool) -> (Entry, Anchoring) {
+        let ts = monotonic_after(draft.statement.as_ref().and_then(|stated| stated.replaces))
+            .to_string();
+        let (anchor, anchor_ref, anchoring) = self.anchor(draft, reading);
+        let entry = Entry {
+            ts,
             owner: self.owner.clone(),
             email: self
                 .email
@@ -1370,7 +1449,8 @@ impl Scribe {
                 .map(|stated| stated.statement.clone()),
             text: draft.text.clone(),
             evidence: draft.evidence.clone(),
-            anchor: self.anchor(draft.subject),
+            anchor,
+            anchor_ref,
             pr: draft.pr,
             parents: draft.parents.clone(),
             fix_files: draft.fix_files.clone(),
@@ -1381,7 +1461,8 @@ impl Scribe {
             previous_started: draft.previous_started.clone(),
             previous_last_seen: draft.previous_last_seen.clone(),
             previous_why: draft.previous_why.clone(),
-        }
+        };
+        (entry, anchoring)
     }
 
     /// Write `entry` as one file and list it among what this process
@@ -1405,18 +1486,57 @@ impl Scribe {
         self.record(&Draft::event(subject, text, pr))
     }
 
-    /// The subject's tip now, or nothing when it does not resolve.
+    /// The subject's tip now, or nothing when it does not resolve; the ref it
+    /// was read from, where the draft's evidence chose it
+    /// ([`Entry::anchor_ref`]); and the subject's refs it was chosen from,
+    /// read when `reading`, or when the draft names evidence, which needs them.
+    ///
+    /// The first of the subject's tips, local or on a remote, that an evidence
+    /// item resolves to, the local one first where several hold the commit: a
+    /// clone's local bookmark can be behind the head another clone pushed, or
+    /// missing, while the entry is evidence of that head. Evidence that is no
+    /// tip of the subject, such as the trunk commit a reproduction ran on,
+    /// never anchors it, so the anchor is always where the subject points.
+    /// Else what the subject resolves to here, its local bookmark.
     ///
     /// One local repository open per append. A branch deleted since, a reaped
     /// release ref, and a checkout that is not a repository all land here, and
     /// none of them is a reason to lose the entry.
-    fn anchor(&self, subject: Option<&str>) -> Option<String> {
-        let subject = subject?;
-        crate::jj::Repo::open(self.checkout.as_ref()?)
-            .ok()?
-            .resolve_commit(subject)
-            .ok()
-            .map(|commit| commit.as_str().to_owned())
+    fn anchor(
+        &self,
+        draft: &Draft<'_>,
+        reading: bool,
+    ) -> (Option<String>, Option<String>, Anchoring) {
+        let Some(subject) = draft.subject else {
+            return (None, None, Anchoring::default());
+        };
+        let Some(repo) = self
+            .checkout
+            .as_ref()
+            .and_then(|checkout| crate::jj::Repo::open(checkout).ok())
+        else {
+            return (None, None, Anchoring::default());
+        };
+        let tips = if reading || !draft.evidence.is_empty() {
+            repo.tips_of(subject)
+        } else {
+            Vec::new()
+        };
+        let named = if tips.is_empty() {
+            None
+        } else {
+            draft
+                .evidence
+                .iter()
+                .filter_map(|item| repo.resolve_commit(item.trim()).ok())
+                .find_map(|commit| tips.iter().find(|(_, tip)| *tip == commit))
+        };
+        let (anchor, anchor_ref) = named.map_or_else(
+            || (repo.resolve_commit(subject).ok(), None),
+            |(reference, tip)| (Some(tip.clone()), Some(reference.to_string())),
+        );
+        let anchor = anchor.map(|commit| commit.as_str().to_owned());
+        (anchor, anchor_ref, Anchoring { tips })
     }
 }
 
@@ -1635,7 +1755,7 @@ mod tests {
         reason = "indexing a result in a test is the assertion; a panic is the failure"
     )]
     use super::*;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
     fn entry(subject: Option<&str>, text: &str) -> Entry {
         Entry {
@@ -1647,6 +1767,7 @@ mod tests {
             text: text.to_owned(),
             evidence: Vec::new(),
             anchor: Some("6c42fe71".to_owned()),
+            anchor_ref: None,
             pr: None,
             parents: Vec::new(),
             fix_files: Vec::new(),
@@ -3201,10 +3322,13 @@ mod tests {
             "bbbbbbbbbbbb9999".to_owned(),
             "cccccccccccc9999".to_owned(),
         ]);
-        let tips = BTreeMap::from([("feat/moved".to_owned(), "cccccccccccc9999".to_owned())]);
+        let tips = [(
+            BookmarkRef::Local(crate::ids::BranchName::new("feat/moved")),
+            CommitId::new("cccccccccccc9999"),
+        )];
 
         assert_eq!(
-            verify_entries(&entries, &visible, &tips),
+            verify_entries(&entries, &visible, |_| tips.as_slice()),
             vec![
                 VerifyFlag {
                     ts: "2026-08-15T22:14:04Z".to_owned(),
@@ -3214,9 +3338,62 @@ mod tests {
                 VerifyFlag {
                     ts: "2026-08-15T22:14:05Z".to_owned(),
                     subject: Some("feat/moved".to_owned()),
-                    what: "anchor moved: bbbbbbbbbbbb -> cccccccccccc9999".to_owned(),
+                    what: "anchor moved: bbbbbbbbbbbb -> cccccccccccc9999 (feat/moved)".to_owned(),
                 },
             ]
         );
+    }
+
+    #[test]
+    fn an_anchor_moved_only_where_the_ref_it_was_read_from_moved() {
+        // Given: one anchor, b, and the subject standing each way it can.
+        let anchored = Entry {
+            anchor: Some("bbbbbbbbbbbb".to_owned()),
+            ..entry(Some("feat/x"), "noted")
+        };
+        let visible =
+            BTreeSet::from(["bbbbbbbbbbbb9999".to_owned(), "cccccccccccc9999".to_owned()]);
+        let branch = crate::ids::BranchName::new("feat/x");
+        let here = |commit: &str| (BookmarkRef::Local(branch.clone()), CommitId::new(commit));
+        let origin = |commit: &str| {
+            let remote = crate::ids::RemoteName::new("origin");
+            let reference = BookmarkRef::Remote {
+                branch: branch.clone(),
+                remote,
+            };
+            (reference, CommitId::new(commit))
+        };
+        let flags = |anchor_ref: Option<&str>, tips: &[(BookmarkRef, CommitId)]| {
+            let entry = Entry {
+                anchor_ref: anchor_ref.map(str::to_owned),
+                ..anchored.clone()
+            };
+            verify_entries(std::slice::from_ref(&entry), &visible, |_| tips)
+                .into_iter()
+                .map(|found| found.what)
+                .collect::<Vec<_>>()
+        };
+        let both = [here("cccccccccccc9999"), origin("bbbbbbbbbbbb9999")];
+        let pushed_on = [here("bbbbbbbbbbbb9999"), origin("cccccccccccc9999")];
+        let local_only = [here("cccccccccccc9999")];
+        let origin_only = [origin("cccccccccccc9999")];
+        let held = Vec::<String>::new();
+        let moved_here = "anchor moved: bbbbbbbbbbbb -> cccccccccccc9999 (feat/x)";
+        let moved_origin = "anchor moved: bbbbbbbbbbbb -> cccccccccccc9999 (feat/x@origin)";
+
+        // Then: read from origin's tip, which stayed: held, whatever the
+        // local bookmark holds.
+        assert_eq!(flags(Some("feat/x@origin"), &both), held);
+        // And: read from the local bookmark, which moved, whether its evidence
+        // chose it or not: flagged, though origin still holds the anchor.
+        assert_eq!(flags(None, &both), [moved_here]);
+        assert_eq!(flags(Some("feat/x"), &both), [moved_here]);
+        // And: read from origin's tip, which moved: flagged, though the local
+        // bookmark holds the anchor.
+        assert_eq!(flags(Some("feat/x@origin"), &pushed_on), [moved_origin]);
+        // And: the ref it was read from is gone (a deleted branch): held.
+        assert_eq!(flags(Some("feat/x@origin"), &local_only), held);
+        assert_eq!(flags(None, &origin_only), held);
+        assert_eq!(flags(None, &[]), held);
     }
 }

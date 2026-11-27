@@ -979,6 +979,7 @@ impl Withdrawal {
             text: self.text(),
             evidence: self.evidence(),
             anchor: None,
+            anchor_ref: None,
             pr: None,
             parents: Vec::new(),
             fix_files: Vec::new(),

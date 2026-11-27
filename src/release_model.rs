@@ -2116,6 +2116,7 @@ mod carrier_tests {
             text,
             evidence: vec![commit.as_str().to_owned(), "member0000000".to_owned()],
             anchor: None,
+            anchor_ref: None,
             pr: None,
             parents: vec![RecordedParent {
                 commit: "member0000000".to_owned(),

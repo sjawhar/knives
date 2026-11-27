@@ -725,3 +725,421 @@ fn an_empty_message_is_usage_and_does_not_write_a_note_with_no_text() {
     ));
     assert!(shown.contains("pushed round 6"), "was: {shown}");
 }
+
+/// A registry naming the lab's fork `demo` by its upstream.
+fn lab_home(lab: &lab::Lab) -> tempfile::TempDir {
+    let home = tempfile::tempdir().expect("create config home");
+    std::fs::write(
+        home.path().join("repos.toml"),
+        format!(
+            "[repos.demo]\nupstream = \"{}\"\norigin = \"https://forge.invalid/acme/work.git\"\n",
+            lab.upstream.display()
+        ),
+    )
+    .expect("write registry");
+    home
+}
+
+/// `knives --json notch <subject> -m … [--evidence <each>] --repo demo`, run in
+/// the lab's work checkout.
+fn notch_in(lab: &lab::Lab, home: &tempfile::TempDir, subject: &str, evidence: &[&str]) -> Output {
+    let mut args = vec![
+        "--json",
+        "notch",
+        subject,
+        "-m",
+        "PR head pushed",
+        "--repo",
+        "demo",
+    ];
+    for &item in evidence {
+        args.extend(["--evidence", item]);
+    }
+    lab::knives_command(&lab.work, home.path(), lab.temp_path(), &args)
+        .env("KNIVES_OWNER", "ses_fff688")
+        .output()
+        .expect("run knives")
+}
+
+/// The anchor of the entry a successful JSON write reports; `None` when the
+/// entry has none.
+fn written_anchor(output: &Output) -> Option<String> {
+    assert_eq!(output.status.code(), Some(0), "{}", lab::text(output));
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    parsed["wrote"]
+        .get("anchor")
+        .map(|anchor| anchor.as_str().expect("an anchor is a string").to_owned())
+}
+
+/// `fix-stale` here at one commit and on origin at another that no ancestry
+/// joins: what a clone's bookmark keeps when another clone rewrote the branch
+/// and pushed it, and this clone fetched without moving its own. Its commit
+/// here, then on origin.
+fn stale_bookmark(lab: &lab::Lab) -> (String, String) {
+    lab.branch("fix-stale", "stale.txt", "the head this clone last made\n");
+    lab.foreign_origin_branch(
+        "main@origin",
+        "fix-stale",
+        "the head another clone pushed\n",
+    );
+    lab.jj_work(["git", "fetch", "--remote", "origin"]);
+    let here = lab::commit_at(lab, "fix-stale").as_str().to_owned();
+    let origin = lab::commit_at(lab, "fix-stale@origin").as_str().to_owned();
+    assert_ne!(here, origin, "the fixture's bookmark is not stale");
+    (here, origin)
+}
+
+/// `fix-gone` only on origin, with no local bookmark: a branch another clone
+/// pushed, fetched here and never tracked. Its commit on origin.
+fn origin_only_bookmark(lab: &lab::Lab) -> String {
+    lab.foreign_origin_branch("main@origin", "fix-gone", "pushed by another clone\n");
+    lab.jj_work(["git", "fetch", "--remote", "origin"]);
+    lab::commit_at(lab, "fix-gone@origin").as_str().to_owned()
+}
+
+#[test]
+fn a_note_on_a_stale_bookmark_is_anchored_at_the_origin_head_its_evidence_names() {
+    // Given: a local bookmark left behind origin by another clone's push.
+    let lab = lab::Lab::new();
+    let home = lab_home(&lab);
+    let (here, origin) = stale_bookmark(&lab);
+
+    for evidence in [origin.as_str(), &origin[..8]] {
+        // When: a note names origin's head as its evidence, whole or as the
+        // short id a note's text quotes.
+        let wrote = notch_in(&lab, &home, "fix-stale", &[evidence]);
+
+        // Then: the note is anchored at that head, not at the stale local
+        // bookmark, and the write warns of nothing.
+        assert_eq!(
+            written_anchor(&wrote).as_deref(),
+            Some(origin.as_str()),
+            "{evidence}: anchored behind origin (local is {here}): {}",
+            lab::text(&wrote)
+        );
+        assert!(wrote.stderr.is_empty(), "{evidence}: {}", lab::text(&wrote));
+    }
+
+    // When: a note names the local head as its evidence instead.
+    let wrote = notch_in(&lab, &home, "fix-stale", &[here.as_str()]);
+
+    // Then: it is anchored there, and nothing is warned: the writer chose that
+    // head, so origin's other one is not news.
+    assert_eq!(
+        written_anchor(&wrote).as_deref(),
+        Some(here.as_str()),
+        "{}",
+        lab::text(&wrote)
+    );
+    assert!(wrote.stderr.is_empty(), "{}", lab::text(&wrote));
+}
+
+#[test]
+fn a_note_on_a_branch_only_origin_holds_is_anchored_at_the_head_its_evidence_names() {
+    // Given: a branch this clone has only as `fix-gone@origin`.
+    let lab = lab::Lab::new();
+    let home = lab_home(&lab);
+    let origin = origin_only_bookmark(&lab);
+
+    // When: a note names origin's head as its evidence.
+    let wrote = notch_in(&lab, &home, "fix-gone", &[origin.as_str()]);
+
+    // Then: the note is anchored at that head rather than left with none.
+    assert_eq!(
+        written_anchor(&wrote).as_deref(),
+        Some(origin.as_str()),
+        "{}",
+        lab::text(&wrote)
+    );
+    assert!(wrote.stderr.is_empty(), "{}", lab::text(&wrote));
+}
+
+#[test]
+fn a_note_without_evidence_keeps_the_local_anchor_and_says_what_origin_holds() {
+    // Given: a stale bookmark, a branch only origin holds, and (the control) a
+    // branch whose local bookmark is what it pushed to origin.
+    let lab = lab::Lab::new();
+    let home = lab_home(&lab);
+    let (here, origin) = stale_bookmark(&lab);
+    let gone = origin_only_bookmark(&lab);
+    lab.branch("fix-pushed", "pushed.txt", "pushed\n");
+    lab.push_branch("fix-pushed");
+    let pushed = lab::commit_at(&lab, "fix-pushed").as_str().to_owned();
+
+    // When: a note on the stale bookmark names no evidence.
+    let stale = notch_in(&lab, &home, "fix-stale", &[]);
+
+    // Then: it is anchored at the local bookmark, as before, and the write
+    // warns that origin holds another head, and how to anchor there.
+    assert_eq!(
+        written_anchor(&stale).as_deref(),
+        Some(here.as_str()),
+        "{}",
+        lab::text(&stale)
+    );
+    let warned = String::from_utf8_lossy(&stale.stderr);
+    assert!(
+        warned.contains(&format!(
+            "warning: fix-stale is at {} here but on origin at {}, so this note is anchored at \
+             {}; name the head it is about with --evidence to anchor it there",
+            &here[..12],
+            &origin[..12],
+            &here[..12]
+        )),
+        "{warned}"
+    );
+
+    // When: a note on the branch only origin holds names no evidence.
+    let missing = notch_in(&lab, &home, "fix-gone", &[]);
+
+    // Then: it has no anchor, as before, and the write says so.
+    assert_eq!(written_anchor(&missing), None, "{}", lab::text(&missing));
+    let warned = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        warned.contains(&format!(
+            "warning: fix-gone resolves to no commit here but is on origin at {}, so this note \
+             has no anchor; name the head it is about with --evidence to anchor it there",
+            &gone[..12]
+        )),
+        "{warned}"
+    );
+
+    // When (control): a note on the branch whose local bookmark origin holds.
+    let agreed = notch_in(&lab, &home, "fix-pushed", &[]);
+
+    // Then: anchored at its tip, with nothing to warn of.
+    assert_eq!(
+        written_anchor(&agreed).as_deref(),
+        Some(pushed.as_str()),
+        "{}",
+        lab::text(&agreed)
+    );
+    assert!(agreed.stderr.is_empty(), "{}", lab::text(&agreed));
+}
+
+#[test]
+fn evidence_that_is_no_head_of_the_subject_does_not_anchor_the_note() {
+    // Given: a stale bookmark, and a branch whose local bookmark origin holds.
+    let lab = lab::Lab::new();
+    let home = lab_home(&lab);
+    let (here, origin) = stale_bookmark(&lab);
+    lab.branch("fix-pushed", "pushed.txt", "pushed\n");
+    lab.push_branch("fix-pushed");
+    let pushed = lab::commit_at(&lab, "fix-pushed").as_str().to_owned();
+    // The commit a placement note cites: the trunk a reproduction ran on,
+    // which every branch here holds and none is at.
+    let trunk = lab::commit_at(&lab, "main@origin").as_str().to_owned();
+
+    // When: a note on each cites the trunk commit as its evidence.
+    let stale = notch_in(&lab, &home, "fix-stale", &[trunk.as_str()]);
+    let agreed = notch_in(&lab, &home, "fix-pushed", &[trunk.as_str()]);
+
+    // Then: neither is anchored at the trunk. The stale one keeps its local
+    // anchor and warns that origin holds another head; the other is anchored
+    // at its tip with nothing to warn of.
+    assert_eq!(
+        written_anchor(&stale).as_deref(),
+        Some(here.as_str()),
+        "{}",
+        lab::text(&stale)
+    );
+    assert!(
+        String::from_utf8_lossy(&stale.stderr).contains(&format!(
+            "warning: fix-stale is at {} here but on origin at {}",
+            &here[..12],
+            &origin[..12]
+        )),
+        "{}",
+        lab::text(&stale)
+    );
+    assert_eq!(
+        written_anchor(&agreed).as_deref(),
+        Some(pushed.as_str()),
+        "{}",
+        lab::text(&agreed)
+    );
+    assert!(agreed.stderr.is_empty(), "{}", lab::text(&agreed));
+}
+
+/// `knives --json notch <subject> --verify --repo demo` in the lab's work
+/// checkout: its exit code, how many entries it checked, and the `what` of
+/// each flag it raised.
+fn verified(
+    lab: &lab::Lab,
+    home: &tempfile::TempDir,
+    subject: &str,
+) -> (Option<i32>, u64, Vec<String>) {
+    let args = ["--json", "notch", subject, "--verify", "--repo", "demo"];
+    let output = lab::knives_command(&lab.work, home.path(), lab.temp_path(), &args)
+        .output()
+        .expect("run knives");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    let flags: Vec<String> = report["flags"]
+        .as_array()
+        .expect("a verify report lists its flags")
+        .iter()
+        .map(|flag| flag["what"].as_str().expect("a flag says what").to_owned())
+        .collect();
+    let checked = report["checked"].as_u64().expect("a verify report counts");
+    (output.status.code(), checked, flags)
+}
+
+#[test]
+fn a_fresh_note_at_the_origin_head_verifies_while_no_ref_moves() {
+    // Given: a note its evidence anchored at origin's head, beside a stale
+    // local bookmark. The reviewer's
+    // `sol193_fresh_remote_tip_note_verifies_without_moving_refs`.
+    let lab = lab::Lab::new();
+    let home = lab_home(&lab);
+    let (_, origin) = stale_bookmark(&lab);
+    let wrote = notch_in(&lab, &home, "fix-stale", &[origin.as_str()]);
+    assert_eq!(
+        written_anchor(&wrote).as_deref(),
+        Some(origin.as_str()),
+        "{}",
+        lab::text(&wrote)
+    );
+    // The entry records the ref its evidence chose: origin's.
+    let parsed: serde_json::Value = serde_json::from_slice(&wrote.stdout).expect("JSON");
+    assert_eq!(
+        parsed["wrote"]["anchor_ref"], "fix-stale@origin",
+        "{parsed}"
+    );
+
+    // When: it is verified at once, with no ref moved.
+    let (code, checked, flags) = verified(&lab, &home, "fix-stale");
+
+    // Then: it verifies. Origin's head, where the note is anchored, is where
+    // it was; the local bookmark was elsewhere when the note was written.
+    assert_eq!((code, checked), (Some(0), 1), "{flags:?}");
+    assert!(flags.is_empty(), "{flags:?}");
+}
+
+#[test]
+fn a_note_fails_verify_once_the_tip_it_was_anchored_at_moves() {
+    // Given: a note its evidence anchored at origin's head beside a stale
+    // local bookmark, and a note with no evidence on a pushed branch, which
+    // is anchored at its local bookmark. Each verifies.
+    let lab = lab::Lab::new();
+    let home = lab_home(&lab);
+    let (_, origin) = stale_bookmark(&lab);
+    lab.branch("fix-pushed", "pushed.txt", "pushed\n");
+    lab.push_branch("fix-pushed");
+    let pushed = lab::commit_at(&lab, "fix-pushed").as_str().to_owned();
+    let noted = notch_in(&lab, &home, "fix-stale", &[origin.as_str()]);
+    assert_eq!(written_anchor(&noted).as_deref(), Some(origin.as_str()));
+    let noted = notch_in(&lab, &home, "fix-pushed", &[]);
+    assert_eq!(written_anchor(&noted).as_deref(), Some(pushed.as_str()));
+    assert_eq!(verified(&lab, &home, "fix-stale"), (Some(0), 1, Vec::new()));
+    assert_eq!(
+        verified(&lab, &home, "fix-pushed"),
+        (Some(0), 1, Vec::new())
+    );
+
+    // When: another clone pushes fix-stale on past the head the note names,
+    // and this clone fetches it.
+    let second = &lab.second;
+    lab::jj(second, ["new", "fix-stale", "-m", "origin moves on"]);
+    std::fs::write(second.join("moved.txt"), "moved\n").expect("write the next head");
+    lab::jj(second, ["bookmark", "set", "fix-stale", "-r", "@"]);
+    lab::jj(second, ["new"]);
+    lab::jj(
+        second,
+        [
+            "git",
+            "push",
+            "--remote",
+            "origin",
+            "--bookmark",
+            "fix-stale",
+        ],
+    );
+    lab.jj_work(["git", "fetch", "--remote", "origin"]);
+    let moved = lab::commit_at(&lab, "fix-stale@origin").as_str().to_owned();
+    assert_ne!(moved, origin, "origin did not move");
+
+    // Then: that note's anchor moved, and the flag names origin's tip, which
+    // the note was anchored at.
+    let expected = format!("anchor moved: {origin} -> {moved} (fix-stale@origin)");
+    assert_eq!(
+        verified(&lab, &home, "fix-stale"),
+        (Some(1), 1, vec![expected])
+    );
+
+    // When: fix-pushed's local bookmark moves on, not pushed yet.
+    lab::extend_branch(&lab, "fix-pushed", "more.txt", "more\n");
+    let advanced = lab::commit_at(&lab, "fix-pushed").as_str().to_owned();
+
+    // Then: the note anchored at the local bookmark moved, though origin
+    // still holds the commit it is anchored at.
+    let expected = format!("anchor moved: {pushed} -> {advanced} (fix-pushed)");
+    assert_eq!(
+        verified(&lab, &home, "fix-pushed"),
+        (Some(1), 1, vec![expected])
+    );
+}
+
+#[test]
+fn a_note_whose_evidence_named_the_local_tip_fails_verify_once_that_bookmark_moves() {
+    // Given: a pushed branch, and two notes on it: one whose evidence names
+    // its tip, which the local bookmark and origin both hold, and one with no
+    // evidence. The reviewer's
+    // `sol2_full_local_tip_evidence_must_not_hide_a_real_local_move`.
+    let lab = lab::Lab::new();
+    let home = lab_home(&lab);
+    lab.branch("fix-explicit", "explicit.txt", "explicit\n");
+    lab.push_branch("fix-explicit");
+    let head = lab::commit_at(&lab, "fix-explicit").as_str().to_owned();
+    let explicit = notch_in(&lab, &home, "fix-explicit", &[head.as_str()]);
+    assert_eq!(written_anchor(&explicit).as_deref(), Some(head.as_str()));
+    let automatic = notch_in(&lab, &home, "fix-explicit", &[]);
+    assert_eq!(written_anchor(&automatic).as_deref(), Some(head.as_str()));
+    // The evidence chose the local bookmark, the first of the refs at its
+    // commit.
+    let parsed: serde_json::Value = serde_json::from_slice(&explicit.stdout).expect("JSON");
+    assert_eq!(parsed["wrote"]["anchor_ref"], "fix-explicit", "{parsed}");
+    assert_eq!(
+        verified(&lab, &home, "fix-explicit"),
+        (Some(0), 2, Vec::new())
+    );
+
+    // When: the local bookmark moves on, not pushed; origin still holds the
+    // head both notes are anchored at.
+    lab::extend_branch(&lab, "fix-explicit", "more.txt", "more\n");
+    let advanced = lab::commit_at(&lab, "fix-explicit").as_str().to_owned();
+
+    // Then: both notes are flagged, the one its evidence anchored too.
+    let expected = format!("anchor moved: {head} -> {advanced} (fix-explicit)");
+    assert_eq!(
+        verified(&lab, &home, "fix-explicit"),
+        (Some(1), 2, vec![expected.clone(), expected])
+    );
+}
+
+#[test]
+fn a_note_on_a_local_only_branch_fails_verify_once_it_moves_past_what_it_pushed() {
+    // Given: two notes, with evidence and without, on a branch only the
+    // local bookmark holds. The reviewer's
+    // `sol2_unique_local_anchor_must_not_switch_to_a_later_pushed_remote`.
+    let lab = lab::Lab::new();
+    let home = lab_home(&lab);
+    lab.branch("fix-unique", "unique.txt", "unique\n");
+    let head = lab::commit_at(&lab, "fix-unique").as_str().to_owned();
+    let explicit = notch_in(&lab, &home, "fix-unique", &[head.as_str()]);
+    assert_eq!(written_anchor(&explicit).as_deref(), Some(head.as_str()));
+    let automatic = notch_in(&lab, &home, "fix-unique", &[]);
+    assert_eq!(written_anchor(&automatic).as_deref(), Some(head.as_str()));
+
+    // When: the branch is pushed, then its local bookmark moves on.
+    lab.push_branch("fix-unique");
+    lab::extend_branch(&lab, "fix-unique", "more.txt", "more\n");
+    let advanced = lab::commit_at(&lab, "fix-unique").as_str().to_owned();
+
+    // Then: both notes are flagged. Origin's later copy of the head does not
+    // stand in for the local bookmark they were read from.
+    let expected = format!("anchor moved: {head} -> {advanced} (fix-unique)");
+    assert_eq!(
+        verified(&lab, &home, "fix-unique"),
+        (Some(1), 2, vec![expected.clone(), expected])
+    );
+}

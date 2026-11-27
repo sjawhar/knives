@@ -4742,6 +4742,7 @@ mod cut_tests {
             ),
             evidence,
             anchor: None,
+            anchor_ref: None,
             pr: None,
             parents: Vec::new(),
             fix_files: Vec::new(),

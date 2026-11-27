@@ -483,7 +483,10 @@ pub enum Command {
         #[arg(short = 'm', long = "message", value_parser = note_text)]
         message: Option<String>,
         /// A commit id, `file:line`, `<repo>#<number>` or URL backing the note.
-        /// Repeatable, and it may name another repo.
+        /// Repeatable, and it may name another repo. An item that resolves to
+        /// one of the subject's tips here, its local bookmark or the same name
+        /// on a remote, anchors the note there; without one, the note is
+        /// anchored at the local bookmark.
         #[arg(long, requires = "message", value_parser = evidence_token)]
         evidence: Vec<String>,
         /// Record a terminal ruling with this entry: merged-elsewhere,
