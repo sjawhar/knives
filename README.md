@@ -440,12 +440,25 @@ and a name that exists only on upstream is still a new branch here. Moving the c
 branch that does not compose into the release means the release is behind: move the release,
 never mint a "release-lineage" sibling of the branch on an older base. A member whose own
 history carries a release merge (one a release ref names, or one the ledger records knives
-writing), or a merge bringing in a line the rest of the release lacks, is reported as
-`stacked-history`, and the plan stops calling the cut `flat`. A merge whose side parents the
-release already carries brings nothing but the member's own line: `include` takes such a
-branch beside the members it merges, a named `advance` takes one that continues a member
-(the one the last event recorded under its name, keeping the others it merged), and both
-name the merge.
+writing) that no other member carries, or a merge bringing in a line the rest of the release
+lacks, is reported as `stacked-history`, and the plan stops calling the cut `flat`. A merge
+whose side parents the release already carries brings nothing but the member's own line:
+`include` takes such a branch beside the members it merges, a named `advance` takes one that
+continues a member (the one the last event recorded under its name, keeping the others it
+merged), and both name the merge. A fork that lands each branch on its release, as one merge
+of the release and the branch's own line, builds its next release of those landings, and each
+landing holds the release merge it landed on by construction. Where other members carry every
+release merge a member holds (a carrier, above, is no member and counts for none of them), the
+member is measured past what they carry: a landing that brings one line of its own is
+expected, the plan does not report it, and `include` takes it;
+a merge there that joins two or more lines none of them has, as a landing built on another
+landing the release does not carry, is `stacked-history`, and the detail names that merge and
+lists every commit the member brings. A member that is itself a release merge (one a release ref names, or one the ledger records)
+is never read as a landing, so a release that knives reads as a member of the next one is
+still reported.
+`knives status`, `knives preflight` and the first cut have no release in hand and measure past
+the trunk alone, so they still report a landing: a pull request opened from it carries the whole
+release it landed on.
 
 `knives release members --verify` reads each member's own lines in the release, against the
 release it replaced (in a dated series the newest of our releases named before it, never a later
@@ -604,7 +617,7 @@ When releases publish to a separate remote, `knives audit` holds each release re
 
 Its gates come in this order. Each refusal writes nothing and exits `3`, unless the gate says otherwise:
 
-1. NAME is a dated cut of the series, in the grammar above, that git can hold as a ref. Else the command is a usage error (exit `2`). `--at` on a fixed release branch is a usage error too: a plain `cut` records that branch's published composition.
+1. NAME is a dated cut of the series, in the grammar above, that git can hold as a ref. Else the command is a usage error (exit `2`). On a fixed release branch, `knives release cut --at REV` takes no NAME: REV must be the publish remote's commit of the branch or one in its history, the oldest unrecorded release first.
 2. The plan has no problems, and a shared ledger pulls.
 3. REV names one commit. That commit has no conflict, is no workspace's working copy, and shares history with the trunk: the root commit, and a commit made on the root apart from the trunk, are refused.
 4. When the ledger records a write of NAME and its newest write is REV, the command says that NAME at REV `is already recorded`, writes nothing, and exits with the plan's exit (`0` when the plan is clean). When the newest write is another commit, the refusal names that commit: a commit made over a recorded write is recorded with `knives release adopt`.

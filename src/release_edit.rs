@@ -211,8 +211,9 @@ impl EditContext<'_> {
     /// parents it lists, and the plan would report the member the moment it got
     /// in. Refusing here is what keeps the plan from pointing at an `include`
     /// it would then flag. A merge of lines the release already carries brings
-    /// nothing but the branch's own commits ([`member_history`]), so it is
-    /// admitted and named.
+    /// nothing but the branch's own commits ([`member_history`]), and neither
+    /// does a landing on release cuts the members carry, so both are admitted
+    /// and named.
     fn admit_history(
         &self,
         branch: &str,
@@ -241,6 +242,16 @@ impl EditContext<'_> {
                     self.repo,
                     inline_human_text(branch),
                     listed.join(", "),
+                    self.release.shown_name()
+                );
+                Ok(Some(true))
+            }
+            MemberHistory::Landed { releases, own } => {
+                println!(
+                    "{}: {} lands on {releases} release cut(s) whose lines {} already carries; \
+                     it brings only its own {own} commit(s)",
+                    self.repo,
+                    inline_human_text(branch),
                     self.release.shown_name()
                 );
                 Ok(Some(true))
@@ -301,7 +312,7 @@ impl EditContext<'_> {
         let (repo, release) = (self.repo, self.release);
         match member_history(self.stacked, branch, tip)? {
             MemberHistory::Linear => Ok(true),
-            MemberHistory::CarriedMerges { .. } => {
+            MemberHistory::CarriedMerges { .. } | MemberHistory::Landed { .. } => {
                 if !release.parents.contains(tip) {
                     let lookup = self.member_parents(branch, tip)?;
                     let replaced = (!self.integrates(branch, tip, &lookup)?)

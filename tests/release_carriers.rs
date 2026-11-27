@@ -512,6 +512,52 @@ fn a_carrier_dropped_by_its_id_leaves_the_parent_set_with_the_content_unchanged(
 }
 
 #[test]
+fn a_landing_on_a_carrier_reads_stacked_in_the_plan_as_include_refuses_it() {
+    // Given: the adopted carrier state, then feat/epsilon landed on the
+    // carrier: one merge of the carrier and the branch. No member descends
+    // from the carrier, which is no member itself.
+    let state = carrier_state(&[
+        ("feat/alpha", "alpha.txt", "alpha\n"),
+        ("feat/beta", "beta.txt", "beta\n"),
+    ]);
+    let (lab, home) = (&state.lab, &state.home);
+    lab.branch("feat/epsilon", "epsilon.txt", "epsilon\n");
+    lab.jj_work([
+        "new",
+        state.carrier.as_str(),
+        "feat/epsilon",
+        "-m",
+        "land feat/epsilon on the carrier",
+    ]);
+    lab.jj_work(["bookmark", "create", "land/epsilon", "-r", "@"]);
+    step_off_onto_trunk(lab);
+
+    // When: the plan is read, then the landing is included.
+    let plan = stdout(&knives_release(lab, home, &[]));
+    let include = knives_release(lab, home, &["include", "land/epsilon"]);
+
+    // Then: the plan's note and the include measure it against the same
+    // members, so both read it as stacked on the carrier, and the release
+    // keeps its parents.
+    assert!(
+        plan.contains("branch land/epsilon's history past the trunk carries 2 merge commit(s)")
+            && plan.contains(&format!(
+                "an earlier release write the ledger records ({})",
+                state.carrier.short()
+            ))
+            && plan.contains("rebase it off the trunk before including it"),
+        "{plan}"
+    );
+    assert_eq!(include.status.code(), Some(3), "{}", text(&include));
+    assert!(
+        stdout(&include).contains("branch land/epsilon's history past the trunk carries"),
+        "{}",
+        text(&include)
+    );
+    assert_eq!(commit_at(lab, RELEASE), state.release);
+}
+
+#[test]
 fn an_include_over_a_carrier_keeps_the_hand_resolution_and_the_working_copy() {
     // Given: the adopted carrier state whose carrier holds a hand
     // resolution, a working copy left on the release.

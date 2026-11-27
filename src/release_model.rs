@@ -491,6 +491,11 @@ pub enum MemberHistory {
     /// lines `carried` already has: everything the branch brings is a single
     /// line of its own. The merges, and how many commits the branch brings.
     CarriedMerges { merges: Vec<CommitId>, own: usize },
+    /// Release cuts past the trunk, each of which `carried` already has, and
+    /// past what `carried` has no merge that joins two lines: the branch
+    /// landed its own line on releases the release is built on. How many
+    /// release cuts its history holds, and how many commits the branch brings.
+    Landed { releases: usize, own: usize },
     /// Merges that carry more than the branch's own work.
     Stacked(Finding),
 }
@@ -505,7 +510,8 @@ pub enum MemberHistory {
 /// which is how one branch became an upstream pull request carrying a previous
 /// cut's whole composition.
 ///
-/// `None` when the history is linear, or when every merge joins only lines the
+/// `None` when the history is linear, when every merge joins only lines the
+/// release already carries, or when the branch lands on release cuts the
 /// release already carries ([`member_history`]). The finding names the merges
 /// and, for each that a release names ([`StackedHistoryContext::releases`]),
 /// which release it is. A merge no release names may be upstream's own,
@@ -519,7 +525,9 @@ pub fn stacked_history(
 ) -> Result<Option<Finding>, jj::JjError> {
     Ok(match member_history(context, branch, tip)? {
         MemberHistory::Stacked(finding) => Some(finding),
-        MemberHistory::Linear | MemberHistory::CarriedMerges { .. } => None,
+        MemberHistory::Linear
+        | MemberHistory::CarriedMerges { .. }
+        | MemberHistory::Landed { .. } => None,
     })
 }
 
@@ -529,9 +537,14 @@ pub fn stacked_history(
 /// already carries — a branch built on members of the release, one that
 /// merged them to integrate — brings no content but the branch's own line:
 /// `git rev-list <tip> ^<release>` lists that line alone. That is
-/// [`MemberHistory::CarriedMerges`]. A merge one of our release refs names is a
-/// release cut, never a member's own merge, and a merge whose side parent the
-/// release lacks carries that side line in: both are
+/// [`MemberHistory::CarriedMerges`]. A merge one of our release refs names, or
+/// one the ledger records knives writing, is a release cut, never a member's
+/// own merge. A branch landed on a release holds that release's cut in its
+/// history by construction, so where the release's other members carry each
+/// release cut the branch holds, it is measured past what they carry
+/// ([`landed_history`]); a branch whose tip is a release cut is never
+/// measured so. A release cut no other member carries, and a merge
+/// whose side parent the release lacks, carry those lines in: both are
 /// [`MemberHistory::Stacked`], and when the release carries anything the
 /// finding lists every commit the branch would bring.
 pub fn member_history(
@@ -539,37 +552,58 @@ pub fn member_history(
     branch: &str,
     tip: &CommitId,
 ) -> Result<MemberHistory, jj::JjError> {
-    let merges = context.repo.merges_between(context.trunks, tip)?;
+    let merge_commits = context.repo.merge_commits_between(context.trunks, tip)?;
+    let merges: Vec<CommitId> = merge_commits
+        .iter()
+        .filter(|(_, joins)| *joins)
+        .map(|(merge, _)| merge.clone())
+        .collect();
     if merges.is_empty() {
         return Ok(MemberHistory::Linear);
     }
-    let mut named: Vec<String> = merges
-        .iter()
-        .filter_map(|merge| {
-            context
-                .releases
-                .get(merge)
-                .map(|names| format!("{} ({})", names.join(", "), merge.short()))
-        })
-        .collect();
+    // Release cuts among every merge past the trunk, a cut that upstream has
+    // taken a member of among them; the finding names those of `merges`.
+    let mut releases: Vec<&CommitId> = Vec::new();
+    let mut named: Vec<String> = Vec::new();
+    for (merge, joins) in &merge_commits {
+        if let Some(names) = context.releases.get(merge) {
+            releases.push(merge);
+            if *joins {
+                named.push(format!("{} ({})", names.join(", "), merge.short()));
+            }
+        }
+    }
     if !context.carried.is_empty() {
-        for merge in merges
+        for (merge, joins) in merge_commits
             .iter()
-            .filter(|merge| !context.releases.contains_key(*merge))
+            .filter(|(merge, _)| !context.releases.contains_key(merge))
         {
             if context
                 .written
                 .contains(&context.repo.change_id_of(merge.as_str())?)
             {
-                named.push(format!(
-                    "an earlier release write the ledger records ({})",
-                    merge.short()
-                ));
+                releases.push(merge);
+                if *joins {
+                    named.push(format!(
+                        "an earlier release write the ledger records ({})",
+                        merge.short()
+                    ));
+                }
             }
         }
     }
     let mut bases: Vec<CommitId> = context.trunks.to_vec();
     bases.extend(context.carried.iter().cloned());
+    // A branch whose tip is itself a release cut is never a landing: the
+    // other members carrying it would vouch for the cut as the cut vouches
+    // for them, and a release misread as a member would read flat.
+    if !releases.is_empty()
+        && !context.carried.is_empty()
+        && !releases.contains(&tip)
+        && let Some(landed) = landed_history(context, &bases, &releases, (branch, tip))?
+    {
+        return Ok(landed);
+    }
     let (uncarried, brought) = if named.is_empty() && !context.carried.is_empty() {
         let uncarried = context.repo.merges_with_side_lines(&bases, tip)?;
         let mut brought_bases = bases.clone();
@@ -609,6 +643,70 @@ pub fn member_history(
             uncarried.len()
         ),
     )))
+}
+
+/// [`member_history`] of a branch whose history holds the release cuts
+/// `releases`, measured past `bases` (the trunk positions and `carried`);
+/// `None` where one of those cuts lies past them, which `carried` lacks.
+///
+/// A fork lands a branch on its release as one merge of the release and the
+/// branch's own line, so a release built of landings holds the cut each one
+/// lands on through the others. Such a member brings nothing of the cut, nor
+/// of anything else the other members carry: what it brings lies past them.
+/// There a merge with one parent past them lands that one line on what they
+/// carry, whichever parent it is, and on whatever commit they carry, the
+/// release cut or a later one: [`MemberHistory::Landed`]. A merge that joins
+/// two or more lines past them, as a member built on another member's
+/// landing that the release does not carry, carries a line none of them
+/// has: [`MemberHistory::Stacked`], naming those merges and listing every
+/// commit the branch would bring.
+fn landed_history(
+    context: StackedHistoryContext<'_>,
+    bases: &[CommitId],
+    releases: &[&CommitId],
+    (branch, tip): (&str, &CommitId),
+) -> Result<Option<MemberHistory>, jj::JjError> {
+    let repo = context.repo;
+    let past = repo.commit_ids_between(bases, tip)?;
+    let lies_past = {
+        let past_set: HashSet<&CommitId> = past.iter().collect();
+        releases.iter().any(|release| past_set.contains(release))
+    };
+    if lies_past {
+        return Ok(None);
+    }
+    let joins = repo.merges_between(bases, tip)?;
+    let brought = match context.replaced {
+        Some(replaced) => {
+            let mut brought_bases = bases.to_vec();
+            brought_bases.push(replaced.clone());
+            repo.commit_ids_between(&brought_bases, tip)?
+        }
+        None => past,
+    };
+    if joins.is_empty() {
+        return Ok(Some(MemberHistory::Landed {
+            releases: releases.len(),
+            own: brought.len(),
+        }));
+    }
+    let merges: Vec<&str> = joins.iter().map(CommitId::short).collect();
+    let listed: Vec<&str> = brought.iter().map(CommitId::short).collect();
+    Ok(Some(MemberHistory::Stacked(Finding::new(
+        FindingKind::StackedHistory,
+        Subject::Branch(BranchName::new(branch)),
+        format!(
+            "branch {branch}'s history holds {} release cut(s) the other members already \
+             carry, and past them {} merge commit(s) joining lines none of them has ({}), so \
+             it carries everything those merges carried; it brings {} commit(s) the release \
+             does not carry: {}",
+            releases.len(),
+            joins.len(),
+            merges.join(", "),
+            listed.len(),
+            listed.join(", ")
+        ),
+    ))))
 }
 
 /// How a branch tip stands to one released parent.
@@ -1017,13 +1115,14 @@ fn recorded_under(recorded: &[RecordedParent], member: &CommitId, branch: &str) 
 /// Whether a merge branch builds on the members it descends from, and so
 /// joins beside them through `include`, rather than continuing one of them.
 ///
-/// The branch's history carries merges the release already carries, and
-/// `lookup` found its members by succession. A branch one of whose members
-/// the last event recorded under its own name continues that member, however
-/// many others it merged: `advance` replaces that one and measures it against
-/// the rest. Otherwise, several members: it merges them. One: it merges that
-/// member when, measured against the other members, its history carries that
-/// member's line ([`MemberHistory::Stacked`]).
+/// The branch's history carries merges the release already carries (release
+/// cuts it lands on among them), and `lookup` found its members by
+/// succession. A branch one of whose members the last event recorded under
+/// its own name continues that member, however many others it merged:
+/// `advance` replaces that one and measures it against the rest. Otherwise,
+/// several members: it merges them. One: it merges that member when,
+/// measured against the other members, its history carries that member's
+/// line ([`MemberHistory::Stacked`]).
 pub fn integrates(
     context: StackedHistoryContext<'_>,
     recorded: &[RecordedParent],
@@ -1037,7 +1136,7 @@ pub fn integrates(
             .any(|member| recorded_under(recorded, member, branch))
         || !matches!(
             member_history(context, branch, tip)?,
-            MemberHistory::CarriedMerges { .. }
+            MemberHistory::CarriedMerges { .. } | MemberHistory::Landed { .. }
         )
     {
         return Ok(false);
