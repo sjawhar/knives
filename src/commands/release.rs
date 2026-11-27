@@ -3975,9 +3975,12 @@ fn built_on_release(
 /// history says two changes overlap. Such a line is not carried: the member
 /// reads unresolved, for its review, and the other member answers for its
 /// own change on its own reading. The members whose changes overlap, where
-/// every lost line is so; otherwise none, and `lines` is as it was. Only the
-/// paths of lines still lost are read, and another member not at all where
-/// it holds what the shared commit holds there.
+/// every lost line is so; otherwise none, and `lines` is as it was. A member
+/// left with a path no reading answers (a conflict, or a file it adds that
+/// the release changed, [`LostKind::AddedFileChanged`]) is not unresolved:
+/// its lost lines stay missing, named. Only the paths of lines still lost
+/// are read, and another member not at all where it holds what the shared
+/// commit holds there.
 fn read_overlaps(
     opened: &Repo,
     (tip, base): (&CommitId, &CommitId),
@@ -4036,8 +4039,11 @@ fn read_overlaps(
         {
             by.push(other.clone());
         }
-        if lines.reading != Reading::Missing {
+        if lines.reading == Reading::CarriedForward {
             return Ok(by);
+        }
+        if lines.reading != Reading::Missing {
+            break;
         }
     }
     for (lost, was) in lines.lost.iter_mut().zip(marked) {

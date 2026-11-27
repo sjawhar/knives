@@ -3144,6 +3144,37 @@ fn a_put_back_removal_reads_unresolved_by_a_member_built_on_it_and_missing_by_ha
     assert!(out.contains("removed line put back ‹r2›"), "{out}");
 }
 
+#[test]
+fn an_overlapped_line_beside_an_added_file_the_release_changed_stays_missing() {
+    // Given: `feat/m` adds `a.txt` (`a1`) and `b.txt` (`b1`); `feat/s`,
+    // stacked on it, rewrites `a1` as `a2`; RELEASE merges both and adds a
+    // line to `b.txt` by hand, so `feat/m` lacks `a1`, which `feat/s`
+    // changed again, and its added `b.txt` is left to a person.
+    let lab = trunk_with(&[("f.txt", "f\n")]);
+    branch_on(&lab, "main@upstream", "feat/m", |work| {
+        write_file(work, "a.txt", "a1\n");
+        write_file(work, "b.txt", "b1\n");
+    });
+    branch_on(&lab, "feat/m", "feat/s", |work| {
+        write_file(work, "a.txt", "a2\n");
+    });
+    hand_release(&lab, RELEASE, &["feat/m", "feat/s"], |work| {
+        write_file(work, "b.txt", "b1\nextra\n");
+    });
+    let (home, _consumer) = release_test_home(&lab);
+
+    // When, then: not every finding of `feat/m` is another member's, so it
+    // is not unresolved, and its lost line is not hidden as inconclusive:
+    // it reads missing, naming `a1`.
+    let output = verify(&lab, &home, RELEASE);
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
+    let member = label(&lab, "feat/m");
+    assert!(out.contains(&missing_row(&member)), "{out}");
+    assert!(out.contains("a.txt:1: added line lost ‹a1›"), "{out}");
+    assert!(!out.contains(&format!("{member}: unresolved")), "{out}");
+}
+
 /// Four branches stacked on one another, merged by hand as a release cut
 /// outside knives: `feat/base` writes `base.txt`; `feat/pr`, on it, writes
 /// `pr.txt`; `feat/other`, on `feat/base` too, rewrites `base.txt`;
